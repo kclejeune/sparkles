@@ -970,6 +970,8 @@ pub struct Ctx {
     pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
+    /// Bytes of `local` currently covered by `self.retained` (mutated under `local.write()`).
+    local_retained: AtomicU64,
     values: ValueCache,
     floors: FloorCache,
     next_bnode: AtomicU64,
@@ -1566,6 +1568,7 @@ impl Ctx {
             #[cfg(test)]
             chunk_hook: parking_lot::Mutex::new(None),
             local: RwLock::new(AppendVocab::default()),
+            local_retained: AtomicU64::new(0),
             values: Default::default(),
             floors: Default::default(),
             next_bnode: AtomicU64::new(0),
@@ -2761,15 +2764,21 @@ impl Ctx {
         if let Some(i) = local.find(key) {
             return Id::local(i);
         }
-        if !self.retain_bytes(key.len() as u64 + 96) {
+        let add = key.len() as u64 + 96;
+        if !self.retain_bytes(add) {
             return Id::UNDEF;
         }
-        Id::local(local.insert(key).0)
+        let id = Id::local(local.insert(key).0);
+        let covered = self.local_retained.load(Ordering::Acquire);
+        self.local_retained
+            .store(covered.saturating_add(add), Ordering::Release);
+        id
     }
 
     /// Look up or intern an already-encoded vocabulary key, pre-admitting decompression
-    /// scratch and retained local-vocabulary storage and returning any budget or control
-    /// error directly.
+    /// scratch and local-vocabulary growth peaks (simultaneous old and new hash tables or
+    /// key-pointer buffers during resize) and reconciling against retained physical
+    /// capacities afterward.
     pub(crate) fn intern_key_checked(&self, key: &[u8]) -> Result<Id> {
         self.check()?;
         let vocab_scratch = self.charge(0)?;
@@ -2799,16 +2808,30 @@ impl Ctx {
         if let Some(i) = local.find(key) {
             return Ok(Id::local(i));
         }
-        let retained = u64::try_from(key.len())
-            .ok()
-            .and_then(|n| n.checked_add(96))
+        let covered = self.local_retained.load(Ordering::Acquire);
+        let peak = local
+            .insert_peak_bytes(key.len())
             .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
-        if !self.retain_bytes(retained) {
-            return Err(self.check_memory_failure().err().unwrap_or_else(|| {
-                self.memory_exceeded(self.live_bytes().saturating_add(retained))
-            }));
+        let transient = peak.saturating_sub(covered);
+        let growth_charge = if transient > 0 {
+            Some(self.charge(transient)?)
+        } else {
+            None
+        };
+        let (id, _) = local.insert(key);
+        let after = local.physical_bytes();
+        drop(growth_charge);
+        let retain_delta = after.saturating_sub(covered);
+        if retain_delta > 0 {
+            if !self.retain_bytes(retain_delta) {
+                return Err(self.check_memory_failure().err().unwrap_or_else(|| {
+                    self.memory_exceeded(self.live_bytes().saturating_add(retain_delta))
+                }));
+            }
+            self.local_retained
+                .store(covered.saturating_add(retain_delta), Ordering::Release);
         }
-        Ok(Id::local(local.insert(key).0))
+        Ok(Id::local(id))
     }
 
     /// Intern a simple `xsd:string` literal directly from a borrowed lexical value,
@@ -2881,6 +2904,9 @@ impl Ctx {
         }
         let id = Id::local(local.insert(key).0);
         std::mem::forget(charge);
+        let covered = self.local_retained.load(Ordering::Acquire);
+        self.local_retained
+            .store(covered.saturating_add(estimate), Ordering::Release);
         Ok(id)
     }
 
@@ -2907,8 +2933,11 @@ impl Ctx {
         let local = other.local.read().clone();
         // The copy is this context's own, so it is charged here, and a refusal fails the
         // next check.
-        self.retain_bytes(local.bytes() as u64);
-        *self.local.write() = local;
+        let bytes = local.bytes() as u64;
+        self.retain_bytes(bytes);
+        let mut dst = self.local.write();
+        *dst = local;
+        self.local_retained.store(bytes, Ordering::Release);
         self.next_bnode
             .store(other.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);
     }

@@ -4288,6 +4288,100 @@ mod tests {
         }
     }
 
+    /// Streamed `apf:strSplit` with > 7,168 distinct new tokens pre-admits the
+    /// `AppendVocab` 8,192 -> 16,384 hash-table rehash peak (simultaneous old and new
+    /// tables plus pointer vector and `Arc` headers) even when the caller drops each
+    /// batch, and reconciles retained credit back down to physical capacities afterward.
+    #[test]
+    fn leaf_reader_str_split_pre_admits_local_vocab_rehash_peak() {
+        let tokens: Vec<String> = (0..7_200usize).map(|i| format!("t{i:04}")).collect();
+        let joined = tokens.join(",");
+        // Each encoded key is `"t0000\xff` (7 bytes). At entry 7,169:
+        // - Old flat `key.len() + 96` estimate charged 7,169 * 103 = ~721 KiB.
+        // - Physical rehash peak holds 8,192-slot `keys` (128 KiB) + old 8,192-bucket map
+        //   (200 KiB) + new 16,384-bucket map (400 KiB) + 7,169 Arcs (~273 KiB) ≈ 1,001 KiB.
+        // Choose a budget above the old flat charge (~820 KiB + input string) and below
+        // the rehash peak so the test would pass-by-mistake without rehash peak admission.
+        let tight_limit = 920 << 10;
+        {
+            let ctx = test_ctx(tight_limit);
+            let text_id = ctx.intern_value(&Value::Str(joined.clone().into()));
+            let pat_id = ctx.intern_value(&Value::Str(",".into()));
+            let var = ctx.var("tok");
+            let spec = PfSpec {
+                kind: PfKind::StrSplit,
+                slots: vec![
+                    PathEnd::Var(var),
+                    PathEnd::Const(text_id),
+                    PathEnd::Const(pat_id),
+                ],
+                inputs: Default::default(),
+                graph: GraphFilter::Default,
+            };
+            let mut reader = LeafReader::open(&ctx, &spec, &[var]).unwrap();
+            let mut err = None;
+            loop {
+                let mut out = Table::new(vec![var]);
+                match reader.next(&ctx, &mut out, 1) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                matches!(
+                    err,
+                    Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+                ),
+                "expected Memory BudgetExceeded before local-vocab 8192->16384 rehash, got {err:?}"
+            );
+        }
+
+        // Under ample budget, all 7,200 distinct tokens succeed, peak reflects the rehash
+        // spike, and live retained bytes reconcile below the transient rehash peak.
+        {
+            let ctx = test_ctx(16 << 20);
+            let text_id = ctx.intern_value(&Value::Str(joined.into()));
+            let pat_id = ctx.intern_value(&Value::Str(",".into()));
+            let var = ctx.var("tok");
+            let spec = PfSpec {
+                kind: PfKind::StrSplit,
+                slots: vec![
+                    PathEnd::Var(var),
+                    PathEnd::Const(text_id),
+                    PathEnd::Const(pat_id),
+                ],
+                inputs: Default::default(),
+                graph: GraphFilter::Default,
+            };
+            let mut reader = LeafReader::open(&ctx, &spec, &[var]).unwrap();
+            let mut count = 0usize;
+            loop {
+                let mut out = Table::new(vec![var]);
+                let done = reader.next(&ctx, &mut out, 1).unwrap();
+                count += out.len();
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(count, 7_200);
+            drop(reader);
+            let peak = ctx.mem_peak();
+            let live = ctx.live_bytes();
+            assert!(
+                peak >= 1_000_000,
+                "expected mem_peak to include local-vocab rehash spike, got {peak}"
+            );
+            assert!(
+                live + (100 << 10) <= peak,
+                "expected post-rehash live bytes ({live}) to reconcile below transient rehash peak ({peak})"
+            );
+        }
+    }
+
     /// Production `LeafReader::open` matches eager `regex::Regex::new` both across the
     /// split parity matrix and up to eager's 10 MiB NFA ceiling, while returning a typed
     /// `BudgetKind::Memory` refusal when a smaller query grant caps compilation.

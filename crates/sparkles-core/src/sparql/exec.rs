@@ -10158,13 +10158,27 @@ impl RemoteAnswer {
                         let bytes =
                             super::svcread::read_late_json(start, &mut body, &mut staging, ctx)
                                 .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        let parser_reserve = (bytes.len() as u64)
+                            .saturating_mul(super::svcread::buffered_factor())
+                            .saturating_add(super::svcread::SLACK);
                         Box::new(
-                            super::svcread::ChargedCursor::new(bytes, staging)
-                                .map_err(|e| Self::failed(url.as_str(), e.into()))?,
+                            super::svcread::ChargedCursor::with_parser_reserve(
+                                bytes,
+                                staging,
+                                parser_reserve,
+                            )
+                            .map_err(|e| Self::failed(url.as_str(), e.into()))?,
                         )
                     } else {
-                        let head = super::svcread::ChargedCursor::new(start.bytes, staging)
-                            .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        let parser_reserve = (start.decided as u64)
+                            .saturating_mul(super::svcread::head_factor())
+                            .saturating_add(super::svcread::SLACK);
+                        let head = super::svcread::ChargedCursor::with_parser_reserve(
+                            start.bytes,
+                            staging,
+                            parser_reserve,
+                        )
+                        .map_err(|e| Self::failed(url.as_str(), e.into()))?;
                         Box::new(std::io::Read::chain(head, body))
                     };
                     (reader, None)

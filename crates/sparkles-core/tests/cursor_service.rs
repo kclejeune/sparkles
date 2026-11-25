@@ -1914,3 +1914,148 @@ fn eager_service_charges_json_staging_and_streams_long_whitespace_prefix() {
         "expected Memory BudgetExceeded for large eager late-head body, got {err:?}"
     );
 }
+
+/// Eager SERVICE refuses responses whose raw JSON bytes fit in the memory grant when
+/// either escaped-token parser scratch or late-head buffered bindings exceed the grant.
+#[test]
+fn eager_service_refuses_escaped_token_scratch_and_late_buffered_bindings() {
+    let s = store();
+    let snap = s.snapshot();
+
+    // 1. ~27 KiB escaped string in `head.links` fits in a 32 KiB staging Vec<u8> (48 KiB
+    // growth peak), while the staging Vec + parser's decoded String exceed 56 KiB.
+    let escaped_head = format!(
+        r#"{{"head":{{"links":["\"{}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+        "e".repeat(27 << 10)
+    )
+    .into_bytes();
+    let ep_esc = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(escaped_head.clone())])
+    }));
+    let q_esc = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_esc.url);
+    let tight_esc = QueryOptions {
+        max_memory_bytes: Some(56 << 10),
+        ..opts()
+    };
+    let err = eager(&snap, &q_esc, &tight_esc).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for eager escaped-token scratch, got {err:?}"
+    );
+
+    // 2. 10,000 empty bindings occupy ~30 KiB on the wire (raw staging fits easily in
+    // 128 KiB), while `sparesults` buffers ~469+ KiB of `(Vec<String>, Vec<Term>)` pairs
+    // alongside the replay cursor.
+    let bindings = vec!["{}"; 10_000].join(",");
+    let late_empty =
+        format!(r#"{{"results":{{"bindings":[{bindings}]}},"head":{{"vars":["s"]}}}}"#)
+            .into_bytes();
+    assert!(late_empty.len() < (32 << 10));
+    let ep_late = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(late_empty.clone())])
+    }));
+    let q_late = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_late.url);
+    let tight_late = QueryOptions {
+        max_memory_bytes: Some(128 << 10),
+        ..opts()
+    };
+    let err = eager(&snap, &q_late, &tight_late).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for eager late-head buffered bindings, got {err:?}"
+    );
+}
+
+/// Whitespace compaction never turns a misplaced UTF-8 BOM after leading spaces into a
+/// valid response in either eager or strict cursor SERVICE, while a valid UTF-8 BOM at
+/// byte zero succeeds in both.
+#[test]
+fn service_rejects_misplaced_bom_after_whitespace_and_accepts_leading_bom() {
+    let s = store();
+    let snap = s.snapshot();
+
+    let mut misplaced = vec![b' '; 8192];
+    misplaced.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    misplaced.extend_from_slice(
+        br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:bad"}}]},"head":{"vars":["s"]}}"#,
+    );
+    let ep_bad = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(misplaced.clone())])
+    }));
+    let q_bad = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_bad.url);
+    assert!(
+        matches!(eager(&snap, &q_bad, &opts()), Err(Error::Service(_))),
+        "eager SERVICE must reject misplaced BOM after discarded whitespace"
+    );
+    assert!(
+        matches!(
+            streamed(&snap, &q_bad, &opts(), &strict(1)),
+            Err(Error::Service(_))
+        ),
+        "strict cursor SERVICE must reject misplaced BOM after discarded whitespace"
+    );
+
+    let mut leading_bom = vec![0xEF, 0xBB, 0xBF];
+    leading_bom.extend(std::iter::repeat_n(b' ', 8192));
+    leading_bom.extend_from_slice(
+        br#"{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:ok"}}]}}"#,
+    );
+    let ep_ok = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(leading_bom.clone())])
+    }));
+    let q_ok = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_ok.url);
+    let want = vec![vec![Some(Term::NamedNode(
+        oxrdf::NamedNode::new("urn:ok").unwrap(),
+    ))]];
+    assert_eq!(eager(&snap, &q_ok, &opts()).unwrap(), want);
+    assert_eq!(streamed(&snap, &q_ok, &opts(), &strict(1)).unwrap().0, want);
+}
+
+/// A head-first response with an incomplete > 4 KiB head token delivered across chunks
+/// streams its first solution immediately once the token closes and `"results"` + row 1
+/// arrive, without blocking on the rest of the open HTTP body.
+#[test]
+fn strict_service_streams_first_row_after_chunked_large_head_with_open_body() {
+    let s = store();
+    let snap = s.snapshot();
+    let gate = Arc::new(Gate::default());
+    let g = gate.clone();
+
+    let mut chunk1 = br#"{"head":{"links":[""#.to_vec();
+    chunk1.extend(std::iter::repeat_n(b'a', 5_000));
+    let chunk2 =
+        br#"","b"],"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:first"}}"#
+            .to_vec();
+    let chunk3 = br#"]}}"#.to_vec();
+
+    let ep = Endpoint::start(Arc::new(move || {
+        (
+            200,
+            vec![
+                Part::Bytes(chunk1.clone()),
+                Part::Bytes(chunk2.clone()),
+                Part::Wait(g.clone()),
+                Part::Bytes(chunk3.clone()),
+            ],
+        )
+    }));
+    let q = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep.url);
+    let qopts = QueryOptions {
+        timeout: Some(Duration::from_secs(3)),
+        ..opts()
+    };
+    let mut cursor = select_cursor(snap, &q, &qopts, &strict(1)).unwrap();
+    let batch = cursor
+        .next_batch()
+        .expect("first row must arrive before the endpoint closes or sends more body")
+        .expect("first row present");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch.row(0).unwrap().values(),
+        &[Some(Term::NamedNode(
+            oxrdf::NamedNode::new("urn:first").unwrap()
+        ))]
+    );
+    gate.open();
+    assert!(cursor.next_batch().unwrap().is_none());
+}

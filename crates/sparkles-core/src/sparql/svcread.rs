@@ -31,7 +31,7 @@ const WINDOW_FACTOR: u64 = 8;
 
 /// The parsers' fixed read-ahead: the JSON parser's buffer grows by 4 KiB, and the XML
 /// parser reads through an 8 KiB buffer.
-const SLACK: u64 = 4 * 4096 + 8192;
+pub(super) const SLACK: u64 = 4 * 4096 + 8192;
 
 /// Bytes read per bounded body read while probing a JSON head or validating a late-head
 /// JSON response.
@@ -91,22 +91,35 @@ pub(super) fn eager_charge(ctx: &Ctx) -> crate::error::Result<StagingCharge> {
     }
 }
 
-/// A replay cursor that holds its [`StagingCharge`] until its buffer is drained to EOF
-/// (releasing the buffer and credit immediately) or dropped.
+/// A replay cursor that holds its [`StagingCharge`] for both its raw buffer and any
+/// `parser_reserve` (head structures or late-head buffered bindings held by sparesults).
+/// Once the raw buffer drains to EOF on a non-empty read, the buffer is freed and the
+/// charge shrinks to `parser_reserve`, which stays live until the cursor drops.
 pub(super) struct ChargedCursor {
     inner: io::Cursor<Vec<u8>>,
     charge: StagingCharge,
+    parser_reserve: u64,
 }
 
 impl ChargedCursor {
-    pub(super) fn new(bytes: Vec<u8>, mut charge: StagingCharge) -> io::Result<Self> {
-        let cap = bytes.capacity() as u64;
-        if cap != charge.bytes() {
-            charge.resize(cap).map_err(io::Error::other)?;
+    #[cfg(test)]
+    pub(super) fn new(bytes: Vec<u8>, charge: StagingCharge) -> io::Result<Self> {
+        Self::with_parser_reserve(bytes, charge, 0)
+    }
+
+    pub(super) fn with_parser_reserve(
+        bytes: Vec<u8>,
+        mut charge: StagingCharge,
+        parser_reserve: u64,
+    ) -> io::Result<Self> {
+        let target = (bytes.capacity() as u64).saturating_add(parser_reserve);
+        if target != charge.bytes() {
+            charge.resize(target).map_err(io::Error::other)?;
         }
         Ok(Self {
             inner: io::Cursor::new(bytes),
             charge,
+            parser_reserve,
         })
     }
 }
@@ -114,12 +127,12 @@ impl ChargedCursor {
 impl Read for ChargedCursor {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        if n == 0 && self.inner.get_ref().capacity() > 0 {
+        if !buf.is_empty() && n == 0 && self.inner.get_ref().capacity() > 0 {
             let v = self.inner.get_mut();
             v.clear();
             v.shrink_to_fit();
             self.inner.set_position(0);
-            let _ = self.charge.resize(0);
+            let _ = self.charge.resize(self.parser_reserve);
         }
         Ok(n)
     }
@@ -132,6 +145,90 @@ fn vec_growth_peak(cur_cap: usize, next_len: usize) -> u64 {
         let next_cap = next_len.checked_next_power_of_two().unwrap_or(next_len);
         (cur_cap as u64).saturating_add(next_cap as u64)
     }
+}
+
+/// Conservative peak heap scratch `LowLevelJsonParser::parse_next` may allocate while
+/// decoding the next token in `slice` (an owned `String` when a JSON string contains an
+/// escape sequence or invalid UTF-8 bytes).
+fn lexer_token_scratch(mut slice: &[u8], allow_bom: bool) -> u64 {
+    if allow_bom && slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        slice = &slice[3..];
+    }
+    while let Some((&b, rest)) = slice.split_first() {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+            slice = rest;
+        } else {
+            break;
+        }
+    }
+    if slice.first() != Some(&b'"') {
+        return 0;
+    }
+    let mut escaped = false;
+    let mut has_escape = false;
+    let mut has_non_ascii = false;
+    let mut token_len = 0usize;
+    for (idx, &b) in slice[1..].iter().enumerate() {
+        token_len = idx + 1;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' {
+            escaped = true;
+            has_escape = true;
+        } else if b == b'"' {
+            break;
+        } else if !b.is_ascii() {
+            has_non_ascii = true;
+        }
+    }
+    if !has_escape && !has_non_ascii {
+        return 0;
+    }
+    let decoded = if has_non_ascii {
+        token_len.saturating_mul(3)
+    } else {
+        token_len
+    };
+    let cap = decoded.checked_next_power_of_two().unwrap_or(decoded);
+    let string_peak = (cap as u64).saturating_add((cap / 2) as u64);
+    if has_non_ascii {
+        string_peak.saturating_add(cap as u64)
+    } else {
+        string_peak
+    }
+}
+
+/// When `parse_next` returned `None` on an incomplete JSON string token with no unescaped
+/// closing quote yet, returns `Some(in_escape)` so `json_start` can keep reading chunks
+/// until an unescaped `"` arrives without either quadratic rescanning or extra blocking
+/// reads after the token closes.
+fn incomplete_string_escape_state(mut slice: &[u8], allow_bom: bool) -> Option<bool> {
+    if allow_bom && slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        slice = &slice[3..];
+    }
+    while let Some((&b, rest)) = slice.split_first() {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+            slice = rest;
+        } else {
+            break;
+        }
+    }
+    if slice.first() != Some(&b'"') {
+        return None;
+    }
+    let mut escaped = false;
+    for &b in &slice[1..] {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            return None;
+        }
+    }
+    Some(escaped)
 }
 
 /// How much a JSON head keeps for each byte of it. The shortest variable, `"a",`, is
@@ -187,6 +284,15 @@ pub(super) fn json_start(
     let (mut depth, mut in_head, mut vars, mut seen_token) = (0usize, false, false, false);
     loop {
         let prev_at = at;
+        if at < bytes.len() {
+            let scratch = lexer_token_scratch(&bytes[at..], !seen_token);
+            if scratch > 0 {
+                let parse_peak = (bytes.capacity() as u64).saturating_add(scratch);
+                if parse_peak > charge.bytes() {
+                    charge.resize(parse_peak).map_err(io::Error::other)?;
+                }
+            }
+        }
         let result = parser.parse_next(&bytes[at..], ending);
         at += result.consumed_bytes;
         if result.event.is_some() {
@@ -240,12 +346,16 @@ pub(super) fn json_start(
             });
         }
         // Compact consumed pure whitespace so a long whitespace prefix before the root
-        // object or between tokens does not grow the lookahead buffer.
+        // object or between tokens does not grow the lookahead buffer. Before the first
+        // token, retain one leading space so replaying `bytes` into a fresh lexer never
+        // promotes a later misplaced UTF-8 BOM to byte zero.
         if at > prev_at {
             if !seen_token {
-                bytes.copy_within(at.., 0);
-                bytes.truncate(bytes.len() - at);
-                at = 0;
+                let tail = bytes.len() - at;
+                bytes.copy_within(at.., 1);
+                bytes[0] = b' ';
+                bytes.truncate(1 + tail);
+                at = 1;
             } else if bytes[prev_at..at]
                 .iter()
                 .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
@@ -258,12 +368,7 @@ pub(super) fn json_start(
                 at = drop_from;
             }
         }
-        let unparsed = bytes.len() - at;
-        let target_unparsed = if unparsed < READ_STEP {
-            0
-        } else {
-            unparsed.saturating_mul(2)
-        };
+        let mut string_escape = incomplete_string_escape_state(&bytes[at..], !seen_token);
         loop {
             ctx.check().map_err(io::Error::other)?;
             let start = bytes.len();
@@ -286,7 +391,24 @@ pub(super) fn json_start(
             let n = body.read(&mut bytes[start..])?;
             bytes.truncate(start + n);
             ending = n == 0;
-            if ending || target_unparsed == 0 || bytes.len() - at >= target_unparsed {
+            if ending {
+                break;
+            }
+            let Some(escaped) = string_escape.as_mut() else {
+                break;
+            };
+            let mut closed = false;
+            for &b in &bytes[start..] {
+                if *escaped {
+                    *escaped = false;
+                } else if b == b'\\' {
+                    *escaped = true;
+                } else if b == b'"' {
+                    closed = true;
+                    break;
+                }
+            }
+            if closed {
                 break;
             }
         }
@@ -331,6 +453,15 @@ fn read_late_json_inner(
     let mut links_depth = 0usize;
     let mut incomplete_retries = 0usize;
     loop {
+        if at < bytes.len() {
+            let scratch = lexer_token_scratch(&bytes[at..], false);
+            if scratch > 0 {
+                let parse_peak = (bytes.capacity() as u64).saturating_add(scratch);
+                if parse_peak > charge.bytes() {
+                    charge.resize(parse_peak).map_err(io::Error::other)?;
+                }
+            }
+        }
         let result = parser.parse_next(&bytes[at..], ending);
         at += result.consumed_bytes;
         match result.event {
@@ -351,13 +482,9 @@ fn read_late_json_inner(
                         "unexpected end of JSON response",
                     ));
                 }
-                let target = if charge.is_cursor() {
-                    (bytes.capacity() as u64)
-                        .saturating_add((bytes.len() as u64).saturating_mul(buffered_factor()))
-                        .saturating_add(SLACK)
-                } else {
-                    bytes.capacity() as u64
-                };
+                let target = (bytes.capacity() as u64)
+                    .saturating_add((bytes.len() as u64).saturating_mul(buffered_factor()))
+                    .saturating_add(SLACK);
                 if target != charge.bytes() {
                     charge.resize(target).map_err(io::Error::other)?;
                 }
@@ -431,13 +558,9 @@ fn read_late_json_inner(
                 io::Error::new(io::ErrorKind::OutOfMemory, "JSON response too large")
             })?;
             let vec_peak = vec_growth_peak(bytes.capacity(), next_len);
-            let target = if charge.is_cursor() {
-                vec_peak
-                    .saturating_add((next_len as u64).saturating_mul(buffered_factor()))
-                    .saturating_add(SLACK)
-            } else {
-                vec_peak
-            };
+            let target = vec_peak
+                .saturating_add((next_len as u64).saturating_mul(buffered_factor()))
+                .saturating_add(SLACK);
             if target > charge.bytes() {
                 charge.resize(target).map_err(io::Error::other)?;
             }
@@ -693,7 +816,240 @@ mod tests {
         let head = ChargedCursor::new(start.bytes, staging).unwrap();
         let mut combined = Vec::new();
         head.chain(cur).read_to_end(&mut combined).unwrap();
-        assert_eq!(combined, body_json);
+        assert_eq!(combined[0], b' ');
+        assert_eq!(&combined[1..], body_json);
+    }
+
+    /// Eager head probing pre-admits owned unescaped-string scratch inside
+    /// `LowLevelJsonParser::parse_next` even when the raw staging vector and its growth
+    /// peak fit inside the query memory budget.
+    #[test]
+    fn eager_json_probe_pre_admits_escaped_string_scratch() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut raw = Ctx::new(store.snapshot());
+        // 27 KiB escaped string fits in a 32 KiB Vec<u8> (largest Vec growth peak = 48 KiB),
+        // but coexists with the parser's owned decoded String (~32-48 KiB peak).
+        raw.mem_limit = 56 << 10;
+        let ctx = Arc::new(raw);
+        ctx.attach_owner();
+
+        let escaped = format!(r#"\"{}"#, "a".repeat(27 << 10));
+        let payload = format!(
+            r#"{{"head":{{"links":["{escaped}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#
+        );
+        assert!(payload.len() < (32 << 10));
+
+        let mut cur = io::Cursor::new(payload.as_bytes());
+        let mut staging = eager_charge(&ctx).unwrap();
+        let err = json_start(&mut cur, &mut staging, &ctx).err().unwrap();
+        assert!(
+            matches!(
+                crate::codec::io_error(err),
+                Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+            ),
+            "escaped head string scratch must refuse on memory budget"
+        );
+    }
+
+    /// Eager late-head validation charges `sparesults`'s buffered bindings through replay,
+    /// refusing 10,000 empty bindings (~30 KiB wire, ~469 KiB buffered) under a 128 KiB
+    /// budget even though the raw vector fits.
+    #[test]
+    fn eager_late_json_reserves_buffered_bindings_through_replay() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut raw = Ctx::new(store.snapshot());
+        raw.mem_limit = 128 << 10;
+        let ctx = Arc::new(raw);
+        ctx.attach_owner();
+
+        let bindings = vec!["{}"; 10_000].join(",");
+        let payload =
+            format!(r#"{{"results":{{"bindings":[{bindings}]}},"head":{{"vars":["s"]}}}}"#);
+        assert!(payload.len() < (32 << 10));
+
+        let mut cur = io::Cursor::new(payload.as_bytes());
+        let mut staging = eager_charge(&ctx).unwrap();
+        let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+        assert!(start.late);
+        let err = read_late_json(start, &mut cur, &mut staging, &ctx).unwrap_err();
+        assert!(
+            matches!(
+                crate::codec::io_error(err),
+                Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+            ),
+            "late-head buffered bindings must refuse on eager memory budget"
+        );
+    }
+
+    /// Leading whitespace compaction preserves a single space before replaying so a
+    /// misplaced UTF-8 BOM after spaces is still rejected by `sparesults`, while a valid
+    /// UTF-8 BOM at byte zero is accepted both directly and before long whitespace.
+    #[test]
+    fn json_start_preserves_misplaced_bom_failure_and_accepts_leading_bom() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut raw = Ctx::new(store.snapshot());
+        raw.mem_limit = 1 << 20;
+        let ctx = Arc::new(raw);
+        ctx.attach_owner();
+
+        // 1. Misplaced BOM after > 4 KiB of spaces with late head must fail in sparesults.
+        let mut misplaced = vec![b' '; 8192];
+        misplaced.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        misplaced.extend_from_slice(
+            br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:bad"}}]},"head":{"vars":["s"]}}"#,
+        );
+        let mut cur = io::Cursor::new(misplaced.as_slice());
+        let mut staging = eager_charge(&ctx).unwrap();
+        let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+        assert_eq!(start.bytes[0], b' ');
+        let replay = ChargedCursor::new(start.bytes, staging).unwrap().chain(cur);
+        let parser =
+            sparesults::QueryResultsParser::from_format(sparesults::QueryResultsFormat::Json);
+        assert!(
+            parser.for_reader(replay).is_err(),
+            "misplaced BOM after discarded whitespace must fail parsing"
+        );
+
+        // 2. Valid leading BOM followed by > 4 KiB spaces compacts and parses cleanly.
+        let mut valid_ws = vec![0xEF, 0xBB, 0xBF];
+        valid_ws.extend(std::iter::repeat_n(b' ', 8192));
+        valid_ws.extend_from_slice(
+            br#"{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:ok"}}]}}"#,
+        );
+        let mut cur = io::Cursor::new(valid_ws.as_slice());
+        let mut staging = eager_charge(&ctx).unwrap();
+        let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+        assert!(!start.late);
+        assert!(start.bytes.capacity() <= 2 * READ_STEP);
+        let replay = ChargedCursor::new(start.bytes, staging).unwrap().chain(cur);
+        let parser =
+            sparesults::QueryResultsParser::from_format(sparesults::QueryResultsFormat::Json);
+        let sparesults::ReaderQueryResultsParserOutput::Solutions(sols) =
+            parser.for_reader(replay).unwrap()
+        else {
+            panic!("expected solutions");
+        };
+        assert_eq!(sols.count(), 1);
+
+        // 3. Valid leading BOM followed by > 4 KiB spaces and a SECOND misplaced BOM fails.
+        let mut double_bom = vec![0xEF, 0xBB, 0xBF];
+        double_bom.extend(std::iter::repeat_n(b' ', 8192));
+        double_bom.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        double_bom.extend_from_slice(br#"{"head":{"vars":["s"]},"results":{"bindings":[]}}"#);
+        let mut cur = io::Cursor::new(double_bom.as_slice());
+        let mut staging = eager_charge(&ctx).unwrap();
+        let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+        let replay = ChargedCursor::new(start.bytes, staging).unwrap().chain(cur);
+        let parser =
+            sparesults::QueryResultsParser::from_format(sparesults::QueryResultsFormat::Json);
+        assert!(
+            parser.for_reader(replay).is_err(),
+            "second misplaced BOM after leading BOM + whitespace must fail parsing"
+        );
+
+        // 4. Valid leading BOM immediately before `{` parses cleanly.
+        let mut direct_bom = vec![0xEF, 0xBB, 0xBF];
+        direct_bom.extend_from_slice(
+            br#"{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:direct"}}]}}"#,
+        );
+        let mut cur = io::Cursor::new(direct_bom.as_slice());
+        let mut staging = eager_charge(&ctx).unwrap();
+        let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+        assert!(!start.late);
+        let replay = ChargedCursor::new(start.bytes, staging).unwrap().chain(cur);
+        let parser =
+            sparesults::QueryResultsParser::from_format(sparesults::QueryResultsFormat::Json);
+        let sparesults::ReaderQueryResultsParserOutput::Solutions(sols) =
+            parser.for_reader(replay).unwrap()
+        else {
+            panic!("expected solutions");
+        };
+        assert_eq!(sols.count(), 1);
+    }
+
+    /// Head probing retries immediately once a chunk closes an incomplete > 4 KiB head
+    /// token and does not issue another blocking read after `"results"` has arrived.
+    #[test]
+    fn json_start_does_not_issue_extra_read_after_large_head_token_closes() {
+        struct PanicOnThirdRead {
+            chunks: VecDeque<Vec<u8>>,
+            reads: usize,
+        }
+
+        impl Read for PanicOnThirdRead {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                let Some(chunk) = self.chunks.pop_front() else {
+                    panic!(
+                        "json_start issued unexpected blocking read #{} after head completed",
+                        self.reads
+                    );
+                };
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    self.chunks.push_front(chunk[n..].to_vec());
+                }
+                Ok(n)
+            }
+        }
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut raw = Ctx::new(store.snapshot());
+        raw.mem_limit = 16 << 20;
+        raw.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(raw);
+        ctx.attach_owner();
+
+        // Chunk 1 (> 4 KiB) leaves a `head.links` string incomplete; chunk 2 is short,
+        // closes the string, finishes `head`, and delivers `"results"` plus the first row.
+        let mut chunk1 = br#"{"head":{"links":[""#.to_vec();
+        chunk1.extend(std::iter::repeat_n(b'a', 5_000));
+        let chunk2 =
+            br#"","x"],"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:1"}}"#
+                .to_vec();
+        // `json_start` reads in 4096-byte slices, so chunk1 takes 2 reads (4096 + 923)
+        // and chunk2 takes 1 read -> 3 reads total, never a 4th blocking read.
+        let mut body = PanicOnThirdRead {
+            chunks: VecDeque::from([chunk1, chunk2]),
+            reads: 0,
+        };
+        let mut ch = StagingCharge::from_cursor(charge(&ctx).unwrap());
+        let start = json_start(&mut body, &mut ch, &ctx).unwrap();
+        assert!(!start.late);
+        assert_eq!(body.reads, 3);
+    }
+
+    /// `ChargedCursor::read` ignores zero-length caller buffers without dropping unread
+    /// bytes, and retains `parser_reserve` after EOF until dropped.
+    #[test]
+    fn charged_cursor_ignores_empty_read_slice_and_keeps_parser_reserve_until_drop() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut raw = Ctx::new(store.snapshot());
+        raw.mem_limit = 1 << 20;
+        let ctx = Arc::new(raw);
+        ctx.attach_owner();
+
+        let data = b"hello world".to_vec();
+        let cap = data.capacity() as u64;
+        let reserve = 4096u64;
+        let staging = eager_charge(&ctx).unwrap();
+        let base = ctx.live_bytes();
+        let mut cursor =
+            ChargedCursor::with_parser_reserve(data.clone(), staging, reserve).unwrap();
+        assert_eq!(ctx.live_bytes(), base + cap + reserve);
+
+        // An empty slice read must return 0 without freeing the buffer or charge.
+        assert_eq!(cursor.read(&mut []).unwrap(), 0);
+        assert_eq!(ctx.live_bytes(), base + cap + reserve);
+
+        let mut out = Vec::new();
+        cursor.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data);
+        // After draining to EOF, raw buffer capacity is freed while `parser_reserve` stays.
+        assert_eq!(ctx.live_bytes(), base + reserve);
+        drop(cursor);
+        assert_eq!(ctx.live_bytes(), base);
     }
 
     /// Eager staging credit refuses an oversized non-whitespace head or late-head body

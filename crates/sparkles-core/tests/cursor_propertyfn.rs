@@ -399,14 +399,20 @@ fn leaf_bnode_unbound_subject_errors_and_delimiter_only_split_polls_controls() {
         "expected mid-stream split cancellation, got {err:?}"
     );
 
-    // Deleted range scan: bulk-load one live list cell followed by 2,000 deleted list
-    // cells so `open` and the first batch succeed with `cancel = false`, and flipping
-    // `cancel = true` before the next pull stops while scanning the deleted tail.
+    // Deleted range scan: bulk-load 256 live list cells (`RANGE_CHUNK = 256`) followed by
+    // 2,000 deleted list cells so the first 256-row refill returns only the live prefix
+    // and leaves the deleted tail unread for the second refill. Flipping `cancel = true`
+    // after the first batch then verifies between-pull mid-stream cancellation before the
+    // second refill (deterministic inner-loop cancellation during deletion traversal is
+    // covered by `arqpf::tests::str_split_and_deleted_range_cancel_mid_loop`).
     let s2 = Store::in_memory(StoreOptions::default());
-    let mut nt = String::from(
-        "<urn:0000:live> <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> 0 ;\n\
-         <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .\n",
-    );
+    let mut nt = String::new();
+    for i in 0..256usize {
+        nt.push_str(&format!(
+            "<urn:0000:live:{i:03}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> {i} ;\n\
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .\n"
+        ));
+    }
     for i in 0..2_000usize {
         nt.push_str(&format!(
             "<urn:del:{i:04}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> {i} .\n\
@@ -418,13 +424,18 @@ fn leaf_bnode_unbound_subject_errors_and_delimiter_only_split_polls_controls() {
     sparkles_core::sparql::update::update(
         &s2,
         "DELETE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> ?o } \
-         WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> ?o . FILTER(?s != <urn:0000:live>) }",
+         WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> ?o . FILTER(STRSTARTS(STR(?s), \"urn:del:\")) }",
         &Default::default(),
     )
     .unwrap();
     let snap2 = s2.snapshot();
     let q_del = format!("{P}SELECT ?l ?m {{ ?l list:member ?m }}");
     let cancel = Arc::new(AtomicBool::new(false));
+    let chunk_batch = CursorOptions {
+        batch_rows: 256,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
     let mut del_cursor = select_cursor(
         snap2,
         &q_del,
@@ -432,18 +443,18 @@ fn leaf_bnode_unbound_subject_errors_and_delimiter_only_split_polls_controls() {
             cancel: Some(cancel.clone()),
             ..Default::default()
         },
-        &one_row,
+        &chunk_batch,
     )
     .unwrap();
     let first = del_cursor
         .next_batch()
         .unwrap()
-        .expect("live list row before cancel");
-    assert_eq!(first.len(), 1);
+        .expect("live list rows before cancel");
+    assert_eq!(first.len(), 256);
     cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     let err = del_cursor.next_batch().err();
     assert!(
         matches!(err, Some(Error::Cancelled)),
-        "expected mid-stream deleted-range cancellation, got {err:?}"
+        "expected between-pull mid-stream cancellation before deleted-tail refill, got {err:?}"
     );
 }
