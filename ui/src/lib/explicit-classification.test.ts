@@ -171,6 +171,49 @@ describe('ClassifyOptionsState synchronization', () => {
     expect(opts.expansion).toBe('cautious');
   });
 
+  it('resets local frame edits when transitioning between default-valued options and undefined', () => {
+    const defaults = {
+      partial: undefined,
+      timeoutMs: undefined,
+      expansion: 'cautious' as const,
+    };
+    const opts = new ClassifyOptionsState('uni', null, defaults);
+    opts.partial = true;
+    opts.deadline = '1.5';
+    opts.expansion = 'eager';
+
+    // Re-syncing the same default-valued options keeps local frame edits.
+    opts.sync('uni', null, defaults);
+    expect(opts.partial).toBe(true);
+    expect(opts.deadline).toBe('1.5');
+    expect(opts.expansion).toBe('eager');
+
+    // Clearing default-valued options (e.g. invalid tree deadline) resets local edits.
+    opts.sync('uni', null, undefined);
+    expect(opts.partial).toBe(false);
+    expect(opts.deadline).toBe('');
+    expect(opts.expansion).toBe('cautious');
+    expect(opts.requestOptions).toEqual({
+      partial: undefined,
+      timeoutMs: undefined,
+      expansion: 'cautious',
+    });
+
+    // Reverse transition: restoring default-valued options from undefined also resets local edits.
+    opts.partial = true;
+    opts.deadline = '2.5';
+    opts.expansion = 'eager';
+    opts.sync('uni', null, defaults);
+    expect(opts.partial).toBe(false);
+    expect(opts.deadline).toBe('');
+    expect(opts.expansion).toBe('cautious');
+    expect(opts.requestOptions).toEqual({
+      partial: undefined,
+      timeoutMs: undefined,
+      expansion: 'cautious',
+    });
+  });
+
   it('resets local Browse options when switching datasets or graphs with no classifyOptions prop', () => {
     const opts = new ClassifyOptionsState('ds1', null, undefined);
     opts.partial = true;

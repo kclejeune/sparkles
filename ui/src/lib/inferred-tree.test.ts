@@ -645,6 +645,22 @@ describe('source-pinned inferred regions', () => {
                 parents: 1,
                 equivalenceCount: 2,
               },
+              {
+                iri: 'urn:OmittedCount',
+                label: 'OmittedCount',
+                labelLang: 'en',
+                children: 1,
+                parents: 1,
+                equivalenceCount: 2,
+              },
+              {
+                iri: 'urn:NullCount',
+                label: 'NullCount',
+                labelLang: 'en',
+                children: 1,
+                parents: 1,
+                equivalenceCount: 2,
+              },
             ]
           : [
               {
@@ -673,16 +689,33 @@ describe('source-pinned inferred regions', () => {
           unmappedCount: 0,
         },
         entity: about
-          ? {
-              iri: about,
-              present: true,
-              representative: about,
-              unsatisfiable: false,
-              incomplete: true,
-              children: 1,
-              parents: 1,
-              equivalenceCount: about === 'urn:GroupedRoot' ? 2 : 1,
-            }
+          ? about === 'urn:OmittedCount'
+            ? {
+                iri: about,
+                present: true,
+                representative: null,
+                unsatisfiable: false,
+                incomplete: true,
+              }
+            : about === 'urn:NullCount'
+              ? {
+                  iri: about,
+                  present: true,
+                  representative: null,
+                  unsatisfiable: false,
+                  incomplete: true,
+                  equivalenceCount: null,
+                }
+              : {
+                  iri: about,
+                  present: true,
+                  representative: about,
+                  unsatisfiable: false,
+                  incomplete: true,
+                  children: 1,
+                  parents: 1,
+                  equivalenceCount: about === 'urn:GroupedRoot' ? 2 : 1,
+                }
           : null,
         page: {
           part,
@@ -703,6 +736,12 @@ describe('source-pinned inferred regions', () => {
     expect(model.incomplete['urn:OpenSingleton']).toBe(true);
     await model.tree.load('urn:GroupedRoot');
     expect(model.incomplete['urn:GroupedRoot']).toBeUndefined();
+    await model.tree.load('urn:OmittedCount');
+    expect(model.error).toBeNull();
+    expect(model.incomplete['urn:OmittedCount']).toBeUndefined();
+    await model.tree.load('urn:NullCount');
+    expect(model.error).toBeNull();
+    expect(model.incomplete['urn:NullCount']).toBeUndefined();
     model.drop();
     expect(model.incomplete).toEqual({});
   });

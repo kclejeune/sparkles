@@ -36,6 +36,7 @@ export class ClassifyOptionsState {
 
   static #snapshot(opts?: ClassifyOptions) {
     return {
+      provided: opts != null,
       partial: !!opts?.partial,
       deadline: formatTimeoutSeconds(opts?.timeoutMs) ?? '',
       expansion: (opts?.expansion ?? 'cautious') as ClassificationExpansion,
@@ -45,9 +46,21 @@ export class ClassifyOptionsState {
   static #key(
     target: string,
     graph: string | null,
-    snap: { partial: boolean; deadline: string; expansion: ClassificationExpansion },
+    snap: {
+      provided: boolean;
+      partial: boolean;
+      deadline: string;
+      expansion: ClassificationExpansion;
+    },
   ) {
-    return JSON.stringify([target, graph, snap.partial, snap.deadline, snap.expansion]);
+    return JSON.stringify([
+      target,
+      graph,
+      snap.provided,
+      snap.partial,
+      snap.deadline,
+      snap.expansion,
+    ]);
   }
 
   sync(target: string, graph: string | null, opts?: ClassifyOptions) {

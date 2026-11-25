@@ -242,7 +242,7 @@ export class InferredTree {
     if (
       reply.entity?.present &&
       reply.entity.incomplete != null &&
-      (reply.entity.equivalenceCount ?? 1) === 1
+      reply.entity.equivalenceCount === 1
     ) {
       const targetIri = reply.entity.representative ?? iri;
       if (targetIri) this.incomplete = { ...this.incomplete, [targetIri]: reply.entity.incomplete };
