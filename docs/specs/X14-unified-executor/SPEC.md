@@ -403,10 +403,15 @@ specification's, Jena's or the engine's reading, answers the W3C suites under th
 specification's, and compares the engine under the engine's current reading until the
 setting of item 1064 lands with Jena's as its default. The evaluator notes where a query
 meets item 1064 or 1071, and the tests compare such a query exactly under the engine's
-reading. Item 1077 holds three
-XSD and XPath readings in which the engine differs from both the specification and
-Jena, `isNumeric("inf"^^xsd:double)`, the canonical form of a double cast to a string and
-`.` in REGEX, which matches a carriage return. The
+reading. Item 1077 has shipped and aligns the engine with the specification and Jena on
+all three XSD and XPath readings. `xsd:float` and `xsd:double` parsing now accepts only
+XSD 1.1 lexical forms (`INF`, `+INF`, `-INF`, `NaN` and decimal or exponent numerals)
+across expression evaluation, casts, `numeric_key`, inline literal encoding, `vocab.num`
+classification and `xsd::is_valid`. Casting `xsd:float` or `xsd:double` to `xsd:string`
+uses XPath F&O 3.1 §19.1.2.1 canonical formatting, such as `"1.0E6"` for `1e6` and
+`"1.0E-7"` for `1e-7`. XPath regular expression translation rewrites unescaped `.`
+outside character classes to `[^\n\r]` when the `s` flag is absent across `REGEX`,
+`REPLACE`, key-filter pushdowns, mapping `REPLACE`, SHACL and ShEx. The
 evaluator takes two well-formed values of different supported types, such as a string
 and an integer, as unequal, which the note to section 17.4.1.7 allows and Jena does by
 default, where Jena's strict mode and the section's main text make the comparison an

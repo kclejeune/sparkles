@@ -1052,23 +1052,7 @@ fn hex(bytes: &[u8]) -> String {
 /// callers outside query evaluation, such as SHACL and ShEx shapes, which compile each
 /// pattern once. Query evaluation uses the query's own programs instead.
 pub fn compile_regex(pattern: &str, flags: &str) -> EvalResult<regex::Regex> {
-    let mut b = String::new();
-    let mut literal = false;
-    for f in flags.chars() {
-        match f {
-            'i' => b.push_str("(?i)"),
-            's' => b.push_str("(?s)"),
-            'm' => b.push_str("(?m)"),
-            'x' => b.push_str("(?x)"),
-            'q' => literal = true,
-            _ => return Err(TypeError),
-        }
-    }
-    if literal {
-        b.push_str(&regex::escape(pattern));
-    } else {
-        b.push_str(pattern);
-    }
+    let b = super::query_regex::translate_xpath_pattern(pattern, flags).ok_or(TypeError)?;
     regex::RegexBuilder::new(&b)
         .size_limit(1 << 22)
         .build()
@@ -1744,6 +1728,13 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
             Err(TypeError)
         };
     }
+    if local == "string" {
+        return Ok(match &v {
+            Value::Float(f) => s(super::value::float_to_xpath_string(f32::from(*f))),
+            Value::Double(d) => s(super::value::double_to_xpath_string(f64::from(*d))),
+            _ => s(v.lexical()?),
+        });
+    }
     let lex = v.lexical()?;
     let from_str = matches!(v, Value::Str(_) | Value::Other { .. });
     let parsed = |dt: NamedNodeRef<'_>| -> EvalResult<Val> {
@@ -1757,7 +1748,6 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
     use oxrdf::NamedNodeRef;
     let num = Num::of(&v).ok();
     Ok(match local {
-        "string" => s(lex),
         "boolean" => match (&v, num) {
             (Value::Bool(x), _) => b(*x),
             (_, Some(n)) => b(Value::Double(n.to_double()).ebv().unwrap_or(false)),

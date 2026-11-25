@@ -183,7 +183,7 @@ pub fn inline_literal(lex: &str, datatype: &str) -> Option<Id> {
         (i.to_string() == lex).then_some(())?;
         Id::from_i64(i)
     } else if datatype == xsd::DOUBLE.as_str() {
-        let d: oxsdatatypes::Double = lex.parse().ok()?;
+        let d = crate::sparql::value::parse_double(lex)?;
         (d.to_string() == lex).then_some(())?;
         Id::from_f64(d.into())
     } else if datatype == xsd::BOOLEAN.as_str() {

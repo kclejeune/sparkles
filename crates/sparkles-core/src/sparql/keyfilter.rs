@@ -1012,4 +1012,38 @@ mod tests {
             assert!(!f.test(&bad) && !bound.test(&bad), "case {i} on {bad:?}");
         }
     }
+
+    #[test]
+    fn regex_dot_excludes_carriage_return_unless_s_flag_is_set() {
+        let v = 0;
+        let cr = key(Literal::new_simple_literal("a\rb").into());
+        let lf = key(Literal::new_simple_literal("a\nb").into());
+        let ok = key(Literal::new_simple_literal("axb").into());
+        let dot = key(Literal::new_simple_literal("a.b").into());
+
+        let f = KeyFilter::new(
+            &[call(Function::Regex, vec![Expr::Var(v), lit("^a.b$")])],
+            v,
+        )
+        .unwrap();
+        assert!(f.test(&ok) && f.test(&dot));
+        assert!(!f.test(&cr) && !f.test(&lf));
+
+        let fs = KeyFilter::new(
+            &[call(
+                Function::Regex,
+                vec![Expr::Var(v), lit("^a.b$"), lit("s")],
+            )],
+            v,
+        )
+        .unwrap();
+        assert!(fs.test(&ok) && fs.test(&dot) && fs.test(&cr) && fs.test(&lf));
+
+        let fcls = KeyFilter::new(
+            &[call(Function::Regex, vec![Expr::Var(v), lit("^a[.]b$")])],
+            v,
+        )
+        .unwrap();
+        assert!(fcls.test(&dot) && !fcls.test(&ok) && !fcls.test(&cr));
+    }
 }

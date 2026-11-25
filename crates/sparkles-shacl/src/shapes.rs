@@ -1544,34 +1544,14 @@ impl<'g> Parser<'g> {
 
 /// Compile an XPath-style regular expression with `sh:flags` / SPARQL REGEX flags.
 pub(crate) fn compile_regex(pattern: &str, flags: Option<&str>) -> Result<regex::Regex> {
-    let mut b = regex::RegexBuilder::new(pattern);
-    let mut literal = false;
-    for f in flags.unwrap_or("").chars() {
-        match f {
-            'i' => {
-                b.case_insensitive(true);
-            }
-            'm' => {
-                b.multi_line(true);
-            }
-            's' => {
-                b.dot_matches_new_line(true);
-            }
-            'x' => {
-                b.ignore_whitespace(true);
-            }
-            'q' => literal = true,
-            _ => bail!("unsupported regex flag '{f}'"),
+    let flags = flags.unwrap_or("");
+    for f in flags.chars() {
+        if !matches!(f, 'i' | 'm' | 's' | 'x' | 'q') {
+            bail!("unsupported regex flag '{f}'");
         }
     }
-    if literal {
-        let escaped = regex::escape(pattern);
-        let mut b2 = regex::RegexBuilder::new(&escaped);
-        b2.case_insensitive(flags.unwrap_or("").contains('i'));
-        return Ok(b2.build()?);
-    }
-    b.build()
-        .with_context(|| format!("invalid sh:pattern {pattern:?}"))
+    sparkles_core::sparql::expr::compile_regex(pattern, flags)
+        .map_err(|_| anyhow::anyhow!("invalid sh:pattern {pattern:?}"))
 }
 
 #[cfg(test)]

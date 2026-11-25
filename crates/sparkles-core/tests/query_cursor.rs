@@ -6863,3 +6863,383 @@ fn a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer() {
         }
     }
 }
+
+/// Regression tests for roadmap item 1077: strict XSD 1.1 float/double lexical forms,
+/// canonical XPath F&O `xsd:string` casts of floats/doubles, and XPath `.` excluding `\r`
+/// without the `s` flag across eager, cursor/streaming, `NumColumn`, and `KeyFilter` paths.
+#[test]
+fn xsd_float_double_lexical_forms_string_casts_and_xpath_regex_dot() {
+    use oxrdf::Literal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let ttl = r#"
+@prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:d_inf_upper ex:num "INF"^^xsd:double .
+ex:d_pinf_upper ex:num "+INF"^^xsd:double .
+ex:d_ninf_upper ex:num "-INF"^^xsd:double .
+ex:d_nan_upper ex:num "NaN"^^xsd:double .
+ex:d_inf_lower ex:num "inf"^^xsd:double .
+ex:d_ninf_lower ex:num "-inf"^^xsd:double .
+ex:d_pinf_lower ex:num "+inf"^^xsd:double .
+ex:d_infinity ex:num "infinity"^^xsd:double .
+ex:d_nan_lower ex:num "nan"^^xsd:double .
+ex:d_nnan ex:num "-NaN"^^xsd:double .
+ex:d_pnan ex:num "+NaN"^^xsd:double .
+
+ex:f_inf_upper ex:num "INF"^^xsd:float .
+ex:f_pinf_upper ex:num "+INF"^^xsd:float .
+ex:f_ninf_upper ex:num "-INF"^^xsd:float .
+ex:f_nan_upper ex:num "NaN"^^xsd:float .
+ex:f_inf_lower ex:num "inf"^^xsd:float .
+ex:f_ninf_lower ex:num "-inf"^^xsd:float .
+ex:f_infinity ex:num "infinity"^^xsd:float .
+ex:f_nan_lower ex:num "nan"^^xsd:float .
+ex:f_nnan ex:num "-NaN"^^xsd:float .
+
+ex:c_d_1e6 ex:cast "1e6"^^xsd:double .
+ex:c_d_1000000 ex:cast "1000000"^^xsd:double .
+ex:c_d_n1e6 ex:cast "-1e6"^^xsd:double .
+ex:c_d_1_5e6 ex:cast "1.5e6"^^xsd:double .
+ex:c_d_1_23e6 ex:cast "1.23e6"^^xsd:double .
+ex:c_d_1e_6 ex:cast "1e-6"^^xsd:double .
+ex:c_d_n1e_6 ex:cast "-1e-6"^^xsd:double .
+ex:c_d_1e_7 ex:cast "1e-7"^^xsd:double .
+ex:c_d_n1e_7 ex:cast "-1e-7"^^xsd:double .
+ex:c_d_999999 ex:cast "999999.0e0"^^xsd:double .
+ex:c_d_1_0 ex:cast "1.0e0"^^xsd:double .
+ex:c_d_1_5 ex:cast "1.5e0"^^xsd:double .
+ex:c_d_0 ex:cast "0.0e0"^^xsd:double .
+ex:c_d_n0 ex:cast "-0.0e0"^^xsd:double .
+ex:c_d_inf ex:cast "INF"^^xsd:double .
+ex:c_d_ninf ex:cast "-INF"^^xsd:double .
+ex:c_d_nan ex:cast "NaN"^^xsd:double .
+
+ex:c_f_1e6 ex:cast "1e6"^^xsd:float .
+ex:c_f_n1e6 ex:cast "-1e6"^^xsd:float .
+ex:c_f_1_5e6 ex:cast "1.5e6"^^xsd:float .
+ex:c_f_1e_6 ex:cast "1e-6"^^xsd:float .
+ex:c_f_above_1e_6 ex:cast "1.0000001e-6"^^xsd:float .
+ex:c_f_1e_7 ex:cast "1e-7"^^xsd:float .
+ex:c_f_0_1 ex:cast "0.1"^^xsd:float .
+ex:c_f_0 ex:cast "0.0"^^xsd:float .
+ex:c_f_n0 ex:cast "-0.0"^^xsd:float .
+ex:c_f_inf ex:cast "INF"^^xsd:float .
+ex:c_f_ninf ex:cast "-INF"^^xsd:float .
+ex:c_f_nan ex:cast "NaN"^^xsd:float .
+
+ex:r_cr ex:txt "a\rb" .
+ex:r_lf ex:txt "a\nb" .
+ex:r_crlf ex:txt "a\r\nb" .
+ex:r_x ex:txt "axb" .
+ex:r_dot ex:txt "a.b" .
+ex:r_bs_x ex:txt "a\\xb" .
+ex:r_bs_cr ex:txt "a\\\rb" .
+ex:r_br_x ex:txt "a]xb" .
+ex:r_br_cr ex:txt "a]\rb" .
+ex:r_lines ex:txt "first\rline\nsecond" .
+"#;
+    store
+        .load(&[Source::from_bytes(
+            ttl.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    // Also add delta triples so both compacted base (`vocab.num`) and delta paths are exercised.
+    sparkles_core::sparql::update::update(
+        &store,
+        r#"
+        PREFIX ex: <http://ex.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        INSERT DATA {
+            ex:delta_d_inf_lower ex:num "inf"^^xsd:double .
+            ex:delta_d_inf_upper ex:num "INF"^^xsd:double .
+            ex:delta_r_cr ex:txt "a\rb" .
+        }
+        "#,
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(
+        store.snapshot().generation.vocab.numeric().is_some(),
+        "compacted store builds vocab.num"
+    );
+
+    let run_both = |q: &str| -> Vec<Vec<Option<Term>>> {
+        let opts = QueryOptions::default();
+        let eager = query(store.snapshot(), q, &opts)
+            .unwrap()
+            .application_rows();
+        for batch in [1, 4096] {
+            let streamed = all(open(&store, q, batch));
+            assert_eq!(
+                bag(streamed),
+                bag(eager.clone()),
+                "batch {batch} diverged for: {q}"
+            );
+        }
+        eager
+    };
+    let iri_names = |rows: Vec<Vec<Option<Term>>>| -> Vec<String> {
+        let mut names: Vec<String> = rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                Some(Term::NamedNode(n)) => n
+                    .as_str()
+                    .strip_prefix("http://ex.org/")
+                    .unwrap()
+                    .to_string(),
+                other => panic!("expected ex: IRI, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let str_pairs = |rows: Vec<Vec<Option<Term>>>| -> Vec<(String, Option<String>)> {
+        let mut pairs: Vec<(String, Option<String>)> = rows
+            .into_iter()
+            .map(|r| {
+                let k = match &r[0] {
+                    Some(Term::NamedNode(n)) => n
+                        .as_str()
+                        .strip_prefix("http://ex.org/")
+                        .unwrap()
+                        .to_string(),
+                    other => panic!("expected ex: IRI, got {other:?}"),
+                };
+                let v = r[1].as_ref().map(|t| match t {
+                    Term::Literal(l) => l.value().to_string(),
+                    other => panic!("expected literal, got {other:?}"),
+                });
+                (k, v)
+            })
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    };
+
+    // 1. Strict XSD 1.1 float/double lexical forms
+    let numeric = iri_names(run_both(
+        "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:num ?v FILTER(isNumeric(?v)) }",
+    ));
+    assert_eq!(
+        numeric,
+        vec![
+            "d_inf_upper",
+            "d_nan_upper",
+            "d_ninf_upper",
+            "d_pinf_upper",
+            "delta_d_inf_upper",
+            "f_inf_upper",
+            "f_nan_upper",
+            "f_ninf_upper",
+            "f_pinf_upper",
+        ]
+    );
+
+    let gt_zero = iri_names(run_both(
+        "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:num ?v FILTER(?v > 0) }",
+    ));
+    assert_eq!(
+        gt_zero,
+        vec![
+            "d_inf_upper",
+            "d_pinf_upper",
+            "delta_d_inf_upper",
+            "f_inf_upper",
+            "f_pinf_upper",
+        ]
+    );
+
+    // String-to-float/double casts reject non-XSD spellings and accept INF/+INF/-INF/NaN.
+    let cast_checks = run_both(
+        r#"
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?in (BOUND(?d) AS ?d_ok) (BOUND(?f) AS ?f_ok)
+        WHERE {
+            VALUES ?in { "INF" "+INF" "-INF" "NaN" " INF " "inf" "-inf" "+inf" "infinity" "nan" "-NaN" "+NaN" }
+            BIND(xsd:double(?in) AS ?d)
+            BIND(xsd:float(?in) AS ?f)
+        }
+        "#,
+    );
+    let expected_cast_ok = [
+        ("INF", true),
+        ("+INF", true),
+        ("-INF", true),
+        ("NaN", true),
+        (" INF ", true),
+        ("inf", false),
+        ("-inf", false),
+        ("+inf", false),
+        ("infinity", false),
+        ("nan", false),
+        ("-NaN", false),
+        ("+NaN", false),
+    ];
+    for (row, (input, want)) in cast_checks.iter().zip(expected_cast_ok) {
+        let got_in = match &row[0] {
+            Some(Term::Literal(l)) => l.value(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(got_in, input);
+        let want_term = Some(Term::Literal(Literal::from(want)));
+        assert_eq!(row[1], want_term, "xsd:double({input:?})");
+        assert_eq!(row[2], want_term, "xsd:float({input:?})");
+    }
+
+    // 2. XPath F&O canonical xsd:string casts of xsd:double and xsd:float
+    let casts = str_pairs(run_both(
+        "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT ?s (xsd:string(?v) AS ?out) WHERE { ?s ex:cast ?v }",
+    ));
+    let expected_casts: Vec<(&str, &str)> = vec![
+        ("c_d_0", "0"),
+        ("c_d_1000000", "1.0E6"),
+        ("c_d_1_0", "1"),
+        ("c_d_1_23e6", "1.23E6"),
+        ("c_d_1_5", "1.5"),
+        ("c_d_1_5e6", "1.5E6"),
+        ("c_d_1e6", "1.0E6"),
+        ("c_d_1e_6", "0.000001"),
+        ("c_d_1e_7", "1.0E-7"),
+        ("c_d_999999", "999999"),
+        ("c_d_inf", "INF"),
+        ("c_d_n0", "-0"),
+        ("c_d_n1e6", "-1.0E6"),
+        ("c_d_n1e_6", "-0.000001"),
+        ("c_d_n1e_7", "-1.0E-7"),
+        ("c_d_nan", "NaN"),
+        ("c_d_ninf", "-INF"),
+        ("c_f_0", "0"),
+        ("c_f_0_1", "0.1"),
+        ("c_f_1_5e6", "1.5E6"),
+        ("c_f_1e6", "1.0E6"),
+        ("c_f_1e_6", "1.0E-6"),
+        ("c_f_1e_7", "1.0E-7"),
+        ("c_f_above_1e_6", "0.0000010000001"),
+        ("c_f_inf", "INF"),
+        ("c_f_n0", "-0"),
+        ("c_f_n1e6", "-1.0E6"),
+        ("c_f_nan", "NaN"),
+        ("c_f_ninf", "-INF"),
+    ];
+    let mut expected_casts: Vec<(String, Option<String>)> = expected_casts
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), Some(v.to_string())))
+        .collect();
+    expected_casts.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(casts, expected_casts);
+
+    // STR() preserves the original lexical form while xsd:string() uses XPath canonical form.
+    let str_vs_cast = run_both(
+        "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT (STR(?v) AS ?lex) (xsd:string(?v) AS ?cast) WHERE { ex:c_d_1e6 ex:cast ?v }",
+    );
+    assert_eq!(
+        str_vs_cast,
+        vec![vec![
+            Some(Term::Literal(Literal::new_simple_literal("1e6"))),
+            Some(Term::Literal(Literal::new_simple_literal("1.0E6"))),
+        ]]
+    );
+
+    // 3. XPath REGEX / REPLACE `.` excludes `\r` without the `s` flag (including KeyFilter pushdown)
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a.b$")) }"#
+        )),
+        vec!["r_dot", "r_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a.b$", "s")) }"#
+        )),
+        vec!["delta_r_cr", "r_cr", "r_dot", "r_lf", "r_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(STR(?v), "^a.b$")) }"#
+        )),
+        vec!["r_dot", "r_x"]
+    );
+    // Escaped `\.`, `[.]`, `[^.]`, `\\.` and `[\]].`
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a\\.b$")) }"#
+        )),
+        vec!["r_dot"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[.]b$")) }"#
+        )),
+        vec!["r_dot"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[^.]b$")) }"#
+        )),
+        vec!["delta_r_cr", "r_cr", "r_lf", "r_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a\\\\.b$")) }"#
+        )),
+        vec!["r_bs_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a\\\\.b$", "s")) }"#
+        )),
+        vec!["r_bs_cr", "r_bs_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[\\]].b$")) }"#
+        )),
+        vec!["r_br_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[\\]].b$", "s")) }"#
+        )),
+        vec!["r_br_cr", "r_br_x"]
+    );
+    // `m` flag without `s` still excludes `\r` from `.`; `ms` includes both `\r` and `\n`.
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^first.line$", "m")) }"#
+        )),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^first.line$", "ms")) }"#
+        )),
+        vec!["r_lines"]
+    );
+    // REPLACE without `s` leaves `\r` and `\n` untouched; with `s` replaces them too.
+    let replaced = run_both(
+        r#"
+        SELECT
+            (REPLACE("a\rb\nc", ".", "X") AS ?no_s)
+            (REPLACE("a\rb\nc", ".", "X", "s") AS ?with_s)
+            (REPLACE("a\rb", "a.b", "X") AS ?no_match)
+            (REPLACE("a\rb", "a.b", "X", "s") AS ?match_s)
+        WHERE {}
+        "#,
+    );
+    assert_eq!(
+        replaced,
+        vec![vec![
+            Some(Term::Literal(Literal::new_simple_literal("X\rX\nX"))),
+            Some(Term::Literal(Literal::new_simple_literal("XXXXX"))),
+            Some(Term::Literal(Literal::new_simple_literal("a\rb"))),
+            Some(Term::Literal(Literal::new_simple_literal("X"))),
+        ]]
+    );
+}

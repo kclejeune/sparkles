@@ -341,6 +341,93 @@ impl Matcher<'_> {
     }
 }
 
+/// Rewrite unescaped `.` outside character classes to `[^\n\r]`, matching XPath F&O 3.1
+/// §5.6.1 where `.` excludes both `\n` (`#x0A`) and `\r` (`#x0D`) unless the `s` flag is set.
+fn rewrite_xpath_dot(pattern: &str, out: &mut String) {
+    let mut chars = pattern.chars().peekable();
+    let mut class_depth: usize = 0;
+    // Immediately after `[` or `[^`, `]` is a literal character in Rust regex syntax
+    // rather than closing the class.
+    let mut class_start = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push('\\');
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+                class_start = false;
+            }
+            '[' => {
+                class_depth += 1;
+                out.push('[');
+                if chars.peek() == Some(&'^') {
+                    out.push(chars.next().unwrap());
+                }
+                class_start = true;
+            }
+            ']' if class_depth > 0 => {
+                out.push(']');
+                if class_start {
+                    class_start = false;
+                } else {
+                    class_depth -= 1;
+                }
+            }
+            '.' if class_depth == 0 => {
+                out.push_str("[^\\n\\r]");
+            }
+            _ => {
+                out.push(c);
+                class_start = false;
+            }
+        }
+    }
+}
+
+/// Translate an XPath pattern and SPARQL `REGEX` / `REPLACE` flags into a Rust `regex`
+/// pattern string. Returns `None` if `flags` contains an unsupported flag.
+pub(super) fn translate_xpath_pattern(pattern: &str, flags: &str) -> Option<String> {
+    let mut insensitive = false;
+    let mut dot_all = false;
+    let mut multi_line = false;
+    let mut ignore_ws = false;
+    let mut literal = false;
+    for f in flags.chars() {
+        match f {
+            'i' => insensitive = true,
+            's' => dot_all = true,
+            'm' => multi_line = true,
+            'x' => ignore_ws = true,
+            'q' => literal = true,
+            _ => return None,
+        }
+    }
+    let mut text = String::with_capacity(pattern.len() + 16);
+    if insensitive {
+        text.push_str("(?i)");
+    }
+    if literal {
+        text.push_str(&regex::escape(pattern));
+        return Some(text);
+    }
+    if dot_all {
+        text.push_str("(?s)");
+    }
+    if multi_line {
+        text.push_str("(?m)");
+    }
+    if ignore_ws {
+        text.push_str("(?x)");
+    }
+    if dot_all || !pattern.contains('.') {
+        text.push_str(pattern);
+    } else {
+        rewrite_xpath_dot(pattern, &mut text);
+    }
+    Some(text)
+}
+
 impl RegexState {
     /// Compile `pattern` with the SPARQL `flags`. `Ok(None)` when they do not compile.
     /// A context bounds the program by what its budget leaves and charges it. Without
@@ -359,29 +446,20 @@ impl RegexState {
         // Compilation may hold AST/HIR, forward/reverse NFAs and construction
         // buffers simultaneously. Reserve a conservative envelope up front.
         let text_charge = ctx.map(|ctx| ctx.charge(base)).transpose()?;
-        let mut text = String::new();
-        let mut literal = false;
-        for f in flags.chars() {
-            match f {
-                'i' => text.push_str("(?i)"),
-                's' => text.push_str("(?s)"),
-                'm' => text.push_str("(?m)"),
-                'x' => text.push_str("(?x)"),
-                'q' => literal = true,
-                _ => return Ok(None),
-            }
-        }
-        if literal {
-            text.push_str(&regex::escape(pattern));
-        } else {
-            text.push_str(pattern);
-        }
+        let Some(text) = translate_xpath_pattern(pattern, flags) else {
+            return Ok(None);
+        };
         let retained = |bytes: u64| match ctx {
             Some(ctx) => ctx.retained_charge(bytes),
             None => Ok(None),
         };
         let check = || ctx.map_or(Ok(()), Ctx::check);
-        let mut nfa = maximum.min(pattern.len().saturating_mul(128).saturating_add(8192));
+        let mut nfa = maximum.min(
+            text.len()
+                .max(pattern.len())
+                .saturating_mul(128)
+                .saturating_add(8192),
+        );
         let kept = kept_program(&text, maximum);
         let (program, hybrid, mut charge) = loop {
             if let Some(kept) = &kept {
@@ -907,5 +985,68 @@ mod tests {
         assert!(cache.entries().load().is_empty());
         assert!(!Arc::ptr_eq(&empty, &cache.entries().load_full()));
         assert_eq!(ctx.live_bytes(), before);
+    }
+
+    #[test]
+    fn xpath_dot_excludes_carriage_return_without_s_flag() {
+        let re = RegexState::compile(None, "^a.b$", "").unwrap().unwrap();
+        assert!(re.is_match("axb"));
+        assert!(re.is_match("a.b"));
+        assert!(!re.is_match("a\nb"));
+        assert!(!re.is_match("a\rb"));
+
+        let dot_all = RegexState::compile(None, "^a.b$", "s").unwrap().unwrap();
+        assert!(dot_all.is_match("a\nb"));
+        assert!(dot_all.is_match("a\rb"));
+
+        // Escaped dot, escaped backslash before dot, and character classes with `.` or `]`.
+        let esc_dot = RegexState::compile(None, "^a\\.b$", "").unwrap().unwrap();
+        assert!(esc_dot.is_match("a.b"));
+        assert!(!esc_dot.is_match("axb"));
+        assert!(!esc_dot.is_match("a\rb"));
+
+        let bs_dot = RegexState::compile(None, "^a\\\\.b$", "").unwrap().unwrap();
+        assert!(bs_dot.is_match("a\\xb"));
+        assert!(!bs_dot.is_match("a\\\rb"));
+
+        let cls_dot = RegexState::compile(None, "^a[.]b$", "").unwrap().unwrap();
+        assert!(cls_dot.is_match("a.b"));
+        assert!(!cls_dot.is_match("axb"));
+
+        let neg_cls = RegexState::compile(None, "^a[^.]b$", "").unwrap().unwrap();
+        assert!(neg_cls.is_match("a\rb"));
+        assert!(neg_cls.is_match("a\nb"));
+        assert!(!neg_cls.is_match("a.b"));
+
+        let leading_rbracket = RegexState::compile(None, "^a[].]b$", "").unwrap().unwrap();
+        assert!(leading_rbracket.is_match("a]b"));
+        assert!(leading_rbracket.is_match("a.b"));
+        assert!(!leading_rbracket.is_match("axb"));
+
+        let neg_leading_rbracket = RegexState::compile(None, "^a[^].]b$", "").unwrap().unwrap();
+        assert!(neg_leading_rbracket.is_match("axb"));
+        assert!(neg_leading_rbracket.is_match("a\rb"));
+        assert!(!neg_leading_rbracket.is_match("a]b"));
+        assert!(!neg_leading_rbracket.is_match("a.b"));
+
+        let posix_then_dot = RegexState::compile(None, "^[[:alpha:].].$", "")
+            .unwrap()
+            .unwrap();
+        assert!(posix_then_dot.is_match(".x"));
+        assert!(posix_then_dot.is_match("ax"));
+        assert!(!posix_then_dot.is_match(".\r"));
+        assert!(!posix_then_dot.is_match("a\r"));
+
+        let escaped_rbracket = RegexState::compile(None, "^[\\]].$", "").unwrap().unwrap();
+        assert!(escaped_rbracket.is_match("]x"));
+        assert!(!escaped_rbracket.is_match("]\r"));
+
+        // `q` flag ignores `s`, `m`, `x` while preserving `i`.
+        let qx = RegexState::compile(None, "a . b", "qx").unwrap().unwrap();
+        assert!(qx.is_match("a . b"));
+        assert!(!qx.is_match("axb"));
+        let qi = RegexState::compile(None, "A.B", "qi").unwrap().unwrap();
+        assert!(qi.is_match("a.b"));
+        assert!(!qi.is_match("axb"));
     }
 }

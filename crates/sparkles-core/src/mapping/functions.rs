@@ -531,17 +531,15 @@ pub fn call(iri: &str, args: &[Vec<String>]) -> Result<Vec<Cell<'static>>, Strin
                     .concat(),
             )],
             "REPLACE" => {
-                let mut b = regex::RegexBuilder::new(need(1)?);
-                for f in a(3).unwrap_or("").chars() {
-                    match f {
-                        'i' => b.case_insensitive(true),
-                        's' => b.dot_matches_new_line(true),
-                        'm' => b.multi_line(true),
-                        'x' => b.ignore_whitespace(true),
-                        _ => return Err(format!("REPLACE flag {f:?} is not i, s, m or x")),
-                    };
+                let flags = a(3).unwrap_or("");
+                for f in flags.chars() {
+                    if !matches!(f, 'i' | 's' | 'm' | 'x') {
+                        return Err(format!("REPLACE flag {f:?} is not i, s, m or x"));
+                    }
                 }
-                let re = b.build().map_err(|e| format!("REPLACE pattern: {e}"))?;
+                let pat = need(1)?;
+                let re = crate::sparql::expr::compile_regex(pat, flags)
+                    .map_err(|_| format!("REPLACE pattern {pat:?} is invalid"))?;
                 let rep = xpath_replacement(need(2)?)?;
                 vec![text(re.replace_all(s0()?, rep.as_str()).into_owned())]
             }

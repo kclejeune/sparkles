@@ -67,6 +67,67 @@ pub(crate) fn numeric_datatype(dt: &str) -> bool {
         || INTEGER_DERIVED.contains(&dt)
 }
 
+/// Parse an `xsd:float` literal lexical form strictly according to XSD 1.1.
+#[inline]
+pub(crate) fn parse_float(lex: &str) -> Option<Float> {
+    crate::xsd::is_float_lexical(lex)
+        .then(|| lex.parse().ok())
+        .flatten()
+}
+
+/// Parse an `xsd:double` literal lexical form strictly according to XSD 1.1.
+#[inline]
+pub(crate) fn parse_double(lex: &str) -> Option<Double> {
+    crate::xsd::is_float_lexical(lex)
+        .then(|| lex.parse().ok())
+        .flatten()
+}
+
+fn format_xpath_sci(sci: &str) -> String {
+    let (mantissa, exponent) = sci.split_once('e').expect("scientific format has 'e'");
+    if mantissa.contains('.') {
+        format!("{mantissa}E{exponent}")
+    } else {
+        format!("{mantissa}.0E{exponent}")
+    }
+}
+
+/// Format an `xsd:float` cast to `xsd:string` per XPath F&O 3.1 §19.1.2.1.
+pub(crate) fn float_to_xpath_string(f: f32) -> String {
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "INF" } else { "-INF" }.into();
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    if (1e-6_f64..1e6_f64).contains(&(f.abs() as f64)) {
+        format!("{f}")
+    } else {
+        format_xpath_sci(&format!("{f:e}"))
+    }
+}
+
+/// Format an `xsd:double` cast to `xsd:string` per XPath F&O 3.1 §19.1.2.1.
+pub(crate) fn double_to_xpath_string(d: f64) -> String {
+    if d.is_nan() {
+        return "NaN".into();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 { "INF" } else { "-INF" }.into();
+    }
+    if d == 0.0 {
+        return if d.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    if (1e-6_f64..1e6_f64).contains(&d.abs()) {
+        format!("{d}")
+    } else {
+        format_xpath_sci(&format!("{d:e}"))
+    }
+}
+
 /// Numeric subset of from_key without allocating Other/lexical Arc values.
 /// The pinned four parsers and approx_f64 use fixed scalar/stack storage.
 pub(crate) fn numeric_key(key: &[u8]) -> Option<f64> {
@@ -86,9 +147,9 @@ pub(crate) fn numeric_key(key: &[u8]) -> Option<f64> {
     let value = if dt == xsd::DECIMAL.as_str() {
         Value::Decimal(lex.parse().ok()?)
     } else if dt == xsd::FLOAT.as_str() {
-        Value::Float(lex.parse().ok()?)
+        Value::Float(parse_float(lex)?)
     } else if dt == xsd::DOUBLE.as_str() {
-        Value::Double(lex.parse().ok()?)
+        Value::Double(parse_double(lex)?)
     } else {
         Value::Integer(lex.parse().ok()?)
     };
@@ -171,8 +232,12 @@ impl Value {
             },
             s if s == xsd::INTEGER.as_str() => parse!(Integer),
             s if s == xsd::DECIMAL.as_str() => parse!(Decimal),
-            s if s == xsd::DOUBLE.as_str() => parse!(Double),
-            s if s == xsd::FLOAT.as_str() => parse!(Float),
+            s if s == xsd::DOUBLE.as_str() => {
+                parse_double(lex).map(Value::Double).unwrap_or_else(other)
+            }
+            s if s == xsd::FLOAT.as_str() => {
+                parse_float(lex).map(Value::Float).unwrap_or_else(other)
+            }
             s if s == xsd::DATE_TIME.as_str() || s == xsd::DATE_TIME_STAMP.as_str() => {
                 parse!(DateTime)
             }
@@ -959,8 +1024,14 @@ mod projection_numeric_tests {
                 "+1",
                 "1e20",
                 "INF",
+                "+INF",
                 "-INF",
                 "NaN",
+                "inf",
+                "-inf",
+                "infinity",
+                "nan",
+                "-NaN",
                 "heavy",
                 "99999999999999999999999999999",
             ] {

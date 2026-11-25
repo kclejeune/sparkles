@@ -1456,10 +1456,10 @@ pub(crate) mod tests {
                 &Literal::new_simple_literal(format!("{i}")).into(),
             ));
         }
-        // strings between the digits and "inf": two segments
+        // strings between the digits and "INF": two segments
         for i in 0..GAP + 100 {
             keys.push(term_key(
-                &Literal::new_simple_literal(format!("a{i:06}")).into(),
+                &Literal::new_simple_literal(format!("A{i:06}")).into(),
             ));
         }
         keys.sort();
