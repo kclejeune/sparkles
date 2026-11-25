@@ -1527,7 +1527,7 @@ impl Ctx {
 
     /// The query's live estimate, from the ledger once it exists.
     #[inline]
-    pub(super) fn live_bytes(&self) -> u64 {
+    pub(crate) fn live_bytes(&self) -> u64 {
         match self.memory.get() {
             Some(ledger) => ledger.live.load(Ordering::Relaxed),
             None => self.fast.live.load(Ordering::Relaxed) & !PROMOTED,
@@ -1992,7 +1992,7 @@ impl Ctx {
     /// which avoids a plan and context reference cycle. A context that was never shared
     /// has no owner to release through, so an eager one keeps such state uncharged, as
     /// `None` says, while a cursor always has one.
-    pub(super) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
+    pub(crate) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
         let owner = self.owner.lock().clone();
         if owner.strong_count() == 0 {
             if !self.streams {
@@ -4168,7 +4168,7 @@ impl Drop for OutputCredit {
 }
 
 /// Weak retained state never owns the context, grant or ledger.
-pub(super) struct RetainedCharge {
+pub(crate) struct RetainedCharge {
     owner: Weak<Ctx>,
     id: Option<u64>,
     bytes: u64,
@@ -4198,7 +4198,7 @@ impl RetainedCharge {
             exact_receiving: false,
         }
     }
-    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn resize(&mut self, bytes: u64) -> Result<()> {
         // A size that does not change takes neither the owner nor an account. A sort key
         // column of numbers resized its charge on every row this way.
         if bytes == self.bytes {
@@ -4281,15 +4281,15 @@ impl Drop for RetainedCharge {
 }
 
 /// Cursor ownership can adopt an admitted algorithm lease without release/recharge.
-pub(super) struct OwnedCharge {
+pub(crate) struct OwnedCharge {
     ctx: Arc<Ctx>,
     lease: QueryMemoryLease,
 }
 impl OwnedCharge {
-    pub(super) fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.lease.bytes
     }
-    pub(super) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
+    pub(crate) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
         let ledger = ctx.memory();
         let owner = ledger.owner(ctx.grant.as_ref())?;
         ledger.reserve(&owner, ctx.mem_limit, bytes, false)?;
@@ -4313,7 +4313,7 @@ impl OwnedCharge {
             lease: slot.take().expect("admitted output"),
         })
     }
-    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn resize(&mut self, bytes: u64) -> Result<()> {
         self.lease.resize(self.ctx.mem_limit, bytes)
     }
     /// Adopt the actual predecoded payload guard; the existing cursor ledger is

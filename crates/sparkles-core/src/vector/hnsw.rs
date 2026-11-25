@@ -170,8 +170,29 @@ pub(crate) fn search_layer(
     accept: &dyn Fn(u32) -> bool,
     visit: &mut dyn FnMut(u32) -> bool,
 ) -> Vec<Near> {
-    let mut cand: BinaryHeap<Reverse<Near>> = BinaryHeap::with_capacity(ef * 2);
-    let mut best: BinaryHeap<Near> = BinaryHeap::with_capacity(ef + 1);
+    search_layer_admitted(eps, ef, dist, links, accept, visit, 64, |_| Ok(()))
+        .expect("unlimited graph search")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_layer_admitted(
+    eps: &[Near],
+    ef: usize,
+    dist: &dyn Fn(u32) -> f32,
+    links: &dyn Fn(u32, &mut Vec<u32>),
+    accept: &dyn Fn(u32) -> bool,
+    visit: &mut dyn FnMut(u32) -> bool,
+    links_cap: usize,
+    mut admit: impl FnMut(u64) -> crate::error::Result<()>,
+) -> crate::error::Result<Vec<Near>> {
+    let cand_cap = ef.saturating_mul(2).max(eps.len());
+    let best_cap = ef.saturating_add(1);
+    let fixed =
+        best_cap as u64 * size_of::<Near>() as u64 + links_cap as u64 * size_of::<u32>() as u64;
+    let candidate_bytes = |cap: usize| cap as u64 * size_of::<Near>() as u64;
+    admit(fixed.saturating_add(candidate_bytes(cand_cap)))?;
+    let mut cand: BinaryHeap<Reverse<Near>> = BinaryHeap::with_capacity(cand_cap);
+    let mut best: BinaryHeap<Near> = BinaryHeap::with_capacity(best_cap);
     for &e in eps {
         if !visit(e.1) {
             continue;
@@ -184,7 +205,7 @@ pub(crate) fn search_layer(
             }
         }
     }
-    let mut buf = Vec::with_capacity(64);
+    let mut buf = Vec::with_capacity(links_cap);
     while let Some(Reverse(c)) = cand.pop() {
         let bound = best.peek().map_or(f32::INFINITY, |b| b.0);
         if c.0 > bound && best.len() >= ef {
@@ -199,6 +220,12 @@ pub(crate) fn search_layer(
             let d = dist(n);
             let bound = best.peek().map_or(f32::INFINITY, |b| b.0);
             if best.len() < ef || d < bound {
+                if cand.len() == cand.capacity() {
+                    let old = cand.capacity();
+                    let new =
+                        sparkles_budget::sizes::vec_grown(old, cand.len(), 1, size_of::<Near>());
+                    admit(fixed.saturating_add(candidate_bytes(old.saturating_add(new))))?;
+                }
                 cand.push(Reverse(Near(d, n)));
                 if accept(n) {
                     best.push(Near(d, n));
@@ -211,7 +238,7 @@ pub(crate) fn search_layer(
     }
     let mut v = best.into_vec();
     v.sort_unstable();
-    v
+    Ok(v)
 }
 
 /// Algorithm 4 with `keepPrunedConnections` (without extending the candidates): `cands`
@@ -276,6 +303,63 @@ pub fn search(
     .into_iter()
     .map(|x| (x.0, x.1))
     .collect()
+}
+
+/// Search with a reservation for the visited marks, layer queues and hit transfer.
+pub(super) fn search_with_admit(
+    g: &dyn Layers,
+    dist: &dyn Fn(u32) -> f32,
+    ef: usize,
+    accept: &dyn Fn(u32) -> bool,
+    links_cap: usize,
+    admit: &mut dyn FnMut(u64) -> crate::error::Result<()>,
+) -> crate::error::Result<Vec<(f32, u32)>> {
+    let Some((ep, top)) = g.entry() else {
+        return Ok(Vec::new());
+    };
+    let n = g.len();
+    let (mark_bytes, growth_bytes) = VISITED.with(|v| {
+        let v = v.borrow();
+        let cap = v.0.capacity();
+        let elem = size_of::<u32>();
+        if n > cap {
+            let new = sparkles_budget::sizes::vec_grown(cap, 0, n, elem);
+            (new as u64 * elem as u64, cap as u64 * elem as u64)
+        } else {
+            // Only the marks indexed by this query are in use when reusing the arena.
+            (n as u64 * elem as u64, 0)
+        }
+    });
+    let near_bytes = |n: usize| (n as u64).saturating_mul(size_of::<Near>() as u64);
+    admit(
+        mark_bytes
+            .saturating_add(growth_bytes)
+            .saturating_add(near_bytes(1)),
+    )?;
+    let mut eps = vec![Near(dist(ep), ep)];
+    for l in (0..=top).rev() {
+        let allowed: &dyn Fn(u32) -> bool = if l == 0 { accept } else { &|_| true };
+        let links = |x: u32, out: &mut Vec<u32>| g.links(l, x, out);
+        let base = mark_bytes.saturating_add(near_bytes(eps.capacity()));
+        eps = with_visited(n, |visit| {
+            search_layer_admitted(
+                &eps,
+                if l == 0 { ef.max(1) } else { 1 },
+                dist,
+                &links,
+                allowed,
+                visit,
+                links_cap,
+                |b| admit(base.saturating_add(b)),
+            )
+        })?;
+    }
+    admit(
+        mark_bytes
+            .saturating_add(near_bytes(eps.capacity()))
+            .saturating_add(eps.len() as u64 * size_of::<(f32, u32)>() as u64),
+    )?;
+    Ok(eps.into_iter().map(|x| (x.0, x.1)).collect())
 }
 
 /// A graph being built: nodes with fixed levels whose links insertions add, in

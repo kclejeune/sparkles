@@ -151,6 +151,24 @@ pub fn point(lat: f64, lon: f64) -> Option<Arc<ColumnEntry>> {
     )))
 }
 
+/// Visit longitude objects in key order, polling on physical keys even in other
+/// graphs. Return the next key if the visitor stops early.
+pub(super) fn visit_objects(
+    snap: &Snapshot,
+    lo: [u64; 4],
+    hi: [u64; 4],
+    graph: u64,
+    check: impl Fn() -> crate::error::Result<()>,
+    mut each: impl FnMut(u64) -> crate::error::Result<bool>,
+) -> crate::error::Result<Option<[u64; 4]>> {
+    super::search::visit_keys(snap, Perm::Spo, lo, hi, check, |k| {
+        if k[3] == graph { each(k[2]) } else { Ok(true) }
+    })
+}
+
+pub(super) const POINT_BYTES: u64 =
+    (size_of::<ColumnEntry>() + size_of::<Geom>() + 4 * size_of::<usize>()) as u64;
+
 /// The objects of `snap`'s quads `(s, p, ?, g)`.
 pub fn objects(snap: &Snapshot, s: u64, p: u64, g: u64) -> crate::error::Result<Vec<u64>> {
     let mut out = Vec::new();

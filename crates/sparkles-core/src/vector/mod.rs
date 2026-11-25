@@ -659,8 +659,8 @@ pub use config::{HnswConfig, SearchMode, VectorConfigFile, VectorIndexConfig, Ve
 pub(crate) use index::{BuildCtl, Carry, Outcome, build_index};
 pub use index::{Built, GenerationVectors, PackedStatus, PredicateVectors, Segment, check_files};
 pub use projection::{Projection, ProjectionConfig, ProjectionMethod};
-pub(crate) use search::overlay_counts;
 pub use search::{Hit, Search, SearchInfo, search};
+pub(crate) use search::{overlay_counts, search_with_admit};
 
 #[cfg(test)]
 mod tests {

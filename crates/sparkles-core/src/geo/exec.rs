@@ -170,7 +170,7 @@ pub(crate) fn pf_windows(func: SpatialPfKind, q: &Geom, radius_m: Option<f64>) -
 
 /// The exact tests of a `spatial:` call (the cardinal functions have none: meeting
 /// their windows is the test).
-fn pf_tests(spec: &SpatialPfSpec) -> Vec<SpatialTest> {
+pub(crate) fn pf_tests(spec: &SpatialPfSpec) -> Vec<SpatialTest> {
     use SpatialPfKind::*;
     let q = spec.query.clone();
     match spec.func {
@@ -197,23 +197,23 @@ enum Src {
 }
 
 /// What a geometry must pass, and what to rank it by.
-struct Check<'a> {
+pub(crate) struct Check<'a> {
     /// its envelope meets one of these
-    windows: &'a [[f64; 4]],
+    pub(crate) windows: &'a [[f64; 4]],
     /// meeting the windows is the test itself (the cardinal functions); otherwise the
     /// windows only rule out geometries that cannot pass the tests, and a geometry
     /// without an envelope in longitude and latitude goes to the tests
-    envelope_test: bool,
+    pub(crate) envelope_test: bool,
     /// all of these hold
-    tests: &'a [SpatialTest],
+    pub(crate) tests: &'a [SpatialTest],
     /// rank by the distance from this geometry
-    rank: Option<&'a GeomRef>,
-    model: DistanceModel,
+    pub(crate) rank: Option<&'a GeomRef>,
+    pub(crate) model: DistanceModel,
 }
 
 /// [`Check`] for one worker: the constants prepared once (a prepared geometry is not
 /// shared between threads).
-struct Tester<'a> {
+pub(crate) struct Tester<'a> {
     check: &'a Check<'a>,
     prepared: Vec<Option<Prepared>>,
     /// transposed `relate` patterns, for the prepared constant
@@ -223,7 +223,7 @@ struct Tester<'a> {
 }
 
 impl<'a> Tester<'a> {
-    fn new(ctx: &Ctx, check: &'a Check<'a>) -> Tester<'a> {
+    pub(crate) fn new(ctx: &Ctx, check: &'a Check<'a>) -> Tester<'a> {
         Tester {
             check,
             op_vertices: ctx.geo.op_vertices(),
@@ -240,7 +240,7 @@ impl<'a> Tester<'a> {
     }
 
     /// `None`: `w` fails; else its ranking distance (0 without ranking).
-    fn check(&mut self, w: &Geom) -> Option<f64> {
+    pub(crate) fn check(&mut self, w: &Geom) -> Option<f64> {
         match w.bbox84() {
             Some(b) if !windows_meet(b, self.check.windows) => return None,
             Some(_) => {}
@@ -415,14 +415,14 @@ impl Candidates {
 }
 
 /// Whether quads of graph `g` are in the index's scope (cached per graph).
-struct Scope<'a> {
+pub(crate) struct Scope<'a> {
     cfg: &'a GeoConfig,
     all: bool,
     memo: FxHashMap<u64, bool>,
 }
 
 impl<'a> Scope<'a> {
-    fn new(cfg: &'a GeoConfig) -> Scope<'a> {
+    pub(crate) fn new(cfg: &'a GeoConfig) -> Scope<'a> {
         let all = matches!(cfg.graphs.include, crate::text::PredicateSet::All)
             && cfg.graphs.exclude.is_empty();
         Scope {
@@ -432,7 +432,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn contains(&mut self, ctx: &Ctx, g: u64) -> bool {
+    pub(crate) fn contains(&mut self, ctx: &Ctx, g: u64) -> bool {
         if self.all {
             return true;
         }
@@ -445,7 +445,7 @@ impl<'a> Scope<'a> {
 }
 
 /// Visit the keys of a prefix scan.
-fn scan_keys(
+pub(crate) fn scan_keys(
     ctx: &Ctx,
     perm: Perm,
     prefix: &[u64],
@@ -465,7 +465,7 @@ fn scan_keys(
 }
 
 /// `state`: the index's state, or how the operator found its rows without it.
-fn counters(st: &SearchStats, state: String) -> Counters {
+pub(crate) fn counters(st: &SearchStats, state: String) -> Counters {
     let mut c = Counters::new();
     c.insert("candidates".into(), st.candidates.into());
     c.insert("refined".into(), st.refined.into());

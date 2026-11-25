@@ -33,8 +33,10 @@ mod leaf;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 pub(super) use joinspill::row_hash;
 mod merge;
+mod pathsearch;
 mod ripple;
 mod service;
+mod spatial;
 mod text;
 mod topk;
 mod walk;
@@ -2749,12 +2751,23 @@ enum State {
     },
     TopK(Box<topk::TopK>),
     IndexTopK(Box<topk::IndexTopK>),
+    /// A vector search below ORDER BY DESC(...) LIMIT k, with a generic scan fallback.
+    VectorOrder(Box<topk::VectorOrder>),
     /// A SERVICE without SILENT, read from its endpoint a batch at a time.
     Service(Box<service::Service>),
     /// A text search without a limit, which holds its hits and decodes rows from them.
     Text(Box<text::Text>),
     /// A history query without a limit or input, read a page of whole commits at a time.
     History(Box<history::History>),
+    /// A path search without a limit or input: shortest/kShortest between constants, or
+    /// `path:all` with at least one constant endpoint.
+    PathSearch(Box<pathsearch::PathSearch>),
+    /// A streaming GeoSPARQL leaf (`SpatialScan`, unlimited `SpatialPf`, or `SpatialRelate`).
+    SpatialLeaf(Box<spatial::SpatialLeaf>),
+    /// A streaming GeoSPARQL join over 0, 1, or 2 plan children.
+    SpatialJoin(Box<spatial::SpatialJoin>),
+    /// A streaming k-nearest-neighbour search with cursor-executed template batches.
+    SpatialKnn(Box<spatial::SpatialKnn>),
 }
 
 /// An eager kernel's node, its answer once it has run, and how far its consumer has
@@ -3335,13 +3348,21 @@ impl Operator {
         // predicate, as a grouped count scan does.
         let pattern_counts = matches!(node.kind, Kind::PatternCount(_)) && node.children.is_empty();
         // An ordered top-k keeps a heap of its best rows, as a streaming top-k does.
-        let index_topk = matches!(node.kind, Kind::OrderedTopK(_)) && exec::heap_eligible(ctx);
+        let index_topk = matches!(node.kind, Kind::OrderedTopK(_));
+        // A vector ORDER BY search serves top-k from the vector index or falls back to its scan child.
+        let vector_order = topk::vector_order_eligible(&node);
         // A SERVICE without SILENT reads its endpoint's answer as it arrives.
         let service_reader = service::eligible(&node);
         // A text search without a limit holds its hits and decodes rows as they are read.
         let text_reader = text::eligible(&node);
         // A history query without a limit holds a page of its changes at a time.
         let history_reader = history::eligible(&node);
+        // A path search between constants (shortest/kShortest) or `path:all` with a constant end.
+        let path_reader = pathsearch::eligible(&node);
+        // Streaming GeoSPARQL operators (scan, unlimited property function, relate, join, kNN).
+        let spatial_leaf = spatial::leaf_eligible(&node);
+        let spatial_join = spatial::join_eligible(&node);
+        let spatial_knn = spatial::knn_eligible(&node);
         // A native sort consumes cursor batches into charged state. It blocks before
         // its first output but is not an eager fallback, so strict policy admits it.
         let materializes = !(exists_streams && supported(&node.kind))
@@ -3352,9 +3373,14 @@ impl Operator {
             && !walking
             && !whole_input
             && !index_topk
+            && !vector_order
             && !service_reader
             && !text_reader
             && !history_reader
+            && !path_reader
+            && !spatial_leaf
+            && !spatial_join
+            && !spatial_knn
             && !pattern_counts
             && (!native_blocking || !exists_streams);
         // A kernel that answers whole tables runs as a native operator when its form is
@@ -3382,6 +3408,10 @@ impl Operator {
                 let _charge = reserve_graph_branch_copy(ctx, plan, 0)?;
                 Operator::build(ctx, plan.clone(), fallback)?;
             }
+        }
+        if fallback == FallbackPolicy::RejectMaterialization && spatial_knn {
+            // Validate the kNN template strictly before emitting any output.
+            Operator::build(ctx, node.children[0].clone(), fallback)?;
         }
         let mut info = exec::describe_node(ctx, &node);
         if count_join && matches!(node.kind, Kind::Group { .. }) {
@@ -3463,8 +3493,12 @@ impl Operator {
         };
         // A count over the key runs of two scans reads those scans itself.
         let reads_scans = matches!(node.kind, Kind::CountJoinRuns { .. });
-        // An ordered top-k builds its generic plan only when it needs it.
-        let children = if (materializes && !native_blocking && !inputs) || reads_scans || index_topk
+        // An ordered top-k builds its generic plan only when it needs it, and SpatialKnn
+        // instantiates its template per candidate batch.
+        let children = if (materializes && !native_blocking && !inputs)
+            || reads_scans
+            || index_topk
+            || spatial_knn
         {
             Vec::new()
         } else {
@@ -3528,6 +3562,7 @@ impl Operator {
         ) || materializes
             || native_blocking
             || index_topk
+            || vector_order
             || incremental_merge
             || incremental_binary
             || incremental_group
@@ -3538,7 +3573,11 @@ impl Operator {
             || exists
             || service_reader
             || text_reader
-            || history_reader;
+            || history_reader
+            || path_reader
+            || spatial_leaf
+            || spatial_join
+            || spatial_knn;
         let mut order = output_order(
             &node,
             &children,
@@ -3598,66 +3637,115 @@ impl Operator {
             }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input || text_reader || history_reader).then(|| {
-            if history_reader {
-                format!(
-                    "{} reads the change log a page of whole commits at a time under the memory budget, pinning the commits it has still to read",
-                    node.operator()
-                )
-            } else if text_reader {
-                format!(
-                    "{} counts its hits, at most maxHits, holds them under the memory budget and decodes their rows a page at a time",
-                    node.operator()
-                )
-            } else if let Kind::OrderedTopK(spec) = &node.kind {
-                format!(
-                    "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
-                    node.operator(),
-                    spec.k
-                )
-            } else if let (true, Kind::OrderBy { limit: Some(k), .. }) = (heap, &node.kind) {
-                format!(
-                    "{} reads all input but keeps only its best {k} rows under the memory budget before output",
-                    node.operator()
-                )
-            } else if native_blocking {
-                format!(
-                    "{} consumes all input under the memory budget before output",
-                    node.operator()
-                )
-            } else if run_group && !exists {
-                format!(
-                    "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
-                    node.operator()
-                )
-            } else if whole_input {
-                let reads = whole::reads(&node);
-                match whole::bound(&node) {
-                    Some(bound) => format!(
-                        "{} reads {reads} under the memory budget, runs once and serves its answer of {bound}",
+        let reason = (materializes
+            || native_blocking
+            || exists
+            || index_topk
+            || vector_order
+            || run_group
+            || whole_input
+            || text_reader
+            || history_reader
+            || path_reader
+            || spatial_leaf
+            || spatial_join
+            || spatial_knn)
+            .then(|| {
+                if history_reader {
+                    format!(
+                        "{} reads the change log a page of whole commits at a time under the memory budget, pinning the commits it has still to read",
                         node.operator()
-                    ),
-                    None => format!(
-                        "{} reads {reads} under the memory budget, runs once and serves its charged answer",
+                    )
+                } else if text_reader {
+                    format!(
+                        "{} counts its hits, at most maxHits, holds them under the memory budget and decodes their rows a page at a time",
                         node.operator()
-                    ),
+                    )
+                } else if path_reader {
+                    format!(
+                        "{} streams matching paths under the memory budget and emits rows a batch at a time",
+                        node.operator()
+                    )
+                } else if spatial_leaf {
+                    format!(
+                        "{} streams matching spatial rows from the index or predicate scan under the memory budget",
+                        node.operator()
+                    )
+                } else if spatial_join {
+                    if spatial::join_full_input(&node) {
+                        format!(
+                            "{} builds a spatial index over its smaller input under the memory budget and streams its probe input",
+                            node.operator()
+                        )
+                    } else {
+                        format!(
+                            "{} streams spatial join pairs under the memory budget",
+                            node.operator()
+                        )
+                    }
+                } else if spatial_knn {
+                    format!(
+                        "{} streams nearest-neighbour candidate batches through its template cursor under the memory budget",
+                        node.operator()
+                    )
+                } else if vector_order {
+                    let k = match &node.kind {
+                        Kind::VectorSearch(spec) => spec.k,
+                        _ => 0,
+                    };
+                    format!(
+                        "{} answers at most {k} rows from the vector index under the memory budget, or streams its generic scan child",
+                        node.operator()
+                    )
+                } else if let Kind::OrderedTopK(spec) = &node.kind {
+                    format!(
+                        "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
+                        node.operator(),
+                        spec.k
+                    )
+                } else if let (true, Kind::OrderBy { limit: Some(k), .. }) = (heap, &node.kind) {
+                    format!(
+                        "{} reads all input but keeps only its best {k} rows under the memory budget before output",
+                        node.operator()
+                    )
+                } else if native_blocking {
+                    format!(
+                        "{} consumes all input under the memory budget before output",
+                        node.operator()
+                    )
+                } else if run_group && !exists {
+                    format!(
+                        "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
+                        node.operator()
+                    )
+                } else if whole_input {
+                    let reads = whole::reads(&node);
+                    match whole::bound(&node) {
+                        Some(bound) => format!(
+                            "{} reads {reads} under the memory budget, runs once and serves its answer of {bound}",
+                            node.operator()
+                        ),
+                        None => format!(
+                            "{} reads {reads} under the memory budget, runs once and serves its charged answer",
+                            node.operator()
+                        ),
+                    }
+                } else if native {
+                    leaf::reason(&node, leaf::form(&node).expect("a native form"))
+                } else if !materializes {
+                    format!(
+                        "{} answers EXISTS from a key set of its pattern, built under the memory budget on first demand, or evaluates it once per distinct outer key",
+                        node.operator()
+                    )
+                } else if !inputs && !node.children.is_empty() {
+                    format!(
+                        "{} has no resumable cursor implementation and runs its whole subtree eagerly",
+                        node.operator()
+                    )
+                } else {
+                    format!("{} has no resumable cursor implementation", node.operator())
                 }
-            } else if native {
-                leaf::reason(&node, leaf::form(&node).expect("a native form"))
-            } else if !materializes {
-                format!(
-                    "{} answers EXISTS from a key set of its pattern, built under the memory budget on first demand, or evaluates it once per distinct outer key",
-                    node.operator()
-                )
-            } else if !inputs && !node.children.is_empty() {
-                format!(
-                    "{} has no resumable cursor implementation and runs its whole subtree eagerly",
-                    node.operator()
-                )
-            } else {
-                format!("{} has no resumable cursor implementation", node.operator())
-            }
-        });
+            });
         let bind_reuse = bind_reuse_admission
             .and_then(|admission| bind::Reuse::new(ctx, admission))
             .map(Box::new);
@@ -3679,6 +3767,17 @@ impl Operator {
             State::Text(Box::new(text::Text::new(node)))
         } else if history_reader {
             State::History(Box::new(history::History::new(node)))
+        } else if path_reader {
+            State::PathSearch(Box::new(pathsearch::PathSearch::new(node)))
+        } else if spatial_leaf {
+            State::SpatialLeaf(Box::new(spatial::SpatialLeaf::new(node)))
+        } else if spatial_join {
+            State::SpatialJoin(Box::new(spatial::SpatialJoin::new(node)))
+        } else if spatial_knn {
+            let template = node.children.pop().expect("SpatialKnn template child");
+            State::SpatialKnn(Box::new(spatial::SpatialKnn::new(node, template, fallback)))
+        } else if vector_order {
+            State::VectorOrder(Box::new(topk::VectorOrder::new(node)))
         } else if index_topk {
             State::IndexTopK(Box::new(topk::IndexTopK::new(node, fallback)))
         } else if heap {
@@ -3879,6 +3978,12 @@ impl Operator {
             State::Service(service) => service.release(),
             State::Text(text) => text.release(),
             State::History(history) => history.release(),
+            State::IndexTopK(topk) => topk.release(),
+            State::VectorOrder(vo) => vo.release(),
+            State::PathSearch(ps) => ps.release(),
+            State::SpatialLeaf(sl) => sl.release(),
+            State::SpatialJoin(sj) => sj.release(),
+            State::SpatialKnn(sk) => sk.release(),
             _ => {}
         }
         if let Some(ahead) = &mut self.ahead {
@@ -3968,6 +4073,13 @@ impl Operator {
                 .into_iter()
                 .map(|c| eager(c, "read by its parent", false))
                 .collect(),
+            State::SpatialKnn(knn) => {
+                let mut d = exec::describe(ctx, knn.template());
+                if ctx.graphs.is_some() {
+                    d.redact();
+                }
+                vec![eager(d, "template run per candidate batch", false)]
+            }
             _ => self.children.iter().map(|c| c.describe(ctx)).collect(),
         };
         CursorPlan {
@@ -4038,8 +4150,10 @@ impl Operator {
                     | State::Whole(_)
                     | State::TopK(_)
                     | State::IndexTopK(_)
+                    | State::VectorOrder(_)
                     | State::Text(_)
             )
+            || matches!(&self.state, State::SpatialJoin(_) if self.children.len() == 2)
             || matches!(&self.state, State::Service(service) if service.full_input_before_output())
     }
 
@@ -4074,9 +4188,11 @@ impl Operator {
         if self.info.counters.is_some() {
             plan.operator.counters.clone_from(&self.info.counters);
         }
-        // An expanding or whole-input kernel notes its runs in its description.
-        if matches!(self.state, State::Expand(_) | State::Whole(_))
-            && plan.operator.description != self.info.description
+        // An expanding, whole-input, or fallback-switching kernel notes its runs in its description.
+        if matches!(
+            self.state,
+            State::Expand(_) | State::Whole(_) | State::VectorOrder(_) | State::IndexTopK(_)
+        ) && plan.operator.description != self.info.description
         {
             plan.operator.description.clone_from(&self.info.description);
         }
@@ -4120,6 +4236,11 @@ impl Operator {
             && let Some(generic) = topk.generic_plan()
         {
             plan.children.push(generic.clone());
+        }
+        if let State::SpatialKnn(knn) = &self.state
+            && let Some(tp) = &knn.template_plan
+        {
+            plan.children = vec![(**tp).clone()];
         }
         if let State::GraphBranches(branches) = &mut self.state {
             branches.update_plan(plan);
@@ -4581,6 +4702,49 @@ impl Operator {
                 State::IndexTopK(topk) => {
                     let b = topk.next(ctx, &mut self.children, options, &mut self.info, cap)?;
                     self.done = topk.done(&self.children);
+                    b
+                }
+                State::VectorOrder(vo) => {
+                    let b = vo.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if let Some(counters) = &vo.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    if let Some(desc) = vo.description() {
+                        self.info.description = desc;
+                    }
+                    self.done = vo.done(&self.children);
+                    b
+                }
+                State::PathSearch(ps) => {
+                    let b = ps.next(ctx, cap)?;
+                    if let Some(counters) = &ps.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    self.done = ps.done();
+                    b
+                }
+                State::SpatialLeaf(sl) => {
+                    let b = sl.next(ctx, cap)?;
+                    if let Some(counters) = &sl.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    self.done = sl.done();
+                    b
+                }
+                State::SpatialJoin(sj) => {
+                    let b = sj.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if let Some(counters) = &sj.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    self.done = sj.done();
+                    b
+                }
+                State::SpatialKnn(sk) => {
+                    let b = sk.next(ctx, options, &self.vars, cap)?;
+                    if let Some(counters) = &sk.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    self.done = sk.done();
                     b
                 }
                 State::Blocking {
@@ -5397,7 +5561,6 @@ impl Scan {
             }
         }
         if !exact && !out.table.is_empty() {
-            let _scratch = ctx.charge(out.table.len as u64 * 16 + ctx.nvars() as u64 * 16)?;
             exec::apply_range_filter(ctx, &mut out.table, self.var, &self.filter)?;
         }
         out.reconcile()?;
@@ -5476,9 +5639,7 @@ impl Scan {
             self.position = None;
         }
         if !exact && !b.table.is_empty() {
-            let scratch = ctx.charge(b.table.len as u64 * 16 + ctx.nvars() as u64 * 16)?;
             exec::apply_range_filter(ctx, &mut b.table, self.var, &self.filter)?;
-            drop(scratch);
         }
         ctx.check()?;
         b.reconcile()?;

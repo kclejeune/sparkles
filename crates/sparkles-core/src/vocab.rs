@@ -1847,6 +1847,20 @@ impl Vocab {
         }
     }
 
+    /// Checked version of [`Vocab::prefetch_value_pages`] that admits the sorted block-index
+    /// vector through `reserve` before allocating it.
+    pub(crate) fn prefetch_value_pages_checked(
+        &self,
+        ids: &[u64],
+        reserve: impl FnMut(usize) -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        self.prefetch_sorted_checked(ids, reserve)?;
+        if let Some(num) = &self.num {
+            num.advise_ids(ids);
+        }
+        Ok(())
+    }
+
     /// Overlap the vocabulary reads of a medium-sized result decoded in row order.
     /// With a sparse index, use its in-memory offsets and hint each group once, as
     /// `find` does. Warm requests then avoid sorting their cells or repeating hints.

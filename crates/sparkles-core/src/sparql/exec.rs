@@ -3236,10 +3236,19 @@ pub(super) fn apply_range_filter(
         t.col_of(var),
         num_atoms(ctx, var, exprs),
     ) else {
+        let _scratch = ctx.charge((t.len() as u64).saturating_add(
+            (ctx.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        ))?;
         apply_filter(ctx, t, exprs)?;
         return Ok(());
     };
     let col = &t.cols[c];
+    let n = col.len();
+    let vocab_count = col.iter().filter(|x| x.tag() == Tag::Vocab).count();
+    let decided_bytes = n.saturating_mul(size_of::<Option<bool>>()) as u64;
+    let vocab_bytes = (vocab_count as u64)
+        .saturating_mul((size_of::<u64>() + size_of::<(u8, u64)>() + size_of::<Numeric>()) as u64);
+    let scratch = ctx.charge(decided_bytes.saturating_add(vocab_bytes))?;
     use super::value::Num;
     let test = |x: Id, v: Num| atoms.iter().all(|a| a.holds(x, v));
     // `Some(passes)`, or `None` for the generic filter
@@ -3261,23 +3270,32 @@ pub(super) fn apply_range_filter(
         }
     };
     // the distinct vocabulary ids of a run of rows read from the column at once, and
-    // runs of one id (the scan's sorted column) decided once
-    let chunk = |ids: &[Id]| -> Vec<Option<bool>> {
-        let mut vocab: Vec<u64> = ids
-            .iter()
-            .filter(|x| x.tag() == Tag::Vocab)
-            .map(|x| x.payload())
-            .collect();
-        // already sorted when the column is the scan's sorted column
-        if !vocab.is_sorted() {
-            vocab.sort_unstable();
+    // runs of one id (the scan's sorted column) decided once, written directly into
+    // disjoint slices of the pre-admitted `decided` buffer
+    let fill_chunk = |ids: &[Id], out: &mut [Option<bool>]| {
+        let vocab_len = ids.iter().filter(|x| x.tag() == Tag::Vocab).count();
+        let mut vocab = Vec::with_capacity(vocab_len);
+        if vocab_len > 0 {
+            vocab.extend(
+                ids.iter()
+                    .filter(|x| x.tag() == Tag::Vocab)
+                    .map(|x| x.payload()),
+            );
+            // already sorted when the column is the scan's sorted column
+            if !vocab.is_sorted() {
+                vocab.sort_unstable();
+            }
+            vocab.dedup();
         }
-        vocab.dedup();
-        let found = num.get_many(&vocab);
+        let found = if vocab.is_empty() {
+            Vec::new()
+        } else {
+            num.get_many(&vocab)
+        };
         let mut at = 0;
         let mut last: Option<(Id, Option<bool>)> = None;
-        ids.iter()
-            .map(|&x| match last {
+        for (&x, slot) in ids.iter().zip(out.iter_mut()) {
+            *slot = match last {
                 Some((l, d)) if l == x => d,
                 _ => {
                     let n = if x.tag() == Tag::Vocab {
@@ -3297,44 +3315,78 @@ pub(super) fn apply_range_filter(
                     last = Some((x, d));
                     d
                 }
-            })
-            .collect()
+            };
+        }
     };
-    let decided: Vec<Option<bool>> = if col.len() > PAR_THRESHOLD {
-        col.par_chunks(PAR_MIN_LEN.max(4096))
-            .flat_map_iter(chunk)
-            .collect()
+    let mut decided = vec![None; n];
+    if col.len() > PAR_THRESHOLD {
+        let step = PAR_MIN_LEN.max(4096);
+        col.par_chunks(step)
+            .zip(decided.par_chunks_mut(step))
+            .for_each(|(ids, out)| fill_chunk(ids, out));
     } else {
-        chunk(col)
-    };
-    let rest: Vec<usize> = (0..decided.len())
-        .filter(|&i| decided[i].is_none())
-        .collect();
-    let mut keep: Vec<bool> = decided.iter().map(|d| d.unwrap_or(false)).collect();
+        fill_chunk(col, &mut decided);
+    }
+    let rest_len = decided.iter().filter(|d| d.is_none()).count();
+    let keep_bytes = n.saturating_mul(size_of::<bool>()) as u64;
+    let rest_bytes = rest_len.saturating_mul(size_of::<usize>()) as u64;
+    scratch.resize(
+        decided_bytes
+            .saturating_add(keep_bytes)
+            .saturating_add(rest_bytes),
+    )?;
+    let mut rest = Vec::with_capacity(rest_len);
+    let mut keep = Vec::with_capacity(n);
+    for (i, d) in decided.into_iter().enumerate() {
+        match d {
+            Some(k) => keep.push(k),
+            None => {
+                keep.push(false);
+                rest.push(i);
+            }
+        }
+    }
+    scratch.resize(keep_bytes.saturating_add(rest_bytes))?;
     if !rest.is_empty() {
+        let sub_bytes = topk_table_bytes(rest.len(), t.width());
+        let mask_bytes =
+            rest.len()
+                .saturating_mul(size_of::<bool>())
+                .saturating_add(ctx.nvars().saturating_mul(size_of::<Option<usize>>()))
+                .saturating_add(exprs.len().saturating_mul(size_of::<&Expr>())) as u64;
+        scratch.resize(
+            keep_bytes
+                .saturating_add(rest_bytes)
+                .saturating_add(sub_bytes)
+                .saturating_add(mask_bytes),
+        )?;
         let sub = t.take_rows(&rest);
         let mask = filter_mask(ctx, &sub, exprs)?;
         for (&i, k) in rest.iter().zip(mask) {
             keep[i] = k;
         }
     }
-    let sorted = t.sorted.clone();
+    drop(rest);
+    scratch.resize(keep_bytes)?;
+    let sorted = std::mem::take(&mut t.sorted);
     t.filter_rows(&keep);
     t.sorted = sorted;
+    drop(keep);
+    drop(scratch);
     Ok(())
 }
 
 // ---------------------------------------------------------- ordered top-k ------
 
 /// The unread part `[lo, hi]` of a monotone piece of an [`OrderedTopK`] scan.
-struct TopKRun {
+struct TopKRun<'ctx> {
     lo: u64,
     hi: u64,
     exact: bool,
     /// the best values are at the high end of the id range
     best_high: bool,
     /// the rows read so far that can still be among the first k
-    kept: Table,
+    kept: Materialized<'ctx>,
     /// base rows to read in the next step (grows geometrically)
     want: usize,
     /// no unread row of the piece can be among the first k
@@ -3379,7 +3431,7 @@ const LEXICAL_PREFIX_BYTES: usize = 256;
 fn lexical_check(
     ctx: &Ctx,
     spec: &OrderedTopK,
-    run: &TopKRun,
+    run: &TopKRun<'_>,
     kth: Option<&Value>,
 ) -> Result<Lexical> {
     let s = match kth {
@@ -3457,14 +3509,14 @@ fn lexical_check(
 
 /// Rows of an [`OrderedTopK`] scan whose order-column ids lie in `[lo, hi]`, in key order,
 /// with the filters applied; also returns how many rows were scanned.
-fn topk_read(
-    ctx: &Ctx,
+fn topk_read<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     lo: u64,
     hi: u64,
     exact: bool,
     vars: &[VarId],
-) -> Result<(Table, usize)> {
+) -> Result<(Materialized<'ctx>, usize)> {
     let scan = &spec.scan;
     let bound = |v: u64, fill: u64| {
         let mut k = pad(&scan.prefix, fill);
@@ -3475,38 +3527,47 @@ fn topk_read(
 }
 
 /// [`topk_read`] of the keys `[lo, hi]` of the scan.
-fn topk_read_keys(
-    ctx: &Ctx,
+fn topk_read_keys<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     lo: crate::index::Key,
     hi: crate::index::Key,
     exact: bool,
     vars: &[VarId],
-) -> Result<(Table, usize)> {
+) -> Result<(Materialized<'ctx>, usize)> {
     topk_read_keys_last(ctx, spec, lo, hi, exact, vars).map(|(t, n, _)| (t, n))
 }
 
 /// [`topk_read_keys`], with the last row the scan produced before any filter when the
 /// scan drops duplicate rows of a union default graph: the next read of the same piece
 /// must drop that row again if it starts with it.
-fn topk_read_keys_last(
-    ctx: &Ctx,
+fn topk_read_keys_last<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     lo: crate::index::Key,
     hi: crate::index::Key,
     exact: bool,
     vars: &[VarId],
-) -> Result<(Table, usize, Option<Vec<Id>>)> {
-    let mut t = Table::new(vars.to_vec());
+) -> Result<MorselBest<'ctx>> {
+    let mut t = Materialized::empty_fast(ctx, vars, &[])?;
     scan_into(ctx, &spec.scan, lo, hi, None, &mut t)?;
-    let scanned = t.len();
-    let last =
-        (spec.scan.dedup && scanned > 0).then(|| t.cols.iter().map(|c| c[scanned - 1]).collect());
-    if !exact && !spec.range_filter.is_empty() && !t.is_empty() {
-        apply_range_filter(ctx, &mut t, spec.var, &spec.range_filter)?;
+    let table = &mut t.table;
+    let scanned = table.len();
+    let last = (spec.scan.dedup && scanned > 0).then(|| {
+        let mut last = [Id::UNDEF; 4];
+        for (dst, col) in last.iter_mut().zip(&table.cols) {
+            *dst = col[scanned - 1];
+        }
+        last
+    });
+    if !exact && !spec.range_filter.is_empty() && !table.is_empty() {
+        apply_range_filter(ctx, table, spec.var, &spec.range_filter)?;
     }
-    if !spec.filter.is_empty() && !t.is_empty() {
-        apply_filter(ctx, &mut t, &spec.filter)?;
+    if !spec.filter.is_empty() && !table.is_empty() {
+        let _filter_scratch = ctx.charge((table.len() as u64).saturating_add(
+            (ctx.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        ))?;
+        apply_filter(ctx, table, &spec.filter)?;
     }
     Ok((t, scanned, last))
 }
@@ -3566,7 +3627,37 @@ fn topk_boundary(
 
 /// Read the next rows of a monotone piece from its best end, keeping those that can
 /// still be among the first k; returns the rows scanned.
-fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -> Result<usize> {
+fn topk_table_bytes(rows: usize, width: usize) -> u64 {
+    128 + width as u64 * (size_of::<VarId>() * 2 + size_of::<Vec<Id>>()) as u64
+        + super::ctx::table_bytes(rows, width)
+}
+
+fn topk_append(ctx: &Ctx, dst: &mut Materialized<'_>, src: Materialized<'_>) -> Result<()> {
+    dst.reserve_rows(ctx, dst.table.len().saturating_add(src.table.len()))?;
+    dst.table.append(src.table);
+    Ok(())
+}
+
+fn topk_take_rows<'ctx>(
+    ctx: &'ctx Ctx,
+    source: &Table,
+    rows: &[usize],
+) -> Result<Materialized<'ctx>> {
+    let mut out = Materialized::empty_fast(ctx, &source.vars, &[])?;
+    out.reserve_rows(ctx, rows.len())?;
+    for (dst, src) in out.table.cols.iter_mut().zip(&source.cols) {
+        dst.extend(rows.iter().map(|&r| src[r]));
+    }
+    out.table.len = rows.len();
+    Ok(out)
+}
+
+fn topk_step(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    run: &mut TopKRun<'_>,
+    vars: &[VarId],
+) -> Result<usize> {
     // base rows only: delta rows in between are merged by the scan
     let edge = topk_boundary(ctx, spec, run.lo, run.hi, run.best_high, run.want)?;
     let (a, b) = if run.best_high {
@@ -3582,13 +3673,14 @@ fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -
         run.lo = b.saturating_add(1);
         run.want = run.want.saturating_mul(4);
         if !run.extra.is_empty() {
-            let keep: Vec<bool> = part.cols[0]
+            let _mask = ctx.charge(part.table.len() as u64)?;
+            let keep: Vec<bool> = part.table.cols[0]
                 .iter()
                 .map(|id| !run.extra.contains(&id.0))
                 .collect();
-            part.filter_rows(&keep);
+            part.table.filter_rows(&keep);
         }
-        run.kept.append(part);
+        topk_append(ctx, &mut run.kept, part)?;
         return Ok(scanned);
     }
     if run.best_high {
@@ -3603,20 +3695,24 @@ fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -
     // best row of this step and its ties complete the piece's best k, and every other
     // row of the piece has k rows with strictly better values ahead of it (distinct ids
     // of a monotone piece are distinct numbers)
-    let need = spec.k - run.kept.len();
-    if part.len() >= need {
-        let col = &part.cols[0];
-        let keep: Vec<bool> = if run.best_high {
-            let cut = col[part.len() - need];
-            col.iter().map(|&id| id >= cut).collect()
+    let need = spec.k - run.kept.table.len();
+    if part.table.len() >= need {
+        let col = &part.table.cols[0];
+        let (first, end) = if run.best_high {
+            let cut = col[part.table.len() - need];
+            (col.partition_point(|&id| id < cut), col.len())
         } else {
             let cut = col[need - 1];
-            col.iter().map(|&id| id <= cut).collect()
+            (0, col.partition_point(|&id| id <= cut))
         };
-        part.filter_rows(&keep);
+        for col in &mut part.table.cols {
+            col.copy_within(first..end, 0);
+            col.truncate(end - first);
+        }
+        part.table.len = end - first;
         run.done = true;
     }
-    run.kept.append(part);
+    topk_append(ctx, &mut run.kept, part)?;
     Ok(scanned)
 }
 
@@ -3654,36 +3750,36 @@ fn value_totally_ordered(value: Option<&Value>) -> bool {
 /// The best k rows of the pieces of an [`OrderedTopK`] scan without value order, which
 /// are read whole, in no particular order; `None` when one of their values is not
 /// totally ordered. Adds the rows read to `scanned`.
-fn topk_rest(
-    ctx: &Ctx,
+fn topk_rest<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
     pieces: &[&super::plan::TopKPiece],
     scanned: &mut usize,
-) -> Result<Option<Table>> {
-    let mut rest = Table::new(vars.to_vec());
+) -> Result<Option<Materialized<'ctx>>> {
+    let mut rest = Materialized::empty_fast(ctx, vars, &[])?;
     for p in pieces {
         let (t, n) = topk_read(ctx, spec, p.lo, p.hi, p.exact, vars)?;
         *scanned += n;
-        rest.append(t);
-        ctx.check_output(rest.len(), rest.width())?;
+        topk_append(ctx, &mut rest, t)?;
+        ctx.check_output(rest.table.len(), rest.table.width())?;
     }
     // Up to `PAR_THRESHOLD` rows, decode the dictionary ORDER values once each in key
     // order, in one charged, operation-local pass, for the checks and the prefilter
     // below. A larger input reads them through the value cache in parallel.
-    let decoded = if rest.len() <= PAR_THRESHOLD {
-        super::exprcache::dictionary_values(ctx, &rest, &Expr::Var(spec.var))?
+    let decoded = if rest.table.len() <= PAR_THRESHOLD {
+        super::exprcache::dictionary_values(ctx, &rest.table, &Expr::Var(spec.var))?
     } else {
         None
     };
     let total = match &decoded {
-        Some(values) => rest_total(ctx, &rest, values)?,
+        Some(values) => rest_total(ctx, &rest.table, values)?,
         None => {
             let total = |id: &Id| totally_ordered(ctx, *id);
-            if rest.len() > PAR_THRESHOLD / 4 {
-                rest.cols[0].par_iter().all(total)
+            if rest.table.len() > PAR_THRESHOLD / 4 {
+                rest.table.cols[0].par_iter().all(total)
             } else {
-                rest.cols[0].iter().all(total)
+                rest.table.cols[0].iter().all(total)
             }
         }
     };
@@ -3695,19 +3791,23 @@ fn topk_rest(
     // values again in the prefilter of `order_by`.
     if let Some(values) = &decoded
         && ctx.opt.topk_prefilter
-        && rest.len() > spec.k
-        && let Some((rows, charge)) = topk_candidates(ctx, &rest, &keys, spec.k, Some(values))?
-        && rows.len() < rest.len()
+        && rest.table.len() > spec.k
+        && let Some((rows, charge)) =
+            topk_candidates(ctx, &rest.table, &keys, spec.k, Some(values))?
+        && rows.len() < rest.table.len()
     {
-        ctx.check_output(rows.len(), rest.width())?;
-        rest = rest.take_rows(&rows);
+        ctx.check_output(rows.len(), rest.table.width())?;
+        rest = topk_take_rows(ctx, &rest.table, &rows)?;
         drop(charge);
     }
     drop(decoded);
     // only their first k can be among the first k of all rows (the order of two rows
     // does not depend on the others)
-    if rest.len() > spec.k {
-        rest = order_by(ctx, rest, &keys, Some(spec.k), &mut ExprReport::default())?.0;
+    if rest.table.len() > spec.k {
+        let (input, _input_charge) = rest.into_fast_parts()?;
+        let credit = ctx.charge(topk_table_bytes(spec.k, vars.len()))?;
+        let sorted = order_by(ctx, input, &keys, Some(spec.k), &mut ExprReport::default())?.0;
+        rest = Materialized::with_fast(sorted, credit)?;
     }
     Ok(Some(rest))
 }
@@ -3794,7 +3894,7 @@ const TOPK_MORSEL_ROWS: usize = crate::index::BLOCK_ROWS;
 
 /// The rows a morsel of [`topk_rest_morsels`] keeps, the rows its scan produced and, when
 /// the scan drops union-graph duplicates, the last of those rows.
-type MorselBest = (Table, usize, Option<Vec<Id>>);
+type MorselBest<'ctx> = (Materialized<'ctx>, usize, Option<[Id; 4]>);
 
 /// The keys `[first, last]` of one morsel of [`topk_rest_morsels`], the piece it belongs
 /// to and the rows of its blocks.
@@ -3803,7 +3903,6 @@ struct Morsel {
     last: Key,
     exact: bool,
     piece: usize,
-    rows: usize,
 }
 
 /// [`topk_rest`] with a heap. The pieces are split into morsels of whole index blocks,
@@ -3815,13 +3914,13 @@ struct Morsel {
 /// per worker thread and the rows they keep, instead of every row of the pieces. A morsel
 /// is checked for values that are not totally ordered before it ranks its rows, and one
 /// such value sends the whole query to the generic plan, as it does eagerly.
-fn topk_rest_morsels(
-    ctx: &Ctx,
+fn topk_rest_morsels<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
     pieces: &[&super::plan::TopKPiece],
     scanned: &mut usize,
-) -> Result<Option<Table>> {
+) -> Result<Option<Materialized<'ctx>>> {
     let keys = [(Expr::Var(spec.var), spec.asc)];
     let scan = &spec.scan;
     let perm = ctx.snap.perm(scan.perm);
@@ -3834,6 +3933,7 @@ fn topk_rest_morsels(
     // the one before the gap, so each morsel but a piece's last ends just before the next
     // one's first block, and a piece with no base block is one morsel.
     let mut morsels: Vec<Morsel> = Vec::new();
+    let mut morsel_list = ctx.retained_charge(0)?;
     for (piece, p) in pieces.iter().enumerate() {
         let (lo, hi) = (bound(p.lo, 0), bound(p.hi, u64::MAX));
         let (b0, b1) = perm.key_block_range(&lo, &hi);
@@ -3864,12 +3964,17 @@ fn topk_rest_morsels(
                 }
                 next.min(hi)
             };
+            if morsels.len() == morsels.capacity() {
+                let next_cap = morsels.capacity().saturating_mul(2).max(8);
+                if let Some(h) = &mut morsel_list {
+                    h.resize((next_cap * std::mem::size_of::<Morsel>()) as u64)?;
+                }
+            }
             morsels.push(Morsel {
                 first,
                 last,
                 exact: p.exact,
                 piece,
-                rows,
             });
             if e >= b1 {
                 break;
@@ -3878,7 +3983,9 @@ fn topk_rest_morsels(
         }
     }
     ctx.check()?;
-    let _list = ctx.charge((morsels.capacity() * std::mem::size_of::<Morsel>()) as u64)?;
+    if let Some(h) = &mut morsel_list {
+        h.resize((morsels.capacity() * std::mem::size_of::<Morsel>()) as u64)?;
+    }
     let mut heap: TopK<u32> = TopK::new(spec.k, vec![spec.asc]);
     let mut slots = RestSlots {
         width: vars.len(),
@@ -3894,7 +4001,7 @@ fn topk_rest_morsels(
     // scan drops duplicate rows of a union default graph. The copies of a triple are
     // adjacent in key order, and the scan of one morsel drops them within the morsel,
     // so a morsel can only repeat the previous one's last row, as its first row.
-    let mut carried: Option<(usize, Vec<Id>)> = None;
+    let mut carried: Option<(usize, [Id; 4])> = None;
     // A wave of one morsel per worker at a time: a worker that waits inside a morsel's
     // own parallel work could otherwise steal and start every other morsel.
     for wave in morsels.chunks(rayon::current_num_threads().max(1)) {
@@ -3908,22 +4015,23 @@ fn topk_rest_morsels(
         for (m, (mut t, mut n, last)) in wave.iter().zip(parts) {
             if let Some((piece, row)) = &carried
                 && *piece == m.piece
-                && !t.is_empty()
-                && t.cols.iter().zip(row).all(|(c, &id)| c[0] == id)
+                && !t.table.is_empty()
+                && t.table.cols.iter().zip(row).all(|(c, &id)| c[0] == id)
             {
                 // a read of the whole piece drops this copy, as eager execution does
-                let rows: Vec<usize> = (1..t.len()).collect();
-                t = t.take_rows(&rows);
+                let _rows = ctx.charge(t.table.len() as u64 * size_of::<usize>() as u64)?;
+                let rows: Vec<usize> = (1..t.table.len()).collect();
+                t = topk_take_rows(ctx, &t.table, &rows)?;
                 n -= 1;
             }
             if let Some(last) = last {
                 carried = Some((m.piece, last));
             }
             *scanned += n;
-            if t.is_empty() {
+            if t.table.is_empty() {
                 continue;
             }
-            let room = heap.k().saturating_add(1).min(t.len()) as u64;
+            let room = heap.k().saturating_add(1).min(t.table.len()) as u64;
             if let Some(held) = &mut held {
                 held.resize(
                     1024 + (heap.kept() as u64 + room) * entry_bytes
@@ -3933,12 +4041,12 @@ fn topk_rest_morsels(
             }
             let mut offer = RestOffer {
                 slots: &mut slots,
-                table: &t,
+                table: &t.table,
             };
             offer_rows(
                 ctx,
                 &mut heap,
-                &t,
+                &t.table,
                 &keys,
                 &mut ExprReport::default(),
                 &mut offer,
@@ -3949,69 +4057,69 @@ fn topk_rest_morsels(
     let width = slots.width;
     let entries = heap.into_sorted();
     ctx.check_output(entries.len(), width)?;
-    let mut rest = Table::new(vars.to_vec());
-    for (j, col) in rest.cols.iter_mut().enumerate() {
+    let mut rest = Materialized::empty_fast(ctx, vars, &[])?;
+    rest.reserve_rows(ctx, entries.len())?;
+    for (j, col) in rest.table.cols.iter_mut().enumerate() {
         col.extend(
             entries
                 .iter()
                 .map(|e| slots.ids[e.payload as usize * width + j]),
         );
     }
-    rest.len = entries.len();
+    rest.table.len = entries.len();
     Ok(Some(rest))
 }
 
 /// The rows of one morsel of [`topk_rest_morsels`] that have fewer than k rows of the
 /// morsel ahead of them, in arrival order, and the rows the morsel read; `None` when one
 /// of its values is not totally ordered.
-fn morsel_best(
-    ctx: &Ctx,
+fn morsel_best<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
     keys: &[(Expr, bool)],
     m: &Morsel,
-) -> Result<Option<MorselBest>> {
-    // the morsel's rows, charged from its blocks before they are read and then at their
-    // real size
-    let estimate = (m.rows as u64).saturating_mul(vars.len() as u64 * 8);
-    let rows = ctx.charge(estimate)?;
+) -> Result<Option<MorselBest<'ctx>>> {
     let (mut t, n, last) = topk_read_keys_last(ctx, spec, m.first, m.last, m.exact, vars)?;
-    if t.is_empty() {
+    if t.table.is_empty() {
         return Ok(Some((t, n, last)));
     }
-    rows.add(t.mem_bytes().saturating_sub(estimate))?;
-    let decoded = super::exprcache::dictionary_values(ctx, &t, &Expr::Var(spec.var))?;
+    let decoded = super::exprcache::dictionary_values(ctx, &t.table, &Expr::Var(spec.var))?;
     let total = match &decoded {
-        Some(values) => rest_total(ctx, &t, values)?,
+        Some(values) => rest_total(ctx, &t.table, values)?,
         // without a decoded column, values are read one at a time, as eager execution
         // reads them
-        None => t.cols[0].iter().all(|&id| totally_ordered(ctx, id)),
+        None => t.table.cols[0].iter().all(|&id| totally_ordered(ctx, id)),
     };
     if !total {
         return Ok(None);
     }
     if ctx.opt.topk_prefilter
-        && t.len() > spec.k
-        && let Some((rows, charge)) = topk_candidates(ctx, &t, keys, spec.k, decoded.as_ref())?
-        && rows.len() < t.len()
+        && t.table.len() > spec.k
+        && let Some((rows, charge)) =
+            topk_candidates(ctx, &t.table, keys, spec.k, decoded.as_ref())?
+        && rows.len() < t.table.len()
     {
-        t = t.take_rows(&rows);
+        t = topk_take_rows(ctx, &t.table, &rows)?;
         drop(charge);
     }
     drop(decoded);
-    if t.len() > spec.k {
+    if t.table.len() > spec.k {
+        let row_bytes = size_of::<Entry<usize>>() + size_of::<SortKey>() + size_of::<usize>();
+        let _ranked =
+            ctx.charge((spec.k.saturating_add(1) as u64).saturating_mul(2 * row_bytes as u64))?;
         let mut heap: TopK<usize> = TopK::new(spec.k, vec![spec.asc]);
         offer_rows(
             ctx,
             &mut heap,
-            &t,
+            &t.table,
             keys,
             &mut ExprReport::default(),
             &mut RowIndex,
         )?;
         let mut rows: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
         rows.sort_unstable();
-        t = t.take_rows(&rows);
+        t = topk_take_rows(ctx, &t.table, &rows)?;
     }
     ctx.check()?;
     Ok(Some((t, n, last)))
@@ -4025,6 +4133,69 @@ pub(super) fn ordered_topk(
     spec: &OrderedTopK,
     out: &[VarId],
 ) -> Result<Option<(Table, usize)>> {
+    ordered_topk_inner(ctx, spec, out, heap_eligible(ctx))
+}
+
+/// [`ordered_topk`] using morsel-wise heap selection for non-monotone pieces regardless
+/// of `ctx.opt.topk_heap`, transferring the projected result directly into a pre-admitted
+/// cursor [`OwnedCharge`](super::ctx::OwnedCharge) before releasing working charges.
+pub(super) fn ordered_topk_morsels_charged(
+    ctx: &std::sync::Arc<Ctx>,
+    spec: &OrderedTopK,
+    out: &[VarId],
+) -> Result<Option<(Table, super::ctx::OwnedCharge, usize)>> {
+    ordered_topk_inner_charged(ctx, spec, out, true)
+}
+
+fn ordered_topk_inner(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    out: &[VarId],
+    morsels: bool,
+) -> Result<Option<(Table, usize)>> {
+    let mut table_out = None;
+    let scanned = ordered_topk_run(ctx, spec, out, morsels, &mut |top| {
+        table_out = Some(top.project(out));
+        Ok(())
+    })?;
+    Ok(table_out.map(|t| (t, scanned)))
+}
+
+fn ordered_topk_inner_charged(
+    ctx: &std::sync::Arc<Ctx>,
+    spec: &OrderedTopK,
+    out: &[VarId],
+    morsels: bool,
+) -> Result<Option<(Table, super::ctx::OwnedCharge, usize)>> {
+    let mut result: Option<(Table, super::ctx::OwnedCharge)> = None;
+    let scanned = ordered_topk_run(ctx, spec, out, morsels, &mut |top| {
+        let len = top.len();
+        let width = out.len();
+        let mut charge = super::ctx::OwnedCharge::new(ctx, topk_table_bytes(len, width))?;
+        let mut projected = Table::new(out.to_vec());
+        for (col, &var) in projected.cols.iter_mut().zip(out) {
+            col.reserve_exact(len);
+            if let Some(src) = top.col_of(var) {
+                col.extend_from_slice(&top.cols[src]);
+            } else {
+                col.resize(len, Id::UNDEF);
+            }
+        }
+        projected.len = len;
+        charge.resize(super::algosvc::table_capacity(&projected)?)?;
+        result = Some((projected, charge));
+        Ok(())
+    })?;
+    Ok(result.map(|(t, c)| (t, c, scanned)))
+}
+
+fn ordered_topk_run(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    _out: &[VarId],
+    morsels: bool,
+    finish: &mut dyn FnMut(Table) -> Result<()>,
+) -> Result<usize> {
     let vars: Vec<VarId> = spec.scan.cols.iter().map(|c| c.1).collect();
     debug_assert_eq!(vars.first(), Some(&spec.var));
     let mut scanned = 0;
@@ -4039,7 +4210,7 @@ pub(super) fn ordered_topk(
                 hi: p.hi,
                 exact: p.exact,
                 best_high: mono.is_some_and(|up| up != spec.asc),
-                kept: Table::new(vars.clone()),
+                kept: Materialized::empty_fast(ctx, &vars, &[])?,
                 want: spec.k.max(16).saturating_mul(2),
                 done: false,
                 lexical: mono.is_none(),
@@ -4048,16 +4219,15 @@ pub(super) fn ordered_topk(
             }),
         }
     }
-    let rest = if heap_eligible(ctx) {
+    let rest = if morsels {
         topk_rest_morsels(ctx, spec, &vars, &whole, &mut scanned)?
     } else {
         topk_rest(ctx, spec, &vars, &whole, &mut scanned)?
     };
     let Some(rest) = rest else {
-        return Ok(None);
+        return Ok(scanned);
     };
     let keys = [(Expr::Var(spec.var), spec.asc)];
-    let held = ctx.charge(rest.mem_bytes())?;
     let better = if spec.asc {
         Ordering::Less
     } else {
@@ -4072,15 +4242,34 @@ pub(super) fn ordered_topk(
             scanned += topk_step(ctx, spec, run, &vars)?;
         }
         // the candidates in the generic plan's row order, ranked by the generic ORDER BY
-        let n = rest.len() + runs.iter().map(|r| r.kept.len()).sum::<usize>();
+        let n = rest.table.len() + runs.iter().map(|r| r.kept.table.len()).sum::<usize>();
         ctx.check_output(n, vars.len())?;
-        let mut cand = rest.clone();
+        let cand_est = topk_table_bytes(n, vars.len());
+        let cand_charge = ctx.charge(cand_est)?;
+        let mut cand = Table::new(vars.clone());
+        for col in &mut cand.cols {
+            col.reserve_exact(n);
+        }
+        for (dst, src) in cand.cols.iter_mut().zip(&rest.table.cols) {
+            dst.extend_from_slice(src);
+        }
+        cand.len = rest.table.len();
         for run in &runs {
-            cand.append(run.kept.clone());
+            for (dst, src) in cand.cols.iter_mut().zip(&run.kept.table.cols) {
+                dst.extend_from_slice(src);
+            }
+            cand.len += run.kept.table.len();
         }
         cand.sorted.clear();
-        cand.sort_by_vars(&spec.tie_order);
+        {
+            let sort_cols = spec.tie_order.len() as u64 * size_of::<usize>() as u64;
+            let sort_rows = n as u64 * size_of::<usize>() as u64;
+            let _ties = ctx.charge(cand_est.saturating_add(sort_cols).saturating_add(sort_rows))?;
+            cand.sort_by_vars(&spec.tie_order);
+        }
+        let top_charge = ctx.charge(topk_table_bytes(n.min(spec.k), vars.len()))?;
         let (top, _) = order_by(ctx, cand, &keys, Some(spec.k), &mut ExprReport::default())?;
+        drop(cand_charge);
         if top.len() == spec.k {
             // a piece is finished once the k-th row is strictly better than its best
             // unread value, and so than every unread value
@@ -4094,12 +4283,12 @@ pub(super) fn ordered_topk(
                             for id in ids {
                                 let (t, n) = topk_read(ctx, spec, id, id, run.exact, &vars)?;
                                 scanned += n;
-                                run.kept.append(t);
+                                topk_append(ctx, &mut run.kept, t)?;
                                 run.extra.push(id);
                             }
                             run.hold = true;
                         }
-                        Lexical::Generic => return Ok(None),
+                        Lexical::Generic => return Ok(scanned),
                     }
                     continue;
                 }
@@ -4110,65 +4299,28 @@ pub(super) fn ordered_topk(
             }
         }
         if runs.iter().all(|r| r.done) {
-            drop(held);
-            return Ok(Some((top.project(out), scanned)));
+            finish(top)?;
+            drop(top_charge);
+            return Ok(scanned);
         }
     }
 }
 
-// The paid sink keeps its actual guard around every physical growth. Raw-table
-// callers remain explicit legacy internal paths until their producer migration.
-trait ScanSink {
-    fn table(&self) -> &Table;
-    fn table_mut(&mut self) -> &mut Table;
-    fn prepare(&mut self, ctx: &Ctx, rows: usize) -> Result<()>;
-    fn check_output(&self, ctx: &Ctx) -> Result<()>;
-}
-impl ScanSink for Table {
-    fn table(&self) -> &Table {
-        self
-    }
-    fn table_mut(&mut self) -> &mut Table {
-        self
-    }
-    fn prepare(&mut self, _ctx: &Ctx, _rows: usize) -> Result<()> {
-        Ok(())
-    }
-    fn check_output(&self, ctx: &Ctx) -> Result<()> {
-        ctx.check_output(self.len(), self.width())
-    }
-}
-impl ScanSink for Materialized<'_> {
-    fn table(&self) -> &Table {
-        &self.table
-    }
-    fn table_mut(&mut self) -> &mut Table {
-        &mut self.table
-    }
-    fn prepare(&mut self, ctx: &Ctx, rows: usize) -> Result<()> {
-        ctx.check_output_rows(rows)?;
-        self.reserve_rows(ctx, rows)
-    }
-    fn check_output(&self, ctx: &Ctx) -> Result<()> {
-        ctx.check_output_rows(self.table.len())
-    }
-}
-
 /// Append the scan's rows with keys in `[lo, hi]`, stopping at the row limit.
-fn scan_into<T: ScanSink>(
+fn scan_into(
     ctx: &Ctx,
     spec: &ScanSpec,
     lo: crate::index::Key,
     hi: crate::index::Key,
     limit: Option<usize>,
-    t: &mut T,
+    t: &mut Materialized<'_>,
 ) -> Result<bool> {
     let limit = limit.unwrap_or(usize::MAX);
     let mut truncated = false;
     let mut last: Option<[u64; 4]> = None;
     let mut n = 0usize;
-    let mut row = |k: &[u64; 4], t: &mut T| -> Result<()> {
-        if t.table().len >= limit || !spec.graph.accepts(k[spec.graph_col]) {
+    let mut row = |k: &[u64; 4], t: &mut Materialized<'_>| -> Result<()> {
+        if t.table.len >= limit || !spec.graph.accepts(k[spec.graph_col]) {
             return Ok(());
         }
         if spec.eqs.iter().any(|&(a, b)| k[a] != k[b]) {
@@ -4185,12 +4337,13 @@ fn scan_into<T: ScanSink>(
             last = Some(proj);
         }
         let rows = t
-            .table()
+            .table
             .len
             .checked_add(1)
             .ok_or_else(|| Error::invalid("scan output rows overflow"))?;
-        t.prepare(ctx, rows)?;
-        let table = t.table_mut();
+        ctx.check_output_rows(rows)?;
+        t.reserve_rows(ctx, rows)?;
+        let table = &mut t.table;
         for (c, &(kc, _)) in spec.cols.iter().enumerate() {
             table.cols[c].push(Id(k[kc]));
         }
@@ -4199,20 +4352,21 @@ fn scan_into<T: ScanSink>(
     };
     ctx.snap
         .scan_between_cols(spec.perm, lo, hi, scan_mask(spec), |chunk| {
-            if t.table().len >= limit {
+            if t.table.len >= limit {
                 truncated = true;
                 return Ok(false);
             }
             match chunk {
                 Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
-                    let e = e.min(s.saturating_add(limit - t.table().len));
+                    let e = e.min(s.saturating_add(limit - t.table.len));
                     let rows = t
-                        .table()
+                        .table
                         .len
                         .checked_add(e - s)
                         .ok_or_else(|| Error::invalid("scan output rows overflow"))?;
-                    t.prepare(ctx, rows)?;
-                    let table = t.table_mut();
+                    ctx.check_output_rows(rows)?;
+                    t.reserve_rows(ctx, rows)?;
+                    let table = &mut t.table;
                     for (c, &(kc, _)) in spec.cols.iter().enumerate() {
                         table.cols[c].extend(b.cols[kc][s..e].iter().map(|&x| Id(x)));
                     }
@@ -4233,9 +4387,9 @@ fn scan_into<T: ScanSink>(
             if n > 1 << 16 {
                 n = 0;
                 ctx.check()?;
-                t.check_output(ctx)?;
+                ctx.check_output_rows(t.table.len())?;
             }
-            if t.table().len >= limit {
+            if t.table.len >= limit {
                 truncated = true;
                 return Ok(false);
             }
@@ -5682,21 +5836,69 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
     }))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Count of admitted `prefetch_column_terms` ID-vector allocations on this thread
+    /// (for tests that verify budget-checked admission and scalar fallback).
+    static PREFETCH_COLUMN_TERMS_ALLOCATED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Count of admitted `prefetch_column_terms` mapped block-index resizes on this thread.
+    static PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
-/// (see [`decode_for`]).
+/// (see [`decode_for`]). The optional scratch vector is admitted first and skipped if
+/// the remaining memory budget cannot hold it.
 fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
-    let mut ids: Vec<u64> = vars
+    let count: usize = vars
         .iter()
         .filter_map(|&v| t.col_of(v))
-        .flat_map(|c| t.cols[c].iter())
-        .filter(|id| id.tag() == crate::id::Tag::Vocab)
-        .map(|id| id.payload())
-        .collect();
+        .map(|c| {
+            t.cols[c]
+                .iter()
+                .filter(|id| id.tag() == crate::id::Tag::Vocab)
+                .count()
+        })
+        .sum();
+    if count < 2 {
+        return;
+    }
+    let Some(ids_bytes) = count
+        .checked_mul(size_of::<u64>())
+        .and_then(|b| u64::try_from(b).ok())
+    else {
+        return;
+    };
+    let Ok(scratch) = ctx.charge(ids_bytes) else {
+        return;
+    };
+    #[cfg(test)]
+    PREFETCH_COLUMN_TERMS_ALLOCATED.with(|n| n.set(n.get() + 1));
+    let mut ids = Vec::with_capacity(count);
+    ids.extend(
+        vars.iter()
+            .filter_map(|&v| t.col_of(v))
+            .flat_map(|c| t.cols[c].iter())
+            .filter(|id| id.tag() == crate::id::Tag::Vocab)
+            .map(|id| id.payload()),
+    );
     ids.sort_unstable();
     ids.dedup();
     if ids.len() >= 2 {
-        ctx.snap.generation.vocab.prefetch_value_pages(&ids);
+        let _ = ctx
+            .snap
+            .generation
+            .vocab
+            .prefetch_value_pages_checked(&ids, |block_bytes| {
+                scratch.resize(ids_bytes.saturating_add(block_bytes as u64))?;
+                #[cfg(test)]
+                PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|n| n.set(n.get() + 1));
+                Ok(())
+            });
     }
+    drop(ids);
+    drop(scratch);
 }
 
 /// Keep the rows that pass every conjunct: EXISTS conjuncts answered from a key set
@@ -9358,7 +9560,13 @@ pub(super) fn vector_search(
             subjects: subjects.as_deref(),
             mode: spec.mode,
         };
-        let (hits, info) = vector::search(&ctx.snap, &q, &|| ctx.check())?;
+        let mut search_charge = ctx.retained_charge(0)?;
+        let (hits, info) = vector::search_with_admit(&ctx.snap, &q, &|| ctx.check(), &mut |b| {
+            if let Some(h) = &mut search_charge {
+                h.resize(b)?;
+            }
+            Ok(())
+        })?;
         searches += 1;
         match &mut info_all {
             None => info_all = Some(info),
@@ -9445,6 +9653,137 @@ pub(super) fn vector_search(
         counters.insert("searches".into(), searches.into());
     }
     Ok((t, counters))
+}
+
+pub(super) type ChargedVectorOrder = (Table, super::ctx::OwnedCharge, Counters);
+
+/// Cursor entry for [`Kind::VectorSearch`] with `order_fallback`: pre-admits search
+/// scratch and builds the projected output table directly under an [`OwnedCharge`]
+/// before returning so the caller never holds an uncharged table or marks the generic
+/// child skipped before admission succeeds.
+pub(super) fn vector_search_order_charged(
+    ctx: &std::sync::Arc<Ctx>,
+    spec: &super::plan::VectorSpec,
+    node_vars: &[VarId],
+    out_vars: &[VarId],
+) -> Result<Option<ChargedVectorOrder>> {
+    use super::plan::VectorQuery;
+    use crate::vector;
+    let mut counters = serde_json::Map::new();
+    let Some(pred) = spec.pred else {
+        return Ok(None);
+    };
+    let query = match &spec.query {
+        VectorQuery::Vector(v) => v.to_vec(),
+        VectorQuery::Text(s) => text_vector(ctx, pred, s)?.to_vec(),
+        VectorQuery::Entity(e) => match entity_vector(ctx, spec, pred, *e)? {
+            Some(v) => v,
+            None => return Ok(None),
+        },
+        VectorQuery::Var(_) => {
+            return Err(Error::invalid(
+                "spk:vectorSearch: the query variable is not bound by the rest of the group",
+            ));
+        }
+    };
+    let graph = |g: u64| spec.graph.accepts(g);
+    let q = vector::Search {
+        pred: pred.0,
+        query: &query,
+        k: spec.k,
+        metric: spec.metric,
+        graph: &graph,
+        dedup: spec.dedup,
+        distinct_subject: spec.distinct_subject,
+        subjects: None,
+        mode: spec.mode,
+    };
+    let mut scratch = super::ctx::OwnedCharge::new(ctx, 0)?;
+    let (hits, info) =
+        vector::search_with_admit(&ctx.snap, &q, &|| ctx.check(), &mut |b| scratch.resize(b))?;
+    let col = |v: Option<VarId>| v.and_then(|v| node_vars.iter().position(|x| *x == v));
+    let cs = match spec.subject {
+        PathEnd::Var(v) => col(Some(v)),
+        _ => None,
+    };
+    let (cscore, cvec, cg) = (col(spec.score), col(spec.vector), col(spec.graph_var));
+    let est = (hits.len() as u64)
+        .saturating_mul(node_vars.len() as u64 * 8)
+        .max(hits.len() as u64 * 8 * u64::from(node_vars.is_empty()))
+        .saturating_add(node_vars.len() as u64 * 4);
+    ctx.check_output(hits.len(), node_vars.len())?;
+    let mut out_charge = super::ctx::OwnedCharge::new(ctx, est)?;
+    let mut t = Table::new(node_vars.to_vec());
+    for col in &mut t.cols {
+        col.reserve_exact(hits.len());
+    }
+    let mut row = vec![Id::UNDEF; node_vars.len()];
+    let fill = |row: &mut Vec<Id>, h: &vector::Hit| -> bool {
+        let mut set = |c: Option<usize>, id: Id| -> bool {
+            match c {
+                Some(c) if row[c] != Id::UNDEF && row[c] != id => false,
+                Some(c) => {
+                    row[c] = id;
+                    true
+                }
+                None => true,
+            }
+        };
+        let score = Id::from_f64(h.score as f64)
+            .unwrap_or_else(|| ctx.intern_value(&Value::Double((h.score as f64).into())));
+        set(cs, Id(h.s)) && set(cscore, score) && set(cvec, Id(h.o)) && set(cg, Id(h.g))
+    };
+    for h in &hits {
+        if let PathEnd::Const(s) = spec.subject
+            && s.0 != h.s
+        {
+            continue;
+        }
+        row.fill(Id::UNDEF);
+        if fill(&mut row, h) {
+            t.push_row(&row);
+        }
+    }
+    drop(hits);
+    drop(scratch);
+    if t.len() < spec.k {
+        return Ok(None);
+    }
+    let t = if node_vars == out_vars {
+        t
+    } else {
+        let proj_est = (t.len() as u64)
+            .saturating_mul(out_vars.len() as u64 * 8)
+            .max(t.len() as u64 * 8 * u64::from(out_vars.is_empty()))
+            .saturating_add(out_vars.len() as u64 * 4);
+        out_charge.resize(est.saturating_add(proj_est))?;
+        t.project(out_vars)
+    };
+    let actual: u64 = t
+        .cols
+        .iter()
+        .map(|c| c.capacity() as u64 * 8)
+        .sum::<u64>()
+        .max(t.len as u64 * 8 * u64::from(t.width() == 0))
+        .saturating_add(t.vars.capacity() as u64 * 4)
+        .saturating_add(t.sorted.capacity() as u64 * 4);
+    out_charge.resize(actual)?;
+    counters.insert("method".into(), info.method.into());
+    if let Some(r) = info.reason {
+        counters.insert("exactBecause".into(), r.into());
+    }
+    if let Some(n) = info.index {
+        counters.insert("index".into(), n.into());
+    }
+    if info.ef > 0 {
+        counters.insert("ef".into(), info.ef.into());
+    }
+    counters.insert("rows".into(), info.rows.into());
+    counters.insert("scored".into(), info.scored.into());
+    counters.insert("overlayInserts".into(), info.inserted.into());
+    counters.insert("overlayPending".into(), info.pending.into());
+    counters.insert("overlayDeletes".into(), info.deleted.into());
+    Ok(Some((t, out_charge, counters)))
 }
 
 // ---------------------------------------------------------------- service ------
@@ -10287,6 +10626,584 @@ mod path_lookup_tests {
 mod paid_eager_producer_tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn r2_topk_scan_refuses_numeric_ties_and_delta_before_the_full_read() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, update::update};
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..512)
+            .map(|i| format!("<urn:tie:{i}> <urn:p> 42 .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let data = (0..512)
+            .map(|i| format!("<urn:delta:{i}> <urn:p> \"value-{i}\" .\n"))
+            .collect::<String>();
+        update(
+            &store,
+            &format!("INSERT DATA {{ {data} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 512;
+        let pred = ctx.snap.lookup_iri("urn:p").unwrap();
+        let scan = ScanSpec {
+            perm: Perm::Pos,
+            prefix: vec![pred.0],
+            cols: vec![(1, 0), (2, 1)],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let spec = OrderedTopK {
+            scan,
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: Vec::new(),
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+        let tied = ctx
+            .snap
+            .lookup_term(&oxrdf::Literal::from(42_i64).into())
+            .unwrap();
+        let delta = ctx
+            .snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal("value-0").into())
+            .unwrap();
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(delta.tag(), payload).0);
+        for (lower, upper) in [(tied.0, tied.0), (lo, hi)] {
+            let err = topk_read(&ctx, &spec, lower, upper, true, &[0, 1])
+                .err()
+                .unwrap();
+            assert!(matches!(
+                err,
+                Error::BudgetExceeded(b) if b.kind == crate::error::BudgetKind::Memory && b.requested > 512
+            ));
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn r3_topk_residual_range_filter_refuses_before_copying_delta_rows() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, expr::CmpOp, update::update};
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:base> <urn:p> \"9999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                    .to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let data = (0..512)
+            .map(|i| {
+                format!(
+                    "<urn:delta:{i}> <urn:p> \"{i}.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                )
+            })
+            .collect::<String>();
+        update(
+            &store,
+            &format!("INSERT DATA {{ {data} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_some());
+        let probe = Ctx::new(snap.clone());
+        let pred = probe.snap.lookup_iri("urn:p").unwrap();
+        let delta = probe
+            .snap
+            .lookup_term(&oxrdf::Literal::from(0.5_f32).into())
+            .unwrap();
+        assert_eq!(delta.tag(), crate::id::Tag::Delta);
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(delta.tag(), payload).0);
+        let threshold = Id::from_i64(100).unwrap();
+        let spec = OrderedTopK {
+            scan: ScanSpec {
+                perm: Perm::Pos,
+                prefix: vec![pred.0],
+                cols: vec![(1, 0), (2, 1)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            },
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![Expr::Cmp(
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(threshold)),
+                CmpOp::Ge,
+            )],
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+
+        // Measure the raw delta table's admitted charge with no residual copy.
+        let (raw, scanned) = topk_read(&probe, &spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, 512);
+        let raw_bytes = probe.live_bytes();
+        drop(raw);
+        assert_eq!(probe.live_bytes(), 0);
+
+        // Allow the raw table plus `decided`/`keep`/`rest`, but not the residual `sub` table copy.
+        let mut tight = Ctx::new(snap.clone());
+        let scratch_without_copy = 512u64 * (1 + 1 + size_of::<usize>() as u64);
+        tight.mem_limit = raw_bytes + scratch_without_copy + 256;
+        let err = topk_read(&tight, &spec, lo, hi, false, &[0, 1])
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory && b.requested > tight.mem_limit
+        ));
+        assert_eq!(tight.live_bytes(), 0);
+
+        // With room for the residual copy, the non-exact range filter keeps the 412 matching rows.
+        let ok_ctx = Ctx::new(snap);
+        let (filtered, scanned) = topk_read(&ok_ctx, &spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, 512);
+        assert_eq!(filtered.table.len(), 412);
+        let before_drop = ok_ctx.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ok_ctx.live_bytes(), raw_bytes);
+    }
+
+    #[test]
+    fn r4_topk_parallel_range_filter_admits_disjoint_decisions() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, expr::CmpOp, update::update};
+        use oxrdfio::RdfFormat;
+
+        let n = PAR_THRESHOLD + 64;
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:base> <urn:p> \"999999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                    .to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let data = (0..n)
+            .map(|i| {
+                format!(
+                    "<urn:delta:{i}> <urn:p> \"{i}.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                )
+            })
+            .collect::<String>();
+        update(
+            &store,
+            &format!("INSERT DATA {{ {data} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_some());
+        let probe = Ctx::new(snap.clone());
+        let pred = probe.snap.lookup_iri("urn:p").unwrap();
+        let delta = probe
+            .snap
+            .lookup_term(&oxrdf::Literal::from(0.5_f32).into())
+            .unwrap();
+        assert_eq!(delta.tag(), crate::id::Tag::Delta);
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(delta.tag(), payload).0);
+        let threshold = Id::from_i64(100).unwrap();
+        let spec = OrderedTopK {
+            scan: ScanSpec {
+                perm: Perm::Pos,
+                prefix: vec![pred.0],
+                cols: vec![(1, 0), (2, 1)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            },
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![Expr::Cmp(
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(threshold)),
+                CmpOp::Ge,
+            )],
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+
+        let (raw, scanned) = topk_read(&probe, &spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        let raw_bytes = probe.live_bytes();
+
+        let decided_bytes = n as u64 * size_of::<Option<bool>>() as u64;
+        let keep_bytes = n as u64 * size_of::<bool>() as u64;
+        let rest_bytes = n as u64 * size_of::<usize>() as u64;
+        let sub_bytes = topk_table_bytes(n, 2);
+        let mask_bytes = (n * size_of::<bool>()
+            + probe.nvars() * size_of::<Option<usize>>()
+            + size_of::<&Expr>()) as u64;
+
+        // Direct Phase 1 & Phase 2 checks on the already-scanned table (so `scan_into`'s
+        // power-of-two doubling peak cannot mask the exact Phase 1/2 boundaries):
+        // 1 byte below Phase 1 (`decided` disjoint output slice) refuses cleanly.
+        let mut p1 = Ctx::new(snap.clone());
+        p1.mem_limit = raw_bytes + decided_bytes - 1;
+        let held = p1.charge(raw_bytes).unwrap();
+        let mut tbl = raw.table.clone();
+        let err = apply_range_filter(&p1, &mut tbl, 0, &spec.range_filter)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory
+                    && b.requested == raw_bytes + decided_bytes
+        ));
+        drop(held);
+        assert_eq!(p1.live_bytes(), 0);
+
+        // Room for a single `decided` copy passes Phase 1 (no extra Rayon collector copy)
+        // and refuses at Phase 2 (`decided + keep + rest`).
+        let mut p2 = Ctx::new(snap.clone());
+        p2.mem_limit = raw_bytes + decided_bytes + 512;
+        let held = p2.charge(raw_bytes).unwrap();
+        let mut tbl = raw.table.clone();
+        let err = apply_range_filter(&p2, &mut tbl, 0, &spec.range_filter)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory
+                    && b.requested == raw_bytes + decided_bytes + keep_bytes + rest_bytes
+        ));
+        drop(held);
+        assert_eq!(p2.live_bytes(), 0);
+        drop(raw);
+        assert_eq!(probe.live_bytes(), 0);
+
+        // End-to-end `topk_read` 1 byte below Phase 3 (`keep + rest + sub + mask`) passes
+        // `scan_into`, Phase 1 parallel slices, and Phase 2, then refuses before copying `sub`.
+        let mut p3 = Ctx::new(snap.clone());
+        let p3_peak = raw_bytes + keep_bytes + rest_bytes + sub_bytes + mask_bytes;
+        p3.mem_limit = p3_peak - 1;
+        let err = topk_read(&p3, &spec, lo, hi, false, &[0, 1]).err().unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory && b.requested == p3_peak
+        ));
+        assert_eq!(p3.live_bytes(), 0);
+
+        // With room for the residual copy, all `n - 100` matching rows survive.
+        let ok_ctx = Ctx::new(snap);
+        let (filtered, scanned) = topk_read(&ok_ctx, &spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.len(), n - 100);
+        let before_drop = ok_ctx.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ok_ctx.live_bytes(), raw_bytes);
+    }
+
+    #[test]
+    fn r4_filter_vocabulary_prefetch_admits_or_skips_under_tight_budget() {
+        use crate::io::Source;
+        use crate::sparql::expr::CmpOp;
+        use crate::vocab::numeric::Numeric;
+        use oxrdfio::RdfFormat;
+
+        let n = 2048usize;
+        let half = n / 2;
+        let dir = tempfile::tempdir().unwrap();
+        // Use a disk-backed store so the base vocabulary is file-mapped (`Bytes::Map`)
+        // and exercises `prefetch_sorted_checked`'s block-index admission callback.
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        // Include one packed float on an unrelated predicate so `vocab.num` is built, plus
+        // 2,048 21-digit decimals (half negative, half positive) that exceed both inline
+        // Tag::Decimal and vocab.num's 58-bit packed mantissa so they remain Tag::Vocab +
+        // Numeric::Unknown and reach the residual filter + prefetch path.
+        let mut data = String::from(
+            "<urn:base> <urn:other> \"999999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n",
+        );
+        for i in 0..half {
+            data.push_str(&format!(
+                "<urn:dec:neg:{i}> <urn:p> \"-100000000000000000000.{i:04}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
+            ));
+        }
+        for i in 0..(n - half) {
+            data.push_str(&format!(
+                "<urn:dec:pos:{i}> <urn:p> \"100000000000000000000.{i:04}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let num = snap
+            .generation
+            .vocab
+            .numeric()
+            .expect("base vocab numeric column");
+        let decimal_dt =
+            oxrdf::NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#decimal");
+        let neg_sample = snap
+            .lookup_term(
+                &oxrdf::Literal::new_typed_literal(
+                    "-100000000000000000000.0000",
+                    decimal_dt.clone(),
+                )
+                .into(),
+            )
+            .unwrap();
+        let pos_sample = snap
+            .lookup_term(
+                &oxrdf::Literal::new_typed_literal("100000000000000000000.0000", decimal_dt).into(),
+            )
+            .unwrap();
+        assert_eq!(neg_sample.tag(), crate::id::Tag::Vocab);
+        assert_eq!(pos_sample.tag(), crate::id::Tag::Vocab);
+        assert_eq!(
+            num.get_many(&[neg_sample.payload(), pos_sample.payload()]),
+            vec![Numeric::Unknown, Numeric::Unknown]
+        );
+
+        let make_ctx = || {
+            let ctx = Ctx::new(snap.clone());
+            assert_eq!(ctx.var("v"), 0);
+            assert_eq!(ctx.var("s"), 1);
+            ctx
+        };
+        let probe = make_ctx();
+        let pred = probe.snap.lookup_iri("urn:p").unwrap();
+        let [lo, hi] =
+            [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(pos_sample.tag(), payload).0);
+        let threshold = Id::from_i64(0).unwrap();
+        let filter_expr = Expr::Cmp(
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Const(threshold)),
+            CmpOp::Ge,
+        );
+        let base_scan = || ScanSpec {
+            perm: Perm::Pos,
+            prefix: vec![pred.0],
+            cols: vec![(1, 0), (2, 1)],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let raw_spec = OrderedTopK {
+            scan: base_scan(),
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: Vec::new(),
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+        let generic_spec = OrderedTopK {
+            scan: base_scan(),
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: vec![filter_expr.clone()],
+            range_filter: Vec::new(),
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+        let range_spec = OrderedTopK {
+            scan: base_scan(),
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![filter_expr],
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+
+        let (raw, scanned) = topk_read(&probe, &raw_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        let raw_bytes = probe.live_bytes();
+        assert_eq!(probe.mem_peak(), raw_bytes);
+
+        // Compute the expected surviving rows once under an unconstrained budget.
+        let baseline_ctx = make_ctx();
+        let (baseline, scanned) =
+            topk_read(&baseline_ctx, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        let expected_kept = baseline.table.cols[0].clone();
+        assert_eq!(expected_kept.len(), n - half);
+        assert!(expected_kept.contains(&pos_sample));
+        assert!(!expected_kept.contains(&neg_sample));
+        drop(baseline);
+
+        let ids_count = || PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        let blocks_count = || PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|c| c.get());
+        let io_hints = crate::index::io_hints();
+        let ids_bytes = (n * size_of::<u64>()) as u64;
+        let blocks_bytes = (n * size_of::<usize>()) as u64;
+
+        // Direct check 1: 1 byte below `ids_bytes` skips the ID vector and block-index hint.
+        let mut tight_ids = make_ctx();
+        tight_ids.mem_limit = ids_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        prefetch_column_terms(&tight_ids, &raw.table, &[0]);
+        assert_eq!(ids_count(), before_ids);
+        assert_eq!(blocks_count(), before_blocks);
+        assert_eq!(tight_ids.mem_peak(), 0);
+        assert_eq!(tight_ids.live_bytes(), 0);
+
+        // Direct check 2: room for `ids_bytes` alone (1 byte below `ids_bytes + blocks_bytes`)
+        // admits the ID vector, refuses the mapped block-index vector, and releases cleanly.
+        let mut ids_only = make_ctx();
+        ids_only.mem_limit = ids_bytes + blocks_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        prefetch_column_terms(&ids_only, &raw.table, &[0]);
+        assert_eq!(ids_count(), before_ids + 1);
+        assert_eq!(blocks_count(), before_blocks);
+        assert_eq!(ids_only.mem_peak(), ids_bytes);
+        assert_eq!(ids_only.live_bytes(), 0);
+
+        // Direct check 3: exact room for both ID and mapped block-index vectors admits both
+        // (when I/O hints are enabled) and releases cleanly.
+        let mut both_direct = make_ctx();
+        both_direct.mem_limit = ids_bytes + blocks_bytes;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        prefetch_column_terms(&both_direct, &raw.table, &[0]);
+        assert_eq!(ids_count(), before_ids + 1);
+        if io_hints {
+            assert_eq!(blocks_count(), before_blocks + 1);
+            assert_eq!(both_direct.mem_peak(), ids_bytes + blocks_bytes);
+        } else {
+            assert_eq!(blocks_count(), before_blocks);
+            assert_eq!(both_direct.mem_peak(), ids_bytes);
+        }
+        assert_eq!(both_direct.live_bytes(), 0);
+
+        drop(raw);
+        assert_eq!(probe.live_bytes(), 0);
+
+        // Generic top-k filter entry point (`topk_read_keys_last` with non-empty `spec.filter`):
+        // verify exact scalar results on ID refusal, on block-index refusal, and when both
+        // prefetch vectors are admitted.
+        let filter_scratch = (n as u64).saturating_add(
+            (probe.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        );
+
+        // Generic top-k case 1: 1 byte below `ids_bytes` skips prefetch and keeps exact scalar
+        // results within budget.
+        let mut tight_ids_topk = make_ctx();
+        tight_ids_topk.opt.prefetch_terms = true;
+        tight_ids_topk.mem_limit = raw_bytes + filter_scratch + ids_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        let (filtered, scanned) =
+            topk_read(&tight_ids_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        assert_eq!(ids_count(), before_ids);
+        assert_eq!(blocks_count(), before_blocks);
+        assert!(tight_ids_topk.mem_peak() <= tight_ids_topk.mem_limit);
+        let before_drop = tight_ids_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - tight_ids_topk.live_bytes(), raw_bytes);
+
+        // Generic top-k case 2: room for `ids_bytes` alone admits IDs, refuses the mapped
+        // block-index resize, and still returns exact scalar results.
+        let mut ids_only_topk = make_ctx();
+        ids_only_topk.opt.prefetch_terms = true;
+        ids_only_topk.mem_limit = raw_bytes + filter_scratch + ids_bytes + blocks_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        let (filtered, scanned) =
+            topk_read(&ids_only_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        if io_hints {
+            assert_eq!(ids_count(), before_ids + 1);
+            assert_eq!(blocks_count(), before_blocks);
+            assert!(ids_only_topk.mem_peak() >= raw_bytes + filter_scratch + ids_bytes);
+            assert!(ids_only_topk.mem_peak() <= ids_only_topk.mem_limit);
+        } else {
+            assert_eq!(ids_count(), before_ids);
+            assert_eq!(blocks_count(), before_blocks);
+        }
+        let before_drop = ids_only_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ids_only_topk.live_bytes(), raw_bytes);
+
+        // Generic top-k case 3: exact room for both ID and mapped block-index vectors admits
+        // both through `topk_read` -> `apply_filter` -> `decode_for` -> `prefetch_column_terms`.
+        let mut both_topk = make_ctx();
+        both_topk.opt.prefetch_terms = true;
+        both_topk.mem_limit = raw_bytes + filter_scratch + ids_bytes + blocks_bytes;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        let (filtered, scanned) =
+            topk_read(&both_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        if io_hints {
+            assert_eq!(ids_count(), before_ids + 1);
+            assert_eq!(blocks_count(), before_blocks + 1);
+            assert_eq!(
+                both_topk.mem_peak(),
+                raw_bytes + filter_scratch + ids_bytes + blocks_bytes
+            );
+        } else {
+            assert_eq!(ids_count(), before_ids);
+            assert_eq!(blocks_count(), before_blocks);
+        }
+        let before_drop = both_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - both_topk.live_bytes(), raw_bytes);
+
+        // End-to-end `topk_read` (`exact = false`) over the 2,048 `Numeric::Unknown` base
+        // decimals keeps the exact positive half and releases the table charge cleanly.
+        let ok_topk = make_ctx();
+        let (filtered, scanned) = topk_read(&ok_topk, &range_spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        let before_drop = ok_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ok_topk.live_bytes(), raw_bytes);
+    }
 
     #[test]
     fn eager_and_nested_limited_slice_keep_prepaid_columns_without_ledger() {

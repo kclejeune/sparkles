@@ -24,6 +24,8 @@ pub mod column;
 #[cfg(feature = "geo")]
 pub mod convert;
 #[cfg(feature = "geo")]
+pub(crate) mod cursor;
+#[cfg(feature = "geo")]
 pub mod exec;
 #[cfg(feature = "geo")]
 pub mod functions;

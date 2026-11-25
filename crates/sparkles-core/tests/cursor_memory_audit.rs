@@ -223,12 +223,11 @@ const FIXTURES: &[(&str, &str, &str, bool)] = &[
         "Limit",
         true,
     ),
-    // item 1189: a path search under a cursor runs as a materialized fallback
     (
         "path search",
         "PREFIX path: <urn:x-sparkles:path#> SELECT ?b ?p { SERVICE path:search { [] path:source <urn:c:0> ; path:target ?b ; path:predicate <urn:n> ; path:algorithm path:all ; path:maxLength 3000 ; path:pathIndex ?p } }",
         "PathSearch",
-        false,
+        true,
     ),
 ];
 
@@ -343,11 +342,6 @@ fn allowance(name: &str) -> Allowance {
         // item 1188: a transitive path holds state outside its ledger inside a pull
         "transitive path" => Allowance {
             under: 52 * K,
-            ..exact
-        },
-        // item 1189: a path search under a cursor holds its search outside its ledger
-        "path search" => Allowance {
-            under: 360 * K,
             ..exact
         },
         // items 1190 and 1192: the streamed change-log reader stays within its ledger
@@ -986,4 +980,199 @@ fn meter_race(site: usize) -> bool {
     heap::HOOK.store(0, Ordering::SeqCst);
     other.join().unwrap();
     moved
+}
+
+#[test]
+fn native_backward_search_admits_a_wide_filtered_frontier() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("<urn:root> <urn:p> <urn:mid:00000> .\n");
+    for i in 0..4096 {
+        data.push_str(&format!("<urn:mid:{i:05}> <urn:p> <urn:target> .\n"));
+    }
+    data.push_str("<urn:mid:04095> <urn:p> <urn:dead:1>, <urn:dead:2>, <urn:dead:3> .\n");
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "PREFIX path: <urn:x-sparkles:path#> SELECT ?i { SERVICE path:search { [] path:source <urn:root> ; path:target <urn:target> ; path:predicate <urn:p> ; path:algorithm path:all ; path:maxLength 2 ; path:maxDegree 2 ; path:pathIndex ?i } }";
+    let _ = run(&s, q, false, 1);
+    let audit = run(&s, q, false, 1);
+    assert_eq!(audit.rows, 1);
+    target(&audit.plan, "PathSearch", true).unwrap();
+    let failures = audit.check("backward path frontier", &Allowance::EXACT);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn native_vector_order_admits_exact_partitions() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let data = (0..16_400)
+        .map(|i| format!("<urn:s:{i}> <urn:v> \"[1,0,0]\"^^<urn:x-sparkles:vector> .\n"))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "PREFIX spk: <urn:x-sparkles:> SELECT ?s { ?s <urn:v> ?v } ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 2";
+    // Keep the value cache reservation step smaller than the audit tolerance.
+    let _ = run_under(&s, q, false, 1, 512 << 10, None);
+    let audit = run_under(&s, q, false, 1, 512 << 10, None);
+    assert_eq!(audit.rows, 2);
+    target(&audit.plan, "VectorSearch", true).unwrap();
+    let plan = serde_json::from_str(&audit.plan).unwrap();
+    assert!(nodes(&plan).into_iter().any(|node| {
+        node["operator"]["operator"] == "VectorSearch"
+            && node["operator"]["counters"]["method"] == "exact"
+            && node["operator"]["counters"]["scored"] == 16_400
+    }));
+    let failures = audit.check("exact VectorOrder", &Allowance::EXACT);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_constant_relation_keeps_its_input_charged_until_the_first_witness() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+    for i in 0..1000 {
+        data.push_str(&format!(
+            "<urn:a> geo:hasDefaultGeometry <urn:g:{i}> .\n<urn:g:{i}> geo:asWKT \"POLYGON((0 0, {} 0, {} 10, 0 10, 0 0))\"^^geo:wktLiteral .\n\
+             <urn:b> geo:asWKT \"POINT(1.{i:04} 1)\"^^geo:wktLiteral .\n",
+            i + 3, i + 3
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        query_rewrite: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> SELECT * { <urn:a> geo:sfIntersects <urn:b> } LIMIT 1";
+    // Tighten the ordinary cache reservation steps for this small result.
+    let _ = run_under(&s, q, false, 1, 512 << 10, None);
+    let audit = run_under(&s, q, false, 1, 512 << 10, None);
+    assert_eq!(audit.rows, 1);
+    target(&audit.plan, "SpatialRelate", true).unwrap();
+    let failures = audit.check("both-constant SpatialRelate", &Allowance::EXACT);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_constant_basic_geo_keeps_longitude_scratch_bounded() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from(
+        "@prefix wgs: <http://www.w3.org/2003/01/geo/wgs84_pos#> .\n<urn:point> wgs:lat 1 .\n",
+    );
+    for i in 0..6000 {
+        data.push_str(&format!("<urn:point> wgs:long 1.{i:04} .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        wgs84: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX spatial: <http://jena.apache.org/spatial#> SELECT * { <urn:point> spatial:withinBox(0 0 10 10) }";
+    let _ = run_under(&s, q, false, 1, 512 << 10, None);
+    let audit = run_under(&s, q, false, 1, 512 << 10, None);
+    assert_eq!(audit.rows, 1);
+    target(&audit.plan, "SpatialPf", true).unwrap();
+    let failures = audit.check("constant-subject Basic Geo", &Allowance::EXACT);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_one_constant_relation_admits_lit_pass_memo() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+    for i in 0..4000 {
+        data.push_str(&format!(
+            "<urn:p:{i}> geo:asWKT \"POINT(5.{i:04} 5)\"^^geo:wktLiteral .\n"
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        query_rewrite: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> SELECT ?s { ?s geo:sfIntersects \"POLYGON((0 0, 10 0, 10 1, 1 1, 1 10, 0 10, 0 0))\"^^geo:wktLiteral }";
+    let _ = run_under(&s, q, false, 1, 512 << 10, None);
+    let audit = run_under(&s, q, false, 1, 512 << 10, None);
+    assert_eq!(audit.rows, 0);
+    target(&audit.plan, "SpatialRelate", true).unwrap();
+    let failures = audit.check(
+        "one-constant SpatialRelate lit_pass memo",
+        &Allowance::EXACT,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_one_constant_relation_fallback_admits_key_chunk() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+    for i in 0..4096 {
+        data.push_str(&format!(
+            "<urn:p:{i}> geo:asWKT \"POINT(5.{:04} 5)\"^^geo:wktLiteral .\n",
+            i % 64
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    // `geo:sfDisjoint` is not index-usable, so SpatialRelate takes the `OneConstCand::Scan`
+    // fallback arm with a 4,096-key chunk pull while every point lies inside the query polygon.
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        query_rewrite: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> SELECT ?s { ?s geo:sfDisjoint \"POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))\"^^geo:wktLiteral }";
+    let _ = run_under(&s, q, false, 4096, 512 << 10, None);
+    let audit = run_under(&s, q, false, 4096, 512 << 10, None);
+    assert_eq!(audit.rows, 0);
+    target(&audit.plan, "SpatialRelate", true).unwrap();
+    let plan = serde_json::from_str(&audit.plan).unwrap();
+    assert!(nodes(&plan).into_iter().any(|node| {
+        node["operator"]["operator"] == "SpatialRelate"
+            && node["operator"]["counters"]["candidates"] == 4096
+            && node["operator"]["counters"]["treeNodesVisited"] == 0
+    }));
+    let failures = audit.check(
+        "one-constant SpatialRelate fallback scan",
+        &Allowance::EXACT,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
