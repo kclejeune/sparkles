@@ -88,7 +88,8 @@ impl Saturation {
             .filter_map(|e| class_of(e).map(|k| (e, k)))
             .collect();
         let individuals = || -> Vec<(Ex, NamedIndividual)> {
-            self.interner
+            let mut out: Vec<(Ex, NamedIndividual)> = self
+                .interner
                 .individuals
                 .iter()
                 .enumerate()
@@ -98,7 +99,18 @@ impl Saturation {
                         .map(|e| (e, n.clone()))
                 })
                 .filter(|(e, _)| self.named_subsumers(*e).is_some())
-                .collect()
+                .collect();
+            if let Some(canon) = &self.interner.canon {
+                for (alias, rep) in canon.iter() {
+                    if let Some(id) = self.interner.individuals.get(rep)
+                        && let Some(e) = self.interner.get(&Node::Nominal(id))
+                        && self.named_subsumers(e).is_some()
+                    {
+                        out.push((e, alias.clone()));
+                    }
+                }
+            }
+            out
         };
         let unsatisfiable = |e: Ex| self.named_subsumers(e).is_some_and(|(b, _)| b);
         if !self.consistent {
@@ -108,6 +120,7 @@ impl Saturation {
             eq.retain(|k| k != c);
             let mut is: Vec<NamedIndividual> = individuals().into_iter().map(|(_, i)| i).collect();
             is.sort();
+            is.dedup();
             return Some(Description {
                 satisfiable: false,
                 equivalents: sorted(eq),
@@ -207,6 +220,7 @@ impl Saturation {
         let classes = |es: &[Ex]| sorted(es.iter().filter_map(|e| class_of(*e)).collect());
         let mut instances = instances;
         instances.sort();
+        instances.dedup();
         Some(Description {
             satisfiable: true,
             equivalents: classes(&equivalents),

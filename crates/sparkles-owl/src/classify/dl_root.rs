@@ -562,6 +562,14 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
             x.store.interrupted = true;
             break;
         }
+        if max_guard.dl().merge_enabled()
+            && const_eq(&max_guard, &x.store.clauses[id as usize].c, inv).is_some()
+        {
+            if !harvest_and_halt_merge(x, inv, &mut max_guard) {
+                x.store.interrupted = true;
+            }
+            break;
+        }
         let c_bytes = {
             let c = &x.store.clauses[id as usize].c;
             (c.body().len() + c.head().len()) * std::mem::size_of::<Lit>()
@@ -588,6 +596,101 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         }
     }
     n
+}
+
+/// Returns `(min(u, v), max(u, v))` when `c` is an unconditional root unit constant
+/// equality `⊤ → u ≈ v` with `u != v` and neither constant skipped by `DlRun::merge_skip`.
+/// Strictly rejects non-empty bodies, disjunctions, inequalities, and function/variable
+/// terms.
+fn const_eq<S: Sink>(
+    out: &S,
+    c: &Clause,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+) -> Option<(u32, u32)> {
+    if !c.body().is_empty() || c.head().len() != 1 {
+        return None;
+    }
+    let XLit::Eq(RTerm::C(u), RTerm::C(v)) = out.dl().lits.view(c.head()[0], inv) else {
+        return None;
+    };
+    if u == v {
+        return None;
+    }
+    let skip = &out.dl().merge_skip;
+    if !skip.is_empty() && (skip.contains(&u) || skip.contains(&v)) {
+        return None;
+    }
+    Some((u.min(v), u.max(v)))
+}
+
+/// Harvests every live empty-body unit constant equality in the root's store (both
+/// processed and waiting, including the popped clause still live in `x.store.clauses`)
+/// using two metered passes with pre-admitted exact capacity, publishes `STOP_MERGE` via
+/// CAS, and transfers ownership and its single memory debit to `DlRun::merged`.
+///
+/// Returns `true` only when this call won `STOP_MERGE` and published the payload.
+/// Returns `false` if any bound, memory refusal, cancellation, timeout, or racing stop
+/// intervened, leaving no leaked debit or stale payload.
+fn harvest_and_halt_merge<S: Sink>(
+    x: &mut DlSt,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    out: &mut S,
+) -> bool {
+    let mut count = 0usize;
+    let mut scan = Scan(0);
+    for s in &x.store.clauses {
+        if !scan.read(1, out) {
+            return false;
+        }
+        if !s.dead && const_eq(out, &s.c, inv).is_some() {
+            count += 1;
+        }
+    }
+    scan.end(out);
+    if !out.go_on() || count == 0 {
+        return false;
+    }
+    let Some(bytes) = count.checked_mul(std::mem::size_of::<(u32, u32)>()) else {
+        out.data_overflow();
+        return false;
+    };
+    let mut pair_guard = DlGuard::new(out);
+    if !pair_guard.admit_add(bytes) {
+        return false;
+    }
+    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(count);
+    let mut scan2 = Scan(0);
+    for s in &x.store.clauses {
+        if !scan2.read(1, &mut pair_guard) {
+            return false;
+        }
+        if !s.dead
+            && let Some(p) = const_eq(&pair_guard, &s.c, inv)
+        {
+            debug_assert!(pairs.len() < count);
+            pairs.push(p);
+        }
+    }
+    scan2.end(&mut pair_guard);
+    if !pair_guard.go_on() {
+        return false;
+    }
+    let Some(kept) = pairs
+        .capacity()
+        .checked_mul(std::mem::size_of::<(u32, u32)>())
+    else {
+        pair_guard.data_overflow();
+        return false;
+    };
+    if kept > pair_guard.bytes() && !pair_guard.admit_add(kept - pair_guard.bytes()) {
+        return false;
+    }
+    if !pair_guard.halt_merge() {
+        return false;
+    }
+    pair_guard.dl().set_merged(pairs, kept);
+    pair_guard.commit(kept);
+    true
 }
 
 /// Lists the processed clause `id` of a context by the constants of its maximal literals
@@ -9777,5 +9880,226 @@ Ontology(<http://example.org/g6>
                 );
             });
         }
+    }
+
+    #[test]
+    fn const_eq_rejects_disjunctive_conditional_inequality_and_function_terms() {
+        let mut run = DlRun::new(false, Default::default());
+        run.merge_skip.push(99);
+        let mk = |xl: XLit| match run.lits.lit(xl, |_| None) {
+            Made::Lit(l) => l,
+            other => panic!("expected literal for {xl:?}, got {other:?}"),
+        };
+        let eq_uv = mk(XLit::Eq(RTerm::C(1), RTerm::C(2)));
+        let eq_skip = mk(XLit::Eq(RTerm::C(99), RTerm::C(2)));
+        let ne_uv = mk(XLit::Ne(RTerm::C(1), RTerm::C(2)));
+        let eq_fn = mk(XLit::Eq(RTerm::C(1), RTerm::Fc(7, 2)));
+        let eq_var = mk(XLit::Eq(RTerm::X, RTerm::C(2)));
+        let atom_c = mk(XLit::Atom(10, RTerm::C(1)));
+        let probe = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let inv = |_: Role| None;
+
+        // Genuine unconditional unit constant equality -> accepted.
+        assert_eq!(
+            const_eq(&probe, &Clause::new(Vec::new(), vec![eq_uv]), inv),
+            Some((1, 2))
+        );
+        // Disjunctive equality -> rejected.
+        assert_eq!(
+            const_eq(&probe, &Clause::new(Vec::new(), vec![eq_uv, atom_c]), inv),
+            None
+        );
+        // Conditional equality (non-empty body) -> rejected.
+        assert_eq!(
+            const_eq(&probe, &Clause::new(vec![atom_c], vec![eq_uv]), inv),
+            None
+        );
+        // Inequality -> rejected.
+        assert_eq!(
+            const_eq(&probe, &Clause::new(Vec::new(), vec![ne_uv]), inv),
+            None
+        );
+        // Function term equality -> rejected.
+        assert_eq!(
+            const_eq(&probe, &Clause::new(Vec::new(), vec![eq_fn]), inv),
+            None
+        );
+        // Variable equality -> rejected.
+        assert_eq!(
+            const_eq(&probe, &Clause::new(Vec::new(), vec![eq_var]), inv),
+            None
+        );
+        // Skipped constant -> rejected.
+        assert_eq!(
+            const_eq(&probe, &Clause::new(Vec::new(), vec![eq_skip]), inv),
+            None
+        );
+    }
+
+    #[test]
+    fn sink_adapters_forward_halt_merge() {
+        struct FlagSink {
+            calls: std::cell::Cell<usize>,
+            win: bool,
+        }
+        impl Sink for FlagSink {
+            fn send(&mut self, _: Ex, _: Concl) {}
+            fn me(&mut self, _: Concl) {}
+            fn halt_merge(&self) -> bool {
+                self.calls.set(self.calls.get() + 1);
+                self.win
+            }
+        }
+        let mut inner = FlagSink {
+            calls: std::cell::Cell::new(0),
+            win: true,
+        };
+        {
+            let g = Guard::new(&mut inner);
+            assert!(g.halt_merge());
+        }
+        assert_eq!(inner.calls.get(), 1);
+        {
+            let g = DlGuard::new(&mut inner);
+            assert!(g.halt_merge());
+        }
+        assert_eq!(inner.calls.get(), 2);
+        {
+            let g = CreditGuard::new(&mut inner, 0);
+            assert!(g.halt_merge());
+        }
+        assert_eq!(inner.calls.get(), 3);
+        inner.win = false;
+        {
+            let mut g1 = Guard::new(&mut inner);
+            let mut g2 = DlGuard::new(&mut g1);
+            let g3 = CreditGuard::new(&mut g2, 0);
+            assert!(!g3.halt_merge());
+        }
+        assert_eq!(inner.calls.get(), 4);
+    }
+
+    #[test]
+    fn harvest_meters_reads_polls_and_transfers_single_debit() {
+        struct HarvestSink<'a> {
+            run: &'a DlRun,
+            admit_ok: bool,
+            halt_ok: bool,
+            go_on_calls: std::cell::Cell<usize>,
+            admitted_total: usize,
+            committed_kept: usize,
+            committed_released: usize,
+        }
+        impl Sink for HarvestSink<'_> {
+            fn send(&mut self, _: Ex, _: Concl) {}
+            fn me(&mut self, _: Concl) {}
+            fn dl(&self) -> &DlRun {
+                self.run
+            }
+            fn go_on(&self) -> bool {
+                self.go_on_calls.set(self.go_on_calls.get() + 1);
+                true
+            }
+            fn admit_dl(&mut self, bytes: usize) -> bool {
+                if !self.admit_ok {
+                    return false;
+                }
+                self.admitted_total += bytes;
+                true
+            }
+            fn commit_dl(&mut self, admitted: usize, kept: usize) {
+                self.committed_kept += kept;
+                self.committed_released += admitted.saturating_sub(kept);
+            }
+            fn halt_merge(&self) -> bool {
+                self.halt_ok
+            }
+        }
+
+        let run = DlRun::new(false, Default::default());
+        run.set_merge(true);
+        let mk = |xl: XLit| match run.lits.lit(xl, |_| None) {
+            Made::Lit(l) => l,
+            other => panic!("expected literal for {xl:?}, got {other:?}"),
+        };
+        let eq01 = mk(XLit::Eq(RTerm::C(0), RTerm::C(1)));
+        let eq23 = mk(XLit::Eq(RTerm::C(2), RTerm::C(3)));
+        let atom = mk(XLit::Atom(5, RTerm::C(0)));
+        let inv = |_: Role| None;
+
+        let mut x = DlSt::default();
+        // Add 1100 distinct non-eq clauses to exercise Scan metering past M_SCAN=1024,
+        // plus two live unit equalities and one disjunctive equality.
+        for i in 0..1100u32 {
+            let body_lit = mk(XLit::Atom(100 + i, RTerm::C(0)));
+            let _ = x.store.add(Clause::new(vec![body_lit], vec![eq01]));
+        }
+        // Mark half dead to confirm dead slots are metered too.
+        for s in x.store.clauses.iter_mut().step_by(2) {
+            s.dead = true;
+        }
+        let _ = x.store.add(Clause::new(Vec::new(), vec![eq01]));
+        let _ = x.store.add(Clause::new(Vec::new(), vec![eq23]));
+        let _ = x.store.add(Clause::new(Vec::new(), vec![eq01, atom]));
+
+        // Case 1: admission refusal -> false, zero debit kept, no payload.
+        let mut s_refuse = HarvestSink {
+            run: &run,
+            admit_ok: false,
+            halt_ok: true,
+            go_on_calls: std::cell::Cell::new(0),
+            admitted_total: 0,
+            committed_kept: 0,
+            committed_released: 0,
+        };
+        assert!(!harvest_and_halt_merge(&mut x, inv, &mut s_refuse));
+        assert_eq!(s_refuse.admitted_total, 0);
+        assert_eq!(s_refuse.committed_kept, 0);
+        assert!(run.take_merged().is_none());
+        assert!(run.work() > 0, "Pass 1 must meter reads via Scan");
+
+        // Case 2: lost stop race (`halt_merge` returns false) -> debit released, no payload.
+        let mut s_race = HarvestSink {
+            run: &run,
+            admit_ok: true,
+            halt_ok: false,
+            go_on_calls: std::cell::Cell::new(0),
+            admitted_total: 0,
+            committed_kept: 0,
+            committed_released: 0,
+        };
+        assert!(!harvest_and_halt_merge(&mut x, inv, &mut s_race));
+        let want_bytes = 2 * std::mem::size_of::<(u32, u32)>();
+        assert_eq!(s_race.admitted_total, want_bytes);
+        assert_eq!(s_race.committed_kept, 0);
+        assert_eq!(s_race.committed_released, want_bytes);
+        assert!(run.take_merged().is_none());
+
+        // Case 3: winning publish -> exact single debit committed, exact 2 pairs, zero realloc.
+        let mut s_win = HarvestSink {
+            run: &run,
+            admit_ok: true,
+            halt_ok: true,
+            go_on_calls: std::cell::Cell::new(0),
+            admitted_total: 0,
+            committed_kept: 0,
+            committed_released: 0,
+        };
+        assert!(harvest_and_halt_merge(&mut x, inv, &mut s_win));
+        assert!(
+            s_win.go_on_calls.get() >= 4,
+            "both passes must poll via Scan plus once before publication"
+        );
+        assert_eq!(s_win.admitted_total, want_bytes);
+        assert_eq!(s_win.committed_kept, want_bytes);
+        assert_eq!(s_win.committed_released, 0);
+        let (pairs, kept) = run.take_merged().expect("winning payload stored");
+        assert_eq!(kept, want_bytes);
+        assert_eq!(pairs.capacity(), 2);
+        assert_eq!(pairs, vec![(0, 1), (2, 3)]);
     }
 }

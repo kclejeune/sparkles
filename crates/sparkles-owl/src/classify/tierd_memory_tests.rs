@@ -4839,3 +4839,452 @@ fn pred_c_visits_reaching_edges_in_id_order_before_width_stop() {
         "higher-ID explicit edge's wide product must still trigger width-limit interruption"
     );
 }
+
+/// Phase 2 `Merge` UF + `CanonMap` exact accounting must cover actual counting-allocator
+/// live heap, including many aliases sharing one long representative, long-IRI pairs, and
+/// long anonymous blank labels.
+#[test]
+fn merge_canon_and_uf_cover_counting_allocator_heap() {
+    let long_rep = NamedIndividual::new(format!("http://example.org/rep/{}", "r".repeat(1024)));
+    let mut pairs: Vec<(Individual, Individual)> = Vec::new();
+    // 500 aliases sharing one 1024-byte representative.
+    for i in 0..500usize {
+        let alias = NamedIndividual::new(format!(
+            "http://example.org/z-alias-{i:04}/{}",
+            "a".repeat(256)
+        ));
+        pairs.push((
+            Individual::Named(long_rep.clone()),
+            Individual::Named(alias),
+        ));
+    }
+    // 200 distinct long-IRI pairs (512-byte IRIs).
+    for i in 0..200usize {
+        let a = NamedIndividual::new(format!("http://example.org/p{i:04}a/{}", "x".repeat(512)));
+        let b = NamedIndividual::new(format!("http://example.org/p{i:04}b/{}", "y".repeat(512)));
+        pairs.push((Individual::Named(a), Individual::Named(b)));
+    }
+    // Long anonymous blank label merged with a named individual.
+    let long_blank = AnonymousIndividual::new(format!("blank_{}", "b".repeat(1024)));
+    pairs.push((
+        Individual::Named(long_rep.clone()),
+        Individual::Anonymous(long_blank),
+    ));
+
+    let limits = Limits::default();
+    let mut peak_admitted = 0usize;
+    let mut admit = |used: usize| -> bool {
+        peak_admitted = peak_admitted.max(used);
+        true
+    };
+    let ((uf_bytes, canon_bytes, canon_len), sample) = measure(|| {
+        let mut m = Merge::default();
+        for (a, b) in &pairs {
+            m.union_individual(a, b, 0, &mut admit).expect("admitted");
+        }
+        let uf_bytes = m.uf_bytes();
+        let canon = m
+            .build_canon(0, &limits, &mut admit)
+            .ok()
+            .flatten()
+            .expect("non-empty canon");
+        let canon_bytes = canon.owned_bytes();
+        let canon_len = canon.len();
+        (uf_bytes, canon_bytes, canon_len)
+    });
+
+    assert_eq!(canon_len, 500 + 200 + 1);
+    assert!(
+        uf_bytes + canon_bytes >= sample.live,
+        "uf_bytes ({uf_bytes}) + canon_bytes ({canon_bytes}) undercounted live heap ({})",
+        sample.live
+    );
+    assert!(
+        peak_admitted >= sample.peak,
+        "peak_admitted ({peak_admitted}) undercounted measured peak heap ({})",
+        sample.peak
+    );
+
+    // End-to-end classification with long-IRI SameIndividual + entailed merge must cover peak.
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:C0 ObjectOneOf(:e1))\n\
+         SubClassOf(ObjectOneOf(:e0 :e1) :C0)\n",
+    );
+    let rep_name = format!("rep_{}", "r".repeat(512));
+    for i in 0..80usize {
+        let alias = format!("z_{i:03}_{}", "a".repeat(256));
+        body.push_str(&format!("SameIndividual(:{rep_name} :{alias})\n"));
+    }
+    body.push_str(&format!("ClassAssertion(:C0 :{rep_name})\n"));
+    let input = axioms(&body);
+    let mut k = Classifier::of(&input);
+    let (res, run_sample) = measure(|| {
+        k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+    });
+    let out = res.expect("classify");
+    assert!(out.complete);
+    assert!(out.stats.dl_rooted_restarts >= 1);
+    assert!(out.stats.dl_rooted_merged >= 81);
+    assert!(
+        out.stats.peak_memory >= run_sample.peak,
+        "peak_memory ({}) < measured peak ({})",
+        out.stats.peak_memory,
+        run_sample.peak
+    );
+}
+
+/// Optional prepass (`collect_same`) refusal must discard provisional partition/map,
+/// disable merging for the call, answer cleanly with the ordinary classifier, and leave a
+/// follow-up unrestricted classify on the same `Classifier` identical to a fresh one.
+#[test]
+fn merge_prepass_charge_refusal_disables_merge_and_answers_normally() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:A :B)\n",
+    );
+    let rep = format!("r_{}", "x".repeat(512));
+    for i in 0..40usize {
+        body.push_str(&format!(
+            "SameIndividual(:{rep} :z_{i:02}_{})\n",
+            "y".repeat(512)
+        ));
+    }
+    body.push_str(&format!("ClassAssertion(:A :{rep})\n"));
+    let input = axioms(&body);
+
+    // Refuse the first non-zero charge during `collect_same` UF/CanonMap build, then allow
+    // subsequent ordinary classifier charges so the fallback finishes.
+    let refused = Arc::new(AtomicBool::new(false));
+    let refused_cb = refused.clone();
+    let charge = Arc::new(move |bytes: usize| -> bool {
+        if !refused_cb.swap(true, Ordering::SeqCst) && bytes > 0 {
+            return false;
+        }
+        true
+    });
+
+    let mut k = Classifier::of(&input);
+    let out = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            charge: Some(charge),
+            ..Limits::default()
+        })
+        .expect("ordinary classifier should succeed when prepass declines");
+    assert!(refused.load(Ordering::SeqCst), "prepass charge was hit");
+    assert_eq!(
+        out.stats.dl_rooted_merged, 0,
+        "merging disabled after refusal"
+    );
+    assert!(out.taxonomy.is_subclass(
+        &Class::new("urn:tierd1291:A"),
+        &Class::new("urn:tierd1291:B")
+    ));
+
+    // Follow-up unrestricted classify on the same Classifier must match a fresh one.
+    let follow = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("follow-up classify");
+    assert_eq!(follow.stats.dl_rooted_merged, 40);
+
+    let mut fresh = Classifier::of(&input);
+    let expected = fresh
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("fresh classify");
+    assert_eq!(follow.consistent, expected.consistent);
+    assert_eq!(
+        follow.stats.dl_rooted_merged,
+        expected.stats.dl_rooted_merged
+    );
+}
+
+/// Refusal during harvest/restart allocation must route through ordinary memory handling
+/// (clearing `dl_worked` so `dl_rooted_over` is not falsely claimed), stay bounded, and
+/// recover cleanly on a follow-up unrestricted call on the same `Classifier`.
+#[test]
+fn merge_restart_and_harvest_refusal_reclaims_and_routes_to_memory_fallback() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:C0 ObjectOneOf(:a2))\n\
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)\n\
+         ClassAssertion(:C0 :a0)\n",
+    );
+    // Add long-IRI derived equalities so restart union/CanonMap allocates noticeably.
+    for i in 0..16usize {
+        let a = format!("u{i:02}_{}", "p".repeat(512));
+        let b = format!("v{i:02}_{}", "q".repeat(512));
+        body.push_str(&format!(
+            "SubClassOf(:K{i} ObjectOneOf(:{b}))\n\
+             SubClassOf(ObjectOneOf(:{a} :{b}) :K{i})\n"
+        ));
+    }
+    let input = axioms(&body);
+
+    // First measure baseline unrestricted peak to calibrate a tight charge cap that lets
+    // prefix saturation start and refuses during harvest/restart.
+    let mut base_k = Classifier::of(&input);
+    let base_out = base_k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("unrestricted");
+    assert!(base_out.stats.dl_rooted_restarts >= 1);
+
+    // Sweep several tight caps below `base_out.stats.peak_memory` so we exercise refusal
+    // during harvest and restart rebuilding.
+    let mut saw_memory_path = false;
+    for frac in [1usize, 2, 3, 4] {
+        let cap = (base_out.stats.peak_memory * frac) / 6;
+        let mut k = Classifier::of(&input);
+        let (res, sample) = measure(|| {
+            k.classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                max_memory: Some(cap),
+                ..Limits::default()
+            })
+        });
+        match res {
+            Ok(out) => {
+                assert!(
+                    !out.stats.dl_rooted_over,
+                    "memory refusal must not masquerade as rooted work exhaustion"
+                );
+                if out.stats.dl_over_budget || out.stats.horn_over_budget {
+                    saw_memory_path = true;
+                }
+            }
+            Err(Error::Memory { .. }) => {
+                saw_memory_path = true;
+            }
+            Err(other) => panic!("unexpected error under tight memory cap: {other:?}"),
+        }
+        assert!(
+            sample.peak <= cap + (512 << 10),
+            "tight cap measured peak ({}) overshot cap ({cap})",
+            sample.peak
+        );
+        // Follow-up unrestricted classify on the same Classifier must succeed cleanly.
+        let recovered = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("follow-up unrestricted classify");
+        assert!(recovered.complete);
+        assert_eq!(recovered.consistent, base_out.consistent);
+        assert_eq!(
+            recovered.stats.dl_rooted_merged,
+            base_out.stats.dl_rooted_merged
+        );
+    }
+    assert!(
+        saw_memory_path,
+        "expected at least one cap to trigger memory refusal"
+    );
+}
+
+/// Cancellation during `collect_same` (including inside a single large n-ary
+/// `SameIndividual` axiom) and during saturation/restart must return `Error::Cancelled`
+/// and invalidate cached answers on `Classifier`.
+#[test]
+fn merge_cancellation_polls_n_ary_same_and_invalidates_old_answers() {
+    let mut k = Classifier::of(&axioms("SubClassOf(:A :B)\nClassAssertion(:A :a0)\n"));
+    let first = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("initial classify");
+    assert!(first.consistent);
+    assert!(k.describe(&Class::new("urn:tierd1291:A")).is_some());
+
+    // Add a single very large n-ary SameIndividual axiom (> POLL_AXIOMS members).
+    let mut members = std::collections::BTreeSet::new();
+    for i in 0..300usize {
+        members.insert(Individual::Named(NamedIndividual::new(format!(
+            "urn:tierd1291:n{i:04}"
+        ))));
+    }
+    k.add([&Axiom::new(AxiomKind::SameIndividual(members))]);
+    k.add([&Axiom::sub_class_of(
+        Class::new("urn:tierd1291:B"),
+        Class::new("urn:tierd1291:C"),
+    )]);
+
+    // Cancel after 2 poll checks so it fires mid-loop inside the single n-ary axiom.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let polls_cb = polls.clone();
+    let err = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            cancelled: Some(Arc::new(move || {
+                polls_cb.fetch_add(1, Ordering::SeqCst) >= 2
+            })),
+            ..Limits::default()
+        })
+        .expect_err("must cancel inside large n-ary SameIndividual");
+    assert_eq!(err, Error::Cancelled);
+    assert!(
+        k.describe(&Class::new("urn:tierd1291:A")).is_none(),
+        "cancelled pre-saturation preparation must invalidate old describe() answers"
+    );
+
+    // Follow-up unrestricted classify must reflect the added axioms (A ⊑ C) even though
+    // `Classifier::run_held` advanced its edit counters on the cancelled call!
+    let after = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("follow-up classify after cancel");
+    assert!(after.taxonomy.is_subclass(
+        &Class::new("urn:tierd1291:A"),
+        &Class::new("urn:tierd1291:C")
+    ));
+    assert_eq!(after.stats.dl_rooted_merged, 299);
+}
+
+/// Logical allowance (`allowance_base` and `own`) must be identical on 1 thread vs 4
+/// threads past `PARALLEL_AXIOMS` when `rooted_merge` is enabled.
+#[test]
+fn merge_deterministic_allowance_across_threads() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SameIndividual(:a0 :a1)\n\
+         SubClassOf(:C0 ObjectOneOf(:a2))\n\
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)\n",
+    );
+    for i in 0..(PARALLEL_AXIOMS + 64) {
+        body.push_str(&format!("SubClassOf(:P{i} :Q{i})\n"));
+    }
+    let input = axioms(&body);
+
+    let mut k1 = Classifier::of(&input);
+    let out1 = k1
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("1t classify");
+    let (_, base1, own1) = LAST_ALLOWANCE.get();
+
+    let mut k4 = Classifier::of(&input);
+    let out4 = k4
+        .classify(&Limits {
+            threads: 4,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("4t classify");
+    let (_, base4, own4) = LAST_ALLOWANCE.get();
+
+    assert_eq!(out1.stats.dl_rooted_merged, 2);
+    assert_eq!(out4.stats.dl_rooted_merged, 2);
+    assert_eq!(base1, base4, "allowance_base must be thread-independent");
+    assert_eq!(
+        own1, own4,
+        "discretionary allowance must be thread-independent"
+    );
+}
+
+/// Class-scaled rooted work bound (`SPARKLES_ROOTED_BOUND_PER_CLASS=1`) must be captured
+/// and honored across merge restarts instead of hardcoding `ROOTED_WORK_BOUND`.
+#[test]
+fn merge_restart_honors_class_scaled_bound_and_hub_skip_switch() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:C0 ObjectOneOf(:a1))\n\
+         SubClassOf(ObjectOneOf(:a0 :a1) :C0)\n",
+    );
+    for i in 0..32usize {
+        body.push_str(&format!("Declaration(Class(:Extra{i}))\n"));
+    }
+    let input = axioms(&body);
+    with_rooted_bound_per_class(true, || {
+        let mut k = Classifier::of(&input);
+        let out = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("classify");
+        assert!(out.complete);
+        assert_eq!(out.stats.dl_rooted_restarts, 1);
+        assert_eq!(
+            LAST_ROOTED_WORK_LIMIT.get(),
+            rooted_work_bound(36, true),
+            "captured bound must match class-scaled bound"
+        );
+    });
+
+    // Hub skipping (`SPARKLES_ROOTED_MERGE_HUB=0`): when the ONLY forced equality involves
+    // the generated hub (`⊤ ⊑ {:a}` + `ObjectSomeValuesFrom(owl:topObjectProperty ...)`),
+    // hub-merge OFF triggers 0 restarts while hub-merge ON triggers 1 restart, with
+    // identical semantics.
+    let hub_ax = axioms(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(owl:Thing ObjectOneOf(:a))\n\
+         SubClassOf(:Q ObjectSomeValuesFrom(owl:topObjectProperty :A))\n\
+         ClassAssertion(:A :a)\n",
+    );
+    let out_hub_on = with_merge_hub(true, || {
+        let mut k = Classifier::of(&hub_ax);
+        k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("hub on")
+    });
+    let out_hub_off = with_merge_hub(false, || {
+        let mut k = Classifier::of(&hub_ax);
+        k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("hub off")
+    });
+    assert!(out_hub_on.complete && out_hub_off.complete);
+    assert_eq!(out_hub_on.stats.dl_rooted_restarts, 1);
+    assert_eq!(out_hub_off.stats.dl_rooted_restarts, 0);
+    assert_eq!(out_hub_on.consistent, out_hub_off.consistent);
+}

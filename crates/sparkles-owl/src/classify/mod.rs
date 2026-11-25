@@ -220,6 +220,12 @@ thread_local! {
     static ROOTED_BOUND_PER_CLASS_TEST: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
     static LAST_ROOTED_WORK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ROOTED_MERGE_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static ROOTED_MERGE_HUB_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static ROOTED_MERGE_ROOT_FIRST_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -231,6 +237,89 @@ fn with_rooted_bound_per_class<R>(on: bool, f: impl FnOnce() -> R) -> R {
         }
     }
     let prev = ROOTED_BOUND_PER_CLASS_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Whether item 1061 phase 2 rooted constant merging is enabled by default
+/// (`SPARKLES_ROOTED_MERGE=1`), off by default.
+fn rooted_merge_switch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ROOTED_MERGE_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_MERGE").is_some_and(|v| v == "1"))
+}
+
+/// Whether a generated item 805 hub participates in constant merging when
+/// `rooted_merge` is on (`SPARKLES_ROOTED_MERGE_HUB=0` disables it for ablation).
+fn merge_hub() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ROOTED_MERGE_HUB_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_MERGE_HUB").is_none_or(|v| v != "0"))
+}
+
+/// Whether eligible constant-merging runs rotate the root context to `roots[0]`
+/// (`SPARKLES_ROOTED_MERGE_ROOT_FIRST=0` disables it for ablation).
+fn merge_root_first() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ROOTED_MERGE_ROOT_FIRST_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SPARKLES_ROOTED_MERGE_ROOT_FIRST").is_none_or(|v| v != "0")
+    })
+}
+
+/// Whether to print merge restart diagnostics to stderr (`SPARKLES_ROOTED_MERGE_TRACE=1`).
+fn merge_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_MERGE_TRACE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn with_rooted_merge<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOTED_MERGE_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = ROOTED_MERGE_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn with_merge_hub<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOTED_MERGE_HUB_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = ROOTED_MERGE_HUB_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn with_merge_root_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOTED_MERGE_ROOT_FIRST_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = ROOTED_MERGE_ROOT_FIRST_TEST.with(|c| c.replace(Some(on)));
     let _reset = Reset(prev);
     f()
 }
@@ -414,6 +503,11 @@ pub struct Limits {
     /// overrides it for measurements, with `0`, `1`, or a sum of the bits of
     /// [`dl_rules::DlRun::mrepair`].
     pub rooted_marker_repair: bool,
+    /// whether item 1061 phase 2 rooted constant merging on asserted `SameIndividual`
+    /// axioms and unconditionally root-entailed unit constant equalities is enabled
+    /// (default off; `SPARKLES_ROOTED_MERGE=1` turns it on).
+    #[doc(hidden)]
+    pub rooted_merge: bool,
     /// whether a run that counts without the root orders its number restrictions by
     /// entailment (F24, "The order between number restrictions"), which is on by default
     /// and changes nothing without [`counting`](Limits::counting). `≥m r.F` entails
@@ -488,6 +582,7 @@ impl Default for Limits {
             rooted: false,
             rooted_decline: true,
             rooted_marker_repair: false,
+            rooted_merge: rooted_merge_switch(),
             number_order: true,
             dl_steps: true,
             dl_automata: None,
@@ -614,6 +709,15 @@ pub struct Stats {
     pub dl_stored: usize,
     /// the conclusions Tier D derived, kept or not, which its work bound counts
     pub dl_work: usize,
+    /// prefix conclusions spent across merge restarts of the answering rooted attempt
+    #[doc(hidden)]
+    pub dl_rooted_spent: usize,
+    /// number of constant-merge restarts in the answering rooted attempt
+    #[doc(hidden)]
+    pub dl_rooted_restarts: usize,
+    /// number of non-representative individuals mapped away in the answering run
+    #[doc(hidden)]
+    pub dl_rooted_merged: usize,
     /// Tier D with counting passed its bound on derived conclusions, so the run
     /// classified again without counting and left the axioms that need it out
     pub dl_counting_over: bool,
@@ -1183,6 +1287,492 @@ pub struct Saturation {
     /// the clause table of the last run of Tier D whose contexts the next run may keep,
     /// which name its clauses by id
     dl_run: Option<dl_rules::DlRun>,
+    /// item 1061 phase 2 dense union-find and cached canonical map for rooted constant
+    /// merging; cleared at the end of every `run_with_all`
+    merge: Merge,
+    /// canonical map requested for the current `run` / `run_once` attempt
+    canon_want: Option<std::sync::Arc<index::CanonMap>>,
+    /// generated hub of the currently active item 805 reduction, if any
+    active_hub: Option<NamedIndividual>,
+    /// winning merge-stop payload returned from `run_once` to `run_merging`
+    merge_stop: Option<MergeStop>,
+    /// set for the remainder of a call when `collect_same` declines on memory refusal
+    merge_disabled: bool,
+}
+
+/// Payload transferred from a winning `Stop::Merge` out of `run_once` into `run_merging`.
+struct MergeStop {
+    pairs: Vec<(u32, u32)>,
+    pairs_bytes: usize,
+    spent: usize,
+    bound: usize,
+    peak: usize,
+    active_hub: Option<NamedIndividual>,
+}
+
+enum BuildCanonErr {
+    Poll(Error),
+    Memory(usize),
+}
+
+/// Hash of `(is_anon, raw)` matching `index::name_hash` without allocating `"_:label"`.
+#[inline]
+fn merge_name_hash(is_anon: bool, raw: &str) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = rustc_hash::FxBuildHasher.build_hasher();
+    if is_anon {
+        h.write(index::ANONYMOUS.as_bytes());
+    }
+    h.write(raw.as_bytes());
+    h.write_u8(0xff);
+    h.finish()
+}
+
+/// Full key equality on hash collisions without allocating `"_:label"`.
+#[inline]
+fn merge_name_eq(stored: &NamedIndividual, is_anon: bool, raw: &str) -> bool {
+    if is_anon {
+        stored
+            .as_str()
+            .strip_prefix(index::ANONYMOUS)
+            .is_some_and(|rest| rest == raw)
+    } else {
+        stored.as_str() == raw
+    }
+}
+
+/// Provenance-aware 3-tier representative ordering:
+/// Tier 0 = genuine user input named individual (including any legal input IRI starting
+/// with `dl_reduce::PREFIX`), Tier 1 = item 1281 anonymous individual, Tier 2 = generated
+/// hub of the active item 805 reduction.
+#[inline]
+fn rep_key<'a>(n: &'a NamedIndividual, active_hub: Option<&NamedIndividual>) -> (u8, &'a str) {
+    let tier = if active_hub.is_some_and(|h| h == n) {
+        2
+    } else if index::is_anonymous(n) {
+        1
+    } else {
+        0
+    };
+    (tier, n.as_str())
+}
+
+#[inline]
+fn same_canon(
+    a: &Option<std::sync::Arc<index::CanonMap>>,
+    b: &Option<std::sync::Arc<index::CanonMap>>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+/// Dense integer union-find for item 1061 phase 2 constant merging, storing each
+/// participating individual string once with exact Item 1291 byte tracking and
+/// pre-admission before every allocation or container growth.
+#[derive(Default)]
+struct Merge {
+    names: Vec<NamedIndividual>,
+    hashes: Vec<u64>,
+    ids: hashbrown::HashTable<u32>,
+    parent: Vec<u32>,
+    size: Vec<u32>,
+    best: Vec<u32>,
+    name_str_bytes: usize,
+    active_hub: Option<NamedIndividual>,
+    shared: Option<std::sync::Arc<index::CanonMap>>,
+    spent: usize,
+    restarts: usize,
+    frozen_bound: Option<usize>,
+}
+
+impl Merge {
+    fn clear(&mut self) {
+        self.names = Vec::new();
+        self.hashes = Vec::new();
+        self.ids = hashbrown::HashTable::new();
+        self.parent = Vec::new();
+        self.size = Vec::new();
+        self.best = Vec::new();
+        self.name_str_bytes = 0;
+        self.active_hub = None;
+        self.shared = None;
+        self.spent = 0;
+        self.restarts = 0;
+        self.frozen_bound = None;
+    }
+
+    fn uf_bytes(&self) -> usize {
+        self.names
+            .capacity()
+            .saturating_mul(std::mem::size_of::<NamedIndividual>())
+            .saturating_add(self.name_str_bytes)
+            .saturating_add(
+                self.hashes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(dl_clause::hash_table_bytes(
+                self.ids.capacity(),
+                std::mem::size_of::<u32>(),
+            ))
+            .saturating_add(
+                self.parent
+                    .capacity()
+                    .saturating_add(self.size.capacity())
+                    .saturating_add(self.best.capacity())
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(self.active_hub.as_ref().map_or(0, |h| h.as_str().len()))
+    }
+
+    fn uf_logical_bytes(&self) -> usize {
+        self.names
+            .len()
+            .saturating_mul(
+                std::mem::size_of::<NamedIndividual>()
+                    + std::mem::size_of::<u64>()
+                    + 3 * std::mem::size_of::<u32>(),
+            )
+            .saturating_add(self.name_str_bytes)
+            .saturating_add(saturate::table_bytes(
+                self.ids.len(),
+                std::mem::size_of::<u32>(),
+            ))
+            .saturating_add(self.active_hub.as_ref().map_or(0, |h| h.as_str().len()))
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        let mut r = x;
+        while self.parent[r as usize] != r {
+            r = self.parent[r as usize];
+        }
+        while self.parent[x as usize] != r {
+            let p = self.parent[x as usize];
+            self.parent[x as usize] = r;
+            x = p;
+        }
+        r
+    }
+
+    fn set_active_hub(
+        &mut self,
+        hub: Option<&NamedIndividual>,
+        live_base: usize,
+        admit: &mut impl FnMut(usize) -> bool,
+    ) -> Result<(), usize> {
+        let Some(h) = hub else {
+            return Ok(());
+        };
+        if self.active_hub.as_ref() == Some(h) {
+            return Ok(());
+        }
+        let add = h.as_str().len();
+        let Some(peak) = live_base
+            .checked_add(self.uf_bytes())
+            .and_then(|b| b.checked_add(add))
+        else {
+            return Err(usize::MAX);
+        };
+        if !admit(peak) {
+            return Err(peak);
+        }
+        self.active_hub = Some(index::exact_individual(h));
+        Ok(())
+    }
+
+    fn intern_parts(
+        &mut self,
+        is_anon: bool,
+        raw: &str,
+        live_base: usize,
+        admit: &mut impl FnMut(usize) -> bool,
+    ) -> Result<u32, usize> {
+        let h = merge_name_hash(is_anon, raw);
+        if let Some(&id) = self
+            .ids
+            .find(h, |&i| merge_name_eq(&self.names[i as usize], is_anon, raw))
+        {
+            return Ok(id);
+        }
+        let Ok(id) = u32::try_from(self.names.len()) else {
+            return Err(usize::MAX);
+        };
+        if self.names.len().checked_add(1).is_none() {
+            return Err(usize::MAX);
+        }
+        let Some(str_len) = (if is_anon {
+            index::ANONYMOUS.len().checked_add(raw.len())
+        } else {
+            Some(raw.len())
+        }) else {
+            return Err(usize::MAX);
+        };
+        let vec_grow = |len: usize, cap: usize, elem: usize| -> Option<usize> {
+            if len == cap {
+                dl_clause::next_vec_cap(cap, elem)?.checked_mul(elem)
+            } else {
+                Some(0)
+            }
+        };
+        let names_add = vec_grow(
+            self.names.len(),
+            self.names.capacity(),
+            std::mem::size_of::<NamedIndividual>(),
+        );
+        let hashes_add = vec_grow(
+            self.hashes.len(),
+            self.hashes.capacity(),
+            std::mem::size_of::<u64>(),
+        );
+        let ids_add = if self.ids.len() == self.ids.capacity() {
+            dl_clause::next_hash_table_bytes(self.ids.capacity(), std::mem::size_of::<u32>())
+        } else {
+            Some(0)
+        };
+        let parent_add = vec_grow(
+            self.parent.len(),
+            self.parent.capacity(),
+            std::mem::size_of::<u32>(),
+        );
+        let size_add = vec_grow(
+            self.size.len(),
+            self.size.capacity(),
+            std::mem::size_of::<u32>(),
+        );
+        let best_add = vec_grow(
+            self.best.len(),
+            self.best.capacity(),
+            std::mem::size_of::<u32>(),
+        );
+        let Some(add) = Some(str_len)
+            .and_then(|n| n.checked_add(names_add?))
+            .and_then(|n| n.checked_add(hashes_add?))
+            .and_then(|n| n.checked_add(ids_add?))
+            .and_then(|n| n.checked_add(parent_add?))
+            .and_then(|n| n.checked_add(size_add?))
+            .and_then(|n| n.checked_add(best_add?))
+        else {
+            return Err(usize::MAX);
+        };
+        let Some(peak) = live_base
+            .checked_add(self.uf_bytes())
+            .and_then(|b| b.checked_add(add))
+        else {
+            return Err(usize::MAX);
+        };
+        if !admit(peak) {
+            return Err(peak);
+        }
+        let owned = if is_anon {
+            let mut s = String::with_capacity(str_len);
+            s.push_str(index::ANONYMOUS);
+            s.push_str(raw);
+            NamedIndividual::new(s)
+        } else {
+            NamedIndividual::new(raw.to_owned())
+        };
+        self.names.push(owned);
+        self.hashes.push(h);
+        let hashes = &self.hashes;
+        self.ids.insert_unique(h, id, |&i| hashes[i as usize]);
+        self.parent.push(id);
+        self.size.push(1);
+        self.best.push(id);
+        self.name_str_bytes = self.name_str_bytes.saturating_add(str_len);
+        Ok(id)
+    }
+
+    fn union_parts(
+        &mut self,
+        a_anon: bool,
+        a_raw: &str,
+        b_anon: bool,
+        b_raw: &str,
+        live_base: usize,
+        admit: &mut impl FnMut(usize) -> bool,
+    ) -> Result<bool, usize> {
+        if a_anon == b_anon && a_raw == b_raw {
+            return Ok(false);
+        }
+        let a = self.intern_parts(a_anon, a_raw, live_base, admit)?;
+        let b = self.intern_parts(b_anon, b_raw, live_base, admit)?;
+        let mut ra = self.find(a);
+        let mut rb = self.find(b);
+        if ra == rb {
+            return Ok(false);
+        }
+        if self.size[ra as usize] < self.size[rb as usize] {
+            std::mem::swap(&mut ra, &mut rb);
+        }
+        self.parent[rb as usize] = ra;
+        self.size[ra as usize] = self.size[ra as usize].saturating_add(self.size[rb as usize]);
+        let ba = self.best[ra as usize];
+        let bb = self.best[rb as usize];
+        let hub = self.active_hub.as_ref();
+        if rep_key(&self.names[bb as usize], hub) < rep_key(&self.names[ba as usize], hub) {
+            self.best[ra as usize] = bb;
+        }
+        self.shared = None;
+        Ok(true)
+    }
+
+    fn union_individual(
+        &mut self,
+        a: &Individual,
+        b: &Individual,
+        live_base: usize,
+        admit: &mut impl FnMut(usize) -> bool,
+    ) -> Result<bool, usize> {
+        fn parts(i: &Individual) -> (bool, &str) {
+            match i {
+                Individual::Named(n) => (false, n.as_str()),
+                Individual::Anonymous(a) => (true, a.label()),
+            }
+        }
+        let (aa, ar) = parts(a);
+        let (ba, br) = parts(b);
+        self.union_parts(aa, ar, ba, br, live_base, admit)
+    }
+
+    fn union_named(
+        &mut self,
+        a: &NamedIndividual,
+        b: &NamedIndividual,
+        live_base: usize,
+        admit: &mut impl FnMut(usize) -> bool,
+    ) -> Result<bool, usize> {
+        self.union_parts(false, a.as_str(), false, b.as_str(), live_base, admit)
+    }
+
+    /// Builds a flat immutable `Arc<CanonMap>` where every alias points directly to its
+    /// final canonical representative, pre-admitting exact heap bytes (including
+    /// `ArcInner`, hash table, owned strings, and temporary root-to-slot index) before
+    /// allocating. Returns `Ok(None)` without allocation when no alias exists.
+    fn build_canon(
+        &mut self,
+        live_base: usize,
+        limits: &Limits,
+        admit: &mut impl FnMut(usize) -> bool,
+    ) -> Result<Option<std::sync::Arc<index::CanonMap>>, BuildCanonErr> {
+        if self.names.is_empty() {
+            self.shared = None;
+            return Ok(None);
+        }
+        let n = self.names.len();
+        let mut rep_count = 0usize;
+        let mut rep_str_bytes = 0usize;
+        let mut alias_count = 0usize;
+        let mut alias_str_bytes = 0usize;
+        for i in 0..n {
+            if i % POLL_AXIOMS == 0 {
+                poll(limits).map_err(BuildCanonErr::Poll)?;
+            }
+            let r = self.find(i as u32) as usize;
+            let b = self.best[r] as usize;
+            if i == r && self.size[r] > 1 {
+                rep_count += 1;
+                rep_str_bytes = rep_str_bytes
+                    .checked_add(self.names[b].as_str().len())
+                    .ok_or(BuildCanonErr::Memory(usize::MAX))?;
+            }
+            if i != b {
+                alias_count += 1;
+                alias_str_bytes = alias_str_bytes
+                    .checked_add(self.names[i].as_str().len())
+                    .ok_or(BuildCanonErr::Memory(usize::MAX))?;
+            }
+        }
+        if alias_count == 0 {
+            self.shared = None;
+            return Ok(None);
+        }
+        if u32::try_from(rep_count).is_err() {
+            return Err(BuildCanonErr::Memory(usize::MAX));
+        }
+        let arc_bytes = index::arc_payload_bytes::<index::CanonMap>()
+            .ok_or(BuildCanonErr::Memory(usize::MAX))?;
+        let reps_vec = rep_count
+            .checked_mul(std::mem::size_of::<NamedIndividual>())
+            .ok_or(BuildCanonErr::Memory(usize::MAX))?;
+        let entry_size = std::mem::size_of::<(NamedIndividual, u32)>();
+        let map_table = dl_clause::hash_table_bytes(alias_count, entry_size);
+        if map_table == usize::MAX {
+            return Err(BuildCanonErr::Memory(usize::MAX));
+        }
+        let planned_owned = arc_bytes
+            .checked_add(reps_vec)
+            .and_then(|b| b.checked_add(rep_str_bytes))
+            .and_then(|b| b.checked_add(map_table))
+            .and_then(|b| b.checked_add(alias_str_bytes))
+            .ok_or(BuildCanonErr::Memory(usize::MAX))?;
+        let tmp_slot = n
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(BuildCanonErr::Memory(usize::MAX))?;
+        let peak = live_base
+            .checked_add(self.uf_bytes())
+            .and_then(|b| b.checked_add(planned_owned))
+            .and_then(|b| b.checked_add(tmp_slot))
+            .ok_or(BuildCanonErr::Memory(usize::MAX))?;
+        if !admit(peak) {
+            return Err(BuildCanonErr::Memory(peak));
+        }
+        let mut reps: Vec<NamedIndividual> = Vec::with_capacity(rep_count);
+        let mut rep_slot: Vec<u32> = vec![u32::MAX; n];
+        for (i, slot_out) in rep_slot.iter_mut().enumerate() {
+            if i % POLL_AXIOMS == 0 {
+                poll(limits).map_err(BuildCanonErr::Poll)?;
+            }
+            if self.parent[i] as usize == i && self.size[i] > 1 {
+                let b = self.best[i] as usize;
+                let slot = reps.len() as u32;
+                reps.push(index::exact_individual(&self.names[b]));
+                *slot_out = slot;
+            }
+        }
+        let mut map: FxHashMap<NamedIndividual, u32> =
+            FxHashMap::with_capacity_and_hasher(alias_count, Default::default());
+        for i in 0..n {
+            if i % POLL_AXIOMS == 0 {
+                poll(limits).map_err(BuildCanonErr::Poll)?;
+            }
+            let r = self.parent[i] as usize;
+            let b = self.best[r] as usize;
+            if i != b {
+                let slot = rep_slot[r];
+                debug_assert_ne!(slot, u32::MAX);
+                map.insert(index::exact_individual(&self.names[i]), slot);
+            }
+        }
+        drop(rep_slot);
+        let actual_table = dl_clause::hash_table_bytes(map.capacity(), entry_size);
+        let actual_owned = arc_bytes
+            .saturating_add(
+                reps.capacity()
+                    .saturating_mul(std::mem::size_of::<NamedIndividual>()),
+            )
+            .saturating_add(rep_str_bytes)
+            .saturating_add(actual_table)
+            .saturating_add(alias_str_bytes);
+        let logical = arc_bytes
+            .saturating_add(
+                reps.len()
+                    .saturating_mul(std::mem::size_of::<NamedIndividual>()),
+            )
+            .saturating_add(rep_str_bytes)
+            .saturating_add(saturate::table_bytes(map.len(), entry_size))
+            .saturating_add(alias_str_bytes);
+        let canon = std::sync::Arc::new(index::CanonMap::new_from_parts(
+            reps,
+            map,
+            actual_owned,
+            logical,
+        ));
+        self.shared = Some(canon.clone());
+        Ok(Some(canon))
+    }
 }
 
 /// The rules of a run whose contexts the next run may keep.
@@ -1206,6 +1796,7 @@ struct RuleKey {
     el_only: bool,
     counting: bool,
     rooted: bool,
+    rooted_merge: bool,
     number_order: bool,
     eager: bool,
     skip_dl: bool,
@@ -1849,6 +2440,11 @@ impl Saturation {
             kept: None,
             reused: false,
             dl_run: None,
+            merge: Merge::default(),
+            canon_want: None,
+            active_hub: None,
+            merge_stop: None,
+            merge_disabled: false,
         }
     }
 
@@ -1957,6 +2553,341 @@ impl Saturation {
         r
     }
 
+    /// Wraps `limits.charge` so charges draw first on what `admitted` already covers, and
+    /// any additional granted charge increases `admitted`.
+    fn charge_drawing_on(
+        limits: &Limits,
+        admitted: &std::sync::Arc<AtomicUsize>,
+    ) -> Option<std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync>> {
+        limits.charge.clone().map(|f| {
+            let a = admitted.clone();
+            let counting: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
+                std::sync::Arc::new(move |bytes: usize| {
+                    let ok = f(bytes);
+                    if ok {
+                        a.fetch_add(bytes, Ordering::Relaxed);
+                    }
+                    ok
+                });
+            drawing_on(admitted.load(Ordering::Relaxed), counting)
+        })
+    }
+
+    /// Collects asserted `SameIndividual` axioms (both named and anonymous members) into
+    /// `self.merge` and builds the initial `CanonMap`. On memory admission refusal,
+    /// discards the provisional partition and disables merging for the rest of this call
+    /// (optional prepass policy). Cancellation and timeout errors propagate immediately
+    /// after invalidating any cached state (`self.dirty = true`).
+    fn collect_same(
+        &mut self,
+        axioms: &[&AxiomKind],
+        held_bytes: usize,
+        limits: &Limits,
+        admitted: &std::sync::Arc<AtomicUsize>,
+        call_peak: &mut usize,
+    ) -> Result<(), Error> {
+        let mut ops = 0usize;
+        let mut has_same = false;
+        for k in axioms {
+            if ops.is_multiple_of(POLL_AXIOMS)
+                && let Err(e) = poll(limits)
+            {
+                self.dirty = true;
+                return Err(e);
+            }
+            ops += 1;
+            if let AxiomKind::SameIndividual(is) = k {
+                if is.len() >= 2 {
+                    has_same = true;
+                    break;
+                }
+                for _ in is {
+                    ops += 1;
+                    if ops.is_multiple_of(POLL_AXIOMS)
+                        && let Err(e) = poll(limits)
+                    {
+                        self.dirty = true;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        if !has_same {
+            return Ok(());
+        }
+        // Individuals always require a full run, so release any stale prior state before
+        // growing the merge tables.
+        self.dirty = true;
+        self.reset();
+        self.merge.clear();
+        self.canon_want = None;
+        let mut paid = admitted.load(Ordering::Relaxed);
+        let charge_fn = limits
+            .charge
+            .as_deref()
+            .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+        let mut admit = |used: usize| -> bool {
+            *call_peak = (*call_peak).max(used);
+            let ok = cover_memory(used, limits.max_memory, charge_fn, &mut paid);
+            if ok {
+                admitted.store(paid, Ordering::Relaxed);
+            }
+            ok
+        };
+        let mut step = 0usize;
+        for k in axioms {
+            if step.is_multiple_of(POLL_AXIOMS)
+                && let Err(e) = poll(limits)
+            {
+                self.merge.clear();
+                self.dirty = true;
+                return Err(e);
+            }
+            step += 1;
+            let AxiomKind::SameIndividual(is) = k else {
+                continue;
+            };
+            if is.len() < 2 {
+                continue;
+            }
+            let mut it = is.iter();
+            let Some(first) = it.next() else {
+                continue;
+            };
+            for other in it {
+                step += 1;
+                if step.is_multiple_of(POLL_AXIOMS)
+                    && let Err(e) = poll(limits)
+                {
+                    self.merge.clear();
+                    self.dirty = true;
+                    return Err(e);
+                }
+                if self
+                    .merge
+                    .union_individual(first, other, held_bytes, &mut admit)
+                    .is_err()
+                {
+                    self.merge.clear();
+                    self.canon_want = None;
+                    if let Err(e) = poll(limits) {
+                        self.dirty = true;
+                        return Err(e);
+                    }
+                    self.merge_disabled = true;
+                    return Ok(());
+                }
+            }
+        }
+        match self.merge.build_canon(held_bytes, limits, &mut admit) {
+            Ok(_) => Ok(()),
+            Err(BuildCanonErr::Poll(e)) => {
+                self.merge.clear();
+                self.canon_want = None;
+                self.dirty = true;
+                Err(e)
+            }
+            Err(BuildCanonErr::Memory(_)) => {
+                self.merge.clear();
+                self.canon_want = None;
+                if let Err(e) = poll(limits) {
+                    self.dirty = true;
+                    return Err(e);
+                }
+                self.merge_disabled = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Runs `self.run(...)`, handling item 1061 phase 2 clean constant-merge restarts
+    /// against the same enclosing work bound while preserving memory high-water marks,
+    /// pool credit, deadlines, cancellation, and genuine fallback semantics.
+    #[allow(clippy::too_many_arguments)]
+    fn run_merging(
+        &mut self,
+        axioms: &[&AxiomKind],
+        mut changes: Option<Changes<'_>>,
+        held_bytes: usize,
+        limits: &Limits,
+        admitted: &std::sync::Arc<AtomicUsize>,
+        call_peak: &mut usize,
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        self.merge.spent = 0;
+        self.merge.restarts = 0;
+        self.merge.frozen_bound = None;
+        self.merge_stop = None;
+        loop {
+            let step_limits = Limits {
+                charge: Self::charge_drawing_on(limits, admitted),
+                ..limits.clone()
+            };
+            let r = self.run(
+                axioms,
+                changes.take(),
+                held_bytes,
+                &step_limits,
+                with_taxonomy,
+            );
+            match r {
+                Ok((consistent, taxonomy, mut stats)) => {
+                    stats.dl_rooted_merged = self.interner.canon.as_ref().map_or(0, |c| c.len());
+                    stats.dl_rooted_spent = self.merge.spent;
+                    stats.dl_rooted_restarts = self.merge.restarts;
+                    stats.peak_memory = stats.peak_memory.max(*call_peak);
+                    *call_peak = stats.peak_memory;
+                    // Drop UF tables after the answering run while `self.interner.canon`
+                    // retains the sole `Arc<CanonMap>` for `describe()`.
+                    self.merge.clear();
+                    self.canon_want = None;
+                    return Ok((consistent, taxonomy, stats));
+                }
+                Err(e) => {
+                    let Some(stop) = self.merge_stop.take() else {
+                        if let Error::Memory { used, .. } = e {
+                            *call_peak = (*call_peak).max(used);
+                        }
+                        self.merge.clear();
+                        self.canon_want = None;
+                        return Err(e);
+                    };
+                    *call_peak = (*call_peak).max(stop.peak);
+                    if let Err(poll_err) = poll(limits) {
+                        self.merge.clear();
+                        self.canon_want = None;
+                        self.reset();
+                        self.dirty = true;
+                        return Err(poll_err);
+                    }
+                    // Detach individual names first, then drop all heavy state and old
+                    // `Arc<CanonMap>` owners BEFORE growing `Merge` or building the new
+                    // `CanonMap`, accounting explicitly for `old_inds` + `stop.pairs`.
+                    let old_inds = std::mem::take(&mut self.interner.individuals);
+                    let old_inds_bytes = old_inds.exact_bytes();
+                    let pair_count = stop.pairs.len();
+                    self.reset();
+                    self.reduced = false;
+                    self.canon_want = None;
+                    self.merge.shared = None;
+
+                    let mut paid = admitted.load(Ordering::Relaxed);
+                    let charge_fn = limits
+                        .charge
+                        .as_deref()
+                        .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+                    let mut admit = |used: usize| -> bool {
+                        *call_peak = (*call_peak).max(used);
+                        let ok = cover_memory(used, limits.max_memory, charge_fn, &mut paid);
+                        if ok {
+                            admitted.store(paid, Ordering::Relaxed);
+                        }
+                        ok
+                    };
+                    let union_base = held_bytes
+                        .saturating_add(old_inds_bytes)
+                        .saturating_add(stop.pairs_bytes);
+                    if let Err(used) =
+                        self.merge
+                            .set_active_hub(stop.active_hub.as_ref(), union_base, &mut admit)
+                    {
+                        drop(old_inds);
+                        drop(stop.pairs);
+                        self.merge.clear();
+                        self.dl_worked.store(false, Ordering::Relaxed);
+                        poll(limits)?;
+                        return Err(Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used,
+                        });
+                    }
+                    let mut joined = false;
+                    let mut invalid_id = false;
+                    for (idx, &(u, v)) in stop.pairs.iter().enumerate() {
+                        if idx % POLL_AXIOMS == 0
+                            && let Err(poll_err) = poll(limits)
+                        {
+                            drop(old_inds);
+                            drop(stop.pairs);
+                            self.merge.clear();
+                            self.dirty = true;
+                            return Err(poll_err);
+                        }
+                        let old_slice: &[NamedIndividual] = &old_inds;
+                        let (Some(nu), Some(nv)) =
+                            (old_slice.get(u as usize), old_slice.get(v as usize))
+                        else {
+                            invalid_id = true;
+                            break;
+                        };
+                        match self.merge.union_named(nu, nv, union_base, &mut admit) {
+                            Ok(did_join) => joined |= did_join,
+                            Err(used) => {
+                                drop(old_inds);
+                                drop(stop.pairs);
+                                self.merge.clear();
+                                self.dl_worked.store(false, Ordering::Relaxed);
+                                poll(limits)?;
+                                return Err(Error::Memory {
+                                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                                    used,
+                                });
+                            }
+                        }
+                    }
+                    drop(stop.pairs);
+                    drop(old_inds);
+                    if invalid_id || !joined {
+                        debug_assert!(
+                            !invalid_id && joined,
+                            "merge restart had no valid union progress (invalid_id={invalid_id}, joined={joined})"
+                        );
+                        self.merge.clear();
+                        self.canon_want = None;
+                        self.merge_disabled = true;
+                        self.dl_worked.store(false, Ordering::Relaxed);
+                        return Err(Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used: *call_peak,
+                        });
+                    }
+                    match self.merge.build_canon(held_bytes, limits, &mut admit) {
+                        Ok(_) => {}
+                        Err(BuildCanonErr::Poll(poll_err)) => {
+                            self.merge.clear();
+                            self.canon_want = None;
+                            self.dirty = true;
+                            return Err(poll_err);
+                        }
+                        Err(BuildCanonErr::Memory(used)) => {
+                            self.merge.clear();
+                            self.canon_want = None;
+                            self.dl_worked.store(false, Ordering::Relaxed);
+                            poll(limits)?;
+                            return Err(Error::Memory {
+                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                used,
+                            });
+                        }
+                    }
+                    self.merge.spent = stop.spent;
+                    self.merge.restarts += 1;
+                    self.merge.frozen_bound.get_or_insert(stop.bound);
+                    if merge_trace() {
+                        eprintln!(
+                            "MERGE restart={} spent={} bound={} merged={} pairs={}",
+                            self.merge.restarts,
+                            self.merge.spent,
+                            stop.bound,
+                            self.merge.shared.as_ref().map_or(0, |c| c.len()),
+                            pair_count,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// [`run_with`](Saturation::run_with) over every axiom it is given.
     fn run_with_all(
         &mut self,
@@ -1969,27 +2900,26 @@ impl Saturation {
         // what a pool admitted for a run that may fall back or start again, so that the
         // later run charges only what it needs beyond that
         let admitted = std::sync::Arc::new(AtomicUsize::new(0));
-        let counted;
-        let first = match &limits.charge {
-            Some(f) => {
-                let (f, a) = (f.clone(), admitted.clone());
-                counted = Limits {
-                    charge: Some(std::sync::Arc::new(move |bytes: usize| {
-                        let ok = f(bytes);
-                        if ok {
-                            a.fetch_add(bytes, Ordering::Relaxed);
-                        }
-                        ok
-                    })),
-                    ..limits.clone()
-                };
-                &counted
-            }
-            None => limits,
-        };
+        self.merge.clear();
+        self.canon_want = None;
+        self.active_hub = None;
+        self.merge_stop = None;
+        self.merge_disabled = false;
+        let mut call_peak = 0usize;
+        if limits.rooted && limits.rooted_merge && !limits.el_only {
+            self.collect_same(axioms, held_bytes, limits, &admitted, &mut call_peak)?;
+        }
         self.dl_worked.store(false, Ordering::Relaxed);
         self.rooted_declined = false;
-        let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
+        let mut r = self.run_merging(
+            axioms,
+            changes,
+            held_bytes,
+            limits,
+            &admitted,
+            &mut call_peak,
+            with_taxonomy,
+        );
         if let Err(Error::Memory { .. }) = r
             && self.reused
         {
@@ -2007,25 +2937,22 @@ impl Saturation {
             // Its charges draw first on what the pool admitted. Whether it passed a bound
             // on derived conclusions, or withdrew a rooted answer, is the new run's to say.
             self.reset();
+            self.merge.clear();
+            self.canon_want = None;
             self.dl_worked.store(false, Ordering::Relaxed);
             self.rooted_declined = false;
-            let a = admitted.clone();
-            let counting = limits.charge.clone().map(|f| {
-                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
-                    std::sync::Arc::new(move |bytes: usize| {
-                        let ok = f(bytes);
-                        if ok {
-                            a.fetch_add(bytes, Ordering::Relaxed);
-                        }
-                        ok
-                    });
-                drawing_on(admitted.load(Ordering::Relaxed), f)
-            });
-            let again = Limits {
-                charge: counting,
-                ..limits.clone()
-            };
-            r = self.run(axioms, None, held_bytes, &again, with_taxonomy);
+            if limits.rooted && limits.rooted_merge && !limits.el_only && !self.merge_disabled {
+                self.collect_same(axioms, held_bytes, limits, &admitted, &mut call_peak)?;
+            }
+            r = self.run_merging(
+                axioms,
+                None,
+                held_bytes,
+                limits,
+                &admitted,
+                &mut call_peak,
+                with_taxonomy,
+            );
         }
         // a rooted run that withdrew its answer starts again without the rooted rules, here
         // and after each retry below that can run the rooted rules again
@@ -2054,28 +2981,38 @@ impl Saturation {
             // conclusions: the run starts again on one thread, whose order is fixed, before
             // it falls back to the Horn rules. A schedule that stays within the bound where
             // one thread does not still answers in full. A run in steps
-            // (`Limits::dl_steps`) derives the same on every schedule and does not repeat. Its charges draw first on what the pool admitted
-            // for the first run.
+            // (`Limits::dl_steps`) derives the same on every schedule and does not repeat.
+            // Its charges draw first on what the pool admitted for the first run.
             self.reset();
+            self.merge.clear();
+            self.canon_want = None;
             self.dl_worked.store(false, Ordering::Relaxed);
-            let a = admitted.clone();
-            let counting = limits.charge.clone().map(|f| {
-                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
-                    std::sync::Arc::new(move |bytes: usize| {
-                        let ok = f(bytes);
-                        if ok {
-                            a.fetch_add(bytes, Ordering::Relaxed);
-                        }
-                        ok
-                    });
-                drawing_on(admitted.load(Ordering::Relaxed), f)
-            });
             let one = Limits {
                 threads: 1,
-                charge: counting,
                 ..limits.clone()
             };
-            r = self.run(axioms, None, held_bytes, &one, with_taxonomy);
+            if one.rooted
+                && one.rooted_merge
+                && !one.el_only
+                && !self.no_rooted
+                && !self.merge_disabled
+                && let Err(e) =
+                    self.collect_same(axioms, held_bytes, &one, &admitted, &mut call_peak)
+            {
+                if declined.is_some() {
+                    self.no_rooted = false;
+                }
+                return Err(e);
+            }
+            r = self.run_merging(
+                axioms,
+                None,
+                held_bytes,
+                &one,
+                &admitted,
+                &mut call_peak,
+                with_taxonomy,
+            );
             self.restart_declined(
                 &mut r,
                 &mut declined,
@@ -2100,25 +3037,35 @@ impl Saturation {
             // counting left out and reported, as before counting was built, before it falls
             // back to the Horn rules. Its charges draw first on what the pool admitted.
             self.reset();
+            self.merge.clear();
+            self.canon_want = None;
             self.dl_worked.store(false, Ordering::Relaxed);
             self.no_counting = true;
-            let a = admitted.clone();
-            let counting = limits.charge.clone().map(|f| {
-                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
-                    std::sync::Arc::new(move |bytes: usize| {
-                        let ok = f(bytes);
-                        if ok {
-                            a.fetch_add(bytes, Ordering::Relaxed);
-                        }
-                        ok
-                    });
-                drawing_on(admitted.load(Ordering::Relaxed), f)
-            });
-            let without = Limits {
-                charge: counting,
-                ..limits.clone()
-            };
-            r = self.run(axioms, None, held_bytes, &without, with_taxonomy);
+            if limits.rooted
+                && limits.rooted_merge
+                && !limits.el_only
+                && !self.no_rooted
+                && !self.merge_disabled
+            {
+                let collect =
+                    self.collect_same(axioms, held_bytes, limits, &admitted, &mut call_peak);
+                if let Err(e) = collect {
+                    self.no_counting = false;
+                    if declined.is_some() {
+                        self.no_rooted = false;
+                    }
+                    return Err(e);
+                }
+            }
+            r = self.run_merging(
+                axioms,
+                None,
+                held_bytes,
+                limits,
+                &admitted,
+                &mut call_peak,
+                with_taxonomy,
+            );
             // the run without counting can be rooted and withdraw its answer, and its
             // restart counts no more than it did
             self.restart_declined(
@@ -2148,23 +3095,14 @@ impl Saturation {
             // paths it takes without the option and the axioms outside OWL 2 EL are left
             // out and reported, before it falls back further. Its charges draw first on
             // what the pool admitted.
+            self.merge.clear();
+            self.canon_want = None;
+            self.merge_stop = None;
             self.reset();
             self.dl_worked.store(false, Ordering::Relaxed);
             self.no_rooted = true;
-            let a = admitted.clone();
-            let counting = limits.charge.clone().map(|f| {
-                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
-                    std::sync::Arc::new(move |bytes: usize| {
-                        let ok = f(bytes);
-                        if ok {
-                            a.fetch_add(bytes, Ordering::Relaxed);
-                        }
-                        ok
-                    });
-                drawing_on(admitted.load(Ordering::Relaxed), f)
-            });
             let unrooted = Limits {
-                charge: counting,
+                charge: Self::charge_drawing_on(limits, &admitted),
                 ..limits.clone()
             };
             r = self.run(axioms, None, held_bytes, &unrooted, with_taxonomy);
@@ -2188,22 +3126,13 @@ impl Saturation {
             // Tier D passed its budget or the caller's: the run starts again with the Horn
             // rules, which leave the disjunctive axioms out. Its charges draw first on
             // what the pool admitted for the run of Tier D.
+            self.merge.clear();
+            self.canon_want = None;
+            self.merge_stop = None;
             self.reset();
             self.skip_dl = true;
-            let a = admitted.clone();
-            let counting = limits.charge.clone().map(|f| {
-                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
-                    std::sync::Arc::new(move |bytes: usize| {
-                        let ok = f(bytes);
-                        if ok {
-                            a.fetch_add(bytes, Ordering::Relaxed);
-                        }
-                        ok
-                    });
-                drawing_on(admitted.load(Ordering::Relaxed), f)
-            });
             let horn = Limits {
-                charge: counting,
+                charge: Self::charge_drawing_on(limits, &admitted),
                 ..limits.clone()
             };
             r = self.run(axioms, None, held_bytes, &horn, with_taxonomy);
@@ -2227,6 +3156,9 @@ impl Saturation {
             // classifier did before the Horn rules and as the ELK mode does. Its charges
             // draw first on what the pool admitted for the Horn run, which the grant
             // still holds.
+            self.merge.clear();
+            self.canon_want = None;
+            self.merge_stop = None;
             self.reset();
             let el = Limits {
                 el_only: true,
@@ -2252,6 +3184,14 @@ impl Saturation {
         }
         if r.is_err() && self.dirty {
             self.reset();
+        }
+        self.merge.clear();
+        self.canon_want = None;
+        self.active_hub = None;
+        self.merge_stop = None;
+        self.merge_disabled = false;
+        if let Ok((_, _, stats)) = &mut r {
+            stats.peak_memory = stats.peak_memory.max(call_peak);
         }
         if let Some(counted) = counting_over
             && let Ok((_, _, stats)) = &mut r
@@ -2309,23 +3249,14 @@ impl Saturation {
             Err(Error::Memory { used, .. }) => *used,
             _ => 0,
         };
+        self.merge.clear();
+        self.canon_want = None;
+        self.merge_stop = None;
         self.reset();
         self.dl_worked.store(false, Ordering::Relaxed);
         self.no_rooted = true;
-        let a = admitted.clone();
-        let counting = limits.charge.clone().map(|f| {
-            let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
-                std::sync::Arc::new(move |bytes: usize| {
-                    let ok = f(bytes);
-                    if ok {
-                        a.fetch_add(bytes, Ordering::Relaxed);
-                    }
-                    ok
-                });
-            drawing_on(admitted.load(Ordering::Relaxed), f)
-        });
         let unrooted = Limits {
-            charge: counting,
+            charge: Self::charge_drawing_on(limits, admitted),
             ..limits.clone()
         };
         *r = self.run(axioms, None, held_bytes, &unrooted, with_taxonomy);
@@ -2362,7 +3293,7 @@ impl Saturation {
             held_bytes + kept_bytes,
             self.interner.ranges.ledger.clone(),
         );
-        budget.baseline(self.interner.bytes())?;
+        budget.baseline(self.interner.bytes() + self.merge_extra_bytes())?;
         self.interner.ranges.begin(budget.clone());
         let result = self.build_inner(axioms, outside, threads, held_bytes, limits);
         // the run's components and definitions end with its normalization, on every exit
@@ -2472,16 +3403,18 @@ impl Saturation {
             let gauge = Gauge {
                 limits,
                 numeric: self.interner.ranges.budget.clone(),
-                base: held_bytes + self.interner.bytes(),
+                base: held_bytes + self.interner.bytes() + self.merge_extra_bytes(),
                 held: AtomicUsize::new(0),
                 peak: parking_lot::Mutex::new(0),
                 over: std::sync::atomic::AtomicBool::new(false),
             };
             let numeric = self.interner.ranges.budget.clone();
             let definitions = &self.interner.ranges.definitions;
+            let canon = self.interner.canon.clone();
             let is_outside = &is_outside;
             let parts = par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
                 let mut it = Interner::chunk(definitions);
+                it.canon = canon.clone();
                 if let Some(b) = &numeric {
                     it.ranges.begin(b.clone());
                 }
@@ -2712,7 +3645,7 @@ impl Saturation {
         ax.classes.extend(self.interner.met_classes());
         let visible_named_classes = ax.classes.len() - classes_before;
         if let Some(b) = &self.interner.ranges.budget {
-            b.baseline(self.interner.bytes() + ax.bytes())?;
+            b.baseline(self.interner.bytes() + self.merge_extra_bytes() + ax.bytes())?;
         }
         if cfg!(debug_assertions)
             && let Some(run) = &self.interner.dt_run
@@ -2818,11 +3751,33 @@ impl Saturation {
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        let want_canon = if limits.rooted
+            && limits.rooted_merge
+            && !self.merge_disabled
+            && !self.no_rooted
+            && !limits.el_only
+            && !self.skip_dl
+        {
+            self.merge.shared.clone()
+        } else {
+            None
+        };
+        if !same_canon(&self.interner.canon, &want_canon) {
+            self.reset();
+        }
+        self.canon_want = want_canon;
+        let reduce_mem = limits.max_memory.map(|m| {
+            m.saturating_sub(
+                self.merge
+                    .uf_bytes()
+                    .saturating_add(self.canon_live_bytes()),
+            )
+        });
         if limits.rooted
             && !self.no_rooted
             && !limits.el_only
             && !self.skip_dl
-            && let Some(red) = dl_reduce::plan(axioms, limits.max_memory)
+            && let Some(red) = dl_reduce::plan(axioms, reduce_mem, self.canon_want.as_deref())
         {
             // item 805: keys over object properties and the universal property go through
             // class axioms over fresh names, which a run that does not take Tier D leaves
@@ -2834,7 +3789,9 @@ impl Saturation {
             // the rewritten axioms are held beside the caller's for the run
             let red_bytes: usize = red.axioms.iter().map(held_bytes_of).sum();
             self.hide_internal = true;
+            self.active_hub = red.hub.clone();
             let r = self.run_once(&all, None, held_bytes + red_bytes, limits, with_taxonomy);
+            self.active_hub = None;
             self.hide_internal = false;
             match r {
                 Ok(Some(mut r)) if self.dl_tried => {
@@ -2932,6 +3889,7 @@ impl Saturation {
             el_only: limits.el_only,
             counting: limits.counting,
             rooted: limits.rooted,
+            rooted_merge: limits.rooted_merge,
             number_order: limits.number_order,
             eager: limits.expansion == Expansion::Eager,
             skip_dl: self.skip_dl,
@@ -2982,6 +3940,7 @@ impl Saturation {
         self.worlds.clear();
         if full {
             self.interner = Interner::new();
+            self.interner.canon = self.canon_want.clone();
             self.ctx = Vec::new();
             self.disjoint = Vec::new();
             self.dynamic = None;
@@ -3184,7 +4143,7 @@ impl Saturation {
             }
             _ => dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone()),
         });
-        let dl_run = dl_run.map(|mut d| {
+        let mut dl_run = dl_run.map(|mut d| {
             d.mrepair = dl_root::marker_repair(limits.rooted_marker_repair);
             d
         });
@@ -3302,7 +4261,16 @@ impl Saturation {
         self.dl_counted = ax.dl.as_ref().is_some_and(|d| d.counting);
         self.dl_attempt =
             dl_run.is_some() && !self.dl_rooted && !self.dl_counted && !self.no_counting;
-        if let Some(d) = &dl_run {
+        let merge_discover =
+            self.dl_rooted && !self.dl_counted && limits.rooted_merge && !self.merge_disabled;
+        if merge_discover
+            && merge_root_first()
+            && let Some(root) = rooted
+            && let Some(at) = roots.iter().position(|&r| r == root)
+        {
+            roots[..=at].rotate_right(1);
+        }
+        if let Some(d) = &mut dl_run {
             // a run that counts has the bound of the limits, and the run that starts again
             // without counting after it passed that bound has the larger one of a run that
             // cannot expect to finish soon, before the Horn rules take over; a rooted run
@@ -3311,15 +4279,29 @@ impl Saturation {
             // only an attempt has a limit on the choices of a product
             d.set_width_limit(0);
             if self.dl_rooted && !self.dl_counted {
-                let limit = limits
-                    .dl_work
-                    .unwrap_or_else(|| {
-                        rooted_work_bound(visible_named_classes, rooted_bound_per_class())
-                    })
-                    .max(1);
+                let limit = self.merge.frozen_bound.unwrap_or_else(|| {
+                    limits
+                        .dl_work
+                        .unwrap_or_else(|| {
+                            rooted_work_bound(visible_named_classes, rooted_bound_per_class())
+                        })
+                        .max(1)
+                });
                 #[cfg(test)]
                 LAST_ROOTED_WORK_LIMIT.with(|c| c.set(limit));
                 d.set_work_limit(limit);
+                if merge_discover {
+                    d.set_merge(true);
+                    if self.merge.spent > 0 {
+                        d.add_carried(self.merge.spent);
+                    }
+                    if !merge_hub()
+                        && let Some(hub) = &self.active_hub
+                        && let Some(id) = self.interner.individuals.get(hub)
+                    {
+                        d.merge_skip.push(id);
+                    }
+                }
             } else if self.no_counting {
                 d.set_work_limit(DL_RETRY_WORK);
             } else if self.dl_counted {
@@ -3409,7 +4391,7 @@ impl Saturation {
             Stop::Timeout => Error::Timeout,
             // the bound on derived conclusions goes back as the memory error that the
             // fallback chain of `run_with` takes
-            Stop::Memory { used } | Stop::Work { used } => Error::Memory {
+            Stop::Memory { used } | Stop::Work { used } | Stop::Merge { used } => Error::Memory {
                 limit: limits.max_memory.unwrap_or(usize::MAX),
                 used,
             },
@@ -3424,6 +4406,43 @@ impl Saturation {
         let mut totals = match saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds)
         {
             (t, None) => t,
+            (_, Some(Stop::Merge { used })) => {
+                // Disable merge discovery outside the main round and inspect the winning
+                // payload after all workers have joined. A merge stop never returns a
+                // partial taxonomy.
+                if let Some(d) = &dl_run {
+                    d.set_merge(false);
+                    let spent = d.work_total();
+                    let bound = d.work_limit();
+                    let exhausted = d.over_work() || (bound != 0 && spent >= bound);
+                    let payload = d.take_merged();
+                    if !exhausted
+                        && let Some((pairs, pairs_bytes)) = payload
+                        && !pairs.is_empty()
+                    {
+                        self.dl_worked.store(false, Ordering::Relaxed);
+                        self.merge_stop = Some(MergeStop {
+                            pairs,
+                            pairs_bytes,
+                            spent,
+                            bound,
+                            peak: used,
+                            active_hub: self.active_hub.clone(),
+                        });
+                        return Err(Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used,
+                        });
+                    }
+                    self.dl_worked.store(true, Ordering::Relaxed);
+                    #[cfg(test)]
+                    PASSED_AT.with(|p| p.set(d.work()));
+                }
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used,
+                });
+            }
             (t, Some(s)) if partial => {
                 over_work = matches!(s, Stop::Work { .. });
                 halted = Some(stopped(s));
@@ -3439,6 +4458,10 @@ impl Saturation {
                 return Err(stopped(s));
             }
         };
+        if let Some(d) = &dl_run {
+            // Never trigger merge discovery in later marking/test rounds.
+            d.set_merge(false);
+        }
         // the candidates whose tests ended without a contradiction
         let mut refuted: FxHashSet<(Ex, Ex)> = FxHashSet::default();
         // Tier D orders the atoms totally, which leaves the subsumers that only a case
@@ -4224,6 +5247,56 @@ impl Saturation {
             && !root.is_some_and(bottom)
     }
 
+    /// Exact live bytes of all distinct `Arc<CanonMap>` allocations currently owned by
+    /// `self`, counting each distinct `Arc` allocation once even when shared across
+    /// `interner.canon`, `canon_want`, and `merge.shared`.
+    fn canon_live_bytes(&self) -> usize {
+        let mut ptrs: [Option<*const index::CanonMap>; 3] = [None; 3];
+        let mut n = 0usize;
+        let mut sum = 0usize;
+        for arc in [&self.interner.canon, &self.canon_want, &self.merge.shared]
+            .into_iter()
+            .flatten()
+        {
+            let p = std::sync::Arc::as_ptr(arc);
+            if !ptrs[..n].contains(&Some(p)) {
+                ptrs[n] = Some(p);
+                n += 1;
+                sum = sum.saturating_add(arc.owned_bytes());
+            }
+        }
+        sum
+    }
+
+    /// Deterministic logical bytes of all distinct `Arc<CanonMap>` allocations owned by
+    /// `self`.
+    fn canon_logical_bytes(&self) -> usize {
+        let mut ptrs: [Option<*const index::CanonMap>; 3] = [None; 3];
+        let mut n = 0usize;
+        let mut sum = 0usize;
+        for arc in [&self.interner.canon, &self.canon_want, &self.merge.shared]
+            .into_iter()
+            .flatten()
+        {
+            let p = std::sync::Arc::as_ptr(arc);
+            if !ptrs[..n].contains(&Some(p)) {
+                ptrs[n] = Some(p);
+                n += 1;
+                sum = sum.saturating_add(arc.logical_bytes());
+            }
+        }
+        sum
+    }
+
+    /// Merge/canonical-map bytes live on `self` beyond what `self.interner.bytes()`
+    /// already counts.
+    fn merge_extra_bytes(&self) -> usize {
+        self.merge.uf_bytes().saturating_add(
+            self.canon_live_bytes()
+                .saturating_sub(self.interner.canon_bytes()),
+        )
+    }
+
     fn index_bytes(&self, ix: &Index) -> usize {
         // each class's IRI is held once, beside its hash and its entry in the table
         self.interner.len() * 40
@@ -4236,6 +5309,8 @@ impl Saturation {
                 .map_or(0, |l| l.bytes())
             + ix.bytes()
             + self.interner.scope_bytes()
+            + self.canon_live_bytes()
+            + self.merge.uf_bytes()
             + self.disjoint.capacity() * 24
             + self
                 .disjoint
@@ -4255,6 +5330,8 @@ impl Saturation {
                 .map_or(0, |l| l.bytes())
             + ix.logical_bytes()
             + self.interner.logical_scope_bytes()
+            + self.canon_logical_bytes()
+            + self.merge.uf_logical_bytes()
             + self.disjoint.len() * 24
             + self.disjoint.iter().map(|d| d.len() * 4).sum::<usize>()
     }

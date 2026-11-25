@@ -550,6 +550,9 @@ impl DlIx {
     }
 }
 
+/// Harvested constant-equality pairs and their retained vector capacity in bytes.
+pub(super) type MergedPairs = (Vec<(u32, u32)>, usize);
+
 /// What a saturation with Tier D shares: the table of the clauses that contexts send one
 /// another and the bytes of the clause stores.
 #[derive(Default)]
@@ -588,6 +591,16 @@ pub struct DlRun {
     /// constants-only successor replay deduplication are enabled (default off, behind
     /// `SPARKLES_ROOTED_SHARED_FACTS=1`)
     pub(super) shared_facts: bool,
+    /// whether item 1061 phase 2 root unit constant-equality discovery is active during
+    /// the current saturation round (default off, disabled after the main round)
+    pub(super) merge: std::sync::atomic::AtomicBool,
+    /// constant IDs excluded from merge discovery (e.g. generated hub when
+    /// `SPARKLES_ROOTED_MERGE_HUB=0`)
+    pub(super) merge_skip: Vec<u32>,
+    /// winning merge-stop payload `(pairs, retained_vec_bytes)` moved in once after
+    /// winning `STOP_MERGE` and taken by move after workers join; its bytes are carried
+    /// in `Run::memory` via `DlGuard::commit`, not in `DlRun::bytes()`
+    merged: parking_lot::Mutex<Option<MergedPairs>>,
     /// the repair's counts, for measurements: the notices of held triggers the root took,
     /// the markers it sent and the clauses it returned
     pub mcount: [AtomicUsize; 3],
@@ -637,7 +650,44 @@ impl DlRun {
         self
     }
     pub fn bytes(&self) -> usize {
-        self.table.bytes() + self.lits.unadmitted_bytes() + self.stores.load(Ordering::Relaxed)
+        self.table.bytes()
+            + self.lits.unadmitted_bytes()
+            + self.stores.load(Ordering::Relaxed)
+            + self.merge_skip.capacity() * std::mem::size_of::<u32>()
+    }
+    #[inline]
+    pub(super) fn merge_enabled(&self) -> bool {
+        self.merge.load(Ordering::Relaxed)
+    }
+    #[inline]
+    pub(super) fn set_merge(&self, on: bool) {
+        self.merge.store(on, Ordering::Relaxed);
+    }
+    /// Total conclusions counted against this run's bound, including carried prefix work.
+    pub fn work_total(&self) -> usize {
+        self.carried.saturating_add(self.work())
+    }
+    /// Current work bound, or 0 when unbounded.
+    pub fn work_limit(&self) -> usize {
+        self.work_limit.load(Ordering::Relaxed)
+    }
+    /// Adds `n` prefix conclusions from earlier merge restarts without overwriting any
+    /// carried history from reused contexts.
+    pub(super) fn add_carried(&mut self, n: usize) {
+        self.carried = self.carried.saturating_add(n);
+    }
+    /// Stores the single harvested pair buffer after winning `STOP_MERGE`.
+    pub(super) fn set_merged(&self, pairs: Vec<(u32, u32)>, bytes: usize) {
+        let mut slot = self.merged.lock();
+        debug_assert!(
+            slot.is_none(),
+            "merge stop payload published more than once"
+        );
+        *slot = Some((pairs, bytes));
+    }
+    /// Takes the harvested pair buffer by move after workers join.
+    pub(super) fn take_merged(&self) -> Option<(Vec<(u32, u32)>, usize)> {
+        self.merged.lock().take()
     }
     /// Starts another run over the table of the last one, whose kept contexts name its
     /// clauses by id (roadmap item 753). The bytes of the kept contexts' stores count
@@ -657,6 +707,9 @@ impl DlRun {
         *self.work_limit.get_mut() = 0;
         *self.width_limit.get_mut() = 0;
         *self.exhausted.get_mut() = false;
+        *self.merge.get_mut() = false;
+        self.merge_skip.clear();
+        *self.merged.get_mut() = None;
     }
     pub(super) fn grow(&self, bytes: usize) {
         self.stores.fetch_add(bytes, Ordering::Relaxed);

@@ -689,6 +689,11 @@ pub enum Stop {
     Work {
         used: usize,
     },
+    /// Rooted constant merging discovered an unconditional unit constant equality in the
+    /// root context and halted the prefix cleanly for a quotient restart
+    Merge {
+        used: usize,
+    },
 }
 
 /// Estimates the live overlap at a saturation check or after the workers have joined.
@@ -739,6 +744,7 @@ const STOP_CANCEL: u8 = 1;
 const STOP_TIMEOUT: u8 = 2;
 const STOP_MEMORY: u8 = 3;
 const STOP_WORK: u8 = 4;
+const STOP_MERGE: u8 = 5;
 
 /// The conclusions a worker applies between checks of the bounds.
 const CHECK_EVERY: usize = 4096;
@@ -1121,6 +1127,9 @@ impl<S: Sink> Sink for Guard<'_, S> {
     fn stopped(&self) -> bool {
         self.out.stopped()
     }
+    fn halt_merge(&self) -> bool {
+        self.out.halt_merge()
+    }
 }
 
 /// RAII scope guard for Tier D reservations granted through [`Sink::admit_dl`]. Commits
@@ -1257,6 +1266,9 @@ impl<S: Sink> Sink for DlGuard<'_, S> {
     fn stopped(&self) -> bool {
         self.out.stopped()
     }
+    fn halt_merge(&self) -> bool {
+        self.out.halt_merge()
+    }
 }
 
 /// RAII scope guard for retained Tier D memory credit returned through [`Sink::credit_dl`]
@@ -1356,6 +1368,9 @@ impl<S: Sink> Sink for CreditGuard<'_, S> {
     }
     fn stopped(&self) -> bool {
         self.out.stopped()
+    }
+    fn halt_merge(&self) -> bool {
+        self.out.halt_merge()
     }
 }
 
@@ -1553,6 +1568,7 @@ pub fn saturate_counted(
         // the most counted, waiting messages included, which is what passed the limit
         STOP_MEMORY => Some(Stop::Memory { used: peak }),
         STOP_WORK => Some(Stop::Work { used: peak }),
+        STOP_MERGE => Some(Stop::Merge { used: peak }),
         _ => None,
     };
     (totals, stop)
@@ -1862,6 +1878,11 @@ pub trait Sink {
     fn stopped(&self) -> bool {
         false
     }
+    /// Publishes an unambiguous internal merge stop if no earlier stop has already won,
+    /// waking idle workers. Returns `true` only for the winning publisher.
+    fn halt_merge(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -2079,6 +2100,10 @@ impl Sink for Out<'_, '_> {
     #[inline]
     fn stopped(&self) -> bool {
         self.run.stopped()
+    }
+
+    fn halt_merge(&self) -> bool {
+        self.run.halt_merge()
     }
 }
 
@@ -2573,6 +2598,19 @@ impl<'a> Run<'a> {
     fn halt(&self, why: u8) {
         self.publish_stop(why);
         self.wake_stopped(why);
+    }
+
+    fn halt_merge(&self) -> bool {
+        if self
+            .stop
+            .compare_exchange(STOP_NONE, STOP_MERGE, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.wake_stopped(STOP_MERGE);
+            true
+        } else {
+            false
+        }
     }
 
     fn publish_stop(&self, why: u8) {

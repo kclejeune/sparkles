@@ -57,6 +57,9 @@ pub struct Reduction {
     pub origin: Vec<usize>,
     /// the original axioms that the rewriting replaces or drops
     pub replaced: Vec<bool>,
+    /// the generated hub individual if this reduction introduced `owl:topObjectProperty`
+    /// via `⊤ ⊑ ∃U.{hub}`, identifying the generated hub by provenance rather than prefix
+    pub hub: Option<NamedIndividual>,
 }
 
 impl Reduction {
@@ -407,7 +410,11 @@ impl Cx {
 /// Whether the axioms hold something that keeps a rooted run of Tier D from them whatever
 /// the rewriting does, data, the bottom property or a reflexive property, or a name with
 /// the prefix of the made-up names.
-fn blocked(k: &AxiomKind, inds: &mut BTreeSet<NamedIndividual>) -> bool {
+fn blocked(
+    k: &AxiomKind,
+    inds: &mut BTreeSet<NamedIndividual>,
+    canon: Option<&super::index::CanonMap>,
+) -> bool {
     let mut s = Signature::default();
     s.axiom(k);
     let mut bad = matches!(k, AxiomKind::ReflexiveObjectProperty(p) if !is_top(p));
@@ -422,7 +429,8 @@ fn blocked(k: &AxiomKind, inds: &mut BTreeSet<NamedIndividual>) -> bool {
                 bad = true
             }
             Entity::NamedIndividual(i) => {
-                inds.insert(i.clone());
+                let rep = canon.and_then(|m| m.get(i)).unwrap_or(i);
+                inds.insert(rep.clone());
             }
             _ => {}
         }
@@ -433,8 +441,14 @@ fn blocked(k: &AxiomKind, inds: &mut BTreeSet<NamedIndividual>) -> bool {
 /// The rewriting of the axioms for a rooted run, or `None` when no axiom needs it, when
 /// the ontology has no axiom that needs case analysis, which the Horn rules take, when
 /// something keeps Tier D from it anyway, or when an axiom has no reduction or the keys'
-/// reductions pass the bound. `memory` is the run's memory budget.
-pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
+/// reductions pass the bound. `memory` is the run's memory budget. When `canon` is given,
+/// key subjects and object-key values range over the distinct canonical images of the
+/// original named signature.
+pub fn plan(
+    axioms: &[&AxiomKind],
+    memory: Option<usize>,
+    canon: Option<&super::index::CanonMap>,
+) -> Option<Reduction> {
     // an inclusion in the top property alone needs no rewriting, since the run takes it
     // as an axiom that adds nothing (roadmap item 1282)
     let wants = |k: &AxiomKind| {
@@ -451,7 +465,7 @@ pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
         if super::index::top_inclusion(k) {
             continue;
         }
-        if blocked(k, &mut inds) {
+        if blocked(k, &mut inds, canon) {
             return None;
         }
         if matches!(k, AxiomKind::HasKey(_, _, dps) if !dps.is_empty()) {
@@ -470,6 +484,7 @@ pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
         axioms: Vec::new(),
         origin: Vec::new(),
         replaced: vec![false; axioms.len()],
+        hub: None,
     };
     let mut first_use = None;
     let mut keys = 0usize;
@@ -527,6 +542,7 @@ pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
     if let Some(i) = first_use {
         let up = ObjectPropertyExpression::Property(u());
         let thing = ClassExpression::Class(Class::thing());
+        out.hub = Some(NamedIndividual::new(format!("{PREFIX}hub")));
         for k in [
             AxiomKind::SubClassOf(
                 thing,
