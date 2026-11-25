@@ -4,18 +4,19 @@
 //! DOSDP and Cellfie:
 //!
 //! - [`TemplateMode::Robot`]: column directives (`ID`, `LABEL`, `TYPE`, `SC %`, `EC %`,
-//!   `DC %`, `SP %`, `C %`, `I %`, `I <prop>`, `A <prop>`, `AL <prop>@lang`,
+//!   `DC %`, `SP %`, `C %`, `I %`, `I <prop>`, `TI %`, `A <prop>`, `AL <prop>@lang`,
 //!   `AT <prop>^^<dt>`, `AI <prop>`, `SPLIT=<sep>`, and axiom annotations `>A`/`>AL`/
-//!   `>AT`/`>AI`), read either from row 2 of the spreadsheet or from explicit column
-//!   directive mappings.
+//!   `>AT`/`>AI`), read from row 2 of the spreadsheet, from explicit column directive
+//!   mappings, or merged with explicit overrides on top of row 2.
 //! - [`TemplateMode::Pattern`]: parameterized axiom templates in Manchester syntax or
 //!   functional-style syntax with `${col}` and `${col|filter}` placeholders, optional
 //!   entity declarations, multi-valued cell splitting, and axiom annotations.
 //!
 //! Evaluation runs in two passes so entities and labels declared by one row are visible
-//! to Manchester expressions on other rows in the same table. Output axioms are
-//! validated with [`crate::validate::axiom`] and deduplicated deterministically with
-//! 1-based source line provenance.
+//! to Manchester expressions on other rows in the same table. Output axioms are staged
+//! per row, validated with [`crate::validate::axiom`], and deduplicated deterministically
+//! with 1-based source line provenance. Any row with an error discards all staged
+//! declarations and axioms from that row.
 
 mod robot;
 mod rules;
@@ -43,6 +44,54 @@ const DEFAULT_PATTERN_PREFIXES: [(&str, &str); 6] = [
     ("obo", "http://purl.obolibrary.org/obo/"),
 ];
 
+/// Non-hierarchical URI schemes accepted without angle brackets when not bound as prefixes.
+const ALLOWED_NON_HIERARCHICAL_SCHEMES: &[&str] = &[
+    "urn", "mailto", "tag", "doi", "info", "data", "did", "uuid", "ni", "geo", "tel", "ark", "hdl",
+    "isbn", "issn",
+];
+
+/// Cooperative stop reason returned by cancellation / deadline hooks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelReason {
+    Cancelled,
+    Timeout,
+}
+
+/// Error returned when parsing or evaluating a table stops before producing a result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvalError {
+    Table(TableError),
+    Cancelled,
+    Timeout,
+}
+
+impl std::fmt::Display for EvalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Table(e) => e.fmt(f),
+            Self::Cancelled => f.write_str("pattern evaluation cancelled"),
+            Self::Timeout => f.write_str("pattern evaluation timed out"),
+        }
+    }
+}
+
+impl std::error::Error for EvalError {}
+
+impl From<TableError> for EvalError {
+    fn from(e: TableError) -> Self {
+        Self::Table(e)
+    }
+}
+
+impl From<CancelReason> for EvalError {
+    fn from(r: CancelReason) -> Self {
+        match r {
+            CancelReason::Cancelled => Self::Cancelled,
+            CancelReason::Timeout => Self::Timeout,
+        }
+    }
+}
+
 /// Resource bounds enforced while parsing and evaluating spreadsheet patterns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -58,6 +107,32 @@ pub struct Limits {
     pub max_diagnostics: usize,
     /// Maximum Cartesian expansion combinations per rule per row (default: 256).
     pub max_rule_expansion_per_row: usize,
+    /// Maximum number of rules in a pattern spec (default: 128).
+    pub max_rules: usize,
+    /// Maximum number of declarations in a pattern spec (default: 128).
+    pub max_declarations: usize,
+    /// Maximum number of explicit column directives in a ROBOT spec (default: 256).
+    pub max_columns_spec: usize,
+    /// Maximum number of annotations per rule spec (default: 64).
+    pub max_annotations_per_rule: usize,
+    /// Maximum number of extra prefix bindings in a spec (default: 256).
+    pub max_prefixes: usize,
+    /// Maximum number of split tokens extracted from one cell (default: 256).
+    pub max_split_values_per_cell: usize,
+    /// Maximum number of axiom annotations attached to one axiom (default: 64).
+    pub max_annotations_per_axiom: usize,
+    /// Maximum expanded template text length in bytes per evaluation (default: 64 KiB).
+    pub max_expanded_bytes_per_template: usize,
+    /// Maximum cumulative expanded text bytes across one evaluation (default: 32 MiB).
+    pub max_total_expanded_bytes: usize,
+    /// Maximum total axiom/annotation evaluation attempts across a request (default: 100,000).
+    pub max_axiom_attempts: usize,
+    /// Maximum projected RDF triples (default: 250,000).
+    pub max_triples: usize,
+    /// Maximum byte length of each recorded diagnostic message (default: 1,024).
+    pub max_diagnostic_message_bytes: usize,
+    /// Maximum vocabulary entries (entities + labels) added during Pass 1 (default: 100,000).
+    pub max_vocab_entries_added: usize,
 }
 
 impl Default for Limits {
@@ -69,6 +144,19 @@ impl Default for Limits {
             max_axioms: 50_000,
             max_diagnostics: 1_000,
             max_rule_expansion_per_row: 256,
+            max_rules: 128,
+            max_declarations: 128,
+            max_columns_spec: 256,
+            max_annotations_per_rule: 64,
+            max_prefixes: 256,
+            max_split_values_per_cell: 256,
+            max_annotations_per_axiom: 64,
+            max_expanded_bytes_per_template: 64 * 1024,
+            max_total_expanded_bytes: 32 * 1024 * 1024,
+            max_axiom_attempts: 100_000,
+            max_triples: 250_000,
+            max_diagnostic_message_bytes: 1_024,
+            max_vocab_entries_added: 100_000,
         }
     }
 }
@@ -145,6 +233,12 @@ pub struct PatternResult {
     pub rows_processed: usize,
     pub rows_skipped: usize,
     pub rows_with_errors: usize,
+    /// Total error-level diagnostics observed (even when `diagnostics` is truncated).
+    pub error_count: usize,
+    /// Total spec/structural error diagnostics observed.
+    pub structural_error_count: usize,
+    /// True when evaluation hit a request-wide budget limit.
+    pub budget_exceeded: bool,
     /// Deduplicated generated axioms in deterministic first-seen order.
     pub axioms: Vec<GeneratedAxiom>,
     /// Distinct entities explicitly declared by the template.
@@ -154,21 +248,37 @@ pub struct PatternResult {
 }
 
 impl PatternResult {
-    /// Whether evaluation completed with zero error-level diagnostics.
+    /// Whether evaluation completed with zero error-level diagnostics and within budget.
     pub fn is_valid(&self) -> bool {
-        !self
-            .diagnostics
-            .iter()
-            .any(|d| d.severity == Severity::Error)
-            && self.rows_with_errors == 0
+        self.error_count == 0 && self.rows_with_errors == 0 && !self.budget_exceeded
     }
 
-    /// Count of error-level diagnostics.
+    /// Total count of error-level diagnostics (including those omitted after truncation).
     pub fn error_count(&self) -> usize {
-        self.diagnostics
-            .iter()
-            .filter(|d| d.severity == Severity::Error)
-            .count()
+        self.error_count
+    }
+
+    /// Whether a request-wide budget failure or structural specification error occurred
+    /// (these refuse writes even under `onError: "skip"`).
+    pub fn has_fatal_error(&self) -> bool {
+        self.structural_error_count > 0 || self.budget_exceeded
+    }
+
+    /// Deterministically map all generated axioms to RDF triples via the OWL 2 forward
+    /// mapping (`sparkles_owl::write`), refusing if the output exceeds `max_triples`.
+    pub fn try_triples(&self, max_triples: usize) -> Result<Vec<Triple>, String> {
+        let mut fresh = write::counter("pat");
+        let mut out = Vec::new();
+        for item in &self.axioms {
+            let chunk = write::axiom_triples(&item.axiom, &mut fresh);
+            if out.len().saturating_add(chunk.len()) > max_triples {
+                return Err(format!(
+                    "projected RDF triples exceeded the limit of {max_triples}"
+                ));
+            }
+            out.extend(chunk);
+        }
+        Ok(out)
     }
 
     /// Deterministically map all generated axioms to RDF triples via the OWL 2 forward
@@ -245,93 +355,220 @@ impl Context {
 
 /// Deterministic deduplicating accumulator for generated axioms and diagnostics.
 pub(crate) struct Emitter {
-    max_axioms: usize,
-    max_diagnostics: usize,
+    limits: Limits,
     axioms: Vec<GeneratedAxiom>,
     index: FxHashMap<Axiom, usize>,
     declarations: BTreeSet<Entity>,
     diagnostics: Vec<RowDiagnostic>,
     diagnostics_truncated: bool,
     error_rows: FxHashSet<usize>,
+    total_errors: usize,
+    structural_errors: usize,
+    budget_exceeded: bool,
+    attempts: usize,
+    total_expanded_bytes: usize,
+    vocab_entries_added: usize,
     limit_reported: bool,
     pub rows_processed: usize,
     pub rows_skipped: usize,
 }
 
 impl Emitter {
-    fn new(limits: &Limits) -> Self {
+    fn new(limits: &Limits, initial_truncated: bool) -> Self {
         Self {
-            max_axioms: limits.max_axioms,
-            max_diagnostics: limits.max_diagnostics,
+            limits: *limits,
             axioms: Vec::new(),
             index: FxHashMap::default(),
             declarations: BTreeSet::new(),
             diagnostics: Vec::new(),
-            diagnostics_truncated: false,
+            diagnostics_truncated: initial_truncated,
             error_rows: FxHashSet::default(),
+            total_errors: 0,
+            structural_errors: 0,
+            budget_exceeded: false,
+            attempts: 0,
+            total_expanded_bytes: 0,
+            vocab_entries_added: 0,
             limit_reported: false,
             rows_processed: 0,
             rows_skipped: 0,
         }
     }
 
-    pub(crate) fn declare(&mut self, entity: Entity) {
-        self.declarations.insert(entity);
-    }
-
     pub(crate) fn mark_row_error(&mut self, row: usize) {
         self.error_rows.insert(row);
     }
 
-    pub(crate) fn diag(&mut self, diag: RowDiagnostic) {
-        if self.diagnostics.len() < self.max_diagnostics {
+    pub(crate) fn diag(&mut self, mut diag: RowDiagnostic) {
+        if diag.severity == Severity::Error {
+            self.total_errors = self.total_errors.saturating_add(1);
+        }
+        truncate_utf8(&mut diag.message, self.limits.max_diagnostic_message_bytes);
+        if self.diagnostics.len() < self.limits.max_diagnostics {
             self.diagnostics.push(diag);
         } else {
             self.diagnostics_truncated = true;
         }
     }
 
-    /// Validate and record `axiom` generated at 1-based `row`. Returns `false` if the
-    /// axiom limit has been reached and evaluation should stop.
-    pub(crate) fn emit(&mut self, axiom: Axiom, row: usize, column: Option<String>) -> bool {
-        if let Err(e) = crate::validate::axiom(&axiom) {
-            self.mark_row_error(row);
+    pub(crate) fn structural_error(&mut self, diag: RowDiagnostic) {
+        self.structural_errors = self.structural_errors.saturating_add(1);
+        self.diag(diag);
+    }
+
+    pub(crate) fn budget_error(
+        &mut self,
+        row: usize,
+        column: Option<String>,
+        code: &'static str,
+        message: String,
+    ) {
+        self.budget_exceeded = true;
+        if !self.limit_reported {
+            self.limit_reported = true;
             self.diag(RowDiagnostic {
                 row,
                 column,
                 severity: Severity::Error,
-                code: "invalid-axiom".to_string(),
-                message: e.0,
+                code: code.to_string(),
+                message,
             });
-            return true;
         }
-        if let Some(&pos) = self.index.get(&axiom) {
-            let entry = &mut self.axioms[pos];
-            if entry.rows.last() != Some(&row) && !entry.rows.contains(&row) {
-                entry.rows.push(row);
-            }
-            return true;
+    }
+
+    pub(crate) fn charge_attempt(
+        &mut self,
+        count: usize,
+        row: usize,
+        column: Option<String>,
+    ) -> bool {
+        self.attempts = self.attempts.saturating_add(count);
+        if self.attempts > self.limits.max_axiom_attempts {
+            self.budget_error(
+                row,
+                column,
+                "work-limit",
+                format!(
+                    "pattern evaluation work exceeded the limit of {} attempts",
+                    self.limits.max_axiom_attempts
+                ),
+            );
+            return false;
         }
-        if self.axioms.len() >= self.max_axioms {
-            if !self.limit_reported {
-                self.limit_reported = true;
+        true
+    }
+
+    pub(crate) fn charge_expanded_bytes(
+        &mut self,
+        bytes: usize,
+        row: usize,
+        column: Option<String>,
+    ) -> bool {
+        self.total_expanded_bytes = self.total_expanded_bytes.saturating_add(bytes);
+        if self.total_expanded_bytes > self.limits.max_total_expanded_bytes {
+            self.budget_error(
+                row,
+                column,
+                "expansion-bytes-limit",
+                format!(
+                    "expanded template text exceeded the {} byte request budget",
+                    self.limits.max_total_expanded_bytes
+                ),
+            );
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn charge_vocab(&mut self, row: usize) -> bool {
+        self.vocab_entries_added = self.vocab_entries_added.saturating_add(1);
+        if self.vocab_entries_added > self.limits.max_vocab_entries_added {
+            self.budget_error(
+                row,
+                None,
+                "vocab-limit",
+                format!(
+                    "vocabulary additions exceeded the limit of {} entries",
+                    self.limits.max_vocab_entries_added
+                ),
+            );
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn remaining_axiom_capacity(&self) -> usize {
+        self.limits.max_axioms.saturating_sub(self.axioms.len())
+    }
+
+    /// Validate all staged axioms for one row and commit declarations + axioms atomically.
+    /// If any axiom fails `validate::axiom`, records the diagnostic(s), marks the row as
+    /// erroneous, and discards every staged declaration and axiom from this row.
+    /// Returns `false` if a request-wide budget limit is exceeded and evaluation should stop.
+    pub(crate) fn commit_row(
+        &mut self,
+        row: usize,
+        declarations: Vec<Entity>,
+        axioms: Vec<(Axiom, Option<String>)>,
+    ) -> bool {
+        let mut any_invalid = false;
+        for (ax, col) in &axioms {
+            if let Err(e) = crate::validate::axiom(ax) {
+                any_invalid = true;
                 self.mark_row_error(row);
                 self.diag(RowDiagnostic {
                     row,
-                    column,
+                    column: col.clone(),
                     severity: Severity::Error,
-                    code: "axiom-limit".to_string(),
-                    message: format!("generated axioms exceeded the limit of {}", self.max_axioms),
+                    code: "invalid-axiom".to_string(),
+                    message: e.0,
                 });
             }
+        }
+        if any_invalid {
+            return true;
+        }
+
+        // Check whether adding the new unique axioms from this row would exceed `max_axioms`
+        // before mutating state so a partially committed row never leaks on limit overflow.
+        let mut new_unique: FxHashSet<&Axiom> = FxHashSet::default();
+        for (ax, _) in &axioms {
+            if !self.index.contains_key(ax) {
+                new_unique.insert(ax);
+            }
+        }
+        if self.axioms.len().saturating_add(new_unique.len()) > self.limits.max_axioms {
+            let col = axioms.first().and_then(|(_, c)| c.clone());
+            self.budget_error(
+                row,
+                col,
+                "axiom-limit",
+                format!(
+                    "generated axioms exceeded the limit of {}",
+                    self.limits.max_axioms
+                ),
+            );
             return false;
         }
-        let pos = self.axioms.len();
-        self.index.insert(axiom.clone(), pos);
-        self.axioms.push(GeneratedAxiom {
-            axiom,
-            rows: vec![row],
-        });
+
+        for entity in declarations {
+            self.declarations.insert(entity);
+        }
+        for (axiom, _) in axioms {
+            if let Some(&pos) = self.index.get(&axiom) {
+                let entry = &mut self.axioms[pos];
+                if entry.rows.last() != Some(&row) && !entry.rows.contains(&row) {
+                    entry.rows.push(row);
+                }
+            } else {
+                let pos = self.axioms.len();
+                self.index.insert(axiom.clone(), pos);
+                self.axioms.push(GeneratedAxiom {
+                    axiom,
+                    rows: vec![row],
+                });
+            }
+        }
         true
     }
 
@@ -342,11 +579,30 @@ impl Emitter {
             rows_processed: self.rows_processed,
             rows_skipped: self.rows_skipped,
             rows_with_errors: self.error_rows.len(),
+            error_count: self.total_errors,
+            structural_error_count: self.structural_errors,
+            budget_exceeded: self.budget_exceeded,
             axioms: self.axioms,
             declarations: self.declarations.into_iter().collect(),
             diagnostics: self.diagnostics,
             diagnostics_truncated: self.diagnostics_truncated,
         }
+    }
+}
+
+fn truncate_utf8(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let suffix = "…";
+    let target = max_bytes.saturating_sub(suffix.len());
+    let mut end = target.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    if max_bytes >= suffix.len() {
+        s.push_str(suffix);
     }
 }
 
@@ -359,15 +615,51 @@ pub fn evaluate(
     base_vocab: &Vocabulary,
     limits: &Limits,
 ) -> Result<PatternResult, TableError> {
+    let mut noop = || Ok(());
+    match evaluate_with_cancel(raw_table, delimiter, spec, base_vocab, limits, &mut noop) {
+        Ok(r) => Ok(r),
+        Err(EvalError::Table(e)) => Err(e),
+        Err(EvalError::Cancelled | EvalError::Timeout) => unreachable!(),
+    }
+}
+
+/// Evaluate raw CSV/TSV spreadsheet text against `spec`, periodically invoking
+/// `check_cancel` so callers can enforce deadlines or client disconnect cancellation.
+pub fn evaluate_with_cancel(
+    raw_table: &str,
+    delimiter: Delimiter,
+    spec: &PatternSpec,
+    base_vocab: &Vocabulary,
+    limits: &Limits,
+    check_cancel: &mut dyn FnMut() -> Result<(), CancelReason>,
+) -> Result<PatternResult, EvalError> {
+    let extra_rows = usize::from(matches!(
+        spec.mode,
+        TemplateMode::Robot {
+            header_template_row: true,
+            ..
+        }
+    ));
     let mut table_diags = Vec::new();
-    let table = parse_table(raw_table, delimiter, limits, &mut table_diags)?;
-    Ok(evaluate_table(
+    let mut table_truncated = false;
+    let table = table::parse_table_with_options(
+        raw_table,
+        delimiter,
+        limits,
+        extra_rows,
+        &mut table_diags,
+        &mut table_truncated,
+        check_cancel,
+    )?;
+    evaluate_table_with_cancel(
         &table,
         spec,
         base_vocab,
         limits,
         table_diags,
-    ))
+        table_truncated,
+        check_cancel,
+    )
 }
 
 /// Evaluate an already-parsed [`Table`] against `spec`.
@@ -378,23 +670,51 @@ pub fn evaluate_table(
     limits: &Limits,
     initial_diagnostics: Vec<RowDiagnostic>,
 ) -> PatternResult {
-    let mut emitter = Emitter::new(limits);
+    let mut noop = || Ok(());
+    evaluate_table_with_cancel(
+        table,
+        spec,
+        base_vocab,
+        limits,
+        initial_diagnostics,
+        false,
+        &mut noop,
+    )
+    .expect("noop cancel never fails")
+}
+
+/// Evaluate an already-parsed [`Table`] against `spec` with cooperative cancellation.
+pub fn evaluate_table_with_cancel(
+    table: &Table,
+    spec: &PatternSpec,
+    base_vocab: &Vocabulary,
+    limits: &Limits,
+    initial_diagnostics: Vec<RowDiagnostic>,
+    initial_truncated: bool,
+    check_cancel: &mut dyn FnMut() -> Result<(), CancelReason>,
+) -> Result<PatternResult, EvalError> {
+    check_cancel()?;
+    let mut emitter = Emitter::new(limits, initial_truncated);
     for d in initial_diagnostics {
         emitter.diag(d);
+    }
+
+    if !check_spec_limits(spec, limits, &mut emitter) {
+        return Ok(emitter.finish(table.delimiter, table.headers.clone()));
     }
 
     let mut ctx = Context::build(base_vocab, spec);
     if let Some(ref base) = ctx.base_iri
         && parse_iri(base).is_err()
     {
-        emitter.diag(RowDiagnostic {
+        emitter.structural_error(RowDiagnostic {
             row: 1,
             column: None,
             severity: Severity::Error,
             code: "invalid-base-iri".to_string(),
             message: format!("base IRI '{base}' is not a valid absolute IRI"),
         });
-        return emitter.finish(table.delimiter, table.headers.clone());
+        return Ok(emitter.finish(table.delimiter, table.headers.clone()));
     }
 
     match &spec.mode {
@@ -408,14 +728,112 @@ pub fn evaluate_table(
             &mut ctx,
             limits,
             &mut emitter,
-        ),
+            check_cancel,
+        )?,
         TemplateMode::Pattern {
             rules,
             declarations,
-        } => rules::evaluate_rules(table, rules, declarations, &mut ctx, limits, &mut emitter),
+        } => rules::evaluate_rules(
+            table,
+            rules,
+            declarations,
+            &mut ctx,
+            limits,
+            &mut emitter,
+            check_cancel,
+        )?,
     }
 
-    emitter.finish(table.delimiter, table.headers.clone())
+    Ok(emitter.finish(table.delimiter, table.headers.clone()))
+}
+
+fn check_spec_limits(spec: &PatternSpec, limits: &Limits, emitter: &mut Emitter) -> bool {
+    if spec.prefixes.len() > limits.max_prefixes {
+        emitter.budget_error(
+            1,
+            None,
+            "spec-limit",
+            format!(
+                "spec defines {} prefixes, exceeding the limit of {}",
+                spec.prefixes.len(),
+                limits.max_prefixes
+            ),
+        );
+        return false;
+    }
+    match &spec.mode {
+        TemplateMode::Robot { columns, .. } => {
+            if columns.len() > limits.max_columns_spec {
+                emitter.budget_error(
+                    1,
+                    None,
+                    "spec-limit",
+                    format!(
+                        "spec defines {} column directives, exceeding the limit of {}",
+                        columns.len(),
+                        limits.max_columns_spec
+                    ),
+                );
+                return false;
+            }
+        }
+        TemplateMode::Pattern {
+            rules,
+            declarations,
+        } => {
+            if rules.len() > limits.max_rules {
+                emitter.budget_error(
+                    1,
+                    None,
+                    "spec-limit",
+                    format!(
+                        "spec defines {} rules, exceeding the limit of {}",
+                        rules.len(),
+                        limits.max_rules
+                    ),
+                );
+                return false;
+            }
+            if declarations.len() > limits.max_declarations {
+                emitter.budget_error(
+                    1,
+                    None,
+                    "spec-limit",
+                    format!(
+                        "spec defines {} declarations, exceeding the limit of {}",
+                        declarations.len(),
+                        limits.max_declarations
+                    ),
+                );
+                return false;
+            }
+            for (idx, rule) in rules.iter().enumerate() {
+                if rule.annotations.len() > limits.max_annotations_per_rule {
+                    emitter.budget_error(
+                        1,
+                        rule.name
+                            .clone()
+                            .or_else(|| Some(format!("rule_{}", idx + 1))),
+                        "spec-limit",
+                        format!(
+                            "rule defines {} annotations, exceeding the limit of {}",
+                            rule.annotations.len(),
+                            limits.max_annotations_per_rule
+                        ),
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn is_curie_prefix(prefix: &str) -> bool {
+    prefix.is_empty()
+        || prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 /// Resolve an IRI, `<IRI>`, CURIE (`prefix:local`), or bare local name (when `base_iri`
@@ -428,19 +846,29 @@ pub(crate) fn resolve_iri(raw: &str, ctx: &Context) -> Result<Iri, String> {
     if s.starts_with('<') && s.ends_with('>') && s.len() > 2 {
         return parse_iri(&s[1..s.len() - 1]).map_err(|e| e.0);
     }
-    if let Some((prefix, local)) = s.split_once(':')
-        && !prefix.contains(['/', '#', '?', ' '])
-        && let Some((_, ns)) = ctx.prefixes.iter().find(|(p, _)| p == prefix)
+    if !s.contains(char::is_whitespace)
+        && let Some((prefix, local)) = s.split_once(':')
     {
-        let full = format!("{ns}{local}");
-        return parse_iri(&full).map_err(|e| e.0);
-    }
-    // Full IRI such as http://..., https://..., urn:...
-    if s.contains(':')
-        && !s.contains(char::is_whitespace)
-        && let Ok(iri) = parse_iri(s)
-    {
-        return Ok(iri);
+        // Hierarchical full IRIs such as http://..., https://..., file://...
+        if local.starts_with("//") {
+            return parse_iri(s).map_err(|e| e.0);
+        }
+        if is_curie_prefix(prefix) {
+            if let Some((_, ns)) = ctx.prefixes.iter().find(|(p, _)| p == prefix) {
+                let full = format!("{ns}{local}");
+                return parse_iri(&full).map_err(|e| e.0);
+            }
+            if !prefix.is_empty()
+                && ALLOWED_NON_HIERARCHICAL_SCHEMES
+                    .iter()
+                    .any(|scheme| prefix.eq_ignore_ascii_case(scheme))
+            {
+                return parse_iri(s).map_err(|e| e.0);
+            }
+            return Err(format!(
+                "unknown prefix '{prefix}' in '{s}' (bind the prefix or wrap full IRIs in <...>)"
+            ));
+        }
     }
     // Bare local name resolved against base_iri if configured.
     if let Some(base) = &ctx.base_iri

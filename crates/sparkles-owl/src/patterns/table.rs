@@ -1,6 +1,6 @@
 //! RFC 4180 CSV/TSV parser with source line tracking and strict resource bounds.
 
-use super::{Limits, RowDiagnostic, Severity};
+use super::{CancelReason, EvalError, Limits, RowDiagnostic, Severity};
 
 /// Field delimiter for tabular inputs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,32 +68,50 @@ impl std::fmt::Display for TableError {
 
 impl std::error::Error for TableError {}
 
-/// Detect whether the header line uses tabs or commas outside quoted fields.
+/// Detect whether the first non-blank logical header record uses tabs or commas outside
+/// quoted fields.
 fn detect_delimiter(input: &str) -> Delimiter {
-    let mut in_quotes = false;
-    let mut tabs = 0usize;
-    let mut commas = 0usize;
     let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                if in_quotes && chars.peek() == Some(&'"') {
-                    chars.next();
-                } else {
-                    in_quotes = !in_quotes;
+    while chars.peek().is_some() {
+        let mut in_quotes = false;
+        let mut tabs = 0usize;
+        let mut commas = 0usize;
+        let mut has_content = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    if in_quotes && chars.peek() == Some(&'"') {
+                        chars.next();
+                        has_content = true;
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                }
+                '\r' if !in_quotes => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    break;
+                }
+                '\n' if !in_quotes => break,
+                '\t' if !in_quotes => tabs += 1,
+                ',' if !in_quotes => commas += 1,
+                other => {
+                    if !other.is_whitespace() {
+                        has_content = true;
+                    }
                 }
             }
-            '\n' | '\r' if !in_quotes => break,
-            '\t' if !in_quotes => tabs += 1,
-            ',' if !in_quotes => commas += 1,
-            _ => {}
+        }
+        if has_content {
+            return if tabs > commas {
+                Delimiter::Tab
+            } else {
+                Delimiter::Comma
+            };
         }
     }
-    if tabs > commas {
-        Delimiter::Tab
-    } else {
-        Delimiter::Comma
-    }
+    Delimiter::Comma
 }
 
 /// Parse CSV or TSV text into a [`Table`], collecting non-fatal warnings in `diagnostics`.
@@ -103,6 +121,35 @@ pub fn parse_table(
     limits: &Limits,
     diagnostics: &mut Vec<RowDiagnostic>,
 ) -> Result<Table, TableError> {
+    let mut truncated = false;
+    let mut noop = || Ok(());
+    match parse_table_with_options(
+        raw,
+        delimiter,
+        limits,
+        0,
+        diagnostics,
+        &mut truncated,
+        &mut noop,
+    ) {
+        Ok(t) => Ok(t),
+        Err(EvalError::Table(e)) => Err(e),
+        Err(EvalError::Cancelled | EvalError::Timeout) => unreachable!(),
+    }
+}
+
+/// Internal entry point allowing an optional extra template row (when ROBOT
+/// `header_template_row` is true), forwarding warning truncation, and polling cancellation.
+pub(crate) fn parse_table_with_options(
+    raw: &str,
+    delimiter: Delimiter,
+    limits: &Limits,
+    extra_rows: usize,
+    diagnostics: &mut Vec<RowDiagnostic>,
+    diagnostics_truncated: &mut bool,
+    check_cancel: &mut dyn FnMut() -> Result<(), CancelReason>,
+) -> Result<Table, EvalError> {
+    check_cancel()?;
     if raw.len() > limits.max_input_bytes {
         return Err(TableError {
             code: "input-too-large",
@@ -112,7 +159,8 @@ pub fn parse_table(
                 limits.max_input_bytes
             ),
             line: None,
-        });
+        }
+        .into());
     }
     let text = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let resolved = match delimiter {
@@ -124,7 +172,7 @@ pub fn parse_table(
         Delimiter::Comma | Delimiter::Auto => ',',
     };
 
-    let records = parse_records(text, sep, limits)?;
+    let records = parse_records(text, sep, limits, check_cancel)?;
     let mut iter = records.into_iter().filter(|(_, cells)| {
         // Ignore completely blank lines.
         cells.iter().any(|c| !c.trim().is_empty())
@@ -135,7 +183,8 @@ pub fn parse_table(
             code: "empty-table",
             message: "table has no header row".to_string(),
             line: None,
-        });
+        }
+        .into());
     };
 
     if raw_headers.len() > limits.max_cols {
@@ -147,7 +196,8 @@ pub fn parse_table(
                 limits.max_cols
             ),
             line: Some(header_line),
-        });
+        }
+        .into());
     }
 
     let headers: Vec<String> = raw_headers
@@ -159,7 +209,8 @@ pub fn parse_table(
             code: "empty-header",
             message: "header row contains no column names".to_string(),
             line: Some(header_line),
-        });
+        }
+        .into());
     }
 
     let mut seen_headers = rustc_hash::FxHashSet::default();
@@ -168,6 +219,7 @@ pub fn parse_table(
             push_diag(
                 diagnostics,
                 limits.max_diagnostics,
+                diagnostics_truncated,
                 RowDiagnostic {
                     row: header_line,
                     column: Some(h.clone()),
@@ -180,23 +232,27 @@ pub fn parse_table(
     }
 
     let col_count = headers.len();
+    let max_table_rows = limits.max_rows.saturating_add(extra_rows);
     let mut rows = Vec::new();
     for (idx, (line, mut cells)) in iter.enumerate() {
+        if idx.is_multiple_of(256) {
+            check_cancel()?;
+        }
         let row_number = idx + 1;
-        // Allow up to max_rows + 1 when header_template_row might consume row 1;
-        // the caller checks the final data row count against limits.max_rows.
-        if row_number > limits.max_rows + 1 {
+        if row_number > max_table_rows {
             return Err(TableError {
                 code: "too-many-rows",
                 message: format!("table exceeds the {} row limit", limits.max_rows),
                 line: Some(line),
-            });
+            }
+            .into());
         }
         if cells.len() > col_count {
             let extra = cells.len() - col_count;
             push_diag(
                 diagnostics,
                 limits.max_diagnostics,
+                diagnostics_truncated,
                 RowDiagnostic {
                     row: line,
                     column: None,
@@ -227,9 +283,11 @@ pub fn parse_table(
     })
 }
 
-fn push_diag(out: &mut Vec<RowDiagnostic>, max: usize, diag: RowDiagnostic) {
+fn push_diag(out: &mut Vec<RowDiagnostic>, max: usize, truncated: &mut bool, diag: RowDiagnostic) {
     if out.len() < max {
         out.push(diag);
+    } else {
+        *truncated = true;
     }
 }
 
@@ -238,12 +296,17 @@ fn parse_records(
     text: &str,
     sep: char,
     limits: &Limits,
-) -> Result<Vec<(usize, Vec<String>)>, TableError> {
+    check_cancel: &mut dyn FnMut() -> Result<(), CancelReason>,
+) -> Result<Vec<(usize, Vec<String>)>, EvalError> {
     let mut records = Vec::new();
     let mut chars = text.chars().peekable();
     let mut line = 1usize;
+    let mut char_ticks = 0usize;
 
     while chars.peek().is_some() {
+        if records.len().is_multiple_of(256) {
+            check_cancel()?;
+        }
         let start_line = line;
         let mut row = Vec::new();
         loop {
@@ -252,6 +315,10 @@ fn parse_records(
                 chars.next();
                 let mut closed = false;
                 while let Some(c) = chars.next() {
+                    char_ticks += 1;
+                    if char_ticks.is_multiple_of(8192) {
+                        check_cancel()?;
+                    }
                     if c == '"' {
                         if chars.peek() == Some(&'"') {
                             chars.next();
@@ -272,7 +339,8 @@ fn parse_records(
                         code: "unclosed-quote",
                         message: "unclosed quoted field".to_string(),
                         line: Some(start_line),
-                    });
+                    }
+                    .into());
                 }
                 // Consume trailing spaces after closing quote before separator/EOL.
                 while let Some(&c) = chars.peek() {
@@ -286,11 +354,16 @@ fn parse_records(
                             code: "invalid-quote",
                             message: format!("unexpected character '{c}' after closing quote"),
                             line: Some(line),
-                        });
+                        }
+                        .into());
                     }
                 }
             } else {
                 while let Some(&c) = chars.peek() {
+                    char_ticks += 1;
+                    if char_ticks.is_multiple_of(8192) {
+                        check_cancel()?;
+                    }
                     if c == sep || c == '\n' || c == '\r' {
                         break;
                     }
@@ -304,7 +377,8 @@ fn parse_records(
                     code: "too-many-columns",
                     message: format!("row exceeds column limit ({})", limits.max_cols),
                     line: Some(start_line),
-                });
+                }
+                .into());
             }
             row.push(field);
 
@@ -336,7 +410,8 @@ fn parse_records(
                 code: "too-many-rows",
                 message: format!("table exceeds the {} row limit", limits.max_rows),
                 line: Some(line),
-            });
+            }
+            .into());
         }
     }
 

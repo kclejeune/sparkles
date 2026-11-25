@@ -1,8 +1,11 @@
 //! DOSDP/Cellfie-style parameterized axiom pattern rules with `${col}` and `${col|filter}`
 //! placeholder substitution across Manchester and Functional-style OWL 2 syntax.
 
-use super::{Context, Emitter, Limits, RowDiagnostic, Severity, Table, resolve_iri};
+use super::{
+    CancelReason, Context, Emitter, EvalError, Limits, RowDiagnostic, Severity, Table, resolve_iri,
+};
 use crate::model::*;
+use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 
 /// Syntax used by a parameterized axiom rule template.
@@ -188,11 +191,14 @@ fn parse_placeholder_expr(expr: &str) -> Result<(String, Filter), String> {
     Ok((col.to_string(), filter))
 }
 
+/// Safely match an ASCII `name(...)` call without risking mid-UTF-8-char slices.
 fn strip_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
-    if s.len() > name.len() + 2
-        && s[..name.len()].eq_ignore_ascii_case(name)
-        && s.as_bytes()[name.len()] == b'('
-        && s.ends_with(')')
+    debug_assert!(name.is_ascii());
+    let bytes = s.as_bytes();
+    if bytes.len() >= name.len() + 2
+        && bytes[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+        && bytes[name.len()] == b'('
+        && bytes[bytes.len() - 1] == b')'
     {
         Some(s[name.len() + 1..s.len() - 1].trim())
     } else {
@@ -208,9 +214,10 @@ pub(crate) fn evaluate_rules(
     ctx: &mut Context,
     limits: &Limits,
     emitter: &mut Emitter,
-) {
+    check_cancel: &mut dyn FnMut() -> Result<(), CancelReason>,
+) -> Result<(), EvalError> {
     if table.rows.len() > limits.max_rows {
-        emitter.diag(RowDiagnostic {
+        emitter.structural_error(RowDiagnostic {
             row: table.rows[limits.max_rows].line,
             column: None,
             severity: Severity::Error,
@@ -221,11 +228,11 @@ pub(crate) fn evaluate_rules(
                 limits.max_rows
             ),
         });
-        return;
+        return Ok(());
     }
 
     if rules.is_empty() && declarations.is_empty() {
-        emitter.diag(RowDiagnostic {
+        emitter.structural_error(RowDiagnostic {
             row: 1,
             column: None,
             severity: Severity::Error,
@@ -233,22 +240,58 @@ pub(crate) fn evaluate_rules(
             message: "pattern specification must define at least one rule or declaration"
                 .to_string(),
         });
-        return;
+        return Ok(());
     }
 
-    let header_idx: rustc_hash::FxHashMap<&str, usize> = table
-        .headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.as_str(), i))
-        .collect();
+    // Track first index and occurrence counts so duplicate column references are diagnosed
+    // consistently rather than silently picking first vs last.
+    let mut header_idx: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut header_counts: FxHashMap<&str, usize> = FxHashMap::default();
+    for (i, h) in table.headers.iter().enumerate() {
+        *header_counts.entry(h.as_str()).or_insert(0) += 1;
+        header_idx.entry(h.as_str()).or_insert(i);
+    }
 
-    // Parse all rule templates and validate column references upfront.
+    let check_column = |col: &str, context: &str, emitter: &mut Emitter| -> bool {
+        match header_counts.get(col).copied().unwrap_or(0) {
+            0 => {
+                emitter.structural_error(RowDiagnostic {
+                    row: 1,
+                    column: Some(col.to_string()),
+                    severity: Severity::Error,
+                    code: "unknown-column".to_string(),
+                    message: format!(
+                        "{context} references column '{col}', which is not in the table header"
+                    ),
+                });
+                false
+            }
+            1 => true,
+            _ => {
+                emitter.structural_error(RowDiagnostic {
+                    row: 1,
+                    column: Some(col.to_string()),
+                    severity: Severity::Error,
+                    code: "ambiguous-column".to_string(),
+                    message: format!("{context} references duplicate column header '{col}'"),
+                });
+                false
+            }
+        }
+    };
+
+    struct CompiledAnn<'a> {
+        spec: &'a RuleAnnotation,
+        segments: Vec<Segment>,
+        /// Annotation-only placeholder columns (not bound by the rule template).
+        extra_cols: Vec<String>,
+    }
+
     struct CompiledRule<'a> {
         rule: &'a PatternRule,
         segments: Vec<Segment>,
         referenced: Vec<String>,
-        annotations: Vec<(&'a RuleAnnotation, Vec<Segment>)>,
+        annotations: Vec<CompiledAnn<'a>>,
     }
 
     let mut compiled = Vec::with_capacity(rules.len());
@@ -260,7 +303,7 @@ pub(crate) fn evaluate_rules(
         let segments = match parse_template(&rule.template) {
             Ok(segs) => segs,
             Err(msg) => {
-                emitter.diag(RowDiagnostic {
+                emitter.structural_error(RowDiagnostic {
                     row: 1,
                     column: Some(label),
                     severity: Severity::Error,
@@ -271,64 +314,79 @@ pub(crate) fn evaluate_rules(
             }
         };
         let mut referenced = Vec::new();
-        let mut missing_col = false;
+        let mut rule_invalid = false;
         for seg in &segments {
             if let Segment::Placeholder { column, .. } = seg {
-                if !header_idx.contains_key(column.as_str()) {
-                    missing_col = true;
-                    emitter.diag(RowDiagnostic {
-                        row: 1,
-                        column: Some(column.clone()),
-                        severity: Severity::Error,
-                        code: "unknown-column".to_string(),
-                        message: format!(
-                            "rule '{label}' references column '{column}', which is not in the table header"
-                        ),
-                    });
+                if !check_column(column, &format!("rule '{label}'"), emitter) {
+                    rule_invalid = true;
                 } else if !referenced.contains(column) {
                     referenced.push(column.clone());
                 }
             }
         }
         for req in &rule.required_columns {
-            if !header_idx.contains_key(req.as_str()) {
-                missing_col = true;
-                emitter.diag(RowDiagnostic {
-                    row: 1,
-                    column: Some(req.clone()),
-                    severity: Severity::Error,
-                    code: "unknown-column".to_string(),
-                    message: format!(
-                        "rule '{label}' requires column '{req}', which is not in the table header"
-                    ),
-                });
+            if !check_column(req, &format!("rule '{label}' requiredColumns"), emitter) {
+                rule_invalid = true;
+            }
+        }
+        for split_col in rule.split.keys() {
+            if !check_column(split_col, &format!("rule '{label}' split"), emitter) {
+                rule_invalid = true;
             }
         }
         let mut compiled_anns = Vec::with_capacity(rule.annotations.len());
         for ann in &rule.annotations {
+            if ann.iri && (ann.lang.is_some() || ann.datatype.is_some()) {
+                rule_invalid = true;
+                emitter.structural_error(RowDiagnostic {
+                    row: 1,
+                    column: Some(label.clone()),
+                    severity: Severity::Error,
+                    code: "invalid-annotation".to_string(),
+                    message: format!(
+                        "annotation in rule '{label}' cannot combine iri=true with lang or datatype"
+                    ),
+                });
+                continue;
+            }
+            if ann.lang.is_some() && ann.datatype.is_some() {
+                rule_invalid = true;
+                emitter.structural_error(RowDiagnostic {
+                    row: 1,
+                    column: Some(label.clone()),
+                    severity: Severity::Error,
+                    code: "invalid-annotation".to_string(),
+                    message: format!(
+                        "annotation in rule '{label}' cannot specify both lang and datatype"
+                    ),
+                });
+                continue;
+            }
             match parse_template(&ann.value) {
                 Ok(ann_segs) => {
+                    let mut extra_cols = Vec::new();
                     for seg in &ann_segs {
-                        if let Segment::Placeholder { column, .. } = seg
-                            && !header_idx.contains_key(column.as_str())
-                        {
-                            missing_col = true;
-                            emitter.diag(RowDiagnostic {
-                                row: 1,
-                                column: Some(column.clone()),
-                                severity: Severity::Error,
-                                code: "unknown-column".to_string(),
-                                message: format!(
-                                    "annotation template in rule '{label}' references unknown column '{column}'"
-                                ),
-                            });
+                        if let Segment::Placeholder { column, .. } = seg {
+                            if !check_column(
+                                column,
+                                &format!("annotation template in rule '{label}'"),
+                                emitter,
+                            ) {
+                                rule_invalid = true;
+                            } else if !referenced.contains(column) && !extra_cols.contains(column) {
+                                extra_cols.push(column.clone());
+                            }
                         }
                     }
-                    compiled_anns.push((ann, ann_segs));
+                    compiled_anns.push(CompiledAnn {
+                        spec: ann,
+                        segments: ann_segs,
+                        extra_cols,
+                    });
                 }
                 Err(msg) => {
-                    missing_col = true;
-                    emitter.diag(RowDiagnostic {
+                    rule_invalid = true;
+                    emitter.structural_error(RowDiagnostic {
                         row: 1,
                         column: Some(label.clone()),
                         severity: Severity::Error,
@@ -338,7 +396,7 @@ pub(crate) fn evaluate_rules(
                 }
             }
         }
-        if !missing_col {
+        if !rule_invalid {
             compiled.push(CompiledRule {
                 rule,
                 segments,
@@ -351,31 +409,31 @@ pub(crate) fn evaluate_rules(
     // Validate declaration columns.
     let mut resolved_decls: Vec<(usize, &ColumnDeclaration)> = Vec::new();
     for decl in declarations {
-        if let Some(&idx) = header_idx.get(decl.column.as_str()) {
-            resolved_decls.push((idx, decl));
-        } else {
-            emitter.diag(RowDiagnostic {
-                row: 1,
-                column: Some(decl.column.clone()),
-                severity: Severity::Error,
-                code: "unknown-column".to_string(),
-                message: format!(
-                    "declaration column '{}' is not in the table header",
-                    decl.column
-                ),
-            });
+        if check_column(&decl.column, "declaration", emitter) {
+            resolved_decls.push((header_idx[decl.column.as_str()], decl));
         }
     }
 
     // Pass 1: register declared entities across all rows so Manchester rules can reference
     // entities introduced by the spreadsheet itself.
-    for row in &table.rows {
+    for (row_i, row) in table.rows.iter().enumerate() {
+        if row_i.is_multiple_of(64) {
+            check_cancel()?;
+        }
         for &(col_idx, decl) in &resolved_decls {
             let cell = row.cells.get(col_idx).map(|s| s.trim()).unwrap_or("");
             if cell.is_empty() {
                 continue;
             }
-            for item in split_values(cell, decl.split.as_deref()) {
+            let (items, _truncated) = split_values_bounded(
+                cell,
+                decl.split.as_deref(),
+                limits.max_split_values_per_cell,
+            );
+            for item in items {
+                if !emitter.charge_vocab(row.line) {
+                    return Ok(());
+                }
                 if let Ok(iri) = resolve_iri(item, ctx) {
                     ctx.register_entity(&iri, decl.kind);
                 }
@@ -383,34 +441,55 @@ pub(crate) fn evaluate_rules(
         }
     }
 
-    // Pass 2: emit declaration axioms and rule axioms per row.
+    // Pass 2: stage and emit declaration axioms and rule axioms per row.
     for row in &table.rows {
+        check_cancel()?;
         if row.cells.iter().all(|c| c.trim().is_empty()) {
             emitter.rows_skipped += 1;
             continue;
         }
         emitter.rows_processed += 1;
 
+        let mut row_has_error = false;
+        let mut row_declarations: Vec<Entity> = Vec::new();
+        let mut row_axioms: Vec<(Axiom, Option<String>)> = Vec::new();
+
         for &(col_idx, decl) in &resolved_decls {
             let cell = row.cells.get(col_idx).map(|s| s.trim()).unwrap_or("");
             if cell.is_empty() {
                 continue;
             }
-            for item in split_values(cell, decl.split.as_deref()) {
+            let (items, truncated) = split_values_bounded(
+                cell,
+                decl.split.as_deref(),
+                limits.max_split_values_per_cell,
+            );
+            if truncated {
+                row_has_error = true;
+                emitter.diag(RowDiagnostic {
+                    row: row.line,
+                    column: Some(decl.column.clone()),
+                    severity: Severity::Error,
+                    code: "expansion-limit".to_string(),
+                    message: format!(
+                        "declaration column '{}' split exceeds the limit of {} values",
+                        decl.column, limits.max_split_values_per_cell
+                    ),
+                });
+                continue;
+            }
+            for item in items {
+                if !emitter.charge_attempt(1, row.line, Some(decl.column.clone())) {
+                    return Ok(());
+                }
                 match resolve_iri(item, ctx) {
                     Ok(iri) => {
                         let entity = make_entity(iri, decl.kind);
-                        emitter.declare(entity.clone());
-                        if !emitter.emit(
-                            Axiom::declaration(entity),
-                            row.line,
-                            Some(decl.column.clone()),
-                        ) {
-                            return;
-                        }
+                        row_declarations.push(entity.clone());
+                        row_axioms.push((Axiom::declaration(entity), Some(decl.column.clone())));
                     }
                     Err(msg) => {
-                        emitter.mark_row_error(row.line);
+                        row_has_error = true;
                         emitter.diag(RowDiagnostic {
                             row: row.line,
                             column: Some(decl.column.clone()),
@@ -431,7 +510,7 @@ pub(crate) fn evaluate_rules(
                 let val = row.cells.get(idx).map(|s| s.trim()).unwrap_or("");
                 if val.is_empty() {
                     missing_req = true;
-                    emitter.mark_row_error(row.line);
+                    row_has_error = true;
                     emitter.diag(RowDiagnostic {
                         row: row.line,
                         column: Some(req.clone()),
@@ -451,13 +530,32 @@ pub(crate) fn evaluate_rules(
             for col_name in &cr.referenced {
                 let idx = header_idx[col_name.as_str()];
                 let raw = row.cells.get(idx).map(|s| s.trim()).unwrap_or("");
-                let vals = split_values(raw, cr.rule.split.get(col_name).map(String::as_str));
+                let (vals, truncated) = split_values_bounded(
+                    raw,
+                    cr.rule.split.get(col_name).map(String::as_str),
+                    limits.max_split_values_per_cell,
+                );
+                if truncated {
+                    row_has_error = true;
+                    emitter.diag(RowDiagnostic {
+                        row: row.line,
+                        column: Some(col_name.clone()),
+                        severity: Severity::Error,
+                        code: "expansion-limit".to_string(),
+                        message: format!(
+                            "column '{col_name}' split exceeds the limit of {} values",
+                            limits.max_split_values_per_cell
+                        ),
+                    });
+                    skip = true;
+                    break;
+                }
                 if vals.is_empty() {
                     if cr.rule.skip_if_empty {
                         skip = true;
                         break;
                     } else {
-                        emitter.mark_row_error(row.line);
+                        row_has_error = true;
                         emitter.diag(RowDiagnostic {
                             row: row.line,
                             column: Some(col_name.clone()),
@@ -480,7 +578,7 @@ pub(crate) fn evaluate_rules(
                 .iter()
                 .try_fold(1usize, |acc, (_, v)| acc.checked_mul(v.len()));
             if total_combos.is_none_or(|n| n > limits.max_rule_expansion_per_row) {
-                emitter.mark_row_error(row.line);
+                row_has_error = true;
                 emitter.diag(RowDiagnostic {
                     row: row.line,
                     column: cr.rule.name.clone(),
@@ -495,8 +593,7 @@ pub(crate) fn evaluate_rules(
             }
 
             // Build binding combinations.
-            let mut combos: Vec<rustc_hash::FxHashMap<&str, &str>> =
-                vec![rustc_hash::FxHashMap::default()];
+            let mut combos: Vec<FxHashMap<&str, &str>> = vec![FxHashMap::default()];
             for (col_name, vals) in &col_lists {
                 let mut next = Vec::with_capacity(combos.len() * vals.len());
                 for existing in &combos {
@@ -509,12 +606,30 @@ pub(crate) fn evaluate_rules(
                 combos = next;
             }
 
-            for bindings in &combos {
-                let expanded = match render_segments(&cr.segments, bindings, row, &header_idx, ctx)
-                {
+            for (combo_i, bindings) in combos.iter().enumerate() {
+                if combo_i.is_multiple_of(64) {
+                    check_cancel()?;
+                }
+                if !emitter.charge_attempt(1, row.line, cr.rule.name.clone()) {
+                    return Ok(());
+                }
+
+                let expanded = match render_segments_bounded(
+                    &cr.segments,
+                    bindings,
+                    row,
+                    &header_idx,
+                    ctx,
+                    cr.rule.syntax,
+                    limits.max_expanded_bytes_per_template,
+                    emitter,
+                    row.line,
+                    cr.rule.name.as_deref(),
+                ) {
                     Ok(s) => s,
-                    Err(msg) => {
-                        emitter.mark_row_error(row.line);
+                    Err(RenderError::Budget) => return Ok(()),
+                    Err(RenderError::Row(msg)) => {
+                        row_has_error = true;
                         emitter.diag(RowDiagnostic {
                             row: row.line,
                             column: cr.rule.name.clone(),
@@ -539,7 +654,7 @@ pub(crate) fn evaluate_rules(
                 let mut ax = match parsed_axiom {
                     Ok(a) => a,
                     Err(msg) => {
-                        emitter.mark_row_error(row.line);
+                        row_has_error = true;
                         emitter.diag(RowDiagnostic {
                             row: row.line,
                             column: cr.rule.name.clone(),
@@ -551,34 +666,90 @@ pub(crate) fn evaluate_rules(
                     }
                 };
 
-                // Attach optional rule annotations.
-                for (ann_spec, ann_segs) in &cr.annotations {
-                    let mut all_present = true;
-                    for seg in ann_segs {
-                        if let Segment::Placeholder { column, .. } = seg {
-                            let val = bindings
-                                .get(column.as_str())
-                                .copied()
-                                .or_else(|| {
-                                    header_idx
-                                        .get(column.as_str())
-                                        .and_then(|&i| row.cells.get(i))
-                                        .map(|s| s.trim())
-                                })
-                                .unwrap_or("");
-                            if val.is_empty() {
-                                all_present = false;
-                                break;
-                            }
+                // Attach optional rule annotations (supporting bounded splits on
+                // annotation-only columns).
+                let mut ann_failed = false;
+                for ann in &cr.annotations {
+                    let mut extra_lists: Vec<(&str, Vec<&str>)> =
+                        Vec::with_capacity(ann.extra_cols.len());
+                    let mut ann_skip = false;
+                    // Check template-bound placeholders referenced by the annotation.
+                    for seg in &ann.segments {
+                        if let Segment::Placeholder { column, .. } = seg
+                            && let Some(&v) = bindings.get(column.as_str())
+                            && v.is_empty()
+                        {
+                            ann_skip = true;
+                            break;
                         }
                     }
-                    if !all_present {
+                    if ann_skip {
                         continue;
                     }
-                    let prop_iri = match resolve_iri(&ann_spec.property, ctx) {
+                    for col_name in &ann.extra_cols {
+                        let idx = header_idx[col_name.as_str()];
+                        let raw = row.cells.get(idx).map(|s| s.trim()).unwrap_or("");
+                        let (vals, truncated) = split_values_bounded(
+                            raw,
+                            cr.rule.split.get(col_name).map(String::as_str),
+                            limits.max_split_values_per_cell,
+                        );
+                        if truncated {
+                            ann_failed = true;
+                            row_has_error = true;
+                            emitter.diag(RowDiagnostic {
+                                row: row.line,
+                                column: Some(col_name.clone()),
+                                severity: Severity::Error,
+                                code: "expansion-limit".to_string(),
+                                message: format!(
+                                    "annotation column '{col_name}' split exceeds the limit of {} values",
+                                    limits.max_split_values_per_cell
+                                ),
+                            });
+                            ann_skip = true;
+                            break;
+                        }
+                        if vals.is_empty() {
+                            ann_skip = true;
+                            break;
+                        }
+                        extra_lists.push((col_name.as_str(), vals));
+                    }
+                    if ann_skip {
+                        continue;
+                    }
+
+                    let ann_combo_count = extra_lists
+                        .iter()
+                        .try_fold(1usize, |acc, (_, v)| acc.checked_mul(v.len()));
+                    let Some(ann_combo_count) = ann_combo_count.filter(|&n| {
+                        ax.annotations.len().saturating_add(n) <= limits.max_annotations_per_axiom
+                    }) else {
+                        ann_failed = true;
+                        row_has_error = true;
+                        emitter.diag(RowDiagnostic {
+                            row: row.line,
+                            column: cr.rule.name.clone(),
+                            severity: Severity::Error,
+                            code: "annotation-limit".to_string(),
+                            message: format!(
+                                "rule annotations exceed the limit of {} per axiom",
+                                limits.max_annotations_per_axiom
+                            ),
+                        });
+                        continue;
+                    };
+
+                    if !emitter.charge_attempt(ann_combo_count, row.line, cr.rule.name.clone()) {
+                        return Ok(());
+                    }
+
+                    let prop_iri = match resolve_iri(&ann.spec.property, ctx) {
                         Ok(i) => i,
                         Err(msg) => {
-                            emitter.mark_row_error(row.line);
+                            ann_failed = true;
+                            row_has_error = true;
                             emitter.diag(RowDiagnostic {
                                 row: row.line,
                                 column: cr.rule.name.clone(),
@@ -589,110 +760,182 @@ pub(crate) fn evaluate_rules(
                             continue;
                         }
                     };
-                    let val_str = match render_segments(ann_segs, bindings, row, &header_idx, ctx) {
-                        Ok(s) => s,
-                        Err(msg) => {
-                            emitter.mark_row_error(row.line);
-                            emitter.diag(RowDiagnostic {
-                                row: row.line,
-                                column: cr.rule.name.clone(),
-                                severity: Severity::Error,
-                                code: "template-substitution".to_string(),
-                                message: msg,
-                            });
-                            continue;
+
+                    let mut ann_combos: Vec<FxHashMap<&str, &str>> = vec![bindings.clone()];
+                    for (col_name, vals) in &extra_lists {
+                        let mut next = Vec::with_capacity(ann_combos.len() * vals.len());
+                        for existing in &ann_combos {
+                            for &v in vals {
+                                let mut cloned = existing.clone();
+                                cloned.insert(*col_name, v);
+                                next.push(cloned);
+                            }
                         }
-                    };
-                    let ann_val = if ann_spec.iri {
-                        match resolve_iri(&val_str, ctx) {
-                            Ok(iri) => AnnotationValue::Iri(iri),
-                            Err(msg) => {
-                                emitter.mark_row_error(row.line);
+                        ann_combos = next;
+                    }
+
+                    for ann_bindings in &ann_combos {
+                        let val_str = match render_segments_bounded(
+                            &ann.segments,
+                            ann_bindings,
+                            row,
+                            &header_idx,
+                            ctx,
+                            cr.rule.syntax,
+                            limits.max_expanded_bytes_per_template,
+                            emitter,
+                            row.line,
+                            cr.rule.name.as_deref(),
+                        ) {
+                            Ok(s) => s,
+                            Err(RenderError::Budget) => return Ok(()),
+                            Err(RenderError::Row(msg)) => {
+                                ann_failed = true;
+                                row_has_error = true;
                                 emitter.diag(RowDiagnostic {
                                     row: row.line,
                                     column: cr.rule.name.clone(),
                                     severity: Severity::Error,
-                                    code: "invalid-iri".to_string(),
+                                    code: "template-substitution".to_string(),
                                     message: msg,
                                 });
                                 continue;
                             }
-                        }
-                    } else if let Some(lang) = &ann_spec.lang {
-                        match Literal::lang(val_str, lang) {
-                            Ok(lit) => AnnotationValue::Literal(lit),
-                            Err(e) => {
-                                emitter.mark_row_error(row.line);
-                                emitter.diag(RowDiagnostic {
-                                    row: row.line,
-                                    column: cr.rule.name.clone(),
-                                    severity: Severity::Error,
-                                    code: "invalid-language-tag".to_string(),
-                                    message: e.0,
-                                });
-                                continue;
+                        };
+                        let ann_val = if ann.spec.iri {
+                            match resolve_iri(&val_str, ctx) {
+                                Ok(iri) => AnnotationValue::Iri(iri),
+                                Err(msg) => {
+                                    ann_failed = true;
+                                    row_has_error = true;
+                                    emitter.diag(RowDiagnostic {
+                                        row: row.line,
+                                        column: cr.rule.name.clone(),
+                                        severity: Severity::Error,
+                                        code: "invalid-iri".to_string(),
+                                        message: msg,
+                                    });
+                                    continue;
+                                }
                             }
-                        }
-                    } else if let Some(dt) = &ann_spec.datatype {
-                        match resolve_iri(dt, ctx) {
-                            Ok(dt_iri) => {
-                                AnnotationValue::Literal(Literal::typed(val_str, dt_iri.as_str()))
+                        } else if let Some(lang) = &ann.spec.lang {
+                            match Literal::lang(val_str, lang) {
+                                Ok(lit) => AnnotationValue::Literal(lit),
+                                Err(e) => {
+                                    ann_failed = true;
+                                    row_has_error = true;
+                                    emitter.diag(RowDiagnostic {
+                                        row: row.line,
+                                        column: cr.rule.name.clone(),
+                                        severity: Severity::Error,
+                                        code: "invalid-language-tag".to_string(),
+                                        message: e.0,
+                                    });
+                                    continue;
+                                }
                             }
-                            Err(msg) => {
-                                emitter.mark_row_error(row.line);
-                                emitter.diag(RowDiagnostic {
-                                    row: row.line,
-                                    column: cr.rule.name.clone(),
-                                    severity: Severity::Error,
-                                    code: "invalid-iri".to_string(),
-                                    message: msg,
-                                });
-                                continue;
+                        } else if let Some(dt) = &ann.spec.datatype {
+                            match resolve_iri(dt, ctx) {
+                                Ok(dt_iri) => AnnotationValue::Literal(Literal::typed(
+                                    val_str,
+                                    dt_iri.as_str(),
+                                )),
+                                Err(msg) => {
+                                    ann_failed = true;
+                                    row_has_error = true;
+                                    emitter.diag(RowDiagnostic {
+                                        row: row.line,
+                                        column: cr.rule.name.clone(),
+                                        severity: Severity::Error,
+                                        code: "invalid-iri".to_string(),
+                                        message: msg,
+                                    });
+                                    continue;
+                                }
                             }
-                        }
-                    } else {
-                        AnnotationValue::Literal(Literal::simple(val_str))
-                    };
-                    ax.annotations.insert(Annotation {
-                        property: AnnotationProperty(prop_iri),
-                        value: ann_val,
-                        annotations: Default::default(),
-                    });
+                        } else {
+                            AnnotationValue::Literal(Literal::simple(val_str))
+                        };
+                        ax.annotations.insert(Annotation {
+                            property: AnnotationProperty(prop_iri.clone()),
+                            value: ann_val,
+                            annotations: Default::default(),
+                        });
+                    }
                 }
 
-                if !emitter.emit(ax, row.line, cr.rule.name.clone()) {
-                    return;
+                if !ann_failed {
+                    row_axioms.push((ax, cr.rule.name.clone()));
                 }
             }
         }
+
+        if row_has_error {
+            emitter.mark_row_error(row.line);
+            continue;
+        }
+        if !emitter.commit_row(row.line, row_declarations, row_axioms) {
+            return Ok(());
+        }
     }
+    Ok(())
 }
 
-fn split_values<'a>(cell: &'a str, sep: Option<&str>) -> Vec<&'a str> {
+fn split_values_bounded<'a>(
+    cell: &'a str,
+    sep: Option<&str>,
+    max_values: usize,
+) -> (Vec<&'a str>, bool) {
     if cell.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     match sep {
-        Some(s) if !s.is_empty() => cell
-            .split(s)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .collect(),
-        _ => vec![cell],
+        Some(s) if !s.is_empty() => {
+            let mut out = Vec::new();
+            for v in cell.split(s).map(str::trim).filter(|v| !v.is_empty()) {
+                if out.len() >= max_values {
+                    return (out, true);
+                }
+                out.push(v);
+            }
+            (out, false)
+        }
+        _ => (vec![cell], false),
     }
 }
 
-fn render_segments(
+enum RenderError {
+    Row(String),
+    Budget,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_segments_bounded(
     segments: &[Segment],
-    bindings: &rustc_hash::FxHashMap<&str, &str>,
+    bindings: &FxHashMap<&str, &str>,
     row: &super::TableRow,
-    header_idx: &rustc_hash::FxHashMap<&str, usize>,
+    header_idx: &FxHashMap<&str, usize>,
     ctx: &Context,
-) -> Result<String, String> {
+    syntax: PatternSyntax,
+    max_per_template: usize,
+    emitter: &mut Emitter,
+    line: usize,
+    col_name: Option<&str>,
+) -> Result<String, RenderError> {
     let mut out = String::new();
+    let push_checked = |out: &mut String, piece: &str| -> Result<(), RenderError> {
+        if out.len().saturating_add(piece.len()) > max_per_template {
+            return Err(RenderError::Row(format!(
+                "expanded template exceeds the {max_per_template} byte limit"
+            )));
+        }
+        out.push_str(piece);
+        Ok(())
+    };
+
     for seg in segments {
         match seg {
-            Segment::Literal(s) => out.push_str(s),
+            Segment::Literal(s) => push_checked(&mut out, s)?,
             Segment::Placeholder { column, filter } => {
                 let raw = bindings
                     .get(column.as_str())
@@ -705,53 +948,77 @@ fn render_segments(
                     })
                     .unwrap_or("");
                 match filter {
-                    Filter::Raw => out.push_str(raw),
+                    Filter::Raw => push_checked(&mut out, raw)?,
                     Filter::Iri => {
-                        let iri = resolve_iri(raw, ctx)?;
-                        out.push('<');
-                        out.push_str(iri.as_str());
-                        out.push('>');
+                        let iri = resolve_iri(raw, ctx).map_err(RenderError::Row)?;
+                        push_checked(&mut out, "<")?;
+                        push_checked(&mut out, iri.as_str())?;
+                        push_checked(&mut out, ">")?;
                     }
                     Filter::Slug => {
-                        out.push_str(&slugify(raw));
+                        let slug = slugify(raw);
+                        push_checked(&mut out, &slug)?;
                     }
                     Filter::Str => {
-                        out.push('"');
-                        escape_string(raw, &mut out);
-                        out.push('"');
+                        push_checked(&mut out, "\"")?;
+                        escape_string_checked(raw, syntax, &mut out, max_per_template)?;
+                        push_checked(&mut out, "\"")?;
                     }
                     Filter::Lang(tag) => {
-                        out.push('"');
-                        escape_string(raw, &mut out);
-                        out.push_str("\"@");
-                        out.push_str(tag);
+                        push_checked(&mut out, "\"")?;
+                        escape_string_checked(raw, syntax, &mut out, max_per_template)?;
+                        push_checked(&mut out, "\"@")?;
+                        push_checked(&mut out, tag)?;
                     }
                     Filter::Typed(dt) => {
-                        let dt_iri = resolve_iri(dt, ctx)?;
-                        out.push('"');
-                        escape_string(raw, &mut out);
-                        out.push_str("\"^^<");
-                        out.push_str(dt_iri.as_str());
-                        out.push('>');
+                        let dt_iri = resolve_iri(dt, ctx).map_err(RenderError::Row)?;
+                        push_checked(&mut out, "\"")?;
+                        escape_string_checked(raw, syntax, &mut out, max_per_template)?;
+                        push_checked(&mut out, "\"^^<")?;
+                        push_checked(&mut out, dt_iri.as_str())?;
+                        push_checked(&mut out, ">")?;
                     }
                 }
             }
         }
     }
+    if !emitter.charge_expanded_bytes(out.len(), line, col_name.map(str::to_string)) {
+        return Err(RenderError::Budget);
+    }
     Ok(out)
 }
 
-fn escape_string(s: &str, out: &mut String) {
+/// Escape string literals according to the target OWL syntax:
+/// - Functional-Style Syntax (`ofn_read`) escapes only `\` and `"`, preserving raw newlines
+///   and tabs inside quoted strings.
+/// - Manchester syntax escapes `\`, `"`, `\n`, `\r`, and `\t`.
+fn escape_string_checked(
+    s: &str,
+    syntax: PatternSyntax,
+    out: &mut String,
+    max_per_template: usize,
+) -> Result<(), RenderError> {
     for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
+        let extra = match (syntax, c) {
+            (_, '\\' | '"') => 2,
+            (PatternSyntax::Manchester, '\n' | '\r' | '\t') => 2,
+            _ => c.len_utf8(),
+        };
+        if out.len().saturating_add(extra) > max_per_template {
+            return Err(RenderError::Row(format!(
+                "expanded template exceeds the {max_per_template} byte limit"
+            )));
+        }
+        match (syntax, c) {
+            (_, '\\') => out.push_str("\\\\"),
+            (_, '"') => out.push_str("\\\""),
+            (PatternSyntax::Manchester, '\n') => out.push_str("\\n"),
+            (PatternSyntax::Manchester, '\r') => out.push_str("\\r"),
+            (PatternSyntax::Manchester, '\t') => out.push_str("\\t"),
+            (_, other) => out.push(other),
         }
     }
+    Ok(())
 }
 
 fn slugify(s: &str) -> String {
