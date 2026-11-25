@@ -367,13 +367,235 @@ fn is_xml_ws(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r')
 }
 
+/// Matches `regex_syntax::ast::parse::is_capture_char`.
+#[inline]
+fn is_capture_char(c: char, first: bool) -> bool {
+    if first {
+        c == '_' || c.is_alphabetic()
+    } else {
+        c == '_' || c == '.' || c == '[' || c == ']' || c.is_alphanumeric()
+    }
+}
+
+/// Advance `probe` past whitespace/comments (under inline Rust `(?x)`) or XML whitespace
+/// (under external XPath `x` when `rust_x` is off), returning the number of chars skipped.
+fn skip_group_trivia(
+    probe: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    state: FlagState,
+) -> usize {
+    let mut skipped = 0usize;
+    if state.rust_x {
+        loop {
+            match probe.peek().copied() {
+                Some(ch) if ch.is_whitespace() => {
+                    probe.next();
+                    skipped += 1;
+                }
+                Some('#') => {
+                    probe.next();
+                    skipped += 1;
+                    for cc in probe.by_ref() {
+                        skipped += 1;
+                        if cc == '\n' {
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+    } else if state.xpath_x {
+        while probe.peek().is_some_and(|&ch| is_xml_ws(ch)) {
+            probe.next();
+            skipped += 1;
+        }
+    }
+    skipped
+}
+
+/// Copy `count` characters from `chars` into `out`, stripping XML whitespace when
+/// `strip_ws` is active.
+fn emit_consumed(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    count: usize,
+    strip_ws: bool,
+    out: &mut String,
+) {
+    for _ in 0..count {
+        let ch = chars.next().expect("probed character exists");
+        if !(strip_ws && is_xml_ws(ch)) {
+            out.push(ch);
+        }
+    }
+}
+
+/// Handle an opening `(` outside a character class, mirroring `regex_syntax`'s
+/// `parse_group`, `parse_capture_name`, and `parse_flags` rules while also honoring
+/// external XPath `x` whitespace stripping.
+fn handle_open_paren(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    state: &mut FlagState,
+    stack: &mut Vec<FlagState>,
+    out: &mut String,
+) {
+    out.push('(');
+    let strip_ws = state.xpath_x && !state.rust_x;
+    let mut probe = chars.clone();
+    let mut consumed = skip_group_trivia(&mut probe, *state);
+    if probe.peek() != Some(&'?') {
+        stack.push(*state);
+        return;
+    }
+    probe.next();
+    consumed += 1;
+    if strip_ws {
+        while probe.peek().is_some_and(|&ch| is_xml_ws(ch)) {
+            probe.next();
+            consumed += 1;
+        }
+    }
+
+    // Named capture group: `(?P<name>...)` or `(?<name>...)`. Copy the header and name
+    // verbatim (stripping XPath `x` whitespace if active) so `.`, `[`, and `]` inside the
+    // name are never mistaken for regex syntax.
+    let mut named_probe = probe.clone();
+    let mut named_extra = 0usize;
+    let is_named = if named_probe.peek() == Some(&'<') {
+        named_probe.next();
+        named_extra += 1;
+        true
+    } else if named_probe.peek() == Some(&'P') {
+        named_probe.next();
+        named_extra += 1;
+        if strip_ws {
+            while named_probe.peek().is_some_and(|&ch| is_xml_ws(ch)) {
+                named_probe.next();
+                named_extra += 1;
+            }
+        }
+        if named_probe.peek() == Some(&'<') {
+            named_probe.next();
+            named_extra += 1;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if is_named {
+        let mut first = true;
+        let mut valid_name = false;
+        for nc in named_probe {
+            named_extra += 1;
+            if strip_ws && is_xml_ws(nc) {
+                continue;
+            }
+            if nc == '>' {
+                valid_name = !first;
+                break;
+            }
+            if !is_capture_char(nc, first) {
+                break;
+            }
+            first = false;
+        }
+        if valid_name {
+            emit_consumed(chars, consumed + named_extra, strip_ws, out);
+            stack.push(*state);
+            return;
+        }
+    }
+
+    // Inline flag directive `(?flags)` or scoped flag group `(?flags:...)`.
+    let mut next_state = *state;
+    let mut neg = false;
+    let mut last_was_neg = false;
+    let mut saw_flag = false;
+    let mut seen_flags = 0u8;
+    let mut valid = true;
+    let mut terminator = None;
+    for fc in probe {
+        consumed += 1;
+        if strip_ws && is_xml_ws(fc) {
+            continue;
+        }
+        match fc {
+            'i' | 'm' | 'R' | 'U' | 'u' | 's' | 'x' => {
+                let bit = match fc {
+                    'i' => 1 << 0,
+                    'm' => 1 << 1,
+                    'R' => 1 << 2,
+                    'U' => 1 << 3,
+                    'u' => 1 << 4,
+                    's' => 1 << 5,
+                    'x' => 1 << 6,
+                    _ => unreachable!(),
+                };
+                if seen_flags & bit != 0 {
+                    valid = false;
+                    break;
+                }
+                seen_flags |= bit;
+                saw_flag = true;
+                last_was_neg = false;
+                if fc == 's' {
+                    next_state.dot_all = !neg;
+                } else if fc == 'x' {
+                    if neg {
+                        next_state.rust_x = false;
+                        next_state.xpath_x = false;
+                    } else {
+                        next_state.rust_x = true;
+                    }
+                }
+            }
+            '-' if !neg => {
+                neg = true;
+                last_was_neg = true;
+            }
+            ':' if !last_was_neg => {
+                terminator = Some(':');
+                break;
+            }
+            ')' if saw_flag && !last_was_neg => {
+                terminator = Some(')');
+                break;
+            }
+            _ => {
+                valid = false;
+                break;
+            }
+        }
+    }
+    if valid {
+        match terminator {
+            Some(')') => {
+                emit_consumed(chars, consumed, strip_ws, out);
+                *state = next_state;
+                return;
+            }
+            Some(':') => {
+                emit_consumed(chars, consumed, strip_ws, out);
+                stack.push(*state);
+                *state = next_state;
+                return;
+            }
+            _ => {}
+        }
+    }
+    stack.push(*state);
+}
+
 /// Translate `pattern` into Rust `regex` syntax under the effective flag state:
 /// - Under XPath `x` (`xpath_x && !rust_x`), strip XML whitespace (`#x9`, `#xA`, `#xD`,
-///   `#x20`) outside character classes while preserving whitespace inside classes and
-///   keeping `#` literal.
+///   `#x20`) outside character classes before interpreting escapes while preserving
+///   whitespace inside classes and keeping `#` literal.
 /// - Under inline Rust `(?x)` (`rust_x`), copy `#...\n` comments verbatim without
-///   altering class/group state and keep `ClassStart` across whitespace/comments inside
-///   character classes.
+///   altering class/group state, skip whitespace and comments after `(` when probing
+///   group headers, and keep `ClassStart` across whitespace/comments inside classes.
+/// - Preserve named capture headers (`(?P<name>...)` and `(?<name>...)`) verbatim so
+///   `.` and brackets in capture names are not treated as regex body tokens.
 /// - Track inline Rust flag directives `(?flags)` and scoped flag groups `(?flags:...)`
 ///   across parenthesized groups so effective `s` and `x` are respected at each `.`.
 /// - Rewrite unescaped `.` outside character classes to `[^\n\r]` whenever effective `s`
@@ -406,6 +628,11 @@ fn rewrite_xpath_pattern(pattern: &str, initial: FlagState, out: &mut String) {
         match c {
             '\\' => {
                 out.push('\\');
+                if class_depth == 0 && state.xpath_x && !state.rust_x {
+                    while chars.peek().is_some_and(|&ch| is_xml_ws(ch)) {
+                        chars.next();
+                    }
+                }
                 if let Some(next) = chars.next() {
                     out.push(next);
                 }
@@ -429,91 +656,7 @@ fn rewrite_xpath_pattern(pattern: &str, initial: FlagState, out: &mut String) {
                 }
             }
             '(' if class_depth == 0 => {
-                out.push('(');
-                let strip_ws = state.xpath_x && !state.rust_x;
-                let mut probe = chars.clone();
-                let mut skipped_ws = 0usize;
-                if strip_ws {
-                    while probe.peek().is_some_and(|&ch| is_xml_ws(ch)) {
-                        probe.next();
-                        skipped_ws += 1;
-                    }
-                }
-                if probe.peek() == Some(&'?') {
-                    probe.next();
-                    let mut next_state = state;
-                    let mut neg = false;
-                    let mut saw_flag = false;
-                    let mut valid = true;
-                    let mut consumed = skipped_ws + 1; // skipped ws + '?'
-                    let mut terminator = None;
-                    for fc in probe {
-                        consumed += 1;
-                        if strip_ws && is_xml_ws(fc) {
-                            continue;
-                        }
-                        match fc {
-                            'i' | 'm' | 'R' | 'U' | 'u' => {
-                                saw_flag = true;
-                            }
-                            's' => {
-                                saw_flag = true;
-                                next_state.dot_all = !neg;
-                            }
-                            'x' => {
-                                saw_flag = true;
-                                if neg {
-                                    next_state.rust_x = false;
-                                    next_state.xpath_x = false;
-                                } else {
-                                    next_state.rust_x = true;
-                                }
-                            }
-                            '-' if !neg => {
-                                neg = true;
-                            }
-                            ':' => {
-                                terminator = Some(':');
-                                break;
-                            }
-                            ')' if saw_flag => {
-                                terminator = Some(')');
-                                break;
-                            }
-                            _ => {
-                                valid = false;
-                                break;
-                            }
-                        }
-                    }
-                    if valid {
-                        match terminator {
-                            Some(')') => {
-                                for _ in 0..consumed {
-                                    let ch = chars.next().unwrap();
-                                    if !(strip_ws && is_xml_ws(ch)) {
-                                        out.push(ch);
-                                    }
-                                }
-                                state = next_state;
-                                continue;
-                            }
-                            Some(':') => {
-                                for _ in 0..consumed {
-                                    let ch = chars.next().unwrap();
-                                    if !(strip_ws && is_xml_ws(ch)) {
-                                        out.push(ch);
-                                    }
-                                }
-                                stack.push(state);
-                                state = next_state;
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                stack.push(state);
+                handle_open_paren(&mut chars, &mut state, &mut stack, out);
             }
             ')' if class_depth == 0 => {
                 out.push(')');
@@ -787,26 +930,65 @@ impl RegexState {
     /// `text` with every match of the program replaced by `replacement`, in which `$n`
     /// names a group, with the output charged as it grows.
     pub(super) fn replace(&self, ctx: &Ctx, text: &str, replacement: &str) -> Result<String> {
+        self.replace_inner(ctx, text, replacement, false)
+    }
+
+    /// `text` with every match of the program replaced by the literal string
+    /// `replacement` (for XPath `REPLACE` under the `q` flag), charging the actual output
+    /// bytes without reserving capture expansions for `$`.
+    pub(super) fn replace_literal(
+        &self,
+        ctx: &Ctx,
+        text: &str,
+        replacement: &str,
+    ) -> Result<String> {
+        self.replace_inner(ctx, text, replacement, true)
+    }
+
+    fn replace_inner(
+        &self,
+        ctx: &Ctx,
+        text: &str,
+        replacement: &str,
+        literal: bool,
+    ) -> Result<String> {
         let worker = self.worker();
         let mut shared = worker.is_none().then(|| self.shared.lock());
-        let mut captures = self.program.create_captures();
+        let mut captures = (!literal).then(|| self.program.create_captures());
         let mut searcher = Searcher::new(Input::new(text));
         let charge = ctx.charge(1024)?;
-        // `$` starts every group reference, and `$$` counts twice, which only overstates
-        let references = replacement.bytes().filter(|&b| b == b'$').count();
+        // `$` starts every group reference, and `$$` counts twice, which only overstates.
+        // Literal (`q`) replacements write `replacement` verbatim with no capture expansion.
+        let references = if literal {
+            0
+        } else {
+            replacement.bytes().filter(|&b| b == b'$').count()
+        };
         let mut reserved = 0u64;
         let mut output = String::new();
         let mut end = 0;
         while let Some(found) = searcher.advance(|input| {
-            match (worker, shared.as_deref_mut()) {
-                (Some(program), _) => program.search_captures(input, &mut captures),
-                (None, Some(cache)) => {
-                    self.program
-                        .search_captures_with(cache, input, &mut captures)
+            let found = if let Some(captures) = captures.as_mut() {
+                match (worker, shared.as_deref_mut()) {
+                    (Some(program), _) => program.search_captures(input, captures),
+                    (None, Some(cache)) => {
+                        self.program.search_captures_with(cache, input, captures)
+                    }
+                    (None, None) => {
+                        unreachable!("a search without a worker holds the shared cache")
+                    }
                 }
-                (None, None) => unreachable!("a search without a worker holds the shared cache"),
-            }
-            Ok(captures.get_match())
+                captures.get_match()
+            } else {
+                match (worker, shared.as_deref_mut()) {
+                    (Some(program), _) => program.search(input),
+                    (None, Some(cache)) => self.program.search_with(cache, input),
+                    (None, None) => {
+                        unreachable!("a search without a worker holds the shared cache")
+                    }
+                }
+            };
+            Ok(found)
         }) {
             ctx.check()?;
             // A group lies inside its match, so each reference in the replacement adds
@@ -824,7 +1006,11 @@ impl RegexState {
             // charge covers.
             output.reserve(need.saturating_sub(output.len()));
             output.push_str(&text[end..found.start()]);
-            captures.interpolate_string_into(text, replacement, &mut output);
+            if let Some(captures) = captures.as_ref() {
+                captures.interpolate_string_into(text, replacement, &mut output);
+            } else {
+                output.push_str(replacement);
+            }
             end = found.end();
         }
         let need = output.len().saturating_add(text.len() - end);
@@ -1296,5 +1482,121 @@ mod tests {
             .unwrap();
         assert!(group_scoped_toggle.is_match("a\rbx"));
         assert!(!group_scoped_toggle.is_match("a\rb\r"));
+
+        // XPath `x` strips XML whitespace outside character classes BEFORE pairing `\`
+        // with the next character (W3C F&O 3.1 example: `hello\ sworld` -> `hello\sworld`),
+        // while keeping `\ ` inside classes and inline Rust `(?x)` `\ ` literal.
+        let xpath_esc_ws = RegexState::compile(None, "^hello\\ sworld$", "x")
+            .unwrap()
+            .unwrap();
+        assert!(xpath_esc_ws.is_match("hello world"));
+        assert!(!xpath_esc_ws.is_match("hello sworld"));
+
+        let xpath_esc_dot = RegexState::compile(None, "^a\\ \t\n.b$", "x")
+            .unwrap()
+            .unwrap();
+        assert!(xpath_esc_dot.is_match("a.b"));
+        assert!(!xpath_esc_dot.is_match("axb"));
+
+        let xpath_esc_open_bracket = RegexState::compile(None, "^a\\ [ ]b$", "x")
+            .unwrap()
+            .unwrap();
+        assert!(xpath_esc_open_bracket.is_match("a[]b"));
+        assert!(!xpath_esc_open_bracket.is_match("a b"));
+
+        let xpath_class_esc_space = RegexState::compile(None, "^[\\ ]a.b$", "x")
+            .unwrap()
+            .unwrap();
+        assert!(xpath_class_esc_space.is_match(" axb"));
+        assert!(!xpath_class_esc_space.is_match(" a\rb"));
+        assert!(!xpath_class_esc_space.is_match("axb"));
+
+        // Trailing backslash followed only by stripped XML whitespace is an invalid escape.
+        assert!(RegexState::compile(None, "a\\ ", "x").unwrap().is_none());
+
+        // Inline Rust `(?x)` keeps `\ ` as an escaped literal space.
+        let rust_x_esc_space = RegexState::compile(None, "(?x)^hello\\ sworld$", "")
+            .unwrap()
+            .unwrap();
+        assert!(rust_x_esc_space.is_match("hello sworld"));
+        assert!(!rust_x_esc_space.is_match("hello world"));
+
+        // Inline Rust `(?x)` skips whitespace and `#...\n` comments directly after `(`
+        // before both scoped and standalone flag directives.
+        for pat in [
+            "(?x)^( ?s:.)$",
+            "(?x)^(# enable s\n ?s:.)$",
+            "(?x)^( ?s).$",
+            "(?x)^(# enable s\n ?s).$",
+        ] {
+            let re = RegexState::compile(None, pat, "").unwrap().unwrap();
+            assert!(re.is_match("\n"), "pattern {pat} should match LF");
+            assert!(re.is_match("\r"), "pattern {pat} should match CR");
+            assert!(re.is_match("x"), "pattern {pat} should match x");
+        }
+        for pat in [
+            "(?x)^( ?-s:.)$",
+            "(?x)^(# disable s\n ?-s:.)$",
+            "(?x)^( ?-s).$",
+            "(?x)^(# disable s\n ?-s).$",
+        ] {
+            let re = RegexState::compile(None, pat, "s").unwrap().unwrap();
+            assert!(re.is_match("x"), "pattern {pat} should match x");
+            assert!(!re.is_match("\r"), "pattern {pat} must reject CR");
+            assert!(!re.is_match("\n"), "pattern {pat} must reject LF");
+        }
+
+        // Named capture headers (`(?P<...>)` and `(?<...>`) may contain `.`, `[`, and `]`
+        // without corrupting the name or putting the scanner into class mode.
+        for pat in [
+            "^(?-s:(?P<a.b>.))$",
+            "^(?-s:(?<a.b>.))$",
+            "^(?-s:(?P<a[b].c>.))$",
+            "^(?-s:(?<a[b>.))$",
+            "(?x)^(?-s:( # named capture\n ?P<a[b].c> . ))$",
+        ] {
+            let re = RegexState::compile(None, pat, "s").unwrap().unwrap();
+            assert!(re.is_match("x"), "pattern {pat} should match x");
+            assert!(!re.is_match("\r"), "pattern {pat} must reject CR");
+            assert!(!re.is_match("\n"), "pattern {pat} must reject LF");
+        }
+    }
+
+    /// Replacing a large match with a dollar-heavy literal (`q`) replacement charges only
+    /// the actual output size rather than `count('$') * match_len * 2`.
+    #[test]
+    fn literal_q_replacement_does_not_inflate_budget_for_dollars() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let make_ctx = |limit: u64| {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit;
+            let ctx = Arc::new(ctx);
+            ctx.attach_owner();
+            ctx
+        };
+
+        let hay = "a".repeat(4096);
+        let dollars = "$".repeat(4096);
+        // 8 MiB easily covers the compiled literal pattern (~1 MiB) and 4 KiB output,
+        // whereas doubling `$` and reserving `references * found.len() * 2` demands > 64 MiB.
+        let budget = 8 << 20;
+
+        let ctx_lit = make_ctx(budget);
+        let re_lit = RegexState::compile(Some(&ctx_lit), &hay, "q")
+            .unwrap()
+            .unwrap();
+        let out = re_lit.replace_literal(&ctx_lit, &hay, &dollars).unwrap();
+        assert_eq!(out, dollars);
+
+        // Confirm the old doubled-`$` capture-interpolation path would exceed this budget.
+        let ctx_interp = make_ctx(budget);
+        let re_interp = RegexState::compile(Some(&ctx_interp), &hay, "q")
+            .unwrap()
+            .unwrap();
+        let doubled = dollars.replace('$', "$$");
+        assert!(
+            re_interp.replace(&ctx_interp, &hay, &doubled).is_err(),
+            "interpolating doubled dollars should exceed the 8 MiB budget"
+        );
     }
 }

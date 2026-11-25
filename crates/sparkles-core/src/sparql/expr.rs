@@ -1367,17 +1367,22 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 .map_or(Some(""), Value::as_str)
                 .ok_or(TypeError)?;
             let rep_str = r.as_str().ok_or(TypeError)?;
-            let rep = if flags.contains('q') {
-                rep_str.replace('$', "$$")
+            let literal_rep = flags.contains('q');
+            let rep: Cow<'_, str> = if literal_rep {
+                Cow::Borrowed(rep_str)
             } else {
-                xpath_replacement(rep_str)?
+                Cow::Owned(xpath_replacement(rep_str)?)
             };
             let output = ctx
                 .with_regex(p.as_str().ok_or(TypeError)?, flags, |re| {
                     if re.matches_empty() {
                         return Ok(None);
                     }
-                    re.replace(ctx, st, &rep).map(Some)
+                    if literal_rep {
+                        re.replace_literal(ctx, st, &rep).map(Some)
+                    } else {
+                        re.replace(ctx, st, &rep).map(Some)
+                    }
                 })
                 .and_then(|output| output.transpose())
                 .map_err(|error| {

@@ -232,6 +232,64 @@ impl NumColumn {
         Self::open_inner(dir, len, literals, None).ok().flatten()
     }
 
+    /// Whether `dir/vocab.num` already holds a valid current-format numeric column for
+    /// a vocabulary of `len` ids whose literals are `0..literals`.
+    pub(crate) fn is_current(dir: &Path, len: u64, literals: u64) -> bool {
+        let path = dir.join(FILE);
+        let Ok(mut f) = File::open(&path) else {
+            return false;
+        };
+        let Ok(meta) = f.metadata() else {
+            return false;
+        };
+        let Ok(file_len) = usize::try_from(meta.len()) else {
+            return false;
+        };
+        if file_len < HEADER {
+            return false;
+        }
+        let mut hdr = [0u8; HEADER];
+        if f.read_exact(&mut hdr).is_err() {
+            return false;
+        }
+        let (covered, count, positions, nsegs) = (
+            word(&hdr, 16),
+            word(&hdr, 24),
+            word(&hdr, 32),
+            word(&hdr, 40),
+        );
+        if hdr[..8] != *MAGIC
+            || word(&hdr, 8) != len
+            || covered != literals
+            || count > positions
+            || positions > covered
+        {
+            return false;
+        }
+        let Some((_, _, segs, end)) = layout(positions, count, nsegs) else {
+            return false;
+        };
+        if end != file_len {
+            return false;
+        }
+        if f.seek(SeekFrom::Start(segs as u64)).is_err() {
+            return false;
+        }
+        let mut next = (0u64, 0u64);
+        let mut seg_buf = [0u8; 24];
+        for _ in 0..nsegs {
+            if f.read_exact(&mut seg_buf).is_err() {
+                return false;
+            }
+            let (lo, hi, base) = (word(&seg_buf, 0), word(&seg_buf, 8), word(&seg_buf, 16));
+            if lo < next.0 || hi <= lo || hi > covered || base != next.1 {
+                return false;
+            }
+            next = (hi, base + (hi - lo));
+        }
+        next.1 == positions
+    }
+
     pub(super) fn open_controlled(
         dir: &Path,
         len: u64,

@@ -409,16 +409,20 @@ lexical forms (`INF`, `+INF`, `-INF`, `NaN` and decimal or exponent numerals) ac
 expression evaluation, XML-whitespace-trimmed string casts, `numeric_key`, inline literal
 encoding, `vocab.num` classification and `xsd::is_valid`. The numeric column format marker
 is bumped to `SPKVNUM3` so pre-existing `SPKVNUM2` files fall back to key decoding until
-recompaction or `add_numeric_column`. Casting `xsd:float` or `xsd:double` to `xsd:string`
-formats values outside `[1e-6, 1e6)` with uppercase `E` scientific notation and at least
-one fractional digit, such as `"1.0E6"` for `1e6` and `"1.0E-7"` for `1e-7`, and uses each
-type's shortest round-trip decimal inside `[1e-6, 1e6)` (matching the reference evaluator;
-Jena widens `xsd:float` to `double` via `BigDecimal.valueOf` in that range). XPath regular
-expression translation removes XML whitespace outside character classes under the `x`
-flag while preserving literal spaces inside classes, respects inline Rust `(?s)`/`(?-s)`
-and `(?x)` flag scopes, rewrites unescaped `.` outside character classes to `[^\n\r]` when
-effective `s` is disabled, and treats `REPLACE` replacement strings literally under `q`
-across `REGEX`, `REPLACE`, key-filter pushdowns, mapping `REPLACE`, SHACL and ShEx. The
+recompaction or `add_numeric_column`. Casting `xsd:float` or `xsd:double` to `xsd:string` spells `NaN`, `INF`, `-INF`, `0`, and
+`-0` directly. Finite nonzero values whose absolute magnitude lies in `[1e-6, 1e6)` format
+as each type's shortest round-trip decimal, matching the reference evaluator while Jena
+widens `xsd:float` to `double` through `BigDecimal.valueOf`. Finite nonzero values with
+absolute magnitude below `1e-6` or at least `1e6` format in scientific notation with an
+uppercase `E` and at least one fractional digit, such as `"1.0E6"` for `1e6`, `"-1.0E6"`
+for `-1e6`, and `"1.0E-7"` for `1e-7`. XPath regular expression translation removes XML
+whitespace outside character classes before interpreting escapes under the `x` flag while
+preserving literal spaces inside classes, tracks inline Rust `(?s)`, `(?-s)`, and `(?x)`
+flag scopes including whitespace and comments after `(`, preserves named capture headers
+verbatim, rewrites unescaped `.` outside character classes to `[^\n\r]` when effective `s`
+is disabled, and treats `REPLACE` replacement strings literally under `q` without capture
+expansion across `REGEX`, `REPLACE`, key-filter pushdowns, mapping `REPLACE`, SHACL, and
+ShEx. The
 evaluator takes two well-formed values of different supported types, such as a string
 and an integer, as unequal, which the note to section 17.4.1.7 allows and Jena does by
 default, where Jena's strict mode and the section's main text make the comparison an

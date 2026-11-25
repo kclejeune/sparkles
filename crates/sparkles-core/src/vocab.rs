@@ -845,6 +845,12 @@ impl Vocab {
         self.num.as_ref()
     }
 
+    /// Whether this generation already has a valid current-format numeric column loaded
+    /// in memory or written to `dir`.
+    pub(crate) fn has_current_numeric_column(&self, dir: &Path) -> bool {
+        self.num.is_some() || numeric::NumColumn::is_current(dir, self.len, self.first_triple)
+    }
+
     #[inline]
     fn num_blocks(&self) -> usize {
         // last 8 bytes store the term count

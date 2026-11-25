@@ -7284,6 +7284,11 @@ ex:r_lines ex:txt "first\rline\nsecond" .
             (REPLACE("a.b", ".", "\\$1\\", "q") AS ?q_bs_dollar)
             (REGEX(" axb", "^[ ]a.b$", "x") AS ?x_space_ok)
             (REGEX(" a\rb", "^[ ]a.b$", "x") AS ?x_space_cr)
+            (REGEX("hello world", "hello\\ sworld", "x") AS ?x_esc_ws)
+            (REGEX("\n", "(?x)^( ?s:.)$") AS ?rx_ws_scoped_s)
+            (REGEX("\r", "(?x)^(# comment\n ?-s:.)$", "s") AS ?rx_comment_scoped_no_s)
+            (REGEX("x", "^(?-s:(?P<a.b>.))$", "s") AS ?named_dot_ok)
+            (REGEX("\r", "^(?-s:(?P<a.b>.))$", "s") AS ?named_dot_cr)
             (REGEX("\r", "^(?s:.)$") AS ?scoped_s_on)
             (REGEX("\r", "^(?-s:.)$", "s") AS ?scoped_s_off)
         WHERE {}
@@ -7301,9 +7306,36 @@ ex:r_lines ex:txt "first\rline\nsecond" .
             Some(Term::Literal(Literal::from(true))),
             Some(Term::Literal(Literal::from(false))),
             Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+            Some(Term::Literal(Literal::from(true))),
             Some(Term::Literal(Literal::from(false))),
         ]]
     );
+
+    // Dollar-heavy literal `q` replacement stays within a tight query memory budget.
+    let hay = "a".repeat(4096);
+    let dollars = "$".repeat(4096);
+    let q_budget =
+        format!(r#"SELECT (REPLACE("{hay}", "{hay}", "{dollars}", "q") AS ?out) WHERE {{}}"#);
+    let tight_opts = QueryOptions {
+        max_memory_bytes: Some(8 << 20),
+        ..QueryOptions::default()
+    };
+    let eager_q = query(store.snapshot(), &q_budget, &tight_opts)
+        .unwrap()
+        .application_rows();
+    assert_eq!(
+        eager_q,
+        vec![vec![Some(Term::Literal(Literal::new_simple_literal(
+            &dollars
+        )))]]
+    );
+    let cur_q =
+        all(select_cursor(store.snapshot(), &q_budget, &tight_opts, &options(4096)).unwrap());
+    assert_eq!(cur_q, eager_q);
 }
 
 /// Regression test for upgrading a store whose compacted generation still carries a legacy
@@ -7508,8 +7540,10 @@ ex:d_num ex:v "1.50"^^xsd:double .
 
     verify_queries(&store);
 
-    // Rebuilding upgrades vocab.num to SPKVNUM3 (holding only the 2 valid numbers).
+    // Rebuilding upgrades vocab.num to SPKVNUM3 (holding only the 2 valid numbers),
+    // and a second call on the same handle returns None without rewriting the file.
     assert_eq!(store.add_numeric_column().unwrap(), Some(2));
+    assert_eq!(store.add_numeric_column().unwrap(), None);
     drop(store);
 
     let clean = check(dir.path(), &CheckOptions { quick: false }).unwrap();
@@ -7519,4 +7553,111 @@ ex:d_num ex:v "1.50"^^xsd:double .
     assert!(reopened.snapshot().generation.vocab.numeric().is_some());
     assert_eq!(reopened.add_numeric_column().unwrap(), None);
     verify_queries(&reopened);
+}
+
+/// Upgrading a legacy `SPKVNUM2` column whose only numeric entries were invalid spellings
+/// (`"inf"^^xsd:double` and `"-inf"^^xsd:float`) returns `Some(0)`, removes the stale
+/// `vocab.num` file, and leaves `check --full` clean.
+#[test]
+fn legacy_spkvnum2_invalid_only_column_removed_on_upgrade() {
+    use sparkles_core::check::{CheckOptions, Status, check};
+    use sparkles_core::id::Id;
+    use sparkles_core::vocab::numeric::{DOUBLE, FILE, FLOAT, NOT_NUMERIC};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ttl = r#"
+@prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:d_inf_lower ex:v "inf"^^xsd:double .
+ex:f_ninf_lower ex:v "-inf"^^xsd:float .
+"#;
+    let gen_dir;
+    {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        store
+            .load(&[Source::from_bytes(
+                ttl.as_bytes().to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_none());
+        gen_dir = snap.generation.dir.as_ref().unwrap().clone();
+        let vocab_len = snap.generation.vocab.len();
+
+        let mut covered = 0u64;
+        let mut kinds = Vec::new();
+        let mut values = Vec::new();
+        for id in 0..vocab_len {
+            let Some(Term::Literal(lit)) = snap.term(Id::vocab(id)) else {
+                break;
+            };
+            covered += 1;
+            let dt = lit.datatype().as_str();
+            let (kind, bits) = if dt == oxrdf::vocab::xsd::DOUBLE.as_str() {
+                match lit.value().parse::<f64>() {
+                    Ok(v) => (DOUBLE, v.to_bits()),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else if dt == oxrdf::vocab::xsd::FLOAT.as_str() {
+                match lit.value().parse::<f32>() {
+                    Ok(v) => (FLOAT, v.to_bits() as u64),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else {
+                (NOT_NUMERIC, 0)
+            };
+            kinds.push(kind);
+            if kind & 8 != 0 {
+                values.push(bits);
+            }
+        }
+        assert_eq!(values.len(), 2);
+        let positions = covered;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SPKVNUM2");
+        bytes.extend_from_slice(&vocab_len.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&positions.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let mut word = 0u64;
+        for (i, &k) in kinds.iter().enumerate() {
+            word |= (k as u64) << ((i % 16) * 4);
+            if (i + 1) % 16 == 0 {
+                bytes.extend_from_slice(&word.to_le_bytes());
+                word = 0;
+            }
+        }
+        if !kinds.len().is_multiple_of(16) {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(positions <= 128);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        for bits in &values {
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        std::fs::write(gen_dir.join(FILE), &bytes).unwrap();
+    }
+
+    let report = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(report.status, Status::Warning, "{}", report.to_text());
+
+    let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert_eq!(store.add_numeric_column().unwrap(), Some(0));
+    assert!(
+        !gen_dir.join(FILE).exists(),
+        "stale SPKVNUM2 file must be removed when zero valid numbers remain"
+    );
+    drop(store);
+
+    let clean = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(clean.status, Status::Ok, "{}", clean.to_text());
 }
