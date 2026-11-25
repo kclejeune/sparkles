@@ -1311,7 +1311,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             let mut tag: Option<Tag> = None;
             for i in 0..args.len() {
                 let v = arg(args, i, row, ctx)?;
-                let (st, ld) = v.string_arg()?;
+                let (st, ld) = v.string_arg_dir()?;
                 out.push_str(st);
                 let t: Tag = ld.map(|(l, d)| (l.into(), d));
                 tag = match tag {
@@ -1328,7 +1328,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::SubStr => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             let start = Num::of(&*a1()?)?.to_double();
             let len = if args.len() > 2 {
                 Some(f64::from(Num::of(&*a2()?)?.to_double()))
@@ -1361,7 +1361,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::Replace => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             let p = a1()?;
             let r = a2()?;
             let f = if args.len() > 3 {
@@ -1392,12 +1392,12 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::UCase => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             same_kind(l, st.to_uppercase())
         }
         F::LCase => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             same_kind(l, st.to_lowercase())
         }
         F::EncodeForUri => {
@@ -1413,8 +1413,8 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         F::Contains | F::StrStarts | F::StrEnds | F::StrBefore | F::StrAfter => {
             let x = a0()?;
             let y = a1()?;
-            let (xs, xl) = x.string_arg()?;
-            let (ys, yl) = y.string_arg()?;
+            let (xs, xl) = x.string_arg_dir()?;
+            let (ys, yl) = y.string_arg_dir()?;
             if !compatible(xl, yl) {
                 return Err(TypeError);
             }
@@ -2019,7 +2019,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             "timezone-from-dateTime" => fb(Function::Timezone),
             "normalize-space" => {
                 let v = a(0)?;
-                let (st, l) = v.string_arg()?;
+                let (st, l) = v.string_arg_dir()?;
                 Ok(same_kind(
                     l,
                     st.split_whitespace().collect::<Vec<_>>().join(" "),

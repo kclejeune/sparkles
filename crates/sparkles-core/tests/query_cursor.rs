@@ -7088,6 +7088,20 @@ fn directional_string_function_compatibility_and_results() {
         let rows = check_all_modes(&small, &q, true);
         assert_eq!(rows, vec![vec![want]], "{q}");
     }
+    for (expr, want) in [
+        (
+            r#"<http://www.w3.org/2005/xpath-functions#normalize-space>("  a \t b  "@en--ltr)"#,
+            dir_ltr("a b", "en"),
+        ),
+        (
+            r#"<http://www.w3.org/2005/xpath-functions#normalize-space>("  a \n b  "@ar--rtl)"#,
+            dir_rtl("a b", "ar"),
+        ),
+    ] {
+        let q = format!("SELECT ({expr} AS ?r) WHERE {{ <urn:x> <urn:p> ?dummy }}");
+        let rows = check_all_modes(&small, &q, false);
+        assert_eq!(rows, vec![vec![want]], "{q}");
+    }
 
     // 3. String-run / KeyFilter / CountFilterFromRuns / cursor Morsels pushdown paths on
     //    the 5,000-row store (both compacted base vocab and uncompacted delta vocab).
@@ -7147,6 +7161,36 @@ fn directional_string_function_compatibility_and_results() {
             && plan_text.contains("key ranges"),
         "expected KeyFilter count-from-runs plan: {plan_text}"
     );
+
+    // Confirm the cursor morsel path actually runs on the compacted base scan for
+    // directional needles at 4,096-row demand (requires an empty delta).
+    for morsel_q in [
+        r#"SELECT ?s ?v WHERE { ?s <urn:label> ?v FILTER(STRSTARTS(?v, "Ada"@en-us--ltr)) }"#,
+        r#"SELECT ?s ?v WHERE { ?s <urn:label> ?v FILTER(CONTAINS(?v, "da"@EN--ltr)) }"#,
+    ] {
+        let mut cur = select_cursor(
+            store.snapshot(),
+            morsel_q,
+            &QueryOptions {
+                optimizations: Some(Optimizations::ALL),
+                no_cache: true,
+                ..Default::default()
+            },
+            &options(4096),
+        )
+        .unwrap();
+        let mut morsel_rows = 0usize;
+        while let Some(batch) = cur.next_batch().unwrap() {
+            morsel_rows += batch.len();
+        }
+        assert_eq!(cur.status(), CursorStatus::Complete, "{morsel_q}");
+        assert_eq!(morsel_rows, 1_000, "{morsel_q}");
+        assert!(
+            leaf_counter(cur.plan(), "morselRows") > 0,
+            "expected cursor morsel path for {morsel_q}: {:#?}",
+            cur.plan()
+        );
+    }
 
     // 4. Add delta terms (uncompacted update) and re-check directional filter compatibility
     //    across base + delta keys.

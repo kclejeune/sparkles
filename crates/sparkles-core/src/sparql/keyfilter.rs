@@ -823,8 +823,61 @@ mod tests {
         // STR(?v) yields a simple string, so any directional needle is incompatible
         let str_v = call(Function::Str, vec![Expr::Var(v)]);
         let f_str_ltr =
-            KeyFilter::new(&[call(Function::StrStarts, vec![str_v, en_ltr])], v).unwrap();
+            KeyFilter::new(&[call(Function::StrStarts, vec![str_v, en_ltr.clone()])], v).unwrap();
         assert!(!f_str_ltr.test(&ltr_key));
+
+        // Malformed or uppercase direction suffixes stay part of the language tag with no
+        // base direction, matching Value::from_key and id::lang_literal.
+        let raw_lang =
+            |lex: &[u8], tag: &[u8]| [b"\"".as_slice(), lex, &[KEY_SEP], b"@", tag].concat();
+        let f_en_only = KeyFilter::new(
+            &[call(
+                Function::StrStarts,
+                vec![
+                    Expr::Var(v),
+                    Expr::Lit(crate::id::Id::UNDEF, Value::Lang("A".into(), "en".into())),
+                ],
+            )],
+            v,
+        )
+        .unwrap();
+        let f_en_ltr =
+            KeyFilter::new(&[call(Function::StrStarts, vec![Expr::Var(v), en_ltr])], v).unwrap();
+        for tag in [
+            b"en--LTR".as_slice(),
+            b"en--RTL",
+            b"en--foo",
+            b"en-us--RTL",
+            b"a",
+        ] {
+            let raw = raw_lang(b"Ada", tag);
+            let tag_str = std::str::from_utf8(tag).unwrap();
+            assert!(
+                matches!(Value::from_key(&raw), Value::Lang(ref l, ref t) if &**l == "Ada" && &**t == tag_str),
+                "from_key should keep {tag_str:?} as an undirected language tag"
+            );
+            assert!(
+                matches!(
+                    split(&raw),
+                    Key::Literal {
+                        lex: b"Ada",
+                        lang: Some(l),
+                        dir: None,
+                        typed: false,
+                    } if l == tag
+                ),
+                "split should match from_key for {tag_str:?}"
+            );
+            assert!(f_plain.test(&raw), "plain needle should match {tag_str:?}");
+            assert!(
+                !f_en_only.test(&raw),
+                "@en needle should reject {tag_str:?}"
+            );
+            assert!(
+                !f_en_ltr.test(&raw),
+                "@en--ltr needle should reject {tag_str:?}"
+            );
+        }
     }
 
     /// A bound filter takes each regular expression's own program after earlier tests
