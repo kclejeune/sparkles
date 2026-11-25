@@ -610,16 +610,24 @@ pub(super) fn restore_conflicts(
     if uncertain.is_empty() {
         return Ok(conflicts);
     }
+    let uncertain_names: BTreeSet<&str> = uncertain
+        .iter()
+        .map(|intent| intent.name.as_str())
+        .collect();
     let mut replaced = BTreeMap::<String, Vec<OsString>>::new();
     for name in databases.names()? {
         let name = name?;
-        if let Some(dataset) = name.to_str().and_then(super::restore::replaced_dataset) {
-            let dir = databases.child(&name)?;
-            if super::restore::is_unmarked_keep_replaced(&dir, dataset)? {
-                continue;
-            }
-            replaced.entry(dataset.into()).or_default().push(name);
+        let Some(dataset) = name.to_str().and_then(super::restore::replaced_dataset) else {
+            continue;
+        };
+        if !uncertain_names.contains(dataset) {
+            continue;
         }
+        let registered = registered_dataset(registry, dataset);
+        if super::restore::is_retained_keep_replaced(databases, &name, dataset, registered) {
+            continue;
+        }
+        replaced.entry(dataset.into()).or_default().push(name);
     }
     for intent in uncertain {
         let Some(candidates) = replaced.get(&intent.name) else {
@@ -3632,6 +3640,10 @@ mod tests {
             });
             let syncs = take_catalog_dir_syncs();
             assert!(
+                syncs.contains(&replaced),
+                "finishing keepReplaced move must sync predecessor dir {replaced:?}; saw {syncs:?}"
+            );
+            assert!(
                 syncs.contains(&db),
                 "finishing keepReplaced move must sync databases; saw {syncs:?}"
             );
@@ -3738,10 +3750,16 @@ mod tests {
             )
             .unwrap();
 
+            let _ = take_catalog_dir_syncs();
             let capture = EventCapture::default();
             let first = tracing::subscriber::with_default(capture.clone(), || {
                 Catalog::open(dir.path(), Default::default()).unwrap()
             });
+            let syncs = take_catalog_dir_syncs();
+            assert!(
+                syncs.contains(&replaced),
+                "occupied keepReplaced must sync predecessor dir {replaced:?}; saw {syncs:?}"
+            );
             assert!(first.get("doomed").is_none());
             assert!(first.refusal("doomed").is_none());
             assert!(!db.join("doomed").exists());
@@ -3928,6 +3946,539 @@ mod tests {
     }
 
     #[test]
+    fn r7_occupied_keep_replaced_syncs_predecessor_dir_and_fails_closed_on_sync_error() {
+        use super::super::{CONFIG_FILE, FAIL_NEXT_DIR_SYNC, take_catalog_dir_syncs};
+        use crate::store::Store;
+
+        // Subtest A: unmarked `.keep-replaced-v1` on an occupied destination must sync the
+        // predecessor directory before reporting retention, and fail closed if that sync fails.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let trash = db.join(intent.trash_name());
+            std::fs::rename(db.join(intent.kept_name()), &trash).unwrap();
+
+            let kept_dst = db.join(".kept-doomed-1");
+            let earlier = Store::open(&kept_dst, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &earlier,
+                "INSERT DATA { <urn:r7-earlier> <urn:p> 1 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let earlier_id = earlier.dataset_id();
+            let earlier_head = earlier.head_commit();
+            drop(earlier);
+            write_file_atomic(&kept_dst.join(KEEP_REPLACED_MARKER), b".kept-doomed-1").unwrap();
+
+            let replaced = db.join(".replaced-doomed-1");
+            let second_pred = Store::open(&replaced, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &second_pred,
+                "INSERT DATA { <urn:r7-second> <urn:p> 2 . <urn:r7-second> <urn:p> 3 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let second_id = second_pred.dataset_id();
+            let second_head = second_pred.head_commit();
+            drop(second_pred);
+            write_file_atomic(&replaced.join(KEEP_REPLACED_MARKER), b".kept-doomed-1").unwrap();
+
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                serde_json::to_vec(&serde_json::json!({
+                    "format": 2,
+                    "datasets": [],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let journal = dir.path().join(INTENT_FILE);
+            std::fs::write(
+                &journal,
+                serde_json::to_vec(&serde_json::json!({
+                    "format": 3,
+                    "intents": [{
+                        "name": intent.name,
+                        "id": intent.id,
+                        "token": intent.token,
+                        "state": "prepared",
+                    }],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Inject a sync failure on the predecessor directory itself.
+            let _ = take_catalog_dir_syncs();
+            FAIL_NEXT_DIR_SYNC.set(Some(replaced.clone()));
+            let capture = EventCapture::default();
+            let failed = tracing::subscriber::with_default(capture.clone(), || {
+                Catalog::open(dir.path(), Default::default())
+            });
+            let remaining = FAIL_NEXT_DIR_SYNC.replace(None);
+            assert!(
+                failed.is_err(),
+                "occupied keepReplaced must fail closed if predecessor dir sync fails"
+            );
+            assert!(
+                remaining.is_none(),
+                "startup must attempt to sync the occupied predecessor directory {replaced:?}"
+            );
+            assert!(
+                capture.warnings().is_empty(),
+                "retention warning must not fire before predecessor sync succeeds: {:?}",
+                capture.warnings()
+            );
+            assert!(trash.exists() && journal.exists());
+            let earlier_check =
+                Store::open_existing(&kept_dst, Default::default(), Some(earlier_id)).unwrap();
+            assert_eq!(earlier_check.head_commit(), earlier_head);
+            let second_check =
+                Store::open_existing(&replaced, Default::default(), Some(second_id)).unwrap();
+            assert_eq!(second_check.head_commit(), second_head);
+            drop((earlier_check, second_check));
+
+            // Retry succeeds, records the predecessor directory sync, warns, and keeps both heads.
+            let _ = take_catalog_dir_syncs();
+            let capture = EventCapture::default();
+            let opened = tracing::subscriber::with_default(capture.clone(), || {
+                Catalog::open(dir.path(), Default::default()).unwrap()
+            });
+            let syncs = take_catalog_dir_syncs();
+            assert!(
+                syncs.contains(&replaced),
+                "occupied keepReplaced retry must sync predecessor dir {replaced:?}; saw {syncs:?}"
+            );
+            assert!(!trash.exists() && !journal.exists());
+            assert!(capture.warnings().iter().any(|event| {
+                event
+                    .fields
+                    .get("path")
+                    .is_some_and(|p| p.ends_with(".replaced-doomed-1"))
+            }));
+            drop(opened);
+            let earlier_check =
+                Store::open_existing(&kept_dst, Default::default(), Some(earlier_id)).unwrap();
+            assert_eq!(earlier_check.head_commit(), earlier_head);
+            let second_check =
+                Store::open_existing(&replaced, Default::default(), Some(second_id)).unwrap();
+            assert_eq!(second_check.head_commit(), second_head);
+        }
+
+        // Subtest B: dual-marked committed predecessor on an occupied destination must sync
+        // `.keep-replaced-v1` before unlinking `.restore-swap.json`, leaving both markers and
+        // both heads intact if that sync fails.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = catalog.create("ds", &Default::default()).unwrap();
+            active
+                .update("INSERT DATA { <urn:r7-live> <urn:p> 1 }")
+                .unwrap();
+            let active_id = active.dataset_id();
+            let active_head = active.head_commit();
+            drop((active, catalog));
+
+            let restored_rev = read_registry(dir.path()).unwrap().datasets[0]
+                .revision
+                .expect("created dataset has swap revision");
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+
+            let kept_dst = db.join(".kept-ds-1");
+            let earlier = Store::open(&kept_dst, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &earlier,
+                "INSERT DATA { <urn:r7-earlier-b> <urn:p> 1 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let earlier_id = earlier.dataset_id();
+            let earlier_head = earlier.head_commit();
+            drop(earlier);
+            write_file_atomic(&kept_dst.join(KEEP_REPLACED_MARKER), b".kept-ds-1").unwrap();
+
+            let replaced = db.join(".replaced-ds-1");
+            let pred = Store::open(&replaced, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &pred,
+                "INSERT DATA { <urn:r7-pred-b> <urn:p> 2 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let pred_id = pred.dataset_id();
+            let pred_head = pred.head_commit();
+            drop(pred);
+            write_file_atomic(&replaced.join(KEEP_REPLACED_MARKER), b".kept-ds-1").unwrap();
+            let swap_marker = replaced.join(super::super::restore::SWAP_MARKER);
+            write_file_atomic(
+                &swap_marker,
+                &serde_json::to_vec(&serde_json::json!({
+                    "format": 1,
+                    "dataset": "ds",
+                    "predecessor_id": pred_id,
+                    "predecessor_revision": Uuid::new_v4(),
+                    "restored_id": active_id,
+                    "restored_revision": restored_rev,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            FAIL_NEXT_DIR_SYNC.set(Some(replaced.clone()));
+            let failed = Catalog::open(dir.path(), Default::default());
+            assert!(FAIL_NEXT_DIR_SYNC.replace(None).is_none());
+            assert!(failed.is_err());
+            // Swap marker must still be present because pre-unlink sync failed.
+            assert!(
+                swap_marker.exists(),
+                "swap marker must not be unlinked before keep marker is durably synced"
+            );
+            assert!(replaced.join(KEEP_REPLACED_MARKER).exists());
+
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let ds = reopened.get("ds").unwrap();
+            assert_eq!(
+                (ds.dataset_id(), ds.head_commit()),
+                (active_id, active_head)
+            );
+            assert!(!swap_marker.exists());
+            assert!(replaced.join(KEEP_REPLACED_MARKER).exists());
+            let earlier_check =
+                Store::open_existing(&kept_dst, Default::default(), Some(earlier_id)).unwrap();
+            assert_eq!(earlier_check.head_commit(), earlier_head);
+            let pred_check =
+                Store::open_existing(&replaced, Default::default(), Some(pred_id)).unwrap();
+            assert_eq!(pred_check.head_commit(), pred_head);
+        }
+    }
+
+    #[test]
+    fn r7_dual_marked_committed_keep_replaced_allows_interrupted_delete_recovery() {
+        use super::super::take_catalog_dir_syncs;
+        use crate::store::Store;
+
+        // Subtest A: prepared format 4 delete with restored revision still registered and an
+        // occupied predecessor carrying both `.restore-swap.json` and `.keep-replaced-v1`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = catalog.create("ds", &Default::default()).unwrap();
+            active
+                .update("INSERT DATA { <urn:r7-active> <urn:p> 1 }")
+                .unwrap();
+            let active_id = active.dataset_id();
+            let active_head = active.head_commit();
+            drop(active);
+
+            let restored_rev = read_registry(dir.path()).unwrap().datasets[0]
+                .revision
+                .expect("created persistent dataset records swap revision");
+
+            CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+            assert!(catalog.delete("ds").is_err());
+            CRASH_AFTER.set(0);
+            drop(catalog);
+
+            let intent = read_intents(dir.path()).unwrap().pop().unwrap();
+            assert_eq!(intent.state, IntentState::Prepared);
+            assert_eq!(intent.id, active_id);
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let kept_dst = db.join(".kept-ds-1");
+            let earlier = Store::open(&kept_dst, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &earlier,
+                "INSERT DATA { <urn:r7-earlier> <urn:p> 10 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let earlier_id = earlier.dataset_id();
+            let earlier_head = earlier.head_commit();
+            drop(earlier);
+            write_file_atomic(&kept_dst.join(KEEP_REPLACED_MARKER), b".kept-ds-1").unwrap();
+
+            let replaced = db.join(".replaced-ds-1");
+            let pred = Store::open(&replaced, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &pred,
+                "INSERT DATA { <urn:r7-pred> <urn:p> 20 . <urn:r7-pred> <urn:p> 21 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let pred_id = pred.dataset_id();
+            let pred_head = pred.head_commit();
+            drop(pred);
+            write_file_atomic(&replaced.join(KEEP_REPLACED_MARKER), b".kept-ds-1").unwrap();
+            let swap_marker = replaced.join(super::super::restore::SWAP_MARKER);
+            write_file_atomic(
+                &swap_marker,
+                &serde_json::to_vec(&serde_json::json!({
+                    "format": 1,
+                    "dataset": "ds",
+                    "predecessor_id": pred_id,
+                    "predecessor_revision": Uuid::new_v4(),
+                    "restored_id": active_id,
+                    "restored_revision": restored_rev,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let _ = take_catalog_dir_syncs();
+            let capture = EventCapture::default();
+            let first = tracing::subscriber::with_default(capture.clone(), || {
+                Catalog::open(dir.path(), Default::default()).unwrap()
+            });
+            let syncs = take_catalog_dir_syncs();
+            assert!(
+                syncs.contains(&replaced),
+                "occupied keepReplaced must sync predecessor dir {replaced:?}; saw {syncs:?}"
+            );
+            assert!(
+                first.refusal("ds").is_none(),
+                "committed dual-marked keepReplaced copy must not block delete recovery: {:?}",
+                first.refusals()
+            );
+            let live = first.get("ds").expect("active dataset must be restored");
+            assert_eq!(
+                (live.dataset_id(), live.head_commit()),
+                (active_id, active_head)
+            );
+            assert!(!dir.path().join(INTENT_FILE).exists());
+            assert!(!db.join(intent.kept_name()).exists());
+            assert!(!swap_marker.exists());
+            assert!(replaced.join(KEEP_REPLACED_MARKER).exists());
+            assert!(capture.warnings().iter().any(|event| {
+                event
+                    .fields
+                    .get("path")
+                    .is_some_and(|p| p.ends_with(".replaced-ds-1"))
+            }));
+            drop((live, first));
+
+            // Reopen confirms active head and both kept heads survive.
+            let second = Catalog::open(dir.path(), Default::default()).unwrap();
+            assert!(second.refusal("ds").is_none());
+            let live = second.get("ds").unwrap();
+            assert_eq!(
+                (live.dataset_id(), live.head_commit()),
+                (active_id, active_head)
+            );
+            let earlier_check =
+                Store::open_existing(&kept_dst, Default::default(), Some(earlier_id)).unwrap();
+            assert_eq!(earlier_check.head_commit(), earlier_head);
+            let pred_check =
+                Store::open_existing(&replaced, Default::default(), Some(pred_id)).unwrap();
+            assert_eq!(pred_check.head_commit(), pred_head);
+        }
+
+        // Subtest B: a dual-marked candidate matching the registered predecessor revision is a
+        // possible rollback source and must still trigger a per-dataset conflict refusal.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = catalog.create("ds", &Default::default()).unwrap();
+            active
+                .update("INSERT DATA { <urn:r7-rollback> <urn:p> 1 }")
+                .unwrap();
+            let active_id = active.dataset_id();
+            drop(active);
+
+            let registered_rev = read_registry(dir.path()).unwrap().datasets[0]
+                .revision
+                .expect("created persistent dataset records swap revision");
+
+            CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+            assert!(catalog.delete("ds").is_err());
+            CRASH_AFTER.set(0);
+            drop(catalog);
+
+            let intent = read_intents(dir.path()).unwrap().pop().unwrap();
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let replaced = db.join(".replaced-ds-1");
+            let pred = Store::open(&replaced, Default::default()).unwrap();
+            let pred_id = pred.dataset_id();
+            drop(pred);
+            write_file_atomic(&replaced.join(KEEP_REPLACED_MARKER), b".kept-ds-1").unwrap();
+            let swap_marker = replaced.join(super::super::restore::SWAP_MARKER);
+            write_file_atomic(
+                &swap_marker,
+                &serde_json::to_vec(&serde_json::json!({
+                    "format": 1,
+                    "dataset": "ds",
+                    "predecessor_id": pred_id,
+                    "predecessor_revision": registered_rev,
+                    "restored_id": active_id,
+                    "restored_revision": Uuid::new_v4(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            assert_eq!(
+                reopened.refusal("ds").map(|r| r.kind),
+                Some("recovery"),
+                "predecessor-revision match must stay refused"
+            );
+            assert!(reopened.get("ds").is_none());
+            assert!(!db.join("ds").exists());
+            assert!(db.join(intent.kept_name()).join("dataset.json").exists());
+            assert!(replaced.join("dataset.json").exists());
+            assert!(swap_marker.exists());
+            assert!(dir.path().join(INTENT_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn r7_conflict_discovery_isolates_malformed_and_unreadable_candidates() {
+        use crate::store::Store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+        let healthy = catalog.create("healthy", &Default::default()).unwrap();
+        healthy
+            .update("INSERT DATA { <urn:r7-healthy> <urn:p> 1 }")
+            .unwrap();
+        let healthy_id = healthy.dataset_id();
+        let healthy_head = healthy.head_commit();
+        drop(healthy);
+        let doomed = catalog.create("doomed", &Default::default()).unwrap();
+        doomed
+            .update("INSERT DATA { <urn:r7-doomed> <urn:p> 2 }")
+            .unwrap();
+        drop(doomed);
+
+        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+        assert!(catalog.delete("doomed").is_err());
+        CRASH_AFTER.set(0);
+        drop(catalog);
+
+        let intent = read_intents(dir.path()).unwrap().pop().unwrap();
+        let db = dir.path().join("databases");
+        let kept = db.join(intent.kept_name());
+        let replaced = db.join(".replaced-doomed-42");
+        drop(Store::open(&replaced, Default::default()).unwrap());
+        let swap_marker = replaced.join(super::super::restore::SWAP_MARKER);
+
+        // Truncated swap marker (without and with `.keep-replaced-v1`) must keep the conflict
+        // scoped to `/doomed` while `/healthy` still opens cleanly.
+        for with_keep_marker in [false, true] {
+            if with_keep_marker {
+                write_file_atomic(&replaced.join(KEEP_REPLACED_MARKER), b".kept-doomed-42")
+                    .unwrap();
+            }
+            std::fs::write(&swap_marker, b"{\"format\":1,").unwrap();
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let h = reopened
+                .get("healthy")
+                .expect("healthy sibling must open despite competing malformed swap marker");
+            assert_eq!(
+                (h.dataset_id(), h.head_commit()),
+                (healthy_id, healthy_head)
+            );
+            assert_eq!(reopened.refusal("doomed").map(|r| r.kind), Some("recovery"));
+            assert!(reopened.get("doomed").is_none());
+            assert!(!db.join("doomed").exists());
+            assert!(kept.join("dataset.json").exists());
+            assert!(replaced.join("dataset.json").exists());
+            assert!(dir.path().join(INTENT_FILE).exists());
+        }
+
+        // Unreadable competing `.replaced-*` directory must also stay scoped to `/doomed`.
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&replaced, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let opened = Catalog::open(dir.path(), Default::default());
+            std::fs::set_permissions(&replaced, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let reopened = opened.expect(
+                "healthy sibling must open when competing .replaced-* directory is unreadable",
+            );
+            let h = reopened.get("healthy").unwrap();
+            assert_eq!(
+                (h.dataset_id(), h.head_commit()),
+                (healthy_id, healthy_head)
+            );
+            assert_eq!(reopened.refusal("doomed").map(|r| r.kind), Some("recovery"));
+            assert!(kept.join("dataset.json").exists());
+            assert!(replaced.join("dataset.json").exists());
+            assert!(dir.path().join(INTENT_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn r7_missing_config_reports_unsupported_swap_before_prepared_delete_or_malformed_sibling() {
+        use super::super::CONFIG_FILE;
+
+        let dir = tempfile::tempdir().unwrap();
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_KEPT_RENAME);
+        let db = dir.path().join("databases");
+        let kept = db.join(intent.kept_name());
+        let journal = dir.path().join(INTENT_FILE);
+        std::fs::remove_file(dir.path().join(CONFIG_FILE)).unwrap();
+
+        let future = db.join(".replaced-other-9");
+        std::fs::create_dir_all(&future).unwrap();
+        std::fs::write(
+            future.join(super::super::restore::SWAP_MARKER),
+            br#"{"format":99,"dataset":"other"}"#,
+        )
+        .unwrap();
+
+        // Missing config.json + prepared delete + future swap marker on another alias -> Unsupported.
+        let err = Catalog::open(dir.path(), Default::default())
+            .err()
+            .expect("future swap marker must report Unsupported even beside a prepared delete");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert!(kept.join("dataset.json").exists());
+        assert!(journal.exists());
+        assert!(future.exists());
+
+        // Malformed siblings on both sides of `other` must not mask the Unsupported format.
+        let malformed_a = db.join(".replaced-aaa-1");
+        let malformed_z = db.join(".replaced-zzz-2");
+        for malformed in [&malformed_a, &malformed_z] {
+            std::fs::create_dir_all(malformed).unwrap();
+            std::fs::write(
+                malformed.join(super::super::restore::SWAP_MARKER),
+                b"{\"format\":1,",
+            )
+            .unwrap();
+        }
+        let err = Catalog::open(dir.path(), Default::default())
+            .err()
+            .expect("malformed siblings must not mask future swap marker");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+
+        // Without the prepared delete, malformed siblings still must not mask Unsupported.
+        let saved_journal = std::fs::read(&journal).unwrap();
+        std::fs::remove_file(&journal).unwrap();
+        let err = Catalog::open(dir.path(), Default::default())
+            .err()
+            .expect("malformed siblings without prepared delete must not mask Unsupported");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+
+        // Once the future swap marker is removed, the malformed marker reports Corrupt.
+        std::fs::remove_dir_all(&future).unwrap();
+        let err = Catalog::open(dir.path(), Default::default())
+            .err()
+            .expect("malformed marker alone must fail closed with Corrupt");
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+
+        // With the prepared delete restored and no future swap marker, missing registry reports Corrupt.
+        std::fs::write(&journal, &saved_journal).unwrap();
+        let err = Catalog::open(dir.path(), Default::default())
+            .err()
+            .expect("prepared delete with missing config.json must still report Corrupt");
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+        assert!(kept.join("dataset.json").exists());
+        assert!(journal.exists());
+    }
+
+    #[test]
     fn staging_failures_and_precommit_crashes_restore_the_registered_dataset() {
         use super::super::{
             DELETE_BEFORE_MOVE, DELETE_FAIL, DELETE_ROLLBACK_MOVE, DELETE_ROLLBACK_SYNC,
@@ -4077,16 +4628,42 @@ mod tests {
         assert_eq!(catalog.get("old").unwrap().dataset_id(), id);
     }
 
-    #[cfg(feature = "backup")]
     #[test]
     fn staged_restore_and_delete_conflict_keeps_both_copies() {
         let dir = tempfile::tempdir().unwrap();
-        let intent = interrupted_delete(dir.path(), CRASH_AFTER_KEPT_RENAME);
+        let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+        let healthy = catalog.create("healthy", &Default::default()).unwrap();
+        healthy
+            .update("INSERT DATA { <urn:healthy> <urn:p> 1 }")
+            .unwrap();
+        let healthy_id = healthy.dataset_id();
+        drop(healthy);
+        let doomed = catalog.create("doomed", &Default::default()).unwrap();
+        doomed.update("INSERT DATA { <urn:d> <urn:p> 2 }").unwrap();
+        drop(doomed);
+        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+        assert!(catalog.delete("doomed").is_err());
+        CRASH_AFTER.set(0);
+        drop(catalog);
+
+        let intent = read_intents(dir.path()).unwrap().pop().unwrap();
         let databases = dir.path().join("databases");
         let replaced = databases.join(".replaced-doomed-42");
         drop(crate::store::Store::open(&replaced, Default::default()).unwrap());
+        std::fs::write(
+            replaced.join(super::super::restore::SWAP_MARKER),
+            b"{\"format\":1,",
+        )
+        .unwrap();
         let kept = databases.join(intent.kept_name());
         let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(
+            catalog
+                .get("healthy")
+                .expect("healthy sibling must remain available")
+                .dataset_id(),
+            healthy_id
+        );
         assert!(catalog.refusal("doomed").is_some());
         assert!(catalog.get("doomed").is_none());
         assert!(!databases.join("doomed").exists());

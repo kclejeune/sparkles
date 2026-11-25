@@ -7,10 +7,10 @@
 //!   predecessor when the predecessor revision survived, or removing `.replaced-*`
 //!   when the restored revision or a later registration survived);
 //! * `databases/.replaced-<ds>-<task>` carrying a validated `.keep-replaced-v1`
-//!   marker from a `keepReplaced` restore whose final rename did not finish is
-//!   moved to `.kept-<ds>-<task>` under the store lock when that destination is
-//!   free, or retained with a warning when occupied, without populating the live
-//!   path;
+//!   marker from a `keepReplaced` restore whose final rename did not finish
+//!   synchronizes the predecessor directory, then moves it to `.kept-<ds>-<task>`
+//!   under the store lock when that destination is free or retains it with a
+//!   warning when occupied, without populating the live path;
 //! * an unmarked legacy `databases/.replaced-<ds>-<task>` is reconciled against
 //!   `config.json`: for a persistent row with a UUID, `databases` is synchronized
 //!   under the live store lock before removing `.replaced-*` when `databases/<ds>`
@@ -164,18 +164,31 @@ fn read_swap_marker(replaced: &RecoveryDir, dataset: &str) -> Result<Option<Swap
 
 /// Whether `databases` contains any `.replaced-<ds>-<task>` directory
 /// (requiring `config.json` for recovery). Validates swap markers on every
-/// staged entry so a newer format still reports [`Error::Unsupported`].
+/// staged entry so a newer format still reports [`Error::Unsupported`] even
+/// when an earlier sibling is malformed or unreadable.
 pub(super) fn has_staged_swaps(databases: &RecoveryDir) -> Result<bool> {
     let mut found = false;
+    let mut first_error: Option<Error> = None;
     for entry in databases.names()? {
         let name = entry?;
         let text = name.to_string_lossy();
         let Some(ds) = replaced_dataset(&text) else {
             continue;
         };
-        let dir = databases.child(&name)?;
-        let _ = read_swap_marker(&dir, ds)?;
         found = true;
+        let check = databases
+            .child(&name)
+            .map_err(Error::from)
+            .and_then(|dir| read_swap_marker(&dir, ds).map(|_| ()));
+        if let Err(error) = check {
+            if matches!(error, Error::Unsupported(_)) {
+                return Err(error);
+            }
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(found)
 }
@@ -205,16 +218,46 @@ fn keep_replaced_target(dir: &RecoveryDir) -> Result<Option<String>> {
     Ok((marker == expected.as_bytes()).then_some(expected))
 }
 
-/// Whether a `.replaced-<ds>-<task>` directory has no swap marker and carries a
-/// validated `.keep-replaced-v1` marker (so it is an intentionally retained copy
-/// rather than a rollback candidate for `ds`).
-pub(super) fn is_unmarked_keep_replaced(dir: &RecoveryDir, ds: &str) -> Result<bool> {
-    if read_swap_marker(dir, ds)?.is_some() {
-        return Ok(false);
+/// Whether `databases/<name>` (a `.replaced-<ds>-<task>` directory) is provably
+/// an intentionally retained `keepReplaced` copy rather than a rollback candidate
+/// for `ds`. Returns `false` whenever the directory cannot be opened or its
+/// markers or identity cannot be validated, keeping questionable candidates in
+/// per-dataset conflict arbitration instead of failing catalog startup.
+pub(super) fn is_retained_keep_replaced(
+    databases: &RecoveryDir,
+    name: &OsStr,
+    ds: &str,
+    registered: Option<&super::RegistryEntry>,
+) -> bool {
+    let Ok(dir) = databases.child(name) else {
+        return false;
+    };
+    if !matches!(keep_replaced_target(&dir), Ok(Some(_))) {
+        return false;
     }
-    Ok(keep_replaced_target(dir)?.is_some())
+    match read_swap_marker(&dir, ds) {
+        Ok(None) => delete::dataset_id(&dir).is_ok(),
+        Ok(Some(marker)) => {
+            let committed = match registered {
+                None => true,
+                Some(row) => row
+                    .revision
+                    .is_some_and(|revision| revision != marker.predecessor_revision),
+            };
+            committed
+                && matches!(
+                    delete::dataset_id(&dir),
+                    Ok(Some(id)) if id == marker.predecessor_id
+                )
+        }
+        Err(_) => false,
+    }
 }
 
+/// Move a locked `keepReplaced` predecessor to `kept_name`, or retain it with a
+/// warning when `kept_name` is already occupied. Callers must synchronize
+/// `replaced_dir` first so the observed `.keep-replaced-v1` marker is durable on
+/// every exit path.
 fn rename_keep_replaced(
     databases: &RecoveryDir,
     ds: &str,
@@ -279,6 +322,9 @@ fn finish_keep_replaced(
     replaced_dir: RecoveryDir,
     kept_name: &str,
 ) -> Result<()> {
+    // Make the observed `.keep-replaced-v1` marker durable in its own directory
+    // before reporting retention or moving the copy, including occupied destinations.
+    replaced_dir.sync()?;
     let replaced_name = replaced_dir
         .path()
         .file_name()
@@ -322,6 +368,7 @@ pub(super) fn recover(
     let mut restore_leftovers = Vec::new();
     let mut replaced_entries: BTreeMap<String, Vec<(RecoveryDir, Option<SwapMarker>)>> =
         BTreeMap::new();
+    let mut first_error: Option<Error> = None;
     for entry in databases.names()? {
         let name = entry?;
         let text = name.to_string_lossy().into_owned();
@@ -331,13 +378,24 @@ pub(super) fn recover(
             if protected.contains(ds) {
                 continue;
             }
-            let dir = databases.child(&name)?;
-            let marker = read_swap_marker(&dir, ds)?;
-            replaced_entries
-                .entry(ds.to_string())
-                .or_default()
-                .push((dir, marker));
+            let opened = databases.child(&name).map_err(Error::from).and_then(|dir| {
+                let marker = read_swap_marker(&dir, ds)?;
+                Ok((dir, marker))
+            });
+            match opened {
+                Ok((dir, marker)) => replaced_entries
+                    .entry(ds.to_string())
+                    .or_default()
+                    .push((dir, marker)),
+                Err(error @ Error::Unsupported(_)) => return Err(error),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
 
     if !restore_leftovers.is_empty() {
@@ -466,6 +524,10 @@ pub(super) fn recover(
             }
             if let Some(kept_name) = keep_replaced_target(&replaced_dir)? {
                 let lock = delete::lock_candidate(&replaced_dir, marker.predecessor_id, false)?;
+                // Make the observed `.keep-replaced-v1` marker durable before clearing the
+                // swap marker, so power loss cannot drop the keep marker and leave an
+                // unmarked staging copy.
+                replaced_dir.sync()?;
                 match replaced_dir.remove_file(OsStr::new(SWAP_MARKER)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}

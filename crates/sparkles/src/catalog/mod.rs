@@ -326,16 +326,21 @@ impl Catalog {
         let intents = delete::read_intents_at(&catalog_dir)?;
         let registry = match read_registry_at(&catalog_dir)? {
             Some(registry) => registry,
-            None if intents.iter().any(|intent| intent.state.is_prepared()) => {
-                return Err(Error::Corrupt(format!(
-                    "{CONFIG_FILE} is missing while a prepared delete requires recovery"
-                )));
-            }
             None => {
-                if let Some(existing_databases) =
-                    delete::child_if_present(&catalog_dir, OsStr::new("databases"))?
-                    && restore::has_staged_swaps(&existing_databases)?
-                {
+                let staged_swaps =
+                    match delete::child_if_present(&catalog_dir, OsStr::new("databases"))? {
+                        Some(existing_databases) => restore::has_staged_swaps(&existing_databases),
+                        None => Ok(false),
+                    };
+                if let Err(error @ Error::Unsupported(_)) = staged_swaps {
+                    return Err(error);
+                }
+                if intents.iter().any(|intent| intent.state.is_prepared()) {
+                    return Err(Error::Corrupt(format!(
+                        "{CONFIG_FILE} is missing while a prepared delete requires recovery"
+                    )));
+                }
+                if staged_swaps? {
                     return Err(Error::Corrupt(format!(
                         "{CONFIG_FILE} is missing while a staged restore swap requires recovery"
                     )));
