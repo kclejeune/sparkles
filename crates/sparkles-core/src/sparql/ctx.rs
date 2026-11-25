@@ -1319,6 +1319,17 @@ impl ResourceRefusal {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeGrowPoint {
+    BeforeLock,
+    BeforeEagerCharge,
+    AfterLedgerSnapshot,
+}
+
+#[cfg(test)]
+type DecodeGrowHook = Arc<dyn Fn(DecodeGrowPoint) + Send + Sync>;
+
 /// The high-water envelope that transient dictionary decoding reserves in both
 /// accounting modes: a key of the largest size seen so far on every worker, charged once
 /// when it grows and released when the work ends (see [`Ctx::reserve_decode_checked`]).
@@ -1328,6 +1339,18 @@ struct DecodeEnvelope {
     state: parking_lot::Mutex<(u64, Vec<(u64, u64)>)>,
     /// the reserved bytes, read without the lock
     reserved: AtomicU64,
+    #[cfg(test)]
+    grow_hook: parking_lot::Mutex<Option<DecodeGrowHook>>,
+}
+
+#[cfg(test)]
+impl DecodeEnvelope {
+    fn notify_grow_hook(&self, point: DecodeGrowPoint) {
+        let hook = self.grow_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2446,46 +2469,50 @@ impl Ctx {
         // A refused charge is dropped after the guard, since even an empty cursor
         // charge can synchronously wake pool waiters.
         let charge = self.charge(0)?;
-        if let Some(ledger) = self.memory.get() {
+        #[cfg(test)]
+        envelope.notify_grow_hook(DecodeGrowPoint::BeforeLock);
+        let ledger_target = {
+            let mut state = envelope.state.lock();
+            if need <= state.0 {
+                drop(state);
+                drop(charge);
+                return self.check_memory_failure();
+            }
+            if let Some(ledger) = self.memory.get() {
+                let eager_paid: u64 = state.1.iter().map(|&(_, owned)| owned).sum();
+                Some((ledger, need.saturating_sub(eager_paid)))
+            } else {
+                #[cfg(test)]
+                envelope.notify_grow_hook(DecodeGrowPoint::BeforeEagerCharge);
+                let (peak, owners) = &mut *state;
+                let delta = need - *peak;
+                charge.add(delta)?;
+                if let Some(id) = charge.disarm() {
+                    if let Some((_, owned)) = owners.iter_mut().find(|(owner, _)| *owner == id) {
+                        *owned += delta;
+                    } else {
+                        owners.push((id, delta));
+                    }
+                }
+                *peak = need;
+                envelope.reserved.store(need, Ordering::Release);
+                None
+            }
+        };
+        if let Some((ledger, target)) = ledger_target {
+            #[cfg(test)]
+            envelope.notify_grow_hook(DecodeGrowPoint::AfterLedgerSnapshot);
             // Reserve decode bytes directly on the ledger's decode envelope while
             // `envelope.state` is unlocked so synchronous pool wakes can re-enter safely
             // and optional cursor prefetch shares the envelope with zero extra ledger ops.
-            let eager_paid: u64 = {
-                let state = envelope.state.lock();
-                if need <= state.0 {
-                    drop(state);
-                    drop(charge);
-                    return self.check_memory_failure();
-                }
-                state.1.iter().map(|&(_, owned)| owned).sum()
-            };
             let account = ledger.owner(self.grant.as_ref())?;
-            ledger.reserve_decode_to(&account, self.mem_limit, need.saturating_sub(eager_paid))?;
+            ledger.reserve_decode_to(&account, self.mem_limit, target)?;
             let mut state = envelope.state.lock();
             if need > state.0 {
                 state.0 = need;
                 envelope.reserved.store(need, Ordering::Release);
             }
-            drop(state);
-            drop(charge);
-            return self.check_memory_failure();
         }
-        let mut state = envelope.state.lock();
-        let (peak, owners) = &mut *state;
-        if need > *peak {
-            let delta = need - *peak;
-            charge.add(delta)?;
-            if let Some(id) = charge.disarm() {
-                if let Some((_, owned)) = owners.iter_mut().find(|(owner, _)| *owner == id) {
-                    *owned += delta;
-                } else {
-                    owners.push((id, delta));
-                }
-            }
-            *peak = need;
-            envelope.reserved.store(need, Ordering::Release);
-        }
-        drop(state);
         drop(charge);
         self.check_memory_failure()
     }
@@ -6262,5 +6289,181 @@ mod charge_tests {
         assert_eq!(accepted.load(Ordering::SeqCst), 0);
         drop((g1, g2));
         assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn grow_decode_serializes_mode_selection_across_ledger_promotion() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        fn recv_bounded<T>(rx: &mpsc::Receiver<T>, msg: &str) -> T {
+            rx.recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|err| panic!("{msg}: {err}"))
+        }
+
+        let store = Store::in_memory(StoreOptions::default());
+
+        // Case 1: Decoder 1 pauses before acquiring `decode.state`, `memory_parent()`
+        // promotes the context to a ledger, and Decoder 2 enters the ledger path and
+        // pauses after snapshotting `eager_paid == 0`. When Decoder 1 resumes, it must
+        // observe the promoted ledger under `decode.state` instead of taking a stale
+        // eager branch and double-charging the envelope.
+        {
+            let need = Ctx::decode_need(128);
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = need;
+            let ctx = ctx.into_shared();
+
+            let before_lock_calls = Arc::new(AtomicUsize::new(0));
+            let after_snap_calls = Arc::new(AtomicUsize::new(0));
+            let (t1_paused_tx, t1_paused_rx) = mpsc::channel::<()>();
+            let (t1_go_tx, t1_go_rx) = mpsc::channel::<()>();
+            let (t2_paused_tx, t2_paused_rx) = mpsc::channel::<()>();
+            let (t2_go_tx, t2_go_rx) = mpsc::channel::<()>();
+            let t1_paused_tx = Arc::new(parking_lot::Mutex::new(Some(t1_paused_tx)));
+            let t1_go_rx = Arc::new(parking_lot::Mutex::new(Some(t1_go_rx)));
+            let t2_paused_tx = Arc::new(parking_lot::Mutex::new(Some(t2_paused_tx)));
+            let t2_go_rx = Arc::new(parking_lot::Mutex::new(Some(t2_go_rx)));
+
+            let bl_calls = before_lock_calls.clone();
+            let as_calls = after_snap_calls.clone();
+            *ctx.decode.grow_hook.lock() = Some(Arc::new(move |point| match point {
+                DecodeGrowPoint::BeforeLock => {
+                    if bl_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        t1_paused_tx.lock().take().unwrap().send(()).unwrap();
+                        let rx = t1_go_rx.lock().take().unwrap();
+                        recv_bounded(&rx, "decoder 1 was not released before lock");
+                    }
+                }
+                DecodeGrowPoint::AfterLedgerSnapshot => {
+                    if as_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        t2_paused_tx.lock().take().unwrap().send(()).unwrap();
+                        let rx = t2_go_rx.lock().take().unwrap();
+                        recv_bounded(&rx, "decoder 2 was not released after snapshot");
+                    }
+                }
+                DecodeGrowPoint::BeforeEagerCharge => {
+                    panic!("neither decoder should take the eager branch after promotion");
+                }
+            }));
+
+            let (r1_tx, r1_rx) = mpsc::channel();
+            let ctx1 = ctx.clone();
+            let t1 = std::thread::spawn(move || {
+                let _ = r1_tx.send(ctx1.reserve_decode_checked(128));
+            });
+
+            recv_bounded(&t1_paused_rx, "decoder 1 did not pause before decode lock");
+
+            // Promote to the shared ledger while decoder 1 is paused before the lock.
+            let _parent = ctx.memory_parent().unwrap();
+
+            let (r2_tx, r2_rx) = mpsc::channel();
+            let ctx2 = ctx.clone();
+            let t2 = std::thread::spawn(move || {
+                let _ = r2_tx.send(ctx2.reserve_decode_checked(128));
+            });
+
+            recv_bounded(
+                &t2_paused_rx,
+                "decoder 2 did not pause after ledger snapshot",
+            );
+
+            // Release decoder 1 first; it must enter the ledger path and fund `need` once.
+            t1_go_tx.send(()).unwrap();
+            let r1 = recv_bounded(&r1_rx, "decoder 1 did not finish");
+            r1.expect("decoder 1 must succeed on the promoted ledger path");
+
+            // Release decoder 2; it must reuse the already-funded ledger decode target.
+            t2_go_tx.send(()).unwrap();
+            let r2 = recv_bounded(&r2_rx, "decoder 2 did not finish");
+            r2.expect("decoder 2 must succeed without double-charging the envelope");
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+            *ctx.decode.grow_hook.lock() = None;
+
+            assert_eq!(ctx.live_bytes(), need);
+            assert!(ctx.decode.state.lock().1.is_empty());
+            assert!(ctx.check().is_ok());
+            ctx.release_work();
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+
+        // Case 2: Decoder 1 acquires `decode.state` before `memory_parent()` promotes
+        // the ledger, then falls back to `Charge::add` on the promoted ledger while
+        // still holding `decode.state`. Decoder 2 requests a larger envelope and must
+        // wait until Decoder 1 records its eager-paid owner bytes, then reserve only
+        // the remaining delta on the ledger.
+        {
+            let need1 = Ctx::decode_need(128);
+            let need2 = Ctx::decode_need(256);
+            assert!(need2 > need1);
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = need2;
+            let ctx = ctx.into_shared();
+
+            let before_lock_calls = Arc::new(AtomicUsize::new(0));
+            let (t1_eager_tx, t1_eager_rx) = mpsc::channel::<()>();
+            let (t1_go_tx, t1_go_rx) = mpsc::channel::<()>();
+            let (t2_before_lock_tx, t2_before_lock_rx) = mpsc::channel::<()>();
+            let t1_eager_tx = Arc::new(parking_lot::Mutex::new(Some(t1_eager_tx)));
+            let t1_go_rx = Arc::new(parking_lot::Mutex::new(Some(t1_go_rx)));
+            let t2_before_lock_tx = Arc::new(parking_lot::Mutex::new(Some(t2_before_lock_tx)));
+
+            let bl_calls = before_lock_calls.clone();
+            *ctx.decode.grow_hook.lock() = Some(Arc::new(move |point| match point {
+                DecodeGrowPoint::BeforeLock => {
+                    if bl_calls.fetch_add(1, Ordering::AcqRel) == 1 {
+                        t2_before_lock_tx.lock().take().unwrap().send(()).unwrap();
+                    }
+                }
+                DecodeGrowPoint::BeforeEagerCharge => {
+                    t1_eager_tx.lock().take().unwrap().send(()).unwrap();
+                    let rx = t1_go_rx.lock().take().unwrap();
+                    recv_bounded(&rx, "decoder 1 was not released in eager branch");
+                }
+                DecodeGrowPoint::AfterLedgerSnapshot => {}
+            }));
+
+            let (r1_tx, r1_rx) = mpsc::channel();
+            let ctx1 = ctx.clone();
+            let t1 = std::thread::spawn(move || {
+                let _ = r1_tx.send(ctx1.reserve_decode_checked(128));
+            });
+
+            recv_bounded(&t1_eager_rx, "decoder 1 did not enter locked eager branch");
+
+            let _parent = ctx.memory_parent().unwrap();
+
+            let (r2_tx, r2_rx) = mpsc::channel();
+            let ctx2 = ctx.clone();
+            let t2 = std::thread::spawn(move || {
+                let _ = r2_tx.send(ctx2.reserve_decode_checked(256));
+            });
+
+            recv_bounded(&t2_before_lock_rx, "decoder 2 did not reach decode lock");
+            assert!(
+                !ctx.decode_state_unlocked(),
+                "decoder 1 must hold decode.state across its eager fallback charge"
+            );
+
+            t1_go_tx.send(()).unwrap();
+            let r1 = recv_bounded(&r1_rx, "decoder 1 did not finish eager fallback");
+            let r2 = recv_bounded(&r2_rx, "decoder 2 did not finish ledger delta");
+            t1.join().unwrap();
+            t2.join().unwrap();
+            *ctx.decode.grow_hook.lock() = None;
+
+            r1.expect("decoder 1 must succeed");
+            r2.expect("decoder 2 must succeed by charging only need2 - need1");
+            assert_eq!(ctx.live_bytes(), need2);
+            let eager_paid: u64 = ctx.decode.state.lock().1.iter().map(|&(_, b)| b).sum();
+            assert_eq!(eager_paid, need1);
+            assert!(ctx.check().is_ok());
+            ctx.release_work();
+            assert_eq!(ctx.live_bytes(), 0);
+        }
     }
 }

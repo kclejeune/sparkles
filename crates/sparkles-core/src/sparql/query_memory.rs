@@ -201,6 +201,7 @@ enum AdmitStep {
 #[derive(Clone, Copy)]
 enum RefusalDemand {
     Bytes { bytes: u64, decode: bool },
+    DecodeTarget { target: u64 },
     Prefetch { need: u64 },
 }
 
@@ -1260,6 +1261,14 @@ impl QueryMemoryLedger {
                     bytes
                 }
             }
+            RefusalDemand::DecodeTarget { target } => {
+                let bytes = target.saturating_sub(state.decode_total);
+                if self.prefetch_active.load(Ordering::SeqCst) == 0 {
+                    bytes.saturating_sub(account.prefetch)
+                } else {
+                    bytes
+                }
+            }
             RefusalDemand::Prefetch { need } => {
                 let current = state.decode_total.saturating_add(state.prefetch_total);
                 need.saturating_sub(current)
@@ -1599,10 +1608,7 @@ impl QueryMemoryLedger {
                         if let Err(err) = reserve_more_credit(&mut admission.credit, &req)
                             && !self.revalidate_upstream_refusal(
                                 owner.id,
-                                RefusalDemand::Bytes {
-                                    bytes,
-                                    decode: true,
-                                },
+                                RefusalDemand::DecodeTarget { target },
                                 req.min_delta,
                                 &return_scope,
                                 &err,
@@ -5154,6 +5160,133 @@ mod tests {
                 "overflow scopes for this thread must be completely drained"
             );
         });
+    }
+
+    #[test]
+    fn reserve_decode_to_revalidates_absolute_target_after_concurrent_promotion() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        // Nested ledger backed by a parent with exactly 4 KiB capacity, initially
+        // filled by an actively pinned 4 KiB prefetch envelope. Decoder A targets
+        // 4 KiB and hits the parent because the active pin blocks promotion. Before
+        // A's upstream refusal returns, prefetch drops its pin and Decoder B promotes
+        // the 4 KiB into `decode_total` without touching the parent. A's refusal
+        // revalidation must check the absolute decode target against `decode_total`
+        // and succeed instead of returning a spurious `BudgetExceeded`.
+        let limit = 4096u64;
+        let used = Arc::new(AtomicU64::new(0));
+        let armed = Arc::new(AtomicBool::new(false));
+        let (a_in_parent_tx, a_in_parent_rx) = mpsc::channel::<()>();
+        let (a_resume_tx, a_resume_rx) = mpsc::channel::<()>();
+        let a_in_parent_tx = Arc::new(Mutex::new(Some(a_in_parent_tx)));
+        let a_resume_rx = Arc::new(Mutex::new(Some(a_resume_rx)));
+
+        let take_used = used.clone();
+        let take_armed = armed.clone();
+        let take_in_parent = a_in_parent_tx.clone();
+        let take_resume = a_resume_rx.clone();
+        let give_used = used.clone();
+
+        let parent = MemoryDomain::unpooled().parent(
+            move |n| {
+                if take_armed.load(Ordering::Acquire)
+                    && n == limit
+                    && let Some(tx) = take_in_parent.lock().take()
+                {
+                    tx.send(()).unwrap();
+                    let rx = take_resume.lock().take().unwrap();
+                    recv_bounded(
+                        &rx,
+                        "decoder A was not released after decoder B promoted prefetch",
+                    );
+                }
+                let mut cur = take_used.load(Ordering::Relaxed);
+                loop {
+                    let next = cur.checked_add(n).ok_or(ParentRefused::Overflow)?;
+                    if next > limit {
+                        return Err(ParentRefused::Limit {
+                            limit,
+                            requested: next,
+                            scope: Scope::Work,
+                        });
+                    }
+                    match take_used.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(actual) => cur = actual,
+                    }
+                }
+            },
+            move |n| {
+                give_used.fetch_sub(n, Ordering::AcqRel);
+            },
+        );
+
+        let nested = QueryMemoryLedger::nested(None, parent);
+        let owner = nested.owner(None).unwrap();
+
+        // Fill the 4 KiB parent with actively pinned prefetch.
+        nested.admit_prefetch(None, 1 << 20, limit).unwrap();
+        assert_eq!(used.load(Ordering::Acquire), limit);
+        assert_eq!(nested.prefetch_bytes.load(Ordering::Acquire), limit);
+
+        // Arm the pause for decoder A's fallback upstream request of `limit` bytes.
+        armed.store(true, Ordering::Release);
+
+        let (ra_tx, ra_rx) = mpsc::channel();
+        let na = nested.clone();
+        let oa = owner.clone();
+        let ta = std::thread::spawn(move || {
+            let _ = ra_tx.send(na.reserve_decode_to(&oa, 1 << 20, limit));
+        });
+
+        recv_bounded(
+            &a_in_parent_rx,
+            "decoder A did not reach parent refusal callback",
+        );
+
+        // Drop the prefetch pin and let decoder B promote the 4 KiB into `decode_total`
+        // without touching the parent or advancing reclaim/return epochs.
+        nested.end_prefetch();
+        nested
+            .reserve_decode_to(&owner, 1 << 20, limit)
+            .expect("decoder B must promote idle prefetch into decode_total");
+        assert_eq!(nested.prefetch_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(nested.state.lock().decode_total, limit);
+        assert_eq!(nested.reclaim_epoch.load(Ordering::Acquire), 0);
+        assert_eq!(nested.upstream_return_epoch.load(Ordering::Acquire), 0);
+
+        // Release decoder A's failing parent call; revalidation must see `decode_total == limit`
+        // and retry to observe the already-funded target.
+        a_resume_tx.send(()).unwrap();
+        let ra = recv_bounded(
+            &ra_rx,
+            "decoder A did not finish after refusal revalidation",
+        );
+        ta.join().unwrap();
+        ra.expect("decoder A must succeed after decoder B promoted its absolute decode target");
+        assert_eq!(nested.live.load(Ordering::Acquire), limit);
+        assert_eq!(used.load(Ordering::Acquire), limit);
+        assert_eq!(nested.reclaim_epoch.load(Ordering::Acquire), 0);
+        assert_eq!(nested.upstream_return_epoch.load(Ordering::Acquire), 0);
+
+        // A genuinely unsatisfiable higher target must still fail cleanly without looping.
+        armed.store(false, Ordering::Release);
+        assert!(matches!(
+            nested.reserve_decode_to(&owner, 1 << 20, limit * 2),
+            Err(Error::BudgetExceeded(b))
+                if b.kind == BudgetKind::ServerMemory && b.limit == limit
+        ));
+
+        nested.release_decode();
+        drop(owner);
+        drop(nested);
+        assert_eq!(used.load(Ordering::Acquire), 0);
     }
 }
 
