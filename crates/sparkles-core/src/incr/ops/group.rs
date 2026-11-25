@@ -129,6 +129,10 @@ struct SumState {
 }
 
 impl SumState {
+    fn bytes(&self) -> u64 {
+        96 + (self.floats.len() + self.doubles.len()) as u64 * 24 + self.decs.len() as u64 * 40
+    }
+
     /// Add `w` copies of a value (`None`: an error or unbound).
     fn add(&mut self, v: Option<&Value>, w: i64) {
         self.rows += w;
@@ -798,11 +802,10 @@ impl Group {
                         .map(|a| match a {
                             AState::Count(_) => 8,
                             AState::Rows(m) => m.len() as u64 * row_bytes(self.inner.schema.len()),
-                            AState::Values { vals, .. } => vals.len() as u64 * 24 + 96,
-                            AState::Sum(s) => {
-                                96 + (s.floats.len() + s.doubles.len()) as u64 * 24
-                                    + s.decs.len() as u64 * 40
+                            AState::Values { vals, sum, .. } => {
+                                48 + vals.len() as u64 * 24 + sum.bytes()
                             }
+                            AState::Sum(s) => s.bytes(),
                             AState::Multi(m) => 40 + m.vals.len() as u64 * 16,
                         })
                         .sum::<u64>()
@@ -956,7 +959,7 @@ impl Group {
                         }
                     }
                     AState::Values { vals, errs, sum: s } => {
-                        r.charge_state(96)?;
+                        r.charge_state(48)?;
                         for _ in 0..r.u64()? {
                             let v = r.id()?;
                             r.charge_state(24)?;

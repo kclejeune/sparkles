@@ -313,7 +313,7 @@ impl Runtime {
                     c
                 }
                 Err(e) => {
-                    self.fail(cell, &mut st, &e);
+                    self.fail(cell, &mut st, &e, deferred);
                     deferred.retired.extend(st.circuit.drain_retired());
                     continue;
                 }

@@ -275,38 +275,55 @@ impl Window {
 
     /// The window as segments of the kept rows.
     fn segments(&self) -> Vec<Segment> {
-        let big = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
-        let (start, end) = (
-            big(self.offset),
-            big(self.offset).saturating_add(big(self.limit)),
-        );
-        let mut out = Vec::new();
-        let mut at: i64 = 0;
-        for e in &self.kept {
-            if at >= end {
-                break;
-            }
-            let next = at + e.w;
-            let (a, b) = (at.max(start), next.min(end));
-            if a < b {
-                out.push(Segment {
-                    serial: e.serial,
-                    lo: a - at,
-                    hi: b - at,
-                    pos: (a - start) as u64,
-                    row: e.row.clone(),
-                });
-            }
-            at = next;
-        }
-        out
+        self.segment_slices()
+            .map(|(e, lo, hi, pos)| Segment {
+                serial: e.serial,
+                lo,
+                hi,
+                pos,
+                row: e.row.clone(),
+            })
+            .collect()
     }
 
-    /// The rows of the window in order, each with its copies.
+    fn segment_slices(&self) -> impl Iterator<Item = (&Entry, i64, i64, u64)> {
+        let big = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        let start = big(self.offset);
+        let end = start.saturating_add(big(self.limit));
+        self.kept
+            .iter()
+            .scan(0i64, move |at, e| {
+                if *at >= end {
+                    return None;
+                }
+                let lo = (*at).max(start);
+                let hi = (*at + e.w).min(end);
+                let slice = (lo < hi).then(|| (e, lo - *at, hi - *at, (lo - start) as u64));
+                *at += e.w;
+                Some(slice)
+            })
+            .flatten()
+    }
+
     /// The slots of the kept rows' vector, for tests of its memory.
     #[cfg(test)]
     pub fn slots(&self) -> usize {
         self.kept.capacity()
+    }
+
+    /// Visit the rows of the window in order with their multiplicity (`(&Row, i64)`)
+    /// without allocating an intermediate `Vec<Segment>`.
+    pub(crate) fn for_each_row<E>(
+        &self,
+        mut f: impl FnMut(&Row, i64) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.segment_slices()
+            .try_for_each(|(e, lo, hi, _)| f(&e.row, hi - lo))
+    }
+
+    /// The number of runs in the current window.
+    pub(crate) fn row_count(&self) -> usize {
+        self.segment_slices().count()
     }
 
     pub fn rows(&self) -> Vec<(Row, i64)> {
@@ -357,7 +374,12 @@ impl Window {
     }
 
     /// The change of the window from `old` to the current rows, and its moves.
-    fn diff(&mut self, p: &mut Pass, old: Vec<Segment>) -> Result<Changes> {
+    fn diff(
+        &mut self,
+        p: &mut Pass,
+        old_lease: super::super::budget::ScratchLease,
+        old: Vec<Segment>,
+    ) -> Result<Changes> {
         let width = self.inner.schema.len();
         let mut diff_lease = p.scratch_lease();
         let new_est = (self.kept.len().min(self.limit) as u64)
@@ -382,7 +404,7 @@ impl Window {
         };
         let (oi, ni) = (idx(&old), idx(&new));
         let (removed, rem_bytes) = Self::leaving(&old, &ni, width, base_bytes, &mut diff_lease)?;
-        let (added, _add_bytes) = Self::leaving(
+        let (added, add_bytes) = Self::leaving(
             &new,
             &oi,
             width,
@@ -393,6 +415,13 @@ impl Window {
         drop(ni);
         drop(new);
         drop(old);
+        drop(old_lease);
+        // Release scratch for the dropped index maps and `new` segments while keeping
+        // `removed` and `added` covered.
+        let moves_scratch = rem_bytes.saturating_add(add_bytes);
+        if diff_lease.bytes() > moves_scratch {
+            diff_lease.release(diff_lease.bytes() - moves_scratch);
+        }
         let mut out_lease = p.scratch_lease();
         let mut out = Changes::new();
         for (_, r, n) in &removed {
@@ -406,11 +435,22 @@ impl Window {
         if self.positions {
             let moves = Moves { removed, added };
             let moves_bytes = moves.bytes(width);
-            p.reserve_pass(moves_bytes)?;
+            let moved = p.move_scratch_to_pass(&mut diff_lease, moves_bytes);
+            if moves_bytes > moved {
+                p.reserve_pass(moves_bytes - moved)?;
+            }
             self.moves = Some(moves);
+        } else {
+            drop(removed);
+            drop(added);
         }
         drop(diff_lease);
-        let out = consolidate(out);
+        let out = super::super::circuit::consolidate_budgeted(
+            out,
+            width,
+            p.budget_handle(),
+            &mut out_lease,
+        )?;
         p.push_output_lease(out_lease);
         Ok(out)
     }
@@ -703,10 +743,11 @@ impl Window {
         let width = self.inner.schema.len();
         let mut out_lease = p.scratch_lease();
         let mut out = Changes::new();
-        for s in self.segments() {
+        self.for_each_row(|row, w| -> Result<()> {
             p.preadmit_changes_push(&out, width, &mut out_lease)?;
-            out.push((s.row, s.hi - s.lo));
-        }
+            out.push((row.clone(), w));
+            Ok(())
+        })?;
         p.push_output_lease(out_lease);
         Ok(out)
     }
@@ -746,9 +787,7 @@ impl Window {
             let r_leases = p.take_output_leases_since(rmark);
             self.fill(p, rows, false)?;
             drop(r_leases);
-            let diff = self.diff(p, old)?;
-            drop(old_lease);
-            return Ok(diff);
+            return self.diff(p, old_lease, old);
         }
         // Pre-admit the split remove/add vectors before partitioning `keyed`.
         let split_slot = std::mem::size_of::<(Row, i64, Vec<SortKey>)>() as u64;
@@ -817,9 +856,7 @@ impl Window {
             self.fill(p, rows, true)?;
             drop(r_leases);
         }
-        let diff = self.diff(p, old)?;
-        drop(old_lease);
-        Ok(diff)
+        self.diff(p, old_lease, old)
     }
 
     /// [`init`](Self::init) with annotations. The window's rows carry unknown

@@ -10,7 +10,7 @@ use super::pass::{Pass, PassStats, Vis};
 use super::persist::{Reader, Writer};
 use super::prov::{self, AChanges, AnnMap, Annotation, FactCache, FactKey, Provenance};
 use super::terms::Terms;
-use super::zset::{Changes, Row, ZSet, consolidate};
+use super::zset::{Changes, Row, ZSet};
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -320,39 +320,156 @@ pub struct Circuit {
     budget: ViewBudget,
 }
 
+type LiveDiffRows = (
+    Arc<[super::live::LiveRow]>,
+    Arc<[super::live::LiveRow]>,
+    super::budget::ScratchLease,
+);
+
+pub(crate) fn reserve_vec_slot<T>(
+    rows: &Vec<T>,
+    lease: &mut super::budget::ScratchLease,
+) -> Result<()> {
+    let slot = std::mem::size_of::<T>();
+    let cap = sparkles_budget::sizes::vec_grown(rows.capacity(), rows.len(), 1, slot);
+    lease.try_reserve((cap.saturating_sub(rows.capacity()) * slot) as u64)
+}
+
+pub(crate) fn into_arc_rows<T>(
+    rows: Vec<T>,
+    lease: &mut super::budget::ScratchLease,
+) -> Result<Arc<[T]>> {
+    let slot = std::mem::size_of::<T>() as u64;
+    let old_bytes = rows.capacity() as u64 * slot;
+    lease.try_reserve(rows.len() as u64 * slot)?;
+    let rows = rows.into();
+    lease.release(old_bytes);
+    Ok(rows)
+}
+
 /// Approximate heap bytes of one decoded term row.
 pub(crate) fn decoded_row_bytes(row: &[Option<Term>]) -> u64 {
     fn term_bytes(t: &Term) -> u64 {
         match t {
-            Term::NamedNode(n) => 32 + n.as_str().len() as u64,
-            Term::BlankNode(b) => 32 + b.as_str().len() as u64,
+            Term::NamedNode(n) => n.as_str().len() as u64,
+            Term::BlankNode(b) => b.as_str().len() as u64,
             Term::Literal(l) => {
-                48 + l.value().len() as u64
-                    + l.language().map_or(0, |s| s.len() as u64)
-                    + l.datatype().as_str().len() as u64
+                let lang_or_datatype = match l.language() {
+                    Some(lang) => lang.len(),
+                    None if l.datatype() == oxrdf::vocab::xsd::STRING => 0,
+                    None => l.datatype().as_str().len(),
+                };
+                (l.value().len() + lang_or_datatype) as u64
             }
             Term::Triple(tr) => {
-                64 + term_bytes(&Term::from(tr.subject.clone()))
-                    + term_bytes(&Term::NamedNode(tr.predicate.clone()))
+                let subject = match &tr.subject {
+                    oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+                    oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+                };
+                (std::mem::size_of::<oxrdf::Triple>() + subject + tr.predicate.as_str().len())
+                    as u64
                     + term_bytes(&tr.object)
             }
         }
     }
-    let mut total = 32u64;
-    for cell in row {
-        total = total.saturating_add(match cell {
-            Some(t) => term_bytes(t),
-            None => 8,
-        });
-    }
-    total
+    let slots = std::mem::size_of_val(row) as u64;
+    slots.saturating_add(row.iter().flatten().map(term_bytes).sum())
 }
 
-/// Annotated changes split into the weights' changes, consolidated, and the changes
-/// themselves.
-fn split(c: AChanges) -> (Changes, AChanges) {
-    let w = consolidate(c.iter().map(|(r, w, _)| (r.clone(), *w)).collect());
-    (w, c)
+/// Consolidate `c` while pre-admitting the intermediate `ZSet` and compacted output
+/// buffer, and reconcile `out_lease` to the returned `Changes` vector's exact size.
+pub(crate) fn consolidate_budgeted(
+    c: Changes,
+    width: usize,
+    budget: Option<super::budget::BudgetHandle>,
+    out_lease: &mut super::budget::ScratchLease,
+) -> Result<Changes> {
+    let slot = std::mem::size_of::<(Row, i64)>() as u64;
+    let row = (width as u64) * 8;
+    let mut c = c;
+    if c.len() <= 1 {
+        c.retain(|(_, w)| *w != 0);
+        if c.is_empty() {
+            drop(c);
+            out_lease.release(out_lease.bytes());
+            return Ok(Changes::new());
+        }
+        out_lease.try_set(c.capacity() as u64 * slot + row)?;
+        return Ok(c);
+    }
+
+    out_lease.try_set(c.capacity() as u64 * slot + c.len() as u64 * row)?;
+    let mut map_lease = super::budget::ScratchLease::new(budget);
+    let mut z = ZSet::new();
+    let mut map_slots = 0u64;
+    for (r, w) in c {
+        if w != 0 && z.get(&r) == 0 {
+            let slots = (z.len() as u64 + 1) * (super::zset::row_bytes(width) - row);
+            if slots > map_slots {
+                map_lease.try_reserve(slots - map_slots)?;
+                map_slots = slots;
+            }
+            out_lease.transfer_to(&mut map_lease, row);
+            z.add(r, w);
+        } else {
+            let (old, new) = z.add(r, w);
+            out_lease.release(row);
+            if old != 0 && new == 0 {
+                map_lease.release(row);
+            }
+        }
+    }
+    // The source vector is consumed. Only new vector slots need admission; the map
+    // moves its existing row payloads into them.
+    out_lease.release(out_lease.bytes());
+    finish_consolidation(z, row, &mut map_lease, out_lease)
+}
+
+fn finish_consolidation(
+    z: ZSet,
+    row_bytes: u64,
+    map_lease: &mut super::budget::ScratchLease,
+    out_lease: &mut super::budget::ScratchLease,
+) -> Result<Changes> {
+    let n = z.len() as u64;
+    out_lease.try_reserve(n * std::mem::size_of::<(Row, i64)>() as u64)?;
+    map_lease.transfer_to(out_lease, n * row_bytes);
+    let out = z.into_changes();
+    Ok(out)
+}
+
+/// Split annotated changes into consolidated `(Changes, w_lease)` and `(AChanges, a_lease)`
+/// without unbudgeted cloning or consolidation.
+fn split_budgeted(
+    c: AChanges,
+    width: usize,
+    budget: Option<super::budget::BudgetHandle>,
+    a_lease: super::budget::ScratchLease,
+) -> Result<(
+    Changes,
+    super::budget::ScratchLease,
+    AChanges,
+    super::budget::ScratchLease,
+)> {
+    let row_sz = (width as u64) * 8;
+    let r_bytes = super::zset::row_bytes(width);
+    let mut map_lease = super::budget::ScratchLease::new(budget.clone());
+    let mut z = ZSet::new();
+    for (r, w, _) in &c {
+        if *w == 0 {
+            continue;
+        }
+        if z.get(r) == 0 {
+            let need = (z.len() as u64 + 1).saturating_mul(r_bytes);
+            if need > map_lease.bytes() {
+                map_lease.try_set(need)?;
+            }
+        }
+        z.add_borrowed(r, *w);
+    }
+    let mut w_lease = super::budget::ScratchLease::new(budget);
+    let out = finish_consolidation(z, row_sz, &mut map_lease, &mut w_lease)?;
+    Ok((out, w_lease, c, a_lease))
 }
 
 impl Circuit {
@@ -415,6 +532,13 @@ impl Circuit {
 
     pub(crate) fn scratch_lease(&self) -> super::budget::ScratchLease {
         self.budget.scratch_lease()
+    }
+
+    pub(crate) fn detach_scratch_lease(
+        &self,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Option<MemoryLease> {
+        self.budget.detach_scratch_lease(lease)
     }
 
     pub(crate) fn set_reclaim_external(&self, hook: Option<super::budget::ReclaimHook>) {
@@ -719,26 +843,142 @@ impl Circuit {
         (p, &mut self.root)
     }
 
-    /// Run the root's delta, with annotations when the circuit keeps them.
-    fn run_delta(root: &mut Node, p: &mut Pass) -> Result<(Changes, Option<AChanges>)> {
+    /// Run the root's delta, with annotations when the circuit keeps them, pre-admitting
+    /// consolidation and returning leases reconciled to the returned buffers.
+    #[allow(clippy::type_complexity)]
+    fn run_delta(
+        root: &mut Node,
+        p: &mut Pass,
+    ) -> Result<(
+        Changes,
+        super::budget::ScratchLease,
+        Option<(AChanges, super::budget::ScratchLease)>,
+    )> {
+        let width = root.schema.len();
+        let budget = p.budget_handle();
         if p.prov.is_none() {
-            return Ok((consolidate(root.delta(p)?), None));
+            let raw = root.delta(p)?;
+            let mut out_lease = p.take_output_lease();
+            let out = consolidate_budgeted(raw, width, budget, &mut out_lease)?;
+            return Ok((out, out_lease, None));
         }
-        let (w, a) = split(root.delta_a(p)?);
-        Ok((w, Some(a)))
+        let raw = root.delta_a(p)?;
+        let raw_lease = p.take_output_lease();
+        let (w, w_lease, a, a_lease) = split_budgeted(raw, width, budget, raw_lease)?;
+        Ok((w, w_lease, Some((a, a_lease))))
     }
 
-    /// Add the annotations' changes to the result's.
-    fn absorb(&mut self, a: Option<AChanges>) {
+    /// Apply `out` into `self.result` while pre-admitting persistent Z-set growth via
+    /// per-owner `pass_bytes` before cloning new rows.
+    fn apply_result_budgeted(&mut self, out: &Changes) -> Result<()> {
+        if !self.keep_result {
+            return Ok(());
+        }
+        let width = self.root.schema.len();
+        let r_bytes = super::zset::row_bytes(width);
+        let base = self.result.bytes(width);
+        let mut pass_reserved = 0u64;
+        let handle = self.budget.handle();
+        for (r, w) in out {
+            if *w == 0 {
+                continue;
+            }
+            if self.result.get(r) == 0 {
+                let target = (self.result.len() as u64 + 1).saturating_mul(r_bytes);
+                let needed = target.saturating_sub(base);
+                if needed > pass_reserved {
+                    handle.try_reserve_pass(needed - pass_reserved)?;
+                    pass_reserved = needed;
+                }
+            }
+            self.result.add_borrowed(r, *w);
+            let needed = self.result.bytes(width).saturating_sub(base);
+            if needed < pass_reserved {
+                handle.release_pass(pass_reserved - needed);
+                pass_reserved = needed;
+            }
+        }
+        Ok(())
+    }
+
+    /// Move build output rows into `self.result`, transferring moved row payload credit
+    /// from `out_lease` into `pass_bytes` and pre-admitting hash-table slot growth.
+    fn install_build_result_budgeted(
+        &mut self,
+        out: Changes,
+        out_lease: &mut super::budget::ScratchLease,
+    ) -> Result<()> {
+        if !self.keep_result {
+            drop(out);
+            return Ok(());
+        }
+        let width = self.root.schema.len();
+        let r_bytes = super::zset::row_bytes(width);
+        let row_payload = (width as u64) * 8;
+        let handle = self.budget.handle();
+        let mut pass_reserved = 0u64;
+        let mut z = ZSet::new();
+        for (r, w) in out {
+            if w == 0 {
+                continue;
+            }
+            if z.get(&r) == 0 {
+                let needed = (z.len() as u64 + 1).saturating_mul(r_bytes);
+                if needed > pass_reserved {
+                    let delta = needed - pass_reserved;
+                    let moved = handle.move_scratch_to_pass(out_lease, delta.min(row_payload));
+                    let rem = delta - moved;
+                    if rem > 0 {
+                        handle.try_reserve_pass(rem)?;
+                    }
+                    pass_reserved = needed;
+                }
+            }
+            z.add(r, w);
+            let cur = z.bytes(width);
+            if cur < pass_reserved {
+                handle.release_pass(pass_reserved - cur);
+                pass_reserved = cur;
+            }
+        }
+        self.result = z;
+        Ok(())
+    }
+
+    /// Add the annotations' changes to the result's, pre-admitting retained annotation
+    /// map growth before mutating `self.ann`.
+    fn absorb_budgeted(&mut self, a: Option<AChanges>) -> Result<()> {
         let Some(a) = a else {
-            return;
+            return Ok(());
         };
         if !self.keep_result {
-            return;
+            return Ok(());
         }
+        let width = self.root.schema.len();
+        let r_bytes = super::zset::row_bytes(width);
+        let base = prov::map_bytes(&self.ann, width);
+        let mut pass_reserved = 0u64;
+        let handle = self.budget.handle();
         for (r, _, d) in a {
+            let extra = d.bytes().saturating_add(if self.ann.contains_key(&r) {
+                0
+            } else {
+                r_bytes
+            });
+            let target = prov::map_bytes(&self.ann, width).saturating_add(extra);
+            let needed = target.saturating_sub(base);
+            if needed > pass_reserved {
+                handle.try_reserve_pass(needed - pass_reserved)?;
+                pass_reserved = needed;
+            }
             prov::absorb_row(&mut self.ann, &r, d, self.prov);
+            let needed = prov::map_bytes(&self.ann, width).saturating_sub(base);
+            if needed < pass_reserved {
+                handle.release_pass(pass_reserved - needed);
+                pass_reserved = needed;
+            }
         }
+        Ok(())
     }
 
     /// Evaluate the circuit from scratch at `snap`.
@@ -754,23 +994,27 @@ impl Circuit {
         self.budget.shrink_state_to(0);
         let vis = Vis::new(self.access.as_ref(), &snap);
         let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
+        let width = root.schema.len();
+        let budget = p.budget_handle();
         let res = if p.prov.is_none() {
-            root.init(&mut p).map(|out| (out, None))
+            root.init(&mut p).map(|out| {
+                let out_lease = p.take_output_lease();
+                (out, out_lease, None)
+            })
         } else {
-            root.init_a(&mut p).map(|a| {
-                let (w, a) = split(a);
-                (w, Some(a))
+            root.init_a(&mut p).and_then(|a| {
+                let raw_lease = p.take_output_lease();
+                let (w, w_lease, a, a_lease) = split_budgeted(a, width, budget, raw_lease)?;
+                Ok((w, w_lease, Some((a, a_lease))))
             })
         };
         let stats = p.stats;
-        let mut out_lease = p.take_output_lease();
         #[cfg(test)]
         let (scanned, estimated) = (p.scanned.get(), p.estimated.get());
         drop(p);
-        let (out, ann) = match res {
+        let (out, mut out_lease, ann) = match res {
             Ok(v) => v,
             Err(e) => {
-                drop(out_lease);
                 self.clear_state();
                 return Err(e);
             }
@@ -780,13 +1024,22 @@ impl Circuit {
             self.build_scanned = scanned;
             self.build_estimated = estimated;
         }
-        self.result = if self.keep_result {
-            out.into_iter().collect()
-        } else {
-            ZSet::new()
-        };
+        if let Err(e) = self.install_build_result_budgeted(out, &mut out_lease) {
+            drop(ann);
+            self.clear_state();
+            drop(out_lease);
+            return Err(e);
+        }
         self.ann.clear();
-        self.absorb(ann);
+        if let Some((a, a_lease)) = ann {
+            let res = self.absorb_budgeted(Some(a));
+            drop(a_lease);
+            if let Err(e) = res {
+                self.clear_state();
+                drop(out_lease);
+                return Err(e);
+            }
+        }
         if let Err(e) = self
             .budget
             .commit_pass_with_scratch(self.bytes(), &mut out_lease)
@@ -969,7 +1222,7 @@ impl Circuit {
         let mut out = Changes::new();
         let row_sz = (width as u64) * 8;
         let slot_sz = std::mem::size_of::<(Row, i64)>() as u64;
-        let mut push = |out: &mut Changes, row: Row, w: i64| -> Result<()> {
+        let mut push = |out: &mut Changes, row: &Row, w: i64| -> Result<()> {
             let next_cap = sparkles_budget::sizes::vec_grown(
                 out.capacity(),
                 out.len(),
@@ -982,18 +1235,18 @@ impl Circuit {
             if need > lease.bytes() {
                 lease.try_set(need)?;
             }
-            out.push((row, w));
+            out.push((row.clone(), w));
             Ok(())
         };
         for (r, w) in now.iter() {
             let d = w - before.get(r);
             if d != 0 {
-                push(&mut out, r.clone(), d)?;
+                push(&mut out, r, d)?;
             }
         }
         for (r, w) in before.iter() {
             if now.get(r) == 0 {
-                push(&mut out, r.clone(), -w)?;
+                push(&mut out, r, -w)?;
             }
         }
         Ok(out)
@@ -1012,6 +1265,56 @@ impl Circuit {
                 Ok(Advance::Reset(out))
             }
         }
+    }
+
+    /// Apply the output of a delta pass to persistent result and annotation state while
+    /// pre-admitting growth and keeping `out_lease` attached to the returned `Changes`.
+    #[allow(clippy::type_complexity)]
+    fn finish_delta_pass(
+        &mut self,
+        res: Result<(
+            Changes,
+            super::budget::ScratchLease,
+            Option<(AChanges, super::budget::ScratchLease)>,
+        )>,
+        snap: Arc<Snapshot>,
+        stats: PassStats,
+    ) -> Result<ChargedAdvance> {
+        let (out, out_lease, ann) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                self.budget.abort_pass(self.bytes());
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.apply_result_budgeted(&out) {
+            drop(ann);
+            drop(out);
+            drop(out_lease);
+            self.budget.abort_pass(self.bytes());
+            return Err(e);
+        }
+        if let Some((a, a_lease)) = ann {
+            let res = self.absorb_budgeted(Some(a));
+            drop(a_lease);
+            if let Err(e) = res {
+                drop(out);
+                drop(out_lease);
+                self.budget.abort_pass(self.bytes());
+                return Err(e);
+            }
+        }
+        // Keep `out_lease` intact while `out` is returned to the caller.
+        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+            drop(out);
+            drop(out_lease);
+            self.budget.abort_pass(self.bytes());
+            return Err(e);
+        }
+        self.applied = snap.commit;
+        self.snap = Some(snap);
+        self.last = stats;
+        Ok(ChargedAdvance::Changed(out, out_lease))
     }
 
     /// Like [`advance`](Self::advance), keeping the returned [`Changes`] vector covered
@@ -1068,31 +1371,8 @@ impl Circuit {
             p.full = true;
             let res = Self::run_delta(root, &mut p);
             let stats = p.stats;
-            let out_lease = p.take_output_lease();
             drop(p);
-            let (out, ann) = match res {
-                Ok(v) => v,
-                Err(e) => {
-                    drop(out_lease);
-                    self.budget.abort_pass(self.bytes());
-                    return Err(e);
-                }
-            };
-            if self.keep_result {
-                self.result.apply(&out);
-            }
-            self.absorb(ann);
-            // Keep `out_lease` intact while `out` is returned to the caller.
-            if let Err(e) = self.budget.commit_pass(self.bytes()) {
-                drop(out);
-                drop(out_lease);
-                self.budget.abort_pass(self.bytes());
-                return Err(e);
-            }
-            self.applied = snap.commit;
-            self.snap = Some(snap);
-            self.last = stats;
-            return Ok(ChargedAdvance::Changed(out, out_lease));
+            return self.finish_delta_pass(res, snap, stats);
         }
         let (added, removed): (Vec<[Id; 4]>, Vec<[Id; 4]>) = if vis.everything() {
             (d.added.clone(), d.removed.clone())
@@ -1127,31 +1407,8 @@ impl Circuit {
         let (mut p, root) = self.pass(snap.clone(), Some(old), &added, &removed, &vis, control);
         let res = Self::run_delta(root, &mut p);
         let stats = p.stats;
-        let out_lease = p.take_output_lease();
         drop(p);
-        let (out, ann) = match res {
-            Ok(v) => v,
-            Err(e) => {
-                drop(out_lease);
-                self.budget.abort_pass(self.bytes());
-                return Err(e);
-            }
-        };
-        if self.keep_result {
-            self.result.apply(&out);
-        }
-        self.absorb(ann);
-        // Keep `out_lease` intact while `out` is returned to the caller.
-        if let Err(e) = self.budget.commit_pass(self.bytes()) {
-            drop(out);
-            drop(out_lease);
-            self.budget.abort_pass(self.bytes());
-            return Err(e);
-        }
-        self.applied = snap.commit;
-        self.snap = Some(snap);
-        self.last = stats;
-        Ok(ChargedAdvance::Changed(out, out_lease))
+        self.finish_delta_pass(res, snap, stats)
     }
 
     /// Decode `rows` into terms while charging the decoded copy against this circuit's
@@ -1161,44 +1418,164 @@ impl Circuit {
     pub(crate) fn rows_budgeted(
         &self,
     ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, Option<MemoryLease>)> {
+        let (rows, mut lease) = self.rows_charged()?;
+        Ok((rows, self.budget.detach_scratch_lease(&mut lease)))
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn rows_charged(
+        &self,
+    ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, super::budget::ScratchLease)> {
         let mut lease = self.budget.scratch_lease();
         let Some(snap) = &self.snap else {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), lease));
         };
-        let slot_sz = std::mem::size_of::<(Vec<Option<Term>>, i64)>() as u64;
-        let mut out: Vec<(Vec<Option<Term>>, i64)> = Vec::new();
-        let mut payload_bytes = 0u64;
-        let mut push_decoded = |decoded: Vec<Option<Term>>, w: i64| -> Result<()> {
-            let next_cap =
-                sparkles_budget::sizes::vec_grown(out.capacity(), out.len(), 1, slot_sz as usize);
-            payload_bytes = payload_bytes.saturating_add(decoded_row_bytes(&decoded));
-            let need = (next_cap as u64)
-                .saturating_mul(slot_sz)
-                .saturating_add(payload_bytes);
-            if need > lease.bytes() {
-                lease.try_set(need)?;
-            }
+        let mut out = Vec::new();
+        let mut push_decoded = |cols, row: &Row, w: i64| -> Result<()> {
+            reserve_vec_slot(&out, &mut lease)?;
+            let decoded = self.decode_row_budgeted(snap, cols, row, &mut lease)?;
             out.push((decoded, w));
             Ok(())
         };
         if let Some((w, cols)) = self.root.result_window()
             && w.positions
         {
-            for (r, n) in w.rows() {
-                let row = Self::window_row(cols, &r);
-                let decoded: Vec<Option<Term>> =
-                    row.iter().map(|&i| self.terms.term(snap, i)).collect();
-                push_decoded(decoded, n)?;
-            }
+            w.for_each_row(|row, n| push_decoded(cols, row, n))?;
         } else {
-            for (r, w) in self.result.iter() {
-                let decoded: Vec<Option<Term>> =
-                    r.iter().map(|&i| self.terms.term(snap, i)).collect();
-                push_decoded(decoded, w)?;
+            for (row, w) in self.result.iter() {
+                push_decoded(None, row, w)?;
             }
         }
-        let detached = self.budget.detach_scratch_lease(&mut lease);
-        Ok((out, detached))
+        Ok((out, lease))
+    }
+
+    /// Decode one row after admitting each term's owned representation.
+    pub(crate) fn decode_row_budgeted(
+        &self,
+        snap: &Snapshot,
+        cols: Option<&[Option<usize>]>,
+        row: &Row,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<Vec<Option<Term>>> {
+        let width = cols.map_or(row.len(), <[_]>::len);
+        lease.try_reserve((width * std::mem::size_of::<Option<Term>>()) as u64)?;
+        let mut out = Vec::with_capacity(width);
+        for col in 0..width {
+            let id = cols
+                .map_or(Some(col), |cols| cols[col])
+                .map_or(Id::UNDEF, |i| row[i]);
+            out.push(self.terms.term_budgeted(snap, id, lease)?);
+        }
+        Ok(out)
+    }
+
+    /// Number of rows in the ordered window, when this circuit is an ordered window.
+    pub(crate) fn ordered_row_count(&self) -> Option<usize> {
+        let (w, _) = self.root.result_window()?;
+        w.positions.then(|| w.row_count())
+    }
+
+    /// Total number of removed + added move runs from the latest ordered-window pass.
+    pub(crate) fn moves_row_count(&self) -> Option<usize> {
+        let (w, _) = self.root.result_window()?;
+        let m = w.moves.as_ref()?;
+        Some(m.removed.len().saturating_add(m.added.len()))
+    }
+
+    /// Decode the circuit's current result into [`super::live::LiveRow`]s incrementally
+    /// under a [`super::budget::ScratchLease`].
+    pub(crate) fn live_rows_budgeted(
+        &self,
+    ) -> Result<(Arc<[super::live::LiveRow]>, super::budget::ScratchLease)> {
+        let mut lease = self.budget.scratch_lease();
+        let Some(snap) = &self.snap else {
+            return Ok((Arc::from(Vec::new()), lease));
+        };
+        let mut out = Vec::new();
+        let ordered = self.ordered();
+        let mut at = 0u64;
+        let mut push_row = |cols, row: &Row, w: i64| -> Result<()> {
+            let position = ordered.then_some(at);
+            let count = w.unsigned_abs();
+            at += count;
+            self.push_live_row(&mut out, (snap, cols, row), (count, position), &mut lease)
+        };
+        if let Some((w, cols)) = self.root.result_window()
+            && w.positions
+        {
+            w.for_each_row(|row, n| push_row(cols, row, n))?;
+        } else {
+            for (row, w) in self.result.iter() {
+                push_row(None, row, w)?;
+            }
+        }
+        Ok((into_arc_rows(out, &mut lease)?, lease))
+    }
+
+    fn push_live_row(
+        &self,
+        out: &mut Vec<super::live::LiveRow>,
+        (snap, cols, row): (&Snapshot, Option<&[Option<usize>]>, &Row),
+        (count, position): (u64, Option<u64>),
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<()> {
+        reserve_vec_slot(out, lease)?;
+        let terms = self.decode_row_budgeted(snap, cols, row, lease)?;
+        out.push(super::live::LiveRow {
+            terms,
+            count,
+            position,
+        });
+        Ok(())
+    }
+
+    /// Decode the ordered window's latest moves with their positions.
+    pub(crate) fn moves_live_budgeted(&self) -> Result<Option<LiveDiffRows>> {
+        let Some(((window, cols), snap)) = self.root.result_window().zip(self.snap.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(moves) = &window.moves else {
+            return Ok(None);
+        };
+        let mut lease = self.budget.scratch_lease();
+        let (mut removed, mut added) = (Vec::new(), Vec::new());
+        for (out, rows) in [(&mut removed, &moves.removed), (&mut added, &moves.added)] {
+            for (pos, row, count) in rows {
+                self.push_live_row(out, (snap, cols, row), (*count, Some(*pos)), &mut lease)?;
+            }
+        }
+        Self::finish_live_diff(removed, added, lease)
+    }
+
+    /// Decode compact unordered changes into the live event's removed and added rows.
+    pub(crate) fn diff_live_budgeted(&self, c: &Changes) -> Result<Option<LiveDiffRows>> {
+        let Some(snap) = &self.snap else {
+            return Ok(None);
+        };
+        let mut lease = self.budget.scratch_lease();
+        let (mut removed, mut added) = (Vec::new(), Vec::new());
+        for (row, w) in c {
+            let out = match w.cmp(&0) {
+                std::cmp::Ordering::Less => &mut removed,
+                std::cmp::Ordering::Greater => &mut added,
+                std::cmp::Ordering::Equal => continue,
+            };
+            self.push_live_row(out, (snap, None, row), (w.unsigned_abs(), None), &mut lease)?;
+        }
+        Self::finish_live_diff(removed, added, lease)
+    }
+
+    fn finish_live_diff(
+        removed: Vec<super::live::LiveRow>,
+        added: Vec<super::live::LiveRow>,
+        mut lease: super::budget::ScratchLease,
+    ) -> Result<Option<LiveDiffRows>> {
+        if removed.is_empty() && added.is_empty() {
+            return Ok(None);
+        }
+        let removed = into_arc_rows(removed, &mut lease)?;
+        let added = into_arc_rows(added, &mut lease)?;
+        Ok(Some((removed, added, lease)))
     }
 
     /// The terms of rows of the result.
@@ -1273,8 +1650,13 @@ impl Circuit {
     }
 
     fn clear_moves(&mut self) {
-        if let Some(w) = self.root.result_window_mut() {
-            w.moves = None;
+        let had = self
+            .root
+            .result_window_mut()
+            .and_then(|w| w.moves.take())
+            .is_some();
+        if had {
+            self.budget.shrink_state_to(self.bytes());
         }
     }
 }

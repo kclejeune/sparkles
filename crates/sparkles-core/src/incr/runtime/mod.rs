@@ -77,6 +77,7 @@ pub use worker::WorkerPause;
 pub(super) struct DeferredDrops {
     pub(super) circuits: Vec<Circuit>,
     pub(super) cells: Vec<Arc<Cell>>,
+    pub(super) queued: Vec<super::live::QueuedEvent>,
     pub(super) retired: Vec<MemoryLease>,
 }
 

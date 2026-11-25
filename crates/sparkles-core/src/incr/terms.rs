@@ -113,6 +113,63 @@ impl Terms {
         }
     }
 
+    /// Decode an owned term only after admitting storage for its decoded representation.
+    pub(crate) fn term_budgeted(
+        &self,
+        snap: &Snapshot,
+        i: Id,
+        lease: &mut super::budget::ScratchLease,
+    ) -> crate::error::Result<Option<Term>> {
+        fn key_bytes(key: &[u8]) -> u64 {
+            match key.first() {
+                Some(b'(') => {
+                    let mut pos = 1;
+                    let mut bytes = (std::mem::size_of::<oxrdf::Triple>()
+                        + 3 * std::mem::size_of::<Term>())
+                        as u64;
+                    for _ in 0..3 {
+                        let len = crate::vocab::read_varint(key, &mut pos) as usize;
+                        bytes = bytes.saturating_add(key_bytes(&key[pos..pos + len]));
+                        pos += len;
+                    }
+                    bytes
+                }
+                Some(b'_') => 32,
+                // The row's slots are already admitted. Encoded scalar keys cover
+                // the value, language and datatype strings that decoding owns.
+                _ => key.len() as u64,
+            }
+        }
+        if matches!(i.tag(), Tag::Undef | Tag::Special) {
+            return Ok(None);
+        }
+        let mut scratch = lease.sibling();
+        let mut decode = |key: &[u8]| {
+            lease.try_reserve(key_bytes(key))?;
+            Ok::<_, crate::error::Error>(id::key_to_term(key))
+        };
+        match i.tag() {
+            Tag::Local => self
+                .keys
+                .get(i.payload() as usize)
+                .map(|key| decode(key))
+                .transpose(),
+            Tag::Delta => snap
+                .generation
+                .dvocab
+                .with(|v| v.get(i.payload()).map(decode).transpose()),
+            Tag::Vocab => snap
+                .generation
+                .vocab
+                .get_with_checked(i.payload(), |bytes| scratch.try_set(bytes as u64), decode)?
+                .transpose(),
+            _ => {
+                lease.try_reserve(144)?;
+                Ok(snap.term(i))
+            }
+        }
+    }
+
     /// The vocabulary key of an id, which means the same term in every generation.
     pub fn key(&self, snap: &Snapshot, i: Id) -> Option<Vec<u8>> {
         match i.tag() {

@@ -50,35 +50,12 @@ pub(super) struct HistoryBuf {
     pub(super) bytes: u64,
 }
 
-fn term_bytes(t: &Term) -> u64 {
-    match t {
-        Term::NamedNode(n) => 32 + n.as_str().len() as u64,
-        Term::BlankNode(b) => 32 + b.as_str().len() as u64,
-        Term::Literal(l) => {
-            48 + l.value().len() as u64
-                + l.language().map_or(0, |s| s.len() as u64)
-                + l.datatype().as_str().len() as u64
-        }
-        Term::Triple(tr) => {
-            64 + term_bytes(&Term::from(tr.subject.clone()))
-                + term_bytes(&Term::NamedNode(tr.predicate.clone()))
-                + term_bytes(&tr.object)
-        }
-    }
-}
-
 pub(super) fn hist_bytes(rows: &[(Vec<Option<Term>>, i64)]) -> u64 {
-    let mut total = std::mem::size_of::<Hist>() as u64;
-    for (row, _) in rows {
-        total = total.saturating_add(32);
-        for cell in row {
-            total = total.saturating_add(match cell {
-                Some(t) => term_bytes(t),
-                None => 8,
-            });
-        }
-    }
-    total
+    (std::mem::size_of::<Hist>() + std::mem::size_of_val(rows)) as u64
+        + rows
+            .iter()
+            .map(|(row, _)| crate::incr::circuit::decoded_row_bytes(row))
+            .sum::<u64>()
 }
 
 pub(super) struct Sub {
@@ -209,74 +186,146 @@ impl Slot {
         u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
     }
 
-    /// The rows of a snapshot. An ordered window's rows come in order with their
-    /// positions.
-    pub(super) fn live_rows(&self, rows: Vec<(Vec<Option<Term>>, i64)>) -> Vec<LiveRow> {
-        let ordered = self.circuit.ordered();
-        let mut at = 0u64;
-        rows.into_iter()
-            .map(|(terms, w)| {
-                let count = w.unsigned_abs();
-                let position = ordered.then_some(at);
-                at += count;
-                LiveRow {
-                    terms,
-                    count,
-                    position,
-                }
-            })
-            .collect()
-    }
-
-    /// The diff of an ordered window's latest pass, `None` when the pass left the
-    /// window alone.
-    pub(super) fn moves_event(&self, from: u64, to: u64) -> Option<LiveEvent> {
-        let (removed, added) = self.circuit.moves()?;
-        if removed.is_empty() && added.is_empty() {
-            return None;
-        }
-        let rows = |v: Vec<(u64, Vec<Option<Term>>, u64)>| -> Arc<[LiveRow]> {
-            v.into_iter()
-                .map(|(position, terms, count)| LiveRow {
-                    terms,
-                    count,
-                    position: Some(position),
-                })
-                .collect()
+    /// The diff of an ordered window's latest pass, decoded incrementally under a
+    /// `ScratchLease`. Returns `Ok(None)` when the pass left the window alone.
+    pub(super) fn moves_event_budgeted(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<(LiveEvent, crate::incr::budget::ScratchLease)>> {
+        let Some((removed, added, lease)) = self.circuit.moves_live_budgeted()? else {
+            return Ok(None);
         };
-        Some(LiveEvent::Diff {
-            commit: to,
-            from,
-            removed: rows(removed),
-            added: rows(added),
-        })
-    }
-
-    pub(super) fn event(&self, reset: bool) -> LiveEvent {
-        let ask = self.circuit.kind == Kind::Ask;
-        LiveEvent::Snapshot {
-            commit: self.circuit.applied,
-            vars: self.vars.clone(),
-            rows: if ask {
-                Arc::from(Vec::new())
-            } else {
-                self.live_rows(self.circuit.rows()).into()
+        Ok(Some((
+            LiveEvent::Diff {
+                commit: to,
+                from,
+                removed,
+                added,
             },
-            value: ask.then(|| self.circuit.result.total() > 0),
-            reset,
-        }
+            lease,
+        )))
     }
 
-    /// The whole result as a `reset` event for the subscriber of `shared`, whose next
-    /// diff then starts from the circuit's commit.
-    pub(crate) fn resync(&mut self, shared: &Arc<Shared>) -> LiveEvent {
-        let applied = self.circuit.applied;
-        for s in &mut self.subs {
-            if std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)) {
-                s.last = applied;
+    /// Build a snapshot event incrementally under a `ScratchLease`, covering its decoded
+    /// rows before returning.
+    pub(super) fn event_budgeted(
+        &self,
+        reset: bool,
+    ) -> Result<(LiveEvent, crate::incr::budget::ScratchLease)> {
+        let ask = self.circuit.kind == Kind::Ask;
+        if ask {
+            return Ok((
+                LiveEvent::Snapshot {
+                    commit: self.circuit.applied,
+                    vars: self.vars.clone(),
+                    rows: Arc::from(Vec::new()),
+                    value: Some(self.circuit.result.total() > 0),
+                    reset,
+                },
+                self.circuit.scratch_lease(),
+            ));
+        }
+        let (rows, lease) = self.circuit.live_rows_budgeted()?;
+        Ok((
+            LiveEvent::Snapshot {
+                commit: self.circuit.applied,
+                vars: self.vars.clone(),
+                rows,
+                value: None,
+                reset,
+            },
+            lease,
+        ))
+    }
+
+    /// Build an unordered diff event from compact `c` incrementally under a `ScratchLease`.
+    pub(super) fn diff_event_budgeted(
+        &self,
+        from: u64,
+        to: u64,
+        c: &Changes,
+    ) -> Result<Option<(LiveEvent, crate::incr::budget::ScratchLease)>> {
+        let Some((removed, added, lease)) = self.circuit.diff_live_budgeted(c)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            LiveEvent::Diff {
+                commit: to,
+                from,
+                removed,
+                added,
+            },
+            lease,
+        )))
+    }
+
+    /// End all active live subscribers on this slot with an error event and lower
+    /// `local_limit` accordingly without failing co-located named views.
+    pub(super) fn fail_live_subs(&mut self, e: &Error, deferred: &mut DeferredDrops) {
+        let (code, message) = super::round::failure(e);
+        for s in self.subs.drain(..) {
+            if let Some(sh) = s.shared.upgrade() {
+                deferred.queued.extend(sh.push_leased(
+                    LiveEvent::Error {
+                        code: code.clone(),
+                        message: message.clone(),
+                    },
+                    None,
+                ));
             }
         }
-        self.event(true)
+        self.recompute_local_limit();
+    }
+
+    pub(super) fn detach_event_lease(
+        &self,
+        lease: &mut crate::incr::budget::ScratchLease,
+    ) -> Option<Arc<crate::incr::live::QueuedLease>> {
+        crate::incr::live::QueuedLease::new(lease.bytes(), self.circuit.detach_scratch_lease(lease))
+    }
+
+    /// The whole result as a `reset` event for the subscriber of `shared`, built under
+    /// budget admission. Returns the event and retired credit to release after unlocking.
+    pub(crate) fn resync_budgeted(
+        &mut self,
+        shared: &Arc<Shared>,
+    ) -> (crate::incr::live::QueuedEvent, Vec<MemoryLease>) {
+        let applied = self.circuit.applied;
+        let event = self.event_budgeted(true).and_then(|(event, lease)| {
+            if lease.bytes() <= shared.byte_limit() {
+                Ok((event, lease))
+            } else {
+                Err(Error::BudgetExceeded(crate::error::Budget {
+                    kind: crate::error::BudgetKind::Memory,
+                    limit: shared.byte_limit(),
+                    requested: lease.bytes(),
+                }))
+            }
+        });
+        match event {
+            Ok((ev, mut lease)) => {
+                for s in &mut self.subs {
+                    if std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)) {
+                        s.last = applied;
+                    }
+                }
+                let detached = self.detach_event_lease(&mut lease);
+                let retired = self.circuit.drain_retired();
+                (crate::incr::live::QueuedEvent::new(ev, detached), retired)
+            }
+            Err(e) => {
+                self.subs
+                    .retain(|s| !std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)));
+                self.recompute_local_limit();
+                let retired = self.circuit.drain_retired();
+                let (code, message) = super::round::failure(&e);
+                (
+                    crate::incr::live::QueuedEvent::new(LiveEvent::Error { code, message }, None),
+                    retired,
+                )
+            }
+        }
     }
 
     /// Evaluate the query at `snap` from scratch. This is the first build, or a rebuild
@@ -410,6 +459,43 @@ impl Slot {
                 return;
             }
         }
+    }
+
+    /// Admit the history copies and netting buffers before materializing a resumed diff.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn history_since_budgeted(
+        &self,
+        after: u64,
+    ) -> Option<(
+        Vec<(Vec<Option<Term>>, i64)>,
+        crate::incr::budget::ScratchLease,
+    )> {
+        let mut lease = self.circuit.scratch_lease();
+        let (bytes, rows) = {
+            let history = self.history.lock();
+            let start = history.entries.iter().position(|entry| {
+                entry.from == after
+                    || (entry.rows.is_empty() && entry.from <= after && after < entry.to)
+            })?;
+            history
+                .entries
+                .iter()
+                .skip(start)
+                .fold((0u64, 0usize), |(bytes, rows), h| {
+                    (
+                        bytes.saturating_add(h.bytes),
+                        rows.saturating_add(h.rows.len()),
+                    )
+                })
+        };
+        // Netting keeps a map of row keys, a copy of each distinct row in its input
+        // order, and an output vector. Admission may evict history, so history_since
+        // checks continuity again after the reservation.
+        lease
+            .try_reserve(bytes.saturating_mul(2).saturating_add(rows as u64 * 96))
+            .ok()?;
+        let change = self.history_since(after)?;
+        Some((change, lease))
     }
 
     /// The net change from commit `after` to the circuit's commit from the history.

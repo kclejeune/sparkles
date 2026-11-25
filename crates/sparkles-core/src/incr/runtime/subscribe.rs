@@ -42,12 +42,12 @@ impl Runtime {
         let (cell, _) = cell?;
         let joining = Joining(&cell);
         self.ensure_subscription(store);
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared::new(budget));
         // Declared outside `cell.state.lock()` so any temporary circuit built by `resume`
         // and any retired leases drop strictly after the state lock releases (even on
         // panic unwind), with circuits freeing payloads strictly before retired leases.
         let mut deferred_state = DeferredDrops::default();
-        let subscribe_res: Result<()> = (|| {
+        let subscribe_res: Result<()> = {
             struct LimitGuard<'a>(parking_lot::MutexGuard<'a, Slot>);
             impl Drop for LimitGuard<'_> {
                 fn drop(&mut self) {
@@ -56,49 +56,54 @@ impl Runtime {
             }
             let mut guard = LimitGuard(cell.state.lock());
             let st = &mut *guard.0;
-            let status = cell.info.lock().status.clone();
-            if status != Status::Ready {
-                // Provisionally allow the joining subscriber's budget during the build;
-                // `LimitGuard` restores the exact active-consumer ceiling on exit/unwind.
+            // Provisionally allow the joining subscriber's budget while building or
+            // constructing its initial event; `LimitGuard` restores the exact
+            // active-consumer ceiling on exit or unwind.
+            let result = (|| {
                 let next_limit = st
                     .circuit
                     .local_limit()
                     .map_or(budget, |cur| cur.max(budget));
                 st.circuit.set_local_limit(Some(next_limit));
-                if let Err(e) = self.evaluate_for_live(store, &cell, st) {
-                    deferred_state.retired.extend(st.circuit.drain_retired());
+                let status = cell.info.lock().status.clone();
+                if status != Status::Ready
+                    && let Err(e) = self.evaluate_for_live(store, &cell, st, &mut deferred_state)
+                {
                     return Err(e);
                 }
-            }
-            if st.circuit.bytes() > budget {
-                let bytes = st.circuit.bytes();
-                deferred_state.retired.extend(st.circuit.drain_retired());
-                return Err(crate::incr::error(
-                    "over-budget",
-                    format!(
-                        "the live query's state of {bytes} bytes passes its budget of {budget} bytes"
-                    ),
-                ));
-            }
-            let first = match o.after {
-                None => Some(st.event(false)),
-                Some(after) => self.resume(store, st, after, &mut deferred_state.circuits),
-            };
-            // queued before a pass can see the subscriber, so that no later diff
-            // overtakes it
-            if let Some(e) = first {
-                shared.push(e);
-            }
-            let last = st.circuit.applied;
-            st.subs.push(Sub {
-                shared: Arc::downgrade(&shared),
-                budget,
-                last,
-            });
-            st.recompute_local_limit();
+                if st.circuit.bytes() > budget {
+                    let bytes = st.circuit.bytes();
+                    return Err(crate::incr::error(
+                        "over-budget",
+                        format!(
+                            "the live query's state of {bytes} bytes passes its budget of {budget} bytes"
+                        ),
+                    ));
+                }
+                let first = match o.after {
+                    None => Some(st.event_budgeted(false)?),
+                    Some(after) => self.resume(store, st, after, &mut deferred_state.circuits)?,
+                };
+                // queued before a pass can see the subscriber, so that no later diff
+                // overtakes it
+                if let Some((e, mut lease)) = first {
+                    let shared_lease = st.detach_event_lease(&mut lease);
+                    deferred_state
+                        .queued
+                        .extend(shared.push_leased(e, shared_lease));
+                }
+                let last = st.circuit.applied;
+                st.subs.push(Sub {
+                    shared: Arc::downgrade(&shared),
+                    budget,
+                    last,
+                });
+                st.recompute_local_limit();
+                Ok(())
+            })();
             deferred_state.retired.extend(st.circuit.drain_retired());
-            Ok(())
-        })();
+            result
+        };
         drop(deferred_state);
         if let Err(e) = subscribe_res {
             drop(joining);
@@ -156,7 +161,13 @@ impl Runtime {
 
     /// Evaluate the circuit a live query joins when it is not ready, and send its
     /// other subscribers the new result as a `reset`.
-    fn evaluate_for_live(&self, store: &Store, cell: &Cell, st: &mut Slot) -> Result<()> {
+    fn evaluate_for_live(
+        &self,
+        store: &Store,
+        cell: &Cell,
+        st: &mut Slot,
+        deferred: &mut DeferredDrops,
+    ) -> Result<()> {
         let snap = store.snapshot();
         let had_snap = st.circuit.snap.is_some();
         let t0 = Instant::now();
@@ -171,14 +182,29 @@ impl Runtime {
         if std::mem::take(&mut st.rebased) {
             st.clear_history();
         }
-        self.live_budgets(st);
-        // other subscribers see the new result as a reset
-        let applied = st.circuit.applied;
-        let reset = st.event(true);
-        for s in &mut st.subs {
-            if let Some(sh) = s.shared.upgrade() {
-                s.last = applied;
-                sh.push(reset.clone());
+        self.live_budgets(st, deferred);
+        st.prune_dead_subs();
+        if !st.subs.is_empty() {
+            // other subscribers see the new result as a reset
+            let applied = st.circuit.applied;
+            match st.event_budgeted(true) {
+                Ok((reset, mut lease)) => {
+                    let shared_lease = st.detach_event_lease(&mut lease);
+                    for s in &mut st.subs {
+                        if let Some(sh) = s.shared.upgrade() {
+                            s.last = applied;
+                            deferred
+                                .queued
+                                .extend(sh.push_leased(reset.clone(), shared_lease.clone()));
+                        }
+                    }
+                    deferred
+                        .queued
+                        .push(crate::incr::live::QueuedEvent::new(reset, shared_lease));
+                }
+                Err(e) => {
+                    st.fail_live_subs(&e, deferred);
+                }
             }
         }
         Ok(())
@@ -194,25 +220,25 @@ impl Runtime {
         st: &Slot,
         after: u64,
         temp_circuits: &mut Vec<Circuit>,
-    ) -> Option<LiveEvent> {
+    ) -> Result<Option<(LiveEvent, crate::incr::budget::ScratchLease)>> {
         let applied = st.circuit.applied;
         let switched = self.switched.load(Ordering::Acquire);
         if switched > 0 && after <= switched {
-            return Some(st.event(true));
+            return st.event_budgeted(true).map(Some);
         }
         // an ordered window keeps no positions for past commits, and a circuit built
         // again since the subscriber's event may order ties otherwise, even at its commit
         if st.circuit.ordered() {
-            return Some(st.event(true));
+            return st.event_budgeted(true).map(Some);
         }
         if after == applied {
-            return None;
+            return Ok(None);
         }
         if after > applied {
-            return Some(st.event(true));
+            return st.event_budgeted(true).map(Some);
         }
         let ask = st.circuit.kind == Kind::Ask;
-        let change = st.history_since(after).or_else(|| {
+        let change = st.history_since_budgeted(after).or_else(|| {
             let d = DeltaSet::read(store, after, &Control::none());
             if !d.complete || d.snapshot.commit != applied {
                 return None;
@@ -220,42 +246,75 @@ impl Runtime {
             let old = d.old().ok()?;
             let mut c = st.fresh(st.circuit.inference.clone()).ok()?;
             c.set_pool(self.pool.clone(), self.circuit_parent());
-            // Move `c` into caller-owned storage outside `cell.state.lock()` BEFORE
-            // charging/building it so a panic unwind cannot drop `c` under the state lock.
+            // Keep the temporary circuit outside the cell lock's drop scope.
             temp_circuits.push(c);
             let c = temp_circuits.last_mut().expect("pushed above");
-            let built = c.build(old, &self.control());
-            if built.is_ok() {
-                if ask {
-                    let delta = st.circuit.result.total() - c.result.total();
-                    Some(vec![(Vec::new(), delta)])
-                } else {
-                    let now = st.circuit.rows();
-                    let before = c.rows();
-                    Some(net(now
-                        .into_iter()
-                        .chain(before.into_iter().map(|(r, w)| (r, -w)))))
-                }
-            } else {
-                None
+            c.build(old, &self.control()).ok()?;
+            let mut lease = st.circuit.scratch_lease();
+            if ask {
+                let delta = st.circuit.result.total() - c.result.total();
+                return Some((vec![(Vec::new(), delta)], lease));
             }
+            let now = st.circuit.rows_charged().ok()?;
+            let before = c.rows_charged().ok()?;
+            let terms = now
+                .0
+                .iter()
+                .chain(&before.0)
+                .map(|(row, _)| crate::incr::circuit::decoded_row_bytes(row))
+                .sum::<u64>();
+            lease
+                .try_reserve(terms + (now.0.len() + before.0.len()) as u64 * 96)
+                .ok()?;
+            let change = net(now
+                .0
+                .into_iter()
+                .chain(before.0.into_iter().map(|(row, w)| (row, -w))));
+            drop(before.1);
+            drop(now.1);
+            Some((change, lease))
         });
-        let Some(change) = change else {
-            return Some(st.event(true));
+        let Some((change, mut lease)) = change else {
+            return st.event_budgeted(true).map(Some);
         };
         if ask {
             let delta: i64 = change.iter().map(|x| x.1).sum();
             let now = st.circuit.result.total();
             if (now - delta > 0) == (now > 0) {
-                return None;
+                return Ok(None);
             }
-            return Some(LiveEvent::Value {
-                commit: applied,
-                from: after,
-                value: now > 0,
-            });
+            return Ok(Some((
+                LiveEvent::Value {
+                    commit: applied,
+                    from: after,
+                    value: now > 0,
+                },
+                st.circuit.scratch_lease(),
+            )));
         }
-        Some(diff_event(after, applied, change.into_iter()))
+        if change.len() > crate::incr::live::QUEUE_ROWS {
+            drop(change);
+            drop(lease);
+            return st.event_budgeted(true).map(Some);
+        }
+        let row_slot = std::mem::size_of::<LiveRow>() as u64;
+        let rows = change.len() as u64;
+        let terms = change
+            .iter()
+            .map(|(row, _)| crate::incr::circuit::decoded_row_bytes(row))
+            .sum::<u64>();
+        // diff_event temporarily owns both its vectors and the final Arc slices.
+        if lease
+            .try_set(terms + change.capacity() as u64 * 32 + (3 * rows + 8) * row_slot)
+            .is_err()
+        {
+            drop(change);
+            drop(lease);
+            return st.event_budgeted(true).map(Some);
+        }
+        let event = diff_event(after, applied, change.into_iter());
+        lease.try_set(terms + rows * row_slot)?;
+        Ok(Some((event, lease)))
     }
 }
 
@@ -392,12 +451,11 @@ mod resume_unwind_tests {
 
         let baseline = pool.granted();
         assert!(baseline > 0);
-        // Pin all but 4 MiB so the fallback resume circuit can build and a 4 MiB waiter
-        // wakes synchronously when `deferred_state` drops the fallback circuit outside
-        // `cell.state.lock()`.
+        // Leave room for the fallback circuit. The resumed event stays leased
+        // while queued, so leave a margin between free room and the waiting grant.
         let filler = pool
             .work_parent()
-            .reserve(pool.capacity() - (4 << 20) - baseline)
+            .reserve(pool.capacity() - (5 << 20) - baseline)
             .unwrap();
         let woke = Arc::new(AtomicUsize::new(0));
         let woke_cb = woke.clone();
@@ -425,11 +483,11 @@ mod resume_unwind_tests {
             .unwrap();
         // The resumed subscriber received the diff for `<urn:r:extra>`, and the fallback
         // circuit dropped cleanly outside `cell.state.lock()` waking our waiter.
-        assert!(matches!(live2.try_next(), Some(LiveEvent::Diff { .. })));
         assert!(
             woke.load(Ordering::SeqCst) >= 1,
             "waker must acquire cell.state.lock() cleanly when Runtime::resume drops fallback circuit"
         );
+        assert!(matches!(live2.try_next(), Some(LiveEvent::Diff { .. })));
         drop(waiter);
         drop(filler);
         drop(live2);

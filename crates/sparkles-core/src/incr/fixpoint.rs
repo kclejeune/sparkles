@@ -1157,7 +1157,7 @@ impl<P: Program> FixedPoint<P> {
             &mut order,
         )?;
         self.free(charges, queue);
-        let anns = if self.mode.is_none() {
+        let mut anns = if self.mode.is_none() {
             None
         } else {
             let mut dirty: Held<FxHashSet<P::Fact>> = Held::default();
@@ -1167,25 +1167,28 @@ impl<P: Program> FixedPoint<P> {
             self.free(charges, dirty);
             anns
         };
+        let base_ann = self.ann_state_bytes();
+        let mut ann_pass_reserved = 0u64;
         let mut out: Held<Vec<Change<P::Fact>>> = Held::default();
         self.room(charges, &mut out, order.len())?;
         let mut out_ann_bytes = 0u64;
         for &f in order.iter() {
-            let ann = match anns.as_ref() {
+            let ann = match anns.as_mut() {
                 Some(m) => {
-                    let a = m.get(&f).cloned().ok_or_else(|| {
-                        Error::Corrupt("a fixed point did not annotate a fact it built".into())
-                    })?;
-                    let ab = a.bytes();
-                    // Charge persistent `self.ann` growth and output `Change.ann`
-                    // payload residency independently before installing them.
-                    self.store.reserve_pass(ab.saturating_add(16))?;
-                    if ab > 0 {
-                        self.store.reserve(ab)?;
-                        charges.live = charges.live.saturating_add(ab);
-                        out_ann_bytes = out_ann_bytes.saturating_add(ab);
-                    }
+                    let ab = m
+                        .get(&f)
+                        .ok_or_else(|| {
+                            Error::Corrupt("a fixed point did not annotate a fact it built".into())
+                        })?
+                        .bytes();
+                    // Pre-admit persistent `self.ann` growth before cloning the
+                    // already-charged `annotate` output, then move the original into
+                    // `Change.ann` so `out_ann_bytes` retains its scratch reservation.
+                    let target_ann = self.ann_state_bytes().saturating_add(ab).saturating_add(16);
+                    self.sync_ann_pass(base_ann, &mut ann_pass_reserved, target_ann)?;
+                    let a = m.remove(&f).expect("checked above");
                     self.store_ann(f, a.clone());
+                    out_ann_bytes = out_ann_bytes.saturating_add(ab);
                     Some(a)
                 }
                 None => None,
@@ -1198,6 +1201,30 @@ impl<P: Program> FixedPoint<P> {
         }
         self.check(max_bytes, 0)?;
         Ok((out.buf, out.bytes.saturating_add(out_ann_bytes)))
+    }
+
+    fn ann_state_bytes(&self) -> u64 {
+        self.ann_bytes.saturating_add(self.ann.len() as u64 * 16)
+    }
+
+    /// Reconcile net annotation growth above `base_ann` against `store.reserve_pass` /
+    /// `release_pass`, releasing only credit that this fixed point itself reserved in
+    /// the current pass (never credit belonging to memos, fact tables, or other ops).
+    fn sync_ann_pass(
+        &self,
+        base_ann: u64,
+        ann_pass_reserved: &mut u64,
+        target_ann_bytes: u64,
+    ) -> std::result::Result<(), P::Error> {
+        let needed = target_ann_bytes.saturating_sub(base_ann);
+        if needed > *ann_pass_reserved {
+            self.store.reserve_pass(needed - *ann_pass_reserved)?;
+            *ann_pass_reserved = needed;
+        } else if needed < *ann_pass_reserved {
+            self.store.release_pass(*ann_pass_reserved - needed);
+            *ann_pass_reserved = needed;
+        }
+        Ok(())
     }
 
     fn store_ann(&mut self, f: P::Fact, a: Ann) {
@@ -1504,6 +1531,8 @@ impl<P: Program> FixedPoint<P> {
         max_bytes: Option<u64>,
         charges: &mut Charges,
     ) -> std::result::Result<ChargedChanges<P::Fact>, P::Error> {
+        let base_ann = self.ann_state_bytes();
+        let mut ann_pass_reserved = 0u64;
         let n = self.program.batch_len().max(1);
         // 1. the broken facts, and every fact whose record depends on them, at the
         //    snapshot before the changes
@@ -1642,21 +1671,16 @@ impl<P: Program> FixedPoint<P> {
         let mut out_ann_bytes = 0u64;
         for f in candidates.iter() {
             if pending.contains(f) {
-                self.store.remove(f)?;
-                let ann = self.drop_ann(f).map(|a| {
-                    let old_bytes = a.bytes();
-                    self.store.release_pass(old_bytes.saturating_add(16));
-                    a.scaled(-1)
-                });
-                if let Some(ref a) = ann {
-                    let ab = a.bytes();
-                    if ab > 0 {
-                        self.store.reserve(ab)?;
-                        charges.live = charges.live.saturating_add(ab);
-                        out_ann_bytes = out_ann_bytes.saturating_add(ab);
-                    }
+                let ab = self.ann.get(f).map_or(0, Ann::bytes);
+                if ab > 0 {
+                    self.store.reserve(ab)?;
+                    charges.live = charges.live.saturating_add(ab);
                 }
                 self.room(charges, &mut out, 1)?;
+                self.store.remove(f)?;
+                let ann = self.drop_ann(f).map(|a| a.scaled(-1));
+                self.sync_ann_pass(base_ann, &mut ann_pass_reserved, self.ann_state_bytes())?;
+                out_ann_bytes = out_ann_bytes.saturating_add(ab);
                 out.buf.push(Change {
                     fact: *f,
                     weight: -1,
@@ -1728,41 +1752,84 @@ impl<P: Program> FixedPoint<P> {
         self.free(charges, stack);
         self.free(charges, seen);
         self.free(charges, found);
-        let anns = self
+        let mut anns = self
             .annotate(cx, charges, &dirty, max_bytes)?
             .unwrap_or_default();
         let mut fresh: Held<FxHashSet<P::Fact>> = Held::default();
         self.room(charges, &mut fresh, added.len())?;
         fresh.buf.extend(added.iter().copied());
         for &f in dirty.iter() {
-            let Some(a) = anns.get(&f).cloned() else {
+            let Some(a) = anns.remove(&f) else {
                 continue;
             };
-            let old = self.ann.get(&f).cloned();
-            let d = match &old {
+            let ab = a.bytes();
+            let (old_bytes, has_old) = match self.ann.get(&f) {
+                Some(o) => (o.bytes(), true),
+                None => (0, false),
+            };
+            // Pre-admit the computed difference `d` before constructing it while both
+            // `a` (in `charges.live`) and any `old` (in `self.ann`) remain live.
+            let d_est = if has_old {
+                ab.saturating_add(old_bytes)
+            } else {
+                ab
+            };
+            if d_est > 0 {
+                self.store.reserve(d_est)?;
+                charges.live = charges.live.saturating_add(d_est);
+            }
+            let d = match self.ann.get(&f) {
                 Some(o) => a.sub(o),
                 None => a.clone(),
             };
+            let db = d.bytes();
+            if db > d_est {
+                let extra = db - d_est;
+                self.store.reserve(extra)?;
+                charges.live = charges.live.saturating_add(extra);
+            } else if db < d_est {
+                let excess = d_est - db;
+                self.store.release(excess);
+                charges.live = charges.live.saturating_sub(excess);
+            }
             let weight = i64::from(fresh.contains(&f));
             if weight == 0 && d.is_zero() {
+                drop(d);
+                if db > 0 {
+                    self.store.release(db);
+                    charges.live = charges.live.saturating_sub(db);
+                }
+                drop(a);
+                if ab > 0 {
+                    self.store.release(ab);
+                    charges.live = charges.live.saturating_sub(ab);
+                }
                 continue;
             }
-            let new_entry = a.bytes().saturating_add(16);
-            let old_entry = old.as_ref().map_or(0, |o| o.bytes().saturating_add(16));
-            if new_entry > old_entry {
-                self.store.reserve_pass(new_entry - old_entry)?;
-            }
-            let db = d.bytes();
-            if db > 0 {
-                self.store.reserve(db)?;
-                charges.live = charges.live.saturating_add(db);
-                out_ann_bytes = out_ann_bytes.saturating_add(db);
-            }
             self.room(charges, &mut out, 1)?;
-            self.store_ann(f, a);
-            if old_entry > new_entry {
-                self.store.release_pass(old_entry - new_entry);
+            let new_entry = ab.saturating_add(16);
+            let old_entry = if has_old {
+                old_bytes.saturating_add(16)
+            } else {
+                0
+            };
+            let target_ann = self
+                .ann_state_bytes()
+                .saturating_sub(old_entry)
+                .saturating_add(new_entry);
+            // Pre-admit net persistent annotation growth before installing `a`; if
+            // `target_ann < self.ann_state_bytes()`, defer any shrink release until
+            // after `store_ann` drops the old entry.
+            if target_ann > self.ann_state_bytes() {
+                self.sync_ann_pass(base_ann, &mut ann_pass_reserved, target_ann)?;
             }
+            self.store_ann(f, a);
+            if ab > 0 {
+                self.store.release(ab);
+                charges.live = charges.live.saturating_sub(ab);
+            }
+            self.sync_ann_pass(base_ann, &mut ann_pass_reserved, self.ann_state_bytes())?;
+            out_ann_bytes = out_ann_bytes.saturating_add(db);
             out.buf.push(Change {
                 fact: f,
                 weight,

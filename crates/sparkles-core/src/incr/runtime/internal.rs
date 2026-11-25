@@ -39,13 +39,54 @@ pub(crate) struct InternalCell {
 /// budget) drops strictly before `circuit`'s credit returns to the pool.
 pub(super) struct InternalSlot {
     pub(super) status: Status,
-    /// the counts of an accumulator, from its first build
-    pub(super) tally: Option<Tally>,
+    /// the counts of an accumulator, behind a leaf mutex so `ViewBudget` can evict
+    /// oldest counts when active pass work needs headroom under the cap or pool
+    /// (spec F13 §3.6).
+    pub(super) tally: Option<Arc<Mutex<Tally>>>,
+    /// set by `tally_reclaim_hook` when background reclaim drops oldest counts
+    pub(super) tally_dirty: Arc<AtomicBool>,
     pub(super) key_cols: Vec<usize>,
     pub(super) checkpointed: u64,
     /// the counts changed without a pass (counts were discarded)
     pub(super) dirty: bool,
     pub(super) circuit: Circuit,
+}
+
+impl InternalSlot {
+    /// Leaf reclaim hook for `ViewBudget`: evicts oldest accumulator counts when active
+    /// circuit pass work needs headroom under the local cap or parent pool. Captures a
+    /// `Weak` reference so `InternalSlot::tally` remains the sole strong owner and drops
+    /// strictly before `InternalSlot::circuit`'s credit returns to the pool.
+    pub(super) fn tally_reclaim_hook(
+        tally: &Arc<Mutex<Tally>>,
+        dirty: &Arc<AtomicBool>,
+    ) -> crate::incr::budget::ReclaimHook {
+        let weak = Arc::downgrade(tally);
+        let dirty = dirty.clone();
+        Arc::new(move |needed: u64| {
+            let Some(tally) = weak.upgrade() else {
+                return 0;
+            };
+            let (freed, evicted) = tally.lock().evict_for_reclaim(needed);
+            if evicted {
+                dirty.store(true, Ordering::Release);
+            }
+            freed
+        })
+    }
+
+    pub(super) fn install_tally(&mut self, tally: Tally) {
+        let arc = Arc::new(Mutex::new(tally));
+        self.circuit
+            .set_reclaim_external(Some(Self::tally_reclaim_hook(&arc, &self.tally_dirty)));
+        self.tally = Some(arc);
+    }
+
+    pub(super) fn sync_tally_dirty(&mut self) {
+        if self.tally_dirty.swap(false, Ordering::AcqRel) {
+            self.dirty = true;
+        }
+    }
 }
 
 /// A handle on an internal circuit that server code attached
@@ -138,7 +179,7 @@ impl InternalCircuit {
         let tally = st.tally.as_ref().ok_or_else(|| {
             crate::incr::error("invalid-view", "the internal circuit is not an accumulator")
         })?;
-        Ok(tally.counts(after, st.circuit.applied))
+        Ok(tally.lock().counts(after, st.circuit.applied))
     }
 
     /// Drop an accumulator's counts of the commits up to `commit`, which server code
@@ -147,9 +188,12 @@ impl InternalCircuit {
         let retired = {
             let mut st = self.cell.state.lock();
             let through = commit.min(st.circuit.applied);
-            if let Some(t) = st.tally.as_mut() {
-                t.discard_through(through);
-                let bytes = t.bytes();
+            if let Some(tally) = st.tally.clone() {
+                let bytes = {
+                    let mut t = tally.lock();
+                    t.discard_through(through);
+                    t.bytes()
+                };
                 st.circuit.set_external_best_effort(bytes);
                 st.dirty = true;
             }
@@ -240,19 +284,17 @@ impl InternalCircuit {
     /// The circuit's state's approximate memory, its counts' included.
     pub fn bytes(&self) -> u64 {
         let st = self.cell.state.lock();
-        st.circuit.bytes() + st.tally.as_ref().map_or(0, Tally::bytes)
+        st.circuit.bytes() + st.tally.as_ref().map_or(0, |t| t.lock().bytes())
     }
 
     /// The most memory the counts took right after a commit was counted, and the drops
     /// that the budget made.
     #[cfg(test)]
     pub(crate) fn tally_peak(&self) -> (u64, u64) {
-        self.cell
-            .state
-            .lock()
-            .tally
-            .as_ref()
-            .map_or((0, 0), |t| (t.peak, t.drops))
+        self.cell.state.lock().tally.as_ref().map_or((0, 0), |t| {
+            let t = t.lock();
+            (t.peak, t.drops)
+        })
     }
 
     /// Evaluate the circuit again from scratch on the next round, lifting a failure.
@@ -444,6 +486,7 @@ impl Runtime {
             state: Mutex::new(InternalSlot {
                 status: Status::Building,
                 tally: None,
+                tally_dirty: Arc::new(AtomicBool::new(false)),
                 key_cols,
                 checkpointed: 0,
                 dirty: false,
@@ -517,14 +560,29 @@ impl Runtime {
                 // such as commit 0 of a new store
                 st.dirty = true;
                 if !st.key_cols.is_empty() {
-                    match st.tally.as_mut() {
-                        // a rebuild: the commits since the last pass are not counted
-                        Some(t) if had_state => t.lose(before + 1, snap.commit),
-                        Some(t) => t.lose(t.since + 1, snap.commit),
-                        None => st.tally = Some(Tally::new(st.key_cols.clone(), snap.commit)),
+                    if let Some(tally) = st.tally.clone() {
+                        // A rebuild cannot count commits since the last applied pass.
+                        let last_counted = if had_state {
+                            before
+                        } else {
+                            tally.lock().since
+                        };
+                        if let Err(e) = Self::record_lost(
+                            &st.circuit,
+                            &tally,
+                            &mut st.dirty,
+                            last_counted + 1,
+                            snap.commit,
+                        ) {
+                            self.fail_internal(cell, st, &e);
+                        }
+                    } else {
+                        st.install_tally(Tally::new(st.key_cols.clone(), snap.commit));
                     }
                 }
-                if let Some(e) = self.internal_budget(st) {
+                if st.status == Status::Ready
+                    && let Some(e) = self.internal_budget(st)
+                {
                     self.fail_internal(cell, st, &e);
                 }
             }
@@ -544,9 +602,12 @@ impl Runtime {
         // pins QueryPool credit while alive (a future rebuild records missed commits as
         // unknown from `since`).
         let applied = st.circuit.applied;
-        if let Some(t) = st.tally.as_mut() {
-            t.discard_through(applied);
-            t.clear_storage();
+        if let Some(tally) = st.tally.clone() {
+            {
+                let mut t = tally.lock();
+                t.discard_through(applied);
+                t.clear_storage();
+            }
             st.circuit.set_external_best_effort(0);
         }
         st.circuit.clear_state();
@@ -554,49 +615,63 @@ impl Runtime {
     }
 
     /// Reconcile an accumulator's tally bytes against the circuit's budget and parent
-    /// pool, shrinking spare capacity first and oldest counts when needed.
+    /// pool, shrinking spare capacity first and oldest counts when needed. Never holds
+    /// `tally.lock()` across `circuit` budget calls.
     fn charge_tally(
         circuit: &Circuit,
-        tally: &mut Tally,
+        tally: &Mutex<Tally>,
         dirty: &mut bool,
         applied: u64,
     ) -> Result<()> {
-        while let Err(e) = circuit.try_set_external(tally.bytes()) {
-            let cur = tally.bytes();
-            // First try releasing spare backing capacity without dropping any commits.
-            if cur > 0 && tally.shrink_spare_capacity() {
-                continue;
-            }
-            let dropped = if cur > 0 {
-                tally.shrink_to(cur / 2)
-            } else {
-                false
+        loop {
+            let cur = tally.lock().bytes();
+            let Err(e) = circuit.try_set_external(cur) else {
+                return Ok(());
             };
-            if dropped {
+            // First try releasing spare backing capacity without dropping any commits.
+            let (shrunk_cap, shrunk_to, after) = {
+                let mut t = tally.lock();
+                let cur = t.bytes();
+                if cur > 0 && t.shrink_spare_capacity() {
+                    (true, false, t.bytes())
+                } else {
+                    let dropped = if cur > 0 { t.shrink_to(cur / 2) } else { false };
+                    (false, dropped, t.bytes())
+                }
+            };
+            if shrunk_to {
                 *dirty = true;
             }
-            if tally.bytes() < cur {
+            if shrunk_cap || after < cur {
                 continue;
             }
-            if tally.since < applied {
-                tally.discard_through(applied);
-                *dirty = true;
-                if circuit.try_set_external(tally.bytes()).is_ok() {
-                    return Ok(());
+            let discarded_bytes = {
+                let mut t = tally.lock();
+                if t.since < applied {
+                    t.discard_through(applied);
+                    *dirty = true;
+                    Some(t.bytes())
+                } else {
+                    None
                 }
+            };
+            if let Some(b) = discarded_bytes
+                && circuit.try_set_external(b).is_ok()
+            {
+                return Ok(());
             }
             // Release all backing capacity before zeroing external accounting so no
             // retained capacity survives uncharged.
-            tally.clear_storage();
+            tally.lock().clear_storage();
             circuit.set_external_best_effort(0);
             return Err(e);
         }
-        Ok(())
     }
 
     /// Fail the circuit whose state passed its budget, and drop the oldest counts of an
     /// accumulator whose counts take the rest of it.
     fn internal_budget(&self, st: &mut InternalSlot) -> Option<Error> {
+        st.sync_tally_dirty();
         let max = st.circuit.max_memory_bytes.unwrap_or(u64::MAX);
         let bytes = st.circuit.bytes();
         if bytes > max {
@@ -607,21 +682,27 @@ impl Runtime {
             }));
         }
         let applied = st.circuit.applied;
-        if let Some(t) = st.tally.as_mut() {
-            if t.shrink_to(max - bytes) {
-                st.dirty = true;
-                tracing::warn!(
-                    target: "sparkles::incr::runtime",
-                    "an internal circuit's counts passed its budget: counts start after commit {}",
-                    t.since
-                );
+        if let Some(tally) = st.tally.clone() {
+            {
+                let mut t = tally.lock();
+                if t.shrink_to(max - bytes) {
+                    st.dirty = true;
+                    tracing::warn!(
+                        target: "sparkles::incr::runtime",
+                        "an internal circuit's counts passed its budget: counts start after commit {}",
+                        t.since
+                    );
+                }
             }
-            if let Err(e) = Self::charge_tally(&st.circuit, t, &mut st.dirty, applied) {
+            if let Err(e) = Self::charge_tally(&st.circuit, &tally, &mut st.dirty, applied) {
                 if matches!(e, Error::BudgetExceeded(_)) {
                     // Counts alone exceeded the remaining budget: record commits through
                     // `applied` as unavailable per F13 §3.6 without failing the circuit.
-                    t.discard_through(applied);
-                    t.clear_storage();
+                    {
+                        let mut t = tally.lock();
+                        t.discard_through(applied);
+                        t.clear_storage();
+                    }
                     st.circuit.set_external_best_effort(0);
                     st.dirty = true;
                 } else {
@@ -680,6 +761,52 @@ impl Runtime {
     /// Advance an accumulator's circuit one commit at a time, counting each commit's
     /// change before the next is read (spec F13 §3.6). Changes that are not known per
     /// commit evaluate the circuit again at the head and are recorded as unknown.
+    /// Pre-admit an unknown count range. If even an empty tally cannot store
+    /// it, advance the first readable commit past the range.
+    fn record_lost(
+        circuit: &Circuit,
+        tally: &Mutex<Tally>,
+        dirty: &mut bool,
+        first: u64,
+        last: u64,
+    ) -> Result<()> {
+        if first > last {
+            return Ok(());
+        }
+        *dirty = true;
+        loop {
+            let estimate = tally.lock().bytes_after_loss(first, last);
+            match circuit.try_set_external(estimate) {
+                Ok(()) => {
+                    let bytes = {
+                        let mut t = tally.lock();
+                        t.lose(first, last);
+                        t.bytes()
+                    };
+                    circuit.set_external_best_effort(bytes);
+                    return Ok(());
+                }
+                Err(Error::BudgetExceeded(_)) => {
+                    let (freed, bytes) = {
+                        let mut t = tally.lock();
+                        let target = (t.bytes() / 2).max(1);
+                        let (freed, _) = t.evict_for_reclaim(target);
+                        if freed == 0 {
+                            t.discard_through(last);
+                            t.clear_storage();
+                        }
+                        (freed, t.bytes())
+                    };
+                    circuit.set_external_best_effort(bytes);
+                    if freed == 0 {
+                        return Ok(());
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     fn step_accumulator(
         &self,
         store: &Store,
@@ -693,46 +820,8 @@ impl Runtime {
             dirty,
             ..
         } = st;
-        let tally = tally.as_mut().expect("an accumulator");
+        let tally = tally.as_ref().expect("an accumulator").clone();
         let max = circuit.max_memory_bytes.unwrap_or(u64::MAX);
-        let record_lost = |circuit: &Circuit,
-                           tally: &mut Tally,
-                           dirty: &mut bool,
-                           first: u64,
-                           last: u64|
-         -> Result<()> {
-            // Pre-admit any unknown-range growth before pushing; if counts cannot fit,
-            // advance `since` to `last` at zero bytes instead of failing the circuit.
-            let next_unknown_cap = sparkles_budget::sizes::vec_grown(
-                tally.unknown.capacity(),
-                tally.unknown.len(),
-                1,
-                16,
-            );
-            let est = tally
-                .bytes()
-                .saturating_sub(tally.unknown.capacity() as u64 * 16)
-                .saturating_add(next_unknown_cap as u64 * 16);
-            if circuit.try_set_external(est).is_ok() {
-                tally.lose(first, last);
-                *dirty = true;
-                let _ = circuit.try_set_external(tally.bytes());
-                return Ok(());
-            }
-            tally.lose(first, last);
-            *dirty = true;
-            if let Err(e) = Self::charge_tally(circuit, tally, dirty, last) {
-                if matches!(e, Error::BudgetExceeded(_)) {
-                    tally.discard_through(last);
-                    tally.clear_storage();
-                    circuit.set_external_best_effort(0);
-                    *dirty = true;
-                } else {
-                    return Err(e);
-                }
-            }
-            Ok(())
-        };
         let Some(mut steps) = DeltaSet::steps(store, from, control) else {
             let snap = store.snapshot();
             let (diff, diff_lease) = circuit.reset_charged(&DeltaSet::at(snap.clone()), control)?;
@@ -746,7 +835,7 @@ impl Runtime {
                     requested: state,
                 }));
             }
-            record_lost(circuit, tally, dirty, from + 1, snap.commit)?;
+            Self::record_lost(circuit, &tally, dirty, from + 1, snap.commit)?;
             return Ok(());
         };
         while let Some(d) = steps.next() {
@@ -768,7 +857,8 @@ impl Runtime {
                     }
                     let snap = d.snapshot.clone();
                     let terms = &circuit.terms;
-                    tally.add_budgeted_charged(
+                    Tally::add_budgeted_charged_shared(
+                        &tally,
                         at,
                         c,
                         c_lease,
@@ -788,7 +878,7 @@ impl Runtime {
                             requested: state,
                         }));
                     }
-                    record_lost(circuit, tally, dirty, d.after + 1, at)?;
+                    Self::record_lost(circuit, &tally, dirty, d.after + 1, at)?;
                 }
             }
         }
@@ -802,6 +892,7 @@ impl Runtime {
         };
         for cell in cells {
             let mut st = cell.state.lock();
+            st.sync_tally_dirty();
             if st.status != Status::Ready {
                 continue;
             }
@@ -820,7 +911,7 @@ impl Runtime {
                     None => e.u64(0),
                     Some(t) => {
                         e.u64(1);
-                        t.encode(&mut e);
+                        t.lock().encode(&mut e);
                     }
                 }
                 persist::write_as(
@@ -928,35 +1019,44 @@ impl Runtime {
             drop(bytes);
             drop(file_lease);
             match r {
-                Ok(mut tally) => {
-                    if let Some(t) = tally.as_mut() {
+                Ok(tally) => {
+                    if let Some(mut t) = tally {
                         if let Some(max) = st.circuit.max_memory_bytes {
                             let avail = max.saturating_sub(st.circuit.bytes());
                             if t.shrink_to(avail) {
                                 st.dirty = true;
                             }
                         }
+                        let t_bytes = t.bytes();
+                        let tally_arc = Arc::new(Mutex::new(t));
                         if let Err(e) = st
                             .circuit
-                            .commit_external_from_scratch(t.bytes(), &mut tally_lease)
+                            .commit_external_from_scratch(t_bytes, &mut tally_lease)
                         {
                             drop(tally_lease);
-                            if Self::charge_tally(&st.circuit, t, &mut st.dirty, h.commit).is_err()
+                            if Self::charge_tally(&st.circuit, &tally_arc, &mut st.dirty, h.commit)
+                                .is_err()
                             {
                                 tracing::warn!(
                                     target: "sparkles::incr::runtime",
                                     "internal circuit {id}: checkpoint {}: {e}; the circuit is built again",
                                     path.display()
                                 );
-                                drop(tally);
+                                drop(tally_arc);
                                 st.circuit.clear_state();
                                 continue;
                             }
                         }
+                        st.circuit
+                            .set_reclaim_external(Some(InternalSlot::tally_reclaim_hook(
+                                &tally_arc,
+                                &st.tally_dirty,
+                            )));
+                        st.tally = Some(tally_arc);
                     } else {
                         drop(tally_lease);
+                        st.tally = None;
                     }
-                    st.tally = tally;
                     st.circuit.applied = h.commit;
                     st.checkpointed = h.commit;
                     st.status = Status::Ready;
@@ -1051,15 +1151,16 @@ mod charge_tally_tests {
         // Set local limit just below `before_bytes` so spare-capacity shrink alone suffices.
         let tight = before_bytes.saturating_sub(1);
         circuit.set_local_limit(Some(tight));
+        let tally = Mutex::new(tally);
         let mut dirty = false;
-        let res = Runtime::charge_tally(&circuit, &mut tally, &mut dirty, 50);
+        let res = Runtime::charge_tally(&circuit, &tally, &mut dirty, 50);
         assert!(
             res.is_ok(),
             "capacity-only shrink must succeed without wiping counts: {res:?}"
         );
         assert!(!dirty, "capacity-only shrink must not mark counts dirty");
-        assert!(tally.bytes() <= tight);
-        let counts = tally.counts(45, 50);
+        assert!(tally.lock().bytes() <= tight);
+        let counts = tally.lock().counts(45, 50);
         assert_eq!(
             counts.unknown, None,
             "capacity-only shrink must preserve accumulated counts"
@@ -1081,15 +1182,15 @@ mod charge_tally_tests {
         circuit.build(store.snapshot(), &Control::none()).unwrap();
         assert!(circuit.bytes() > 0);
         circuit.set_local_limit(Some(0));
-        tally.add(51, &vec![(row, 1)], |i| {
+        tally.lock().add(51, &vec![(row, 1)], |i| {
             Some(oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
                 format!("k{}", i.0),
             )))
         });
-        let err = Runtime::charge_tally(&circuit, &mut tally, &mut dirty, 51);
+        let err = Runtime::charge_tally(&circuit, &tally, &mut dirty, 51);
         assert!(err.is_err());
         assert_eq!(
-            tally.bytes(),
+            tally.lock().bytes(),
             0,
             "terminal refusal in charge_tally must clear retained tally storage"
         );

@@ -518,6 +518,10 @@ impl ScratchLease {
         }
     }
 
+    pub(crate) fn sibling(&self) -> Self {
+        Self::new(self.budget.clone())
+    }
+
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -559,6 +563,19 @@ impl ScratchLease {
                 budget.release_scratch(take);
             }
         }
+    }
+
+    /// Move scratch ownership without changing the underlying budget total.
+    pub(crate) fn transfer_to(&mut self, other: &mut Self, bytes: u64) {
+        debug_assert_eq!(self.pool_only, other.pool_only);
+        debug_assert!(match (&self.budget, &other.budget) {
+            (Some(a), Some(b)) => Arc::ptr_eq(&a.inner, &b.inner),
+            (None, None) => true,
+            _ => false,
+        });
+        assert!(self.bytes >= bytes);
+        self.bytes -= bytes;
+        other.bytes += bytes;
     }
 
     /// Disarm this lease and return its reserved byte count for atomic handoff into
@@ -1050,8 +1067,6 @@ mod tests {
 
         let history_dead_on_release = Arc::new(AtomicBool::new(false));
         let release_seen = Arc::new(AtomicUsize::new(0));
-        let weak_hist: Arc<Mutex<Option<std::sync::Weak<Mutex<()>>>>> = Arc::new(Mutex::new(None));
-        let _ = weak_hist;
 
         // Build a Circuit + HistoryBuf pair wired exactly like `Runtime::cell_for`,
         // with a custom parent release callback that checks `HistoryBuf`'s strong count.

@@ -379,6 +379,22 @@ impl Why {
             }
         }
     }
+
+    fn sub_all(&mut self, o: &Why) {
+        self.unknown -= o.unknown;
+        if self.supports.len() + o.supports.len() > 32 {
+            let mut m: FxHashMap<Witness, i64> =
+                std::mem::take(&mut self.supports).into_iter().collect();
+            for (x, c) in &o.supports {
+                *m.entry(x.clone()).or_insert(0) -= c;
+            }
+            self.supports = m.into_iter().filter(|(_, c)| *c != 0).collect();
+        } else {
+            for (x, c) in &o.supports {
+                self.add(x, -*c);
+            }
+        }
+    }
 }
 
 impl PartialEq for Why {
@@ -603,10 +619,30 @@ impl Ann {
         }
     }
 
+    /// Subtract `o` from `self` in place without cloning `o`.
+    fn sub_assign(&mut self, o: &Ann) {
+        match (self, o) {
+            (Ann::Count(a), Ann::Count(b)) => *a -= b,
+            (Ann::Lineage(a), Ann::Lineage(b)) => {
+                a.n -= b.n;
+                a.unknown -= b.unknown;
+                for (k, c) in &b.atoms {
+                    let e = a.atoms.entry(*k).or_insert(0);
+                    *e -= c;
+                    if *e == 0 {
+                        a.atoms.remove(k);
+                    }
+                }
+            }
+            (Ann::Why(a), Ann::Why(b)) => a.sub_all(b),
+            (a, b) => debug_assert!(false, "annotations of two semirings: {a:?} {b:?}"),
+        }
+    }
+
     /// `self − o`.
     pub fn sub(&self, o: &Ann) -> Ann {
         let mut d = self.clone();
-        d.add_assign(&o.clone().scaled(-1));
+        d.sub_assign(o);
         d
     }
 

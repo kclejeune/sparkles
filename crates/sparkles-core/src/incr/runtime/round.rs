@@ -36,7 +36,8 @@ impl Runtime {
         for cell in &cells {
             // the status is read under the state lock: a switch of the inference replaces
             // the circuit and marks it `building` under that lock
-            let retired = {
+            let mut deferred = DeferredDrops::default();
+            {
                 let mut st = cell.state.lock();
                 // Prune departed or explicitly closed live subscribers before admitting
                 // a build or advance pass so the first pass uses the exact active ceiling.
@@ -44,19 +45,19 @@ impl Runtime {
                 let status = cell.info.lock().status.clone();
                 match status {
                     Status::Building => {
-                        self.build(store, cell, &mut st);
+                        self.build(store, cell, &mut st, &mut deferred);
                         worked = true;
                     }
                     Status::Ready => {
-                        if self.advance(store, cell, &mut st, &mut deltas) {
+                        if self.advance(store, cell, &mut st, &mut deltas, &mut deferred) {
                             worked = true;
                         }
                     }
                     Status::Failed { .. } => {}
                 }
-                st.circuit.drain_retired()
-            };
-            drop(retired);
+                deferred.retired.extend(st.circuit.drain_retired());
+            }
+            drop(deferred);
             let bytes = cell.info.lock().bytes;
             over.push((cell.clone(), bytes));
         }
@@ -129,21 +130,13 @@ impl Runtime {
         self.counters.pass_hist[b].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn fail(&self, cell: &Cell, st: &mut Slot, e: &Error) {
+    pub(super) fn fail(&self, cell: &Cell, st: &mut Slot, e: &Error, deferred: &mut DeferredDrops) {
         let (code, message) = failure(e);
         tracing::warn!(
             target: "sparkles::incr::runtime",
             "a view circuit failed ({code}): {message}"
         );
-        for s in st.subs.drain(..) {
-            if let Some(sh) = s.shared.upgrade() {
-                sh.push(LiveEvent::Error {
-                    code: code.clone(),
-                    message: message.clone(),
-                });
-            }
-        }
-        st.recompute_local_limit();
+        st.fail_live_subs(e, deferred);
         st.clear_history();
         st.circuit.clear_state();
         let mut info = cell.info.lock();
@@ -152,7 +145,13 @@ impl Runtime {
         info.status = Status::Failed { code, message };
     }
 
-    pub(super) fn build(&self, store: &Store, cell: &Cell, st: &mut Slot) {
+    pub(super) fn build(
+        &self,
+        store: &Store,
+        cell: &Cell,
+        st: &mut Slot,
+        deferred: &mut DeferredDrops,
+    ) {
         let snap = store.snapshot();
         let before = st.circuit.applied;
         let t0 = Instant::now();
@@ -161,15 +160,15 @@ impl Runtime {
             Ok(change) => {
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, t0.elapsed(), false);
-                self.live_budgets(st);
+                self.live_budgets(st, deferred);
                 if let Some((c, c_lease)) = change {
-                    self.publish(st, before, c, c_lease, true);
+                    self.publish(st, before, c, c_lease, true, deferred);
                 }
                 if std::mem::take(&mut st.rebased) {
                     st.clear_history();
                 }
             }
-            Err(e) => self.fail(cell, st, &e),
+            Err(e) => self.fail(cell, st, &e, deferred),
         }
     }
 
@@ -179,6 +178,7 @@ impl Runtime {
         cell: &Cell,
         st: &mut Slot,
         deltas: &mut FxHashMap<u64, Arc<DeltaSet>>,
+        deferred: &mut DeferredDrops,
     ) -> bool {
         if !st.alive() {
             return false;
@@ -210,7 +210,7 @@ impl Runtime {
             }
             Ok(crate::incr::circuit::ChargedAdvance::Changed(c, c_lease)) => {
                 self.note_pass(cell, st, took, false);
-                self.publish(st, from, c, c_lease, false);
+                self.publish(st, from, c, c_lease, false, deferred);
             }
             Ok(crate::incr::circuit::ChargedAdvance::Reset(c, c_lease)) => {
                 self.counters.resets.fetch_add(1, Ordering::Relaxed);
@@ -223,10 +223,10 @@ impl Runtime {
                 }
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, took, false);
-                self.publish(st, from, c, c_lease, true);
+                self.publish(st, from, c, c_lease, true, deferred);
             }
             Err(e) => {
-                self.fail(cell, st, &e);
+                self.fail(cell, st, &e, deferred);
                 return true;
             }
         }
@@ -241,12 +241,12 @@ impl Runtime {
                 st.circuit.applied
             );
         }
-        self.live_budgets(st);
+        self.live_budgets(st, deferred);
         true
     }
 
     /// End the live queries of the circuit whose budget its state passed.
-    pub(super) fn live_budgets(&self, st: &mut Slot) {
+    pub(super) fn live_budgets(&self, st: &mut Slot, deferred: &mut DeferredDrops) {
         let bytes = st.circuit.bytes();
         let before = st.subs.len();
         st.subs.retain(|s| {
@@ -254,13 +254,16 @@ impl Runtime {
                 return true;
             }
             if let Some(sh) = s.shared.upgrade() {
-                sh.push(LiveEvent::Error {
-                    code: "over-budget".into(),
-                    message: format!(
-                        "the live query's state of {bytes} bytes passed its budget of {} bytes",
-                        s.budget
-                    ),
-                });
+                deferred.queued.extend(sh.push_leased(
+                    LiveEvent::Error {
+                        code: "over-budget".into(),
+                        message: format!(
+                            "the live query's state of {bytes} bytes passed its budget of {} bytes",
+                            s.budget
+                        ),
+                    },
+                    None,
+                ));
             }
             false
         });
@@ -282,21 +285,56 @@ impl Runtime {
     )> {
         let mut lease = st.circuit.scratch_lease();
         let mut decoded = Vec::new();
-        let mut bytes = 0u64;
         if let Some(snap) = &st.circuit.snap {
             for (r, w) in c {
-                let row: Vec<Option<Term>> =
-                    r.iter().map(|&i| st.circuit.terms.term(snap, i)).collect();
-                bytes = bytes.saturating_add(super::super::circuit::decoded_row_bytes(&row));
-                if lease.try_set(bytes).is_err() {
-                    drop(decoded);
-                    drop(lease);
-                    return None;
-                }
+                crate::incr::circuit::reserve_vec_slot(&decoded, &mut lease).ok()?;
+                let row = st
+                    .circuit
+                    .decode_row_budgeted(snap, None, r, &mut lease)
+                    .ok()?;
                 decoded.push((row, *w));
             }
         }
-        Some((decoded.into(), lease))
+        Some((
+            crate::incr::circuit::into_arc_rows(decoded, &mut lease).ok()?,
+            lease,
+        ))
+    }
+
+    /// Clone a live diff event's decoded rows into a replay-history entry under an
+    /// independent `ScratchLease`, returning `None` when replay cannot coexist with the
+    /// already-leased live event.
+    #[allow(clippy::type_complexity)]
+    fn history_from_diff_charged(
+        st: &Slot,
+        ev: &LiveEvent,
+    ) -> Option<(
+        Arc<[(Vec<Option<Term>>, i64)]>,
+        crate::incr::budget::ScratchLease,
+    )> {
+        let LiveEvent::Diff { removed, added, .. } = ev else {
+            return None;
+        };
+        let mut lease = st.circuit.scratch_lease();
+        let mut decoded = Vec::new();
+        for (rows, sign) in [(removed.as_ref(), -1i64), (added.as_ref(), 1i64)] {
+            for r in rows {
+                crate::incr::circuit::reserve_vec_slot(&decoded, &mut lease).ok()?;
+                lease
+                    .try_reserve(super::super::circuit::decoded_row_bytes(&r.terms))
+                    .ok()?;
+                let weight = if sign < 0 {
+                    (r.count as i64).wrapping_neg()
+                } else {
+                    r.count as i64
+                };
+                decoded.push((r.terms.clone(), weight));
+            }
+        }
+        Some((
+            crate::incr::circuit::into_arc_rows(decoded, &mut lease).ok()?,
+            lease,
+        ))
     }
 
     /// Send the change `c` from commit `from` to the circuit's commit to the
@@ -308,6 +346,7 @@ impl Runtime {
         c: Changes,
         c_lease: crate::incr::budget::ScratchLease,
         reset: bool,
+        deferred: &mut DeferredDrops,
     ) {
         st.prune_dead_subs();
         let to = st.circuit.applied;
@@ -329,7 +368,8 @@ impl Runtime {
             return;
         }
         let max = self.opts.read().history_commits;
-        let event = if st.circuit.kind == Kind::Ask {
+        let reset_rows = self.opts.read().reset_rows;
+        let (event, mut event_lease) = if st.circuit.kind == Kind::Ask {
             let delta: i64 = c.iter().map(|x| x.1).sum();
             drop(c);
             drop(c_lease);
@@ -338,15 +378,18 @@ impl Runtime {
             if (now - delta > 0) == (now > 0) {
                 return;
             }
-            LiveEvent::Value {
-                commit: to,
-                from,
-                value: now > 0,
-            }
-        } else if reset && (c.len() > self.opts.read().reset_rows || st.circuit.ordered()) {
+            (
+                LiveEvent::Value {
+                    commit: to,
+                    from,
+                    value: now > 0,
+                },
+                st.circuit.scratch_lease(),
+            )
+        } else if reset && (c.len() > reset_rows || st.circuit.ordered()) {
             // an ordered window's evaluation has no positions to diff: the subscribers
             // replace their copy
-            if c.len() > self.opts.read().reset_rows {
+            if c.len() > reset_rows {
                 drop(c);
                 drop(c_lease);
                 st.clear_history();
@@ -360,7 +403,31 @@ impl Runtime {
                 drop(c_lease);
                 st.clear_history();
             }
-            st.event(true)
+            let event_rows = st
+                .circuit
+                .ordered_row_count()
+                .unwrap_or_else(|| st.circuit.result.len());
+            if !st.subs.iter().any(|s| {
+                s.shared
+                    .upgrade()
+                    .is_some_and(|sh| sh.can_accept_rows(event_rows))
+            }) {
+                for s in &mut st.subs {
+                    if let Some(sh) = s.shared.upgrade() {
+                        deferred.queued.extend(sh.mark_overflow());
+                        s.last = to;
+                        self.counters.live_events.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
+            match st.event_budgeted(true) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    st.fail_live_subs(&e, deferred);
+                    return;
+                }
+            }
         } else if st.circuit.ordered() {
             // the positions come from the window: a row that moves nets out of `c`
             if let Some((rows, mut lease)) = Self::decode_history_charged(st, &c) {
@@ -373,36 +440,95 @@ impl Runtime {
                 drop(c_lease);
                 st.clear_history();
             }
-            match st.moves_event(from, to) {
-                Some(e) => e,
-                None => return,
+            let Some(event_rows) = st.circuit.moves_row_count() else {
+                return;
+            };
+            if event_rows == 0 {
+                return;
+            }
+            if !st.subs.iter().any(|s| {
+                s.shared
+                    .upgrade()
+                    .is_some_and(|sh| sh.can_accept_rows(event_rows))
+            }) {
+                for s in &mut st.subs {
+                    if let Some(sh) = s.shared.upgrade() {
+                        deferred.queued.extend(sh.mark_overflow());
+                        s.last = to;
+                        self.counters.live_events.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
+            match st.moves_event_budgeted(from, to) {
+                Ok(Some(pair)) => pair,
+                Ok(None) => return,
+                Err(e) => {
+                    st.fail_live_subs(&e, deferred);
+                    return;
+                }
             }
         } else {
-            let event = if let Some((rows, mut lease)) = Self::decode_history_charged(st, &c) {
+            if c.is_empty() {
                 drop(c);
                 drop(c_lease);
-                let empty = rows.is_empty();
-                let ev = (!empty).then(|| diff_event(from, to, rows.iter().cloned()));
-                st.remember_charged(from, to, rows, max, &mut lease);
-                drop(lease);
-                ev
-            } else {
-                st.clear_history();
-                let ev = if c.is_empty() {
-                    None
+                st.remember(from, to, Arc::from(Vec::new()), max);
+                return;
+            }
+            let event_rows = c.len();
+            if !st.subs.iter().any(|s| {
+                s.shared
+                    .upgrade()
+                    .is_some_and(|sh| sh.can_accept_rows(event_rows))
+            }) {
+                if let Some((rows, mut lease)) = Self::decode_history_charged(st, &c) {
+                    drop(c);
+                    drop(c_lease);
+                    st.remember_charged(from, to, rows, max, &mut lease);
+                    drop(lease);
                 } else {
-                    let rows = st.circuit.decode_rows(&c);
-                    Some(diff_event(from, to, rows.into_iter()))
-                };
-                drop(c);
-                drop(c_lease);
-                ev
-            };
-            match event {
-                Some(e) => e,
-                None => return,
+                    drop(c);
+                    drop(c_lease);
+                    st.clear_history();
+                }
+                for s in &mut st.subs {
+                    if let Some(sh) = s.shared.upgrade() {
+                        deferred.queued.extend(sh.mark_overflow());
+                        s.last = to;
+                        self.counters.live_events.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
+            // Build and bound the live event independently of replay history so replay
+            // refusal never triggers an unbounded decode, and replay cannot steal the
+            // live event's lease.
+            let built = st.diff_event_budgeted(from, to, &c);
+            drop(c);
+            drop(c_lease);
+            match built {
+                Ok(Some((ev, ev_lease))) => {
+                    // Best-effort replay admission while `ev_lease` keeps `ev` covered.
+                    if let Some((rows, mut hist_lease)) = Self::history_from_diff_charged(st, &ev) {
+                        st.remember_charged(from, to, rows, max, &mut hist_lease);
+                        drop(hist_lease);
+                    } else {
+                        st.clear_history();
+                    }
+                    (ev, ev_lease)
+                }
+                Ok(None) => {
+                    st.remember(from, to, Arc::from(Vec::new()), max);
+                    return;
+                }
+                Err(e) => {
+                    st.clear_history();
+                    st.fail_live_subs(&e, deferred);
+                    return;
+                }
             }
         };
+        let shared_lease = st.detach_event_lease(&mut event_lease);
         for s in &mut st.subs {
             if let Some(sh) = s.shared.upgrade() {
                 // a diff starts from the subscriber's latest event, which commits that
@@ -413,10 +539,17 @@ impl Runtime {
                     _ => {}
                 }
                 s.last = to;
-                sh.push(e);
+                deferred
+                    .queued
+                    .extend(sh.push_leased(e, shared_lease.clone()));
                 self.counters.live_events.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // Keep `event` and `shared_lease` alive until outside `cell.state.lock()` so a
+        // lease with zero remaining subscribers never releases credit under the mutex.
+        deferred
+            .queued
+            .push(crate::incr::live::QueuedEvent::new(event, shared_lease));
     }
 
     /// Suspend the views whose circuit passed their budget or the pool's.

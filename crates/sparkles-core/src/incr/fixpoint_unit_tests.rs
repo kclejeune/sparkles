@@ -26,6 +26,8 @@ struct Tally {
     inner: HashStore<u32, u32>,
     reserved: Cell<u64>,
     peak: Cell<u64>,
+    pass_reserved: Cell<u64>,
+    pass_min: Cell<u64>,
     cap: Option<u64>,
 }
 
@@ -35,6 +37,8 @@ impl Tally {
             inner: HashStore::new(8),
             reserved: Cell::new(0),
             peak: Cell::new(0),
+            pass_reserved: Cell::new(0),
+            pass_min: Cell::new(0),
             cap,
         }
     }
@@ -93,6 +97,18 @@ impl FactStore<u32, u32> for Tally {
     fn release(&self, bytes: u64) {
         // an underflow is a release of more than was reserved
         self.reserved.set(self.reserved.get() - bytes);
+    }
+
+    fn reserve_pass(&self, bytes: u64) -> std::result::Result<(), Oops> {
+        let now = self.pass_reserved.get() + bytes;
+        self.pass_reserved.set(now);
+        Ok(())
+    }
+
+    fn release_pass(&self, bytes: u64) {
+        let now = self.pass_reserved.get() - bytes;
+        self.pass_reserved.set(now);
+        self.pass_min.set(self.pass_min.get().min(now));
     }
 }
 
@@ -585,4 +601,34 @@ fn the_top_limit_refuses_an_overflow() {
         grow_charged(None, Some((u64::MAX, u64::MAX - 8)), &mut v, &mut held, 1);
     assert!(matches!(r, Err(Error::BudgetExceeded(_))));
     assert_eq!(v.capacity(), 0);
+}
+
+/// Deleting previously retained lineage annotations during `advance_one_step` must not
+/// release credit from shared `pass_bytes` that covers another live allocation (such as
+/// a path edge memo).
+#[test]
+fn annotation_deletion_does_not_release_unrelated_pass_bytes() {
+    let p = Count::<false>::new(1, 5);
+    let mut fp = FixedPoint::new(p);
+    fp.set_provenance(Provenance::Lineage);
+    let built = fp.build(&mut (), None).unwrap();
+    assert_eq!(built.len(), 5);
+    assert_eq!(fp.store().reserved.get(), 0);
+
+    // Simulate a new pass after commit: prior annotations live in `state_bytes`, while
+    // an edge memo holds 4096 bytes in shared `pass_bytes`.
+    let memo_bytes = 4096u64;
+    fp.store().pass_reserved.set(memo_bytes);
+    fp.store().pass_min.set(memo_bytes);
+    fp.program.broken = 5;
+    fp.program.axioms = 0;
+    let delta = fp.advance(&mut (), None).unwrap();
+    assert_eq!(delta.len(), 5);
+    assert_eq!(
+        fp.store().pass_min.get(),
+        memo_bytes,
+        "deleting retained annotations must never subtract from another allocation's pass_bytes"
+    );
+    assert_eq!(fp.store().pass_reserved.get(), memo_bytes);
+    assert_eq!(fp.store().reserved.get(), 0);
 }

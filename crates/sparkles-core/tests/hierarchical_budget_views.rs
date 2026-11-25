@@ -710,7 +710,7 @@ fn circuit_reset_at_over_50_percent_occupancy_succeeds_without_2x_oom() {
     let store = Store::in_memory(StoreOptions::default());
     // DISTINCT keeps both operator `weights` ZSet and `result` ZSet (~2x row state).
     // On a reset, old operator state must be cleared and `before` moved without 2x
-    // double-counting so a view occupying ~65% of its budget resets cleanly.
+    // double-counting so a view occupying over half its budget resets cleanly.
     load_rows(&store, "rst", 600, 16);
 
     // First measure the view's steady-state bytes on a generous pool.
@@ -734,9 +734,9 @@ fn circuit_reset_at_over_50_percent_occupancy_succeeds_without_2x_oom() {
     assert!(steady_bytes > 0);
     probe_rt.close(&store);
 
-    // Choose a local limit where steady-state occupies ~65% (> 50%): old 2x reset bug
-    // would need > 130% and fail over-budget.
-    let limit = (steady_bytes * 100) / 65;
+    // Keep enough room for the rebuild's admitted output vector while keeping the
+    // ceiling below two retained states.
+    let limit = steady_bytes * 19 / 10;
     let pool = QueryPool::new(16 * MB);
     let rt = Runtime::open_with_pool(
         None,
@@ -752,7 +752,7 @@ fn circuit_reset_at_over_50_percent_occupancy_succeeds_without_2x_oom() {
     rt.round(&store);
     assert!(
         matches!(rt.get(&store, "d").unwrap().state, ViewState::Current),
-        "initial build must succeed at ~65% occupancy"
+        "initial build must succeed above half of the budget"
     );
 
     // Trigger an inference switch -> next round runs `Circuit::reset` (old `result`
@@ -1305,66 +1305,92 @@ fn reentrant_waker_during_sync_inference_discard_and_close_checkpoint_panic() {
 }
 
 /// Proves that an incomplete-delta reset of a grouped view with > LIVE_SLACK (1 MiB) of
-/// old operator state and a tiny result succeeds inside a tight `QueryPool` by recycling
-/// detached credit from `BudgetState::retired` instead of stranding it until round end.
+/// freed operator state and a tiny result succeeds inside a tight `QueryPool` by
+/// recycling detached credit from `BudgetState::retired` instead of stranding it until
+/// round end.
 #[test]
 fn tight_pool_incomplete_delta_reset_recycles_retired_operator_credit_above_live_slack() {
-    use sparkles_core::incr::circuit::{Circuit, DeltaSet};
+    use sparkles_core::incr::circuit::Circuit;
     use sparkles_core::incr::compile::compile;
     use sparkles_core::sparql::parse_query;
     use sparkles_core::task::Control;
 
     let store = Store::in_memory(StoreOptions::default());
-    // 48,000 rows across 8 groups with `GROUP_CONCAT` (`AState::Rows`) -> > 1.6 MiB of
-    // Group operator state (well above LIVE_SLACK = 1 MiB) and an 8-row tiny result.
-    for batch in 0..24 {
-        let mut insert = String::from("INSERT DATA { ");
-        for i in 0..2000 {
-            let id = batch * 2000 + i;
-            let g = id % 8;
-            insert.push_str(&format!(
-                "<urn:gr:{id}> <urn:g> <urn:grp:{g}> ; <urn:o> \"val-{id}\" . "
-            ));
+    // Decimal DISTINCT sums retain both the distinct-value table and the numeric
+    // map, while a single-column BGP emits compact rows and the result is one integer.
+    for batch in 0..18 {
+        let mut insert = String::from("INSERT DATA { <urn:g> <urn:o> ");
+        for i in 0..1500 {
+            if i > 0 {
+                insert.push_str(", ");
+            }
+            use std::fmt::Write;
+            write!(insert, "{}.0", batch * 1500 + i).unwrap();
         }
-        insert.push('}');
+        insert.push_str(" }");
         upd(&store, &insert);
     }
-
-    let q_str =
-        "SELECT ?g (GROUP_CONCAT(?o) AS ?all) WHERE { ?s <urn:g> ?g . ?s <urn:o> ?o } GROUP BY ?g";
+    let q_str = "SELECT (SUM(DISTINCT ?o) AS ?sum) WHERE { <urn:g> <urn:o> ?o }";
     let q = parse_query(q_str, None, &[]).unwrap();
-
-    // Measure steady-state bytes and peak on a generous pool.
-    let probe_pool = QueryPool::new(64 * MB);
     let mut probe = Circuit::new(compile(&q, None).unwrap(), None);
-    probe.set_pool(Some(probe_pool.clone()), Some(probe_pool.work_parent()));
-    probe.build(store.snapshot(), &Control::none()).unwrap();
-    let steady_bytes = probe.bytes();
-    assert!(
-        steady_bytes > 1_500_000,
-        "grouped view operator state must exceed LIVE_SLACK (1 MiB), got {steady_bytes}"
+    let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let peak_out = peak.clone();
+    let used_grow = used.clone();
+    let used_release = used.clone();
+    use std::sync::atomic::Ordering::Relaxed;
+    let parent = sparkles_budget::MemoryDomain::unpooled().parent(
+        move |bytes| {
+            peak_out.fetch_max(used_grow.fetch_add(bytes, Relaxed) + bytes, Relaxed);
+            Ok(())
+        },
+        move |bytes| {
+            used_release.fetch_sub(bytes, Relaxed);
+        },
     );
-    let steady_granted = probe_pool.granted();
+    probe.set_pool(None, Some(parent));
+    probe.build(store.snapshot(), &Control::none()).unwrap();
+    let op_bytes = probe.root.bytes();
+    let result_and_terms = probe.bytes() - op_bytes;
+    assert!(op_bytes > 1200 * KB, "operator bytes: {op_bytes}");
+    assert!(
+        result_and_terms < 4 * KB,
+        "result and terms: {result_and_terms}"
+    );
     drop(probe);
-    assert_eq!(probe_pool.granted(), 0);
-
-    // Build on a tight pool (~1.45× steady-state): enough for the old tiny result plus
-    // the full replacement pass, but strictly less than 2× steady-state (which would fail
-    // if `shrink_state_to(0)` stranded > 1 MiB in `BudgetState::retired`).
-    let tight_cap = ((steady_granted as f64) * 1.45) as u64;
+    assert_eq!(used.load(Relaxed), 0);
+    // Allow the measured fresh build and the tiny prior result. With the same build
+    // peak, a reset cannot afford to leave a retired block of old operator credit idle.
+    let tight_cap = peak.load(Relaxed) + 128 * KB;
     let pool = QueryPool::new(tight_cap);
-    let mut circ = Circuit::new(compile(&q, None).unwrap(), None);
-    circ.set_pool(Some(pool.clone()), Some(pool.work_parent()));
-    circ.build(store.snapshot(), &Control::none()).unwrap();
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(OpenHost));
+    let mut def = ViewDef::table(q_str);
+    def.memory_bytes = 64 * MB;
+    rt.put(&store, "tight_v", def).unwrap();
+    rt.round(&store);
+    assert!(matches!(
+        rt.get(&store, "tight_v").unwrap().state,
+        ViewState::Current
+    ));
     assert!(pool.granted() > MB);
 
-    // Apply an incomplete-delta reset directly (simulating a bulk commit or gap reset
-    // without draining `retired` between `shrink_state_to(0)` and `root.init`).
-    let mut incomplete = DeltaSet::at(store.snapshot());
-    incomplete.complete = false;
-    circ.advance(&incomplete, &Control::none())
-        .expect("incomplete-delta reset must recycle retired >1 MiB operator credit in tight pool");
-    drop(circ);
+    // Trigger a reset (`Slot::evaluate` -> `Circuit::reset_charged`) after the drained
+    // initial build: `shrink_state_to(0)` detaches > 1 MiB of old `Group` state into
+    // `BudgetState::retired`, which the replacement `root.init` recycles mid-pass.
+    rt.rebuild("tight_v").unwrap();
+    rt.round(&store);
+    assert!(
+        matches!(rt.get(&store, "tight_v").unwrap().state, ViewState::Current),
+        "reset must recycle >1 MiB retired operator credit in tight pool: {:?}",
+        rt.get(&store, "tight_v").unwrap().state
+    );
+    rt.close(&store);
     assert_eq!(pool.granted(), 0);
 }
 
@@ -1599,7 +1625,7 @@ fn live_subscriber_drop_and_runtime_fail_lower_shared_circuit_limit() {
 
     // Apply a commit causing a large transient Cartesian join (> 1 MiB) while the grouped
     // result stays 1 row. The VERY FIRST worker pass must prune the departed subscriber
-    // and enforce `narrow_v`'s 64 KiB cap mid-pass.
+    // and enforce `narrow_v`'s 256 KiB cap mid-pass.
     let mut cross = String::from("INSERT DATA { ");
     for i in 1..200 {
         cross.push_str(&format!(
@@ -1613,7 +1639,7 @@ fn live_subscriber_drop_and_runtime_fail_lower_shared_circuit_limit() {
     let info = rt.get(&store, "narrow_v").unwrap();
     assert!(
         matches!(&info.state, ViewState::Suspended { reason } if reason.contains("over-budget")),
-        "first pass after dropping larger live subscriber must enforce narrow view's 64 KiB cap: {:?}",
+        "first pass after dropping larger live subscriber must enforce narrow view's 256 KiB cap: {:?}",
         info.state
     );
 
@@ -1667,6 +1693,388 @@ fn live_subscriber_drop_and_runtime_fail_lower_shared_circuit_limit() {
 
     rt.close(&store);
     rt2.close(&store2);
+    drop(_wide2);
     assert_eq!(pool.granted(), 0);
     assert_eq!(pool2.granted(), 0);
+}
+
+/// Proves Finding 1: when a compact diff fits in the circuit's budget while its decoded
+/// terms exceed the budget, live publication must NOT fall back to an unbounded
+/// `decode_rows`, must fail the live subscriber with `over-budget`, and must leave a
+/// co-located named view healthy. Also proves that when a live event fits without replay,
+/// replay is dropped while the live event succeeds and stays leased until consumed.
+#[test]
+fn live_publication_bounds_decoded_diff_when_compact_diff_fits_and_replay_refuses() {
+    use sparkles_core::incr::{LiveEvent, LiveOptions};
+
+    let store = Store::in_memory(StoreOptions::default());
+    upd(&store, "INSERT DATA { <urn:seed> <urn:p> \"ok\" }");
+
+    let pool = QueryPool::new(16 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(OpenHost));
+
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let mut vdef = ViewDef::table(q);
+    vdef.memory_bytes = 48 * KB;
+    rt.put(&store, "compact_view", vdef).unwrap();
+    rt.round(&store);
+
+    let live = rt
+        .live(
+            &store,
+            q,
+            None,
+            &LiveOptions {
+                max_memory_bytes: Some(48 * KB),
+                ..LiveOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(live.try_next(), Some(LiveEvent::Snapshot { .. })));
+
+    // Part 1: 40 rows with 4 KiB literals (~160 KiB decoded terms, < 4 KiB compact IDs).
+    // Compact circuit state fits easily in 48 KiB, but decoding the live diff exceeds
+    // 48 KiB -> live subscriber receives `over-budget` Error, while `compact_view` stays Current.
+    let mut big = String::from("INSERT DATA { ");
+    for i in 0..40 {
+        big.push_str(&format!("<urn:l:{i}> <urn:p> \"{}\" . ", "x".repeat(4096)));
+    }
+    big.push('}');
+    upd(&store, &big);
+    rt.round(&store);
+
+    match live.try_next() {
+        Some(LiveEvent::Error { code, .. }) => assert_eq!(code, "over-budget"),
+        other => {
+            panic!("expected over-budget error when decoded diff exceeds 48 KiB cap, got {other:?}")
+        }
+    }
+    assert!(
+        matches!(
+            rt.get(&store, "compact_view").unwrap().state,
+            ViewState::Current
+        ),
+        "co-located named view whose compact state fits must stay Current"
+    );
+    drop(live);
+    rt.close(&store);
+    assert_eq!(pool.granted(), 0);
+
+    // Part 2: Event fits alone (~24 KiB in a 36 KiB cap) while event + replay (~48 KiB)
+    // does not -> replay is cleared, live diff STILL succeeds, and its lease keeps the
+    // queued payload charged until popped.
+    let store2 = Store::in_memory(StoreOptions::default());
+    upd(&store2, "INSERT DATA { <urn:s0> <urn:p> \"seed\" }");
+    let pool2 = QueryPool::new(16 * MB);
+    let rt2 = Runtime::open_with_pool(
+        None,
+        store2.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool2.clone()),
+    );
+    rt2.set_host(Arc::new(OpenHost));
+    let live2 = rt2
+        .live(
+            &store2,
+            q,
+            None,
+            &LiveOptions {
+                max_memory_bytes: Some(36 * KB),
+                ..LiveOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(live2.try_next(), Some(LiveEvent::Snapshot { .. })));
+
+    let mut med = String::from("INSERT DATA { ");
+    for i in 0..12 {
+        med.push_str(&format!("<urn:m:{i}> <urn:p> \"{}\" . ", "y".repeat(2000)));
+    }
+    med.push('}');
+    upd(&store2, &med);
+    rt2.round(&store2);
+
+    let before_read = pool2.granted();
+    match live2.try_next() {
+        Some(LiveEvent::Diff { added, .. }) => assert_eq!(added.len(), 12),
+        other => panic!(
+            "live diff fitting alone must succeed even when replay cannot coexist, got {other:?}"
+        ),
+    }
+    assert!(
+        before_read >= pool2.granted() + 24_000,
+        "queued terms must hold pool credit through dequeue"
+    );
+    drop(live2);
+    rt2.close(&store2);
+    assert_eq!(pool2.granted(), 0);
+}
+
+/// Proves Finding 2: when retained tally counts occupy most of an accumulator's budget
+/// and the next commit's compact BGP delta exceeds the residual credit, `advance_charged`
+/// reclaims old tally counts through `ViewBudget::reclaim` instead of fatally failing the
+/// healthy accumulator handle.
+#[test]
+fn accumulator_pass_evicts_retained_tally_counts_instead_of_failing_handle() {
+    let store = Store::in_memory(StoreOptions::default());
+    let pool = QueryPool::new(16 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(OpenHost));
+
+    let mut spec = InternalSpec::accumulator(
+        "ic_reclaim_during_pass",
+        "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+        vec!["s"],
+    );
+    spec.max_memory_bytes = 112 * KB;
+    let acc = rt
+        .attach_internal(&store, spec, InternalAccess::everything())
+        .unwrap();
+
+    // Build the retained tally in small commits so their decoded scratch fits while
+    // the tally grows toward the ceiling.
+    for batch in 0..9 {
+        let mut insert = String::from("INSERT DATA { ");
+        for i in 0..12 {
+            insert.push_str(&format!(
+                "<urn:old:{}:{batch}:{i}> <urn:p> \"v\" . ",
+                "a".repeat(370)
+            ));
+        }
+        insert.push('}');
+        upd(&store, &insert);
+        rt.round(&store);
+    }
+    let c1 = store.snapshot().commit;
+    let retained = acc.bytes();
+    assert!(
+        retained > 85 * KB && retained <= 112 * KB,
+        "retained tally must fill most of the cap, got {retained}"
+    );
+
+    assert!(
+        acc.counts(0).unwrap().unknown.is_none(),
+        "all old counts must still be present"
+    );
+
+    // The compact pass emits many rows, all with the same tally key.
+    let mut insert = String::from("INSERT DATA { ");
+    for i in 0..900 {
+        insert.push_str(&format!("<urn:new> <urn:p> {i} . "));
+    }
+    insert.push('}');
+    upd(&store, &insert);
+    rt.round(&store);
+
+    let counts = acc
+        .counts(c1)
+        .expect("accumulator must evict old tally counts during pass instead of failing handle");
+    assert!(
+        counts.unknown.is_none(),
+        "Commit 2 counts must be recorded cleanly after reclaiming Commit 1 tally, got {:?}",
+        counts.unknown
+    );
+    assert_eq!(counts.keys.len(), 1);
+    assert_eq!(counts.keys[0].1, 900);
+    assert!(
+        acc.counts(0).unwrap().unknown.is_some(),
+        "Commit 1 counts should have been evicted to make room for Commit 2's pass"
+    );
+
+    drop(acc);
+    rt.close(&store);
+    assert_eq!(pool.granted(), 0);
+}
+
+/// Proves Finding 4: `advance_charged` pre-admits co-resident persistent `self.result`
+/// growth before cloning delta rows into `self.result`, so a pass where the compact delta
+/// alone fits but `delta + result` exceeds the local cap refuses cleanly before growing
+/// `self.result` past the cap.
+#[test]
+fn advance_charged_pre_admits_result_growth_alongside_compact_delta() {
+    use sparkles_core::incr::circuit::{Circuit, DeltaSet};
+    use sparkles_core::incr::compile::compile;
+    use sparkles_core::sparql::parse_query;
+    use sparkles_core::task::Control;
+
+    let store = Store::in_memory(StoreOptions::default());
+    upd(&store, "INSERT DATA { <urn:s0> <urn:p> \"0\" }");
+    let q = parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
+
+    let pool = QueryPool::new(16 * MB);
+    let mut circ = Circuit::new(compile(&q, None).unwrap(), None);
+    circ.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+    circ.build(store.snapshot(), &Control::none()).unwrap();
+    let base_commit = circ.applied;
+
+    // One new two-column row needs 112 bytes for the compact output alongside
+    // the existing 56-byte result key. A second retained key takes another 56.
+    upd(&store, "INSERT DATA { <urn:s1> <urn:p> 1 }");
+    let d = DeltaSet::read(&store, base_commit, &Control::none());
+    circ.max_memory_bytes = Some(190);
+    let err = match circ.advance(&d, &Control::none()) {
+        Err(e) => e,
+        Ok(_) => panic!("the retained key must be admitted alongside the output"),
+    };
+    assert!(matches!(
+        err,
+        sparkles_core::error::Error::BudgetExceeded(_)
+    ));
+    assert_eq!(
+        circ.result.len(),
+        1,
+        "the refused key must never be inserted"
+    );
+    drop(circ);
+    assert_eq!(pool.granted(), 0);
+}
+
+/// Proves Finding 6: an annotated `EXISTS` delta touching many left rows with large
+/// right-side lineage annotations meters `ds` growth and refuses cleanly under a tight
+/// budget instead of sweeping unbounded annotation unions ahead of admission.
+#[test]
+fn annotated_exists_delta_bounds_ds_annotation_union_under_tight_cap() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut seed = String::from("INSERT DATA { <urn:r0> <urn:rk> <urn:k> . ");
+    for i in 0..80 {
+        seed.push_str(&format!("<urn:l{i}> <urn:lk> <urn:k> . "));
+    }
+    seed.push('}');
+    upd(&store, &seed);
+
+    let pool = QueryPool::new(16 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(OpenHost));
+
+    let spec = InternalSpec::rows(
+        "ic_exists_lineage",
+        "SELECT ?s ?k WHERE { ?s <urn:lk> ?k . FILTER EXISTS { ?r <urn:rk> ?k } }",
+    )
+    .with_provenance(sparkles_core::incr::prov::Provenance::Lineage)
+    .with_memory(300 * KB);
+    let ic = rt
+        .attach_internal(&store, spec, InternalAccess::everything())
+        .unwrap();
+    assert_eq!(ic.rows().unwrap().rows.len(), 80);
+
+    // The right insertions touch the old left rows, so the pass builds their
+    // annotation unions. The same commit deletes those left rows. The final
+    // empty result fits, while all the intermediate unions do not.
+    let mut rhs = String::from("DELETE WHERE { ?s <urn:lk> ?k }; INSERT DATA { ");
+    for j in 1..=30 {
+        rhs.push_str(&format!("<urn:r{j}> <urn:rk> <urn:k> . "));
+    }
+    rhs.push('}');
+    upd(&store, &rhs);
+    rt.round(&store);
+
+    let err = ic
+        .rows()
+        .expect_err("annotated EXISTS delta with oversized ds union must fail over-budget");
+    assert!(
+        err.to_string().contains("budget") || err.to_string().contains("memory"),
+        "expected budget refusal, got {err:?}"
+    );
+    drop(ic);
+    rt.close(&store);
+    assert_eq!(pool.granted(), 0);
+}
+
+/// Proves Finding 7: `Group::bytes` and `Group::load` use the exact same byte accounting
+/// for `SUM(DISTINCT ...)` numeric maps (`decs`, `floats`, `doubles`), so checkpoint
+/// recovery succeeds at the exact steady-state byte ceiling.
+#[test]
+fn distinct_sum_checkpoint_recovery_matches_steady_state_bytes() {
+    use sparkles_core::incr::circuit::Circuit;
+    use sparkles_core::incr::compile::compile;
+    use sparkles_core::sparql::parse_query;
+    use sparkles_core::task::Control;
+
+    let store = Store::in_memory(StoreOptions::default());
+    let mut seed = String::from("INSERT DATA { ");
+    for i in 0..200 {
+        seed.push_str(&format!(
+            "<urn:d{i}> <urn:g> <urn:g1> ; <urn:v> \"{i}.25\"^^<http://www.w3.org/2001/XMLSchema#decimal> . "
+        ));
+        seed.push_str(&format!(
+            "<urn:f{i}> <urn:g> <urn:g2> ; <urn:v> \"{i}.5e0\"^^<http://www.w3.org/2001/XMLSchema#double> . "
+        ));
+    }
+    seed.push('}');
+    upd(&store, &seed);
+
+    let q = parse_query(
+        "SELECT ?g (SUM(DISTINCT ?v) AS ?sum) WHERE { ?x <urn:g> ?g ; <urn:v> ?v } GROUP BY ?g",
+        None,
+        &[],
+    )
+    .unwrap();
+    let snap = store.snapshot();
+    let pool = QueryPool::new(16 * MB);
+    let mut circ = Circuit::new(compile(&q, None).unwrap(), None);
+    circ.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+    circ.build(snap.clone(), &Control::none()).unwrap();
+    let steady = circ.bytes();
+    // 200 decimals (200 * 40 = 8,000) + 200 doubles (200 * 24 = 4,800) must be included
+    // in `steady` on top of `vals` (400 * 24 = 9,600).
+    assert!(
+        steady >= 8_000 + 4_800 + 9_600,
+        "Group::bytes must include SumState numeric maps for AState::Values, got {steady}"
+    );
+    let body = circ.encode(&snap).unwrap();
+    drop(circ);
+    assert_eq!(pool.granted(), 0);
+
+    // Include the checkpoint buffer and the reader's ID table. The term table
+    // starts with the varint count of serialized IDs, excluding UNDEF.
+    let mut keys = 0usize;
+    for (shift, &byte) in body.iter().enumerate() {
+        keys |= usize::from(byte & 0x7f) << (7 * shift);
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    let slots = (keys + 1).next_power_of_two().max(4);
+    let peak =
+        steady + body.len() as u64 + (slots * std::mem::size_of::<sparkles_core::id::Id>()) as u64;
+    let mut recovered = Circuit::new(compile(&q, None).unwrap(), None);
+    recovered.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+    recovered.max_memory_bytes = Some(peak);
+    recovered
+        .decode(&body, &snap)
+        .expect("checkpoint decode must succeed at the exact decode peak");
+    assert_eq!(recovered.bytes(), steady);
+    drop(recovered);
+    assert_eq!(pool.granted(), 0);
+
+    // One byte tighter must refuse cleanly, proving `Group::load` and `Group::bytes`
+    // agree on the exact byte total for `AState::Values` numeric maps.
+    let mut too_tight = Circuit::new(compile(&q, None).unwrap(), None);
+    too_tight.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+    too_tight.max_memory_bytes = Some(peak - 1);
+    assert!(
+        matches!(
+            too_tight.decode(&body, &snap),
+            Err(sparkles_core::error::Error::BudgetExceeded(_))
+        ),
+        "checkpoint decode 1 byte below the exact decode peak must refuse"
+    );
+    drop(too_tight);
+    assert_eq!(pool.granted(), 0);
 }

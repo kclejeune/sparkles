@@ -716,3 +716,38 @@ fn a_loaded_window_refreshes_within_its_own_size() {
     assert!(!w.stale());
     assert_eq!(w.rows(), before);
 }
+
+#[test]
+fn skipped_pass_releases_admitted_window_moves() {
+    let store = Store::in_memory(StoreOptions::default());
+    upd(
+        &store,
+        &format!("INSERT DATA {{ {} }}", ints(100, 200, i64::from)),
+    );
+    let mut c = compiled("SELECT ?s ?v WHERE { ?s :v ?v } ORDER BY ?v LIMIT 100");
+    c.max_memory_bytes = Some(1 << 20);
+    c.build(store.snapshot(), &Control::none()).unwrap();
+
+    upd(
+        &store,
+        &format!("INSERT DATA {{ {} }}", ints(0, 100, i64::from)),
+    );
+    let d = DeltaSet::read(&store, c.applied, &Control::none());
+    c.advance(&d, &Control::none()).unwrap();
+    let moves = window(&mut c).moves.as_ref().unwrap();
+    assert_eq!((moves.removed.len(), moves.added.len()), (100, 100));
+    let move_bytes = moves.bytes(2);
+    let remaining = c.budget_handle().remaining_local().unwrap();
+
+    upd(&store, "INSERT DATA { :s :unrelated 0 }");
+    let d = DeltaSet::read(&store, c.applied, &Control::none());
+    assert!(matches!(
+        c.advance(&d, &Control::none()).unwrap(),
+        crate::incr::circuit::Advance::Skipped
+    ));
+    assert!(window(&mut c).moves.is_none());
+    assert_eq!(
+        c.budget_handle().remaining_local(),
+        Some(remaining + move_bytes)
+    );
+}

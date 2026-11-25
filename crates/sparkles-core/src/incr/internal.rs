@@ -299,90 +299,53 @@ impl Tally {
         self.bytes() < before
     }
 
-    /// Count the change `c` of the circuit's result in `commit`: the absolute weight of
-    /// each row, which holds the key and the fact, summed per key. `term` decodes an id
-    /// of the change.
-    #[cfg(test)]
-    pub(crate) fn add(&mut self, commit: u64, c: &Changes, term: impl Fn(Id) -> Option<Term>) {
-        let mut dirty = false;
-        let _ = self.add_budgeted_charged(
-            commit,
-            c.clone(),
-            super::budget::ScratchLease::default(),
-            term,
-            None,
-            &mut dirty,
-        );
-    }
-
-    /// Reserve `next_bytes` on `scratch`, evicting oldest tally commits in batches if
-    /// needed to stay within the circuit's budget or parent `QueryPool`. Only returns an
-    /// error when the tally has nothing left to reclaim for `next_bytes`.
-    fn reserve_or_shrink(
-        &mut self,
-        circuit: Option<&super::circuit::Circuit>,
-        dirty: &mut bool,
-        scratch: &mut super::budget::ScratchLease,
-        next_bytes: u64,
-    ) -> Result<()> {
-        while let Err(e) = scratch.try_set(next_bytes) {
-            let Some(circ) = circuit else {
-                return Err(e);
-            };
-            let cur = self.bytes();
-            if cur == 0 {
-                return Err(e);
-            }
-            let target = circ
-                .max_memory_bytes
-                .map(|max| max.saturating_sub(circ.bytes()).saturating_sub(next_bytes))
-                .unwrap_or(cur / 2)
-                .min(cur.saturating_sub(1));
-            if self.shrink_to(target) {
-                *dirty = true;
-            }
-            if self.bytes() == cur && !self.shrink_spare_capacity() {
-                if self.shrink_to(cur / 2) {
-                    *dirty = true;
-                }
-                if self.bytes() == cur {
-                    if let Some(last_commit) = self.entries.back().map(|e| e.0) {
-                        self.discard_through(last_commit);
-                        self.shrink_spare_capacity();
-                        *dirty = true;
-                    }
-                    if self.bytes() == cur {
-                        return Err(e);
-                    }
-                }
-            }
-            circ.set_external_best_effort(self.bytes());
+    /// Reclaim up to `needed` bytes for `ViewBudget`'s external reclaim hook, shedding
+    /// spare capacity first and then evicting oldest commits' counts. Returns
+    /// `(freed_bytes, evicted_commits)`.
+    pub(crate) fn evict_for_reclaim(&mut self, needed: u64) -> (u64, bool) {
+        let before = self.bytes();
+        if before == 0 || needed == 0 {
+            return (0, false);
         }
-        Ok(())
-    }
-
-    fn abandon_oversized_commit(
-        &mut self,
-        commit: u64,
-        circuit: Option<&super::circuit::Circuit>,
-        dirty: &mut bool,
-    ) {
-        self.discard_through(commit);
-        self.clear_storage();
-        if let Some(circ) = circuit {
-            circ.set_external_best_effort(0);
+        let target = before.saturating_sub(needed);
+        let mut evicted = false;
+        if self.shrink_spare_capacity() && self.bytes() <= target {
+            return (before - self.bytes(), false);
         }
-        *dirty = true;
+        if self.shrink_to(target) {
+            evicted = true;
+        }
+        if self.bytes() > target {
+            self.shrink_spare_capacity();
+        }
+        while self.bytes() > target {
+            let prev = self.bytes();
+            if let Some(last_commit) = self.entries.back().map(|e| e.0) {
+                self.discard_through(last_commit);
+                self.shrink_spare_capacity();
+                evicted = true;
+            } else if let Some(&(_, last_unk)) = self.unknown.last() {
+                self.discard_through(last_unk);
+                self.shrink_spare_capacity();
+                evicted = true;
+            } else {
+                self.clear_storage();
+                evicted = true;
+                break;
+            }
+            if self.bytes() >= prev {
+                self.clear_storage();
+                evicted = true;
+                break;
+            }
+        }
+        (before.saturating_sub(self.bytes()), evicted)
     }
 
-    /// Like [`add`](Self::add), taking ownership of `c` and its `c_lease` so `c` stays
-    /// charged while aggregated into `per` and is freed before decoding keys. Pre-admits
-    /// transient scratch and key/entry growth against `circuit`'s budget, evicting oldest
-    /// commits first. If a single commit's counts still exceed the remaining budget after
-    /// evicting prior counts, records `commit` as unavailable (`discard_through(commit)`)
-    /// per F13 §3.6 without failing the healthy circuit.
-    pub(crate) fn add_budgeted_charged(
-        &mut self,
+    /// Count one commit with the compact input and decoded keys admitted separately.
+    /// Budget calls happen outside the tally lock, so they can reclaim old counts.
+    pub(crate) fn add_budgeted_charged_shared(
+        tally: &parking_lot::Mutex<Tally>,
         commit: u64,
         c: Changes,
         c_lease: super::budget::ScratchLease,
@@ -390,22 +353,34 @@ impl Tally {
         circuit: Option<&super::circuit::Circuit>,
         dirty: &mut bool,
     ) -> Result<()> {
+        let key_cols = tally.lock().key_cols.clone();
         let mut scratch = super::budget::ScratchLease::new(circuit.map(|c| c.budget_handle()));
         let mut per: FxHashMap<Box<[Id]>, u64> = FxHashMap::default();
-        let key_slot = (self.key_cols.len() as u64) * 8 + 40;
+        let key_slot = (key_cols.len() as u64) * 8 + 40;
+        let abandon = |tally: &parking_lot::Mutex<Tally>, dirty: &mut bool| {
+            {
+                let mut t = tally.lock();
+                t.discard_through(commit);
+                t.clear_storage();
+            }
+            if let Some(circ) = circuit {
+                circ.set_external_best_effort(0);
+            }
+            *dirty = true;
+        };
         for (row, w) in &c {
-            let key: Box<[Id]> = self.key_cols.iter().map(|&i| row[i]).collect();
+            let key: Box<[Id]> = key_cols.iter().map(|&i| row[i]).collect();
             if !per.contains_key(&key) {
                 let next_bytes = (per.len() as u64 + 1).saturating_mul(key_slot);
                 if next_bytes > scratch.bytes() {
-                    match self.reserve_or_shrink(circuit, dirty, &mut scratch, next_bytes) {
+                    match scratch.try_set(next_bytes) {
                         Ok(()) => {}
                         Err(crate::error::Error::BudgetExceeded(_)) => {
                             drop(per);
                             drop(c);
                             drop(c_lease);
                             drop(scratch);
-                            self.abandon_oversized_commit(commit, circuit, dirty);
+                            abandon(tally, dirty);
                             return Ok(());
                         }
                         Err(e) => {
@@ -424,9 +399,6 @@ impl Tally {
         drop(c);
         drop(c_lease);
         let per_bytes = scratch.bytes();
-        // Decode keys and pre-admit both temporary `decoded` storage and any new keys /
-        // entry growth BEFORE mutating `self.keys`/`self.index` so mid-loop eviction
-        // never compacts away freshly interned keys.
         let mut decoded: Vec<(Vec<Option<Term>>, u64)> = Vec::new();
         let mut decoded_bytes = 0u64;
         let mut added_tally = 0u64;
@@ -438,7 +410,7 @@ impl Tally {
             let key: Vec<Option<Term>> = k.iter().map(|&i| term(i)).collect();
             let kb = key_bytes(&key);
             decoded_bytes = decoded_bytes.saturating_add(kb / 2 + 16);
-            if !self.index.contains_key(&key) {
+            if !tally.lock().index.contains_key(&key) {
                 added_tally = added_tally.saturating_add(kb);
             }
             let need = per_bytes
@@ -446,14 +418,14 @@ impl Tally {
                 .saturating_add(added_tally)
                 .saturating_add((decoded.len() as u64 + 1) * ENTRY_BYTES);
             if need > scratch.bytes() {
-                match self.reserve_or_shrink(circuit, dirty, &mut scratch, need) {
+                match scratch.try_set(need) {
                     Ok(()) => {}
                     Err(crate::error::Error::BudgetExceeded(_)) => {
                         drop(key);
                         drop(per_iter);
                         drop(decoded);
                         drop(scratch);
-                        self.abandon_oversized_commit(commit, circuit, dirty);
+                        abandon(tally, dirty);
                         return Ok(());
                     }
                     Err(e) => {
@@ -467,31 +439,38 @@ impl Tally {
             }
             decoded.push((key, n));
         }
-        // Recompute new-key bytes once after any eviction during decoding so `self.intern`
-        // and `self.entries.push_back` are fully pre-admitted.
-        let final_added: u64 = decoded
-            .iter()
-            .filter(|(key, _)| !self.index.contains_key(key))
-            .map(|(key, _)| key_bytes(key))
-            .sum();
-        let entry_next = sparkles_budget::sizes::vec_grown(
-            self.entries.capacity(),
-            self.entries.len(),
-            decoded.len(),
-            ENTRY_BYTES as usize,
-        );
-        let entry_growth =
-            (entry_next.saturating_sub(self.entries.capacity()) as u64) * ENTRY_BYTES;
-        let final_need = decoded_bytes
-            .saturating_add(final_added)
-            .saturating_add(entry_growth);
-        if final_need > scratch.bytes() {
-            match self.reserve_or_shrink(circuit, dirty, &mut scratch, final_need) {
+        // Recompute new-key and entry growth after any reclaim-hook evictions during
+        // decoding; loop until `scratch` covers the post-eviction requirements.
+        loop {
+            let final_need = {
+                let t = tally.lock();
+                let final_added: u64 = decoded
+                    .iter()
+                    .filter(|(key, _)| !t.index.contains_key(key))
+                    .map(|(key, _)| key_bytes(key))
+                    .sum();
+                let entry_next = sparkles_budget::sizes::vec_grown(
+                    t.entries.capacity(),
+                    t.entries.len(),
+                    decoded.len(),
+                    ENTRY_BYTES as usize,
+                );
+                let entry_growth =
+                    (entry_next.saturating_sub(t.entries.capacity()) as u64) * ENTRY_BYTES;
+                decoded_bytes
+                    .saturating_add(final_added)
+                    .saturating_add(entry_growth)
+                    .saturating_add((decoded.len() * std::mem::size_of::<(u32, u64)>()) as u64)
+            };
+            if final_need <= scratch.bytes() {
+                break;
+            }
+            match scratch.try_set(final_need) {
                 Ok(()) => {}
                 Err(crate::error::Error::BudgetExceeded(_)) => {
                     drop(decoded);
                     drop(scratch);
-                    self.abandon_oversized_commit(commit, circuit, dirty);
+                    abandon(tally, dirty);
                     return Ok(());
                 }
                 Err(e) => {
@@ -501,44 +480,56 @@ impl Tally {
                 }
             }
         }
-        let mut counted: Vec<(u32, u64)> = Vec::with_capacity(decoded.len());
-        for (key, n) in decoded {
-            counted.push((self.intern(key), n));
-        }
-        counted.sort_unstable();
-        for (k, n) in counted {
-            self.entries.push_back((commit, k, n));
-        }
-        // Atomically hand off `scratch` into external accounting so there is no uncharged
-        // gap or 2× peak between `add_budgeted_charged` and external charge reconciliation.
-        if let Some(circ) = circuit {
-            let max = circ.max_memory_bytes.unwrap_or(u64::MAX);
-            let state = circ.bytes();
-            if state <= max && self.shrink_to(max - state) {
-                *dirty = true;
+        let final_bytes = {
+            let mut t = tally.lock();
+            let mut counted: Vec<(u32, u64)> = Vec::with_capacity(decoded.len());
+            for (key, n) in decoded {
+                counted.push((t.intern(key), n));
             }
-            if let Err(e) = circ.commit_external_from_scratch(self.bytes(), &mut scratch) {
+            counted.sort_unstable();
+            for (k, n) in counted {
+                t.entries.push_back((commit, k, n));
+            }
+            if let Some(circ) = circuit {
+                let max = circ.max_memory_bytes.unwrap_or(u64::MAX);
+                let state = circ.bytes();
+                if state <= max && t.shrink_to(max - state) {
+                    *dirty = true;
+                }
+            }
+            #[cfg(test)]
+            {
+                let b = t.bytes();
+                t.peak = t.peak.max(b);
+            }
+            t.bytes()
+        };
+        if let Some(circ) = circuit {
+            if let Err(e) = circ.commit_external_from_scratch(final_bytes, &mut scratch) {
                 drop(scratch);
                 if matches!(e, crate::error::Error::BudgetExceeded(_)) {
-                    // Try shrinking spare capacity or older commits before abandoning.
                     loop {
-                        let cur = self.bytes();
-                        if cur > 0 && self.shrink_spare_capacity() {
-                            if circ.try_set_external(self.bytes()).is_ok() {
+                        let (shrunk, next_bytes) = {
+                            let mut t = tally.lock();
+                            let cur = t.bytes();
+                            if cur > 0 && t.shrink_spare_capacity() {
+                                (true, t.bytes())
+                            } else if cur > 0 {
+                                if t.shrink_to(cur / 2) {
+                                    *dirty = true;
+                                }
+                                (t.bytes() < cur, t.bytes())
+                            } else {
+                                (false, 0)
+                            }
+                        };
+                        if shrunk {
+                            if circ.try_set_external(next_bytes).is_ok() {
                                 break;
                             }
                             continue;
                         }
-                        if cur > 0 && self.shrink_to(cur / 2) {
-                            *dirty = true;
-                        }
-                        if self.bytes() < cur {
-                            if circ.try_set_external(self.bytes()).is_ok() {
-                                break;
-                            }
-                            continue;
-                        }
-                        self.abandon_oversized_commit(commit, Some(circ), dirty);
+                        abandon(tally, dirty);
                         break;
                     }
                 } else {
@@ -548,11 +539,40 @@ impl Tally {
         } else {
             drop(scratch);
         }
-        #[cfg(test)]
-        {
-            self.peak = self.peak.max(self.bytes());
-        }
         Ok(())
+    }
+
+    /// Count a change in the in-memory tally fixtures.
+    #[cfg(test)]
+    pub(crate) fn add(&mut self, commit: u64, c: &Changes, term: impl Fn(Id) -> Option<Term>) {
+        let mut dirty = false;
+        let tally = parking_lot::Mutex::new(std::mem::replace(self, Self::new(Vec::new(), 0)));
+        Self::add_budgeted_charged_shared(
+            &tally,
+            commit,
+            c.clone(),
+            super::budget::ScratchLease::default(),
+            term,
+            None,
+            &mut dirty,
+        )
+        .unwrap();
+        *self = tally.into_inner();
+    }
+
+    pub(crate) fn bytes_after_loss(&self, first: u64, last: u64) -> u64 {
+        let merges = self
+            .unknown
+            .last()
+            .is_some_and(|r| first <= r.1.saturating_add(1) && last.saturating_add(1) >= r.0);
+        let capacity = self.unknown.capacity();
+        let next = sparkles_budget::sizes::vec_grown(
+            capacity,
+            self.unknown.len(),
+            usize::from(!merges),
+            RANGE_BYTES as usize,
+        );
+        self.bytes() + next.saturating_sub(capacity) as u64 * RANGE_BYTES
     }
 
     /// Record that the commits `first..=last` were not counted per key.
@@ -694,11 +714,16 @@ impl Tally {
             }
             e.1 = *n;
         }
-        self.index = keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| (k.clone(), i as u32))
-            .collect();
+        self.index.retain(|_, index| {
+            let next = used[*index as usize];
+            if next == u32::MAX {
+                false
+            } else {
+                *index = next;
+                true
+            }
+        });
+        self.index.shrink_to_fit();
         self.key_bytes = keys.iter().map(|k| key_bytes(k)).sum();
         keys.shrink_to_fit();
         self.keys = keys;

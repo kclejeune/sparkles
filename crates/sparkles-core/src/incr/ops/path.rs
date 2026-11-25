@@ -409,7 +409,8 @@ impl Closure {
 pub struct PathStore {
     inner: HashStore<Fact, Id>,
     budget: Option<BudgetHandle>,
-    tracked: u64,
+    base: u64,
+    pass_reserved: u64,
 }
 
 impl Clone for PathStore {
@@ -417,7 +418,8 @@ impl Clone for PathStore {
         Self {
             inner: self.inner.clone(),
             budget: None,
-            tracked: 0,
+            base: 0,
+            pass_reserved: 0,
         }
     }
 }
@@ -428,18 +430,39 @@ impl PathStore {
             // the key, the record and the map's slot overhead
             inner: HashStore::new(24 + 8 + 8),
             budget: None,
-            tracked: 0,
+            base: 0,
+            pass_reserved: 0,
         }
     }
 
     fn attach_budget(&mut self, budget: Option<BudgetHandle>) {
         self.budget = budget;
-        self.tracked = self.inner.bytes();
+        self.base = self.inner.bytes();
+        self.pass_reserved = 0;
     }
 
     fn detach_budget(&mut self) {
         self.budget = None;
-        self.tracked = 0;
+        self.base = 0;
+        self.pass_reserved = 0;
+    }
+
+    fn sync_store_pass(&mut self, target_bytes: u64) -> Result<()> {
+        let needed = target_bytes.saturating_sub(self.base);
+        if needed > self.pass_reserved {
+            let delta = needed - self.pass_reserved;
+            if let Some(budget) = &self.budget {
+                budget.try_reserve_pass(delta)?;
+            }
+            self.pass_reserved = needed;
+        } else if needed < self.pass_reserved {
+            let excess = self.pass_reserved - needed;
+            if let Some(budget) = &self.budget {
+                budget.release_pass(excess);
+            }
+            self.pass_reserved = needed;
+        }
+        Ok(())
     }
 }
 
@@ -479,32 +502,16 @@ impl FactStore<Fact, Id> for PathStore {
         if len >= cap {
             let next_cap = sparkles_budget::sizes::table_grown(cap, len, 1);
             let predicted = (next_cap as u64).saturating_mul(self.inner.fact_bytes());
-            if predicted > self.tracked {
-                let delta = predicted - self.tracked;
-                if let Some(budget) = &self.budget {
-                    budget.try_reserve_pass(delta)?;
-                }
-                self.tracked = predicted;
+            if predicted > self.base.saturating_add(self.pass_reserved) {
+                self.sync_store_pass(predicted)?;
             }
         }
         let inserted = self.inner.insert(f, r)?;
         if inserted {
             let actual = self.inner.bytes();
-            if actual > self.tracked {
-                let delta = actual - self.tracked;
-                if let Some(budget) = &self.budget
-                    && let Err(e) = budget.try_reserve_pass(delta)
-                {
-                    let _ = self.inner.remove(&f);
-                    return Err(e);
-                }
-                self.tracked = actual;
-            } else if actual < self.tracked {
-                let excess = self.tracked - actual;
-                if let Some(budget) = &self.budget {
-                    budget.release_pass(excess);
-                }
-                self.tracked = actual;
+            if let Err(e) = self.sync_store_pass(actual) {
+                let _ = self.inner.remove(&f);
+                return Err(e);
             }
         }
         Ok(inserted)
