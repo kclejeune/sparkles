@@ -32,12 +32,11 @@
 //! description's instances. The axioms the rewriting makes stand for the original axioms in
 //! the run's report.
 
-use super::Excluded;
 use super::dl;
 use super::index::Gap;
+use super::{Error, Excluded};
 use crate::model::*;
 use crate::vocab;
-use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The IRI prefix of the names that the reductions make up.
@@ -118,58 +117,112 @@ impl Reduction {
         all
     }
 
-    /// Puts the original axioms in place of the rewritten ones that the run's report
-    /// holds. A rewritten axiom stands for every original axiom that made it, and for
-    /// itself as well when the ontology states it unchanged, so one entry of the report
-    /// can become several. The lookup holds only the report's axioms, so it costs memory
-    /// in proportion to the report and not to the rewriting.
-    pub fn restore(&self, axioms: &[&AxiomKind], excluded: &mut Vec<Excluded>) {
+    /// Restores the original axioms in a sorted report. A rewritten axiom can stand
+    /// for several originals, and is also kept when it was stated unchanged.
+    pub fn restore(
+        &self,
+        axioms: &[&AxiomKind],
+        excluded: &mut Vec<Excluded>,
+        admit: &mut impl FnMut(usize) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        use std::mem::size_of;
+
+        let start = |k: &AxiomKind| excluded.partition_point(|e| e.axiom < *k);
+        let reported = |k: &AxiomKind| excluded.get(start(k)).is_some_and(|e| e.axiom == *k);
         if excluded.is_empty() {
-            return;
+            return Ok(());
         }
-        // the origins of each axiom of the report, and whether the ontology states it as
-        // it is
-        let mut origin: FxHashMap<AxiomKind, (Vec<usize>, bool)> = excluded
-            .iter()
-            .map(|e| (e.axiom.clone(), (Vec::new(), false)))
-            .collect();
-        for (k, &i) in self.axioms.iter().zip(&self.origin) {
-            if let Some((from, _)) = origin.get_mut(k)
-                && from.last() != Some(&i)
-            {
-                from.push(i);
+        let matches = self.axioms.iter().filter(|k| reported(k)).count();
+        if matches == 0 {
+            return Ok(());
+        }
+
+        let scratch = btree_map_bytes::<usize, [usize; 2]>(matches.min(axioms.len()))
+            .saturating_add(excluded.len().saturating_mul(size_of::<bool>()));
+        admit(scratch)?;
+        let mut dropped = vec![false; excluded.len()];
+        let mut first = BTreeMap::new();
+        let range = |k: &AxiomKind| start(k)..excluded.partition_point(|e| e.axiom <= *k);
+        for (k, &origin) in self.axioms.iter().zip(&self.origin) {
+            let entries = range(k);
+            if entries.is_empty() {
+                continue;
+            }
+            let first = first.entry(origin).or_insert([usize::MAX; 2]);
+            for i in entries {
+                dropped[i] = true;
+                // The first sorted exclusion of each kind supplies the original's gap.
+                let kind = usize::from(matches!(excluded[i].gap, Gap::Partial(_)));
+                first[kind] = first[kind].min(i);
             }
         }
-        for (k, r) in axioms.iter().zip(&self.replaced) {
-            if !*r && let Some((_, stated)) = origin.get_mut(*k) {
-                *stated = true;
+        for (k, replaced) in axioms.iter().zip(&self.replaced) {
+            if !*replaced {
+                dropped[range(k)].fill(false);
             }
         }
-        let mut out = Vec::with_capacity(excluded.len());
-        // an original axiom whose rewritten axioms are left out for several reasons of
-        // one kind is reported once for that kind, by the first of them
-        let mut told: FxHashSet<(usize, std::mem::Discriminant<Gap>)> = FxHashSet::default();
-        excluded.sort();
-        for e in excluded.drain(..) {
-            match origin.get(&e.axiom) {
-                Some((from, stated)) if !from.is_empty() => {
-                    let kind = std::mem::discriminant(&e.gap);
-                    out.extend(from.iter().filter(|&&i| told.insert((i, kind))).map(|&i| {
-                        Excluded {
-                            axiom: axioms[i].clone(),
-                            gap: e.gap.clone(),
-                        }
-                    }));
-                    if *stated {
-                        out.push(e);
-                    }
-                }
-                _ => out.push(e),
-            }
-        }
-        out.sort();
+        let report = excluded.as_slice();
+        let restored = || {
+            first.iter().flat_map(|(&origin, indices)| {
+                indices
+                    .iter()
+                    .filter_map(move |&i| report.get(i).map(|e| (axioms[origin], &e.gap)))
+            })
+        };
+        let (entries, bytes) = restored().fold(
+            (dropped.iter().filter(|&&drop| !drop).count(), 0usize),
+            |(entries, bytes), (k, gap)| {
+                let text = match gap {
+                    Gap::Outside { rule, message } => rule.len().saturating_add(message.len()),
+                    Gap::Partial(_) => 0,
+                };
+                (
+                    entries + 1,
+                    bytes
+                        .saturating_add(axiom_retained_heap_bytes(k))
+                        .saturating_add(text),
+                )
+            },
+        );
+        admit(
+            scratch
+                .saturating_add(entries.saturating_mul(size_of::<Excluded>()))
+                .saturating_add(bytes),
+        )?;
+        let mut out = Vec::with_capacity(entries);
+        out.extend(restored().map(|(axiom, gap)| Excluded {
+            axiom: axiom.clone(),
+            gap: gap.clone(),
+        }));
+        out.extend(
+            excluded
+                .drain(..)
+                .zip(dropped)
+                .filter_map(|(e, drop)| (!drop).then_some(e)),
+        );
+        out.sort_unstable();
         out.dedup();
         *excluded = out;
+        Ok(())
+    }
+
+    /// Which original axioms stand for a rewritten chain or are a chain as stated.
+    pub fn chain_origins<'a>(
+        &'a self,
+        axioms: &'a [&'a AxiomKind],
+        is_chain: impl Fn(&AxiomKind) -> bool + Copy + 'a,
+    ) -> impl Iterator<Item = usize> + Clone + 'a {
+        self.axioms
+            .iter()
+            .zip(&self.origin)
+            .filter_map(move |(k, &i)| is_chain(k).then_some(i))
+            .chain(
+                axioms
+                    .iter()
+                    .zip(&self.replaced)
+                    .enumerate()
+                    .filter_map(move |(i, (k, &replaced))| (!replaced && is_chain(k)).then_some(i)),
+            )
     }
 
     /// What the original axioms outside OWL 2 EL need, for the run's statistics, with the
@@ -179,7 +232,7 @@ impl Reduction {
     pub fn outside_el(
         &self,
         axioms: &[&AxiomKind],
-        chains: &[&AxiomKind],
+        chains: &[usize],
         excluded: &[Excluded],
     ) -> dl::OutsideEl {
         let mut out = dl::OutsideEl::default();
@@ -189,8 +242,8 @@ impl Reduction {
                 out.add(dl::shape(k));
             }
         }
-        for k in chains {
-            if seen.insert(k) {
+        for &i in chains {
+            if seen.insert(axioms[i]) {
                 out.horn += 1;
             }
         }

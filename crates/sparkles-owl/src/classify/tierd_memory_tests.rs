@@ -9215,6 +9215,97 @@ fn split_round4_declined_forked_plan_leaves_empty_interner() {
 }
 
 #[test]
+fn split_round6_reduced_merge_does_not_copy_unchanged_exclusions() {
+    use super::admission_test::{MergePhase, PlanKind, SplitAllocSite, with_merge_probe};
+
+    const IRI_BYTES: usize = 512 * 1024;
+    let input = axioms(&format!(
+        "SubClassOf(:D ObjectUnionOf(:E :F))
+         SubClassOf(:X ObjectOneOf(:b))
+         ClassAssertion(:X :a)
+         HasKey(:K (:r) ())
+         IrreflexiveObjectProperty(:irref_{})",
+        "m".repeat(IRI_BYTES)
+    ));
+    let refs: Vec<_> = input.iter().map(|a| &a.kind).collect();
+    let excluded = refs
+        .iter()
+        .find(|k| matches!(k, AxiomKind::IrreflexiveObjectProperty(_)))
+        .unwrap();
+    // The interner keeps an axiom copy for its normalization scope. Leave room for
+    // that copy and one report while the first branch is live.
+    let cap = 2 * IRI_BYTES + IRI_BYTES / 4;
+    let limits = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        max_memory: Some(cap),
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let ready = Arc::new(AtomicUsize::new(0));
+    let planned = ready.clone();
+    let handoff_allocated = Arc::new(parking_lot::Mutex::new(None));
+    let observed = handoff_allocated.clone();
+    let mut at_stop = None;
+    let result = with_merge_probe(
+        move |phase| match phase {
+            MergePhase::PlanDone {
+                outcome: PlanKind::Ready,
+                ..
+            } => {
+                planned.fetch_add(1, Ordering::Relaxed);
+            }
+            MergePhase::SatStop { stop, .. } if stop == super::saturate::STOP_MERGE => {
+                at_stop = Some(sample().requested_alloc_bytes);
+            }
+            MergePhase::SplitAlloc {
+                site: SplitAllocSite::MergeHandoff,
+                admitted: true,
+                ..
+            } => {
+                *observed.lock() = at_stop.map(|bytes| sample().requested_alloc_bytes - bytes);
+            }
+            _ => {}
+        },
+        || {
+            measure(|| {
+                sat.run_splitting(
+                    &refs,
+                    None,
+                    0,
+                    &limits,
+                    &Arc::new(AtomicUsize::new(0)),
+                    &mut 0,
+                    true,
+                )
+            })
+            .0
+        },
+    );
+    assert_eq!(
+        ready.load(Ordering::Relaxed),
+        2,
+        "both reduction plans must be ready"
+    );
+    assert!(
+        matches!(result, Err(Error::Memory { limit, used }) if limit == cap && used > cap),
+        "the restarted build must refuse a second report, got {result:?}"
+    );
+    assert_eq!(sat.excluded().len(), 1);
+    assert!(sat.excluded()[0].axiom == **excluded);
+
+    let allocated = handoff_allocated
+        .lock()
+        .expect("saturation must hand off a merge");
+    assert!(
+        allocated < IRI_BYTES,
+        "restoring the unchanged report allocated {allocated} bytes before the merge handoff"
+    );
+}
+
+#[test]
 fn split_round5_replacement_exclusions_are_admitted_before_cloning() {
     const IRI_BYTES: usize = 512 * 1024;
     let old = axioms(&format!(

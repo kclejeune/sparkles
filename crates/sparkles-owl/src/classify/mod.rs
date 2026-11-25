@@ -1354,6 +1354,8 @@ pub struct Saturation {
     source_len: Option<usize>,
     /// what the last run left out or used only in part, sorted
     excluded: Vec<Excluded>,
+    /// whether the current attempt published its replacement exclusion report
+    report_replaced: bool,
     /// set when a run stopped part way, so that the next run starts again
     dirty: bool,
     /// the subsumers of the classes that the last run classified in worlds of their own,
@@ -1396,9 +1398,8 @@ pub struct Saturation {
     /// set while a run classifies the axioms that item 805's reductions made, so that the
     /// classes they made up stay out of the taxonomy
     hide_internal: bool,
-    /// the chains outside OWL 2 EL for their ranges alone in a run of rewritten axioms,
-    /// which the statistics of the original axioms count
-    chain_ranged: Vec<AxiomKind>,
+    /// positions of original axioms counted outside OWL 2 EL for chain ranges
+    chain_ranged: Vec<usize>,
     /// whether the last run classified rewritten axioms, which the next run's changes
     /// do not describe and whose made-up names [`Saturation::describe`] leaves out
     pub(crate) reduced: bool,
@@ -3067,6 +3068,7 @@ impl Saturation {
             ctx: Vec::new(),
             source_len: None,
             excluded: Vec::new(),
+            report_replaced: false,
             dirty: true,
             worlds: FxHashMap::default(),
             entangled: false,
@@ -6569,10 +6571,12 @@ impl Saturation {
     /// The answer's last part is the estimated peak of a parallel normalization, with
     /// `held_bytes`, which the pool has been charged for, or 0. `kept_bytes` are those of
     /// the contexts the run keeps, [`Saturation::context_bytes`].
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &mut self,
         axioms: &[&AxiomKind],
         outside: &[(usize, (String, String))],
+        reduction: Option<(&dl_reduce::Reduction, &[&AxiomKind])>,
         threads: usize,
         held_bytes: usize,
         kept_bytes: usize,
@@ -6596,7 +6600,7 @@ impl Saturation {
         )?;
         self.interner.ensure_top_bottom();
         self.interner.ranges.begin(budget.clone());
-        let result = self.build_inner(axioms, outside, threads, held_bytes, limits);
+        let result = self.build_inner(axioms, outside, reduction, threads, held_bytes, limits);
         // the run's components and definitions end with its normalization, on every exit
         self.interner.dt_run = None;
         self.numeric_halt |= self.interner.ranges.check().is_err();
@@ -6616,6 +6620,7 @@ impl Saturation {
         &mut self,
         axioms: &[&AxiomKind],
         outside: &[(usize, (String, String))],
+        reduction: Option<(&dl_reduce::Reduction, &[&AxiomKind])>,
         threads: usize,
         held_bytes: usize,
         limits: &Limits,
@@ -6828,9 +6833,6 @@ impl Saturation {
         // chain whose superproperty has a range its last property lacks is Horn
         let mut candidates: Vec<&AxiomKind> = outside.iter().map(|(i, _)| axioms[*i]).collect();
         candidates.extend(chain_ranges.iter().map(|(k, _)| *k));
-        if self.hide_internal {
-            self.chain_ranged = chain_ranges.iter().map(|(k, _)| (*k).clone()).collect();
-        }
         candidates.sort();
         candidates.dedup();
         let mut outside_el = OutsideEl::default();
@@ -6993,19 +6995,37 @@ impl Saturation {
                             .saturating_add(diagnostic),
                     )
                 });
-        if entries != 0 {
-            // The old report is in the build floor until the replacement is ready.
+        let chain_origins = if let Some((red, original)) = reduction
+            && !chain_ranges.is_empty()
+        {
+            chain_ranges.sort_unstable_by_key(|(chain, _)| *chain);
+            Some(red.chain_origins(original, |k| {
+                chain_ranges
+                    .binary_search_by(|(chain, _)| (*chain).cmp(k))
+                    .is_ok()
+            }))
+        } else {
+            None
+        };
+        let chain_entries = chain_origins.clone().map_or(0, Iterator::count);
+        let chain_bytes = chain_entries.saturating_mul(std::mem::size_of::<usize>());
+
+        // The old report is in the build floor until the replacement is ready.
+        let report_base = || {
+            self.interner
+                .bytes()
+                .saturating_add(self.merge_extra_bytes())
+                .saturating_add(ax.bytes())
+                .saturating_add(ix.bytes())
+                .saturating_add(chain_bytes)
+        };
+        let budget = self.interner.ranges.budget.as_ref().expect("build budget");
+        if entries != 0 || chain_entries != 0 {
             // Admit every entry before cloning, including duplicates removed below.
-            let budget = self.interner.ranges.budget.as_ref().expect("build budget");
-            budget.baseline(
-                self.interner
-                    .bytes()
-                    .saturating_add(self.merge_extra_bytes())
-                    .saturating_add(ax.bytes())
-                    .saturating_add(ix.bytes())
-                    .saturating_add(report_bytes),
-            )?;
+            budget.baseline(report_base().saturating_add(report_bytes))?;
         }
+        let mut chain_ranged = Vec::with_capacity(chain_entries);
+        chain_ranged.extend(chain_origins.into_iter().flatten());
         let mut excluded = Vec::with_capacity(entries);
         for (i, (rule, message)) in outside {
             excluded.push(Excluded {
@@ -7036,7 +7056,17 @@ impl Saturation {
         }
         excluded.sort_unstable();
         excluded.dedup();
+        if let Some((red, original)) = reduction {
+            // Reductions exclude datatype axioms, so the checker cannot add a gap later.
+            debug_assert!(ix.dt.is_none());
+            let base = report_base().saturating_add(excluded_copy_bytes(&excluded));
+            red.restore(original, &mut excluded, &mut |extra| {
+                budget.baseline(base.saturating_add(extra))
+            })?;
+        }
+        self.chain_ranged = chain_ranged;
         self.excluded = excluded;
+        self.report_replaced = true;
         outside_el.taken = taken.len();
         Ok((ax, ix, peak, outside_el, visible_named_classes))
     }
@@ -7194,9 +7224,9 @@ impl Saturation {
                             charge: Self::charge_drawing_on(limits, admitted),
                             ..limits.clone()
                         };
-                        let prior_report = self.excluded.as_ptr();
                         let r = self.run_once(
                             &all,
+                            Some((&red, axioms)),
                             None,
                             held_bytes.saturating_add(red_bytes),
                             &step_limits,
@@ -7204,40 +7234,23 @@ impl Saturation {
                         );
                         self.active_hub = None;
                         self.hide_internal = false;
+                        let chains = std::mem::take(&mut self.chain_ranged);
                         match r {
                             Ok(Some(mut r)) if self.dl_tried => {
-                                red.restore(axioms, &mut self.excluded);
                                 r.2.added = self.source_len.unwrap_or(axioms.len());
-                                let tier = r.2.tier;
-                                let mut chains: Vec<Excluded> =
-                                    std::mem::take(&mut self.chain_ranged)
-                                        .into_iter()
-                                        .map(|axiom| Excluded {
-                                            axiom,
-                                            gap: index::Gap::Partial("chain range"),
-                                        })
-                                        .collect();
-                                red.restore(axioms, &mut chains);
-                                let chains: Vec<&AxiomKind> =
-                                    chains.iter().map(|e| &e.axiom).collect();
                                 r.2.outside_el = red.outside_el(axioms, &chains, &self.excluded);
-                                r.2.tier = tier;
                                 self.reduced = true;
                                 return Ok(r);
                             }
                             Err(e) => {
-                                // A refused build leaves the previous report in place.
-                                // The replacement has its own buffer while the old one
-                                // is live. After saturation the checker may grow that
-                                // buffer, and the completed index identifies that case.
-                                if self.index.is_some() || self.excluded.as_ptr() != prior_report {
-                                    red.restore(axioms, &mut self.excluded);
+                                if !self.report_replaced {
+                                    // A refused build leaves the previous report public.
+                                    self.reset_empty();
                                 }
                                 self.reduced = true;
                                 return Err(e);
                             }
                             _ => {
-                                red.restore(axioms, &mut self.excluded);
                                 if self.split_cfg.as_ref().is_some_and(|c| c.forked) {
                                     self.split_ineligible = true;
                                     self.reset_empty();
@@ -7296,7 +7309,14 @@ impl Saturation {
             charge: Self::charge_drawing_on(limits, admitted),
             ..limits.clone()
         };
-        if let Some(r) = self.run_once(axioms, changes, held_bytes, &step_limits, with_taxonomy)? {
+        if let Some(r) = self.run_once(
+            axioms,
+            None,
+            changes,
+            held_bytes,
+            &step_limits,
+            with_taxonomy,
+        )? {
             return Ok(r);
         }
         self.reset_empty();
@@ -7304,7 +7324,7 @@ impl Saturation {
             charge: Self::charge_drawing_on(limits, admitted),
             ..limits.clone()
         };
-        let r = self.run_once(axioms, None, held_bytes, &retry_limits, with_taxonomy)?;
+        let r = self.run_once(axioms, None, None, held_bytes, &retry_limits, with_taxonomy)?;
         Ok(r.expect("a run without changes starts again"))
     }
 
@@ -7312,6 +7332,7 @@ impl Saturation {
     fn run_once(
         &mut self,
         axioms: &[&AxiomKind],
+        reduction: Option<(&dl_reduce::Reduction, &[&AxiomKind])>,
         changes: Option<Changes<'_>>,
         held_bytes: usize,
         limits: &Limits,
@@ -7335,6 +7356,7 @@ impl Saturation {
         self.dl_tried = false;
         self.partial_over = false;
         self.numeric_halt = false;
+        self.report_replaced = false;
         // the profile check of each axiom, which depends on it alone
         let outside: Vec<(usize, (String, String))> =
             par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
@@ -7469,6 +7491,7 @@ impl Saturation {
         let (mut ax, mut ix, mut normalized_peak, outside_el, visible_named_classes) = self.build(
             axioms,
             &outside,
+            reduction,
             threads,
             held_bytes
                 .saturating_add(old_bytes)
@@ -7733,6 +7756,7 @@ impl Saturation {
         let base = self.index_bytes(&ix)
             + held_bytes
             + excluded_copy_bytes(&self.excluded)
+            + self.chain_ranged_bytes()
             + ax.bytes()
             + roots.capacity() * 4
             + self.context_bytes()
@@ -9099,6 +9123,12 @@ impl Saturation {
             + self.disjoint.iter().map(|d| d.len() * 4).sum::<usize>()
     }
 
+    fn chain_ranged_bytes(&self) -> usize {
+        self.chain_ranged
+            .capacity()
+            .saturating_mul(std::mem::size_of::<usize>())
+    }
+
     fn residual_outer_bytes(&self) -> usize {
         self.ctx
             .capacity()
@@ -9112,11 +9142,7 @@ impl Saturation {
             )
             .saturating_add(self.worlds_bytes())
             .saturating_add(excluded_copy_bytes(&self.excluded))
-            .saturating_add(
-                self.chain_ranged
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<AxiomKind>()),
-            )
+            .saturating_add(self.chain_ranged_bytes())
             .saturating_add(
                 self.leaf_individuals
                     .capacity()
@@ -9138,11 +9164,7 @@ impl Saturation {
                     d.table.bytes() + d.lits.bytes() + d.split_meta_bytes()
                 }))
                 .saturating_add(self.worlds_bytes())
-                .saturating_add(
-                    self.chain_ranged
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<AxiomKind>()),
-                )
+                .saturating_add(self.chain_ranged_bytes())
                 .saturating_add(
                     self.leaf_individuals
                         .capacity()
@@ -9175,6 +9197,7 @@ impl Saturation {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<Ex>())
             + world_bytes
+            + self.chain_ranged_bytes()
             + excluded_copy_bytes(&self.excluded)
     }
 
@@ -10305,7 +10328,7 @@ mod admission_handoff_tests {
             probe,
             individuals,
             move |e| observer.lock().observe(e, refuse),
-            || classifier.run_once(axioms, None, 0, &limits, true),
+            || classifier.run_once(axioms, None, None, 0, &limits, true),
         );
         let trace = recorded.lock().clone();
         (result, trace)
@@ -11548,7 +11571,7 @@ mod tests {
             .collect();
         let mut s = Saturation::default();
         let (_, ix, _, _, _) = s
-            .build(&axioms, &outside, 1, 0, 0, &Limits::default())
+            .build(&axioms, &outside, None, 1, 0, 0, &Limits::default())
             .unwrap();
         assert!(ix.horn.is_some());
         ix
@@ -13248,7 +13271,7 @@ mod tests {
                     }
                     _ => {}
                 },
-                || sat.run_once(&refs, None, 0, &lim, true),
+                || sat.run_once(&refs, None, None, 0, &lim, true),
             );
             (
                 sat,
