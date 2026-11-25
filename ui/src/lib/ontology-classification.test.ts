@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { classificationNote, classifyOntology, type Classification } from './ontology';
+import {
+  classificationNote,
+  classifyOntology,
+  consistencyInfo,
+  formatTimeoutSeconds,
+  inferredNodeStatus,
+  parseDeadlineInput,
+  type Classification,
+} from './ontology';
 
 const source = {
   boundStoreId: 'store-a',
@@ -72,6 +80,186 @@ describe('explicit legacy classification tree pages', () => {
       /partial/i,
     );
   });
+  it('sends partial, deadline timeout and expansion and accepts a requested partial hierarchy', async () => {
+    const calls = mock([
+      page(7, 0, {
+        next: undefined,
+        tier: 'disjunctive',
+        partial: true,
+        complete: false,
+        consistency: 'unknown',
+        incompleteCount: 2,
+        incomplete: ['http://example.org/C0', 'http://example.org/C1'],
+        excludedCount: 0,
+      }),
+    ]);
+    const result = await classifyOntology(
+      'ds',
+      { graph: null, imports: true },
+      undefined,
+      'commit:7',
+      {
+        partial: true,
+        timeoutMs: 1500,
+        expansion: 'eager',
+      },
+    );
+    expect(calls).toHaveLength(1);
+    const url = new URL(calls[0].url, 'http://localhost');
+    expect(url.searchParams.get('at')).toBe('commit:7');
+    expect(url.searchParams.get('timeout')).toBe('1.5');
+    expect(calls[0].body).toMatchObject({
+      graph: 'default',
+      imports: true,
+      nodes: true,
+      partial: true,
+      expansion: 'eager',
+    });
+    expect(result.partial).toBe(true);
+    expect(result.tier).toBe('disjunctive');
+    expect(result.consistency).toBe('unknown');
+    expect(result.incompleteCount).toBe(2);
+    expect(result.incomplete).toEqual(['http://example.org/C0', 'http://example.org/C1']);
+    expect(result.nodesTruncated).toBeUndefined();
+  });
+  it('marks a multi-page partial answer truncated instead of issuing a second unretained run', async () => {
+    const calls = mock([
+      page(7, 0, {
+        next: 1,
+        tier: 'disjunctive',
+        partial: true,
+        complete: false,
+        consistency: 'consistent',
+        incompleteCount: 1,
+        incomplete: ['http://example.org/C0'],
+        excludedCount: 0,
+      }),
+    ]);
+    const result = await classifyOntology(
+      'ds',
+      { graph: null, imports: true },
+      undefined,
+      undefined,
+      {
+        partial: true,
+        timeoutMs: 500,
+        expansion: 'cautious',
+      },
+    );
+    expect(calls).toHaveLength(1);
+    expect(result.partial).toBe(true);
+    expect(result.nodesTruncated).toBe(true);
+    expect(result.nodes).toHaveLength(1);
+  });
+  it('rejects a later page that unexpectedly turns partial after a non-partial first page', async () => {
+    mock([page(7, 0, { partial: false }), page(7, 1, { partial: true })]);
+    await expect(
+      classifyOntology('ds', { graph: null, imports: true }, undefined, undefined, {
+        partial: true,
+        timeoutMs: 2000,
+      }),
+    ).rejects.toThrow(/changed/i);
+  });
+});
+
+describe('deadline parsing and timeout formatting', () => {
+  it('parses blank, seconds, decimals, millisecond suffixes and enforces precision and bounds', () => {
+    expect(parseDeadlineInput('')).toEqual({});
+    expect(parseDeadlineInput('   ')).toEqual({});
+    expect(parseDeadlineInput('5')).toEqual({ timeoutMs: 5000 });
+    expect(parseDeadlineInput('0.5s')).toEqual({ timeoutMs: 500 });
+    expect(parseDeadlineInput('250ms')).toEqual({ timeoutMs: 250 });
+    expect(parseDeadlineInput('0.4ms')).toEqual({ timeoutMs: 0.4 });
+    expect(parseDeadlineInput('1.4ms')).toEqual({ timeoutMs: 1.4 });
+    expect(parseDeadlineInput('0.001ms')).toEqual({ timeoutMs: 0.001 });
+    expect(parseDeadlineInput('86400')).toEqual({ timeoutMs: 86_400_000 });
+    expect(parseDeadlineInput('0').error).toMatch(/greater than zero/i);
+    expect(parseDeadlineInput('-2').error).toMatch(/positive deadline/i);
+    expect(parseDeadlineInput('abc').error).toMatch(/positive deadline/i);
+    expect(parseDeadlineInput('1e20').error).toMatch(/positive deadline/i);
+    expect(parseDeadlineInput('0.0001ms').error).toMatch(/microsecond/i);
+    expect(parseDeadlineInput('0.0000001s').error).toMatch(/microsecond/i);
+    expect(parseDeadlineInput('1.2345ms').error).toMatch(/microsecond/i);
+    expect(parseDeadlineInput('86401').error).toMatch(/at most 86400/i);
+    expect(parseDeadlineInput('99999999999999999999').error).toMatch(/at most 86400/i);
+  });
+  it('formats positive millisecond deadlines as exact decimal seconds without truncation or scientific notation', () => {
+    expect(formatTimeoutSeconds(undefined)).toBeUndefined();
+    expect(formatTimeoutSeconds(0)).toBeUndefined();
+    expect(formatTimeoutSeconds(-10)).toBeUndefined();
+    expect(formatTimeoutSeconds(0.0001)).toBeUndefined();
+    expect(formatTimeoutSeconds(86_400_001)).toBeUndefined();
+    expect(formatTimeoutSeconds(1e20)).toBeUndefined();
+    expect(formatTimeoutSeconds(0.001)).toBe('0.000001');
+    expect(formatTimeoutSeconds(0.4)).toBe('0.0004');
+    expect(formatTimeoutSeconds(1.4)).toBe('0.0014');
+    expect(formatTimeoutSeconds(500)).toBe('0.5');
+    expect(formatTimeoutSeconds(5000)).toBe('5');
+    expect(formatTimeoutSeconds(1250)).toBe('1.25');
+    expect(formatTimeoutSeconds(86_400_000)).toBe('86400');
+    // Round-trip accepted sub-millisecond and fractional millisecond values without drift.
+    for (const input of ['0.4ms', '1.4ms', '0.001ms', '2.5', '10', '86400']) {
+      const parsed = parseDeadlineInput(input);
+      expect(parsed.error).toBeUndefined();
+      const formatted = formatTimeoutSeconds(parsed.timeoutMs);
+      expect(formatted).toBeDefined();
+      expect(parseDeadlineInput(formatted!)).toEqual(parsed);
+    }
+  });
+});
+
+describe('open-class node status and consistency display helpers', () => {
+  it('marks open classes in the inferred tree distinctly from closed and unsatisfiable nodes', () => {
+    const classesOf = new Map<string, string[]>([
+      ['n:1', ['urn:Unsat']],
+      ['n:2', ['urn:Closed']],
+      ['n:3', ['urn:OpenA', 'urn:ClosedB']],
+    ]);
+    const incomplete = new Set(['urn:OpenA']);
+    expect(inferredNodeStatus('n:2', classesOf, incomplete)).toEqual({
+      badge: null,
+      tone: null,
+      open: false,
+      unsatisfiable: false,
+    });
+    expect(inferredNodeStatus('n:3', classesOf, incomplete)).toEqual({
+      badge: 'open',
+      tone: 'warn',
+      open: true,
+      unsatisfiable: false,
+    });
+    expect(inferredNodeStatus('n:1', classesOf, incomplete)).toEqual({
+      badge: 'unsatisfiable',
+      tone: 'danger',
+      open: false,
+      unsatisfiable: true,
+    });
+    expect(inferredNodeStatus('n:1', classesOf, new Set(['urn:Unsat']))).toEqual({
+      badge: 'unsatisfiable · open',
+      tone: 'danger',
+      open: true,
+      unsatisfiable: true,
+    });
+  });
+  it('distinguishes unknown consistency from consistent and inconsistent', () => {
+    expect(consistencyInfo('consistent', true, false)).toMatchObject({
+      state: 'consistent',
+      label: 'Consistent',
+      tone: 'ok',
+    });
+    expect(consistencyInfo('inconsistent', false, false)).toMatchObject({
+      state: 'inconsistent',
+      label: 'Inconsistent',
+      tone: 'danger',
+    });
+    expect(consistencyInfo('unknown', true, true)).toMatchObject({
+      state: 'unknown',
+      label: 'Consistency unknown',
+      tone: 'warn',
+    });
+    expect(consistencyInfo('unknown', true, true).detail).toContain('stopped before deciding');
+    expect(consistencyInfo(undefined, false, false).state).toBe('inconsistent');
+  });
 });
 
 describe('classificationNote', () => {
@@ -112,5 +300,25 @@ describe('classificationNote', () => {
   });
   it('says incomplete when it names nothing left out', () => {
     expect(classificationNote(base)).toBe('incomplete · commit 3');
+  });
+  it('names partial status, tier, open-class count and unknown consistency for a partial run', () => {
+    expect(
+      classificationNote({
+        ...base,
+        tier: 'disjunctive',
+        partial: true,
+        incompleteCount: 3,
+        consistency: 'unknown',
+      }),
+    ).toBe('Partial · DISJUNCTIVE · 3 open classes · consistency unknown · commit 3');
+    expect(
+      classificationNote({
+        ...base,
+        tier: 'disjunctive',
+        partial: true,
+        incompleteCount: 1,
+        consistency: 'consistent',
+      }),
+    ).toBe('Partial · DISJUNCTIVE · 1 open class · commit 3');
   });
 });
