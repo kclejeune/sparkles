@@ -1277,6 +1277,7 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                     format,
                     oxrdfio::RdfFormat::Turtle
                         | oxrdfio::RdfFormat::TriG
+                        | oxrdfio::RdfFormat::N3
                         | oxrdfio::RdfFormat::RdfXml
                 ) {
                     prefixes
@@ -1294,7 +1295,9 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                     .unwrap_or(0)
                     .max(8);
                 let header_bytes = match format {
-                    oxrdfio::RdfFormat::RdfXml => 128u64.saturating_add(
+                    // Built-in XML declaration + `\n` + `<rdf:RDF>` start tag with `rdf` (56 B)
+                    // and `its` (42 B) namespace bindings is 146 bytes before custom prefixes.
+                    oxrdfio::RdfFormat::RdfXml => 146u64.saturating_add(
                         valid_prefixes
                             .iter()
                             .map(|(name, ns)| {
@@ -1305,7 +1308,9 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                             })
                             .sum::<u64>(),
                     ),
-                    oxrdfio::RdfFormat::Turtle | oxrdfio::RdfFormat::TriG => valid_prefixes
+                    oxrdfio::RdfFormat::Turtle
+                    | oxrdfio::RdfFormat::TriG
+                    | oxrdfio::RdfFormat::N3 => valid_prefixes
                         .iter()
                         .map(|(name, ns)| {
                             (name.len() as u64)
@@ -1317,7 +1322,7 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                 };
                 let turtle_prefixes = if matches!(
                     format,
-                    oxrdfio::RdfFormat::Turtle | oxrdfio::RdfFormat::TriG
+                    oxrdfio::RdfFormat::Turtle | oxrdfio::RdfFormat::TriG | oxrdfio::RdfFormat::N3
                 ) {
                     valid_prefixes
                 } else {
@@ -1919,11 +1924,14 @@ fn rdfxml_next_close_tag_bytes(quad: &Quad, max_prefix_name_bytes: u64) -> u64 {
     if quad.predicate.as_ref() == oxrdf::vocab::rdf::TYPE
         && let oxrdf::Term::NamedNode(class) = &quad.object
     {
+        // `\n\t</{prefix}:{local}>` (6 bytes of framing plus prefix and local name; headroom
+        // also exceeds `\n\t</rdf:Description>` if `class` is a reserved syntax term).
         (class.as_str().len() as u64)
             .saturating_add(max_prefix_name_bytes)
             .saturating_add(16)
     } else {
-        18
+        // `\n\t</rdf:Description>` = 20 bytes.
+        20
     }
 }
 
@@ -2181,6 +2189,11 @@ fn sink_quad_fits<W: Write + Send + 'static>(
             }
             let progress = progress_bytes.load(Ordering::Relaxed);
             let available = limit_bytes.saturating_sub(progress);
+            // In `oxrdf::Quad`, RDF 1.2 triple terms can appear only inside `quad.object`.
+            // Skip coarse fast-accept for triple-term quads in prefix-aware formats so the
+            // recursive tighter probe accounts for nested prefixes and doubled RDF/XML QNames
+            // at arbitrary nesting depth.
+            let has_triple = matches!(quad.object, oxrdf::Term::Triple(_));
             if *format == oxrdfio::RdfFormat::RdfXml {
                 let header_extra = if rdfxml_subject.is_none() {
                     *header_bytes
@@ -2219,13 +2232,13 @@ fn sink_quad_fits<W: Write + Send + 'static>(
                 {
                     return false;
                 }
-                if max_bytes <= available {
+                if !has_triple && max_bytes <= available {
                     return true;
                 }
                 return rdfxml_quad_escaped_fits(quad, available, extra, *max_prefix_name_bytes);
             }
-            let (kind, meta, quad_frame, extra_frame) = match format {
-                oxrdfio::RdfFormat::Turtle | oxrdfio::RdfFormat::TriG => {
+            let (kind, meta, quad_frame, extra_frame, skip_fast_accept) = match format {
+                oxrdfio::RdfFormat::Turtle | oxrdfio::RdfFormat::TriG | oxrdfio::RdfFormat::N3 => {
                     let first_header = if progress == 0 { *header_bytes } else { 0 };
                     let prefix_frame = max_prefix_name_bytes.saturating_mul(4);
                     (
@@ -2235,21 +2248,22 @@ fn sink_quad_fits<W: Write + Send + 'static>(
                             .saturating_add(first_header)
                             .saturating_add(prefix_frame),
                         first_header,
+                        has_triple,
                     )
                 }
                 oxrdfio::RdfFormat::NTriples | oxrdfio::RdfFormat::NQuads => {
-                    (EscapeKind::Rdf, LiteralMetaMode::All, 16, 0)
+                    (EscapeKind::Rdf, LiteralMetaMode::All, 16, 0, false)
                 }
                 oxrdfio::RdfFormat::JsonLd { .. } => {
-                    (EscapeKind::Json, LiteralMetaMode::All, 64, 0)
+                    (EscapeKind::Json, LiteralMetaMode::All, 64, 0, false)
                 }
-                _ => (EscapeKind::Rdf, LiteralMetaMode::All, 64, 0),
+                _ => (EscapeKind::Rdf, LiteralMetaMode::All, 64, 0, false),
             };
             let (min_bytes, max_bytes) = quad_size_bounds(quad, meta, 6, *datasets, quad_frame);
             if min_bytes > available {
                 return false;
             }
-            if max_bytes <= available {
+            if !skip_fast_accept && max_bytes <= available {
                 return true;
             }
             quad_escaped_fits(quad, kind, prefixes, *datasets, extra_frame, available)
@@ -2322,7 +2336,8 @@ fn sink_footer_min_bytes<W: Write + Send + 'static>(state: &GraphState<W>) -> u6
                 } else {
                     *header_bytes
                 };
-                10u64.saturating_add(extra)
+                // `\n</rdf:RDF>` = 11 bytes.
+                11u64.saturating_add(extra)
             }
             _ => 0,
         },
@@ -3768,5 +3783,235 @@ mod tests {
         assert!(matches!(err, Error::Invalid(_)));
         assert_eq!(sw.stats().status, crate::sparql::CursorStatus::Failed);
         assert!(sw.plan_value().is_some());
+    }
+
+    #[test]
+    fn nested_triple_term_long_prefix_pauses_before_overflow() {
+        let store = Store::in_memory(Default::default());
+        let pad = "a".repeat((1 << 20) - (8 << 10));
+        let mut nested = "\"x\"".to_string();
+        for _ in 0..15 {
+            nested = format!("<<( <urn:s> <urn:z> {nested} )>>");
+        }
+        let nt = format!("<urn:s> <urn:w> \"{pad}\" .\n<urn:s> <urn:z> {nested} .\n");
+        store
+            .load(&[LoadSource::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+
+        let threshold = 1u64 << 20;
+        let prefixes = vec![("p".repeat(256), "urn:".to_string())];
+        let query = "CONSTRUCT { <urn:s> ?p ?o } WHERE { <urn:s> ?p ?o } ORDER BY ?p";
+        for format in [
+            Format::Rdf(RdfFormat::RdfXml),
+            Format::Rdf(RdfFormat::Turtle),
+            Format::Rdf(RdfFormat::TriG),
+        ] {
+            let open_graph = || match query_execution(
+                store.snapshot(),
+                query,
+                &QueryOptions::default(),
+                &CursorOptions::default(),
+                ExecutionMode::Streaming,
+            )
+            .unwrap()
+            {
+                QueryExecution::Graph(cursor) => *cursor,
+                _ => unreachable!(),
+            };
+            let mut expected = Vec::new();
+            write(
+                Source::Graph(&mut open_graph()),
+                WriteOptions {
+                    prefixes: &prefixes,
+                    ..WriteOptions::new(format, &RowCount::new())
+                },
+                &mut expected,
+            )
+            .unwrap();
+            assert!(
+                expected.len() as u64 > threshold,
+                "{format:?} expected {} <= {threshold}",
+                expected.len()
+            );
+
+            let mut writer = CursorWriter::graph(
+                open_graph(),
+                CursorWriteOptions {
+                    format,
+                    send: None,
+                    prefixes: prefixes.clone(),
+                    metadata: None,
+                    ledger: None,
+                },
+            );
+            let mut slot = Some(Vec::new());
+            assert!(
+                matches!(
+                    writer.write_until(&mut slot, threshold).unwrap(),
+                    WriteStep::Paused
+                ),
+                "{format:?} must pause before overflowing on nested triple term"
+            );
+            if let CursorWriter::Graph(g) = &writer {
+                assert_eq!(
+                    g.sent, 1,
+                    "{format:?} must accept the first triple and pause before the nested triple"
+                );
+            }
+            let prefix_len = slot.as_ref().unwrap().len();
+            assert!(
+                prefix_len <= threshold as usize,
+                "{format:?} buffered {prefix_len} bytes (> {threshold}) before hand-off"
+            );
+            let output = std::thread::spawn(move || {
+                writer.finish(&mut slot).unwrap();
+                slot.unwrap()
+            })
+            .join()
+            .unwrap();
+            assert_eq!(output, expected, "{format:?} parity");
+        }
+    }
+
+    #[test]
+    fn empty_rdf_xml_pauses_before_exceeding_small_limit() {
+        let store = Store::in_memory(Default::default());
+        let format = Format::Rdf(RdfFormat::RdfXml);
+        let query = "CONSTRUCT { ?s ?p ?o } WHERE { <urn:empty:missing> ?p ?o }";
+        let open_graph = || match query_execution(
+            store.snapshot(),
+            query,
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Graph(cursor) => *cursor,
+            _ => unreachable!(),
+        };
+        let mut expected = Vec::new();
+        write(
+            Source::Graph(&mut open_graph()),
+            WriteOptions::new(format, &RowCount::new()),
+            &mut expected,
+        )
+        .unwrap();
+        assert_eq!(expected.len(), 157, "locked empty RDF/XML byte count");
+
+        for limit in [140u64, 156] {
+            let mut writer = CursorWriter::graph(
+                open_graph(),
+                CursorWriteOptions {
+                    format,
+                    send: None,
+                    prefixes: Vec::new(),
+                    metadata: None,
+                    ledger: None,
+                },
+            );
+            let mut slot = Some(Vec::new());
+            assert!(
+                matches!(
+                    writer.write_until(&mut slot, limit).unwrap(),
+                    WriteStep::Paused
+                ),
+                "empty RDF/XML must pause at limit {limit}"
+            );
+            let prefix_len = slot.as_ref().unwrap().len();
+            assert_eq!(
+                prefix_len,
+                0,
+                "empty RDF/XML at limit {limit} must pause before emitting {expected_len} bytes, buffered {prefix_len}",
+                expected_len = expected.len()
+            );
+            let output = std::thread::spawn(move || {
+                writer.finish(&mut slot).unwrap();
+                slot.unwrap()
+            })
+            .join()
+            .unwrap();
+            assert_eq!(output, expected, "empty RDF/XML parity at limit {limit}");
+        }
+
+        // Exact 157-byte limit completes in place.
+        let mut writer = CursorWriter::graph(
+            open_graph(),
+            CursorWriteOptions {
+                format,
+                send: None,
+                prefixes: Vec::new(),
+                metadata: None,
+                ledger: None,
+            },
+        );
+        let mut slot = Some(Vec::new());
+        assert!(
+            matches!(
+                writer.write_until(&mut slot, 157).unwrap(),
+                WriteStep::Done(_)
+            ),
+            "empty RDF/XML must complete in place at exact 157-byte limit"
+        );
+        assert_eq!(slot.unwrap(), expected);
+
+        // Untyped non-empty RDF/XML closing `\n\t</rdf:Description>\n</rdf:RDF>` (31 bytes)
+        // must pause before finish() when only 30 bytes remain.
+        let non_empty = sample_store();
+        let non_empty_q = "CONSTRUCT { ?s <urn:ex:num> ?o } WHERE { ?s <urn:ex:num> ?o } LIMIT 1";
+        let open_one = || match query_execution(
+            non_empty.snapshot(),
+            non_empty_q,
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Graph(cursor) => *cursor,
+            _ => unreachable!(),
+        };
+        let mut full_one = Vec::new();
+        write(
+            Source::Graph(&mut open_one()),
+            WriteOptions::new(format, &RowCount::new()),
+            &mut full_one,
+        )
+        .unwrap();
+        let tight = (full_one.len() - 1) as u64;
+        let mut writer = CursorWriter::graph(
+            open_one(),
+            CursorWriteOptions {
+                format,
+                send: None,
+                prefixes: Vec::new(),
+                metadata: None,
+                ledger: None,
+            },
+        );
+        let mut slot = Some(Vec::new());
+        assert!(
+            matches!(
+                writer.write_until(&mut slot, tight).unwrap(),
+                WriteStep::Paused
+            ),
+            "untyped RDF/XML footer must pause at limit {tight}"
+        );
+        let prefix_len = slot.as_ref().unwrap().len();
+        assert!(
+            prefix_len <= tight as usize,
+            "untyped RDF/XML buffered {prefix_len} bytes (> {tight}) before hand-off"
+        );
+        let output = std::thread::spawn(move || {
+            writer.finish(&mut slot).unwrap();
+            slot.unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(output, full_one);
     }
 }
