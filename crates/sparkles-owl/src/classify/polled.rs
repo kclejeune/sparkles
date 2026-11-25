@@ -440,10 +440,20 @@ fn eq_set_polled<T, B: ScratchBudget>(
     budget: &B,
     eq: fn(&T, &T, &mut usize, &B) -> Result<bool, Error>,
 ) -> Result<bool, Error> {
+    eq_ordered_polled(a.iter(), b.iter(), steps, budget, eq)
+}
+
+fn eq_ordered_polled<'a, T: 'a, B: ScratchBudget>(
+    a: impl ExactSizeIterator<Item = &'a T>,
+    b: impl ExactSizeIterator<Item = &'a T>,
+    steps: &mut usize,
+    budget: &B,
+    eq: fn(&T, &T, &mut usize, &B) -> Result<bool, Error>,
+) -> Result<bool, Error> {
     if a.len() != b.len() {
         return Ok(false);
     }
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (x, y) in a.zip(b) {
         if !eq(x, y, steps, budget)? {
             return Ok(false);
         }
@@ -1066,7 +1076,14 @@ fn hash_axiom_polled(
             hash_ce_polled(a, h, steps, budget)?;
             hash_ce_polled(b, h, steps, budget)
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
+        K::EquivalentClasses(cs) => {
+            cs.len().hash(h);
+            for c in cs {
+                hash_ce_polled(c, h, steps, budget)?;
+            }
+            Ok(())
+        }
+        K::DisjointClasses(cs) => {
             cs.len().hash(h);
             for c in cs {
                 hash_ce_polled(c, h, steps, budget)?;
@@ -1085,7 +1102,14 @@ fn hash_axiom_polled(
             hash_sub_ope_polled(sub, h, steps, budget)?;
             hash_ope_polled(sup, h, steps, budget)
         }
-        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
+        K::EquivalentObjectProperties(ps) => {
+            ps.len().hash(h);
+            for p in ps {
+                hash_ope_polled(p, h, steps, budget)?;
+            }
+            Ok(())
+        }
+        K::DisjointObjectProperties(ps) => {
             ps.len().hash(h);
             for p in ps {
                 hash_ope_polled(p, h, steps, budget)?;
@@ -1111,7 +1135,14 @@ fn hash_axiom_polled(
             hash_str_polled(a.as_str(), h, steps, budget)?;
             hash_str_polled(b.as_str(), h, steps, budget)
         }
-        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
+        K::EquivalentDataProperties(ps) => {
+            ps.len().hash(h);
+            for p in ps {
+                hash_str_polled(p.as_str(), h, steps, budget)?;
+            }
+            Ok(())
+        }
+        K::DisjointDataProperties(ps) => {
             ps.len().hash(h);
             for p in ps {
                 hash_str_polled(p.as_str(), h, steps, budget)?;
@@ -1143,7 +1174,14 @@ fn hash_axiom_polled(
             }
             Ok(())
         }
-        K::SameIndividual(is) | K::DifferentIndividuals(is) => {
+        K::SameIndividual(is) => {
+            is.len().hash(h);
+            for i in is {
+                hash_ind_polled(i, h, steps, budget)?;
+            }
+            Ok(())
+        }
+        K::DifferentIndividuals(is) => {
             is.len().hash(h);
             for i in is {
                 hash_ind_polled(i, h, steps, budget)?;
@@ -1196,20 +1234,24 @@ fn eq_axiom_polled(
         (K::SubClassOf(a1, b1), K::SubClassOf(a2, b2)) => {
             Ok(eq_ce_polled(a1, a2, steps, budget)? && eq_ce_polled(b1, b2, steps, budget)?)
         }
-        (K::EquivalentClasses(xs), K::EquivalentClasses(ys))
-        | (K::DisjointClasses(xs), K::DisjointClasses(ys)) => {
+        (K::EquivalentClasses(xs), K::EquivalentClasses(ys)) => {
             eq_set_polled(xs, ys, steps, budget, eq_ce_polled)
+        }
+        (K::DisjointClasses(xs), K::DisjointClasses(ys)) => {
+            eq_ordered_polled(xs.iter(), ys.iter(), steps, budget, eq_ce_polled)
         }
         (K::DisjointUnion(c1, xs), K::DisjointUnion(c2, ys)) => {
             Ok(eq_str_polled(c1.as_str(), c2.as_str(), steps, budget)?
-                && eq_set_polled(xs, ys, steps, budget, eq_ce_polled)?)
+                && eq_ordered_polled(xs.iter(), ys.iter(), steps, budget, eq_ce_polled)?)
         }
         (K::SubObjectPropertyOf(s1, p1), K::SubObjectPropertyOf(s2, p2)) => {
             Ok(eq_sub_ope_polled(s1, s2, steps, budget)? && eq_ope_polled(p1, p2, steps, budget)?)
         }
-        (K::EquivalentObjectProperties(xs), K::EquivalentObjectProperties(ys))
-        | (K::DisjointObjectProperties(xs), K::DisjointObjectProperties(ys)) => {
+        (K::EquivalentObjectProperties(xs), K::EquivalentObjectProperties(ys)) => {
             eq_set_polled(xs, ys, steps, budget, eq_ope_polled)
+        }
+        (K::DisjointObjectProperties(xs), K::DisjointObjectProperties(ys)) => {
+            eq_ordered_polled(xs.iter(), ys.iter(), steps, budget, eq_ope_polled)
         }
         (K::InverseObjectProperties(a1, b1), K::InverseObjectProperties(a2, b2)) => {
             Ok(eq_ope_polled(a1, a2, steps, budget)? && eq_ope_polled(b1, b2, steps, budget)?)
@@ -1230,9 +1272,11 @@ fn eq_axiom_polled(
         (K::SubDataPropertyOf(a1, b1), K::SubDataPropertyOf(a2, b2)) => {
             Ok(eq_dp_polled(a1, a2, steps, budget)? && eq_dp_polled(b1, b2, steps, budget)?)
         }
-        (K::EquivalentDataProperties(xs), K::EquivalentDataProperties(ys))
-        | (K::DisjointDataProperties(xs), K::DisjointDataProperties(ys)) => {
+        (K::EquivalentDataProperties(xs), K::EquivalentDataProperties(ys)) => {
             eq_set_polled(xs, ys, steps, budget, eq_dp_polled)
+        }
+        (K::DisjointDataProperties(xs), K::DisjointDataProperties(ys)) => {
+            eq_ordered_polled(xs.iter(), ys.iter(), steps, budget, eq_dp_polled)
         }
         (K::DataPropertyDomain(p1, c1), K::DataPropertyDomain(p2, c2)) => {
             Ok(eq_dp_polled(p1, p2, steps, budget)? && eq_ce_polled(c1, c2, steps, budget)?)
@@ -1252,9 +1296,11 @@ fn eq_axiom_polled(
                 && eq_set_polled(ops1, ops2, steps, budget, eq_ope_polled)?
                 && eq_set_polled(dps1, dps2, steps, budget, eq_dp_polled)?)
         }
-        (K::SameIndividual(xs), K::SameIndividual(ys))
-        | (K::DifferentIndividuals(xs), K::DifferentIndividuals(ys)) => {
+        (K::SameIndividual(xs), K::SameIndividual(ys)) => {
             eq_set_polled(xs, ys, steps, budget, eq_ind_polled)
+        }
+        (K::DifferentIndividuals(xs), K::DifferentIndividuals(ys)) => {
+            eq_ordered_polled(xs.iter(), ys.iter(), steps, budget, eq_ind_polled)
         }
         (K::ClassAssertion(c1, i1), K::ClassAssertion(c2, i2)) => {
             Ok(eq_ce_polled(c1, c2, steps, budget)? && eq_ind_polled(i1, i2, steps, budget)?)
@@ -1612,12 +1658,13 @@ mod tests {
     fn axiom() -> impl Strategy<Value = AxiomKind> {
         use AxiomKind as K;
         let ces = || prop::collection::btree_set(class_expression(), 1..3);
+        let repeated_ces = || prop::collection::vec(class_expression(), 1..4);
         let inds = || prop::collection::btree_set(ind(), 1..3);
         prop_oneof![
             3 => (class_expression(), class_expression()).prop_map(|(a, b)| K::SubClassOf(a, b)),
             1 => ces().prop_map(K::EquivalentClasses),
-            1 => ces().prop_map(K::DisjointClasses),
-            1 => (0..2u8, ces()).prop_map(|(c, cs)| K::DisjointUnion(Class::new(format!("urn:c{c}")), cs)),
+            1 => repeated_ces().prop_map(|cs| K::DisjointClasses(cs.into())),
+            1 => (0..2u8, repeated_ces()).prop_map(|(c, cs)| K::DisjointUnion(Class::new(format!("urn:c{c}")), cs.into())),
             1 => (ope(), ope()).prop_map(|(a, b)| K::SubObjectPropertyOf(SubObjectPropertyExpression::Expression(a), b)),
             1 => (prop::collection::vec(ope(), 1..3), ope())
                 .prop_map(|(ps, b)| K::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), b)),

@@ -6359,7 +6359,7 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
         for i in 0..24usize {
             wide_oneof_a.insert(Individual::anonymous(format!(
                 "du_{i:02}_{}",
-                "d".repeat(512)
+                "d".repeat(1024)
             )));
         }
         let wide_filler = ClassExpression::ObjectOneOf(wide_oneof_a);
@@ -6815,7 +6815,7 @@ fn eleven_element_three_node_btree_set_is_not_undercounted_when_cloned() {
 
     // 1. Retained exclusion cloning (`DifferentIndividuals` with 11-member 3-node set).
     let excl_template = vec![Excluded {
-        axiom: AxiomKind::DifferentIndividuals(inds.clone()),
+        axiom: AxiomKind::DifferentIndividuals(inds.clone().into()),
         gap: index::Gap::Partial("eleven-3node"),
     }];
     let (excl_cloned, excl_clone_sample) = measure(|| excl_template.clone());
@@ -6964,9 +6964,9 @@ fn singleton_disjoint_union_with_long_iri_does_not_overlap_live_container_releas
     );
 
     // Check both (a) 2-operand DisjointUnion collapsing to 1 image and (b) 1-operand AST.
-    for (label, operands) in [
-        ("2-operand collapsing", vec![op1.clone(), op2]),
-        ("1-operand singleton", vec![op1]),
+    for (label, operands, collapsed) in [
+        ("2-operand collapsing", vec![op1.clone(), op2], true),
+        ("1-operand singleton", vec![op1], false),
     ] {
         let du = AxiomKind::DisjointUnion(long_union.clone(), operands.into_iter().collect());
         let refs = [&disj, &du];
@@ -7016,13 +7016,20 @@ fn singleton_disjoint_union_with_long_iri_does_not_overlap_live_container_releas
             red.retained_bytes(),
             sample.live
         );
-        assert!(
-            red.axioms
-                .iter()
-                .any(|ax| matches!(ax, AxiomKind::EquivalentClasses(_))),
-            "{label}: singleton DisjointUnion must emit EquivalentClasses: {:?}",
-            red.axioms
-        );
+        if collapsed {
+            assert!(red.axioms.iter().any(|ax| matches!(
+                ax,
+                AxiomKind::SubClassOf(ClassExpression::Class(c), ClassExpression::Class(bottom))
+                    if c == &long_union && bottom == &Class::nothing()
+            )));
+        } else {
+            assert!(
+                red.axioms
+                    .iter()
+                    .any(|ax| matches!(ax, AxiomKind::EquivalentClasses(_))),
+                "{label}: a single surviving operand must yield an equivalence"
+            );
+        }
         drop(red);
 
         // Tight-grant sweep across every observed admission boundary and one byte below it.
@@ -7166,7 +7173,7 @@ fn disjoint_union_deduplication_polls_wide_rewritten_operands_and_cancels() {
     }
 
     // 2. 3-operand cancellation mid-deduplication on 3rd operand (former `empty.entry(d)`).
-    let du3 = AxiomKind::DisjointUnion(union_cls, three_ops);
+    let du3 = AxiomKind::DisjointUnion(union_cls, three_ops.into());
     let refs3 = [&disj, &du3];
     {
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -7251,7 +7258,7 @@ fn disjoint_union_deduplication_polls_wide_rewritten_operands_and_cancels() {
             .filter(|ax| {
                 matches!(
                     ax,
-                    AxiomKind::SubClassOf(_, ClassExpression::Class(c))
+                    AxiomKind::SubClassOf(ClassExpression::ObjectSomeValuesFrom(..), ClassExpression::Class(c))
                         if c.as_str() == crate::vocab::OWL_NOTHING
                 )
             })
@@ -7350,8 +7357,8 @@ fn disjoint_union_full_vector_duplicate_does_not_reserve_unused_growth() {
         "duplicate operand must sort last after 1,024 unique operands"
     );
 
-    let du_no_dup = AxiomKind::DisjointUnion(union_cls.clone(), base_ops);
-    let du_with_dup = AxiomKind::DisjointUnion(union_cls, dup_ops);
+    let du_no_dup = AxiomKind::DisjointUnion(union_cls.clone(), base_ops.into());
+    let du_with_dup = AxiomKind::DisjointUnion(union_cls, dup_ops.into());
     let refs_no_dup = [&disj, &du_no_dup];
     let refs_with_dup = [&disj, &du_with_dup];
 
@@ -7560,7 +7567,7 @@ fn merge_plan_probes_pair_start_and_done_at_exact_boundaries() {
         for i in 0..16usize {
             diff16.insert(Individual::named(format!("urn:tierd1291:b16i{i:02}")));
         }
-        let diff_ax = AxiomKind::DifferentIndividuals(diff16);
+        let diff_ax = AxiomKind::DifferentIndividuals(diff16.into());
         // One non-top property sorting before `http://www.w3.org/2002/07/owl#topObjectProperty`.
         let eqop_one_non_top = AxiomKind::EquivalentObjectProperties(
             [
@@ -7661,7 +7668,7 @@ fn merge_plan_probes_pair_start_and_done_at_exact_boundaries() {
         for i in 0..17usize {
             diff17.insert(Individual::named(format!("urn:tierd1291:b17i{i:02}")));
         }
-        let diff_ax = AxiomKind::DifferentIndividuals(diff17);
+        let diff_ax = AxiomKind::DifferentIndividuals(diff17.into());
         let mut oneof17 = std::collections::BTreeSet::new();
         for i in 0..17usize {
             oneof17.insert(Individual::anonymous(format!("b17a{i:02}")));

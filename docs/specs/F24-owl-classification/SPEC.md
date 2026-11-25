@@ -259,8 +259,8 @@ the rewriting, restores any unchanged exclusions, computes the original axioms' 
 counts, chain range checks and tier from the original ontology, and keeps every internal
 fresh class and the hub individual out of the taxonomy, descriptions and reports. When Tier D
 does not take the rewritten ontology, runs that remain disjunctive or leave out a rewritten
-axiom, such as under a non-regular role hierarchy, a Horn-rejected multi-member
-`DisjointUnion` or an at-least restriction above one beside individuals, still start again on
+axiom, such as under a non-regular role hierarchy, a `DisjointUnion` over a
+non-simple self role or an at-least restriction above the Horn bound of 64, still start again on
 the original axioms. Direct parser regressions in `tests/dl_nominals.rs` cover each kept,
 chain-range statistics and rejected case without injecting unrelated disjunctions.
 

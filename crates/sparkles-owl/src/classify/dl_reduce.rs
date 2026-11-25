@@ -883,19 +883,19 @@ pub(super) fn axiom_retained_heap_bytes(k: &AxiomKind) -> usize {
     match k {
         K::Declaration(e) => e.iri().as_str().len(),
         K::SubClassOf(a, b) => ce_retained_bytes(a).saturating_add(ce_retained_bytes(b)),
-        K::EquivalentClasses(cs) => {
-            btree_set_bytes::<ClassExpression>(cs.len())
-                .saturating_add(cs.iter().map(ce_retained_bytes).sum::<usize>())
-        }
-        K::DisjointClasses(cs) => {
-            cs.capacity()
-                .saturating_mul(std::mem::size_of::<ClassExpression>())
-                .saturating_add(cs.iter().map(ce_retained_bytes).sum::<usize>())
-        }
+        K::EquivalentClasses(cs) => btree_set_bytes::<ClassExpression>(cs.len())
+            .saturating_add(cs.iter().map(ce_retained_bytes).sum::<usize>()),
+        K::DisjointClasses(cs) => cs
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ClassExpression>())
+            .saturating_add(cs.iter().map(ce_retained_bytes).sum::<usize>()),
         K::DisjointUnion(c, cs) => c
             .as_str()
             .len()
-            .saturating_add(cs.capacity().saturating_mul(std::mem::size_of::<ClassExpression>()))
+            .saturating_add(
+                cs.capacity()
+                    .saturating_mul(std::mem::size_of::<ClassExpression>()),
+            )
             .saturating_add(cs.iter().map(ce_retained_bytes).sum::<usize>()),
         K::SubObjectPropertyOf(s, sup) => sup.named().as_str().len().saturating_add(match s {
             SubObjectPropertyExpression::Expression(p) => p.named().as_str().len(),
@@ -904,15 +904,12 @@ pub(super) fn axiom_retained_heap_bytes(k: &AxiomKind) -> usize {
                 .saturating_mul(std::mem::size_of::<ObjectPropertyExpression>())
                 .saturating_add(ps.iter().map(|p| p.named().as_str().len()).sum::<usize>()),
         }),
-        K::EquivalentObjectProperties(ps) => {
-            btree_set_bytes::<ObjectPropertyExpression>(ps.len())
-                .saturating_add(ps.iter().map(|p| p.named().as_str().len()).sum::<usize>())
-        }
-        K::DisjointObjectProperties(ps) => {
-            ps.capacity()
-                .saturating_mul(std::mem::size_of::<ObjectPropertyExpression>())
-                .saturating_add(ps.iter().map(|p| p.named().as_str().len()).sum::<usize>())
-        }
+        K::EquivalentObjectProperties(ps) => btree_set_bytes::<ObjectPropertyExpression>(ps.len())
+            .saturating_add(ps.iter().map(|p| p.named().as_str().len()).sum::<usize>()),
+        K::DisjointObjectProperties(ps) => ps
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ObjectPropertyExpression>())
+            .saturating_add(ps.iter().map(|p| p.named().as_str().len()).sum::<usize>()),
         K::InverseObjectProperties(a, b) => a
             .named()
             .as_str()
@@ -931,15 +928,12 @@ pub(super) fn axiom_retained_heap_bytes(k: &AxiomKind) -> usize {
         | K::AsymmetricObjectProperty(p)
         | K::TransitiveObjectProperty(p) => p.named().as_str().len(),
         K::SubDataPropertyOf(a, b) => a.as_str().len().saturating_add(b.as_str().len()),
-        K::EquivalentDataProperties(ps) => {
-            btree_set_bytes::<DataProperty>(ps.len())
-                .saturating_add(ps.iter().map(|p| p.as_str().len()).sum::<usize>())
-        }
-        K::DisjointDataProperties(ps) => {
-            ps.capacity()
-                .saturating_mul(std::mem::size_of::<DataProperty>())
-                .saturating_add(ps.iter().map(|p| p.as_str().len()).sum::<usize>())
-        }
+        K::EquivalentDataProperties(ps) => btree_set_bytes::<DataProperty>(ps.len())
+            .saturating_add(ps.iter().map(|p| p.as_str().len()).sum::<usize>()),
+        K::DisjointDataProperties(ps) => ps
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DataProperty>())
+            .saturating_add(ps.iter().map(|p| p.as_str().len()).sum::<usize>()),
         K::DataPropertyDomain(p, c) => p.as_str().len().saturating_add(ce_retained_bytes(c)),
         K::DataPropertyRange(p, r) => p.as_str().len().saturating_add(dr_retained_bytes(r)),
         K::FunctionalDataProperty(p) => p.as_str().len(),
@@ -949,15 +943,12 @@ pub(super) fn axiom_retained_heap_bytes(k: &AxiomKind) -> usize {
             .saturating_add(ops.iter().map(|p| p.named().as_str().len()).sum::<usize>())
             .saturating_add(btree_set_bytes::<DataProperty>(dps.len()))
             .saturating_add(dps.iter().map(|p| p.as_str().len()).sum::<usize>()),
-        K::SameIndividual(is) => {
-            btree_set_bytes::<Individual>(is.len())
-                .saturating_add(is.iter().map(ind_retained_bytes).sum::<usize>())
-        }
-        K::DifferentIndividuals(is) => {
-            is.capacity()
-                .saturating_mul(std::mem::size_of::<Individual>())
-                .saturating_add(is.iter().map(ind_retained_bytes).sum::<usize>())
-        }
+        K::SameIndividual(is) => btree_set_bytes::<Individual>(is.len())
+            .saturating_add(is.iter().map(ind_retained_bytes).sum::<usize>()),
+        K::DifferentIndividuals(is) => is
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Individual>())
+            .saturating_add(is.iter().map(ind_retained_bytes).sum::<usize>()),
         K::ClassAssertion(c, i) => ce_retained_bytes(c).saturating_add(ind_retained_bytes(i)),
         K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => p
             .named()
@@ -1837,7 +1828,9 @@ fn disjoint_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
         if !budget.try_add(set_tree_bytes) {
             return Ok(false);
         }
-        let members_bytes = images.len().saturating_mul(std::mem::size_of::<ClassExpression>());
+        let members_bytes = images
+            .len()
+            .saturating_mul(std::mem::size_of::<ClassExpression>());
         if !budget.try_add(members_bytes) {
             return Ok(false);
         }
@@ -1900,7 +1893,7 @@ fn disjoint_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
                 } else if c.as_str() != vocab::OWL_NOTHING {
                     let ax_heap = c.as_str().len().saturating_add(vocab::OWL_NOTHING.len());
                     if !push_axiom_polled(out, budget, origin_i, ax_heap, 0, || {
-                        Ok(K::SubClassOf(
+                        Ok(AxiomKind::SubClassOf(
                             ClassExpression::Class(c.clone()),
                             ClassExpression::Class(Class::nothing()),
                         ))

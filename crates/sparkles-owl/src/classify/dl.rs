@@ -342,15 +342,18 @@ fn is_top_data(d: &DataProperty) -> bool {
 /// The counts of the clauses an axiom stands for, as the largest number of disjuncts of
 /// one of them, and whether one of them is not ⊥-local for the empty signature. Axioms
 /// about properties alone are Horn and local.
-fn clauses<E>(ax: &AxiomKind, state: &mut PollState<'_, E>) -> Result<(u8, bool), E> {
+fn clauses<E>(
+    ax: &AxiomKind,
+    state: &mut PollState<'_, E>,
+    report_global: bool,
+) -> Result<(u8, bool), E> {
     use AxiomKind as K;
-    state.tick()?;
     // C ⊑ D has ¬C ⊔ D as its clause
     let sub = |c: Pl, d: Pl| add(c.neg, d.pos);
     Ok(match ax {
         K::SubClassOf(c, d) => {
             let most = sub(class(c, state)?, class(d, state)?);
-            let global = most > 1 && !bottom(c, state)? && !top(d, state)?;
+            let global = report_global && most > 1 && !bottom(c, state)? && !top(d, state)?;
             (most, global)
         }
         K::EquivalentClasses(cs) => {
@@ -380,7 +383,7 @@ fn clauses<E>(ax: &AxiomKind, state: &mut PollState<'_, E>) -> Result<(u8, bool)
                     }
                 }
             }
-            let global = if most > 1 {
+            let global = if report_global && most > 1 {
                 let mut all_bot = true;
                 for c in cs {
                     if !bottom(c, state)? {
@@ -406,7 +409,7 @@ fn clauses<E>(ax: &AxiomKind, state: &mut PollState<'_, E>) -> Result<(u8, bool)
         K::DisjointClasses(cs) => {
             let (_, most) = disjoint_counts(cs, state)?;
             let mut non_bot = 0;
-            if most > 1 {
+            if report_global && most > 1 {
                 for c in cs {
                     if !bottom(c, state)? {
                         non_bot += 1;
@@ -422,7 +425,7 @@ fn clauses<E>(ax: &AxiomKind, state: &mut PollState<'_, E>) -> Result<(u8, bool)
             let (union, disjoint) = disjoint_counts(cs, state)?;
             let named = class_name_pl(c);
             let most = sub(named, union).max(sub(union, named)).max(disjoint);
-            let global = if most > 1 {
+            let global = if report_global && most > 1 {
                 let named_top = c.as_str() == vocab::OWL_THING;
                 let mut non_bot = 0;
                 let mut any_top = false;
@@ -446,29 +449,29 @@ fn clauses<E>(ax: &AxiomKind, state: &mut PollState<'_, E>) -> Result<(u8, bool)
         }
         K::ClassAssertion(c, _) => {
             let most = class(c, state)?.pos;
-            let global = most > 1 && !top(c, state)?;
+            let global = report_global && most > 1 && !top(c, state)?;
             (most, global)
         }
         K::ObjectPropertyDomain(p, c) => {
             let most = class(c, state)?.pos;
-            let global = most > 1 && is_top_role(p) && !top(c, state)?;
+            let global = report_global && most > 1 && is_top_role(p) && !top(c, state)?;
             (most, global)
         }
         K::ObjectPropertyRange(p, c) => {
             let most = class(c, state)?.pos;
-            let global = most > 1 && is_top_role(p) && !top(c, state)?;
+            let global = report_global && most > 1 && is_top_role(p) && !top(c, state)?;
             (most, global)
         }
         K::DataPropertyDomain(d, c) => {
             let most = class(c, state)?.pos;
-            let global = most > 1 && is_top_data(d) && !top(c, state)?;
+            let global = report_global && most > 1 && is_top_data(d) && !top(c, state)?;
             (most, global)
         }
         // a data range is not emptied with the signature, so a range of the top data
         // property is global unless it holds of every value
         K::DataPropertyRange(d, r) => {
             let most = data(r, state)?.pos;
-            let global = most > 1 && is_top_data(d) && !all_values(r, state)?;
+            let global = report_global && most > 1 && is_top_data(d) && !all_values(r, state)?;
             (most, global)
         }
         K::DatatypeDefinition(_, r) => {
@@ -543,7 +546,6 @@ pub(super) fn split_multiset<T: Eq>(ms: &Multiset<T>) -> (Vec<&T>, Vec<&T>) {
     (unique, repeated)
 }
 
-
 /// Whether a data range holds of every data value.
 fn all_values<E>(r: &DataRange, state: &mut PollState<'_, E>) -> Result<bool, E> {
     state.tick()?;
@@ -581,7 +583,8 @@ pub(super) fn shape_polled<E>(
         visited: 0,
         poll,
     };
-    let (most, global) = clauses(ax, &mut state)?;
+    state.tick()?;
+    let (most, global) = clauses(ax, &mut state, true)?;
     let horn = most <= 1;
     Ok(Shape {
         horn,
@@ -594,7 +597,12 @@ pub(super) fn is_horn_polled<E>(
     ax: &AxiomKind,
     poll: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    Ok(shape_polled(ax, 1, poll)?.horn)
+    let mut state = PollState {
+        step: 1,
+        visited: 0,
+        poll,
+    };
+    Ok(clauses(ax, &mut state, false)?.0 <= 1)
 }
 
 /// What an axiom needs: whether it is Horn and, when it is not, whether it is global.

@@ -1514,7 +1514,13 @@ pub(crate) fn visit_axiom_entities<'a, E>(
             visit_ce(a, f)?;
             visit_ce(b, f)
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
+        K::EquivalentClasses(cs) => {
+            for c in cs {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        K::DisjointClasses(cs) => {
             for c in cs {
                 visit_ce(c, f)?;
             }
@@ -1540,7 +1546,13 @@ pub(crate) fn visit_axiom_entities<'a, E>(
             }
             f(EntityRef::ObjectProperty(sup.named()))
         }
-        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
+        K::EquivalentObjectProperties(ps) => {
+            for p in ps {
+                f(EntityRef::ObjectProperty(p.named()))?;
+            }
+            Ok(())
+        }
+        K::DisjointObjectProperties(ps) => {
             for p in ps {
                 f(EntityRef::ObjectProperty(p.named()))?;
             }
@@ -1565,7 +1577,13 @@ pub(crate) fn visit_axiom_entities<'a, E>(
             f(EntityRef::DataProperty(a))?;
             f(EntityRef::DataProperty(b))
         }
-        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
+        K::EquivalentDataProperties(ps) => {
+            for p in ps {
+                f(EntityRef::DataProperty(p))?;
+            }
+            Ok(())
+        }
+        K::DisjointDataProperties(ps) => {
             for p in ps {
                 f(EntityRef::DataProperty(p))?;
             }
@@ -1594,7 +1612,13 @@ pub(crate) fn visit_axiom_entities<'a, E>(
             }
             Ok(())
         }
-        K::SameIndividual(is) | K::DifferentIndividuals(is) => {
+        K::SameIndividual(is) => {
+            for i in is {
+                visit_ind(i, f)?;
+            }
+            Ok(())
+        }
+        K::DifferentIndividuals(is) => {
             for i in is {
                 visit_ind(i, f)?;
             }

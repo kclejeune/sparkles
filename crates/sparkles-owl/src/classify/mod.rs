@@ -313,6 +313,7 @@ pub(crate) enum WinningStop {
     Memory,
     Timeout,
     Cancelled,
+    Merge,
 }
 
 impl WinningStop {
@@ -323,6 +324,7 @@ impl WinningStop {
             Some(Stop::Memory { .. }) => Self::Memory,
             Some(Stop::Timeout) => Self::Timeout,
             Some(Stop::Cancelled) => Self::Cancelled,
+            Some(Stop::Merge { .. }) => Self::Merge,
         }
     }
 
@@ -340,6 +342,7 @@ impl WinningStop {
             Self::Memory => "memory",
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
+            Self::Merge => "merge",
         }
     }
 }
@@ -3912,7 +3915,6 @@ impl Saturation {
         self.index = None;
         self.interner = Interner::new();
         self.worlds = FxHashMap::default();
-        self.chain_ranged = Vec::new();
         self.partial = None;
         self.stale_tier = false;
         self.ctx = Vec::new();
@@ -3939,10 +3941,12 @@ impl Saturation {
     ) -> Result<(Axioms, Index, usize, OutsideEl, usize), Error> {
         let budget = numeric::Budget::new(
             limits,
-            held_bytes + kept_bytes,
+            held_bytes
+                .saturating_add(kept_bytes)
+                .saturating_add(self.merge_extra_bytes()),
             self.interner.ranges.ledger.clone(),
         );
-        budget.baseline(self.interner.bytes() + self.merge_extra_bytes())?;
+        budget.baseline(self.interner.bytes())?;
         self.interner.ranges.begin(budget.clone());
         let result = self.build_inner(axioms, outside, threads, held_bytes, limits, attempt);
         // the run's components and definitions end with its normalization, on every exit
@@ -4474,7 +4478,6 @@ impl Saturation {
                 .bytes()
                 .checked_add(ax.bytes())
                 .and_then(|n| n.checked_add(chain_ranges_bytes))
-                .and_then(|n| n.checked_add(self.merge_extra_bytes()))
                 .ok_or(Error::Memory {
                     limit: limits.max_memory.unwrap_or(usize::MAX),
                     used: usize::MAX,
@@ -4670,7 +4673,6 @@ impl Saturation {
                         },
                     });
                     p
-                AttemptProvenance::Ineligible,
                 }
                 Err(e) => {
                     #[cfg(test)]
@@ -4737,6 +4739,8 @@ impl Saturation {
                                 self.reduced = true;
                                 drop(all);
                                 drop(red);
+                                #[cfg(test)]
+                                let with_rewrite = r.2.memory;
                                 r.2.memory = r.2.memory.saturating_sub(red_bytes);
                                 r.2.added = self.source_len.unwrap_or(axioms.len());
                                 let charge = step_limits
@@ -4754,7 +4758,10 @@ impl Saturation {
                                     scratch: 0,
                                 };
                                 #[cfg(test)]
-                                admission_test::hit(admission_test::Point::PostRunStart);
+                                admission_test::hit(admission_test::Point::PostRunStart {
+                                    base: scratch.base,
+                                    with_rewrite,
+                                });
                                 match dl_reduce::Reduction::outside_el(
                                     axioms,
                                     &self.excluded,
@@ -4831,11 +4838,17 @@ impl Saturation {
             charge: Self::charge_drawing_on(limits, admitted),
             ..limits.clone()
         };
-        let restart =
-            match self.run_once(axioms, changes, held_bytes, &step_limits, with_taxonomy, attempt)? {
-                ControlFlow::Continue(r) => return Ok(r),
-                ControlFlow::Break(restart) => restart,
-            };
+        let restart = match self.run_once(
+            axioms,
+            changes,
+            held_bytes,
+            &step_limits,
+            with_taxonomy,
+            attempt,
+        )? {
+            ControlFlow::Continue(r) => return Ok(r),
+            ControlFlow::Break(restart) => restart,
+        };
         self.reset();
         let discarded_peak = match restart {
             LateRestart::Incompatible => 0,
@@ -4845,8 +4858,14 @@ impl Saturation {
             charge: Self::charge_drawing_on(limits, admitted),
             ..limits.clone()
         };
-        let ControlFlow::Continue(mut r) =
-            self.run_once(axioms, None, held_bytes, &retry_limits, with_taxonomy, attempt)?
+        let ControlFlow::Continue(mut r) = self.run_once(
+            axioms,
+            None,
+            held_bytes,
+            &retry_limits,
+            with_taxonomy,
+            attempt,
+        )?
         else {
             unreachable!("a run without changes starts fresh");
         };
@@ -5061,7 +5080,7 @@ impl Saturation {
             self.canon_want = None;
             self.active_hub = None;
             self.merge_disabled = true;
-            return Ok(None);
+            return Ok(ControlFlow::Break(LateRestart::Incompatible));
         }
         if let Some(d) = &ax.dl {
             stats.clauses = d.clauses.len();
@@ -5346,7 +5365,10 @@ impl Saturation {
                     policy,
                     fallback_fixed,
                 );
-                let effective_cap = self.merge.frozen_bound.unwrap_or_else(|| selected.work_limit());
+                let effective_cap = self
+                    .merge
+                    .frozen_bound
+                    .unwrap_or_else(|| selected.work_limit());
                 #[cfg(test)]
                 LAST_ROOTED_WORK_LIMIT.with(|c| c.set(effective_cap));
                 d.set_work_limit(effective_cap);
@@ -11687,7 +11709,7 @@ mod tests {
             threads: 1,
             ..Limits::default()
         };
-        let (_, _, peak_no, _) = Saturation::new()
+        let (_, _, peak_no, _, _) = Saturation::new()
             .build(
                 &kinds_no,
                 &[],
@@ -11698,7 +11720,7 @@ mod tests {
                 AttemptProvenance::OriginalDefault,
             )
             .unwrap();
-        let (_, _, peak_with, _) = Saturation::new()
+        let (_, _, peak_with, _, _) = Saturation::new()
             .build(
                 &kinds_with,
                 &[],
@@ -11765,7 +11787,7 @@ mod tests {
         let consume_start_peak_h = consume_start_peak.clone();
         let consume_end_peak = std::sync::Arc::new(AtomicUsize::new(0));
         let consume_end_peak_h = consume_end_peak.clone();
-        let (ax_miss, _, peak_miss, _) = admission_test::with_hook(
+        let (ax_miss, _, peak_miss, _, _) = admission_test::with_hook(
             move |pt| match pt {
                 admission_test::Point::BuildMissingConsumeStart { peak, .. } => {
                     consume_start_peak_h.store(peak, Ordering::Relaxed);
@@ -11864,7 +11886,7 @@ mod tests {
         let par_scan_base = std::sync::Arc::new(AtomicUsize::new(0));
         let par_scan_base_h = par_scan_base.clone();
         let mut sat_par = Saturation::new();
-        let (_, _, peak_par, _) = admission_test::with_hook(
+        let (_, _, peak_par, _, _) = admission_test::with_hook(
             move |pt| {
                 if let admission_test::Point::BuildRangeScanStart { base, .. } = pt {
                     par_scan_base_h.store(base, Ordering::Relaxed);
@@ -11887,7 +11909,7 @@ mod tests {
         let ser_scan_base = std::sync::Arc::new(AtomicUsize::new(0));
         let ser_scan_base_h = ser_scan_base.clone();
         let mut sat_par_ser = Saturation::new();
-        let (_, _, peak_ser, _) = admission_test::with_hook(
+        let (_, _, peak_ser, _, _) = admission_test::with_hook(
             move |pt| {
                 if let admission_test::Point::BuildRangeScanStart { base, .. } = pt {
                     ser_scan_base_h.store(base, Ordering::Relaxed);
@@ -12350,9 +12372,8 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // Construct a kept-rewrite ontology with large `red_bytes` (many independent
-        // rewritten axioms with linear saturation) and a smaller post-run range scan so
-        // that `live_memory + scan_peak <= rewrite_peak < live_memory + red_bytes + scan_peak`.
+        // Construct a kept rewrite whose retained result and original range scan fit
+        // within the memory already admitted for planning and classification.
         let mut body = String::from(
             "Prefix(:=<http://ex.org/>)
              Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
@@ -12389,11 +12410,14 @@ mod tests {
         let granted_at_scan = Arc::new(AtomicUsize::new(0));
         let granted_at_scan_hook = granted_at_scan.clone();
         let granted_for_hook = granted.clone();
+        let baselines = Arc::new(parking_lot::Mutex::new(None));
+        let baselines_for_hook = baselines.clone();
         let mut sat_full = Saturation::new();
 
         let full = admission_test::with_hook(
             move |pt| {
-                if pt == admission_test::Point::PostRunStart {
+                if let admission_test::Point::PostRunStart { base, with_rewrite } = pt {
+                    *baselines_for_hook.lock() = Some((base, with_rewrite));
                     granted_at_scan_hook
                         .store(granted_for_hook.load(Ordering::Relaxed), Ordering::Relaxed);
                 }
@@ -12429,10 +12453,12 @@ mod tests {
             full.stats.peak_memory
         );
 
-        // Explicitly establish that the live baseline + scan peak fits under `before_scan`,
-        // while restoring `red_bytes` would exceed `before_scan`.
         let red = dl_reduce::plan(&kinds, None, None).expect("expected rewrite plan");
-        let red_bytes: usize = red.axioms.iter().map(held_bytes_of).sum();
+        let red_bytes = red.retained_bytes() - red.hub.as_ref().map_or(0, |hub| hub.as_str().len())
+            + vec_bytes(&red.all(&kinds));
+        let (base, with_rewrite) = baselines.lock().expect("post-run scratch baseline");
+        assert_eq!(with_rewrite - base, red_bytes);
+        assert_eq!(base, full.stats.memory);
         let mut scan_peak = 0usize;
         let mut scan_paid = 0usize;
         let unlimited = Limits::default();
@@ -12451,14 +12477,7 @@ mod tests {
             "expected live + scan ({}) <= cap ({before_scan})",
             full.stats.memory + scan_peak
         );
-        assert!(
-            before_scan < full.stats.memory + red_bytes + scan_peak,
-            "cap ({before_scan}) must sit strictly below stale baseline + scan ({})",
-            full.stats.memory + red_bytes + scan_peak
-        );
-
-        // A cap equal to the rewrite peak covers both the rewrite peak and live + scan,
-        // while sitting strictly below live + red_bytes + scan.
+        // Reuse only the credit already granted before scanning the original axioms.
         let capped = Saturation::new()
             .classify(
                 &kinds,
@@ -12592,7 +12611,7 @@ mod tests {
         });
         let scan_base = Arc::new(AtomicUsize::new(0));
         let scan_base_h = scan_base.clone();
-        let (_, _, peak_with, _) = admission_test::with_hook(
+        let (_, _, peak_with, _, _) = admission_test::with_hook(
             move |pt| {
                 if let admission_test::Point::BuildRangeScanStart { base, .. } = pt {
                     scan_base_h.store(base, Ordering::Relaxed);
@@ -12698,7 +12717,7 @@ mod tests {
         });
         let wide_scan_base = Arc::new(AtomicUsize::new(0));
         let wide_scan_base_h = wide_scan_base.clone();
-        let (_, _, wide_peak_with, _) = admission_test::with_hook(
+        let (_, _, wide_peak_with, _, _) = admission_test::with_hook(
             move |pt| {
                 if let admission_test::Point::BuildRangeScanStart { base, .. } = pt {
                     wide_scan_base_h.store(base, Ordering::Relaxed);
@@ -12796,7 +12815,7 @@ mod tests {
             doc_accepted_no.axioms.iter().map(|a| &a.kind).collect();
         let kinds_accepted_with: Vec<&AxiomKind> =
             doc_accepted_with.axioms.iter().map(|a| &a.kind).collect();
-        let ((ax_accepted_no, _, _, _), sample_accepted_no) = a1_probe_alloc::measure(|| {
+        let ((ax_accepted_no, _, _, _, _), sample_accepted_no) = a1_probe_alloc::measure(|| {
             Saturation::new()
                 .build(
                     &kinds_accepted_no,
@@ -12821,7 +12840,7 @@ mod tests {
         let acc_consume_peak_h = acc_consume_peak.clone();
         let acc_consume_scratch = Arc::new(AtomicUsize::new(0));
         let acc_consume_scratch_h = acc_consume_scratch.clone();
-        let (_, _, acc_peak_with, _) = admission_test::with_hook(
+        let (_, _, acc_peak_with, _, _) = admission_test::with_hook(
             move |pt| match pt {
                 admission_test::Point::BuildRangeScanStart { base, .. } => {
                     acc_scan_base_h.store(base, Ordering::Relaxed);

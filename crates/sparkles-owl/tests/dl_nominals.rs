@@ -3356,23 +3356,25 @@ fn ineligible_lower_tier_rewrites_still_fall_back_to_original_axioms() {
                  ObjectMinCardinality(1 owl:topObjectProperty :A))
              ClassAssertion(:B :b)",
         ),
-        // Rewritten 2-member DisjointUnion(:C, {owl:Thing, ∃U.A}) has Horn shape but Horn
-        // rejects multi-member DisjointUnion axioms.
+        // The duplicate image drops out. The self restriction over a transitive role in
+        // the two remaining members makes the Horn-shaped union ineligible.
         (
-            "horn-shaped two-member disjoint union",
-            "DisjointUnion(:C
+            "horn-shaped disjoint union with a non-simple self role",
+            "TransitiveObjectProperty(:s)
+             DisjointUnion(:C
                  owl:Thing
+                 ObjectHasSelf(:s)
                  ObjectSomeValuesFrom(owl:topObjectProperty :A)
                  ObjectMinCardinality(1 owl:topObjectProperty :A))
              ClassAssertion(:B :b)",
         ),
-        // Rewritten ¬(≥2 r.∃U.A) ⊑ ⊥ is Horn-shaped (⊤ ⊑ ≥2 r.∃U.A), but Horn rejects
-        // at-least cardinalities above one beside individuals.
+        // Rewritten ¬(≥65 r.∃U.A) ⊑ ⊥ is Horn-shaped but exceeds the minimum
+        // cardinality supported by the Horn rules.
         (
-            "complemented at-least-2 beside individuals",
+            "complemented at-least-65 beside individuals",
             "DisjointClasses(
-                 ObjectComplementOf(ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A)))
-                 ObjectComplementOf(ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A))))
+                 ObjectComplementOf(ObjectMinCardinality(65 :r ObjectSomeValuesFrom(owl:topObjectProperty :A)))
+                 ObjectComplementOf(ObjectMinCardinality(65 :r ObjectMinCardinality(1 owl:topObjectProperty :A))))
              ClassAssertion(:B :b)",
         ),
         // Rewritten ≥3 r.∃U.A ⊑ ⊥ remains non-Horn (Tier::Disjunctive) and Tier D declines
@@ -3755,6 +3757,7 @@ fn kept_rewritten_original_range_scan_respects_budget_polling_and_restart() {
         .classify(&with_chain, None, &Limits::default())
         .unwrap();
     assert_eq!(recovered_plain.taxonomy, plain_fresh.taxonomy);
+}
 
 // ============================================================================
 // Item 1061 Phase 2: Rooted Constant Merging Tests (`Limits::rooted_merge`)

@@ -38,7 +38,10 @@ pub(super) enum Point {
     TopChainScan,
     TopChainGlobalMessage,
     TopChainWorldMessage,
-    PostRunStart,
+    PostRunStart {
+        base: usize,
+        with_rewrite: usize,
+    },
     BuildRangeScanStart {
         base: usize,
         scratch: usize,

@@ -283,7 +283,15 @@ pub(super) fn breaks_with_anonymous_polled<E>(
         K::SubClassOf(a, b) => {
             Ok(ce_breaks(a, step, &mut visited, poll)? || ce_breaks(b, step, &mut visited, poll)?)
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
+        K::EquivalentClasses(cs) => {
+            for c in cs {
+                if ce_breaks(c, step, &mut visited, poll)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        K::DisjointClasses(cs) => {
             for c in cs {
                 if ce_breaks(c, step, &mut visited, poll)? {
                     return Ok(true);

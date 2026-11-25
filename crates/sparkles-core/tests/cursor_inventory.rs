@@ -25,8 +25,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 enum Why {
     /// A decision of the X14 plan keeps it refused.
     Decision(&'static str),
-    /// A roadmap row holds the change that would give it a reader.
-    Row(u32),
 }
 
 /// What the strict policy does with a form.
@@ -571,11 +569,11 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
     refused.extend(text_forms());
     #[cfg(feature = "geo")]
     refused.extend(geo_forms());
-    // Every refused form is now an explicit decision or a separate roadmap row.
+    // Every refused form names the decision that keeps it eager.
     assert!(
         refused
             .iter()
-            .all(|(_, why)| matches!(why, Why::Decision(_) | Why::Row(_))),
+            .all(|(_, why)| matches!(why, Why::Decision(reason) if !reason.is_empty())),
         "unexpected refusal: {refused:?}"
     );
 }

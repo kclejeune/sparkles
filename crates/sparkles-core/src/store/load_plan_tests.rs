@@ -1574,7 +1574,6 @@ fn sparql_load_transactional_refusal_drains_group_commit() {
             StoreOptions {
                 bulk_threshold: E,
                 group_commit: true,
-                group_commit_idle_direct: false,
                 ..StoreOptions::default()
             },
         )
@@ -1603,7 +1602,9 @@ fn sparql_load_transactional_refusal_drains_group_commit() {
             &QueryOptions::default(),
         )
     });
-    sealed_rx.recv().unwrap();
+    sealed_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("predecessor did not seal its group commit");
 
     let (draining_tx, draining_rx) = mpsc::channel();
     s.set_failpoint(
@@ -1685,7 +1686,6 @@ fn sparql_load_silent_http_limit_preserves_group_poisoned_and_writer_busy() {
             StoreOptions {
                 bulk_threshold: u64::MAX,
                 group_commit: true,
-                group_commit_idle_direct: false,
                 ..StoreOptions::default()
             },
         )
@@ -1768,7 +1768,6 @@ fn sparql_load_silent_http_limit_preserves_group_poisoned_and_writer_busy() {
             StoreOptions {
                 bulk_threshold: E,
                 group_commit: true,
-                group_commit_idle_direct: false,
                 ..StoreOptions::default()
             },
         )
