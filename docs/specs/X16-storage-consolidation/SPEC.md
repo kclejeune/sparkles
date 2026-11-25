@@ -1,10 +1,8 @@
 # X16: Storage consolidation
 
-> **Status:** implemented in part (Phases 1–2). The plan below is ordered and audited against the code.
+> **Status:** implemented in part (Phases 1, 2, 3 stage 1, 4, 5 apart from `imbl`, and item 846). The plan below is ordered and audited against the code.
 >
-> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479 and 830 to 833
-> hold the phases that are ready to start, and each is named in its phase. Items 484 and 832 are
-> complete, and item 1152 takes the last `imbl` maps of Phase 5. The later candidate phases get their numbers when their prerequisites land.
+> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 830 and 833 hold the remaining ready phases, item 1152 takes the last `imbl` maps of Phase 5, and items 479, 484, 831, 832 and 846 are complete. The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -298,8 +296,9 @@ does not check each quad's graph. A batch from `insert_bulk` or a patch has its 
 checked as it is staged, so a restriction does not keep it out of a rebuild, as before the
 phase. The table test includes a patch whose delete row removes nothing and still takes
 the transactional path. The group admission's
-`Fallback::Bulk` reads the same plan. SPARQL `LOAD` keeps inserting per quad, as
-[decision 4](#decisions) records.
+`Fallback::Bulk` reads the same plan. SPARQL `LOAD` stayed transactional in Phase 4, and
+item 846 added `Entry::SparqlLoad` for a single-operation `LOAD`, as [decision 4](#decisions)
+and the Outcome section record.
 
 The gate is the load benchmark of [docs/benchmarks](../../benchmarks/README.md) at 1.05M
 and 10.5M with no load slower, and the table test, which records the plan each entry
@@ -530,12 +529,13 @@ follows them.
    which is format 4 with the `features` list always present and `vocab.idx` required,
    since a second write form and an optional file serve nobody after the cutoff and the
    mandatory index then has a version of its own.
-4. **SPARQL `LOAD` and the load plan.** `LOAD` inserts per quad today whatever its size.
-   Letting it take the bulk plan when it is the only operation of its request would make
-   a large `LOAD` as fast as `sparkles load`, but changes which path an update takes and
-   therefore its memory and lock profile. The recommendation is to leave `LOAD` alone in
-   Phase 4 and record the choice in the load plan's table. Item 846 takes the bulk plan
-   for a large `LOAD` with its own memory and lock measurement.
+4. **SPARQL `LOAD` and the load plan.** `LOAD` stayed transactional in Phase 4 so that an
+   update kept one memory and lock profile. Item 846 added `Entry::SparqlLoad` to
+   `LoadPlan::choose` for a `LOAD` that is the only operation of its request, following the
+   strict threshold rule of `replace_with` so small loads stay transactional and large
+   unrestricted loads take the bulk rebuild path. Multi-operation requests, calls inside an
+   open write transaction and graph-restricted writes stay transactional. The Outcome
+   section records the measured memory and lock profile.
 5. **The import transport's reader.** The unwired import transport writes `minimumReader`
    one above the build's `DATASET_READER` for an imported destination, which is 10 now
    that reader 9 belongs to the job ledger. The recommendation is to
@@ -759,6 +759,41 @@ took 1.01, 1.00 and 0.94 times the base's time persistent and 1.02, 0.99 and 0.9
 memory. The gates were the table test, the entry-point tests, the deadline tests at the
 default and the saturated threshold, lane CI and eight review rounds. Durability, the write-ahead
 log and the on-disk formats did not change.
+
+Item 846 extends `LoadPlan::choose` with `Entry::SparqlLoad` for a SPARQL `LOAD` that is
+the only operation of its request. It follows the strict threshold rule of `replace_with`
+on both empty and non-empty stores, so a small file or HTTP stream stays transactional and
+avoids the rebuild's fixed cost, while an unrestricted file whose estimate exceeds
+`bulk_threshold` or an HTTP stream whose decoded bytes exceed `bulk_threshold * 80`
+(20 MiB at the default threshold of 250,000 quads) takes the bulk rebuild path through
+`Store::load_sparql`. A graph-restricted write, a multi-operation update request and an
+update inside an open write transaction stay transactional so that per-quad graph checks,
+triple protections and multi-operation atomicity are unchanged. `LOAD <uri>` and
+`LOAD <uri> INTO GRAPH <g>` keep their default-graph remapping and named-graph retention
+across all RDF, Jena and OWL functional-style syntaxes. `LOAD SILENT` hides source, fetch,
+format and parse failures and returns an unchanged-head receipt while still surfacing
+permission refusals, outbound and decompression budgets, cancellation, timeouts,
+preconditions, write guards, dry runs, managed-graph boundaries, storage limits and store
+failures.
+
+File permission checks, codec detection, outbound HTTP requests and the stream size probe
+now run before the exclusive writer lock is acquired, so network latency and stream
+probing no longer block concurrent writers. Once the plan is chosen, the bulk path holds
+the exclusive writer lock across the generation build, write-guard validation and atomic
+`CURRENT` switch while concurrent readers continue lock-free against the previous
+snapshot. For an HTTP `LOAD`, stream probing holds at most `bulk_threshold * 80` decoded
+bytes in memory before the parse starts and releases that prefix buffer once replayed; a
+file `LOAD` buffers nothing to choose its plan. On a single 8-vCPU 16 GiB Boat worker in
+release builds at 1,000,000 N-Triples quads (~80 MiB) loaded into a 1,000-quad seeded
+store, one process per arm measured the following wall time, pre-lock time, peak resident
+set (`VmHWM`) and maximum concurrent snapshot read latency. A persistent file load took
+1.811 s and 575 MiB peak RSS on the bulk path against 3.009 s and 1,011 MiB transactional,
+and a persistent loopback HTTP load took 1.376 s with 12.8 ms pre-lock and 560 MiB peak
+RSS against 2.287 s and 1,014 MiB transactional. An in-memory file load took 1.192 s and
+798 MiB against 2.090 s and 1,013 MiB, and an in-memory HTTP load took 1.750 s with
+13.8 ms pre-lock and 778 MiB against 2.190 s and 1,016 MiB. Maximum concurrent snapshot
+read latency stayed within 5 to 27 µs during all bulk rebuilds, and each bulk load left an
+empty delta. Durability, the write-ahead log and the on-disk formats did not change.
 
 Phase 5 is built apart from the `imbl` maps. `index::encode_deltas` writes the zig-zag
 delta varints of an index column frame and of a run block's column, and
