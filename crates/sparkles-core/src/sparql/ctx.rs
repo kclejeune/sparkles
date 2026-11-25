@@ -282,6 +282,17 @@ pub(super) enum DirectCommitPlan {
     NeedsFloorTrial(Option<Arc<FloorTable>>),
 }
 
+/// Result of looking up a string floor in [`FloorMap::try_floor`].
+pub(super) enum FloorLookup {
+    /// Base-vocabulary simple literal with floor `u64`.
+    Floor(u64),
+    /// Not a base-vocabulary simple literal (evaluate via generic SPARQL comparison).
+    NotSimple,
+    /// Computing the floor refused decoding-envelope admission without recording a sticky
+    /// memory failure (caller may fall back to direct key comparison).
+    Refused,
+}
+
 /// The query's cache of string floors ([`Ctx::string_floor`]). It lasts the query, so the
 /// batches of a cursor share it as the rows of an eager table do, and every worker of a
 /// mask reads and writes the same [`FloorTable`] without a lock.
@@ -611,14 +622,28 @@ impl Drop for FloorMap<'_> {
 
 impl FloorMap<'_> {
     /// [`Ctx::string_floor`] of `id`, computed once while the table holds it.
+    #[cfg(test)]
     #[inline]
     pub(super) fn floor(&mut self, id: Id) -> Option<u64> {
+        match self.try_floor(id) {
+            FloorLookup::Floor(f) => Some(f),
+            FloorLookup::NotSimple => None,
+            FloorLookup::Refused => self.ctx.string_floor_in(id, &mut self.scratch),
+        }
+    }
+
+    /// Look up `id`'s string floor without recording a sticky memory failure on a
+    /// decoding-envelope refusal, so a caller with direct key comparison available can
+    /// decline optional floor-only work (such as a block-start predecessor decode) and
+    /// fall back to [`Ctx::simple_literal_cmp_in`] using [`FloorMap::scratch_mut`].
+    #[inline]
+    pub(super) fn try_floor(&mut self, id: Id) -> FloorLookup {
         let p = id.payload();
         if id.tag() != Tag::Vocab || p >= self.first_triple {
-            return None;
+            return FloorLookup::NotSimple;
         }
         let Some(cur) = self.cur.as_ref().map(FloorTableRef::as_ref) else {
-            return self.compute(id);
+            return self.try_compute(id);
         };
         self.lookups += 1;
         let slot = cur.slot(p);
@@ -628,7 +653,10 @@ impl FloorMap<'_> {
             if word & 1 == 0 {
                 slot.store(word | 1, Ordering::Relaxed);
             }
-            return floor;
+            return match floor {
+                Some(f) => FloorLookup::Floor(f),
+                None => FloorLookup::NotSimple,
+            };
         }
         // The slot held another id's floor, which had been read again when its bit is set.
         let evicts = usize::from(word & 1 == 1);
@@ -636,19 +664,32 @@ impl FloorMap<'_> {
         {
             self.computed += 1;
         }
-        let floor = self.ctx.string_floor_in(id, &mut self.scratch);
-        // A refused floor recorded a failure that ends the query. It is not kept as the
-        // floor of another kind of value.
-        if (floor.is_some() || self.ctx.check_memory_failure().is_ok()) && cur.put(p, floor, false)
-        {
-            self.evicted += evicts;
+        match self.ctx.try_string_floor_in(id, &mut self.scratch) {
+            Ok(floor) => {
+                if cur.put(p, floor, false) {
+                    self.evicted += evicts;
+                }
+                match floor {
+                    Some(f) => FloorLookup::Floor(f),
+                    None => FloorLookup::NotSimple,
+                }
+            }
+            // Do not cache a refusal as a non-simple literal or record a sticky failure;
+            // the caller falls back to direct comparison, which records any required refusal.
+            Err(_) => FloorLookup::Refused,
         }
-        floor
+    }
+
+    /// Reusable key-reconstruction scratch owned by this worker map, available for a
+    /// per-row [`Ctx::simple_literal_cmp_in`] fallback after [`FloorLookup::Refused`].
+    #[inline]
+    pub(super) fn scratch_mut(&mut self) -> &mut FloorScratch {
+        &mut self.scratch
     }
 
     /// Record a floor already computed by [`Ctx::string_floor`] for a base-vocabulary simple
     /// literal `id`. Preserves lookup, hit, read-bit, eviction and test `computed` accounting
-    /// identically to [`FloorMap::floor`] without recomputing the floor.
+    /// identically to [`FloorMap::try_floor`] without recomputing the floor.
     #[inline]
     pub(super) fn record_floor(&mut self, id: Id, floor: u64, computed: bool) {
         let p = id.payload();
@@ -679,12 +720,16 @@ impl FloorMap<'_> {
     }
 
     #[inline]
-    fn compute(&mut self, id: Id) -> Option<u64> {
+    fn try_compute(&mut self, id: Id) -> FloorLookup {
         #[cfg(test)]
         {
             self.computed += 1;
         }
-        self.ctx.string_floor_in(id, &mut self.scratch)
+        match self.ctx.try_string_floor_in(id, &mut self.scratch) {
+            Ok(Some(f)) => FloorLookup::Floor(f),
+            Ok(None) => FloorLookup::NotSimple,
+            Err(_) => FloorLookup::Refused,
+        }
     }
 }
 
@@ -3749,6 +3794,7 @@ impl Ctx {
     /// Key reconstruction and the search for the floor use the decoding envelope
     /// ([`Ctx::reserve_decode`]), so a cursor reserves them on the ledger. A refusal
     /// records a failure, which the next check reports, and gives `None`.
+    #[cfg(test)]
     pub(super) fn string_floor(&self, id: Id) -> Option<u64> {
         self.string_floor_in(id, &mut FloorScratch::default())
     }
@@ -3803,6 +3849,7 @@ impl Ctx {
     }
 
     /// [`Ctx::string_floor`] reusing the caller's scratch buffers across calls.
+    #[cfg(test)]
     #[inline]
     pub(super) fn string_floor_in(&self, id: Id, scratch: &mut FloorScratch) -> Option<u64> {
         match self.try_string_floor_in(id, scratch) {
@@ -3967,6 +4014,31 @@ impl Ctx {
         self.begin_floor_mask_locked(&mut tables)
     }
 
+    /// Defer floor-table allocation and enter bypass mode when the first eligible mask's
+    /// sample refused floor-only decoding. If another mask initialized the cache first,
+    /// commits this mask directly without allocating or growing a table.
+    pub(super) fn init_floor_cache_after_refused_floor_trial(&self, slots: usize) -> FloorMaskPlan {
+        let mut tables = self.floors.tables.lock();
+        if !self.floors.initialized.load(Ordering::Relaxed) && tables.cur.is_none() && !tables.full
+        {
+            #[cfg(test)]
+            let first = match self.floors.first_slots.load(Ordering::Relaxed) {
+                0 => slots,
+                s => s,
+            };
+            #[cfg(not(test))]
+            let first = slots;
+            tables.deferred_slots = first;
+            tables.bypass = true;
+            tables.bypass_streak = 1;
+            self.floors.initialized.store(true, Ordering::Release);
+            #[cfg(test)]
+            self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+            return FloorMaskPlan::Direct;
+        }
+        self.begin_floor_mask_after_refused_floor_trial_locked(&mut tables)
+    }
+
     /// Whether the current floor table has enough low-hit lookups past its warmup budget
     /// to enter direct bypass if table growth does not happen first.
     fn low_hit_bypass_pending(tables: &FloorTables, cur: &FloorTable) -> bool {
@@ -3980,26 +4052,23 @@ impl Ctx {
     }
 
     /// Preview the floor mode and table used to validate the next mask's sample without
-    /// mutating [`FloorCache`] state. Whenever a low-hit bypass can take effect, including
-    /// when table growth is also pending and could still be declined after sample decoding
-    /// enlarges the decode envelope, this selects [`FloorMaskPlan::Direct`] so sample
-    /// validation compares keys directly and never triggers a speculative floor-only
-    /// predecessor decode before [`Ctx::begin_floor_mask`] commits the mode.
+    /// mutating [`FloorCache`] state. Whenever bypass is active (including on a scheduled
+    /// periodic probe) or a low-hit bypass can take effect (including when table growth is
+    /// also pending and could still be declined after sample decoding enlarges the decode
+    /// envelope), this selects [`FloorMaskPlan::Direct`] so sample validation compares keys
+    /// directly and never triggers a speculative floor-only predecessor decode before
+    /// [`Ctx::begin_floor_mask`] commits the mode.
     pub(super) fn peek_floor_plan(&self) -> FloorMaskPlan {
         let tables = self.floors.tables.lock();
-        if !tables.bypass {
-            if let Some(cur) = &tables.cur
-                && Self::low_hit_bypass_pending(&tables, cur)
-            {
-                return FloorMaskPlan::Direct;
-            }
-            return FloorMaskPlan::Floors(tables.cur.clone());
+        if tables.bypass {
+            return FloorMaskPlan::Direct;
         }
-        if tables.bypass_streak + 1 < FLOOR_BYPASS_PROBE_INTERVAL {
-            FloorMaskPlan::Direct
-        } else {
-            FloorMaskPlan::Floors(tables.cur.clone())
+        if let Some(cur) = &tables.cur
+            && Self::low_hit_bypass_pending(&tables, cur)
+        {
+            return FloorMaskPlan::Direct;
         }
+        FloorMaskPlan::Floors(tables.cur.clone())
     }
 
     /// Choose whether the next mask or eager part runs against the shared floor table
@@ -4024,15 +4093,12 @@ impl Ctx {
                 if growth_pending && self.can_grow_floor_table_locked(cur) {
                     return DirectCommitPlan::NeedsFloorTrial(Some(cur.clone()));
                 }
-                let bypass = Self::low_hit_bypass_pending(&tables, cur);
-                if bypass {
+                if Self::low_hit_bypass_pending(&tables, cur) {
                     let _ = cur.lookups.swap(0, Ordering::Relaxed);
                     let _ = cur.hits.swap(0, Ordering::Relaxed);
-                }
-                if growth_pending {
-                    tables.full = true;
-                }
-                if bypass {
+                    if growth_pending {
+                        tables.full = true;
+                    }
                     tables.warmup_lookups = 0;
                     tables.bypass = true;
                     tables.bypass_streak = 1;
@@ -4057,9 +4123,16 @@ impl Ctx {
     /// deferred table allocation so the validated direct path succeeds cleanly.
     pub(super) fn begin_floor_mask_after_refused_floor_trial(&self) -> FloorMaskPlan {
         let mut tables = self.floors.tables.lock();
+        self.begin_floor_mask_after_refused_floor_trial_locked(&mut tables)
+    }
+
+    fn begin_floor_mask_after_refused_floor_trial_locked(
+        &self,
+        tables: &mut FloorTables,
+    ) -> FloorMaskPlan {
         if !tables.bypass {
             let bypass = tables.cur.as_ref().is_some_and(|cur| {
-                if Self::low_hit_bypass_pending(&tables, cur) {
+                if Self::low_hit_bypass_pending(tables, cur) {
                     let _ = cur.lookups.swap(0, Ordering::Relaxed);
                     let _ = cur.hits.swap(0, Ordering::Relaxed);
                     true

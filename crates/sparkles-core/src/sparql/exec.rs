@@ -6290,33 +6290,62 @@ fn estimate_floor_slots(xs: &[Id], ys: &[Id]) -> FloorEstimate {
 struct InitialFloorSample {
     rows: [(u64, u64, bool, bool); STRING_ORDER_SAMPLE],
     keep: [bool; STRING_ORDER_SAMPLE],
+    has_floors: bool,
 }
 
 /// Probe the initial sample of [`string_order_mask`] before the shared floor cache is
 /// initialized, confirming in left-to-right order that every sampled row holds two
 /// base-vocabulary simple literals without running [`estimate_floor_slots`], installing
 /// a floor table, setting `initialized` or allocating the mask buffer on fallback.
+/// Floor-only decoding-envelope refusals fall back to direct key comparison without
+/// recording a sticky failure unless a required operand decode itself refuses.
 fn probe_initial_floor_sample(
     ctx: &Ctx,
     xs: &[Id],
     ys: &[Id],
     sample: usize,
     order: impl Fn(Id, Id, u64, u64) -> bool,
+    cmp_op: impl Fn(Ordering) -> bool,
 ) -> Result<Option<InitialFloorSample>> {
+    enum ProbeFloor {
+        Floor(u64, bool),
+        NotSimple,
+        Refused,
+    }
     let mut scratch = super::ctx::FloorScratch::default();
+    let mut keep = [false; STRING_ORDER_SAMPLE];
+    let finish_direct = |start: usize,
+                         keep: &mut [bool; STRING_ORDER_SAMPLE],
+                         scratch: &mut super::ctx::FloorScratch|
+     -> Result<Option<InitialFloorSample>> {
+        ctx.check_memory_failure()?;
+        for i in start..sample {
+            let Some(ord) = ctx.simple_literal_cmp_in(xs[i], ys[i], scratch) else {
+                ctx.check_memory_failure()?;
+                return Ok(None);
+            };
+            keep[i] = cmp_op(ord);
+        }
+        Ok(Some(InitialFloorSample {
+            rows: [(0u64, 0u64, false, false); STRING_ORDER_SAMPLE],
+            keep: *keep,
+            has_floors: false,
+        }))
+    };
     // Check row 0 before touching the 256-slot stack table so immediately-ineligible masks
     // pay no stack initialization cost.
-    let Some(fa0) = ctx.string_floor_in(xs[0], &mut scratch) else {
-        ctx.check_memory_failure()?;
-        return Ok(None);
+    let fa0 = match ctx.try_string_floor_in(xs[0], &mut scratch) {
+        Ok(Some(floor)) => floor,
+        Ok(None) => return Ok(None),
+        Err(_) => return finish_direct(0, &mut keep, &mut scratch),
     };
     let y0_new = ys[0] != xs[0];
     let fb0 = if y0_new {
-        let Some(fb0) = ctx.string_floor_in(ys[0], &mut scratch) else {
-            ctx.check_memory_failure()?;
-            return Ok(None);
-        };
-        fb0
+        match ctx.try_string_floor_in(ys[0], &mut scratch) {
+            Ok(Some(floor)) => floor,
+            Ok(None) => return Ok(None),
+            Err(_) => return finish_direct(0, &mut keep, &mut scratch),
+        }
     } else {
         fa0
     };
@@ -6337,46 +6366,54 @@ fn probe_initial_floor_sample(
     if y0_new {
         insert_known(&mut seen, ys[0], fb0);
     }
-    let mut lookup_or_compute =
-        |seen: &mut [(u64, u64); SEEN_SLOTS], id: Id| -> Result<Option<(u64, bool)>> {
-            if !ctx.may_be_base_literal(id) {
-                return Ok(None);
+    let mut lookup_or_compute = |seen: &mut [(u64, u64); SEEN_SLOTS], id: Id| -> ProbeFloor {
+        if !ctx.may_be_base_literal(id) {
+            return ProbeFloor::NotSimple;
+        }
+        let mut slot = (id.payload() as usize) & (SEEN_SLOTS - 1);
+        loop {
+            let (k, v) = seen[slot];
+            if k == id.0 {
+                return ProbeFloor::Floor(v, false);
             }
-            let mut slot = (id.payload() as usize) & (SEEN_SLOTS - 1);
-            loop {
-                let (k, v) = seen[slot];
-                if k == id.0 {
-                    return Ok(Some((v, false)));
-                }
-                if k == Id::UNDEF.0 {
-                    let Some(floor) = ctx.string_floor_in(id, &mut scratch) else {
-                        ctx.check_memory_failure()?;
-                        return Ok(None);
-                    };
-                    seen[slot] = (id.0, floor);
-                    return Ok(Some((floor, true)));
-                }
-                slot = (slot + 1) & (SEEN_SLOTS - 1);
+            if k == Id::UNDEF.0 {
+                return match ctx.try_string_floor_in(id, &mut scratch) {
+                    Ok(Some(floor)) => {
+                        seen[slot] = (id.0, floor);
+                        ProbeFloor::Floor(floor, true)
+                    }
+                    Ok(None) => ProbeFloor::NotSimple,
+                    Err(_) => ProbeFloor::Refused,
+                };
             }
-        };
+            slot = (slot + 1) & (SEEN_SLOTS - 1);
+        }
+    };
 
     let mut rows = [(0u64, 0u64, false, false); STRING_ORDER_SAMPLE];
-    let mut keep = [false; STRING_ORDER_SAMPLE];
     rows[0] = (fa0, fb0, true, y0_new);
     keep[0] = order(xs[0], ys[0], fa0, fb0);
 
     for i in 1..sample {
         let (a, b) = (xs[i], ys[i]);
-        let Some((fa, a_new)) = lookup_or_compute(&mut seen, a)? else {
-            return Ok(None);
+        let (fa, a_new) = match lookup_or_compute(&mut seen, a) {
+            ProbeFloor::Floor(floor, is_new) => (floor, is_new),
+            ProbeFloor::NotSimple => return Ok(None),
+            ProbeFloor::Refused => return finish_direct(i, &mut keep, &mut scratch),
         };
-        let Some((fb, b_new)) = lookup_or_compute(&mut seen, b)? else {
-            return Ok(None);
+        let (fb, b_new) = match lookup_or_compute(&mut seen, b) {
+            ProbeFloor::Floor(floor, is_new) => (floor, is_new),
+            ProbeFloor::NotSimple => return Ok(None),
+            ProbeFloor::Refused => return finish_direct(i, &mut keep, &mut scratch),
         };
         rows[i] = (fa, fb, a_new, b_new);
         keep[i] = order(a, b, fa, fb);
     }
-    Ok(Some(InitialFloorSample { rows, keep }))
+    Ok(Some(InitialFloorSample {
+        rows,
+        keep,
+        has_floors: true,
+    }))
 }
 
 /// Trial-compute string floors for a sample already validated by direct key comparison,
@@ -6468,7 +6505,7 @@ fn string_order_mask(
     op: super::expr::CmpOp,
     expr: &Expr,
 ) -> Result<Option<Vec<bool>>> {
-    use super::ctx::{DirectCommitPlan, FloorMaskPlan, FloorScratch};
+    use super::ctx::{DirectCommitPlan, FloorLookup, FloorMaskPlan, FloorScratch};
     use super::expr::CmpOp;
     let n = t.len();
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
@@ -6503,25 +6540,31 @@ fn string_order_mask(
     // The sample's rows keep the order their floors or direct comparisons give, so that
     // no row is looked up twice, which would mark floors as read again without a repeat
     // and grow the cache for strings that do not recur.
-    let (sample_keep, plan) = if ctx.floor_cache_needs_init() {
-        let Some(probed) = probe_initial_floor_sample(ctx, xs, ys, sample, order)? else {
+    let (sample_keep, plan, refused_floor_trial) = if ctx.floor_cache_needs_init() {
+        let Some(probed) = probe_initial_floor_sample(ctx, xs, ys, sample, order, cmp_op)? else {
             return Ok(None);
         };
         let est = estimate_floor_slots(xs, ys);
-        let plan = ctx.init_floor_cache(est.slots, est.worth_caching);
-        if let FloorMaskPlan::Floors(ref table) = plan {
-            let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
-            for (i, &(fa, fb, a_new, b_new)) in probed.rows[..sample].iter().enumerate() {
-                floors.record_floor(xs[i], fa, a_new);
-                floors.record_floor(ys[i], fb, b_new);
+        if probed.has_floors {
+            let plan = ctx.init_floor_cache(est.slots, est.worth_caching);
+            if let FloorMaskPlan::Floors(ref table) = plan {
+                let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
+                for (i, &(fa, fb, a_new, b_new)) in probed.rows[..sample].iter().enumerate() {
+                    floors.record_floor(xs[i], fa, a_new);
+                    floors.record_floor(ys[i], fb, b_new);
+                }
             }
+            (probed.keep, plan, false)
+        } else {
+            let plan = ctx.init_floor_cache_after_refused_floor_trial(est.slots);
+            (probed.keep, plan, true)
         }
-        (probed.keep, plan)
     } else {
         if !ctx.may_be_base_literal(ys[0]) {
-            // Check `xs[0]` first so a refused floor decode still reports its failure,
-            // without taking the floor-table lock or allocating a mask buffer.
-            let _ = ctx.string_floor(xs[0]);
+            // Check `xs[0]` first so a refused left-operand decode still reports its failure,
+            // without taking the floor-table lock, decoding an optional floor predecessor, or
+            // allocating a mask buffer.
+            let _ = ctx.simple_literal_cmp(xs[0], ys[0]);
             ctx.check_memory_failure()?;
             return Ok(None);
         }
@@ -6530,57 +6573,107 @@ fn string_order_mask(
         let mut sample_rows = [(0u64, 0u64, false, false); STRING_ORDER_SAMPLE];
         let mut scratch = FloorScratch::default();
         let mut has_floors = false;
+        let mut refused_floor_trial = false;
         let strings = match &peek {
             FloorMaskPlan::Floors(table) => {
+                enum SampleFloor {
+                    Floor(u64, bool),
+                    NotSimple,
+                    Refused,
+                }
                 has_floors = true;
                 let table_ref = table.as_deref();
                 const SEEN_SLOTS: usize = 256;
                 const _: () = assert!(SEEN_SLOTS >= 2 * STRING_ORDER_SAMPLE);
                 let mut seen: Option<[(u64, u64); SEEN_SLOTS]> = None;
-                let mut lookup = |id: Id| -> Option<(u64, bool)> {
+                let mut lookup = |id: Id| -> SampleFloor {
                     if !ctx.may_be_base_literal(id) {
-                        return None;
+                        return SampleFloor::NotSimple;
                     }
                     if let Some(cur) = table_ref
                         && let Some(cached) = cur.get_cached(id.payload())
                     {
-                        return cached.map(|floor| (floor, false));
+                        return match cached {
+                            Some(floor) => SampleFloor::Floor(floor, false),
+                            None => SampleFloor::NotSimple,
+                        };
                     }
                     if let Some(seen_table) = seen.as_mut() {
                         let mut slot = (id.payload() as usize) & (SEEN_SLOTS - 1);
                         loop {
                             let (k, v) = seen_table[slot];
                             if k == id.0 {
-                                return Some((v, false));
+                                return SampleFloor::Floor(v, false);
                             }
                             if k == Id::UNDEF.0 {
-                                let floor = ctx.string_floor_in(id, &mut scratch)?;
-                                seen_table[slot] = (id.0, floor);
-                                return Some((floor, true));
+                                return match ctx.try_string_floor_in(id, &mut scratch) {
+                                    Ok(Some(floor)) => {
+                                        seen_table[slot] = (id.0, floor);
+                                        SampleFloor::Floor(floor, true)
+                                    }
+                                    Ok(None) => SampleFloor::NotSimple,
+                                    Err(_) => SampleFloor::Refused,
+                                };
                             }
                             slot = (slot + 1) & (SEEN_SLOTS - 1);
                         }
                     }
-                    let floor = ctx.string_floor_in(id, &mut scratch)?;
-                    let mut seen_table = [(Id::UNDEF.0, 0u64); SEEN_SLOTS];
-                    seen_table[(id.payload() as usize) & (SEEN_SLOTS - 1)] = (id.0, floor);
-                    seen = Some(seen_table);
-                    Some((floor, true))
+                    match ctx.try_string_floor_in(id, &mut scratch) {
+                        Ok(Some(floor)) => {
+                            let mut seen_table = [(Id::UNDEF.0, 0u64); SEEN_SLOTS];
+                            seen_table[(id.payload() as usize) & (SEEN_SLOTS - 1)] = (id.0, floor);
+                            seen = Some(seen_table);
+                            SampleFloor::Floor(floor, true)
+                        }
+                        Ok(None) => SampleFloor::NotSimple,
+                        Err(_) => SampleFloor::Refused,
+                    }
                 };
-                (0..sample).all(|i| {
+                let mut ok = true;
+                let mut direct_from = None;
+                for i in 0..sample {
                     let (a, b) = (xs[i], ys[i]);
                     // the second floor is read only when the first is a string's, as the generic
                     // comparison reads the second value only when the first has one
-                    let Some((fa, a_new)) = lookup(a) else {
-                        return false;
+                    let (fa, a_new) = match lookup(a) {
+                        SampleFloor::Floor(floor, is_new) => (floor, is_new),
+                        SampleFloor::NotSimple => {
+                            ok = false;
+                            break;
+                        }
+                        SampleFloor::Refused => {
+                            direct_from = Some(i);
+                            break;
+                        }
                     };
-                    let Some((fb, b_new)) = lookup(b) else {
-                        return false;
+                    let (fb, b_new) = match lookup(b) {
+                        SampleFloor::Floor(floor, is_new) => (floor, is_new),
+                        SampleFloor::NotSimple => {
+                            ok = false;
+                            break;
+                        }
+                        SampleFloor::Refused => {
+                            direct_from = Some(i);
+                            break;
+                        }
                     };
                     sample_rows[i] = (fa, fb, a_new, b_new);
                     sample_keep[i] = order(a, b, fa, fb);
-                    true
-                })
+                }
+                if let Some(start) = direct_from {
+                    ctx.check_memory_failure()?;
+                    has_floors = false;
+                    refused_floor_trial = true;
+                    ok = (start..sample).all(|i| {
+                        let Some(ord) = ctx.simple_literal_cmp_in(xs[i], ys[i], &mut scratch)
+                        else {
+                            return false;
+                        };
+                        sample_keep[i] = cmp_op(ord);
+                        true
+                    });
+                }
+                ok
             }
             FloorMaskPlan::Direct => (0..sample).all(|i| {
                 let Some(ord) = ctx.simple_literal_cmp_in(xs[i], ys[i], &mut scratch) else {
@@ -6595,7 +6688,9 @@ fn string_order_mask(
             ctx.check_memory_failure()?;
             return Ok(None);
         }
-        let plan = if has_floors {
+        let plan = if refused_floor_trial {
+            ctx.begin_floor_mask_after_refused_floor_trial()
+        } else if has_floors {
             ctx.begin_floor_mask()
         } else {
             match ctx.begin_floor_mask_after_direct() {
@@ -6613,6 +6708,7 @@ fn string_order_mask(
                         has_floors = true;
                         ctx.begin_floor_mask()
                     } else {
+                        refused_floor_trial = true;
                         ctx.begin_floor_mask_after_refused_floor_trial()
                     }
                 }
@@ -6625,7 +6721,7 @@ fn string_order_mask(
                 floors.record_floor(ys[i], fb, b_new);
             }
         }
-        (sample_keep, plan)
+        (sample_keep, plan, refused_floor_trial)
     };
     let mut keep = vec![false; n];
     keep[..sample].copy_from_slice(&sample_keep[..sample]);
@@ -6641,18 +6737,25 @@ fn string_order_mask(
         };
         ebv(expr, &row, ctx).unwrap_or(false)
     };
-    let order_of = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> bool {
-        let (a, b) = (xs[i], ys[i]);
-        let (Some(fa), Some(fb)) = (floors.floor(a), floors.floor(b)) else {
-            return generic(i);
-        };
-        order(a, b, fa, fb)
-    };
     let direct_of = |scratch: &mut FloorScratch, i: usize| -> bool {
         match ctx.simple_literal_cmp_in(xs[i], ys[i], scratch) {
             Some(ord) => cmp_op(ord),
             None => generic(i),
         }
+    };
+    let order_of = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> bool {
+        let (a, b) = (xs[i], ys[i]);
+        let fa = match floors.try_floor(a) {
+            FloorLookup::Floor(fa) => fa,
+            FloorLookup::NotSimple => return generic(i),
+            FloorLookup::Refused => return direct_of(floors.scratch_mut(), i),
+        };
+        let fb = match floors.try_floor(b) {
+            FloorLookup::Floor(fb) => fb,
+            FloorLookup::NotSimple => return generic(i),
+            FloorLookup::Refused => return direct_of(floors.scratch_mut(), i),
+        };
+        order(a, b, fa, fb)
     };
     let fill_direct = |out: &mut [bool], lo: usize| -> Result<()> {
         if threads > 1 {
@@ -6719,7 +6822,7 @@ fn string_order_mask(
         let mut plan = plan;
         let mut lo = sample;
         while lo < n {
-            if lo > sample {
+            if lo > sample && !refused_floor_trial {
                 plan = ctx.begin_floor_mask();
             }
             let hi = n.min(lo + lo.max(PAR_THRESHOLD));
@@ -14932,7 +15035,10 @@ mod string_order_tests {
             // (c) When room stays at 132 KiB after direct sample validation, a sampled
             // block-start literal whose 1 MiB predecessor cannot fit even before growth
             // must be refused non-stickily during the floor trial so growth is skipped
-            // and the mask finishes cleanly on Direct.
+            // and the mask finishes cleanly on Direct across all eager parts (including
+            // the 4th-part boundary at 65,792) and across later periodic probe masks
+            // (both when the refused literal appears in the probe's sample and when it
+            // appears only in the probe's tail).
             {
                 let mut ctx = Ctx::new(s.snapshot());
                 ctx.mem_limit = 4 << 20;
@@ -14940,6 +15046,11 @@ mod string_order_tests {
                 ctx.floor_cache().set_first_slots(FLOOR_TABLE_FEWEST);
                 let (x, y) = (ctx.var("x"), ctx.var("y"));
                 let e = cmp(x, y, CmpOp::Gt);
+
+                let ref_ctx = Ctx::new(s.snapshot());
+                let (rx, ry) = (ref_ctx.var("x"), ref_ctx.var("y"));
+                assert_eq!((rx, ry), (x, y));
+                let ref_e = cmp(rx, ry, CmpOp::Gt);
 
                 let mut warm = Table::new(vec![x, y]);
                 for i in 0..STRING_ORDER_ROWS {
@@ -14961,8 +15072,11 @@ mod string_order_tests {
                 let _hold = ctx.charge(ctx.memory_room() - initial_room).unwrap();
                 assert_eq!(ctx.memory_room(), initial_room);
 
+                // Cross the 4th-part boundary (`64 -> 16,448 -> 32,896 -> 65,792 -> 65,793`)
+                // so a chunked loop that exited bypass on part 4 would retry `m_id` via
+                // the sticky floor path.
                 let mut transition = Table::new(vec![x, y]);
-                for i in 0..STRING_ORDER_ROWS {
+                for i in 0..65_793usize {
                     let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
                     transition.push_row(&[m_id, rhs]);
                 }
@@ -14970,7 +15084,8 @@ mod string_order_tests {
                     .unwrap()
                     .expect("transition mask applies on Direct after refused floor trial");
                 let generic =
-                    evaluate_mask(&ctx, &transition, std::slice::from_ref(&e), None).unwrap();
+                    evaluate_mask(&ref_ctx, &transition, std::slice::from_ref(&ref_e), None)
+                        .unwrap();
                 assert_eq!(mask, generic);
                 assert_eq!(
                     ctx.floor_cache().slots(),
@@ -14980,7 +15095,82 @@ mod string_order_tests {
                 assert_eq!(
                     ctx.floor_cache().bypassed(),
                     1,
-                    "refused floor trial must preserve Direct without sticky memory failure"
+                    "refused floor trial must keep Direct for every part without sticky failure"
+                );
+                assert!(ctx.check().is_ok());
+
+                // Advance through the remaining bypassed masks (`bypass_streak` 1 -> 2 -> 3)
+                // to reach the periodic probe boundary (`FLOOR_BYPASS_PROBE_INTERVAL == 4`).
+                let mut short_transition = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                    short_transition.push_row(&[m_id, rhs]);
+                }
+                let short_generic = evaluate_mask(
+                    &ref_ctx,
+                    &short_transition,
+                    std::slice::from_ref(&ref_e),
+                    None,
+                )
+                .unwrap();
+                for expected_bypassed in [2usize, 3] {
+                    let mask = string_order_mask(&ctx, &short_transition, (x, y), CmpOp::Gt, &e)
+                        .unwrap()
+                        .expect("bypassed mask applies on Direct");
+                    assert_eq!(mask, short_generic);
+                    assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+                    assert_eq!(ctx.floor_cache().bypassed(), expected_bypassed);
+                    assert!(ctx.check().is_ok());
+                }
+
+                // Periodic probe 1: `m_id` appears in the probe's sample (and across 4 parts).
+                // The probe must decline the floor-only refusal non-stickily and stay Direct.
+                let probe_sample_mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("periodic probe with refused sample floor must succeed on Direct");
+                assert_eq!(probe_sample_mask, generic);
+                assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    4,
+                    "refused periodic probe must reset bypass streak and stay Direct"
+                );
+                assert!(ctx.check().is_ok());
+
+                // Advance `bypass_streak` 1 -> 2 -> 3 to reach a second periodic probe.
+                for expected_bypassed in [5usize, 6] {
+                    let mask = string_order_mask(&ctx, &short_transition, (x, y), CmpOp::Gt, &e)
+                        .unwrap()
+                        .expect("bypassed mask applies on Direct");
+                    assert_eq!(mask, short_generic);
+                    assert_eq!(ctx.floor_cache().bypassed(), expected_bypassed);
+                    assert!(ctx.check().is_ok());
+                }
+
+                // Periodic probe 2: sample rows are cheap literals so the probe enters Floors,
+                // while tail rows contain `m_id`. FloorMap must decline the floor-only refusal
+                // non-stickily and fall back to direct comparison per row.
+                let mut probe_tail = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    let lhs = if i < STRING_ORDER_SAMPLE {
+                        a_ids[i % a_ids.len()]
+                    } else {
+                        m_id
+                    };
+                    let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                    probe_tail.push_row(&[lhs, rhs]);
+                }
+                let probe_tail_mask = string_order_mask(&ctx, &probe_tail, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("periodic probe entering Floors with refused tail floor must succeed");
+                let probe_tail_generic =
+                    evaluate_mask(&ref_ctx, &probe_tail, std::slice::from_ref(&ref_e), None)
+                        .unwrap();
+                assert_eq!(probe_tail_mask, probe_tail_generic);
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    6,
+                    "periodic probe with cheap sample enters Floors and falls back per refused row"
                 );
                 assert!(ctx.check().is_ok());
             }
