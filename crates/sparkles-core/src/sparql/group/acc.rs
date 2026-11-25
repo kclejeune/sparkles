@@ -10,6 +10,8 @@
 //! this one, `finish` gives a group's value, and `retract` takes rows back for a state
 //! that can, which item 418's view operator needs.
 
+use super::deferred::{Deferred, subtotal};
+use super::op::SumBudget;
 use crate::error::Result;
 use crate::id::Id;
 use crate::sparql::ctx::Ctx;
@@ -101,7 +103,13 @@ pub(crate) trait Accumulator: Send {
 
     /// Fold row `i` of the batch into group `slots[i]`, for every row, in row order. A
     /// row's slot is the number of its group among those `init` made.
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()>;
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        budget: Option<&mut SumBudget<'_>>,
+    ) -> Result<()>;
 
     /// Whether [`Accumulator::merge`] gives what one accumulator over all the rows gives.
     fn mergeable(&self) -> bool {
@@ -120,6 +128,17 @@ pub(crate) trait Accumulator: Send {
 
     /// The value of group `group`, which the call takes out of the accumulator.
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id>;
+
+    /// Finish in slot and aggregate order when some subtotals have deferred arguments.
+    fn finish_replay(
+        &mut self,
+        ctx: &Ctx,
+        group: usize,
+        _aggregate: usize,
+        _deferred: &mut Deferred,
+    ) -> Result<Id> {
+        self.finish(ctx, group)
+    }
 
     /// Whether [`Accumulator::retract`] can take back every row.
     fn retractable(&self) -> bool {
@@ -204,8 +223,32 @@ impl Accumulator for Running {
         }
     }
 
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        budget: Option<&mut SumBudget<'_>>,
+    ) -> Result<()> {
         let agg = &self.agg;
+        if self.is_sum()
+            && let Some(budget) = budget
+        {
+            for (row, &slot) in slots.iter().enumerate() {
+                if row.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let id = batch.value(row);
+                let state = &mut self.states[slot as usize];
+                if state.sum_deferred()
+                    || !state.add_admitted(ctx, agg, id, |old, new| budget.replace(old, new))?
+                {
+                    budget.defer(ctx, slot, id)?;
+                    state.defer_sum();
+                }
+            }
+            return Ok(());
+        }
         match (&agg.func, batch.arg) {
             // running counts need no per-row dispatch
             (AggregateFunction::Count, Arg::Star) => {
@@ -303,6 +346,22 @@ impl Accumulator for Running {
         Ok(state.finish(ctx, &self.agg))
     }
 
+    fn finish_replay(
+        &mut self,
+        ctx: &Ctx,
+        group: usize,
+        aggregate: usize,
+        deferred: &mut Deferred,
+    ) -> Result<Id> {
+        let state = &mut self.states[group];
+        if state.sum_deferred() {
+            deferred.replay(ctx, subtotal(group, aggregate), |id| {
+                state.add(ctx, &self.agg, Some(id));
+            })?;
+        }
+        self.finish(ctx, group)
+    }
+
     fn retractable(&self) -> bool {
         matches!(
             self.agg.func,
@@ -379,7 +438,13 @@ impl Accumulator for Concat {
         }
     }
 
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        _budget: Option<&mut SumBudget<'_>>,
+    ) -> Result<()> {
         for (row, &slot) in slots.iter().enumerate() {
             if row.is_multiple_of(1024) {
                 ctx.check()?;
@@ -504,7 +569,13 @@ impl Accumulator for Distinct {
         self.inner.init(groups);
     }
 
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        budget: Option<&mut SumBudget<'_>>,
+    ) -> Result<()> {
         // The slots and values of the rows that are new, which the aggregate underneath
         // reads, are charged until it has read them.
         let _scratch = ctx.charge(slots.len() as u64 * 12 + 64)?;
@@ -559,7 +630,7 @@ impl Accumulator for Distinct {
             rows: None,
             base: batch.base,
         };
-        self.inner.add_batch(ctx, &inner, &keep)
+        self.inner.add_batch(ctx, &inner, &keep, budget)
     }
 
     fn group_bytes(&self) -> u64 {
@@ -568,6 +639,16 @@ impl Accumulator for Distinct {
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         self.inner.finish(ctx, group)
+    }
+
+    fn finish_replay(
+        &mut self,
+        ctx: &Ctx,
+        group: usize,
+        aggregate: usize,
+        deferred: &mut Deferred,
+    ) -> Result<Id> {
+        self.inner.finish_replay(ctx, group, aggregate, deferred)
     }
 
     fn take_growth(&mut self) -> u64 {
@@ -602,7 +683,13 @@ impl Accumulator for Rows {
         self.results.extend(std::iter::repeat_n(Id::UNDEF, groups));
     }
 
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, _slots: &[u32]) -> Result<()> {
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        _slots: &[u32],
+        _budget: Option<&mut SumBudget<'_>>,
+    ) -> Result<()> {
         let index = batch.rows.expect("a batch of whole groups");
         let map = batch.table.var_map(ctx.nvars());
         let arg = match batch.arg {

@@ -365,51 +365,60 @@ struct Head {
 impl Head {
     /// Read the next frame, or return false at the end of the run.
     fn load(&mut self, ctx: &Arc<Ctx>, keys: &Keys) -> Result<bool> {
+        self.columns = Vec::new();
+        self.keys = Vec::new();
         self._charge = None;
+        self.len = 0;
+        self.at = 0;
         let Some((columns, len)) = self.reader.next_frame()? else {
-            self.columns.clear();
-            self.keys.clear();
-            self.len = 0;
-            self.at = 0;
             return Ok(false);
         };
         let mut bytes = columns.len() as u64 * len as u64 * 8 + 256;
-        let (columns, decoded) = match keys {
-            Keys::Raw(_) => (columns, Vec::new()),
+        let mut charge = OwnedCharge::new(ctx, bytes)?;
+        let mut decoded = Vec::new();
+        self.columns = match keys {
+            Keys::Raw(_) => columns,
             Keys::Values { keys, vars } => {
-                let mut decoded = Vec::with_capacity(keys.len());
-                let mut columns = Some(columns);
+                bytes += (keys.len() * len * size_of::<SortKey>()) as u64;
+                charge.resize(bytes)?;
+                let step = ctx.reservation_step();
+                let mut admit = |payload: u64| {
+                    bytes = bytes.saturating_add(payload);
+                    if bytes > charge.bytes() && charge.resize(bytes.saturating_add(step)).is_err()
+                    {
+                        charge.resize(bytes)?;
+                    }
+                    Ok(())
+                };
+                decoded.reserve_exact(keys.len());
+                let mut table = crate::sparql::table::Table::new(vars.clone());
+                table.cols = columns;
+                table.len = len;
                 for (key, _) in keys {
-                    let column: Vec<SortKey> = match key {
-                        Key::Column(c) => columns.as_ref().expect("frame columns")[*c]
-                            .iter()
-                            .map(|&id| SortKey::new(ctx.value(id)))
-                            .collect(),
-                        Key::Expr(e) => {
-                            let mut table = crate::sparql::table::Table::new(vars.clone());
-                            table.cols = columns.take().expect("frame columns");
-                            table.len = len;
-                            let values = exec::key_values(ctx, &table, e);
-                            columns = Some(std::mem::take(&mut table.cols));
-                            values?.into_iter().map(SortKey::new).collect()
+                    let column = match key {
+                        Key::Column(c) => {
+                            let mut values = Vec::with_capacity(len);
+                            for (row, &id) in table.cols[*c].iter().enumerate() {
+                                if row.is_multiple_of(1024) {
+                                    ctx.check()?;
+                                }
+                                let key = SortKey::new(ctx.cursor_value_checked(id)?);
+                                admit(key.payload_bytes())?;
+                                values.push(key);
+                            }
+                            values
                         }
+                        Key::Expr(e) => exec::spill_order_keys(ctx, &table, e, &mut admit)?,
                     };
-                    bytes = bytes.saturating_add(
-                        column
-                            .iter()
-                            .map(|k| k.payload_bytes() + size_of::<SortKey>() as u64)
-                            .sum::<u64>(),
-                    );
                     decoded.push(column);
                 }
-                (columns.expect("frame columns"), decoded)
+                table.cols
             }
         };
-        self._charge = Some(OwnedCharge::new(ctx, bytes)?);
-        self.columns = columns;
+        charge.resize(bytes)?;
+        self._charge = Some(charge);
         self.keys = decoded;
         self.len = len;
-        self.at = 0;
         Ok(true)
     }
 }
@@ -597,4 +606,52 @@ pub(super) fn load(
     external.write_run(ctx, input)?;
     external.finish(ctx)?;
     Ok(None)
+}
+
+#[cfg(test)]
+#[test]
+fn spill_merge_head_admits_wide_order_keys_incrementally() {
+    use crate::sparql::expr::ArithOp;
+    use crate::sparql::value::Value;
+    use crate::spill::{Spill, SpillOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: dir.path().to_path_buf(),
+        max_bytes: 1 << 30,
+        query_bytes: 1 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 768 << 10;
+    let var = ctx.var("value");
+    let ctx = Arc::new(ctx);
+    ctx.attach_owner();
+
+    let mut writer = Arc::new(spill.query(None))
+        .create(SpillKind::SortRun, 1)
+        .unwrap();
+    let rows = vec![Id::from_i64(2).unwrap(); 1024];
+    writer.write(&[&rows], rows.len()).unwrap();
+    let run = Arc::new(writer.finish().unwrap());
+    let factor = Value::from_typed(&"9".repeat(4000), oxrdf::vocab::xsd::INTEGER.as_str());
+    let expr = Expr::Arith(
+        Box::new(Expr::Var(var)),
+        Box::new(Expr::Lit(Id::UNDEF, factor)),
+        ArithOp::Mul,
+    );
+    let keys = Keys::Values {
+        keys: vec![(Key::Expr(expr), true)],
+        vars: vec![var],
+    };
+    assert!(matches!(
+        Merger::new(&ctx, vec![run], &keys, 1),
+        Err(Error::BudgetExceeded(_))
+    ));
+    assert!(ctx.mem_peak() >= 640 << 10, "peak {}", ctx.mem_peak());
+    assert_eq!(ctx.live_bytes(), 0);
+    assert_eq!(spill.reserved_bytes(), 0);
 }

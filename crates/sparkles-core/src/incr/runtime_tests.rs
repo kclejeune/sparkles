@@ -2582,6 +2582,14 @@ fn maintained_numeric_aggregates_keep_fixed_avg_and_staged_float_promotion() {
             :g :g :float ; :v \"2e38\"^^xsd:float .
             :h :g :float ; :v \"3e38\"^^xsd:float .
             :i :g :float ; :v \"0\"^^xsd:double .
+            :j :g :fixed ; :v 1.000000059604644776 .
+            :k :g :fixed ; :v \"0\"^^xsd:float .
+            :l :g :fixed ; :v \"0\"^^xsd:double .
+            :m :g :cancelled ; :v 1.000000059604644776 .
+            :n :g :cancelled ; :v 0.00000000000000000001 .
+            :o :g :cancelled ; :v -0.00000000000000000001 .
+            :p :g :cancelled ; :v \"0\"^^xsd:float .
+            :r :g :cancelled ; :v \"0\"^^xsd:double .
          }",
     );
     let rt = runtime(&s, None);
@@ -2595,6 +2603,11 @@ fn maintained_numeric_aggregates_keep_fixed_avg_and_staged_float_promotion() {
     rt.round(&s);
     assert_eq!(
         read(&rt, &s, "numeric", None).unwrap(),
-        ["decimal 0.000000000000000001 0", "float INF INF"]
+        [
+            "cancelled 1 0.2",
+            "decimal 0.000000000000000001 0",
+            "fixed 1 0.3333333333333333",
+            "float INF INF",
+        ]
     );
 }

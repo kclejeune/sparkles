@@ -290,10 +290,13 @@ impl SumState {
         // Fold floats at float precision before the first double promotes the subtotal.
         let mut acc = match exact {
             ExactAcc::Fixed(v) => v,
+            ExactAcc::Dec(bd) => match bd.to_oxs_decimal() {
+                Some(decimal) => Value::Decimal(decimal),
+                None if self.floats.is_empty() => Value::Double(Double::from(bd.to_f64())),
+                None => Value::Float(Float::from(bd.to_f32())),
+            },
             ExactAcc::Int(bi) if self.floats.is_empty() => Value::Double(Double::from(bi.to_f64())),
-            ExactAcc::Dec(bd) if self.floats.is_empty() => Value::Double(Double::from(bd.to_f64())),
             ExactAcc::Int(bi) => Value::Float(Float::from(bi.to_f32())),
-            ExactAcc::Dec(bd) => Value::Float(Float::from(bd.to_f32())),
         };
         let mut floats: Vec<(f32, i64)> = self
             .floats

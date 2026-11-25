@@ -6373,7 +6373,8 @@ impl Store {
     /// Write the numeric column (`vocab.num`) of the current generation when it has
     /// none, because an older version built it. The store opened next uses it. Returns
     /// the number of values in it, or `None` when the generation already has one or the
-    /// store is in memory.
+    /// store is in memory. A generation without numeric terms returns `Some(0)`
+    /// without writing a sidecar, and a later call scans its vocabulary again.
     pub fn add_numeric_column(&self) -> Result<Option<u64>> {
         let _w = self.guarded_writer();
         let snap = self.snapshot();

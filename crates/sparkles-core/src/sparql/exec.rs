@@ -6158,10 +6158,10 @@ fn topk_candidates(
     ctx.check()?;
     let mut sorted = numbers.clone();
     let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-    // Fixed decimals round once converting the mantissa and again dividing by
-    // an exactly representable power of ten. Each approximation can be at most
-    // two representable steps from the correctly rounded value. Keep the two
-    // error bounds around the cutoff so only the exact comparator resolves them.
+    // The other numeric conversions are correctly rounded. Fixed decimals round
+    // once converting the mantissa and again dividing by an exactly representable
+    // power of ten. The two rounding errors on either side can reverse the exact
+    // order by up to four representable steps. Keep these rows for exact comparison.
     let threshold = if kth.is_finite() {
         kth.next_down().next_down().next_down().next_down()
     } else {
@@ -6503,40 +6503,58 @@ fn first_key_candidates(
     Ok((cand.len() < t.len()).then_some(cand))
 }
 
-/// The value of an ORDER BY key on each row of `t`, for a merge that compares rows
-/// read back from disk. Values the key computes are not interned.
-pub(super) fn key_values(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Option<Value>>> {
-    key_rows(ctx, t, e, None)
-}
-
-fn key_rows(
+/// Evaluate a column with one variable map and one set of EXISTS answers.
+fn with_key_evaluator<T>(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
     dec: Option<&super::expr::DecodedCols>,
-) -> Result<Vec<Option<Value>>> {
+    run: impl FnOnce(&(dyn Fn(usize) -> Result<Option<Value>> + Sync)) -> Result<T>,
+) -> Result<T> {
+    let _map_charge = ctx.charge(ctx.nvars() as u64 * 16 + 128)?;
     let nested = super::exists::nested(ctx, t, &[e])?;
     let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
-    let f = |i: usize| {
-        eval(
-            e,
-            &Row {
-                table: t,
-                i,
-                map: &map,
-                dec,
-                exists,
-            },
-            ctx,
-        )
-        .ok()
-        .and_then(|v| match v {
-            Val::Id(id) => ctx.value(id),
-            Val::V(v) | Val::Dec(_, v) => Some(v),
-        })
-    };
-    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
+    let result = run(&|i| match eval(
+        e,
+        &Row {
+            table: t,
+            i,
+            map: &map,
+            dec,
+            exists,
+        },
+        ctx,
+    )
+    .ok()
+    {
+        Some(Val::Id(id)) => ctx.cursor_value_checked(id),
+        Some(Val::V(v) | Val::Dec(_, v)) => Ok(Some(v)),
+        None => Ok(None),
+    })?;
+    ctx.check()?;
+    Ok(result)
+}
+
+/// Classify each spill merge key after admitting its owned payload.
+pub(super) fn spill_order_keys(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    mut admit: impl FnMut(u64) -> Result<()>,
+) -> Result<Vec<super::sortkey::SortKey>> {
+    with_key_evaluator(ctx, t, e, None, |eval| {
+        let mut values = Vec::with_capacity(t.len());
+        for i in 0..t.len() {
+            if i.is_multiple_of(MAP_POLL_ROWS) {
+                ctx.check()?;
+            }
+            let value = eval(i)?;
+            admit(key_payload(&value))?;
+            values.push(super::sortkey::SortKey::new(value));
+        }
+        Ok(values)
+    })
 }
 
 /// The bytes an ORDER key's value holds beyond its slot.
@@ -6554,48 +6572,17 @@ fn key_payload(value: &Option<Value>) -> u64 {
     }
 }
 
-/// The value of an ORDER key on every row, charged until the sort releases it. An input
-/// of at most [`PAR_THRESHOLD`] rows is evaluated on this thread, each value admitted
-/// before the column keeps it. A larger input is evaluated in parallel, with `dec`'s
-/// decoded columns, after its slots are charged, and its values' payload is charged
-/// once they are made, so a query over its budget fails after one column's payload.
+/// Own decoded ORDER keys until the sort releases them. Admit a value's payload
+/// before keeping it in the key column.
 fn key_column_charged(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
     dec: Option<&super::expr::DecodedCols>,
 ) -> Result<super::exprcache::Column<Option<Value>>> {
-    if t.len() <= PAR_THRESHOLD {
-        return key_rows_charged(ctx, t, e);
-    }
-    let slots = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
-    let mut charge = ctx.retained_charge(slots)?;
-    let vals = key_rows(ctx, t, e, dec)?;
-    let payload: u64 = vals
-        .par_iter()
-        .with_min_len(PAR_MIN_LEN)
-        .map(key_payload)
-        .sum();
-    if let Some(charge) = &mut charge {
-        charge.resize(slots.saturating_add(payload))?;
-    }
-    Ok(super::exprcache::Column::Rows {
-        vals,
-        _charge: charge,
-    })
-}
-
-/// Own decoded ORDER keys until the sort releases them. The current evaluated
-/// value is transient expression memory; admit its payload before retaining it
-/// in the column, rather than retaining an uncharged whole-answer value array.
-fn key_rows_charged(
-    ctx: &Ctx,
-    t: &Table,
-    e: &Expr,
-) -> Result<super::exprcache::Column<Option<Value>>> {
     let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
     let mut charge = ctx.retained_charge(bytes)?;
-    let vals = key_rows_retained(ctx, t, e, &mut charge, &mut bytes)?;
+    let vals = key_rows_retained(ctx, t, e, dec, &mut charge, &mut bytes)?;
     Ok(super::exprcache::Column::Rows {
         vals,
         _charge: charge,
@@ -6606,46 +6593,75 @@ fn key_rows_retained(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
+    dec: Option<&super::expr::DecodedCols>,
     charge: &mut Option<super::ctx::RetainedCharge>,
     bytes: &mut u64,
 ) -> Result<Vec<Option<Value>>> {
-    let _map_charge = ctx.charge(ctx.nvars() as u64 * 16 + 128)?;
-    let nested = super::exists::nested(ctx, t, &[e])?;
-    let exists = nested.as_ref().map(|n| &n.answers);
-    let map = t.var_map(ctx.nvars());
-    // Each payload is admitted before the column keeps it, with the charge a step ahead,
-    // so that short strings take a charge once per step rather than once per row.
-    let step = ctx.reservation_step();
-    let mut values = Vec::with_capacity(t.len());
-    for i in 0..t.len() {
-        if i.is_multiple_of(1024) {
-            ctx.check()?;
-        }
-        let value = match eval(
-            e,
-            &Row {
-                table: t,
-                i,
-                map: &map,
-                dec: None,
-                exists,
-            },
-            ctx,
-        )
-        .ok()
+    with_key_evaluator(ctx, t, e, dec, |eval| {
+        let step = ctx.reservation_step();
+        let mut values = Vec::with_capacity(t.len());
+        // Workers keep a paid part of the retained charge. The only additional
+        // slots are the collector's pieces, with one transient key on each worker.
+        const PIECE_ROWS: usize = 4096;
+        let pieces = t.len().div_ceil(PIECE_ROWS);
+        let scratch = (t.len() * std::mem::size_of::<Option<Value>>()) as u64
+            + pieces.min(rayon::current_num_threads()) as u64
+                * super::bignum::AGG_SUM_PAYLOAD_BYTES;
+        if t.len() > PAR_THRESHOLD
+            && e.parallel()
+            && let Ok(_scratch) = ctx.charge(scratch)
         {
-            Some(Val::Id(id)) => ctx.cursor_value_checked(id)?,
-            Some(Val::V(v) | Val::Dec(_, v)) => Some(v),
-            None => None,
-        };
-        *bytes = bytes.saturating_add(key_payload(&value));
-        if let Some(charge) = charge {
-            charge.cover(*bytes, step)?;
+            let part_owner = charge.as_ref();
+            let parts = (0..pieces)
+                .into_par_iter()
+                .map(|piece| {
+                    let start = piece * PIECE_ROWS;
+                    let end = (start + PIECE_ROWS).min(t.len());
+                    let part = part_owner.map(|owner| owner.part(ctx));
+                    let mut payload = 0u64;
+                    let mut keys = Vec::with_capacity(end - start);
+                    for i in start..end {
+                        if i.is_multiple_of(MAP_POLL_ROWS) {
+                            ctx.check()?;
+                        }
+                        let value = eval(i)?;
+                        payload = payload.saturating_add(key_payload(&value));
+                        if let Some(part) = &part
+                            && payload > part.bytes()
+                            && part.resize(payload.saturating_add(step)).is_err()
+                        {
+                            part.resize(payload)?;
+                        }
+                        keys.push(value);
+                    }
+                    if let Some(part) = &part {
+                        part.resize(payload)?;
+                    }
+                    Ok((keys, payload, part))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (keys, payload, part) in parts {
+                if let (Some(charge), Some(part)) = (charge.as_mut(), part) {
+                    charge.absorb(part);
+                }
+                *bytes = bytes.saturating_add(payload);
+                values.extend(keys);
+            }
+        } else {
+            for i in 0..t.len() {
+                if i.is_multiple_of(MAP_POLL_ROWS) {
+                    ctx.check()?;
+                }
+                let value = eval(i)?;
+                *bytes = bytes.saturating_add(key_payload(&value));
+                if let Some(charge) = &mut *charge {
+                    charge.cover(*bytes, step)?;
+                }
+                values.push(value);
+            }
         }
-        values.push(value);
-    }
-    ctx.check()?;
-    Ok(values)
+        Ok(values)
+    })
 }
 
 /// The value of an ORDER BY key once per distinct input value, where the key is pure
@@ -6656,48 +6672,28 @@ fn key_per_value(
     e: &Expr,
     report: &mut ExprReport,
 ) -> Result<Option<super::exprcache::PerValue<Option<Value>>>> {
-    // Numeric keys reuse their input ids, from a dense range of integers at any size and
-    // from a sort up to `PAR_THRESHOLD` rows. A variable's values are decoded once each
-    // in key order at any size, so that the sort holds one value per distinct term, and
-    // another key of a larger input evaluates each distinct value once, in parallel.
-    // None of them takes fewer than `MIN_ROWS` rows, which return here.
+    // Numeric keys over inline ids and variable keys have specialized reuse.
+    // The general cache is useful only when enough rows can evaluate in parallel.
     if t.len() < super::exprcache::MIN_ROWS {
         return Ok(None);
     }
     if let Some(values) =
         super::exprcache::cursor_numeric_values(ctx, t, e, report, |v, charge, bytes| {
-            if matches!(e, Expr::Var(_)) {
-                key_rows(ctx, v, e, None)
-            } else {
-                key_rows_retained(ctx, v, e, charge, bytes)
-            }
+            key_rows_retained(ctx, v, e, None, charge, bytes)
         })?
     {
         return Ok(Some(values));
     }
-    if t.len() <= PAR_THRESHOLD {
-        return super::exprcache::cursor_variable_values(ctx, t, e);
-    }
     if let Some(values) = super::exprcache::cursor_variable_values(ctx, t, e)? {
         return Ok(Some(values));
     }
-    if t.len() < super::exprcache::MIN_ROWS {
+    if t.len() <= PAR_THRESHOLD {
         return Ok(None);
     }
-    let mut values = super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
-        key_rows(ctx, v, e, Decoded::cols(&decode_for(ctx, v, &[e])?))
-    })?;
-    // The distinct keys' payloads stay with them until the sort is done.
-    if let Some(values) = &mut values {
-        let payload: u64 = values
-            .vals
-            .par_iter()
-            .with_min_len(PAR_MIN_LEN)
-            .map(key_payload)
-            .sum();
-        values.retain(ctx, payload)?;
-    }
-    Ok(values)
+    super::exprcache::per_value_retained(ctx, t, &[e], false, report, |v, charge, bytes| {
+        let dec = decode_for(ctx, v, &[e])?;
+        key_rows_retained(ctx, v, e, Decoded::cols(&dec), charge, bytes)
+    })
 }
 
 /// The value of an ORDER BY key on every row, per distinct value where it can be.
@@ -6916,7 +6912,7 @@ impl SumGeneric {
         }
     }
 
-    fn add_value(self, rhs: &Value) -> Option<Self> {
+    fn add_value(&self, rhs: &Value) -> Option<Self> {
         use super::bignum::{AGG_MAX_DEC_DIGITS, AGG_MAX_INT_DIGITS, BigDec, BigInt};
         use super::value::Num;
         use oxsdatatypes::{Double, Float};
@@ -6925,26 +6921,26 @@ impl SumGeneric {
             (SumGeneric::Decimal(a), Num::Integer(b)) => match a.checked_add(b) {
                 Some(d) => SumGeneric::Decimal(d),
                 None => SumGeneric::BigDec(Box::new(
-                    BigDec::from_oxs_decimal(a)
+                    BigDec::from_oxs_decimal(*a)
                         .checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS)?,
                 )),
             },
             (SumGeneric::Decimal(a), Num::Decimal(b)) => match a.checked_add(b) {
                 Some(d) => SumGeneric::Decimal(d),
                 None => SumGeneric::BigDec(Box::new(
-                    BigDec::from_oxs_decimal(a)
+                    BigDec::from_oxs_decimal(*a)
                         .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
                 )),
             },
             (SumGeneric::Decimal(a), Num::BigInteger(b)) => SumGeneric::BigDec(Box::new(
-                BigDec::from_oxs_decimal(a)
+                BigDec::from_oxs_decimal(*a)
                     .checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS)?,
             )),
             (SumGeneric::Decimal(a), Num::BigDecimal(b)) => SumGeneric::BigDec(Box::new(
-                BigDec::from_oxs_decimal(a).checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?,
+                BigDec::from_oxs_decimal(*a).checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?,
             )),
-            (SumGeneric::Decimal(a), Num::Float(b)) => SumGeneric::Float(Float::from(a) + b),
-            (SumGeneric::Decimal(a), Num::Double(b)) => SumGeneric::Double(Double::from(a) + b),
+            (SumGeneric::Decimal(a), Num::Float(b)) => SumGeneric::Float(Float::from(*a) + b),
+            (SumGeneric::Decimal(a), Num::Double(b)) => SumGeneric::Double(Double::from(*a) + b),
             (SumGeneric::BigInt(a), Num::Integer(b)) => SumGeneric::BigInt(Box::new(
                 a.checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS)?,
             )),
@@ -6952,11 +6948,11 @@ impl SumGeneric {
                 SumGeneric::BigInt(Box::new(a.checked_add_with_limit(b, AGG_MAX_INT_DIGITS)?))
             }
             (SumGeneric::BigInt(a), Num::Decimal(b)) => SumGeneric::BigDec(Box::new(
-                BigDec::from_bigint(*a)
+                BigDec::from_bigint((**a).clone())
                     .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
             )),
             (SumGeneric::BigInt(a), Num::BigDecimal(b)) => SumGeneric::BigDec(Box::new(
-                BigDec::from_bigint(*a).checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?,
+                BigDec::from_bigint((**a).clone()).checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?,
             )),
             (SumGeneric::BigInt(a), Num::Float(b)) => {
                 SumGeneric::Float(Float::from(a.to_f32()) + b)
@@ -6982,9 +6978,9 @@ impl SumGeneric {
             (SumGeneric::BigDec(a), Num::Double(b)) => {
                 SumGeneric::Double(Double::from(a.to_f64()) + b)
             }
-            (SumGeneric::Float(a), Num::Double(b)) => SumGeneric::Double(Double::from(a) + b),
-            (SumGeneric::Float(a), other) => SumGeneric::Float(a + other.to_float()),
-            (SumGeneric::Double(a), other) => SumGeneric::Double(a + other.to_double()),
+            (SumGeneric::Float(a), Num::Double(b)) => SumGeneric::Double(Double::from(*a) + b),
+            (SumGeneric::Float(a), other) => SumGeneric::Float(*a + other.to_float()),
+            (SumGeneric::Double(a), other) => SumGeneric::Double(*a + other.to_double()),
         })
     }
 
@@ -7068,6 +7064,7 @@ pub(super) enum AggState {
         ok: bool,
         rows: u64,
         errs: u64,
+        deferred: bool,
     },
     /// MIN / MAX: the best id and its value, and the count of arguments that were
     /// errors, which some readings make the result unbound (see
@@ -7090,6 +7087,7 @@ impl AggState {
                 ok: true,
                 rows: 0,
                 errs: 0,
+                deferred: false,
             },
             AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0),
             AggregateFunction::Sample => AggState::Sample(None),
@@ -7111,6 +7109,30 @@ impl AggState {
     /// Add one row; `id` is the aggregated column's value (`None` for COUNT(*)).
     #[inline(always)]
     pub(super) fn add(&mut self, ctx: &Ctx, agg: &Agg, id: Option<Id>) {
+        let _ = self.add_admitted(ctx, agg, id, |_, _| Ok(true));
+    }
+
+    /// Whether later arguments of this subtotal must be replayed from disk.
+    pub(super) fn sum_deferred(&self) -> bool {
+        matches!(self, Self::Sum { deferred: true, .. })
+    }
+
+    pub(super) fn defer_sum(&mut self) {
+        if let Self::Sum { deferred, .. } = self {
+            *deferred = true;
+        }
+    }
+
+    /// Try one row. If a subtotal's new heap capacity is refused, preserve its
+    /// prefix so the caller can replay this argument and the rest of the group.
+    #[inline(always)]
+    pub(super) fn add_admitted(
+        &mut self,
+        ctx: &Ctx,
+        agg: &Agg,
+        id: Option<Id>,
+        admit: impl FnOnce(u64, u64) -> Result<bool>,
+    ) -> Result<bool> {
         match self {
             AggState::Count(n) => *n += id.is_none_or(|id| !id.is_undef()) as u64,
             AggState::Sum {
@@ -7119,19 +7141,21 @@ impl AggState {
                 ok,
                 rows,
                 errs,
+                ..
             } => {
                 *rows += 1;
                 let id = id.unwrap_or(Id::UNDEF);
-                *errs += u64::from(id.is_undef());
+                let err = u64::from(id.is_undef());
+                *errs += err;
                 if !*ok {
-                    return;
+                    return Ok(true);
                 }
                 if generic.is_none()
                     && id.tag() == crate::id::Tag::Int
                     && let Some(s) = int.checked_add(id.as_i64().into())
                 {
                     *int = s;
-                    return;
+                    return Ok(true);
                 }
                 let value = (!id.is_undef()).then(|| ctx.value(id)).flatten();
                 // An integer too large to be inlined joins the exact sum as well.
@@ -7140,35 +7164,36 @@ impl AggState {
                     && let Some(s) = int.checked_add(i64::from(*i).into())
                 {
                     *int = s;
-                    return;
+                    return Ok(true);
                 }
-                let acc = match generic.take() {
-                    Some(g) => g,
-                    None => match &value {
-                        Some(Value::Decimal(d)) => {
-                            if let Ok(i) = oxsdatatypes::Decimal::try_from(*int)
-                                && let Some(s) = i.checked_add(*d)
-                            {
-                                *generic = Some(SumGeneric::Decimal(s));
-                                return;
-                            }
-                            SumGeneric::from_int(*int)
+                let next = match (generic.as_ref(), value.as_ref()) {
+                    (Some(acc), Some(value)) => acc.add_value(value),
+                    (None, Some(value)) => {
+                        if let Value::Decimal(d) = value
+                            && let Ok(i) = oxsdatatypes::Decimal::try_from(*int)
+                            && let Some(s) = i.checked_add(*d)
+                        {
+                            *generic = Some(SumGeneric::Decimal(s));
+                            return Ok(true);
                         }
-                        _ => SumGeneric::from_int(*int),
-                    },
+                        SumGeneric::from_int(*int).add_value(value)
+                    }
+                    (_, None) => None,
                 };
-                match value {
-                    Some(v) => match acc.add_value(&v) {
-                        Some(v) => *generic = Some(v),
-                        None => *ok = false,
-                    },
-                    None => *ok = false,
+                let old_bytes = generic.as_ref().map_or(0, SumGeneric::heap_bytes);
+                let new_bytes = next.as_ref().map_or(0, SumGeneric::heap_bytes);
+                if old_bytes != new_bytes && !admit(old_bytes, new_bytes)? {
+                    *rows -= 1;
+                    *errs -= err;
+                    return Ok(false);
                 }
+                *ok = next.is_some();
+                *generic = next;
             }
             AggState::Best(best, best_v, errs) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
                     *errs += 1;
-                    return;
+                    return Ok(true);
                 };
                 let v = ctx.value(id);
                 let better = match best_v {
@@ -7194,6 +7219,7 @@ impl AggState {
             }
             AggState::Stat(_, acc) => acc.add(ctx, id),
         }
+        Ok(true)
     }
 
     /// Fold `other`, the state of the same aggregate over rows that come after this
@@ -7211,6 +7237,7 @@ impl AggState {
                     ok,
                     rows,
                     errs,
+                    ..
                 },
                 AggState::Sum {
                     int: oint,
@@ -7218,6 +7245,7 @@ impl AggState {
                     ok: ook,
                     rows: orows,
                     errs: oerrs,
+                    ..
                 },
             ) => {
                 *rows += orows;
@@ -7318,6 +7346,7 @@ impl AggState {
                 ok,
                 rows,
                 errs,
+                ..
             } => {
                 // AVG is Sum over Count, and Count leaves the errors out
                 if rows > 0
@@ -11577,4 +11606,84 @@ fn cursor_big_numeric_sort_keys_are_admitted_as_they_are_evaluated() {
     // would fail there, before the ledger had admitted any of the big values.
     assert!(ctx.mem_peak() >= 310 * 1024, "peak: {}", ctx.mem_peak());
     assert_eq!(ctx.live_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_fixed_width_sort_reuses_keys_under_a_tight_budget() {
+    use super::expr::ArithOp;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 260 * 1024;
+    let var = ctx.var("v");
+    let ctx = std::sync::Arc::new(ctx);
+    ctx.attach_owner();
+
+    let mut table = Table::new(vec![var]);
+    for i in 1..=512 {
+        let id = Id::from_i64(i).unwrap();
+        table.push_row(&[id]);
+        table.push_row(&[id]);
+    }
+    let expr = Expr::Arith(
+        Box::new(Expr::Var(var)),
+        Box::new(Expr::Const(Id::from_i64(1).unwrap())),
+        ArithOp::Add,
+    );
+    let mut report = ExprReport::default();
+    let keys = key_per_value(&ctx, &table, &expr, &mut report)
+        .unwrap()
+        .expect("fixed-width keys fit in the cache");
+    assert_eq!(keys.vals.len(), 512);
+    assert!(matches!(
+        keys.get(1023),
+        Some(Value::Integer(value)) if i64::from(*value) == 513
+    ));
+    drop(keys);
+    assert_eq!(ctx.live_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_large_sparse_and_uncached_sort_keys_admit_payload_incrementally() {
+    use super::expr::ArithOp;
+
+    for cached in [true, false] {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 5 << 20;
+        let var = ctx.var("v");
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+
+        let mut table = Table::new(vec![var]);
+        for i in 1..=PAR_THRESHOLD as i64 {
+            let id = Id::from_i64(i * 16).unwrap();
+            table.push_row(&[id]);
+            table.push_row(&[id]);
+        }
+        let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
+        let expr = Expr::Arith(
+            Box::new(Expr::Var(var)),
+            Box::new(Expr::Lit(Id::UNDEF, factor)),
+            ArithOp::Mul,
+        );
+        let mut report = ExprReport::default();
+        let err = if cached {
+            key_per_value(&ctx, &table, &expr, &mut report).err()
+        } else {
+            key_column_charged(&ctx, &table, &expr, None).err()
+        };
+        assert!(
+            matches!(err, Some(Error::BudgetExceeded(_))),
+            "cached {cached}"
+        );
+        assert!(
+            ctx.mem_peak() >= 4 << 20,
+            "cached {cached}, peak {}",
+            ctx.mem_peak()
+        );
+        assert_eq!(ctx.live_bytes(), 0);
+    }
 }

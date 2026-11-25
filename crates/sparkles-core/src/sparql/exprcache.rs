@@ -284,18 +284,6 @@ pub struct PerValue<T> {
 }
 
 impl<T> PerValue<T> {
-    /// Charge `bytes` more to these values until they are dropped, such as the heap
-    /// payloads of their results.
-    pub(super) fn retain(&mut self, ctx: &Ctx, bytes: u64) -> Result<()> {
-        match &mut self._charge {
-            Some(charge) => charge.resize(charge.bytes().saturating_add(bytes)),
-            None => {
-                self._charge = ctx.retained_charge(bytes)?;
-                Ok(())
-            }
-        }
-    }
-
     #[inline]
     pub fn get(&self, row: usize) -> &T {
         match &self.slot {
@@ -421,27 +409,36 @@ pub fn per_value<T: Send>(
     report: &mut Report,
     eval: impl FnOnce(&Table) -> Result<Vec<T>>,
 ) -> Result<Option<PerValue<T>>> {
+    per_value_retained(ctx, t, exprs, always, report, |values, _, _| eval(values))
+}
+
+/// Evaluate a distinct column while admitting the heap payload of each result.
+pub(super) fn per_value_retained<T: Send>(
+    ctx: &Ctx,
+    t: &Table,
+    exprs: &[&Expr],
+    always: bool,
+    report: &mut Report,
+    eval: impl FnOnce(&Table, &mut Option<RetainedCharge>, &mut u64) -> Result<Vec<T>>,
+) -> Result<Option<PerValue<T>>> {
     let Some(d) = distinct(ctx, t, exprs, always, report)? else {
         return Ok(None);
     };
-    // The slots, the distinct values and their results live until the caller has
-    // expanded or read them, so they stay charged until then in both accounting modes.
-    let held = (d.slot.as_ref().map_or(0, Vec::capacity) as u64)
-        .saturating_mul(4)
-        .saturating_add(d.values.mem_bytes());
+    let distinct_bytes = d.values.capacity_bytes();
     let size = std::mem::size_of::<T>() as u64;
-    // Reuse is optional, so a charge that does not fit, before or after the evaluation,
-    // leaves the rows to the caller instead of failing the query.
-    let Ok(mut charge) =
-        ctx.retained_charge(held.saturating_add((d.values.len() as u64).saturating_mul(size)))
-    else {
+    let mut retained = (d.slot.as_ref().map_or(0, Vec::capacity) as u64)
+        .saturating_mul(4)
+        .saturating_add(distinct_bytes)
+        .saturating_add((d.values.len() as u64).saturating_mul(size));
+    let Ok(mut charge) = ctx.retained_charge(retained) else {
         return Ok(None);
     };
-    let vals = eval(&d.values)?;
+    let vals = eval(&d.values, &mut charge, &mut retained)?;
     debug_assert_eq!(vals.len(), d.values.len());
+    drop(d.values);
     if let Some(charge) = &mut charge
         && charge
-            .resize(held.saturating_add((vals.capacity() as u64).saturating_mul(size)))
+            .resize(retained - distinct_bytes + (vals.capacity() - vals.len()) as u64 * size)
             .is_err()
     {
         return Ok(None);
@@ -532,14 +529,20 @@ pub(super) fn cursor_numeric_values(
         + 4096
         + distinct_bytes;
     if let Some(charge) = &mut charge {
-        charge.cover(retained, 0)?;
+        // Only the distinct table and its slots survive construction.
+        if charge.resize(retained).is_err() {
+            return Ok(None);
+        }
     }
     // A numeric expression can widen even though its input is fixed-width.
     // Reserve a transient result before evaluation and charge every result
     // before the evaluator adds it to the retained column.
-    let scratch = (!matches!(e, Expr::Var(_)))
+    let Ok(scratch) = (!matches!(e, Expr::Var(_)))
         .then(|| ctx.charge(super::bignum::AGG_SUM_PAYLOAD_BYTES))
-        .transpose()?;
+        .transpose()
+    else {
+        return Ok(None);
+    };
     let vals = eval(&d.values, &mut charge, &mut retained)?;
     ctx.check()?;
     drop((scratch, d.values));

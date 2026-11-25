@@ -1318,7 +1318,8 @@ impl BigDec {
     /// [`MAX_DIGITS`] and [`MAX_SCALE`], and truncates non-terminating quotients towards
     /// zero with at least 18 fractional digits (or 18 significant digits for sub-10^-18
     /// quotients, and up to the dividend's scale), capped to fit [`MAX_DIGITS`] and
-    /// [`MAX_SCALE`].
+    /// [`MAX_SCALE`]. A quotient smaller than the minimum nonzero magnitude truncates
+    /// to zero.
     pub fn checked_div(&self, rhs: &Self) -> Option<Self> {
         if rhs.is_zero() {
             return None;
@@ -1779,6 +1780,11 @@ mod tests {
         assert_eq!(
             four_tiny.checked_div(&BigDec::from_i64(3)),
             Some(tiny_cap.clone())
+        );
+
+        assert_eq!(
+            tiny_cap.checked_div(&BigDec::from_i64(3)),
+            Some(BigDec::zero())
         );
 
         // High-scale repeating divisor: 100 / (3 + 10^-4095) succeeds.

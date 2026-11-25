@@ -163,6 +163,7 @@ impl Group {
                 self.load(ctx, child, options)?;
             }
             if let Some(table) = self.grouping.output(ctx, vars, cap)? {
+                self.spilled = self.grouping.spilled;
                 let mut output = buffer(ctx, table)?;
                 output.reconcile()?;
                 return Ok(Some(output));
