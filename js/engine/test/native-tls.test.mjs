@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { native } from '../dist/native.js';
 
 const PT_DYNAMIC = 2;
 const PT_TLS = 7;
@@ -11,17 +10,21 @@ const DT_NULL = 0n;
 const DT_FLAGS = 30n;
 const DF_STATIC_TLS = 0x10n;
 const MAX_TLS_MEMSZ = 2048n;
+const NATIVE_MODULE_URL = new URL('../dist/native.js', import.meta.url);
 
 function resolveNativePath() {
-  if (process.env.SPARKLES_NODE_NATIVE) return process.env.SPARKLES_NODE_NATIVE;
+  const nativeRequire = createRequire(NATIVE_MODULE_URL);
+  if (process.env.SPARKLES_NODE_NATIVE) {
+    return nativeRequire.resolve(process.env.SPARKLES_NODE_NATIVE);
+  }
   const libc =
     process.platform === 'linux' && !process.report?.getReport()?.header?.glibcVersionRuntime
       ? 'musl'
       : 'gnu';
   const target = `${process.platform}-${process.arch}${process.platform === 'linux' ? '-' + libc : process.platform === 'win32' ? '-msvc' : ''}`;
-  const local = fileURLToPath(new URL(`../native/sparkles.${target}.node`, import.meta.url));
+  const local = fileURLToPath(new URL(`../native/sparkles.${target}.node`, NATIVE_MODULE_URL));
   if (existsSync(local)) return local;
-  return createRequire(import.meta.url).resolve(`@sparkles-rdf/engine-${target}`);
+  return nativeRequire.resolve(`@sparkles-rdf/engine-${target}`);
 }
 
 function inspectElf64Tls(buf) {
@@ -69,7 +72,8 @@ function inspectElf64Tls(buf) {
 test(
   'Linux native addon avoids DF_STATIC_TLS and keeps PT_TLS bounded for dlopen',
   { skip: process.platform !== 'linux' },
-  () => {
+  async () => {
+    const { native } = await import('../dist/native.js');
     assert.ok(native.NativeDataset, 'native addon must load without GLIBC_TUNABLES');
     const path = resolveNativePath();
     const { tlsMemsz, hasStaticTls } = inspectElf64Tls(readFileSync(path));
