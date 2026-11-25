@@ -435,7 +435,7 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             &format!(
                 "SELECT ?p ?i {{ SERVICE path:search {{ [] {src} ; path:target <urn:s:9> ; path:predicate <urn:q> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i }} }}"
             ),
-            Refused(Why::Row(1122)),
+            Native,
         ),
         form(
             "shortest paths to a variable end",
@@ -443,13 +443,21 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             &format!(
                 "SELECT ?b {{ SERVICE path:search {{ [] {src} ; path:target ?b ; path:predicate <urn:q> }} }}"
             ),
-            Refused(Why::Row(1122)),
+            Native,
+        ),
+        form(
+            "all shortest paths to a variable end",
+            "PathSearch",
+            &format!(
+                "SELECT ?b ?p {{ SERVICE path:search {{ [] {src} ; path:target ?b ; path:predicate <urn:q> ; path:algorithm path:allShortest ; path:pathIndex ?p }} }}"
+            ),
+            Native,
         ),
         form(
             "path search over its group without a limit",
             "PathSearch",
             "SELECT ?s ?b { ?s <urn:p> ?o FILTER(?o < 3) SERVICE path:search { [] path:source ?s ; path:target <urn:s:9> ; path:predicate <urn:q> } }",
-            Refused(Why::Row(1123)),
+            Native,
         ),
         form(
             "path search over an edge pattern without a limit",
@@ -457,7 +465,13 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             &format!(
                 "SELECT ?i {{ SERVICE path:search {{ [] {src} ; path:target <urn:s:9> ; path:edgeIndex ?i ; path:start ?x ; path:end ?y . ?x <urn:q> ?y }} }}"
             ),
-            Refused(Why::Row(1123)),
+            Native,
+        ),
+        form(
+            "path search over its group and an edge pattern without a limit",
+            "PathSearch",
+            "SELECT ?s ?i { ?s <urn:p> ?o FILTER(?o < 3) SERVICE path:search { [] path:source ?s ; path:target <urn:s:9> ; path:edgeIndex ?i ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+            Native,
         ),
         // algorithm calls
         form(

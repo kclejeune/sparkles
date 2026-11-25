@@ -4103,9 +4103,9 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
         format!(
             "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {VIEW_READ} FILTER(?x = 3) }} }}"
         ),
-        // a path search over its group without a limit reads its whole input, and that
+        // a BIND over an EXISTS that does not stream reads its whole input, and that
         // input streams into it
-        "SELECT ?s ?b WHERE { ?s <urn:p> ?o FILTER(?o < 5) SERVICE <urn:x-sparkles:path#search> { [] <urn:x-sparkles:path#source> ?s ; <urn:x-sparkles:path#target> ?b ; <urn:x-sparkles:path#predicate> <urn:q> } }".to_string(),
+        "SELECT ?s ?e WHERE { ?s <urn:p> ?o FILTER(?o < 5) BIND(EXISTS { ?t <http://jena.apache.org/ARQ/property#strSplit> (\"a b\" \" \") } AS ?e) }".to_string(),
     ] {
         let q = q.as_str();
         let expected = bag(query(s.snapshot(), q, &views).unwrap().application_rows());
@@ -4119,7 +4119,7 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
             fallbacks(c.plan(), &mut found);
             assert!(!found.is_empty(), "{q}");
             assert!(found.iter().all(|(_, nested)| !nested), "{q}: {:?}", c.plan());
-            if q.contains("path#search") {
+            if q.contains("strSplit") {
                 assert!(found.iter().any(|(inputs, _)| *inputs), "{q}: {:?}", c.plan());
             }
             assert_eq!(bag(all(c)), expected, "{q}; {rows}");

@@ -1378,11 +1378,29 @@ Deleting the branch or dataset still removes the segments under a read, which
 decodes them, which [item 1124](../../ROADMAP.md) holds, and a read-only log's newest-first
 walk is [item 1175](../../ROADMAP.md).
 
+Every `SERVICE path:search` without `path:limit` now runs natively through
+`cursor/pathsearch.rs` and `pathsearch::Reader`, covering `path:shortest`,
+`path:allShortest`, `path:kShortest` and `path:all` across constant or variable
+endpoints, group inputs and nested edge patterns (items 1122 and 1123). Search trees,
+distance maps, priority queues, candidate tables, path-reconstruction stacks and
+triple-term caches pre-admit every allocation and growth through the query's memory
+budget before allocating and release their charges on completion, error or early stop.
+Single-ended breadth-first and Dijkstra searches, bidirectional unweighted and weighted
+`path:allShortest`, Yen's algorithm and depth-first `path:all` stream matching paths one
+at a time through resumable iterators, so a `LIMIT` over a graph with many tied shortest
+paths stops without materializing every path. Searches over a group input or a nested
+edge pattern without `path:limit` read their group rows into a charged buffer and stream
+edge-pattern batches into pre-admitted adjacency maps before streaming matching paths
+batch by batch, reporting `fullInputBeforeOutput` on the `PathSearch` node. Grouped
+streaming emits each discovered path across its matching group rows without
+materializing every path of a search, matching eager execution in full solution
+multiset, `pathIndex` numbering, per-node search counters and work counts at every batch
+size while allowing row order across group rows that share an endpoint to vary when no
+`ORDER BY` is present.
+
 View reads stay refused under the strict policy, since a view's result is decoded under
 its lock against the circuit's latest pass, and [item 1121](../../ROADMAP.md) keeps a
-versioned result that a cursor can page through. Path searches that keep a set per pair
-of endpoints and path searches over their input without a limit stay refused under items
-[1122](../../ROADMAP.md) and [1123](../../ROADMAP.md). The inventory test
+versioned result that a cursor can page through. The inventory test
 `cursor_inventory.rs` lists every form as native or refused with its decision or row.
 
 Tests compare each reader with eager answers at batch sizes down to one row, refuse the

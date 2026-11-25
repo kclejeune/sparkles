@@ -676,3 +676,725 @@ fn vector_order_budget_refusal_runs_the_generic_child_to_completion() {
     assert!(format!("{generic_plan:?}").contains("ran the generic plan"));
     assert!(!format!("{generic_plan:?}").contains("the vector index answered"));
 }
+
+fn assert_parity_batches(
+    snap: &Arc<Snapshot>,
+    body: &str,
+    opts: &QueryOptions,
+    non_empty: bool,
+    expect_full_input: bool,
+) {
+    let q = format!("{P}{body}");
+    let work_eager = Arc::new(AtomicU64::new(0));
+    let eager_opts = QueryOptions {
+        no_cache: true,
+        work: Some(work_eager.clone()),
+        ..opts.clone()
+    };
+    let eager = query(snap.clone(), &q, &eager_opts).unwrap();
+    let expected = bag(eager
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|r| r.values().to_vec())
+        .collect());
+    if non_empty {
+        assert!(!expected.is_empty(), "fixture returned 0 rows for `{body}`");
+    }
+    fn find_ps_info(
+        p: &sparkles_core::sparql::PlanInfo,
+    ) -> Option<&sparkles_core::sparql::PlanInfo> {
+        if p.operator == "PathSearch" {
+            return Some(p);
+        }
+        p.children.iter().find_map(find_ps_info)
+    }
+    let eager_ps_counters = find_ps_info(eager.plan()).and_then(|p| p.counters.clone());
+    for batch_rows in [1, 2, 7, 64, 4096] {
+        let (got, plan, work_stream) = drain_strict(snap, &q, opts, batch_rows);
+        assert_eq!(
+            got, expected,
+            "mismatch at batch_rows={batch_rows} for `{body}`"
+        );
+        assert_eq!(
+            work_stream,
+            work_eager.load(Ordering::Relaxed),
+            "work mismatch at batch_rows={batch_rows} for `{body}`"
+        );
+        fn find_ps(
+            p: &sparkles_core::sparql::CursorPlan,
+        ) -> Option<&sparkles_core::sparql::CursorPlan> {
+            if p.operator.operator == "PathSearch" {
+                return Some(p);
+            }
+            p.children.iter().find_map(find_ps)
+        }
+        let ps = find_ps(&plan).expect("PathSearch node in plan");
+        assert_eq!(
+            ps.full_input_before_output, expect_full_input,
+            "full_input_before_output mismatch for `{body}`: {ps:#?}"
+        );
+        assert_eq!(
+            ps.operator.counters, eager_ps_counters,
+            "PathSearch counters mismatch at batch_rows={batch_rows} for `{body}`"
+        );
+    }
+}
+
+/// Item 1122: `path:allShortest` and `path:shortest` with a variable end run natively
+/// under strict cursors and match eager answers across every batch size.
+#[test]
+fn path_search_item_1122_all_shortest_and_variable_end_parity() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix ex: <http://example.org/> .\n");
+    // Diamond chain: 3 diamonds -> 8 tied shortest paths from d0 to d3.
+    for i in 0..3 {
+        data.push_str(&format!(
+            "ex:d{i} ex:e ex:da{i} . ex:d{i} ex:e ex:db{i} .\n\
+             ex:da{i} ex:e ex:d{} . ex:db{i} ex:e ex:d{} .\n\
+             << ex:d{i} ex:e ex:da{i} >> ex:w 1.5 .\n\
+             << ex:d{i} ex:e ex:db{i} >> ex:w 1.5 .\n\
+             << ex:da{i} ex:e ex:d{} >> ex:w 1.0 .\n\
+             << ex:db{i} ex:e ex:d{} >> ex:w 1.0 .\n",
+            i + 1,
+            i + 1,
+            i + 1,
+            i + 1
+        ));
+    }
+    // Cycle back to d0 with zero-weight edge and wide-weight fallback edge.
+    data.push_str(
+        r#"
+        ex:d3 ex:e ex:d0 .
+        << ex:d3 ex:e ex:d0 >> ex:w 0.0 .
+        ex:d0 ex:e ex:d1 .
+        ex:w0 ex:wedge ex:w1 . ex:w1 ex:wedge ex:w2 . ex:w0 ex:wedge ex:w3 . ex:w3 ex:wedge ex:w2 .
+        << ex:w0 ex:wedge ex:w1 >> ex:w 1.0 .
+        << ex:w1 ex:wedge ex:w2 >> ex:w 1e12 .
+        << ex:w0 ex:wedge ex:w3 >> ex:w 1e12 .
+        << ex:w3 ex:wedge ex:w2 >> ex:w 1.0 .
+        ex:h0 ex:e ex:hub . ex:hub ex:e ex:h1 . ex:hub ex:e ex:h2 . ex:hub ex:e ex:h3 .
+        ex:h0 ex:e ex:alt . ex:alt ex:e ex:h1 .
+        "#,
+    );
+    load(&store, &data, RdfFormat::Turtle);
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+
+    // Unweighted allShortest between constants (per-edge + edge triple term)
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?e ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d3 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edge ?e ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    // Unweighted allShortest cycle (minLength 1 and minLength 0)
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?es ?eo ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d0 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d0 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:minLength 0 ; path:pathIndex ?p ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    // Weighted allShortest between constants (bidirectional Dijkstra + wide-weight fallback + maxLength Yen)
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?es ?eo ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d3 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:weight ex:w ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?c { SERVICE path:search { [] path:source ex:w0 ; path:target ex:w2 ; path:predicate ex:wedge ; path:algorithm path:allShortest ; path:weight ex:w ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d3 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    // Weighted allShortest cycle (s == t)
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?c { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d0 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:weight ex:w ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    // Shortest to variable target (by_level without edge vars, per-edge, weighted, minLength 0)
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?p ?i ?es ?eo ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:minLength 0 ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    // Shortest from variable source (backward BFS and backward Dijkstra)
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?len { SERVICE path:search { [] path:source ?s ; path:target ex:d3 ; path:predicate ex:e ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?p ?i ?c { SERVICE path:search { [] path:source ?s ; path:target ex:d3 ; path:predicate ex:e ; path:weight ex:w ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    // allShortest to variable target and from variable source (unweighted + weighted)
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?p ?i ?es ?eo { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?p ?c { SERVICE path:search { [] path:source ?s ; path:target ex:d3 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:weight ex:w ; path:pathIndex ?p ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    // maxDegree + direction both/backward with allShortest
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?es ?eo { SERVICE path:search { [] path:source ex:h0 ; path:target ex:h1 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:maxDegree 2 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?len { SERVICE path:search { [] path:source ex:d3 ; path:target ?t ; path:predicate ex:e ; path:direction path:backward ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+
+    // Early stop via LIMIT on a 20-diamond chain (1,048,576 tied shortest paths!) must
+    // stream only the first few paths without materializing all 2^20 paths.
+    let diamonds = Store::in_memory(StoreOptions::default());
+    let mut ddata = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..20 {
+        ddata.push_str(&format!(
+            "ex:x{i} ex:e ex:xa{i} . ex:x{i} ex:e ex:xb{i} .\n\
+             ex:xa{i} ex:e ex:x{} . ex:xb{i} ex:e ex:x{} .\n",
+            i + 1,
+            i + 1
+        ));
+    }
+    load(&diamonds, &ddata, RdfFormat::Turtle);
+    let q_lim = format!(
+        "{P}SELECT ?p ?len {{ SERVICE path:search {{ [] path:source ex:x0 ; path:target ex:x20 ; path:predicate ex:e ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:length ?len }} }} LIMIT 5 OFFSET 2"
+    );
+    let (rows, plan, _) = drain_strict(&diamonds.snapshot(), &q_lim, &opts, 2);
+    assert_eq!(rows.len(), 5);
+    assert!(!plan.has_materialization());
+}
+
+/// Item 1123: path searches over their group input and/or nested edge pattern without
+/// `path:limit` run natively under strict cursors and match eager answers across every
+/// batch size.
+#[test]
+fn path_search_item_1123_group_input_and_edge_pattern_parity() {
+    let store = graph_store();
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+
+    // Group input without limit: shortest, allShortest, kShortest, all
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?len { ?s <urn:p> ?o FILTER(?o < 5) SERVICE path:search { [] path:source ?s ; path:target <urn:s:9> ; path:predicate <urn:q> ; path:length ?len } }",
+        &opts,
+        true,
+        true,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?p ?i ?es ?eo { VALUES ?s { <urn:s:8> <urn:s:1> <urn:s:8> } SERVICE path:search { [] path:source ?s ; path:target <urn:s:12> ; path:predicate <urn:q> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo } }",
+        &opts,
+        true,
+        true,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?t ?p ?len { VALUES (?s ?t) { (<urn:s:0> <urn:s:5>) (<urn:s:0> <urn:s:7>) (<urn:s:2> <urn:s:9>) } SERVICE path:search { [] path:source ?s ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:kShortest ; path:k 2 ; path:pathIndex ?p ; path:length ?len } }",
+        &opts,
+        true,
+        true,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?t ?p ?len { ?s <urn:p> ?o FILTER(?o < 3) SERVICE path:search { [] path:source ?s ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 2 ; path:pathIndex ?p ; path:length ?len } }",
+        &opts,
+        true,
+        true,
+    );
+    // Group input binding target only (backward search)
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?t ?len { ?t <urn:p> ?o FILTER(?o < 3) SERVICE path:search { [] path:source ?s ; path:target ?t ; path:predicate <urn:q> ; path:length ?len } }",
+        &opts,
+        true,
+        true,
+    );
+    // Mixed (Some(s), Some(t)) and (Some(s), None) rows from VALUES
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?t ?p ?len { VALUES (?s ?t) { (<urn:s:0> <urn:s:4>) (<urn:s:0> UNDEF) (<urn:s:1> <urn:s:6>) } SERVICE path:search { [] path:source ?s ; path:target ?t ; path:predicate <urn:q> ; path:pathIndex ?p ; path:length ?len } }",
+        &opts,
+        true,
+        true,
+    );
+    // Empty group input
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?len { ?s <urn:p> ?o FILTER(?o > 9999) SERVICE path:search { [] path:source ?s ; path:target <urn:s:9> ; path:predicate <urn:q> ; path:length ?len } }",
+        &opts,
+        false,
+        true,
+    );
+    // Input row binding an output variable (`?len`) filters incompatible paths
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?t ?len { VALUES (?s ?len) { (<urn:s:0> 2) (<urn:s:1> 1) } SERVICE path:search { [] path:source ?s ; path:target ?t ; path:predicate <urn:q> ; path:length ?len } }",
+        &opts,
+        true,
+        true,
+    );
+    // Nested edge pattern without limit (all four algorithms + direction both + FILTER)
+    assert_parity_batches(
+        &snap,
+        "SELECT ?i ?es ?eo ?len { SERVICE path:search { [] path:source <urn:s:1> ; path:target <urn:s:9> ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:length ?len ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+        &opts,
+        true,
+        true,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?p ?i ?len { SERVICE path:search { [] path:source <urn:s:1> ; path:target <urn:s:9> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:length ?len ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+        &opts,
+        true,
+        true,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?p ?len { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?t ; path:algorithm path:all ; path:maxLength 2 ; path:direction path:both ; path:pathIndex ?p ; path:length ?len ; path:start ?x ; path:end ?y . ?x <urn:q> ?y . ?x <urn:p> ?v FILTER(?v < 15) } }",
+        &opts,
+        true,
+        true,
+    );
+    // Both group input AND nested edge pattern without limit
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?p ?i ?len { ?s <urn:p> ?o FILTER(?o < 4) SERVICE path:search { [] path:source ?s ; path:target <urn:s:9> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:length ?len ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+        &opts,
+        true,
+        true,
+    );
+}
+
+/// Items 1122 & 1123: tight memory budgets, cancellation, deadlines, and error parity.
+#[test]
+fn path_search_1122_1123_budgets_cancellation_and_errors() {
+    let store = graph_store();
+    let snap = store.snapshot();
+    let strict = CursorOptions {
+        batch_rows: 2,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let queries = [
+        format!(
+            "{P}SELECT ?p ?i {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target <urn:s:9> ; path:predicate <urn:q> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i }} }}"
+        ),
+        format!(
+            "{P}SELECT ?t ?len {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:length ?len }} }}"
+        ),
+        format!(
+            "{P}SELECT ?s ?len {{ ?s <urn:p> ?o SERVICE path:search {{ [] path:source ?s ; path:target <urn:s:9> ; path:predicate <urn:q> ; path:length ?len }} }}"
+        ),
+        format!(
+            "{P}SELECT ?t ?len {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:length ?len ; path:start ?x ; path:end ?y . ?x <urn:q> ?y }} }}"
+        ),
+    ];
+    for q in &queries {
+        let cancel_opts = QueryOptions {
+            no_cache: true,
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+        let res = select_cursor(snap.clone(), q, &cancel_opts, &strict)
+            .and_then(|mut c| c.next_batch().map(|_| ()));
+        assert!(matches!(res, Err(Error::Cancelled)), "`{q}`: {res:?}");
+
+        let timeout_opts = QueryOptions {
+            no_cache: true,
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let res = select_cursor(snap.clone(), q, &timeout_opts, &strict)
+            .and_then(|mut c| c.next_batch().map(|_| ()));
+        assert!(matches!(res, Err(Error::Timeout)), "`{q}`: {res:?}");
+
+        let mem_opts = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: Some(256),
+            ..Default::default()
+        };
+        let res = select_cursor(snap.clone(), q, &mem_opts, &strict).and_then(|mut c| {
+            while c.next_batch()?.is_some() {}
+            Ok(())
+        });
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+            "`{q}`: {res:?}"
+        );
+    }
+
+    // Error parity on invalid runtime bindings: (UNDEF, UNDEF) row, kShortest unbound target/source.
+    for bad_q in [
+        format!(
+            "{P}SELECT ?s ?t {{ VALUES (?s ?t) {{ (UNDEF UNDEF) }} SERVICE path:search {{ [] path:source ?s ; path:target ?t ; path:predicate <urn:q> }} }}"
+        ),
+        format!(
+            "{P}SELECT ?t {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:kShortest ; path:k 2 }} }}"
+        ),
+        format!(
+            "{P}SELECT ?s {{ SERVICE path:search {{ [] path:source ?s ; path:target <urn:s:0> ; path:predicate <urn:q> ; path:algorithm path:kShortest ; path:k 2 }} }}"
+        ),
+    ] {
+        let opts = QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let eager_err = query(snap.clone(), &bad_q, &opts)
+            .err()
+            .expect("expected eager error");
+        let stream_err = select_cursor(snap.clone(), &bad_q, &opts, &strict)
+            .and_then(|mut c| {
+                while c.next_batch()?.is_some() {}
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(
+            format!("{stream_err}"),
+            format!("{eager_err}"),
+            "error mismatch for `{bad_q}`"
+        );
+    }
+}
+
+/// Round-1 parity regressions: weighted `allShortest` + `path:maxLength` + `path:maxVisited`
+/// on the three-edge graph (`s -> t`, `s -> a`, `a -> t`), plus grouped multiset / `pathIndex`
+/// / `ORDER BY` parity, mid-pull cancellation, pre-admission refusal and memory release.
+#[test]
+fn path_search_r1_parity_cancellation_and_release() {
+    // 1. Weighted `allShortest` with `path:maxLength 1` on `s -> t`, `s -> a`, `a -> t`.
+    let three = Store::in_memory(StoreOptions::default());
+    load(
+        &three,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:t .\n\
+         ex:s ex:p ex:a .\n\
+         ex:a ex:p ex:t .\n",
+        RdfFormat::Turtle,
+    );
+    let snap3 = three.snapshot();
+    let opts = QueryOptions::default();
+    assert_parity_batches(
+        &snap3,
+        "SELECT ?p ?i ?es ?eo ?c { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    // `maxVisited 3`: both eager and streaming stop at cost 2 > best 1 and succeed with
+    // identical `visited` counters.
+    assert_parity_batches(
+        &snap3,
+        "SELECT ?p ?c { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 3 ; path:pathIndex ?p ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    // `maxVisited 2`: both eager and streaming fail with the exact same `path:maxVisited`
+    // error on full drain.
+    let q_mv2 = format!(
+        "{P}SELECT ?p ?c {{ SERVICE path:search {{ [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 2 ; path:pathIndex ?p ; path:cost ?c }} }}"
+    );
+    let strict = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let eager_mv2 = query(snap3.clone(), &q_mv2, &opts)
+        .err()
+        .expect("expected eager maxVisited error");
+    let stream_mv2 = select_cursor(snap3.clone(), &q_mv2, &opts, &strict)
+        .and_then(|mut c| {
+            while c.next_batch()?.is_some() {}
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(format!("{stream_mv2}"), format!("{eager_mv2}"));
+
+    // 2. Grouped output with two VALUES rows binding the same source and two tied shortest
+    //    paths: full multiset + `pathIndex` parity and exact ordered parity under ORDER BY.
+    let diamond = Store::in_memory(StoreOptions::default());
+    load(
+        &diamond,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:a . ex:a ex:p ex:t .\n\
+         ex:s ex:p ex:b . ex:b ex:p ex:t .\n",
+        RdfFormat::Turtle,
+    );
+    let dsnap = diamond.snapshot();
+    assert_parity_batches(
+        &dsnap,
+        "SELECT ?tag ?p ?i ?es ?eo { VALUES (?tag ?s) { (\"first\" ex:s) (\"second\" ex:s) } SERVICE path:search { [] path:source ?s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo } }",
+        &opts,
+        true,
+        true,
+    );
+    let q_ord = format!(
+        "{P}SELECT ?tag ?p ?i ?es ?eo {{ VALUES (?tag ?s) {{ (\"first\" ex:s) (\"second\" ex:s) }} SERVICE path:search {{ [] path:source ?s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo }} }} ORDER BY ?tag ?p ?i"
+    );
+    let eager_ord: Vec<_> = query(dsnap.clone(), &q_ord, &opts)
+        .unwrap()
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|r| r.values().to_vec())
+        .collect();
+    let mut c_ord = select_cursor(dsnap.clone(), &q_ord, &opts, &strict).unwrap();
+    let mut stream_ord = Vec::new();
+    while let Some(b) = c_ord.next_batch().unwrap() {
+        for i in 0..b.len() {
+            stream_ord.push(b.row(i).unwrap().values().to_vec());
+        }
+    }
+    assert_eq!(stream_ord, eager_ord);
+
+    // 3. Mid-pull cancellation and memory release after completion, early close, and error.
+    let store = graph_store();
+    let snap = store.snapshot();
+    let q_multi = format!(
+        "{P}SELECT ?t ?p ?i {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 4 ; path:pathIndex ?p ; path:edgeIndex ?i }} }}"
+    );
+    // 3a. Cancel between pulls after first batch succeeds.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_opts = QueryOptions {
+        no_cache: true,
+        cancel: Some(cancel.clone()),
+        ..Default::default()
+    };
+    let mut c = select_cursor(snap.clone(), &q_multi, &cancel_opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().unwrap().is_some());
+    cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(c.next_batch(), Err(Error::Cancelled)));
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 3a-ii. True within-pull cancellation gated deterministically at a PathSearch
+    // traversal checkpoint (no VALUES group input, constant endpoints, 0 matching paths on
+    // K_12 with minLength=maxLength=12 so an uninterrupted traversal would run millions of
+    // DFS steps). Cancellation stays false until traversal poll #2, proving PathSearch
+    // itself observes cancellation and aborts mid-traversal rather than completing and
+    // failing at `QueryCursor::pull`'s post-operator check.
+    let dense = Store::in_memory(StoreOptions::default());
+    let mut dense_data = String::new();
+    for i in 0..12 {
+        for j in 0..12 {
+            if i != j {
+                dense_data.push_str(&format!("<urn:k:{i}> <urn:e> <urn:k:{j}> .\n"));
+            }
+        }
+    }
+    load(&dense, &dense_data, RdfFormat::Turtle);
+    let q_in_pull = format!(
+        "{P}SELECT ?l {{ SERVICE path:search {{ [] path:source <urn:k:0> ; path:target <urn:k:11> ; path:predicate <urn:e> ; path:algorithm path:all ; path:minLength 12 ; path:maxLength 12 ; path:maxVisited 50000000 ; path:length ?l }} }}"
+    );
+    let in_pull_cancel = Arc::new(AtomicBool::new(false));
+    let in_pull_opts = QueryOptions {
+        no_cache: true,
+        cancel: Some(in_pull_cancel.clone()),
+        ..Default::default()
+    };
+    let mut c_in_pull =
+        select_cursor(dense.snapshot(), &q_in_pull, &in_pull_opts, &strict).unwrap();
+    let meter_in_pull = c_in_pull.memory_meter();
+    let traversal_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let polls_for_hook = traversal_polls.clone();
+    let cancel_for_hook = in_pull_cancel.clone();
+    let _hook = sparkles_core::sparql::pathsearch::test_hooks::on_traversal_poll(move || {
+        let count = polls_for_hook.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 2 {
+            cancel_for_hook.store(true, Ordering::Release);
+        }
+    });
+    let res = c_in_pull.next_batch().map(|b| b.is_some());
+    drop(_hook);
+    assert!(
+        matches!(res, Err(Error::Cancelled)),
+        "expected mid-traversal cancellation inside next_batch(): {res:?}"
+    );
+    let observed_polls = traversal_polls.load(Ordering::Relaxed);
+    assert_eq!(
+        observed_polls, 2,
+        "PathSearch must abort immediately on traversal poll #2 instead of completing (saw {observed_polls} polls)"
+    );
+    fn find_ps_node(
+        p: &sparkles_core::sparql::CursorPlan,
+    ) -> Option<&sparkles_core::sparql::CursorPlan> {
+        if p.operator.operator == "PathSearch" {
+            return Some(p);
+        }
+        p.children.iter().find_map(find_ps_node)
+    }
+    let ps_node = find_ps_node(c_in_pull.plan()).expect("PathSearch node in cursor plan");
+    assert!(
+        !ps_node.complete,
+        "cancelled PathSearch must remain incomplete in cursor plan"
+    );
+    let ps_visited = ps_node
+        .operator
+        .counters
+        .as_ref()
+        .and_then(|c| c.get("visited"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    assert!(
+        ps_visited > 0 && ps_visited < 50_000_000,
+        "expected partial mid-traversal visited count in cursor plan, got {ps_visited}"
+    );
+    drop(c_in_pull);
+    assert_eq!(meter_in_pull.live_bytes(), 0);
+
+    // 3b. Release on early drop after one batch.
+    let mut c = select_cursor(snap.clone(), &q_multi, &opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().unwrap().is_some());
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 3c. Release on full drain.
+    let q_short = format!(
+        "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:length ?l }} }}"
+    );
+    let mut c = select_cursor(snap.clone(), &q_short, &opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    while c.next_batch().unwrap().is_some() {}
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 3d. Release on runtime error (`maxVisited` exceeded).
+    let q_err = format!(
+        "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:maxVisited 3 ; path:length ?l }} }}"
+    );
+    let mut c = select_cursor(snap.clone(), &q_err, &opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().is_err());
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 4. Tight-budget pre-allocation refusal on long predicate list and wide group input.
+    let multi_pred = Store::in_memory(StoreOptions::default());
+    let mut mp_data = String::new();
+    for i in 0..120 {
+        mp_data.push_str(&format!("<urn:a> <urn:mp:{i}> <urn:b> .\n"));
+    }
+    load(&multi_pred, &mp_data, RdfFormat::Turtle);
+    let pred_list: String = (0..120)
+        .map(|i| format!("<urn:mp:{i}>"))
+        .collect::<Vec<_>>()
+        .join(" , ");
+    let q_long_preds = format!(
+        "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:a> ; path:target ?t ; path:predicate {pred_list} ; path:length ?l }} }}"
+    );
+    let probe_preds = select_cursor(multi_pred.snapshot(), &q_long_preds, &opts, &strict).unwrap();
+    let pred_open_bytes = probe_preds.memory_meter().live_bytes();
+    drop(probe_preds);
+    let pred_opts = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(pred_open_bytes + 512),
+        ..Default::default()
+    };
+    let mut c = select_cursor(multi_pred.snapshot(), &q_long_preds, &pred_opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    let res = c.next_batch().map(|b| b.is_some());
+    assert!(
+        matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "expected pre-allocation refusal on long predicate list: {res:?}"
+    );
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    let wide_vars: String = (0..40)
+        .map(|i| format!("?v{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let wide_vals: String = (0..40)
+        .map(|i| format!("{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let q_wide_group = format!(
+        "{P}SELECT ?s ?t ?l {wide_vars} {{ VALUES (?s {wide_vars}) {{ (<urn:s:0> {wide_vals}) }} SERVICE path:search {{ [] path:source ?s ; path:target ?t ; path:predicate <urn:q> ; path:length ?l }} }}"
+    );
+    let probe_wide = select_cursor(snap.clone(), &q_wide_group, &opts, &strict).unwrap();
+    let wide_open_bytes = probe_wide.memory_meter().live_bytes();
+    drop(probe_wide);
+    let wide_opts = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(wide_open_bytes + 512),
+        ..Default::default()
+    };
+    let mut c = select_cursor(snap, &q_wide_group, &wide_opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    let res = c.next_batch().map(|b| b.is_some());
+    assert!(
+        matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "expected pre-allocation refusal on wide group input: {res:?}"
+    );
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+}
