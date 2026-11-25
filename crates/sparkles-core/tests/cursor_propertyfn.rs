@@ -371,59 +371,79 @@ fn leaf_bnode_unbound_subject_errors_and_delimiter_only_split_polls_controls() {
         assert!(matches!(err, Some(Error::Invalid(_))), "{pred}: {err:?}");
     }
 
-    // Delimiter-only `apf:strSplit` (both unbound and bound subject) polls cooperative
-    // cancellation inside `StrSplitIter::next_token`.
+    // Mid-stream cancellation on `apf:strSplit`: open with `cancel = false`, consume the
+    // first live token (confirming execution entered streaming `StrSplit`), then flip
+    // `cancel = true` before pulling the long delimiter-only tail.
     let commas = ",".repeat(50_000);
-    for body in [
-        format!("SELECT ?t {{ ?t apf:strSplit (\"{commas}\" \",\") }}"),
-        format!("SELECT * {{ \"x\" apf:strSplit (\"{commas}\" \",\") }}"),
-    ] {
-        let q = format!("{P}{body}");
-        let cancel = Arc::new(AtomicBool::new(true));
-        let opts = QueryOptions {
-            cancel: Some(cancel),
-            ..Default::default()
-        };
-        let res = select_cursor(snap.clone(), &q, &opts, &strict).and_then(|mut c| {
-            while c.next_batch()?.is_some() {}
-            Ok(())
-        });
-        assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
-    }
+    let q_split = format!("{P}SELECT ?t {{ ?t apf:strSplit (\"first,{commas}\" \",\") }}");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let opts = QueryOptions {
+        cancel: Some(cancel.clone()),
+        ..Default::default()
+    };
+    let one_row = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let mut split_cursor = select_cursor(snap.clone(), &q_split, &opts, &one_row).unwrap();
+    let first = split_cursor
+        .next_batch()
+        .unwrap()
+        .expect("first token before cancel");
+    assert_eq!(first.len(), 1);
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = split_cursor.next_batch().err();
+    assert!(
+        matches!(err, Some(Error::Cancelled)),
+        "expected mid-stream split cancellation, got {err:?}"
+    );
 
-    // Deleted range scan: bulk-load list cells then delete them into the delta so
-    // `scan_between_cols_checked` must skip deletions while polling controls.
+    // Deleted range scan: bulk-load one live list cell followed by 2,000 deleted list
+    // cells so `open` and the first batch succeed with `cancel = false`, and flipping
+    // `cancel = true` before the next pull stops while scanning the deleted tail.
     let s2 = Store::in_memory(StoreOptions::default());
-    let mut nt = String::new();
+    let mut nt = String::from(
+        "<urn:0000:live> <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> 0 ;\n\
+         <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .\n",
+    );
     for i in 0..2_000usize {
         nt.push_str(&format!(
-            "<urn:del:{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> {i} .\n\
-             <urn:del:{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .\n"
+            "<urn:del:{i:04}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> {i} .\n\
+             <urn:del:{i:04}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .\n"
         ));
     }
     s2.load(&[Source::from_bytes(nt.into_bytes(), RdfFormat::Turtle, None)])
         .unwrap();
     sparkles_core::sparql::update::update(
         &s2,
-        "DELETE WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> ?o }",
+        "DELETE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> ?o } \
+         WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> ?o . FILTER(?s != <urn:0000:live>) }",
         &Default::default(),
     )
     .unwrap();
     let snap2 = s2.snapshot();
     let q_del = format!("{P}SELECT ?l ?m {{ ?l list:member ?m }}");
-    let cancel = Arc::new(AtomicBool::new(true));
-    let res = select_cursor(
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut del_cursor = select_cursor(
         snap2,
         &q_del,
         &QueryOptions {
-            cancel: Some(cancel),
+            cancel: Some(cancel.clone()),
             ..Default::default()
         },
-        &strict,
+        &one_row,
     )
-    .and_then(|mut c| {
-        while c.next_batch()?.is_some() {}
-        Ok(())
-    });
-    assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
+    .unwrap();
+    let first = del_cursor
+        .next_batch()
+        .unwrap()
+        .expect("live list row before cancel");
+    assert_eq!(first.len(), 1);
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = del_cursor.next_batch().err();
+    assert!(
+        matches!(err, Some(Error::Cancelled)),
+        "expected mid-stream deleted-range cancellation, got {err:?}"
+    );
 }

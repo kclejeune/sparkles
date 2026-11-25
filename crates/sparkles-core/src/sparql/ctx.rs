@@ -2767,6 +2767,79 @@ impl Ctx {
         Id::local(local.insert(key).0)
     }
 
+    /// Look up or intern an already-encoded vocabulary key, pre-admitting decompression
+    /// scratch and retained local-vocabulary storage and returning any budget or control
+    /// error directly.
+    pub(crate) fn intern_key_checked(&self, key: &[u8]) -> Result<Id> {
+        self.check()?;
+        let vocab_scratch = self.charge(0)?;
+        if let Ok(i) = self.snap.generation.vocab.find_with_checked(key, |need| {
+            let bytes = u64::try_from(need)
+                .ok()
+                .and_then(|n| n.checked_mul(2))
+                .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+            vocab_scratch.resize(bytes)
+        })? {
+            return Ok(Id::vocab(i));
+        }
+        drop(vocab_scratch);
+        if let Some(i) = self
+            .snap
+            .generation
+            .dvocab
+            .find(key)
+            .filter(|&i| i < self.snap.dvocab_len)
+        {
+            return Ok(Id::delta(i));
+        }
+        if let Some(i) = self.local.read().find(key) {
+            return Ok(Id::local(i));
+        }
+        let mut local = self.local.write();
+        if let Some(i) = local.find(key) {
+            return Ok(Id::local(i));
+        }
+        let retained = u64::try_from(key.len())
+            .ok()
+            .and_then(|n| n.checked_add(96))
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        if !self.retain_bytes(retained) {
+            return Err(self.check_memory_failure().err().unwrap_or_else(|| {
+                self.memory_exceeded(self.live_bytes().saturating_add(retained))
+            }));
+        }
+        Ok(Id::local(local.insert(key).0))
+    }
+
+    /// Intern a simple `xsd:string` literal directly from a borrowed lexical value,
+    /// pre-admitting the temporary key buffer before encoding so no intermediate
+    /// `Arc<str>` or `oxrdf::Literal` is allocated outside the query budget.
+    pub(crate) fn intern_simple_str_checked(&self, s: &str) -> Result<Id> {
+        let key_len = s
+            .len()
+            .checked_add(2)
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let _scratch = self.charge(key_len as u64)?;
+        let mut key = Vec::with_capacity(key_len);
+        id::write_literal_ref_key(oxrdf::LiteralRef::new_simple_literal(s), &mut key);
+        debug_assert_eq!(key.len(), key_len);
+        self.intern_key_checked(&key)
+    }
+
+    /// Intern an IRI directly from a borrowed string, pre-admitting the temporary key
+    /// buffer before encoding.
+    pub(crate) fn intern_iri_checked(&self, iri: &str) -> Result<Id> {
+        let key_len = iri
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let _scratch = self.charge(key_len as u64)?;
+        let mut key = Vec::with_capacity(key_len);
+        key.push(b'<');
+        key.extend_from_slice(iri.as_bytes());
+        self.intern_key_checked(&key)
+    }
+
     /// SERVICE-created encoded terms retain the existing key-byte estimate in eager
     /// and cursor execution. This is not an allocator/RSS bound for AppendVocab.
     pub(super) fn intern_algorithm_key(

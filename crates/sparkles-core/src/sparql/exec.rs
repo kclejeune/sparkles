@@ -10151,17 +10151,21 @@ impl RemoteAnswer {
             None => {
                 if syntax == crate::nesting::Syntax::Json {
                     let mut body = body;
-                    let start = super::svcread::json_start(&mut body, None, ctx)
+                    let mut staging = super::svcread::eager_charge(ctx)?;
+                    let start = super::svcread::json_start(&mut body, &mut staging, ctx)
                         .map_err(|e| Self::failed(url.as_str(), e.into()))?;
                     let reader: Box<dyn std::io::Read + Send> = if start.late {
-                        let bytes = super::svcread::read_late_json(start, &mut body, None, ctx)
-                            .map_err(|e| Self::failed(url.as_str(), e.into()))?;
-                        Box::new(std::io::Cursor::new(bytes))
+                        let bytes =
+                            super::svcread::read_late_json(start, &mut body, &mut staging, ctx)
+                                .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        Box::new(
+                            super::svcread::ChargedCursor::new(bytes, staging)
+                                .map_err(|e| Self::failed(url.as_str(), e.into()))?,
+                        )
                     } else {
-                        Box::new(std::io::Read::chain(
-                            std::io::Cursor::new(start.bytes),
-                            body,
-                        ))
+                        let head = super::svcread::ChargedCursor::new(start.bytes, staging)
+                            .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        Box::new(std::io::Read::chain(head, body))
                     };
                     (reader, None)
                 } else {
@@ -10170,55 +10174,55 @@ impl RemoteAnswer {
             }
             Some(meter) => {
                 let mut body = body;
-                let mut charge = super::svcread::charge(meter.ctx)?;
+                let charge = super::svcread::charge(meter.ctx)?;
                 let window = std::sync::Arc::new(super::svcread::Window::default());
-                let reader: Box<dyn std::io::Read + Send> = if syntax
-                    == crate::nesting::Syntax::Json
-                {
-                    let start = super::svcread::json_start(&mut body, Some(&mut charge), meter.ctx)
-                        .map_err(|e| Self::failed(url.as_str(), e.into()))?;
-                    if start.late && meter.strict {
-                        return Err(Error::Service(format!(
-                            "{}<{}>",
-                            super::cursor::LATE_HEAD,
-                            url.as_str()
-                        )));
-                    }
-                    buffered_before_output = start.late;
-                    if start.late {
-                        let bytes = super::svcread::read_late_json(
-                            start,
-                            &mut body,
-                            Some(&mut charge),
-                            meter.ctx,
-                        )
-                        .map_err(|e| Self::failed(url.as_str(), e.into()))?;
-                        Box::new(super::svcread::Metered::precharged(
-                            std::io::Cursor::new(bytes),
-                            charge,
-                            window.clone(),
-                        ))
+                let reader: Box<dyn std::io::Read + Send> =
+                    if syntax == crate::nesting::Syntax::Json {
+                        let mut staging = super::svcread::StagingCharge::from_cursor(charge);
+                        let start = super::svcread::json_start(&mut body, &mut staging, meter.ctx)
+                            .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        if start.late && meter.strict {
+                            return Err(Error::Service(format!(
+                                "{}<{}>",
+                                super::cursor::LATE_HEAD,
+                                url.as_str()
+                            )));
+                        }
+                        buffered_before_output = start.late;
+                        if start.late {
+                            let bytes = super::svcread::read_late_json(
+                                start,
+                                &mut body,
+                                &mut staging,
+                                meter.ctx,
+                            )
+                            .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                            Box::new(super::svcread::Metered::precharged(
+                                std::io::Cursor::new(bytes),
+                                staging.into_cursor(),
+                                window.clone(),
+                            ))
+                        } else {
+                            let base = (start.decided as u64)
+                                .saturating_mul(super::svcread::head_factor());
+                            let bytes = std::io::Cursor::new(start.bytes);
+                            Box::new(super::svcread::Metered::new(
+                                std::io::Read::chain(bytes, body),
+                                staging.into_cursor(),
+                                base,
+                                false,
+                                window.clone(),
+                            ))
+                        }
                     } else {
-                        let base =
-                            (start.decided as u64).saturating_mul(super::svcread::head_factor());
-                        let bytes = std::io::Cursor::new(start.bytes);
                         Box::new(super::svcread::Metered::new(
-                            std::io::Read::chain(bytes, body),
+                            body,
                             charge,
-                            base,
+                            0,
                             false,
                             window.clone(),
                         ))
-                    }
-                } else {
-                    Box::new(super::svcread::Metered::new(
-                        body,
-                        charge,
-                        0,
-                        false,
-                        window.clone(),
-                    ))
-                };
+                    };
                 (reader, Some(window))
             }
         };

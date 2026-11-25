@@ -1857,3 +1857,60 @@ fn unpooled_caller_can_call_local_target_with_pool_configured() {
     );
     assert_eq!(pool_b.granted(), 0);
 }
+
+/// Eager SERVICE compacts a long leading whitespace prefix in bounded memory and charges
+/// non-whitespace JSON head and late-head staging buffers against the query memory grant.
+#[test]
+fn eager_service_charges_json_staging_and_streams_long_whitespace_prefix() {
+    let s = store();
+    let snap = s.snapshot();
+    let tight = QueryOptions {
+        max_memory_bytes: Some(128 << 10),
+        ..opts()
+    };
+
+    // 1. Long leading whitespace prefix before a small head-first response succeeds under
+    // a tight eager budget.
+    let mut ws_payload = vec![b' '; 256 << 10];
+    ws_payload.extend_from_slice(
+        br#"{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:ok"}}]}}"#,
+    );
+    let ep_ws = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(ws_payload.clone())])
+    }));
+    let q_ws = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_ws.url);
+    let rows = eager(&snap, &q_ws, &tight).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0],
+        Some(Term::NamedNode(oxrdf::NamedNode::new("urn:ok").unwrap()))
+    );
+
+    // 2. Large non-whitespace head exceeds the tight eager memory budget.
+    let big_head = format!(
+        r#"{{"head":{{"links":["{}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+        "h".repeat(256 << 10)
+    )
+    .into_bytes();
+    let ep_head = Endpoint::start(Arc::new(move || (200, vec![Part::Bytes(big_head.clone())])));
+    let q_head = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_head.url);
+    let err = eager(&snap, &q_head, &tight).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for large eager head, got {err:?}"
+    );
+
+    // 3. Large late-head body exceeds the tight eager memory budget.
+    let big_late = format!(
+        r#"{{"results":{{"bindings":[{{"s":{{"type":"literal","value":"{}"}}}}]}},"head":{{"vars":["s"]}}}}"#,
+        "v".repeat(256 << 10)
+    )
+    .into_bytes();
+    let ep_late = Endpoint::start(Arc::new(move || (200, vec![Part::Bytes(big_late.clone())])));
+    let q_late = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_late.url);
+    let err = eager(&snap, &q_late, &tight).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for large eager late-head body, got {err:?}"
+    );
+}
