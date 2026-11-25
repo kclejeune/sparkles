@@ -940,12 +940,13 @@ fn evidence_selection_ceiling_is_distinct_from_execution_allowance() {
         .unwrap();
     drop(init_prep);
 
-    // Load enough quads + vocab strings that the retained evidence view uses
-    // substantial selection bytes (> 128 KiB).
+    // Load enough quads + vocab strings that the retained evidence view's
+    // vocabulary uses substantial selection bytes (> 1 MiB) even without
+    // charging the shared live delta.
     let mut ttl = String::from("INSERT DATA {\n");
     for i in 0..800 {
         ttl.push_str(&format!(
-            "  <urn:item:{i}> <urn:payload> \"{:0>256}\" .\n",
+            "  <urn:item:{i}> <urn:payload> \"{:0>1536}\" .\n",
             i
         ));
     }

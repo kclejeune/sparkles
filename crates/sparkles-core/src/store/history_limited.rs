@@ -174,15 +174,15 @@ impl Store {
 
     pub(super) fn cache_limited_snapshot(
         history: &mut crate::history::HistoryState,
-        cached: crate::history::Cached,
+        mut snap: Snapshot,
+        owner: u32,
+        seq: u64,
+        bytes: u64,
+        end: wal::WalPoint,
         limit: &ReadLimit<'_>,
-    ) -> Result<()> {
-        let retained = preparation_delta_bytes(&cached.snap.delta);
-        let mut before = 0u64;
-        for entry in &history.cache {
-            limit.check(retained)?;
-            before = before.saturating_add(entry.bytes);
-        }
+    ) -> Result<Arc<Snapshot>> {
+        let retained = preparation_delta_bytes(&snap.delta).max(SHARED_SNAPSHOT_BYTES);
+        limit.check(retained)?;
         if history.cache.len() == history.cache.capacity() {
             let next = history.cache.capacity().saturating_mul(2).max(1);
             let relocating = (history.cache.capacity().saturating_add(next) as u64)
@@ -191,7 +191,7 @@ impl Store {
             // vector or evict unrelated entries merely to return its completed view.
             if retained.saturating_add(relocating) > limit.remaining() {
                 limit.check(retained)?;
-                return Ok(());
+                return Ok(Arc::new(snap));
             }
             if history
                 .cache
@@ -199,20 +199,30 @@ impl Store {
                 .is_err()
             {
                 limit.check(retained)?;
-                return Ok(());
+                return Ok(Arc::new(snap));
             }
         }
         limit.check(retained)?;
-        let after = before.saturating_add(cached.bytes);
-        history.cache.insert(0, cached);
-        history.settle_precounted(after);
+        let hold = (bytes > 0).then(|| caches::BudgetHold::new(history.budget.clone(), bytes));
         if history.budget.over() {
-            // Only the optional new entry is removed. Existing cache capacity,
+            // Only the optional new entry is omitted. Existing cache capacity,
             // states and warm pins are not narrowed by this request.
-            history.cache.remove(0);
-            history.settle_precounted(before);
+            drop(hold);
+            return Ok(Arc::new(snap));
         }
-        Ok(())
+        snap.history_charge = hold;
+        let snap = Arc::new(snap);
+        history.cache.insert(
+            0,
+            crate::history::Cached {
+                generation: owner,
+                seq,
+                snap: snap.clone(),
+                bytes,
+                end,
+            },
+        );
+        Ok(snap)
     }
 
     /// Origin-aware bounded counterpart of snapshot_at_with_branch.
@@ -223,6 +233,18 @@ impl Store {
         options: &HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        let (snapshot, resolved, origin, _) =
+            self.snapshot_at_with_branch_limited_charged(store, at, options, max_memory_bytes)?;
+        Ok((snapshot, resolved, origin))
+    }
+
+    pub(crate) fn snapshot_at_with_branch_limited_charged(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         let limit = ReadLimit {
             options,
             memory: Some(max_memory_bytes),
@@ -243,7 +265,7 @@ impl Store {
         at: &At,
         preparation: &crate::access::Preparation,
         memory: u64,
-    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         if self.is_branch()
             || self.owner_dataset_id() != logical.owner_dataset_id()
             || !Arc::ptr_eq(&self.family, &logical.family)
@@ -273,6 +295,18 @@ impl Store {
         options: &HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        let (snapshot, resolved, origin, _) =
+            self.snapshot_of_branch_limited_charged(branch, at, options, max_memory_bytes)?;
+        Ok((snapshot, resolved, origin))
+    }
+
+    pub(crate) fn snapshot_of_branch_limited_charged(
+        &self,
+        branch: uuid::Uuid,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         let limit = ReadLimit {
             options,
             memory: Some(max_memory_bytes),
@@ -306,7 +340,7 @@ impl Store {
         at: &At,
         options: &dyn ReadControl,
         memory: u64,
-    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         self.snapshot_from_limited(
             PinnedSource::Resident(branching::BranchStore::Main(store)),
             at,
@@ -321,7 +355,7 @@ impl Store {
         at: &At,
         options: &dyn ReadControl,
         memory: u64,
-    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         use PinnedSource as Source;
         use branching::readonly::OriginRead;
         let capacity = self
@@ -353,7 +387,9 @@ impl Store {
                     store.branch_id(),
                     store
                         .snapshot_at_inner(requested, options, Some(memory))
-                        .map(|(snapshot, resolved)| OriginRead::View(snapshot, resolved)),
+                        .map(|(snapshot, resolved, charge)| {
+                            OriginRead::View(snapshot, resolved, charge)
+                        }),
                 ),
                 Source::Cold(id) => (
                     *id,
@@ -371,9 +407,9 @@ impl Store {
                 }
             };
             match outcome {
-                OriginRead::View(snapshot, resolved) => {
+                OriginRead::View(snapshot, resolved, charge) => {
                     limit.check(0)?;
-                    return Ok((snapshot, resolved, id));
+                    return Ok((snapshot, resolved, id, charge));
                 }
                 OriginRead::Resident(store) => {
                     selected = Source::Resident(branching::BranchStore::Other(store))
@@ -424,19 +460,41 @@ impl Store {
     }
 }
 
+/// Conservative per-request handle and header charge for retaining a reference to an
+/// already-resident shared live or cached snapshot without copying its delta storage.
+pub(crate) const SHARED_SNAPSHOT_BYTES: u64 = 4096;
+
+/// Retained preparation charge for a snapshot returned by a bounded read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotCharge {
+    /// Delta or shared-handle bytes the caller retains: [`SHARED_SNAPSHOT_BYTES`] for a
+    /// shared live or cache-budgeted snapshot. A private replay or an in-memory
+    /// historical snapshot charges `preparation_delta_bytes(&delta)` with
+    /// [`SHARED_SNAPSHOT_BYTES`] as a minimum.
+    pub(crate) delta_bytes: u64,
+    /// Non-live sealed generation bytes retained by a cold or sealed historical snapshot
+    /// (`0` when the snapshot shares the store's live generation).
+    pub(crate) generation_bytes: u64,
+}
+
+impl SnapshotCharge {
+    pub(crate) const fn shared() -> Self {
+        Self {
+            delta_bytes: SHARED_SNAPSHOT_BYTES,
+            generation_bytes: 0,
+        }
+    }
+
+    pub(crate) fn total(self) -> u64 {
+        self.delta_bytes.saturating_add(self.generation_bytes)
+    }
+}
+
 // The cache's 448-byte/quad estimate is not an allocation bound: even a one-key
 // KeySet leaf reserves 65 keys. Bounded reads include sparse root capacity and the
 // predicate map as well. Leaves rebalance below 16 keys and branches below eight
 // children; 256 bytes per key plus 8 KiB per tree conservatively covers retained
 // node/vector capacity, Arc headers, and the per-predicate persistent map.
-impl Snapshot {
-    /// The conservative preparation bytes a bounded read charges for this state's
-    /// delta, which a caller that retains the snapshot keeps charged.
-    pub(crate) fn retained_preparation_bytes(&self) -> u64 {
-        preparation_delta_bytes(&self.delta)
-    }
-}
-
 pub(super) fn preparation_delta_bytes(delta: &Delta) -> u64 {
     let quads = delta.inserts().saturating_add(delta.deletes()) as u64;
     if quads == 0 {
@@ -718,5 +776,60 @@ mod tests {
         drop(held);
         task.join().unwrap();
         assert!(matches!(result, Ok(Err(Error::Timeout))));
+    }
+
+    #[test]
+    fn uncapped_replay_checks_control_after_materialize_before_caching() {
+        struct CancelOn {
+            checks: std::sync::atomic::AtomicUsize,
+            cancel_at: usize,
+        }
+        impl ReadControl for CancelOn {
+            fn check_read(&self) -> Result<()> {
+                let n = self.checks.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= self.cancel_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), StoreOptions::default()).unwrap();
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> 1 }",
+            &Default::default(),
+        )
+        .unwrap();
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:b> <urn:p> 2 }",
+            &Default::default(),
+        )
+        .unwrap();
+        // Check 1 is entry, checks 2 and 3 are locking history (before and after
+        // try_lock_for), and check 4 is the post-materialize check before stats
+        // updates and caching.
+        let control = CancelOn {
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            cancel_at: 4,
+        };
+        let result = store.snapshot_at_inner(&At::Commit(1), &control, None);
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "expected post-materialize cancellation, got {:?} (checks={})",
+            result.err(),
+            control.checks.load(Ordering::Relaxed)
+        );
+        let history = store.history.as_ref().unwrap().lock();
+        assert_eq!(history.misses, 1);
+        assert_eq!(history.materializations, 0);
+        assert!(history.cache.is_empty());
     }
 }

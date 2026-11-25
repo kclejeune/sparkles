@@ -1845,7 +1845,6 @@ mod tests {
             {
                 let mut history = store.history.as_ref().unwrap().lock();
                 history.cache.clear();
-                history.settle();
             }
             let (ordinary, expected) = store.snapshot_at(&at, &Default::default()).unwrap();
             let mut ordinary_quads = Vec::new();

@@ -922,38 +922,17 @@ pub(crate) struct HistoryState {
     /// the durable source holds on this store's commits, read when collecting
     pub(crate) held: Option<crate::holds::HeldView>,
     /// the byte budget the cached states are charged to, shared with other stores when
-    /// the server shares its caches
+    /// the server shares its caches. Individual cached snapshots own a
+    /// [`BudgetHold`](crate::store::caches::BudgetHold) against this budget so evicted
+    /// states stay accounted while any view pins them.
     pub budget: Arc<crate::store::caches::ByteBudget>,
-    /// what this state has charged to `budget`
-    charged: u64,
-}
-
-impl Drop for HistoryState {
-    fn drop(&mut self) {
-        self.budget.settle(self.charged, 0);
-    }
 }
 
 impl HistoryState {
-    /// Charge the cached states to `budget` from now on.
+    /// Charge newly cached states to `budget` from now on.
     pub fn use_budget(&mut self, budget: Arc<crate::store::caches::ByteBudget>) {
-        self.budget.settle(self.charged, 0);
-        self.charged = 0;
+        debug_assert!(self.cache.is_empty());
         self.budget = budget;
-        self.settle();
-    }
-
-    /// Bring the charge to the budget in line with the cached states. Call it after the
-    /// cache changes.
-    pub fn settle(&mut self) {
-        let now: u64 = self.cache.iter().map(|e| e.bytes).sum();
-        self.settle_precounted(now);
-    }
-
-    /// A controlled caller has already summed the entries before publishing a change.
-    pub(crate) fn settle_precounted(&mut self, now: u64) {
-        self.budget.settle(self.charged, now);
-        self.charged = now;
     }
 
     pub fn new(pins: BTreeMap<String, Pin>, retention: Retention) -> HistoryState {
@@ -975,7 +954,6 @@ impl HistoryState {
             branch_pins: Vec::new(),
             held: None,
             budget: Arc::new(crate::store::caches::ByteBudget::new(u64::MAX)),
-            charged: 0,
         }
     }
 

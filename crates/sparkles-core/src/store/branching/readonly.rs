@@ -490,7 +490,11 @@ pub(in crate::store) enum Purpose {
 pub(in crate::store) enum OriginRead {
     Clock(i64),
     Resident(Arc<Store>),
-    View(Arc<Snapshot>, crate::history::Resolved),
+    View(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        super::super::history_limited::SnapshotCharge,
+    ),
     Configuration {
         binding: crate::history::ConfigurationBinding,
         first_bound_own: Option<u64>,
@@ -792,7 +796,9 @@ impl Store {
                 &mut budget,
             )?;
         }
-        budget.charge(history_limited::preparation_delta_bytes(&delta))?;
+        let delta_bytes = history_limited::preparation_delta_bytes(&delta)
+            .max(history_limited::SHARED_SNAPSHOT_BYTES);
+        budget.charge(delta_bytes)?;
         budget.check()?;
         let settings = ChangeLog::settings_controlled(&root, &mut budget)?;
         let log = ChangeLog::capture_read_only(
@@ -833,6 +839,10 @@ impl Store {
                 commit: metadata,
                 head,
                 historical: metadata.seq != head,
+            },
+            history_limited::SnapshotCharge {
+                delta_bytes,
+                generation_bytes: loaded.charge,
             },
         ))
     }

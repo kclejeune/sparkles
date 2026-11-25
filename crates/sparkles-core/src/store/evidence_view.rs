@@ -369,15 +369,15 @@ impl Store {
             cancel: Some(preparation.control().cancel.flag()),
             deadline: preparation.control().deadline,
         };
-        let (snapshot, resolved, serving_branch) =
-            self.snapshot_at_with_branch_limited(store, at, &options, allowance)?;
+        let (snapshot, resolved, serving_branch, charge) =
+            self.snapshot_at_with_branch_limited_charged(store, at, &options, allowance)?;
         let limit = ReadLimit {
             options: &options,
             memory: Some(allowance),
             held: 0,
         };
-        let retained = snapshot
-            .retained_preparation_bytes()
+        let retained = charge
+            .delta_bytes
             .checked_add(snapshot.generation.retained_bytes_limited(&limit)?)
             .and_then(|bytes| bytes.checked_add(1024))
             .ok_or_else(|| preparation.exhausted())?;

@@ -13527,9 +13527,11 @@ A malformed reference is a `400` with code `invalid-reference` whose message sta
 the field, such as `references[2].storedFact.triple`. The request deadline and
 cancellation keep their usual answers. One resolution reads each commit once and
 prepares the caller's view of it once, within a 64 MiB allowance shared by all its
-references. That allowance charges up to 2 KiB for each quad in a state's unindexed
-delta, so a state with tens of thousands of recent writes that compaction has not yet
-folded in may answer `incomplete-evidence`.
+references. Live snapshots and persistent history-cache hits charge a 4 KiB delta
+handle. In-memory historical snapshots and private historical WAL replays charge by
+delta size, up to 2 KiB per unindexed delta quad plus 128 KiB. Permission preparation
+and the retained dictionary and metadata of a non-live generation also consume this
+allowance. Reads that exceed the allowance answer `incomplete-evidence`.
 
 ### Evidence proposals
 

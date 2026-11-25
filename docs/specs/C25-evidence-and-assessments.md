@@ -855,10 +855,25 @@ compared byte for byte, including for references refused from their anchor alone
    It cannot tell a record that a typed writer published from one written with a
    correct-looking receipt while its graph was detached. The authenticated typed writer
    of the next step must record an operation marker that makes that distinction.
-2. **Delta charge.** The 64 MiB allowance uses C29's conservative 2 KiB charge for
-   each quad of a state's unindexed delta, so a state with tens of thousands of writes
-   since its last compaction can answer `incomplete-evidence`. Roadmap item 542
-   tracks a tighter charge for shared live states.
+2. **Delta charge.** An earlier revision charged C29's conservative 2 KiB per delta quad
+   even when the selected state was the store's shared live snapshot or an already-cached
+   historical snapshot, so resolution under the 64 MiB allowance answered
+   `incomplete-evidence` past about 32,700 uncompacted writes. Bounded history reads and
+   evidence resolution now charge a live snapshot or persistent history-cache hit only for
+   its retained 4 KiB handle and any non-live sealed generation metadata, while in-memory
+   historical snapshots and freshly materialized private historical replays still pre-admit
+   and retain the conservative 2 KiB per quad delta charge before allocation. In a release
+   diagnostic,
+   `evidence_resolution_delta_charge_diagnostic`, run on the 8-vCPU, 16-GiB Linux Boat
+   worker `bx_z8s55a5v` and not as a benchmark-host result, shared live and cached
+   stored-fact resolution across 10,000, 50,000 and 100,000 uncompacted delta quads
+   stayed constant at 6,400 bytes retained, with a smallest admitting cap near 7 KiB and
+   0.75 to 1.06 µs median latency. Live record resolution stayed at 6,742 bytes retained
+   and 13.2 to 21.0 µs median latency, and a triple-level protection hiding 10% of quads
+   resolved within the 64 MiB allowance at 3.73 MiB, 18.09 MiB and 36.01 MiB retained,
+   taking 1.07 ms, 5.35 ms and 9.41 ms cold and 2.36 to 2.65 µs warm. Uncached private
+   WAL replay succeeded at 10,000 delta quads and refused cleanly with
+   `incomplete-evidence` at 50,000 and 100,000 delta quads.
 3. **Source leases.** The resident source lease family was removed rather than adopted.
    [C26](C26-durable-jobs-and-delivery.md) does not use it.
 4. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
