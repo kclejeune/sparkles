@@ -18,6 +18,7 @@ pub(super) struct Admission {
     input: VarId,
     expected_reuse: bool,
     direct_str_input: bool,
+    sha256_str_input: bool,
 }
 
 /// Entries of a general map, and of the sampled-key sketch times [`SAMPLE`].
@@ -46,6 +47,8 @@ const SPLIT_LOSSES: u8 = 2;
 const SPLIT_COOLDOWN: u8 = 8;
 /// Default eligible serial evaluations per bounded IRI map-miss cooldown before retry.
 const IRI_SPLIT_COOLDOWN: u8 = 16;
+/// Default eligible serial evaluations per bounded SHA256(STR(input)) map-miss cooldown before retry.
+const SHA_SPLIT_COOLDOWN: u8 = 16;
 /// Largest evaluated row count in the small split/cost bucket (`768..=2047`).
 const SMALL_BUCKET_MAX: usize = 2047;
 /// Minimum estimated per-row evaluation saving (ns) for unhinted weak admission on
@@ -106,6 +109,7 @@ struct ReuseConfig {
     admission_fast_nanos: Option<u128>,
     cooldown: u8,
     iri_split_cooldown: Option<u8>,
+    sha_split_cooldown: Option<u8>,
     trace: bool,
 }
 
@@ -118,6 +122,7 @@ impl Default for ReuseConfig {
             admission_fast_nanos: None,
             cooldown: SPLIT_COOLDOWN,
             iri_split_cooldown: None,
+            sha_split_cooldown: None,
             trace: false,
         }
     }
@@ -145,14 +150,14 @@ fn parse_admission_fast_nanos(raw: Option<&str>) -> Option<u128> {
         .filter(|&n| n >= COST_MIN_SAVING_NANOS)
 }
 
-fn parse_iri_split_cooldown(raw: Option<&str>) -> Option<u8> {
+fn parse_bounded_split_cooldown(raw: Option<&str>, default: u8) -> Option<u8> {
     let raw = raw?.trim();
     if raw.eq_ignore_ascii_case("1")
         || raw.eq_ignore_ascii_case("on")
         || raw.eq_ignore_ascii_case("true")
         || raw.eq_ignore_ascii_case("yes")
     {
-        return Some(IRI_SPLIT_COOLDOWN);
+        return Some(default);
     }
     if raw.is_empty()
         || raw.eq_ignore_ascii_case("0")
@@ -163,6 +168,14 @@ fn parse_iri_split_cooldown(raw: Option<&str>) -> Option<u8> {
         return None;
     }
     raw.parse::<u8>().ok().filter(|&n| (2..=64).contains(&n))
+}
+
+fn parse_iri_split_cooldown(raw: Option<&str>) -> Option<u8> {
+    parse_bounded_split_cooldown(raw, IRI_SPLIT_COOLDOWN)
+}
+
+fn parse_sha_split_cooldown(raw: Option<&str>) -> Option<u8> {
+    parse_bounded_split_cooldown(raw, SHA_SPLIT_COOLDOWN)
 }
 
 fn reuse_config() -> ReuseConfig {
@@ -198,6 +211,11 @@ fn reuse_config() -> ReuseConfig {
                 .ok()
                 .as_deref(),
         );
+        let sha_split_cooldown = parse_sha_split_cooldown(
+            std::env::var("SPARKLES_BIND_SHA_SPLIT_COOLDOWN")
+                .ok()
+                .as_deref(),
+        );
         let trace = matches!(
             std::env::var("SPARKLES_BIND_TRACE").as_deref(),
             Ok("1" | "true" | "yes")
@@ -209,6 +227,7 @@ fn reuse_config() -> ReuseConfig {
             admission_fast_nanos,
             cooldown,
             iri_split_cooldown,
+            sha_split_cooldown,
             trace,
         }
     })
@@ -419,29 +438,69 @@ impl SplitController {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IriBucketPhase {
+enum BoundedBucketPhase {
     Active,
     Cooldown { remaining: u8 },
     Retry,
 }
 
-/// Bounded split cooldown dedicated to homogeneous base-vocabulary IRI misses of direct
-/// `STR(input)` inside [`Reuse::apply_map`]. Kept strictly separate from
-/// [`SplitController`] so override observations never affect fallback cooldown or cost
-/// contention evidence.
+#[cfg(test)]
+type IriBucketPhase = BoundedBucketPhase;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct IriSplitController {
-    cooldown: Option<u8>,
-    small: IriBucketPhase,
-    large: IriBucketPhase,
+struct BoundedSplitLabels {
+    cooldown_to_retry: &'static str,
+    active_to_retry: &'static str,
+    active_to_cooldown: &'static str,
+    retry_to_active: &'static str,
+    retry_to_cooldown: &'static str,
 }
 
-impl IriSplitController {
+const IRI_SPLIT_LABELS: BoundedSplitLabels = BoundedSplitLabels {
+    cooldown_to_retry: "iri:cooldown->retry",
+    active_to_retry: "iri:active->retry",
+    active_to_cooldown: "iri:active->cooldown",
+    retry_to_active: "iri:retry->active",
+    retry_to_cooldown: "iri:retry->cooldown",
+};
+
+const SHA_SPLIT_LABELS: BoundedSplitLabels = BoundedSplitLabels {
+    cooldown_to_retry: "sha:cooldown->retry",
+    active_to_retry: "sha:active->retry",
+    active_to_cooldown: "sha:active->cooldown",
+    retry_to_active: "sha:retry->active",
+    retry_to_cooldown: "sha:retry->cooldown",
+};
+
+/// Bounded first-unpaid split cooldown controller used by isolated map-miss overrides
+/// inside [`Reuse::apply_map`]. Each override owns its own instance, kept strictly
+/// separate from [`SplitController`] and other overrides so observations never affect
+/// fallback cooldown, cost contention evidence, or unrelated map-miss policies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundedSplitController {
+    labels: &'static BoundedSplitLabels,
+    cooldown: Option<u8>,
+    small: BoundedBucketPhase,
+    large: BoundedBucketPhase,
+}
+
+type IriSplitController = BoundedSplitController;
+
+impl BoundedSplitController {
     fn new(cooldown: Option<u8>) -> Self {
+        Self::with_labels(&IRI_SPLIT_LABELS, cooldown)
+    }
+
+    fn sha(cooldown: Option<u8>) -> Self {
+        Self::with_labels(&SHA_SPLIT_LABELS, cooldown)
+    }
+
+    fn with_labels(labels: &'static BoundedSplitLabels, cooldown: Option<u8>) -> Self {
         Self {
+            labels,
             cooldown,
-            small: IriBucketPhase::Active,
-            large: IriBucketPhase::Active,
+            small: BoundedBucketPhase::Active,
+            large: BoundedBucketPhase::Active,
         }
     }
 
@@ -449,14 +508,14 @@ impl IriSplitController {
         self.cooldown.is_some()
     }
 
-    fn bucket(&self, b: SplitBucket) -> IriBucketPhase {
+    fn bucket(&self, b: SplitBucket) -> BoundedBucketPhase {
         match b {
             SplitBucket::Small => self.small,
             SplitBucket::Large => self.large,
         }
     }
 
-    fn bucket_mut(&mut self, b: SplitBucket) -> &mut IriBucketPhase {
+    fn bucket_mut(&mut self, b: SplitBucket) -> &mut BoundedBucketPhase {
         match b {
             SplitBucket::Small => &mut self.small,
             SplitBucket::Large => &mut self.large,
@@ -464,7 +523,7 @@ impl IriSplitController {
     }
 
     fn allow(&self, b: SplitBucket) -> bool {
-        !matches!(self.bucket(b), IriBucketPhase::Cooldown { .. })
+        !matches!(self.bucket(b), BoundedBucketPhase::Cooldown { .. })
     }
 
     fn observe(
@@ -474,60 +533,68 @@ impl IriSplitController {
         split: Option<Split>,
     ) -> Option<&'static str> {
         let cooldown = self.cooldown?;
+        let labels = self.labels;
         let phase = self.bucket_mut(b);
         match *phase {
-            IriBucketPhase::Cooldown { remaining } => {
+            BoundedBucketPhase::Cooldown { remaining } => {
                 if parallel_allowed {
                     return None;
                 }
                 if remaining <= 1 {
-                    *phase = IriBucketPhase::Retry;
-                    Some("iri:cooldown->retry")
+                    *phase = BoundedBucketPhase::Retry;
+                    Some(labels.cooldown_to_retry)
                 } else {
-                    *phase = IriBucketPhase::Cooldown {
+                    *phase = BoundedBucketPhase::Cooldown {
                         remaining: remaining - 1,
                     };
                     None
                 }
             }
-            IriBucketPhase::Active => {
+            BoundedBucketPhase::Active => {
                 let split = split?;
                 match split.valid_paid()? {
                     true => None,
                     false => {
                         if cooldown == 0 {
-                            *phase = IriBucketPhase::Retry;
-                            Some("iri:active->retry")
+                            *phase = BoundedBucketPhase::Retry;
+                            Some(labels.active_to_retry)
                         } else {
-                            *phase = IriBucketPhase::Cooldown {
+                            *phase = BoundedBucketPhase::Cooldown {
                                 remaining: cooldown,
                             };
-                            Some("iri:active->cooldown")
+                            Some(labels.active_to_cooldown)
                         }
                     }
                 }
             }
-            IriBucketPhase::Retry => {
+            BoundedBucketPhase::Retry => {
                 let split = split?;
                 match split.valid_paid()? {
                     true => {
-                        *phase = IriBucketPhase::Active;
-                        Some("iri:retry->active")
+                        *phase = BoundedBucketPhase::Active;
+                        Some(labels.retry_to_active)
                     }
                     false => {
                         if cooldown == 0 {
                             None
                         } else {
-                            *phase = IriBucketPhase::Cooldown {
+                            *phase = BoundedBucketPhase::Cooldown {
                                 remaining: cooldown,
                             };
-                            Some("iri:retry->cooldown")
+                            Some(labels.retry_to_cooldown)
                         }
                     }
                 }
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapSplitPolicy {
+    Iri(SplitBucket),
+    Sha(SplitBucket),
+    Default,
 }
 
 /// Evaluation-size buckets for fallback cost observations (`>= MIN_ROWS`).
@@ -656,6 +723,7 @@ impl CostHistory {
 struct TraceStats {
     admit_batch: Option<u64>,
     admit_reason: Option<&'static str>,
+    first_map_batch: Option<u64>,
     persistent_hits: u64,
     pending_hits: u64,
     answer_nanos: u128,
@@ -665,6 +733,8 @@ struct TraceStats {
     fallback_batches: u64,
     fallback_eval_rows: u64,
     splits: u64,
+    map_splits: u64,
+    fb_splits: u64,
     split_wins: u64,
     split_losses: u64,
     split_inconc: u64,
@@ -674,6 +744,7 @@ struct TraceStats {
 pub(super) struct Reuse {
     input: VarId,
     direct_str_input: bool,
+    sha256_str_input: bool,
     config: ReuseConfig,
     mode: Mode,
     values: FxHashMap<Id, Id>,
@@ -704,6 +775,8 @@ pub(super) struct Reuse {
     split: SplitController,
     /// Separate bounded split cooldown for homogeneous stored-IRI `STR(input)` map misses.
     iri_split: IriSplitController,
+    /// Separate bounded split cooldown for `SHA256(STR(input))` map misses.
+    sha_split: BoundedSplitController,
     trace: TraceStats,
     #[cfg(test)]
     evaluations: usize,
@@ -720,17 +793,19 @@ impl Drop for Reuse {
         }
         let t = &self.trace;
         eprintln!(
-            "[bind-reuse] batches={} mode={:?} admit={:?}@{:?} hits={} misses={} \
-             persistent_hits={} pending_hits={} retained={} answer_us={} eval_us={} \
-             scatter_us={} retain_us={} fb_batches={} fb_eval_rows={} splits={} \
-             wins={} losses={} inconc={} transitions={} small={:?} large={:?} \
-             iri_small={:?} iri_large={:?}",
+            "[bind-reuse] batches={} mode={:?} admit={:?}@{:?} first_map_batch={:?} \
+             hits={} misses={} eval_rows={} persistent_hits={} pending_hits={} retained={} \
+             answer_us={} eval_us={} scatter_us={} retain_us={} fb_batches={} fb_eval_rows={} \
+             splits={} map_splits={} fb_splits={} wins={} losses={} inconc={} transitions={} \
+             small={:?} large={:?} iri_small={:?} iri_large={:?} sha_small={:?} sha_large={:?}",
             self.batch_index,
             self.mode,
             t.admit_reason,
             t.admit_batch,
+            t.first_map_batch,
             self.hits,
             self.misses,
+            self.misses.saturating_add(t.fallback_eval_rows),
             t.persistent_hits,
             t.pending_hits,
             self.values.len(),
@@ -741,6 +816,8 @@ impl Drop for Reuse {
             t.fallback_batches,
             t.fallback_eval_rows,
             t.splits,
+            t.map_splits,
+            t.fb_splits,
             t.split_wins,
             t.split_losses,
             t.split_inconc,
@@ -749,6 +826,8 @@ impl Drop for Reuse {
             self.split.large,
             self.iri_split.small,
             self.iri_split.large,
+            self.sha_split.small,
+            self.sha_split.large,
         );
     }
 }
@@ -762,6 +841,7 @@ impl Reuse {
         Some(Admission {
             input,
             direct_str_input: is_direct_str_input(expr, input),
+            sha256_str_input: is_sha256_str_input(expr, input),
             expected_reuse: source.is_some_and(|source| {
                 source.est.is_finite()
                     && source.est > 0.0
@@ -787,6 +867,7 @@ impl Reuse {
         Some(Self {
             input: admission.input,
             direct_str_input: admission.direct_str_input,
+            sha256_str_input: admission.sha256_str_input,
             config,
             mode,
             values: Default::default(),
@@ -806,6 +887,7 @@ impl Reuse {
             misses: 0,
             split: SplitController::new(config.split, config.cooldown),
             iri_split: IriSplitController::new(config.iri_split_cooldown),
+            sha_split: BoundedSplitController::sha(config.sha_split_cooldown),
             trace: TraceStats::default(),
             #[cfg(test)]
             evaluations: 0,
@@ -835,6 +917,29 @@ impl Reuse {
         all_stored_iris(ctx, miss_keys).then_some(bucket)
     }
 
+    /// Whether a map-miss batch qualifies for the bounded `SHA256(STR(input))` split
+    /// override, returning its sampled-split size bucket when it does.
+    fn sha_miss_bucket(&self, rows: usize, multi_worker: bool) -> Option<SplitBucket> {
+        if !self.sha_split.enabled()
+            || self.config.split != SplitMode::Retry
+            || !self.sha256_str_input
+            || !multi_worker
+        {
+            return None;
+        }
+        split_bucket(rows)
+    }
+
+    fn map_split_policy(&self, ctx: &Ctx, miss_keys: &[Id], multi_worker: bool) -> MapSplitPolicy {
+        if let Some(bucket) = self.iri_miss_bucket(ctx, miss_keys, multi_worker) {
+            MapSplitPolicy::Iri(bucket)
+        } else if let Some(bucket) = self.sha_miss_bucket(miss_keys.len(), multi_worker) {
+            MapSplitPolicy::Sha(bucket)
+        } else {
+            MapSplitPolicy::Default
+        }
+    }
+
     fn observe_iri_map_split(
         &mut self,
         bucket: SplitBucket,
@@ -845,6 +950,19 @@ impl Reuse {
         let transition = self.iri_split.observe(bucket, parallel_allowed, split);
         if self.config.trace {
             self.record_split_trace("map-iri", rows, split, transition);
+        }
+    }
+
+    fn observe_sha_map_split(
+        &mut self,
+        bucket: SplitBucket,
+        rows: usize,
+        parallel_allowed: bool,
+        split: Option<Split>,
+    ) {
+        let transition = self.sha_split.observe(bucket, parallel_allowed, split);
+        if self.config.trace {
+            self.record_split_trace("map-sha", rows, split, transition);
         }
     }
 
@@ -936,6 +1054,11 @@ impl Reuse {
     ) {
         if let Some(s) = split {
             self.trace.splits += 1;
+            if source == "fb" {
+                self.trace.fb_splits += 1;
+            } else {
+                self.trace.map_splits += 1;
+            }
             let outcome = s.classify();
             match outcome {
                 SplitOutcome::ClearWin => self.trace.split_wins += 1,
@@ -1036,6 +1159,7 @@ impl Reuse {
             if let Some(ns) = eval.elapsed_nanos {
                 self.trace.eval_nanos += ns;
             }
+            self.record_split_trace("fb", eval.evaluated_rows, eval.split, None);
         }
 
         let parallel_capable = expr_parallel && multi_worker;
@@ -1524,6 +1648,9 @@ impl Reuse {
         let Ok(_scratch) = ctx.charge(n as u64 * SCRATCH_BYTES + 256) else {
             return Ok(false);
         };
+        if self.config.trace && self.trace.first_map_batch.is_none() {
+            self.trace.first_map_batch = Some(self.batch_index);
+        }
         let mut output = Vec::with_capacity(n);
         let mut missed: Vec<u32> = Vec::with_capacity(n);
         let mut distinct = Vec::with_capacity(n);
@@ -1558,10 +1685,11 @@ impl Reuse {
             misses.len = distinct.len();
             misses.cols[0] = distinct;
             let multi_worker = rayon::current_num_threads() > 1;
-            let iri_bucket = self.iri_miss_bucket(ctx, &misses.cols[0], multi_worker);
-            let par = match iri_bucket {
-                Some(bucket) => self.iri_split.allow(bucket),
-                None => self.allow_map_split(misses.len(), expr),
+            let split_policy = self.map_split_policy(ctx, &misses.cols[0], multi_worker);
+            let par = match split_policy {
+                MapSplitPolicy::Iri(bucket) => self.iri_split.allow(bucket),
+                MapSplitPolicy::Sha(bucket) => self.sha_split.allow(bucket),
+                MapSplitPolicy::Default => self.allow_map_split(misses.len(), expr),
             };
             let t_eval = self.config.trace.then(Instant::now);
             let values = match exec::column_rows_split(ctx, &misses, expr, par)
@@ -1575,11 +1703,16 @@ impl Reuse {
                     if let Some(t) = t_eval {
                         self.trace.eval_nanos += t.elapsed().as_nanos();
                     }
-                    match iri_bucket {
-                        Some(bucket) => {
+                    match split_policy {
+                        MapSplitPolicy::Iri(bucket) => {
                             self.observe_iri_map_split(bucket, misses.len(), par, split);
                         }
-                        None => self.observe_map_split(misses.len(), expr, par, split),
+                        MapSplitPolicy::Sha(bucket) => {
+                            self.observe_sha_map_split(bucket, misses.len(), par, split);
+                        }
+                        MapSplitPolicy::Default => {
+                            self.observe_map_split(misses.len(), expr, par, split)
+                        }
                     }
                     values
                 }
@@ -1632,6 +1765,15 @@ fn is_direct_str_input(expr: &Expr, input: VarId) -> bool {
         expr,
         Expr::Call(Func::Builtin(Function::Str), args)
             if matches!(args.as_slice(), [Expr::Var(var)] if *var == input)
+    )
+}
+
+/// Whether `expr` is `SHA256(STR(input))` on `input`.
+fn is_sha256_str_input(expr: &Expr, input: VarId) -> bool {
+    matches!(
+        expr,
+        Expr::Call(Func::Builtin(Function::Sha256), args)
+            if matches!(args.as_slice(), [arg] if is_direct_str_input(arg, input))
     )
 }
 
@@ -2051,6 +2193,7 @@ mod tests {
             admission_fast_nanos: None,
             cooldown: 2,
             iri_split_cooldown: None,
+            sha_split_cooldown: None,
             trace: false,
         };
         let pool = rayon::ThreadPoolBuilder::new()
@@ -2145,6 +2288,7 @@ mod tests {
             admission_fast_nanos: None,
             cooldown: 2,
             iri_split_cooldown: None,
+            sha_split_cooldown: None,
             trace: false,
         };
         let pool = rayon::ThreadPoolBuilder::new()
@@ -4351,5 +4495,560 @@ mod tests {
             both.weak_decision(4096, 512, 4096, true),
             WeakDecision::FastAdmit
         );
+    }
+
+    #[test]
+    fn sha_split_cooldown_controller_and_config_parser() {
+        assert_eq!(parse_sha_split_cooldown(None), None);
+        assert_eq!(parse_sha_split_cooldown(Some("")), None);
+        assert_eq!(parse_sha_split_cooldown(Some("0")), None);
+        assert_eq!(parse_sha_split_cooldown(Some("off")), None);
+        assert_eq!(parse_sha_split_cooldown(Some("false")), None);
+        assert_eq!(parse_sha_split_cooldown(Some("no")), None);
+        assert_eq!(
+            parse_sha_split_cooldown(Some("1")),
+            Some(SHA_SPLIT_COOLDOWN)
+        );
+        assert_eq!(
+            parse_sha_split_cooldown(Some("on")),
+            Some(SHA_SPLIT_COOLDOWN)
+        );
+        assert_eq!(
+            parse_sha_split_cooldown(Some("true")),
+            Some(SHA_SPLIT_COOLDOWN)
+        );
+        assert_eq!(
+            parse_sha_split_cooldown(Some("yes")),
+            Some(SHA_SPLIT_COOLDOWN)
+        );
+        assert_eq!(parse_sha_split_cooldown(Some("2")), Some(2));
+        assert_eq!(parse_sha_split_cooldown(Some("16")), Some(16));
+        assert_eq!(parse_sha_split_cooldown(Some("64")), Some(64));
+        assert_eq!(parse_sha_split_cooldown(Some("65")), None);
+        assert_eq!(parse_sha_split_cooldown(Some("invalid")), None);
+        assert_eq!(ReuseConfig::default().sha_split_cooldown, None);
+
+        let mut ctrl = BoundedSplitController::sha(Some(SHA_SPLIT_COOLDOWN));
+        assert!(ctrl.enabled());
+        assert!(ctrl.allow(SplitBucket::Small));
+        assert!(ctrl.allow(SplitBucket::Large));
+
+        // Invalid and paying splits keep the bucket Active.
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(0, 1_000_000))),
+            None
+        );
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(100_000, 399_999))),
+            None
+        );
+        assert_eq!(ctrl.large, BoundedBucketPhase::Active);
+
+        // First valid nonpaying split (even in the ordinary Inconclusive band) enters cooldown.
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(100_000, 420_000))),
+            Some("sha:active->cooldown")
+        );
+        assert_eq!(
+            ctrl.large,
+            BoundedBucketPhase::Cooldown {
+                remaining: SHA_SPLIT_COOLDOWN
+            }
+        );
+        assert_eq!(ctrl.small, BoundedBucketPhase::Active);
+        assert!(ctrl.allow(SplitBucket::Small));
+
+        // Exactly 16 eligible suppressed batches transition to Retry.
+        for step in 0..SHA_SPLIT_COOLDOWN {
+            assert!(!ctrl.allow(SplitBucket::Large), "step {step} suppressed");
+            let tr = ctrl.observe(SplitBucket::Large, false, None);
+            if step + 1 == SHA_SPLIT_COOLDOWN {
+                assert_eq!(tr, Some("sha:cooldown->retry"));
+            } else {
+                assert_eq!(tr, None);
+            }
+        }
+        assert_eq!(ctrl.large, BoundedBucketPhase::Retry);
+        assert!(ctrl.allow(SplitBucket::Large));
+
+        // Missing or invalid retry observation keeps Retry pending.
+        assert_eq!(ctrl.observe(SplitBucket::Large, true, None), None);
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(0, 500_000))),
+            None
+        );
+        assert_eq!(ctrl.large, BoundedBucketPhase::Retry);
+
+        // Nonpaying retry re-enters cooldown; paying retry recovers to Active.
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(100_000, 400_000))),
+            Some("sha:retry->cooldown")
+        );
+        assert_eq!(
+            ctrl.large,
+            BoundedBucketPhase::Cooldown {
+                remaining: SHA_SPLIT_COOLDOWN
+            }
+        );
+        for _ in 0..SHA_SPLIT_COOLDOWN {
+            ctrl.observe(SplitBucket::Large, false, None);
+        }
+        assert_eq!(ctrl.large, BoundedBucketPhase::Retry);
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(100_000, 120_000))),
+            Some("sha:retry->active")
+        );
+        assert_eq!(ctrl.large, BoundedBucketPhase::Active);
+    }
+
+    #[test]
+    fn sha_map_miss_cooldown_default_off_preserves_existing_behavior() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("v");
+        let target = ctx.var("h");
+        let str_expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let sha_expr = Expr::Call(Func::Builtin(Function::Sha256), vec![str_expr]);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            // Both default config and the combined comparator (fast admission + IRI cooldown,
+            // SHA cooldown off) leave SHA map misses on the ordinary SplitController.
+            for cfg in [
+                ReuseConfig::default(),
+                ReuseConfig {
+                    admission_fast_nanos: Some(COST_FAST_SAVING_NANOS),
+                    iri_split_cooldown: Some(IRI_SPLIT_COOLDOWN),
+                    sha_split_cooldown: None,
+                    ..ReuseConfig::default()
+                },
+            ] {
+                let mut reuse = new_reuse_config(&ctx, &sha_expr, None, cfg).unwrap();
+                assert!(reuse.sha256_str_input);
+                assert!(!reuse.direct_str_input);
+                assert!(!reuse.sha_split.enabled());
+                assert_eq!(reuse.sha_miss_bucket(1024, true), None);
+                assert_eq!(reuse.sha_miss_bucket(3584, true), None);
+
+                let seed_keys = local_strings(&ctx, 0..64);
+                let miss_keys = local_strings(&ctx, 1000..2024);
+                assert_eq!(
+                    reuse.map_split_policy(&ctx, &miss_keys, true),
+                    MapSplitPolicy::Default
+                );
+
+                // Admit map and cap so subsequent batches evaluate all 1,024 misses.
+                let seed_rows: Vec<Id> = (0..4096).map(|i| seed_keys[i % 64]).collect();
+                let mut first = batch(input, &seed_rows);
+                assert!(reuse.apply(&ctx, &mut first, target, &sha_expr).unwrap());
+                reuse.max_entries = 64;
+
+                // One unpaid inconclusive split and one clear loss do NOT enter cooldown
+                // under the ordinary two-clear-loss controller.
+                reuse.observe_map_split(1024, &sha_expr, true, Some(split(100_000, 420_000)));
+                assert_eq!(reuse.split.small, BucketPhase::Active { losses: 0 });
+                reuse.observe_map_split(1024, &sha_expr, true, Some(split(100_000, 1_200_000)));
+                assert_eq!(reuse.split.small, BucketPhase::Active { losses: 1 });
+                assert_eq!(reuse.sha_split.small, BoundedBucketPhase::Active);
+
+                let mut b = batch(input, &miss_keys);
+                let expected = exec::column_rows(&ctx, &b, &sha_expr).unwrap();
+                assert!(reuse.apply(&ctx, &mut b, target, &sha_expr).unwrap());
+                assert_eq!(b.cols[1], expected);
+                assert!(
+                    reuse.last_miss_dispatch.unwrap().0,
+                    "default-off must keep ordinary map split dispatch active after one loss"
+                );
+                assert_eq!(reuse.sha_split.small, BoundedBucketPhase::Active);
+                assert_eq!(reuse.iri_split.small, BoundedBucketPhase::Active);
+            }
+        });
+    }
+
+    #[test]
+    fn sha_map_miss_cooldown_dispatches_sha_isolates_fallback_and_iri_and_retries_after_16() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        for i in 0..64 {
+            ttl.push_str(&format!("<urn:seed:{i:04}> <urn:p> \"seed{i:04}\" .\n"));
+        }
+        for i in 0..1024 {
+            ttl.push_str(&format!("<urn:iri:{i:04}> <urn:p> \"lit{i:04}\" .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("v");
+        let target = ctx.var("h");
+        let str_expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let sha_str_expr = Expr::Call(Func::Builtin(Function::Sha256), vec![str_expr.clone()]);
+        let direct_sha_expr = Expr::Call(Func::Builtin(Function::Sha256), vec![Expr::Var(input)]);
+        let nested_sha_expr =
+            Expr::Call(Func::Builtin(Function::UCase), vec![sha_str_expr.clone()]);
+        let year_expr = Expr::Call(Func::Builtin(Function::Year), vec![Expr::Var(input)]);
+
+        let config = ReuseConfig {
+            admission_fast_nanos: Some(COST_FAST_SAVING_NANOS),
+            iri_split_cooldown: Some(IRI_SPLIT_COOLDOWN),
+            sha_split_cooldown: Some(SHA_SPLIT_COOLDOWN),
+            ..ReuseConfig::default()
+        };
+
+        // Expression recognition happens once in prepare() and matches only SHA256(STR(input)).
+        assert!(
+            new_reuse_config(&ctx, &sha_str_expr, None, config)
+                .unwrap()
+                .sha256_str_input
+        );
+        assert!(
+            !new_reuse_config(&ctx, &sha_str_expr, None, config)
+                .unwrap()
+                .direct_str_input
+        );
+        for non_sha in [&str_expr, &direct_sha_expr, &nested_sha_expr, &year_expr] {
+            assert!(
+                !new_reuse_config(&ctx, non_sha, None, config)
+                    .unwrap()
+                    .sha256_str_input
+            );
+        }
+
+        let seed_strings = local_strings(&ctx, 0..64);
+        let small_strings = local_strings(&ctx, 1_000..2_024);
+        let large_strings = local_strings(&ctx, 5_000..7_048);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut reuse = new_reuse_config(&ctx, &sha_str_expr, None, config).unwrap();
+
+            // Range, worker-count, and split-mode boundaries.
+            assert_eq!(reuse.sha_miss_bucket(767, true), None);
+            assert_eq!(reuse.sha_miss_bucket(exec::PAR_THRESHOLD + 1, true), None);
+            assert_eq!(reuse.sha_miss_bucket(1024, false), None);
+            assert_eq!(reuse.sha_miss_bucket(1024, true), Some(SplitBucket::Small));
+            assert_eq!(reuse.sha_miss_bucket(2048, true), Some(SplitBucket::Large));
+            assert_eq!(reuse.sha_miss_bucket(3584, true), Some(SplitBucket::Large));
+            for mode in [SplitMode::Always, SplitMode::Never, SplitMode::Legacy] {
+                let non_retry = new_reuse_config(
+                    &ctx,
+                    &sha_str_expr,
+                    None,
+                    ReuseConfig {
+                        split: mode,
+                        ..config
+                    },
+                )
+                .unwrap();
+                assert_eq!(non_retry.sha_miss_bucket(1024, true), None);
+            }
+
+            // Admit map on 64 dense keys and cap at 64 so subsequent batches exercise
+            // apply_map miss dispatch on full distinct miss columns.
+            let seed_rows: Vec<Id> = (0..4096).map(|i| seed_strings[i % 64]).collect();
+            let mut first = batch(input, &seed_rows);
+            assert!(
+                reuse
+                    .apply(&ctx, &mut first, target, &sha_str_expr)
+                    .unwrap()
+            );
+            assert_eq!(reuse.mode, Mode::Map);
+            reuse.max_entries = 64;
+            assert_eq!(reuse.values.len(), 64);
+
+            // Initial Small SHA miss batch dispatches with par = true.
+            let mut sha_small = batch(input, &small_strings);
+            let expected_small = exec::column_rows(&ctx, &sha_small, &sha_str_expr).unwrap();
+            assert!(
+                reuse
+                    .apply(&ctx, &mut sha_small, target, &sha_str_expr)
+                    .unwrap()
+            );
+            assert_eq!(sha_small.cols[1], expected_small);
+            assert!(reuse.last_miss_dispatch.unwrap().0);
+
+            // First unpaid split enters SHA Small cooldown without touching fallback
+            // SplitController, cost contention evidence, or IRI controller.
+            reuse.sha_split.small = BoundedBucketPhase::Active;
+            reuse.observe_sha_map_split(
+                SplitBucket::Small,
+                1024,
+                true,
+                Some(split(100_000, 420_000)),
+            );
+            assert_eq!(
+                reuse.sha_split.small,
+                BoundedBucketPhase::Cooldown {
+                    remaining: SHA_SPLIT_COOLDOWN
+                }
+            );
+            assert_eq!(reuse.split.small, BucketPhase::Active { losses: 0 });
+            assert!(!reuse.split.is_contended(1024));
+            assert!(reuse.allow_fallback_split(1024, &sha_str_expr));
+            assert_eq!(reuse.iri_split.small, BoundedBucketPhase::Active);
+            assert_eq!(reuse.iri_split.large, BoundedBucketPhase::Active);
+
+            // Cooldown step 1: actual dispatch runs serially (par = false).
+            let mut step1 = batch(input, &small_strings);
+            assert!(
+                reuse
+                    .apply(&ctx, &mut step1, target, &sha_str_expr)
+                    .unwrap()
+            );
+            assert_eq!(step1.cols[1], expected_small);
+            assert_eq!(reuse.last_miss_dispatch, Some((false, None)));
+            assert_eq!(
+                reuse.sha_split.small,
+                BoundedBucketPhase::Cooldown {
+                    remaining: SHA_SPLIT_COOLDOWN - 1
+                }
+            );
+            assert_eq!(reuse.split.small, BucketPhase::Active { losses: 0 });
+            assert_eq!(reuse.iri_split.small, BoundedBucketPhase::Active);
+
+            // All-hit batch does not dispatch misses or consume SHA cooldown.
+            reuse.last_miss_dispatch = None;
+            let mut all_hits = batch(input, &seed_rows);
+            assert!(
+                reuse
+                    .apply(&ctx, &mut all_hits, target, &sha_str_expr)
+                    .unwrap()
+            );
+            assert_eq!(reuse.last_miss_dispatch, None);
+            assert_eq!(
+                reuse.sha_split.small,
+                BoundedBucketPhase::Cooldown {
+                    remaining: SHA_SPLIT_COOLDOWN - 1
+                }
+            );
+
+            // Large bucket (2,048 distinct misses) is independent of Small SHA cooldown.
+            let mut sha_large = batch(input, &large_strings);
+            let expected_large = exec::column_rows(&ctx, &sha_large, &sha_str_expr).unwrap();
+            assert!(
+                reuse
+                    .apply(&ctx, &mut sha_large, target, &sha_str_expr)
+                    .unwrap()
+            );
+            assert_eq!(sha_large.cols[1], expected_large);
+            assert!(reuse.last_miss_dispatch.unwrap().0);
+            assert_eq!(
+                reuse.sha_split.small,
+                BoundedBucketPhase::Cooldown {
+                    remaining: SHA_SPLIT_COOLDOWN - 1
+                }
+            );
+
+            // Fallback losses stay strictly in ordinary SplitController without touching
+            // SHA or IRI cooldowns.
+            let large_before_fb = reuse.sha_split.large;
+            let fb_loss = ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: Some(4096 * 1_500),
+                split: Some(split(100_000, 1_200_000)),
+                parallel_allowed: true,
+            };
+            reuse.observe_fallback(4096, fb_loss, None, &sha_str_expr);
+            reuse.observe_fallback(4096, fb_loss, None, &sha_str_expr);
+            assert!(reuse.split.is_contended(4096));
+            assert!(!reuse.allow_fallback_split(4096, &sha_str_expr));
+            assert_eq!(
+                reuse.sha_split.small,
+                BoundedBucketPhase::Cooldown {
+                    remaining: SHA_SPLIT_COOLDOWN - 1
+                }
+            );
+            assert_eq!(reuse.sha_split.large, large_before_fb);
+            assert_eq!(reuse.iri_split.large, BoundedBucketPhase::Active);
+
+            // Remaining 15 eligible Small SHA miss batches stay serial and unlock Retry.
+            for step in 1..SHA_SPLIT_COOLDOWN {
+                let mut b = batch(input, &small_strings);
+                assert!(reuse.apply(&ctx, &mut b, target, &sha_str_expr).unwrap());
+                assert_eq!(b.cols[1], expected_small);
+                assert_eq!(
+                    reuse.last_miss_dispatch,
+                    Some((false, None)),
+                    "eligible step {step} must stay serial"
+                );
+            }
+            assert_eq!(reuse.sha_split.small, BoundedBucketPhase::Retry);
+
+            // 17th eligible batch retries with par = true.
+            let mut retry_batch = batch(input, &small_strings);
+            assert!(
+                reuse
+                    .apply(&ctx, &mut retry_batch, target, &sha_str_expr)
+                    .unwrap()
+            );
+            assert_eq!(retry_batch.cols[1], expected_small);
+            assert!(
+                reuse.last_miss_dispatch.unwrap().0,
+                "17th eligible batch must retry with par = true"
+            );
+            assert_eq!(pending_entries(&reuse), 0);
+
+            // With both SHA and IRI switches enabled, direct STR(input) on stored IRIs
+            // still routes exclusively to iri_split and never touches sha_split.
+            let seed_iris: Vec<Id> = (0..64)
+                .map(|i| {
+                    ctx.snap
+                        .lookup_term(&Term::NamedNode(
+                            oxrdf::NamedNode::new(format!("urn:seed:{i:04}")).unwrap(),
+                        ))
+                        .unwrap()
+                })
+                .collect();
+            let stored_iris: Vec<Id> = (0..1024)
+                .map(|i| {
+                    ctx.snap
+                        .lookup_term(&Term::NamedNode(
+                            oxrdf::NamedNode::new(format!("urn:iri:{i:04}")).unwrap(),
+                        ))
+                        .unwrap()
+                })
+                .collect();
+            let mut iri_reuse = new_reuse_config(&ctx, &str_expr, None, config).unwrap();
+            let iri_seed_rows: Vec<Id> = (0..4096).map(|i| seed_iris[i % 64]).collect();
+            let mut iri_first = batch(input, &iri_seed_rows);
+            assert!(
+                iri_reuse
+                    .apply(&ctx, &mut iri_first, target, &str_expr)
+                    .unwrap()
+            );
+            iri_reuse.max_entries = 64;
+            assert_eq!(
+                iri_reuse.map_split_policy(&ctx, &stored_iris, true),
+                MapSplitPolicy::Iri(SplitBucket::Small)
+            );
+            iri_reuse.observe_iri_map_split(
+                SplitBucket::Small,
+                1024,
+                true,
+                Some(split(100_000, 420_000)),
+            );
+            let mut iri_step = batch(input, &stored_iris);
+            assert!(
+                iri_reuse
+                    .apply(&ctx, &mut iri_step, target, &str_expr)
+                    .unwrap()
+            );
+            assert_eq!(iri_reuse.last_miss_dispatch, Some((false, None)));
+            assert_eq!(
+                iri_reuse.iri_split.small,
+                BoundedBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN - 1
+                }
+            );
+            assert_eq!(iri_reuse.sha_split.small, BoundedBucketPhase::Active);
+            assert_eq!(iri_reuse.sha_split.large, BoundedBucketPhase::Active);
+        });
+    }
+
+    #[test]
+    fn trace_stats_record_first_map_batch_eval_rows_hits_and_map_vs_fallback_splits() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("v");
+        let target = ctx.var("h");
+        let str_expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let sha_expr = Expr::Call(Func::Builtin(Function::Sha256), vec![str_expr]);
+        let cfg = ReuseConfig {
+            sha_split_cooldown: Some(SHA_SPLIT_COOLDOWN),
+            trace: true,
+            ..ReuseConfig::default()
+        };
+
+        // Fallback-admitted map: admit_batch is batch 2, first_map_batch is batch 3.
+        let mut reuse = new_reuse_config(&ctx, &sha_expr, None, cfg).unwrap();
+        let unique_b1 = local_strings(&ctx, 0..4096);
+        let mut t1 = batch(input, &unique_b1);
+        assert!(!reuse.apply(&ctx, &mut t1, target, &sha_expr).unwrap());
+        assert_eq!(reuse.trace.first_map_batch, None);
+        reuse.observe_fallback_with(
+            4096,
+            ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: Some(4096 * 1_000),
+                split: Some(split(100_000, 120_000)),
+                parallel_allowed: true,
+            },
+            Some((4096, 4096)),
+            true,
+            true,
+        );
+        assert_eq!(reuse.trace.fb_splits, 1);
+        assert_eq!(reuse.trace.map_splits, 0);
+        assert_eq!(reuse.trace.splits, 1);
+        assert_eq!(reuse.trace.fallback_eval_rows, 4096);
+
+        // Batch 2 falls back and admits via exact within-batch >= 1/2 repeat.
+        let unique_b2 = local_strings(&ctx, 4096..8192);
+        let mut t2 = batch(input, &unique_b2);
+        assert!(!reuse.apply(&ctx, &mut t2, target, &sha_expr).unwrap());
+        reuse.observe_fallback_with(
+            4096,
+            ColumnEval {
+                evaluated_rows: 2048,
+                elapsed_nanos: Some(2048 * 1_000),
+                split: Some(split(100_000, 120_000)),
+                parallel_allowed: true,
+            },
+            Some((4096, 2048)),
+            true,
+            true,
+        );
+        assert_eq!(reuse.mode, Mode::Map);
+        assert_eq!(reuse.trace.admit_batch, Some(2));
+        assert_eq!(reuse.trace.first_map_batch, None);
+        assert_eq!(reuse.trace.fb_splits, 2);
+        assert_eq!(reuse.trace.fallback_eval_rows, 6144);
+
+        // Batch 3 is the first mapped batch: 64 distinct keys repeated across 256 rows ->
+        // 64 misses, 192 pending hits, 0 persistent hits.
+        let keys_b3 = local_strings(&ctx, 10_000..10_064);
+        let rows_b3: Vec<Id> = (0..256).map(|i| keys_b3[i % 64]).collect();
+        let mut t3 = batch(input, &rows_b3);
+        assert!(reuse.apply(&ctx, &mut t3, target, &sha_expr).unwrap());
+        assert_eq!(reuse.trace.first_map_batch, Some(3));
+        assert_eq!(reuse.misses, 64);
+        assert_eq!(reuse.trace.pending_hits, 192);
+        assert_eq!(reuse.trace.persistent_hits, 0);
+
+        // Batch 4 reuses retained keys (128 persistent hits) plus 32 new keys repeated twice
+        // (32 misses, 32 pending hits); first_map_batch remains 3.
+        let keys_b4 = local_strings(&ctx, 20_000..20_032);
+        let mut rows_b4 = Vec::with_capacity(192);
+        rows_b4.extend((0..128).map(|i| keys_b3[i % 64]));
+        rows_b4.extend((0..64).map(|i| keys_b4[i % 32]));
+        let mut t4 = batch(input, &rows_b4);
+        assert!(reuse.apply(&ctx, &mut t4, target, &sha_expr).unwrap());
+        assert_eq!(reuse.trace.first_map_batch, Some(3));
+        assert_eq!(reuse.misses, 96);
+        assert_eq!(reuse.misses + reuse.trace.fallback_eval_rows, 6240);
+        assert_eq!(reuse.trace.persistent_hits, 128);
+        assert_eq!(reuse.trace.pending_hits, 224);
+
+        // Map split observations increment map_splits without changing fb_splits.
+        reuse.observe_sha_map_split(
+            SplitBucket::Large,
+            3584,
+            true,
+            Some(split(100_000, 420_000)),
+        );
+        assert_eq!(reuse.trace.map_splits, 1);
+        assert_eq!(reuse.trace.fb_splits, 2);
+        assert_eq!(reuse.trace.splits, 3);
     }
 }
