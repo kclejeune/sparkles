@@ -29,6 +29,7 @@ pub(in crate::store) enum Event {
     IndexRecords,
     IndexRecord,
     IndexPosting,
+    CandidateCheck,
     ReadOnlyTimestamp(i64),
     ReadOnlyReference(u64),
     ReadOnlyTermOwned,

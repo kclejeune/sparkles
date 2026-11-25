@@ -1061,27 +1061,187 @@ impl<'a> CandidateStream<'a> {
     }
 }
 
-fn push_hole(
-    holes: &mut Vec<Unrecorded>,
-    guard: Option<&mut BudgetGuard<'_>>,
-    hole: Unrecorded,
+fn hole_key(h: &Unrecorded) -> (u64, u8, u64) {
+    (h.from, h.reason as u8, h.to)
+}
+
+fn reverse_holes_checked(
+    holes: &mut [Unrecorded],
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
-    if holes.len() == holes.capacity()
-        && let Some(guard) = guard
-    {
-        let size = std::mem::size_of::<Unrecorded>() as u64;
-        let old = (holes.capacity() as u64).saturating_mul(size);
-        let more = holes.capacity().max(16);
-        let new = (holes.capacity().saturating_add(more) as u64).saturating_mul(size);
-        guard.resize(old.saturating_add(new))?;
-        holes.try_reserve_exact(more).map_err(|_| {
-            Error::HistoryUnsupported("history unrecorded-range allocation was refused".into())
-        })?;
-        guard.resize((holes.capacity() as u64).saturating_mul(size))?;
+    let len = holes.len();
+    for i in 0..(len / 2) {
+        if checked && i != 0 && i.is_multiple_of(CHECK_STRIDE) {
+            check()?;
+        }
+        holes.swap(i, len - 1 - i);
     }
-    holes.push(hole);
     Ok(())
 }
+
+fn sort_holes_checked(
+    holes: &mut [Unrecorded],
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    let len = holes.len();
+    if len <= 1 {
+        return Ok(());
+    }
+    let mut steps = 0usize;
+    let mut sift_down = |slice: &mut [Unrecorded], mut root: usize, end: usize| -> Result<()> {
+        loop {
+            if checked && steps != 0 && steps.is_multiple_of(CHECK_STRIDE) {
+                check()?;
+            }
+            steps += 1;
+            let left = root * 2 + 1;
+            if left >= end {
+                break;
+            }
+            let mut swap = root;
+            if hole_key(&slice[swap]) < hole_key(&slice[left]) {
+                swap = left;
+            }
+            let right = left + 1;
+            if right < end && hole_key(&slice[swap]) < hole_key(&slice[right]) {
+                swap = right;
+            }
+            if swap == root {
+                break;
+            }
+            slice.swap(root, swap);
+            root = swap;
+        }
+        Ok(())
+    };
+    for start in (0..(len / 2)).rev() {
+        sift_down(holes, start, len)?;
+    }
+    for end in (1..len).rev() {
+        holes.swap(0, end);
+        sift_down(holes, 0, end)?;
+    }
+    Ok(())
+}
+
+fn dedup_holes_checked(
+    holes: &mut Vec<Unrecorded>,
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    if holes.len() <= 1 {
+        return Ok(());
+    }
+    let mut write = 0usize;
+    for read in 1..holes.len() {
+        if checked && read.is_multiple_of(CHECK_STRIDE) {
+            check()?;
+        }
+        let b = holes[read];
+        let a = &mut holes[write];
+        if a.reason == b.reason && b.from <= a.to.saturating_add(1) {
+            a.to = a.to.max(b.to);
+        } else {
+            write += 1;
+            holes[write] = b;
+        }
+    }
+    holes.truncate(write + 1);
+    Ok(())
+}
+
+/// Collects unrecorded ranges incrementally, merging adjacent/overlapping ranges of the
+/// same reason on arrival and normalizing cooperatively on [`HoleCollector::finish`].
+struct HoleCollector<'a> {
+    holes: Vec<Unrecorded>,
+    guard: Option<BudgetGuard<'a>>,
+    descending: bool,
+    ordered: bool,
+}
+
+impl<'a> HoleCollector<'a> {
+    fn new(budget: Option<&'a MemoryBudget>, descending: bool) -> Self {
+        Self {
+            holes: Vec::new(),
+            guard: budget.map(MemoryBudget::guard),
+            descending,
+            ordered: true,
+        }
+    }
+
+    fn push(&mut self, hole: Unrecorded) -> Result<()> {
+        if hole.from > hole.to {
+            self.ordered = false;
+        } else if self.ordered
+            && let Some(last) = self.holes.last_mut()
+        {
+            if self.descending {
+                if last.reason == hole.reason
+                    && hole.to <= last.to
+                    && hole.to.saturating_add(1) >= last.from
+                {
+                    last.from = last.from.min(hole.from);
+                    return Ok(());
+                }
+                if hole.to >= last.from {
+                    self.ordered = false;
+                }
+            } else {
+                if last.reason == hole.reason
+                    && hole.from >= last.from
+                    && hole.from <= last.to.saturating_add(1)
+                {
+                    last.to = last.to.max(hole.to);
+                    return Ok(());
+                }
+                if last.to >= hole.from {
+                    self.ordered = false;
+                }
+            }
+        }
+        if self.holes.len() == self.holes.capacity()
+            && let Some(guard) = self.guard.as_mut()
+        {
+            let size = std::mem::size_of::<Unrecorded>() as u64;
+            let old = (self.holes.capacity() as u64).saturating_mul(size);
+            let more = self.holes.capacity().max(16);
+            let new = (self.holes.capacity().saturating_add(more) as u64).saturating_mul(size);
+            guard.resize(old.saturating_add(new))?;
+            self.holes.try_reserve_exact(more).map_err(|_| {
+                Error::HistoryUnsupported("history unrecorded-range allocation was refused".into())
+            })?;
+            guard.resize((self.holes.capacity() as u64).saturating_mul(size))?;
+        }
+        self.holes.push(hole);
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        checked: bool,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Vec<Unrecorded>> {
+        if checked {
+            check()?;
+        }
+        if self.ordered {
+            if self.descending {
+                reverse_holes_checked(&mut self.holes, checked, check)?;
+            }
+        } else {
+            sort_holes_checked(&mut self.holes, checked, check)?;
+            dedup_holes_checked(&mut self.holes, checked, check)?;
+        }
+        if checked {
+            check()?;
+        }
+        Ok(self.holes)
+    }
+}
+
+type DecodedSegIndex<'a> = (u64, u64, SegIndex, Option<BudgetGuard<'a>>);
 
 /// The index of one segment.
 #[derive(Clone, Default)]
@@ -1197,15 +1357,18 @@ impl SegIndex {
 
     /// Decode an index file: (first, last, index).
     fn decode(b: &[u8], dataset_id: uuid::Uuid) -> Option<(u64, u64, SegIndex)> {
-        Self::decode_with(b, dataset_id, None, None).ok().flatten()
+        Self::decode_with(b, dataset_id, None, None)
+            .ok()
+            .flatten()
+            .map(|(first, last, ix, _)| (first, last, ix))
     }
 
-    fn decode_with(
+    fn decode_with<'a>(
         b: &[u8],
         dataset_id: uuid::Uuid,
         mut check: Option<&mut dyn FnMut() -> Result<()>>,
-        budget: Option<&MemoryBudget>,
-    ) -> Result<Option<(u64, u64, SegIndex)>> {
+        budget: Option<&'a MemoryBudget>,
+    ) -> Result<Option<DecodedSegIndex<'a>>> {
         if b.len() < IDX_HEADER || &b[0..8] != IDX_MAGIC {
             return Ok(None);
         }
@@ -1236,7 +1399,7 @@ impl SegIndex {
         }
         let mut c = Cur { b: body, i: 0 };
         let mut ix = SegIndex::default();
-        let _decoded_guard = if let Some(budget) = budget {
+        let decoded_guard = if let Some(budget) = budget {
             let decoded = arc_slice_bytes(std::mem::size_of::<SegIndex>())
                 .saturating_add(
                     (nrecs as u64).saturating_mul(std::mem::size_of::<RecEntry>() as u64),
@@ -1307,7 +1470,7 @@ impl SegIndex {
         if let Some(check) = check {
             check()?;
         }
-        Ok(Some((first, last, ix)))
+        Ok(Some((first, last, ix, decoded_guard)))
     }
 }
 
@@ -1900,25 +2063,25 @@ impl ChangeLog {
 
     /// The index of segment `i`.
     fn index(&self, inner: &mut Inner, i: usize) -> Result<Arc<SegIndex>> {
-        self.index_with(inner, i, None, None)
+        Ok(self.index_with(inner, i, None, None)?.0)
     }
 
-    fn index_with(
+    fn index_with<'a>(
         &self,
         inner: &mut Inner,
         i: usize,
         mut check: Option<&mut dyn FnMut() -> Result<()>>,
-        budget: Option<&MemoryBudget>,
-    ) -> Result<Arc<SegIndex>> {
+        budget: Option<&'a MemoryBudget>,
+    ) -> Result<(Arc<SegIndex>, Option<BudgetGuard<'a>>)> {
         if let Some(ix) = &inner.segs[i].index {
-            return Ok(ix.clone());
+            return Ok((ix.clone(), None));
         }
         let first = inner.segs[i].first;
         if let Some(p) = inner.cache.iter().position(|c| c.0 == first) {
             let c = inner.cache.remove(p).expect("found");
             let ix = c.1.clone();
             inner.cache.push_front(c);
-            return Ok(ix);
+            return Ok((ix, None));
         }
         let path = inner.segs[i]
             .idx_path()
@@ -1940,14 +2103,16 @@ impl ChangeLog {
                 (bytes, guard)
             }
         };
-        let (_, _, ix) = SegIndex::decode_with(&b, self.dataset_id, check, budget)?
+        let (_, _, ix, decoded_guard) = SegIndex::decode_with(&b, self.dataset_id, check, budget)?
             .ok_or_else(|| Error::Corrupt(format!("{}: damaged index", path.display())))?;
         drop(b);
         drop(raw_guard);
         let ix = Arc::new(ix);
-        inner.cache.push_front((first, ix.clone()));
-        inner.cache.truncate(INDEX_CACHE);
-        Ok(ix)
+        if budget.is_none() {
+            inner.cache.push_front((first, ix.clone()));
+            inner.cache.truncate(INDEX_CACHE);
+        }
+        Ok((ix, decoded_guard))
     }
 
     /// Read the entire sidecar, polling before each read and every interrupted retry.
@@ -2303,7 +2468,7 @@ impl ChangeLog {
             check()?;
             #[cfg(test)]
             open_tests::observe(open_tests::Event::TimestampIndex);
-            let ix = self.index_with(&mut inner, i, Some(check), None)?;
+            let (ix, _) = self.index_with(&mut inner, i, Some(check), None)?;
             let n = ix.recs.partition_point(|r| r.ts <= ms);
             // a gap tells no time of its own
             for (idx, r) in ix.recs[..n].iter().rev().enumerate() {
@@ -2364,45 +2529,35 @@ impl ChangeLog {
         if checked {
             check()?;
         }
-        let mut holes: Vec<Unrecorded> = Vec::new();
-        let mut holes_guard = budget.map(MemoryBudget::guard);
+        let mut holes = HoleCollector::new(budget, descending);
         if from > to {
-            return Ok(holes);
+            if checked {
+                check()?;
+            }
+            return Ok(Vec::new());
         }
         let Some(newest) = inner.last else {
-            push_hole(
-                &mut holes,
-                holes_guard.as_mut(),
-                Unrecorded {
-                    from,
-                    to,
-                    reason: UnrecordedReason::BeforeLog,
-                },
-            )?;
-            return Ok(holes);
+            holes.push(Unrecorded {
+                from,
+                to,
+                reason: UnrecordedReason::BeforeLog,
+            })?;
+            return holes.finish(checked, check);
         };
         let oldest = inner.segs.first().map_or(newest + 1, |s| s.first);
-        if from < oldest {
-            push_hole(
-                &mut holes,
-                holes_guard.as_mut(),
-                Unrecorded {
-                    from,
-                    to: to.min(oldest - 1),
-                    reason: UnrecordedReason::BeforeLog,
-                },
-            )?;
+        if !descending && from < oldest {
+            holes.push(Unrecorded {
+                from,
+                to: to.min(oldest - 1),
+                reason: UnrecordedReason::BeforeLog,
+            })?;
         }
-        if to > newest {
-            push_hole(
-                &mut holes,
-                holes_guard.as_mut(),
-                Unrecorded {
-                    from: from.max(newest + 1),
-                    to,
-                    reason: UnrecordedReason::Gap,
-                },
-            )?;
+        if descending && to > newest {
+            holes.push(Unrecorded {
+                from: from.max(newest + 1),
+                to,
+                reason: UnrecordedReason::Gap,
+            })?;
         }
         let hashes = filter.hashes();
         let n = inner.segs.len();
@@ -2417,18 +2572,14 @@ impl ChangeLog {
                 continue;
             }
             // holes between segments (damage) are reported as gaps
-            if i > 0 && inner.segs[i - 1].last + 1 < sf {
+            if !descending && i > 0 && inner.segs[i - 1].last + 1 < sf {
                 let (a, b) = (inner.segs[i - 1].last + 1, sf - 1);
                 if a <= to && b >= from {
-                    push_hole(
-                        &mut holes,
-                        holes_guard.as_mut(),
-                        Unrecorded {
-                            from: a.max(from),
-                            to: b.min(to),
-                            reason: UnrecordedReason::Gap,
-                        },
-                    )?;
+                    holes.push(Unrecorded {
+                        from: a.max(from),
+                        to: b.min(to),
+                        reason: UnrecordedReason::Gap,
+                    })?;
                 }
             }
             // a full page stops before it loads the next segment's index; a commit is
@@ -2442,10 +2593,13 @@ impl ChangeLog {
             if stop && !holes_after_stop {
                 break;
             }
-            let ix = if checked {
-                self.index_with(&mut inner, i, Some(check), budget)?
+            // Keep the decoded index guard bound before `ix` so `ix` always drops before
+            // its budget charge is released on every exit path.
+            let (_ix_guard, ix) = if checked {
+                let (ix, guard) = self.index_with(&mut inner, i, Some(check), budget)?;
+                (guard, ix)
             } else {
-                self.index(&mut inner, i)?
+                (None, self.index(&mut inner, i)?)
             };
             let lo = ix.recs.partition_point(|r| r.seq < from);
             let hi = ix.recs.partition_point(|r| r.seq <= to);
@@ -2458,20 +2612,41 @@ impl ChangeLog {
                         .get(hi)
                         .is_some_and(|record| record.hole.is_some_and(|(first, _)| first <= to)),
                 );
-            for (idx, r) in ix.recs[lo..hole_hi].iter().enumerate() {
-                if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
-                    check()?;
-                }
-                if let Some((f, reason)) = r.hole {
-                    push_hole(
-                        &mut holes,
-                        holes_guard.as_mut(),
-                        Unrecorded {
+            if descending {
+                for (idx, r) in ix.recs[lo..hole_hi].iter().rev().enumerate() {
+                    if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                        check()?;
+                    }
+                    if let Some((f, reason)) = r.hole {
+                        holes.push(Unrecorded {
                             from: f.max(from),
                             to: r.seq.min(to),
                             reason,
-                        },
-                    )?;
+                        })?;
+                    }
+                }
+                if i > 0 && inner.segs[i - 1].last + 1 < sf {
+                    let (a, b) = (inner.segs[i - 1].last + 1, sf - 1);
+                    if a <= to && b >= from {
+                        holes.push(Unrecorded {
+                            from: a.max(from),
+                            to: b.min(to),
+                            reason: UnrecordedReason::Gap,
+                        })?;
+                    }
+                }
+            } else {
+                for (idx, r) in ix.recs[lo..hole_hi].iter().enumerate() {
+                    if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                        check()?;
+                    }
+                    if let Some((f, reason)) = r.hole {
+                        holes.push(Unrecorded {
+                            from: f.max(from),
+                            to: r.seq.min(to),
+                            reason,
+                        })?;
+                    }
                 }
             }
             if stop {
@@ -2615,6 +2790,8 @@ impl ChangeLog {
             let mut cand_steps = 0usize;
             while let Some(o) = cands.next_ord(checked, check)? {
                 if checked && cand_steps.is_multiple_of(CHECK_STRIDE) {
+                    #[cfg(test)]
+                    open_tests::observe(open_tests::Event::CandidateCheck);
                     #[cfg(feature = "failpoints")]
                     observe_changelog_read(ChangeLogReadEvent::CandidateCheck);
                     check()?;
@@ -2701,21 +2878,27 @@ impl ChangeLog {
             drop(cands);
             drop(other_roles);
             drop(cand_guard);
+            drop(ix);
+            drop(_ix_guard);
             if stop && !holes_after_stop {
                 break;
             }
         }
-        holes.sort_unstable_by_key(|h| (h.from, h.reason as u8, h.to));
-        // a hole reported twice (a gap past the end and a gap record) is merged
-        holes.dedup_by(|b, a| {
-            if a.reason == b.reason && b.from <= a.to + 1 {
-                a.to = a.to.max(b.to);
-                true
-            } else {
-                false
-            }
-        });
-        Ok(holes)
+        if !descending && to > newest {
+            holes.push(Unrecorded {
+                from: from.max(newest + 1),
+                to,
+                reason: UnrecordedReason::Gap,
+            })?;
+        }
+        if descending && from < oldest {
+            holes.push(Unrecorded {
+                from,
+                to: to.min(oldest - 1),
+                reason: UnrecordedReason::BeforeLog,
+            })?;
+        }
+        holes.finish(checked, check)
     }
 
     /// Read the records of commits `from` through `to` in commit order, calling `visit`
@@ -4076,12 +4259,17 @@ mod settings_format_tests {
         let _raw_guard = exact_budget
             .reserve(raw_with_spare.capacity() as u64)
             .unwrap();
-        assert!(
+        let (_, _, _, decoded_guard) =
             SegIndex::decode_with(&raw_with_spare, dataset_id, None, Some(&exact_budget))
                 .unwrap()
-                .is_some()
+                .unwrap();
+        assert_eq!(
+            exact_budget.used(),
+            raw_with_spare.capacity() as u64 + decoded_bytes
         );
         drop(_raw_guard);
+        assert_eq!(exact_budget.used(), decoded_bytes);
+        drop(decoded_guard);
         assert_eq!(exact_budget.used(), 0);
 
         // 2. End-to-end persistent store:
@@ -4250,14 +4438,14 @@ mod settings_format_tests {
         //     overlapping commit 1 result (~96 KiB) with commit 3 read (~193 KiB) peaks near 297 KiB.
         let single_record_limit = 240 << 10;
         for no_wait in [true, false] {
-            // Warm all segment indexes first.
+            // Warm all segment indexes via an unbounded scan first.
             let warm_q = HistoryQuery {
                 subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
                 from: Some(HistoryBound::Commit(c1)),
                 to: Some(HistoryBound::Commit(c3)),
                 ..Default::default()
             };
-            store.published_history_changes(&warm_q, 16 << 20).unwrap();
+            store.history_changes(&warm_q).unwrap();
 
             // Commit 1 alone and commit 3 alone each fit single_record_limit.
             for seq in [c1, c3] {
@@ -4495,7 +4683,8 @@ mod settings_format_tests {
         }
 
         // 4. Cooperative polling inside candidate traversal stops at CHECK_STRIDE
-        //    even when no record matches.
+        //    even when no record matches. Key cancellation to the 2nd CandidateCheck
+        //    event (cand_steps == CHECK_STRIDE) rather than a raw poll counter.
         let filter = LogFilter {
             keys: [
                 None,
@@ -4507,7 +4696,32 @@ mod settings_format_tests {
                 None,
             ],
         };
-        let mut polls = 0usize;
+        let candidate_checks = std::rc::Rc::new(Cell::new(0usize));
+        let witness = candidate_checks.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            if event == open_tests::Event::CandidateCheck {
+                witness.set(witness.get() + 1);
+            }
+        });
+        #[cfg(feature = "failpoints")]
+        let (fp_candidate_checks, _fp_reset) = {
+            use std::sync::atomic::AtomicUsize;
+            struct ResetObserver;
+            impl Drop for ResetObserver {
+                fn drop(&mut self) {
+                    set_changelog_read_observer(None);
+                }
+            }
+            let counts = Arc::new(AtomicUsize::new(0));
+            let c = counts.clone();
+            set_changelog_read_observer(Some(Arc::new(move |event| {
+                if event == ChangeLogReadEvent::CandidateCheck {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            })));
+            (counts, ResetObserver)
+        };
+        let mut visited = 0usize;
         let res = log.scan(
             1,
             hit_seq,
@@ -4517,20 +4731,34 @@ mod settings_format_tests {
             true,
             Some(&MemoryBudget::new(4096)),
             &mut || {
-                polls += 1;
-                // Polls before candidate loop: entry, post-lock, seg, role0, role1,
-                // then steps==0, then steps==CHECK_STRIDE. Cancel on the 2nd traversal poll.
-                if polls >= 7 {
+                if candidate_checks.get() >= 2 {
                     Err(Error::Cancelled)
                 } else {
                     Ok(())
                 }
             },
             None,
-            &mut |_, _, _| Ok(true),
+            &mut |_, _, _| {
+                visited += 1;
+                Ok(true)
+            },
         );
+        drop(observer);
+        #[cfg(feature = "failpoints")]
+        drop(_fp_reset);
         assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
-        assert_eq!(polls, 7);
+        assert_eq!(
+            candidate_checks.get(),
+            2,
+            "expected cancellation on the 2nd CandidateCheck (cand_steps == CHECK_STRIDE)"
+        );
+        #[cfg(feature = "failpoints")]
+        assert_eq!(
+            fp_candidate_checks.load(Ordering::SeqCst),
+            2,
+            "expected failpoints CandidateCheck observer to observe the 2nd traversal stride"
+        );
+        assert_eq!(visited, 0);
 
         // Also exercise published_history_changes against the real HistoryQuery wrapper.
         let q = HistoryQuery {
@@ -4542,5 +4770,404 @@ mod settings_format_tests {
         };
         let res = log.query_with(&q, hit_seq, true, Some(256)).unwrap();
         assert!(res.changes.is_empty());
+    }
+
+    #[test]
+    fn cold_index_and_record_overlap_memory_budget() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::fmt::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 768 << 10,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts).unwrap();
+        store.change_log().unwrap().set_background(false);
+
+        let mut triples = String::new();
+        for i in 0..6_000 {
+            writeln!(&mut triples, "<urn:pad{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c1 = store.head_commit().seq;
+
+        let payload = "x".repeat(160 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:coldhit> <urn:p> \"{payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c2 = store.head_commit().seq;
+
+        let seal_payload = "s".repeat(512 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:seal> <urn:p> \"{seal_payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+
+        let log = store.change_log().unwrap().clone();
+        let (seg0_idx_path, seg0_idx_len) = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs[0].sealed, "segment 0 must be sealed");
+            assert!(
+                inner.segs[0].first <= c1 && inner.segs[0].last >= c2,
+                "c1={c1} and c2={c2} must share sealed segment 0 ({}..={})",
+                inner.segs[0].first,
+                inner.segs[0].last
+            );
+            inner.cache.clear();
+            let path = inner.segs[0].idx_path().unwrap();
+            let len = path.metadata().unwrap().len();
+            (path, len)
+        };
+        let raw_bytes = std::fs::read(&seg0_idx_path).unwrap();
+        let seg0_decoded_bytes = {
+            let (_, _, ix) = SegIndex::decode(&raw_bytes, log.dataset_id).unwrap();
+            arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                + (ix.recs.len() as u64) * (std::mem::size_of::<RecEntry>() as u64)
+                + (ix.postings.len() as u64) * (std::mem::size_of::<(u64, u32)>() as u64)
+        };
+        let limit = (seg0_idx_len + seg0_decoded_bytes).max(360 << 10) + (24 << 10);
+        assert!(
+            seg0_decoded_bytes + (320 << 10) > limit,
+            "decoded index ({seg0_decoded_bytes}) + record peak (~320 KiB) must exceed limit ({limit})"
+        );
+
+        for no_wait in [true, false] {
+            // 1. Cold index decode alone fits limit, and bounded scans leave the shared cache empty.
+            log.inner.lock().cache.clear();
+            let q_missing = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let ok = if no_wait {
+                store.try_published_history_changes(&q_missing, limit)
+            } else {
+                store.published_history_changes(&q_missing, limit)
+            }
+            .unwrap();
+            assert!(ok.changes.is_empty(), "no_wait={no_wait}");
+            assert!(
+                log.inner.lock().cache.is_empty(),
+                "no_wait={no_wait}: bounded cold scan must not insert decoded index into shared cache"
+            );
+
+            // 2. Matching record alone (with warm index loaded by an unbounded scan) fits limit.
+            store.history_changes(&q_missing).unwrap();
+            assert!(!log.inner.lock().cache.is_empty());
+            let q_hit = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:coldhit"))],
+                from: Some(HistoryBound::Commit(c2)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let ok = if no_wait {
+                store.try_published_history_changes(&q_hit, limit)
+            } else {
+                store.published_history_changes(&q_hit, limit)
+            }
+            .unwrap();
+            assert_eq!(ok.changes.len(), 1, "no_wait={no_wait}");
+
+            // 3. Cold index + matching record live overlap exceeds limit and is refused.
+            log.inner.lock().cache.clear();
+            let res = if no_wait {
+                store.try_published_history_changes(&q_hit, limit)
+            } else {
+                store.published_history_changes(&q_hit, limit)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: expected cold index + record live overlap refusal, got {res:?}"
+            );
+            assert!(
+                log.inner.lock().cache.is_empty(),
+                "no_wait={no_wait}: failed bounded cold scan must leave shared cache empty"
+            );
+        }
+    }
+
+    #[test]
+    fn hole_normalization_polls_and_checks_before_return() {
+        let store = Store::in_memory(StoreOptions {
+            change_log_segment_bytes: 64 << 20,
+            ..Default::default()
+        });
+        let log = store.change_log().unwrap().clone();
+        log.set_background(false);
+
+        let default_g: Arc<[u8]> = Arc::from(&[][..]);
+        let pred_key: Arc<[u8]> = Arc::from(id::iri_key("urn:p"));
+        let val_key: Arc<[u8]> = Arc::from(id::iri_key("urn:v"));
+
+        // 5,000 alternating Changes/Summary commits -> 2,500 non-adjacent Bulk holes
+        // (1,250 swaps in descending reverse, exceeding CHECK_STRIDE = 1,024),
+        // followed by two adjacent Bulk commits and a trailing Gap commit.
+        let mut seq = 0u64;
+        {
+            let mut inner = log.inner.lock();
+            for i in 0..2_500u64 {
+                seq += 1;
+                let s: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:s:{i}")));
+                let q: QuadKey = [default_g.clone(), s, pred_key.clone(), val_key.clone()];
+                let c = Arc::new(ChangeCommit {
+                    seq,
+                    timestamp_ms: seq as i64,
+                    kind: CommitKind::Update,
+                    bulk: false,
+                    inserted: 1,
+                    deleted: 0,
+                    author: None,
+                    message: None,
+                });
+                log.append(&mut inner, Record::Changes(c, vec![(true, q)]))
+                    .unwrap();
+                seq += 1;
+                let summary = Arc::new(ChangeCommit {
+                    seq,
+                    timestamp_ms: seq as i64,
+                    kind: CommitKind::Update,
+                    bulk: true,
+                    inserted: 1,
+                    deleted: 0,
+                    author: None,
+                    message: None,
+                });
+                log.append(&mut inner, Record::Summary(summary)).unwrap();
+            }
+            // Adjacent bulk summary merges with seq 5,000.
+            seq += 1;
+            let adjacent_bulk = Arc::new(ChangeCommit {
+                seq,
+                timestamp_ms: seq as i64,
+                kind: CommitKind::Update,
+                bulk: true,
+                inserted: 1,
+                deleted: 0,
+                author: None,
+                message: None,
+            });
+            log.append(&mut inner, Record::Summary(adjacent_bulk))
+                .unwrap();
+            // Trailing gap record merges with to > newest gap.
+            let gap_from = seq + 1;
+            seq += 3;
+            log.append(
+                &mut inner,
+                Record::Gap {
+                    from: gap_from,
+                    through: seq,
+                },
+            )
+            .unwrap();
+        }
+        let head = seq;
+        let filter = LogFilter {
+            keys: [None, Some(vec![id::iri_key("urn:missing")]), None, None],
+        };
+
+        // 1. Ascending and descending produce identical normalized holes including merges.
+        let asc = log
+            .scan(
+                1,
+                head + 5,
+                &filter,
+                false,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || Ok(()),
+                None,
+                &mut |_, _, _| Ok(true),
+            )
+            .unwrap();
+        let desc = log
+            .scan(
+                1,
+                head + 5,
+                &filter,
+                true,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || Ok(()),
+                None,
+                &mut |_, _, _| Ok(true),
+            )
+            .unwrap();
+        assert_eq!(asc, desc);
+        assert_eq!(asc.len(), 2_501);
+        assert_eq!(
+            asc[2_499],
+            Unrecorded {
+                from: 5_000,
+                to: 5_001,
+                reason: UnrecordedReason::Bulk,
+            }
+        );
+        assert_eq!(
+            asc[2_500],
+            Unrecorded {
+                from: 5_002,
+                to: head + 5,
+                reason: UnrecordedReason::Gap,
+            }
+        );
+
+        // 2. Cancellation and deadline expiration right after hole collection completes
+        //    must stop before returning from scan (both ascending and descending).
+        for descending in [false, true] {
+            for use_deadline in [false, true] {
+                let mut polls = 0usize;
+                let mut armed = false;
+                let mut deadline: Option<Instant> = None;
+                let res = log.scan(
+                    1,
+                    head,
+                    &filter,
+                    descending,
+                    true,
+                    true,
+                    Some(&MemoryBudget::new(1 << 20)),
+                    &mut || {
+                        polls += 1;
+                        if let Some(limit) = deadline {
+                            if Instant::now() >= limit {
+                                return Err(Error::Timeout);
+                            }
+                        } else if armed {
+                            return Err(Error::Cancelled);
+                        }
+                        // Polls: 1=entry, 2=post-lock, 3=seg, 4..7=hole@1024..4096, 8=role0.
+                        // Trigger stop right after hole collection finishes on role0.
+                        if polls == 8 {
+                            if use_deadline {
+                                let d = Instant::now() + Duration::from_millis(2);
+                                while Instant::now() < d {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                deadline = Some(d);
+                            } else {
+                                armed = true;
+                            }
+                        }
+                        Ok(())
+                    },
+                    None,
+                    &mut |_, _, _| Ok(true),
+                );
+                if use_deadline {
+                    assert!(
+                        matches!(res, Err(Error::Timeout)),
+                        "descending={descending}: expected Timeout before return, got {res:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(res, Err(Error::Cancelled)),
+                        "descending={descending}: expected Cancelled before return, got {res:?}"
+                    );
+                }
+            }
+        }
+
+        // 3. Descending cooperative reverse polls mid-normalization at CHECK_STRIDE.
+        //    Polls: 1..8 up to role0, 9=finish entry, 10=reverse_holes_checked@CHECK_STRIDE.
+        let mut desc_polls = 0usize;
+        let res = log.scan(
+            1,
+            head,
+            &filter,
+            true,
+            true,
+            true,
+            Some(&MemoryBudget::new(1 << 20)),
+            &mut || {
+                desc_polls += 1;
+                if desc_polls >= 10 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            None,
+            &mut |_, _, _| Ok(true),
+        );
+        assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
+        assert_eq!(desc_polls, 10);
+
+        // 4. Unordered HoleCollector fallback normalizes identically and polls cooperatively.
+        let mut raw = Vec::new();
+        for i in (0..2_500u64).rev() {
+            raw.push(Unrecorded {
+                from: i * 3 + 1,
+                to: i * 3 + 1,
+                reason: UnrecordedReason::Bulk,
+            });
+            if i % 5 == 0 {
+                raw.push(Unrecorded {
+                    from: i * 3 + 2,
+                    to: i * 3 + 2,
+                    reason: UnrecordedReason::Bulk,
+                });
+            }
+        }
+        let mut expected = raw.clone();
+        expected.sort_unstable_by_key(|h| (h.from, h.reason as u8, h.to));
+        expected.dedup_by(|b, a| {
+            if a.reason == b.reason && b.from <= a.to + 1 {
+                a.to = a.to.max(b.to);
+                true
+            } else {
+                false
+            }
+        });
+
+        let mut collector = HoleCollector::new(None, false);
+        for &h in &raw {
+            collector.push(h).unwrap();
+        }
+        assert!(!collector.ordered);
+        let mut norm_polls = 0usize;
+        let got = collector
+            .finish(true, &mut || {
+                norm_polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(got, expected);
+        assert!(
+            norm_polls > 3,
+            "expected cooperative stride polls during unordered sort/dedup, got {norm_polls}"
+        );
+
+        let mut cancel_collector = HoleCollector::new(None, false);
+        for &h in &raw {
+            cancel_collector.push(h).unwrap();
+        }
+        let mut cancel_polls = 0usize;
+        let cancelled = cancel_collector.finish(true, &mut || {
+            cancel_polls += 1;
+            if cancel_polls >= 3 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
+        assert_eq!(cancel_polls, 3);
     }
 }
