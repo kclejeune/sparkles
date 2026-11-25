@@ -9306,6 +9306,90 @@ fn split_round6_reduced_merge_does_not_copy_unchanged_exclusions() {
 }
 
 #[test]
+fn reduced_exclusion_restore_accounts_for_taken_profile_diagnostics() {
+    let input = axioms(
+        "SubClassOf(:D ObjectUnionOf(:E :F))
+         DisjointClasses(
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A)))
+         SubClassOf(
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             owl:Nothing)
+         ClassAssertion(:B :b)",
+    );
+    let original: Vec<_> = input.iter().map(|a| &a.kind).collect();
+    let mut red = dl_reduce::plan(&original, None, None).expect("ready reduction");
+    let hub = red.hub.take();
+    let reduced = red.all(&original);
+    let mut outside: Vec<_> = reduced
+        .iter()
+        .enumerate()
+        .filter_map(|(i, k)| el_break(k).map(|b| (i, (b.rule.to_string(), b.message))))
+        .collect();
+    let union = outside
+        .iter()
+        .position(|(i, _)| reduced[*i] == original[0])
+        .expect("profile diagnostic for the disjunction");
+    let previous = axioms("IrreflexiveObjectProperty(:old)");
+    let old_report = vec![Excluded {
+        axiom: previous[0].kind.clone(),
+        gap: Gap::Outside {
+            rule: "previous rule".into(),
+            message: "previous diagnostic".into(),
+        },
+    }];
+    let held_bytes = excluded_copy_bytes(&old_report)
+        + red.retained_bytes()
+        + reduced.capacity() * std::mem::size_of::<&AxiomKind>();
+    let build = |outside: &Vec<_>, cap| {
+        let mut sat = Saturation::new();
+        sat.active_hub = hub.clone();
+        sat.hide_internal = true;
+        sat.excluded = old_report.clone();
+        let result = sat.build(
+            &reduced,
+            outside,
+            Some((&red, &original)),
+            1,
+            held_bytes,
+            0,
+            &Limits {
+                max_memory: cap,
+                rooted: true,
+                threads: 1,
+                ..Limits::default()
+            },
+        );
+        (sat, result)
+    };
+
+    // Put the report overlap above the normalization peak without changing the
+    // report itself. Tier D takes this disjunction so its diagnostic is filtered out.
+    let message = &mut outside[union].1.1;
+    message.reserve_exact(64 * 1024);
+    let control_capacity = message.capacity();
+    let (sat, result) = build(&outside, None);
+    let (_, _, peak, _, _) = result.expect("initial build");
+    assert_eq!(sat.excluded().len(), 2);
+    for axiom in &original[1..3] {
+        assert!(sat.excluded().iter().any(|e| &e.axiom == *axiom));
+    }
+
+    let message = &mut outside[union].1.1;
+    message.reserve_exact(2 * 64 * 1024);
+    let restore_bytes = peak + message.capacity() - control_capacity;
+    let cap = restore_bytes - 1;
+    let (sat, result) = build(&outside, Some(cap));
+    match result {
+        Err(Error::Memory { limit, used }) => assert_eq!((limit, used), (cap, restore_bytes)),
+        Err(err) => panic!("expected exclusion restoration to refuse, got {err:?}"),
+        Ok(_) => panic!("restored the report without admitting the retained diagnostic"),
+    }
+    assert_eq!(sat.excluded(), old_report);
+    assert!(!sat.report_replaced);
+}
+
+#[test]
 fn split_round5_replacement_exclusions_are_admitted_before_cloning() {
     const IRI_BYTES: usize = 512 * 1024;
     let old = axioms(&format!(

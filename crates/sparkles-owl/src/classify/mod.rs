@@ -6575,7 +6575,7 @@ impl Saturation {
     fn build(
         &mut self,
         axioms: &[&AxiomKind],
-        outside: &[(usize, (String, String))],
+        outside: &Vec<(usize, (String, String))>,
         reduction: Option<(&dl_reduce::Reduction, &[&AxiomKind])>,
         threads: usize,
         held_bytes: usize,
@@ -6619,7 +6619,7 @@ impl Saturation {
     fn build_inner(
         &mut self,
         axioms: &[&AxiomKind],
-        outside: &[(usize, (String, String))],
+        outside: &Vec<(usize, (String, String))>,
         reduction: Option<(&dl_reduce::Reduction, &[&AxiomKind])>,
         threads: usize,
         held_bytes: usize,
@@ -6829,6 +6829,7 @@ impl Saturation {
                 self.interner.ranges.check()?;
             }
         }
+        drop(is_outside);
         // what each axiom outside OWL 2 EL needs, counted once however often it occurs; a
         // chain whose superproperty has a range its last property lacks is Horn
         let mut candidates: Vec<&AxiomKind> = outside.iter().map(|(i, _)| axioms[*i]).collect();
@@ -6972,6 +6973,31 @@ impl Saturation {
         let ix = Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(halt)?;
         self.interner.dt_run = None;
         self.interner.end_run();
+        // Reduced report construction and restoration both overlap the profile
+        // diagnostics, including those filtered from the report, and the tier buffers.
+        let profile_bytes = if reduction.is_some() {
+            let diagnostic_slots = outside
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(usize, (String, String))>());
+            outside
+                .iter()
+                .fold(diagnostic_slots, |bytes, (_, (rule, message))| {
+                    bytes
+                        .saturating_add(rule.capacity())
+                        .saturating_add(message.capacity())
+                })
+                .saturating_add(
+                    candidates
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<&AxiomKind>()),
+                )
+                .saturating_add(dl_clause::hash_table_bytes(
+                    taken.capacity(),
+                    std::mem::size_of::<&AxiomKind>(),
+                ))
+        } else {
+            0
+        };
         let outside = outside.iter().filter(|(i, _)| !taken.contains(axioms[*i]));
         let (entries, report_bytes) =
             outside
@@ -7018,6 +7044,7 @@ impl Saturation {
                 .saturating_add(ax.bytes())
                 .saturating_add(ix.bytes())
                 .saturating_add(chain_bytes)
+                .saturating_add(profile_bytes)
         };
         let budget = self.interner.ranges.budget.as_ref().expect("build budget");
         if entries != 0 || chain_entries != 0 {
