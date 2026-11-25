@@ -42,6 +42,9 @@ pub const MAX_SCALE: u32 = 4_096;
 pub(crate) const AGG_MAX_INT_DIGITS: usize = MAX_DIGITS + 32;
 /// Bounded intermediate digit headroom for decimal `SUM`/`AVG` accumulation.
 pub(crate) const AGG_MAX_DEC_DIGITS: usize = MAX_DIGITS + MAX_SCALE as usize + 32;
+/// A decimal subtotal's aligned limbs, one carry limb, and the owned value.
+pub(crate) const AGG_SUM_PAYLOAD_BYTES: u64 =
+    ((AGG_MAX_DEC_DIGITS + 2).div_ceil(BASE_DIGITS) as u64 + 1) * 4 + 72;
 /// Minimum fractional digits produced by a non-terminating [`BigDec`] division, matching
 /// `oxsdatatypes::Decimal`.
 const MIN_DIV_SCALE: u32 = 18;
@@ -1332,25 +1335,25 @@ impl BigDec {
         if q_mag > MAX_DIGITS as i64 {
             return None;
         }
-        let min_for_sig = if q_mag < 0 {
-            let need = (-q_mag).saturating_add(i64::from(MIN_DIV_SCALE));
-            if need > i64::from(MAX_SCALE) {
-                return None;
-            }
-            need as u32
+        let min_for_sig = (i64::from(MIN_DIV_SCALE) - q_mag.min(0)).min(i64::from(MAX_SCALE));
+        let requested_scale = self.scale.max(min_for_sig as u32);
+        let max_int_digits = (q_mag + 1).max(0) as usize;
+        let out_scale = if max_int_digits + requested_scale as usize <= MAX_DIGITS {
+            requested_scale
         } else {
-            MIN_DIV_SCALE
+            // Compare the significands at equal magnitude. When the dividend's
+            // significand is smaller, the quotient uses one fewer integer digit.
+            let fewer = max_int_digits > 0
+                && cmp_mag_scaled(
+                    &self.mantissa.limbs,
+                    self.mantissa.decimal_digits() as u32,
+                    &rhs.mantissa.limbs,
+                    rhs.mantissa.decimal_digits() as u32,
+                )
+                .is_lt();
+            let int_digits = max_int_digits - usize::from(fewer);
+            requested_scale.min(MAX_DIGITS.checked_sub(int_digits)? as u32)
         };
-        let max_frac_for_digits = if q_mag >= 0 {
-            MAX_DIGITS.saturating_sub((q_mag + 1) as usize) as u32
-        } else {
-            MAX_SCALE
-        };
-        let out_scale = self
-            .scale
-            .max(min_for_sig)
-            .min(MAX_SCALE)
-            .min(max_frac_for_digits);
         let shift = i64::from(out_scale) + i64::from(rhs.scale) - i64::from(self.scale);
         let max_work = MAX_DIGITS * 3;
         let (q, _) = if shift >= 0 {
@@ -1771,6 +1774,13 @@ mod tests {
             BigDec::parse(&format!("0.{}1", "0".repeat(MAX_SCALE as usize - 1))).unwrap();
         assert_eq!(tiny_cap.checked_div(&one).unwrap(), tiny_cap);
 
+        // A repeating quotient still has a nonzero digit at the scale cap.
+        let four_tiny = tiny_cap.checked_mul(&BigDec::from_i64(4)).unwrap();
+        assert_eq!(
+            four_tiny.checked_div(&BigDec::from_i64(3)),
+            Some(tiny_cap.clone())
+        );
+
         // High-scale repeating divisor: 100 / (3 + 10^-4095) succeeds.
         let hundred = BigDec::from_i64(100);
         let high_scale_div =
@@ -1782,6 +1792,8 @@ mod tests {
         let big_int = BigDec::parse(&format!("1{}", "0".repeat(4084))).unwrap();
         let q_clamp = big_int.checked_div(&BigDec::from_i64(7)).unwrap();
         assert!(q_clamp.fits_limits());
+        assert_eq!(q_clamp.scale, 12);
+        assert_eq!(q_clamp.mantissa.decimal_digits(), MAX_DIGITS);
         assert!(q_clamp.to_string().starts_with("142857142857"));
 
         // Bounded operands with 8192-digit scale gap for mod and idiv.

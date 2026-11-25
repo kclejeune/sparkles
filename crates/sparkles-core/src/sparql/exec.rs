@@ -6158,7 +6158,15 @@ fn topk_candidates(
     ctx.check()?;
     let mut sorted = numbers.clone();
     let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-    let threshold = *kth;
+    // Fixed decimals round once converting the mantissa and again dividing by
+    // an exactly representable power of ten. Each approximation can be at most
+    // two representable steps from the correctly rounded value. Keep the two
+    // error bounds around the cutoff so only the exact comparator resolves them.
+    let threshold = if kth.is_finite() {
+        kth.next_down().next_down().next_down().next_down()
+    } else {
+        *kth
+    };
     let mut selected = Vec::new();
     for (i, number) in numbers.into_iter().enumerate() {
         if i.is_multiple_of(1024) {
@@ -6585,12 +6593,26 @@ fn key_rows_charged(
     t: &Table,
     e: &Expr,
 ) -> Result<super::exprcache::Column<Option<Value>>> {
+    let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
+    let mut charge = ctx.retained_charge(bytes)?;
+    let vals = key_rows_retained(ctx, t, e, &mut charge, &mut bytes)?;
+    Ok(super::exprcache::Column::Rows {
+        vals,
+        _charge: charge,
+    })
+}
+
+fn key_rows_retained(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    charge: &mut Option<super::ctx::RetainedCharge>,
+    bytes: &mut u64,
+) -> Result<Vec<Option<Value>>> {
     let _map_charge = ctx.charge(ctx.nvars() as u64 * 16 + 128)?;
     let nested = super::exists::nested(ctx, t, &[e])?;
     let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
-    let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
-    let mut charge = ctx.retained_charge(bytes)?;
     // Each payload is admitted before the column keeps it, with the charge a step ahead,
     // so that short strings take a charge once per step rather than once per row.
     let step = ctx.reservation_step();
@@ -6616,17 +6638,14 @@ fn key_rows_charged(
             Some(Val::V(v) | Val::Dec(_, v)) => Some(v),
             None => None,
         };
-        bytes = bytes.saturating_add(key_payload(&value));
-        if let Some(charge) = &mut charge {
-            charge.cover(bytes, step)?;
+        *bytes = bytes.saturating_add(key_payload(&value));
+        if let Some(charge) = charge {
+            charge.cover(*bytes, step)?;
         }
         values.push(value);
     }
     ctx.check()?;
-    Ok(super::exprcache::Column::Rows {
-        vals: values,
-        _charge: charge,
-    })
+    Ok(values)
 }
 
 /// The value of an ORDER BY key once per distinct input value, where the key is pure
@@ -6646,7 +6665,13 @@ fn key_per_value(
         return Ok(None);
     }
     if let Some(values) =
-        super::exprcache::cursor_numeric_values(ctx, t, e, report, |v| key_rows(ctx, v, e, None))?
+        super::exprcache::cursor_numeric_values(ctx, t, e, report, |v, charge, bytes| {
+            if matches!(e, Expr::Var(_)) {
+                key_rows(ctx, v, e, None)
+            } else {
+                key_rows_retained(ctx, v, e, charge, bytes)
+            }
+        })?
     {
         return Ok(Some(values));
     }
@@ -7348,17 +7373,14 @@ impl AggState {
                     }
                     Some(SumGeneric::BigInt(bi)) => {
                         if is_avg {
-                            super::bignum::BigDec::from_bigint(*bi)
-                                .checked_div(&super::bignum::BigDec::from_u64(rows))
-                                .map(Value::from_bigdec)
+                            super::value::avg_big_int(*bi, rows)
                         } else {
                             bi.fits_limits().then(|| Value::from_bigint(*bi))
                         }
                     }
                     Some(SumGeneric::BigDec(bd)) => {
                         if is_avg {
-                            bd.checked_div(&super::bignum::BigDec::from_u64(rows))
-                                .map(Value::from_bigdec)
+                            super::value::avg_big_decimal(&bd, rows)
                         } else {
                             bd.fits_limits().then(|| Value::from_bigdec(*bd))
                         }
@@ -11524,4 +11546,35 @@ mod string_order_tests {
             assert!(ctx.check().is_ok(), "cursor {cursor}");
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_big_numeric_sort_keys_are_admitted_as_they_are_evaluated() {
+    use super::expr::ArithOp;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 360 * 1024;
+    let var = ctx.var("v");
+    let ctx = std::sync::Arc::new(ctx);
+    ctx.attach_owner();
+
+    let mut table = Table::new(vec![var]);
+    for i in 1..=512 {
+        let id = Id::from_i64(i).unwrap();
+        table.push_row(&[id]);
+        table.push_row(&[id]);
+    }
+    let factor = Id::from_i64(100_000_000_000_000_003).unwrap();
+    let expr = (0..96).fold(Expr::Var(var), |expr, _| {
+        Expr::Arith(Box::new(expr), Box::new(Expr::Const(factor)), ArithOp::Mul)
+    });
+    let mut report = ExprReport::default();
+    let result = key_per_value(&ctx, &table, &expr, &mut report);
+    assert!(matches!(result, Err(Error::BudgetExceeded(_))));
+    // The initial fixed reservation is about 260 KiB. A one-shot payload charge
+    // would fail there, before the ledger had admitted any of the big values.
+    assert!(ctx.mem_peak() >= 310 * 1024, "peak: {}", ctx.mem_peak());
+    assert_eq!(ctx.live_bytes(), 0);
 }

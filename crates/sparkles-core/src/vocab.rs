@@ -845,6 +845,16 @@ impl Vocab {
         self.num.as_ref()
     }
 
+    /// Upgrade a missing or unreadable numeric column under the generation's writer lock.
+    pub(crate) fn ensure_numeric_column(&self, dir: &Path) -> Result<Option<u64>> {
+        if self.numeric().is_some()
+            || numeric::NumColumn::open(dir, self.len, self.first_triple).is_some()
+        {
+            return Ok(None);
+        }
+        write_numeric_column(dir, self).map(Some)
+    }
+
     #[inline]
     fn num_blocks(&self) -> usize {
         // last 8 bytes store the term count
@@ -2769,7 +2779,10 @@ pub(crate) fn verify_numeric_column(
 /// built by a version from before the column. It reads every literal key once. Returns
 /// the numbers in it; with none, no file is written.
 pub fn add_numeric_column(dir: &Path) -> Result<u64> {
-    let v = Vocab::open(dir)?;
+    write_numeric_column(dir, &Vocab::open(dir)?)
+}
+
+fn write_numeric_column(dir: &Path, v: &Vocab) -> Result<u64> {
     let mut w = numeric::NumWriter::create(dir)?;
     let mut failed = None;
     v.for_each(|_, k| {

@@ -725,6 +725,29 @@ pub(crate) fn exact_sum(sum: i128) -> Value {
     }
 }
 
+/// Divide an aggregate's normalized integer subtotal, including subtotals whose
+/// final quotient can fit even when the subtotal itself exceeds the digit cap.
+pub(crate) fn avg_big_int(sum: BigInt, rows: u64) -> Option<Value> {
+    if let Some(i) = sum.to_i64() {
+        let denom = Value::from_bigint(BigInt::from_u64(rows));
+        return arith(NumOp::Div, &Value::Integer(i.into()), &denom).ok();
+    }
+    BigDec::from_bigint(sum)
+        .checked_div(&BigDec::from_u64(rows))
+        .map(Value::from_bigdec)
+}
+
+/// Choose the precision from the final subtotal so intermediate promotion and
+/// cancellation cannot change AVG.
+pub(crate) fn avg_big_decimal(sum: &BigDec, rows: u64) -> Option<Value> {
+    if let Some(d) = sum.to_oxs_decimal() {
+        let denom = Value::from_bigint(BigInt::from_u64(rows));
+        return arith(NumOp::Div, &Value::Decimal(d), &denom).ok();
+    }
+    sum.checked_div(&BigDec::from_u64(rows))
+        .map(Value::from_bigdec)
+}
+
 /// The decimal product or quotient of `a` and `b` in one `i128` operation, for the
 /// operands whose oxsdatatypes result it is known to equal, or `None` to use
 /// oxsdatatypes (or the big-decimal fallback for terminating quotients needing >18
@@ -973,11 +996,8 @@ fn triple_equals(x: &oxrdf::Triple, y: &oxrdf::Triple) -> EvalResult<bool> {
     equals(&Value::from_term(&x.object), &Value::from_term(&y.object))
 }
 
-/// Total order for ORDER BY (SPARQL 15.1 + ARQ's fallback ordering):
-/// unbound < blank nodes < IRIs < literals; comparable literals by value, the rest by
-/// (kind, lexical form, datatype/lang).
-/// A numeric value as `f64` (rounded; monotone in the value: `x < y` implies
-/// `f(x) <= f(y)`), `None` for non-numeric values and NaN.
+/// A numeric value rounded to `f64`, or `None` for non-numeric values and NaN.
+/// A fixed decimal's promotion can differ slightly from correct rounding.
 pub fn approx_f64(v: &Value) -> Option<f64> {
     if let Value::Decimal(d) = v {
         return Some(decimal_f64(*d));
@@ -1090,6 +1110,9 @@ fn exact_vs_f64(exact: Num<'_>, f: f64) -> Option<Ordering> {
     Some(exact_dec.cmp(&f_exact))
 }
 
+/// Total order for ORDER BY (SPARQL 15.1 + ARQ's fallback ordering).
+/// Unbound precedes blank nodes, IRIs and literals. Comparable literals sort by
+/// value. Other literals sort by kind, lexical form and datatype or language.
 pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     let (a, b) = match (a, b) {
         (None, None) => return Ordering::Equal,

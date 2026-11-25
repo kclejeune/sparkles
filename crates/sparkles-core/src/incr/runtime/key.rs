@@ -51,7 +51,7 @@ pub fn covers(caller: Option<&Arc<GraphAccess>>, view: Option<&Arc<GraphAccess>>
 /// The query's text with the variables the parser names at random (aggregates' and
 /// others' that the source `text` does not hold) renamed in order of appearance, so
 /// that one query parsed twice gives one text.
-pub(super) fn normalized(q: &Query, text: &str) -> String {
+pub(in crate::incr) fn normalized(q: &Query, text: &str) -> String {
     let word = |c: char| c.is_alphanumeric() || c == '_';
     let in_source = |name: &str| {
         ['?', '$'].iter().any(|p| {

@@ -272,17 +272,14 @@ impl SumState {
                 }
                 ExactAcc::Int(bi) => {
                     if avg {
-                        crate::sparql::bignum::BigDec::from_bigint(bi)
-                            .checked_div(&crate::sparql::bignum::BigDec::from_i64(self.rows))
-                            .map(Value::from_bigdec)
+                        crate::sparql::value::avg_big_int(bi, self.rows.try_into().ok()?)
                     } else {
                         bi.fits_limits().then(|| Value::from_bigint(bi))
                     }
                 }
                 ExactAcc::Dec(bd) => {
                     if avg {
-                        bd.checked_div(&crate::sparql::bignum::BigDec::from_i64(self.rows))
-                            .map(Value::from_bigdec)
+                        crate::sparql::value::avg_big_decimal(&bd, self.rows.try_into().ok()?)
                     } else {
                         bd.fits_limits().then(|| Value::from_bigdec(bd))
                     }
@@ -290,22 +287,13 @@ impl SumState {
             };
         }
 
-        let mut acc = if !self.doubles.is_empty() {
-            match exact {
-                ExactAcc::Fixed(v) => {
-                    Value::Double(crate::sparql::value::Num::of(&v).ok()?.to_double())
-                }
-                ExactAcc::Int(bi) => Value::Double(Double::from(bi.to_f64())),
-                ExactAcc::Dec(bd) => Value::Double(Double::from(bd.to_f64())),
-            }
-        } else {
-            match exact {
-                ExactAcc::Fixed(v) => {
-                    Value::Float(crate::sparql::value::Num::of(&v).ok()?.to_float())
-                }
-                ExactAcc::Int(bi) => Value::Float(Float::from(bi.to_f32())),
-                ExactAcc::Dec(bd) => Value::Float(Float::from(bd.to_f32())),
-            }
+        // Fold floats at float precision before the first double promotes the subtotal.
+        let mut acc = match exact {
+            ExactAcc::Fixed(v) => v,
+            ExactAcc::Int(bi) if self.floats.is_empty() => Value::Double(Double::from(bi.to_f64())),
+            ExactAcc::Dec(bd) if self.floats.is_empty() => Value::Double(Double::from(bd.to_f64())),
+            ExactAcc::Int(bi) => Value::Float(Float::from(bi.to_f32())),
+            ExactAcc::Dec(bd) => Value::Float(Float::from(bd.to_f32())),
         };
         let mut floats: Vec<(f32, i64)> = self
             .floats

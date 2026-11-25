@@ -23,7 +23,7 @@
 //! and each row's index into them are the cache: at most one entry per input row, charged
 //! to the query's memory budget while they are built.
 
-use super::ctx::Ctx;
+use super::ctx::{Ctx, RetainedCharge};
 use super::exec::PAR_MIN_LEN;
 use super::expr::{Expr, Func, needs_values};
 use super::table::{Table, VarId};
@@ -454,9 +454,9 @@ pub fn per_value<T: Send>(
     }))
 }
 
-/// Fixed-size numeric ORDER keys can reuse input IDs without retaining decoded
-/// strings or populating the eager value cache. Own the reservation with the
-/// returned values/slots; it must survive until the sort has finished.
+/// Numeric ORDER keys can reuse fixed-width input IDs without retaining decoded
+/// strings or populating the eager value cache. The reservation follows the returned
+/// values and slots until the sort has finished.
 ///
 /// An input of more than [`super::exec::PAR_THRESHOLD`] rows takes this path only when
 /// its integers span a dense range, which [`cursor_integer_distinct`] reads in parallel,
@@ -466,7 +466,11 @@ pub(super) fn cursor_numeric_values(
     t: &Table,
     e: &Expr,
     report: &mut Report,
-    eval: impl FnOnce(&Table) -> Result<Vec<Option<super::value::Value>>>,
+    eval: impl FnOnce(
+        &Table,
+        &mut Option<RetainedCharge>,
+        &mut u64,
+    ) -> Result<Vec<Option<super::value::Value>>>,
 ) -> Result<Option<PerValue<Option<super::value::Value>>>> {
     fn numeric(e: &Expr) -> bool {
         match e {
@@ -521,23 +525,28 @@ pub(super) fn cursor_numeric_values(
     let Some(d) = d else {
         return Ok(None);
     };
-    let vals = eval(&d.values)?;
-    ctx.check()?;
-    let big_payload: u64 = vals
-        .iter()
-        .map(|v| match v {
-            Some(super::value::Value::BigInteger(i)) => i.heap_bytes() + 32,
-            Some(super::value::Value::BigDecimal(d)) => d.heap_bytes() + 32,
-            _ => 0,
-        })
-        .sum();
-    let retained = (vals.capacity() as u64
-        * std::mem::size_of::<Option<super::value::Value>>() as u64)
-        .saturating_add(big_payload)
-        .saturating_add(d.slot.as_ref().map_or(0, |s| s.capacity() as u64 * 4))
-        .saturating_add(4096);
+    let distinct_bytes = d.values.capacity_bytes();
+    let mut retained = d.values.len() as u64
+        * std::mem::size_of::<Option<super::value::Value>>() as u64
+        + d.slot.as_ref().map_or(0, |s| s.capacity() as u64 * 4)
+        + 4096
+        + distinct_bytes;
     if let Some(charge) = &mut charge {
-        charge.resize(retained)?;
+        charge.cover(retained, 0)?;
+    }
+    // A numeric expression can widen even though its input is fixed-width.
+    // Reserve a transient result before evaluation and charge every result
+    // before the evaluator adds it to the retained column.
+    let scratch = (!matches!(e, Expr::Var(_)))
+        .then(|| ctx.charge(super::bignum::AGG_SUM_PAYLOAD_BYTES))
+        .transpose()?;
+    let vals = eval(&d.values, &mut charge, &mut retained)?;
+    ctx.check()?;
+    drop((scratch, d.values));
+    if let Some(charge) = &mut charge {
+        let extra_slots = (vals.capacity() - vals.len()) as u64
+            * std::mem::size_of::<Option<super::value::Value>>() as u64;
+        charge.resize(retained - distinct_bytes + extra_slots)?;
     }
     Ok(Some(PerValue {
         vals,

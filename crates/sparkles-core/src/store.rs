@@ -6380,10 +6380,7 @@ impl Store {
         let Some(dir) = snap.generation.dir.as_ref() else {
             return Ok(None);
         };
-        if snap.generation.vocab.numeric().is_some() {
-            return Ok(None);
-        }
-        crate::vocab::add_numeric_column(dir).map(Some)
+        snap.generation.vocab.ensure_numeric_column(dir)
     }
 
     pub fn disk_bytes(&self) -> u64 {

@@ -672,6 +672,7 @@ fn legacy_spkvnum2_file_is_ignored_so_big_integers_are_not_dropped() {
     // file to SPKVNUM3 rather than refusing because the stale file exists on disk.
     let rebuilt = s.add_numeric_column().unwrap();
     assert!(rebuilt.is_some(), "stale SPKVNUM2 should be rebuilt");
+    assert_eq!(s.add_numeric_column().unwrap(), None);
     drop(s);
     let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
     assert!(

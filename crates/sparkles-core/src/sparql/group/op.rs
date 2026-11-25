@@ -24,6 +24,7 @@
 use super::acc::{Accumulator, Arg, Batch, Concat, Distinct, RowIndex, Rows, Running};
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::sparql::bignum::AGG_SUM_PAYLOAD_BYTES;
 use crate::sparql::ctx::{Ctx, RetainedCharge};
 use crate::sparql::exec::{compute_column, stat_aggregate};
 use crate::sparql::expr::Expr;
@@ -171,7 +172,16 @@ pub(crate) struct Grouping {
     pub(crate) passes: usize,
 }
 
-fn accumulators(ctx: &Ctx, aggs: &[Agg], charged: bool) -> Vec<Box<dyn Accumulator>> {
+fn sum_or_avg(agg: &Agg) -> bool {
+    matches!(agg.func, AggregateFunction::Sum | AggregateFunction::Avg)
+}
+
+fn accumulators(
+    ctx: &Ctx,
+    aggs: &[Agg],
+    charged: bool,
+    sum_reserved: bool,
+) -> Vec<Box<dyn Accumulator>> {
     aggs.iter()
         .map(|agg| -> Box<dyn Accumulator> {
             if !running(ctx, agg) {
@@ -179,7 +189,10 @@ fn accumulators(ctx: &Ctx, aggs: &[Agg], charged: bool) -> Vec<Box<dyn Accumulat
             }
             let inner: Box<dyn Accumulator> = match agg.func {
                 AggregateFunction::GroupConcat { .. } => Box::new(Concat::new(agg)),
-                _ => Box::new(Running::new(agg, charged)),
+                _ => Box::new(Running::new(
+                    agg,
+                    charged && !(sum_reserved && sum_or_avg(agg)),
+                )),
             };
             if agg.distinct {
                 Box::new(Distinct::new(inner, agg.expr.is_none()))
@@ -202,15 +215,32 @@ impl Grouping {
         charged: bool,
         spill: bool,
     ) -> Result<Self> {
-        let bytes = aggs.len() as u64 * 256 + keys.len() as u64 * 64 + 1024;
+        let whole = !hashable(ctx, aggs);
+        let query = if spill && !whole && !keys.is_empty() {
+            ctx.spill.clone()
+        } else {
+            None
+        };
+        let agg_list: Vec<Agg> = aggs.iter().map(|(_, a)| a.clone()).collect();
+        let sum_payload = if query.is_some() {
+            agg_list.iter().filter(|agg| sum_or_avg(agg)).count() as u64 * AGG_SUM_PAYLOAD_BYTES
+        } else {
+            0
+        };
+        // A fold can align both operands, produce a result, and normalize it.
+        // All accumulators share this scratch space because they fold sequentially.
+        let sum_scratch = if sum_payload > 0 {
+            4 * AGG_SUM_PAYLOAD_BYTES
+        } else {
+            0
+        };
+        let bytes = aggs.len() as u64 * 256 + keys.len() as u64 * 64 + 1024 + sum_scratch;
         let charge = if charged {
             ctx.retained_charge(bytes)?
         } else {
             None
         };
-        let agg_list: Vec<Agg> = aggs.iter().map(|(_, a)| a.clone()).collect();
-        let accs = accumulators(ctx, &agg_list, charge.is_some());
-        let whole = !hashable(ctx, aggs);
+        let accs = accumulators(ctx, &agg_list, charge.is_some(), sum_payload > 0);
         let sources = agg_list
             .iter()
             .map(|agg| match &agg.expr {
@@ -225,7 +255,13 @@ impl Grouping {
         // columns, the key in `order`, and each accumulator's state for the group.
         // Text and values that states own are charged as they grow.
         let entry = if nk == 1 { 13 } else { 8 * nk + 16 + 21 };
-        let per_group = entry * 2 + nk * 8 + accs.iter().map(|a| a.group_bytes()).sum::<u64>() + 16;
+        // Every row of an admitted group stays in this pass. Hold enough room
+        // for its SUM and AVG even when a later batch promotes their subtotals.
+        let per_group = entry * 2
+            + nk * 8
+            + accs.iter().map(|a| a.group_bytes()).sum::<u64>()
+            + 16
+            + sum_payload;
         let mut grouping = Self {
             keys: keys
                 .iter()
@@ -245,7 +281,7 @@ impl Grouping {
             reserved: bytes,
             base: bytes,
             eager: false,
-            query: None,
+            query,
             threshold: 0,
             frozen: false,
             writers: Vec::new(),
@@ -256,8 +292,6 @@ impl Grouping {
         };
         if keys.is_empty() {
             grouping.insert(ctx, &[])?;
-        } else if spill && !whole {
-            grouping.query = ctx.spill.clone();
         }
         Ok(grouping)
     }
@@ -611,7 +645,7 @@ impl Grouping {
         };
         self.index = Index::new(self.keys.len());
         self.order = Vec::new();
-        self.accs = accumulators(ctx, &self.aggs, self.charge.is_some());
+        self.accs = accumulators(ctx, &self.aggs, self.charge.is_some(), true);
         self.groups = 0;
         self.at = 0;
         self.frozen = false;

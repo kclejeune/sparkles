@@ -317,3 +317,87 @@ fn running_sum_tracks_big_number_subtotal_growth() {
         "expected merge growth for big-number SUM"
     );
 }
+
+#[test]
+fn running_decimal_avg_uses_the_final_subtotal_precision() {
+    let ctx = ctx();
+    let decimal = |s| ctx.intern_value(&Value::from_typed(s, oxrdf::vocab::xsd::DECIMAL.as_str()));
+    let a = decimal("100000000000000000000.0");
+    let neg = decimal("-100000000000000000000.0");
+    let zero = decimal("0.0");
+    let tiny = decimal("0.000000000000000001");
+    let avg = agg(AggregateFunction::Avg, true, false);
+    for inputs in [[a, a, neg, neg, zero, tiny], [a, neg, a, neg, zero, tiny]] {
+        let mut acc = Running::new(&avg, false);
+        acc.init(1);
+        fold(&ctx, &mut acc, &inputs, &[0; 6]);
+        assert_eq!(results(&ctx, &mut acc, 1), ["0"]);
+    }
+}
+
+#[test]
+fn spill_group_reserves_room_for_subtotals_in_later_batches() {
+    use super::group::op::Grouping;
+    use crate::spill::{Spill, SpillOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: dir.path().to_path_buf(),
+        max_bytes: 4 << 30,
+        query_bytes: 4 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+    let mut ctx = ctx();
+    ctx.mem_limit = 1 << 20;
+    ctx.spill = Some(std::sync::Arc::new(spill.query(None)));
+    let key = ctx.var("key");
+    let value = ctx.var("value");
+    let sum = ctx.var("sum");
+    let ctx = std::sync::Arc::new(ctx);
+    ctx.attach_owner();
+
+    let mut table = Table::new(vec![key, value]);
+    for group in 0..1024 {
+        table.push_row(&[int(&ctx, group), int(&ctx, 0)]);
+    }
+    let mut agg = agg(AggregateFunction::Sum, true, false);
+    agg.expr = Some(super::expr::Expr::Var(value));
+    let mut grouping = Grouping::new(&ctx, &[key], &[(sum, agg)], &table.vars, true, true).unwrap();
+    let mut report = super::exprcache::Report::default();
+    grouping.start_pass(&ctx);
+    grouping.add(&ctx, &table, &mut report).unwrap();
+
+    let big = ctx.intern_value(&Value::from_typed(
+        &"9".repeat(4096),
+        oxrdf::vocab::xsd::INTEGER.as_str(),
+    ));
+    table.cols[1].fill(big);
+    grouping.add(&ctx, &table, &mut report).unwrap();
+    grouping.end_input().unwrap();
+    assert!(grouping.spilled > 0);
+    let mut found = Vec::new();
+    loop {
+        let output = grouping
+            .output(&ctx, &[key, sum], usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!((1..1024).contains(&output.len()));
+        assert!(output.cols[1].iter().all(|&id| id == big));
+        found.extend(output.cols[0].iter().map(|id| id.as_i64()));
+        let Some(mut reader) = grouping.next_pass(&ctx).unwrap() else {
+            break;
+        };
+        grouping.start_pass(&ctx);
+        while let Some((cols, len)) = reader.next_frame().unwrap() {
+            table.cols = cols;
+            table.len = len;
+            grouping.add(&ctx, &table, &mut report).unwrap();
+        }
+        grouping.end_input().unwrap();
+    }
+    found.sort_unstable();
+    assert_eq!(found, (0..1024).collect::<Vec<_>>());
+    assert_eq!(spill.reserved_bytes(), 0);
+}
