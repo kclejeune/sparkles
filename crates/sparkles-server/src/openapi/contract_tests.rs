@@ -125,6 +125,8 @@ async fn kept_classification_and_projection_responses_match_typed_schemas() {
         Arc::new(AppState::new(dir.path(), Default::default(), Duration::from_secs(30)).unwrap());
     let ds = state.attach("kept", DbType::Mem, None).unwrap();
     ds.dataset.update("PREFIX : <urn:> PREFIX owl: <http://www.w3.org/2002/07/owl#> INSERT DATA { :A a owl:Class ; owl:equivalentClass :B . :B a owl:Class . }").unwrap();
+    let ds_excluded = state.attach("kept_excluded", DbType::Mem, None).unwrap();
+    ds_excluded.dataset.update("PREFIX : <urn:> PREFIX owl: <http://www.w3.org/2002/07/owl#> INSERT DATA { :A a owl:Class ; owl:equivalentClass :B . :B a owl:Class . :x a :A . }").unwrap();
     let app = crate::http::router(state);
     let doc = build("test");
     let path = "/$/ontology/{ds}/classification";
@@ -187,24 +189,138 @@ async fn kept_classification_and_projection_responses_match_typed_schemas() {
     assert_eq!(full["class"]["incomplete"], false);
     assert!(full["nodes"].is_array());
     assert!(full["stats"]["unmapped"].is_u64());
-    let (code, receipt_body) = call_as(
-        &app,
-        "POST",
-        "/$/ontology/kept/classify?receipt=true",
-        Some(json!({"target":"urn:kept:tax","about":"urn:A"})),
-        Some("application/x-sparkles+json"),
-    )
-    .await;
-    assert_eq!(code, StatusCode::OK, "{receipt_body}");
     let receipt_schema = &doc["paths"]["/$/ontology/{ds}/classify"]["post"]["responses"]["200"]["content"]
         ["application/x-sparkles+json"]["schema"];
+    for (uri, accept, target) in [
+        (
+            "/$/ontology/kept/classify?receipt=true",
+            None,
+            "urn:kept:tax-query",
+        ),
+        (
+            "/$/ontology/kept/classify",
+            Some("application/x-sparkles+json"),
+            "urn:kept:tax-accept",
+        ),
+    ] {
+        let (code, headers, receipt_body) = call_as_with_headers(
+            &app,
+            "POST",
+            uri,
+            Some(json!({"target": target, "about": "urn:A"})),
+            accept,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{uri}: {receipt_body}");
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-sparkles+json"),
+            "{uri}: {headers:?}"
+        );
+        assert_eq!(
+            mismatch(&doc, receipt_schema, &receipt_body, "$"),
+            None,
+            "{uri}: {receipt_body}"
+        );
+        assert!(receipt_body["commit"].is_object());
+        assert!(receipt_body["written"]["committed"].is_boolean());
+    }
+    let excluded_full = checked(
+        &doc,
+        &app,
+        "POST",
+        "/$/ontology/{ds}/classify",
+        "/$/ontology/kept_excluded/classify",
+        Some(json!({"about":"urn:A","nodes":true,"limit":10})),
+    )
+    .await;
+    assert_eq!(excluded_full["complete"], false, "{excluded_full}");
+    assert_eq!(excluded_full["partial"], false, "{excluded_full}");
+    assert_eq!(excluded_full["consistency"], "unknown", "{excluded_full}");
     assert_eq!(
-        mismatch(&doc, receipt_schema, &receipt_body, "$"),
-        None,
-        "{receipt_body}"
+        excluded_full["class"]["incomplete"], true,
+        "{excluded_full}"
     );
-    assert!(receipt_body["commit"].is_object());
-    assert!(receipt_body["written"]["committed"].is_boolean());
+    assert!(
+        excluded_full["excludedCount"].as_u64() >= Some(1),
+        "{excluded_full}"
+    );
+    assert!(
+        !excluded_full["excluded"].as_array().unwrap().is_empty(),
+        "{excluded_full}"
+    );
+    assert_eq!(
+        excluded_full["excluded"][0]["rule"], "assertion-not-read",
+        "{excluded_full}"
+    );
+    let excluded_frame = checked(
+        &doc,
+        &app,
+        "POST",
+        "/$/ontology/{ds}/classify",
+        "/$/ontology/kept_excluded/classify",
+        Some(json!({"projection":"frame","about":"urn:A","limit":10})),
+    )
+    .await;
+    assert_eq!(
+        excluded_frame["frame"]["incomplete"], true,
+        "{excluded_frame}"
+    );
+    assert!(
+        !excluded_frame["frame"]["excluded"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{excluded_frame}"
+    );
+    let excluded_status = checked(
+        &doc,
+        &app,
+        "GET",
+        path,
+        "/$/ontology/kept_excluded/classification?about=urn%3AA",
+        None,
+    )
+    .await;
+    assert_eq!(excluded_status["status"], "available", "{excluded_status}");
+    assert_eq!(
+        excluded_status["outcome"]["partial"], false,
+        "{excluded_status}"
+    );
+    assert_eq!(
+        excluded_status["outcome"]["complete"], false,
+        "{excluded_status}"
+    );
+    assert_eq!(
+        excluded_status["entity"]["incomplete"], true,
+        "{excluded_status}"
+    );
+    assert!(
+        excluded_status["outcome"]["excludedCount"].as_u64() >= Some(1),
+        "{excluded_status}"
+    );
+    let excluded_page = checked(
+        &doc,
+        &app,
+        "GET",
+        path,
+        "/$/ontology/kept_excluded/classification?part=excluded&limit=10",
+        None,
+    )
+    .await;
+    assert!(
+        !excluded_page["page"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{excluded_page}"
+    );
+    assert_eq!(
+        excluded_page["page"]["items"][0]["gap"]["kind"], "omitted",
+        "{excluded_page}"
+    );
 }
 
 #[test]
@@ -256,14 +372,14 @@ fn commit_schema_preserves_hidden_counts_without_accepting_invalid_counts() {
     assert!(mismatch(&doc, schema, &commit, "$").is_some());
 }
 
-/// `call` with an `Accept` header.
-async fn call_as(
+/// `call` with an `Accept` header, returning the status, headers and JSON body.
+async fn call_as_with_headers(
     app: &axum::Router,
     method: &str,
     uri: &str,
     body: Option<J>,
     accept: Option<&str>,
-) -> (StatusCode, J) {
+) -> (StatusCode, axum::http::HeaderMap, J) {
     let mut req = Request::builder().method(method).uri(uri);
     if let Some(a) = accept {
         req = req.header("accept", a);
@@ -277,10 +393,23 @@ async fn call_as(
     };
     let res = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
     let status = res.status();
+    let headers = res.headers().clone();
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
         .await
         .unwrap();
     let j = serde_json::from_slice(&bytes).unwrap_or(J::Null);
+    (status, headers, j)
+}
+
+/// `call` with an `Accept` header.
+async fn call_as(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<J>,
+    accept: Option<&str>,
+) -> (StatusCode, J) {
+    let (status, _, j) = call_as_with_headers(app, method, uri, body, accept).await;
     (status, j)
 }
 
