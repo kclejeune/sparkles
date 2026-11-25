@@ -100,18 +100,29 @@ impl Evaluator<'_> {
     }
 
     pub(crate) fn expr(&self, e: &Expression, cx: &Cx, s: &Solution) -> R<Term> {
-        Ok(self.binding(e, cx, s)?.term)
+        let binding = self.binding(e, cx, s)?;
+        if binding.reads_spelling() {
+            self.read_spelling.set(true);
+        }
+        Ok(binding.term)
     }
 
     pub(super) fn binding(&self, e: &Expression, cx: &Cx, s: &Solution) -> R<Binding> {
-        let binding = self.eval_binding(e, cx, s)?;
-        if matches!(
-            binding.origin,
-            Origin::NumericLexical(_) | Origin::SpellingDependent
-        ) {
-            self.read_spelling.set(true);
+        let outer = self.read_spelling.replace(false);
+        let result = self.eval_binding(e, cx, s);
+        let read = self.read_spelling.replace(outer);
+        match result {
+            Ok(mut binding) => {
+                binding.spelling_dependent |= read;
+                Ok(binding)
+            }
+            Err(error) => {
+                // A different spelling may make this expression succeed, including
+                // an argument that COALESCE passed over.
+                self.read_spelling.set(outer || read);
+                Err(error)
+            }
         }
-        Ok(binding)
     }
 
     fn eval_binding(&self, e: &Expression, cx: &Cx, s: &Solution) -> R<Binding> {
@@ -159,10 +170,37 @@ impl Evaluator<'_> {
                 }
                 let mut values = Vec::with_capacity(args.len());
                 let mut first_origin = Origin::Exact;
+                let metadata_only = matches!(
+                    f,
+                    Function::Lang
+                        | Function::Datatype
+                        | Function::LangDir
+                        | Function::HasLang
+                        | Function::HasLangDir
+                        | Function::IsIri
+                        | Function::IsBlank
+                        | Function::IsLiteral
+                        | Function::IsTriple
+                );
+                let lexical_constructor = matches!(
+                    f,
+                    Function::Str | Function::StrDt | Function::StrLang | Function::StrLangDir
+                );
                 for (i, a) in args.iter().enumerate() {
                     let b = self.binding(a, cx, s)?;
                     if i == 0 {
                         first_origin = b.origin;
+                    }
+                    let copies_spelling = i == 0
+                        && (lexical_constructor
+                            || matches!(f, Function::Custom(n) if n.as_str() == xsd::STRING.as_str())
+                                && matches!(&b.term, Term::Literal(l) if is_string_literal(l)));
+                    // A metadata read ignores lexical variation, but still depends on
+                    // computations that can change the argument's metadata or success.
+                    if b.spelling_dependent
+                        || !metadata_only && !copies_spelling && b.reads_spelling()
+                    {
+                        self.read_spelling.set(true);
                     }
                     values.push(b.term);
                 }
@@ -203,7 +241,11 @@ impl Evaluator<'_> {
                     }
                     _ => Origin::Exact,
                 };
-                Ok(Binding { term, origin })
+                Ok(Binding {
+                    term,
+                    origin,
+                    spelling_dependent: false,
+                })
             }
             E::Add(..)
             | E::Subtract(..)

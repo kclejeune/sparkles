@@ -16,14 +16,17 @@
 //! answer that the conditions before it forbid. An answer whose rows themselves are open,
 //! because an open value decides which rows there are, is not compared.
 
-use super::{AggregateErrors, Error, Notes, Origin, Reference, Selected, SpellingKey, value};
+use super::{
+    AggregateErrors, Error, Notes, Origin, Reference, Selected, SortKey, SpellingKey, TopOrder,
+    value,
+};
 
 /// The engine's default reading of the aggregates over errors and non-strings, which the
 /// comparisons take. Roadmap item 1064's setting makes Jena's reading the engine's
 /// default, and the engine runs under it whenever a query chooses no other.
 pub const ENGINE_AGGREGATE_ERRORS: AggregateErrors = AggregateErrors::Jena;
 use oxrdf::Term;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// The reference's answer to a query that an engine answered.
 #[derive(Debug, Clone)]
@@ -163,16 +166,15 @@ pub fn check_select(
         }
         let matching = match_rows(expected, &rows, &got, relax_lexical)?;
         let Some(order) = order else {
-            return if expected.order_unchecked {
-                Ok(Outcome::OrderUnchecked(
-                    "DISTINCT kept a row whose copies have different sort keys".into(),
-                ))
-            } else {
-                Ok(Outcome::Compared)
-            };
+            return Ok(Outcome::Compared);
         };
         let keys = observed_keys(order, &expected.variables, &matching.chosen, &got);
-        let outcome = check_order(order, &keys.terms, &matching)?;
+        let outcome = match check_order(order, &keys.terms, &matching.chosen) {
+            Err(message) if matching.ambiguous => {
+                check_alternative_keys(order, &expected.variables, &got, &matching, message)?
+            }
+            other => other?,
+        };
         let open_conditions = order.open_conditions || keys.incomplete;
         // The keys of an order with an open condition tell which orders are forbidden and
         // not which are allowed, so an answer that breaks no constraint is not passed.
@@ -181,14 +183,12 @@ pub fn check_select(
                 if open_conditions && got.len() < order.items.len() =>
             {
                 Outcome::Skipped(
-                    "an ORDER BY key is open or uses an unobserved numeric spelling, which can decide the rows of \
-                     the slice"
+                    "an ORDER BY key has an unknown suffix, which can decide the rows of the slice"
                         .into(),
                 )
             }
             Outcome::Compared if open_conditions => Outcome::OrderUnchecked(
-                "an ORDER BY key is open or uses an unobserved numeric spelling, and the remaining \
-                 conditions can order rows that tie before it"
+                "an ORDER BY key has an unknown suffix, which can order rows that tie on its prefix"
                     .into(),
             ),
             // where the slice cuts rows, an order that is not established leaves its rows
@@ -262,7 +262,7 @@ fn cell(t: &Option<Term>, open: bool, origin: Origin) -> String {
                     );
                 }
             }
-            Origin::Exact | Origin::SpellingDependent => {}
+            Origin::Exact => {}
         }
     }
     term.to_string()
@@ -285,6 +285,8 @@ struct RowGroup {
 
 struct Matching {
     chosen: Vec<usize>,
+    groups: Vec<RowGroup>,
+    candidates: Vec<Vec<usize>>,
     ambiguous: bool,
 }
 
@@ -306,7 +308,6 @@ fn match_rows(
             .zip(&expected.open)
             .map(|(&origin, &open)| match origin {
                 _ if open => Origin::Exact,
-                Origin::SpellingDependent => Origin::Exact,
                 Origin::NumericLexical(_) if !relax_lexical => Origin::Exact,
                 other => other,
             })
@@ -372,7 +373,12 @@ fn match_rows(
                 .any(|&g| spread[g] || &order.items[groups[g].expected[0]].1 != first)
         })
     });
-    Ok(Matching { chosen, ambiguous })
+    Ok(Matching {
+        chosen,
+        groups,
+        candidates,
+        ambiguous,
+    })
 }
 
 /// Find a free group by following alternating paths through occupied matches.
@@ -412,19 +418,51 @@ fn reassign(i: usize, candidates: &[Vec<usize>], groups: &mut [RowGroup]) -> boo
 }
 
 struct ObservedKeys {
-    terms: Vec<Option<Vec<Option<Term>>>>,
+    terms: Vec<Option<KeyTerms>>,
     incomplete: bool,
 }
 
+type KeyTerms = Vec<Option<Term>>;
+
+/// Apply one possible reference row's key to an engine row, keeping only the
+/// conditions whose values are known.
+fn observe_key(
+    key: &SortKey,
+    variables: &[String],
+    row: Option<&[Option<Term>]>,
+) -> (KeyTerms, bool) {
+    let mut terms = key.terms.clone();
+    for (i, source) in key.spelling.iter().enumerate() {
+        let Some(source) = source else { continue };
+        let cell = |v: &oxrdf::Variable| {
+            let column = variables.iter().position(|name| name == v.as_str())?;
+            Some(&row?[column])
+        };
+        let observed = match source {
+            SpellingKey::Variable(v) => cell(v).cloned(),
+            SpellingKey::StrOf(v) => {
+                cell(v).map(|cell| cell.as_ref().and_then(value::lexical_string))
+            }
+            SpellingKey::Unobserved => None,
+        };
+        let Some(observed) = observed else {
+            terms.truncate(i);
+            return (terms, true);
+        };
+        terms[i] = observed;
+    }
+    (terms, false)
+}
+
 fn observed_keys(
-    order: &super::TopOrder,
+    order: &TopOrder,
     variables: &[String],
     chosen: &[usize],
     got: &[Vec<Option<Term>>],
 ) -> ObservedKeys {
     let mut observed = vec![None; order.items.len()];
     for (&i, row) in chosen.iter().zip(got) {
-        observed[i] = Some(row);
+        observed[i] = Some(row.as_slice());
     }
     let mut incomplete = false;
     let terms = order
@@ -432,32 +470,90 @@ fn observed_keys(
         .iter()
         .zip(observed)
         .map(|((_, key), row)| {
-            let key = key.as_ref()?;
-            let mut terms = key.terms.clone();
-            for (i, source) in &key.spelling {
-                let cell = |v: &oxrdf::Variable| {
-                    let column = variables.iter().position(|name| name == v.as_str())?;
-                    Some(&row?[column])
-                };
-                let observed = match source {
-                    SpellingKey::Variable(v) => cell(v).cloned(),
-                    SpellingKey::StrOf(v) => {
-                        cell(v).map(|cell| cell.as_ref().and_then(value::lexical_string))
-                    }
-                    SpellingKey::Unobserved => None,
-                };
-                if let Some(observed) = observed {
-                    terms[*i] = observed;
-                } else {
-                    terms.truncate(*i);
-                    incomplete = true;
-                    break;
-                }
-            }
+            let (terms, open) = observe_key(key.as_ref()?, variables, row);
+            incomplete |= open;
             Some(terms)
         })
         .collect();
     ObservedKeys { terms, incomplete }
+}
+
+/// Raw reference keys can differ even when the observed ORDER BY values agree.
+/// Only weaken a failure if a choice of matching could affect the constraints.
+fn check_alternative_keys(
+    order: &TopOrder,
+    variables: &[String],
+    got: &[Vec<Option<Term>>],
+    matching: &Matching,
+    message: String,
+) -> Result<Outcome, String> {
+    let group_keys: Vec<HashSet<_>> = matching
+        .groups
+        .iter()
+        .map(|group| {
+            group
+                .expected
+                .iter()
+                .map(|&i| order.items[i].1.as_ref())
+                .collect()
+        })
+        .collect();
+    let observed = |key: Option<&SortKey>, row| key.map(|k| observe_key(k, variables, row).0);
+    let sliced = got.len() < order.items.len();
+    let mut varies = false;
+    let mut budget = ORDER_BUDGET;
+    let unchecked = |why: &str| Ok(Outcome::OrderUnchecked(why.into()));
+    let mut alternatives = Vec::new();
+    for (i, row) in got.iter().enumerate() {
+        let chosen = order.items[matching.chosen[i]].1.as_ref();
+        let outside = observed(chosen, None);
+        let mut keys = HashSet::new();
+        for &g in &matching.candidates[i] {
+            for &key in &group_keys[g] {
+                let Some(left) = budget.checked_sub(1) else {
+                    return unchecked("the order check's budget ran out");
+                };
+                budget = left;
+                keys.insert(observed(key, Some(row.as_slice())));
+                // For a slice, exchanging rows between the returned and omitted
+                // sets can alter the constraints even when the returned keys agree.
+                varies |= sliced && observed(key, None) != outside;
+            }
+        }
+        varies |= keys.len() > 1;
+        alternatives.push(keys);
+    }
+    if !varies {
+        return Err(message);
+    }
+    // Check every pair of returned rows, including pairs unrelated to the ambiguity.
+    // If even independently chosen candidate keys force an inversion, a consistent
+    // matching of the whole bag cannot avoid it.
+    for (j, later) in alternatives.iter().enumerate() {
+        for earlier in &alternatives[..j] {
+            let mut inverted = true;
+            'pairs: for a in later {
+                for b in earlier {
+                    let Some(left) = budget.checked_sub(1) else {
+                        return unchecked("the order check's budget ran out");
+                    };
+                    budget = left;
+                    if !matches!((a, b), (Some(a), Some(b))
+                        if super::strictly_before(a, b, &order.descending, order.term_ties))
+                    {
+                        inverted = false;
+                        break 'pairs;
+                    }
+                }
+            }
+            if inverted {
+                return Err(format!("row {j} belongs before an earlier row"));
+            }
+        }
+    }
+    Ok(Outcome::OrderUnchecked(format!(
+        "equal rows can have different sort keys, and the first matching found {message}"
+    )))
 }
 
 /// Check that `got` is a slice, at the query's offset, of an order of the reference's
@@ -476,13 +572,12 @@ fn observed_keys(
 /// around it in their own order, complete it to an allowed order, and its order is
 /// unchecked otherwise.
 fn check_order(
-    order: &super::TopOrder,
-    row_keys: &[Option<Vec<Option<Term>>>],
-    matching: &Matching,
+    order: &TopOrder,
+    row_keys: &[Option<KeyTerms>],
+    chosen: &[usize],
 ) -> Result<Outcome, String> {
     let n = row_keys.len();
     let from = order.offset.min(n);
-    let chosen = &matching.chosen;
     // blocks of equal keys, in the reference's order
     let mut block = Vec::with_capacity(n);
     let mut keys = Vec::new();
@@ -501,15 +596,6 @@ fn check_order(
             _ => false,
         })
     };
-    let fail = |message: String| -> Result<Outcome, String> {
-        if matching.ambiguous {
-            Ok(Outcome::OrderUnchecked(format!(
-                "equal rows with different sort keys, and the first matching found {message}"
-            )))
-        } else {
-            Err(message)
-        }
-    };
     let unchecked = || {
         Ok(Outcome::OrderUnchecked(
             "the order check's budget ran out".into(),
@@ -523,7 +609,7 @@ fn check_order(
             match before(b, earlier) {
                 None => return unchecked(),
                 Some(true) => {
-                    return fail(format!("row {j} belongs before an earlier row"));
+                    return Err(format!("row {j} belongs before an earlier row"));
                 }
                 Some(false) => {}
             }
@@ -568,7 +654,7 @@ fn check_order(
             }
         };
         if is_before && is_after {
-            return fail(format!(
+            return Err(format!(
                 "the reference's row {} belongs both before and after returned rows",
                 i
             ));
@@ -578,12 +664,12 @@ fn check_order(
     }
     let rest = n - chosen.len();
     if forced_before > from {
-        return fail(format!(
+        return Err(format!(
             "{forced_before} rows belong before the returned rows, more than the offset {from}"
         ));
     }
     if from + forced_after > rest {
-        return fail(format!(
+        return Err(format!(
             "{forced_after} rows belong after the returned rows, more than the {} rows after the slice",
             rest - from
         ));

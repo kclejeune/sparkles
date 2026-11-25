@@ -57,7 +57,6 @@ enum Origin {
     Exact,
     ComputedNumber,
     NumericLexical(value::NumericKind),
-    SpellingDependent,
 }
 
 impl Origin {
@@ -70,6 +69,8 @@ impl Origin {
 struct Binding {
     term: Term,
     origin: Origin,
+    /// A computation that depends on a spelling beyond carrying it into this term.
+    spelling_dependent: bool,
 }
 
 impl Binding {
@@ -77,6 +78,7 @@ impl Binding {
         Self {
             term,
             origin: Origin::Exact,
+            spelling_dependent: false,
         }
     }
 
@@ -84,7 +86,12 @@ impl Binding {
         Self {
             term,
             origin: Origin::ComputedNumber,
+            spelling_dependent: false,
         }
+    }
+
+    fn reads_spelling(&self) -> bool {
+        self.spelling_dependent || matches!(self.origin, Origin::NumericLexical(_))
     }
 }
 
@@ -94,6 +101,7 @@ impl Binding {
 pub(crate) struct Solution {
     terms: BTreeMap<Variable, Term>,
     origins: BTreeMap<Variable, Origin>,
+    spelling_dependent: HashSet<Variable>,
 }
 
 impl std::ops::Deref for Solution {
@@ -117,6 +125,7 @@ impl Solution {
         Some(Binding {
             term: self.get(v)?.clone(),
             origin: self.origin(v),
+            spelling_dependent: self.spelling_dependent.contains(v),
         })
     }
 
@@ -130,12 +139,18 @@ impl Solution {
         } else {
             self.origins.insert(v.clone(), binding.origin);
         }
+        if binding.spelling_dependent {
+            self.spelling_dependent.insert(v.clone());
+        } else {
+            self.spelling_dependent.remove(&v);
+        }
         self.terms.insert(v, binding.term);
     }
 
     fn project(&mut self, variables: &[Variable]) {
         self.terms.retain(|v, _| variables.contains(v));
         self.origins.retain(|v, _| variables.contains(v));
+        self.spelling_dependent.retain(|v| variables.contains(v));
     }
 }
 
@@ -605,9 +620,6 @@ pub struct Selected {
     origins: Vec<Vec<Origin>>,
     /// The order and slice of the answer, when the query orders or slices it.
     pub order: Option<TopOrder>,
-    /// The answer is ordered, and DISTINCT kept a row whose copies have different sort
-    /// keys, so the order is not checked.
-    pub order_unchecked: bool,
 }
 
 /// The rows of an ordered or sliced answer before its slice, in the order of ORDER BY,
@@ -633,24 +645,45 @@ struct Keyed {
     solutions: Vec<Solution>,
     /// The key of each solution, `None` where its place is open.
     keys: Option<(Vec<Option<SortKey>>, Vec<bool>)>,
-    /// Whether DISTINCT kept a row whose copies have different keys, so that the order
-    /// places it in one of several ranges, which the keys do not describe.
-    unplaced: bool,
-    /// Whether a key ends before a condition that read an open value.
+    /// Whether a key ends before a condition that read an open value or differs
+    /// across DISTINCT copies.
     open_conditions: bool,
 }
 
 /// The values of the ORDER BY conditions for one solution, unbound where a condition is
 /// an error or unbound. The key ends before the first condition that read an open
 /// value, since that condition and the ones after it do not fix the row's place.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SortKey {
     terms: Vec<Option<Term>>,
     /// Conditions that read a spelling and how to recover them from the engine's rows.
-    spelling: Vec<(usize, SpellingKey)>,
+    spelling: Vec<Option<SpellingKey>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl SortKey {
+    /// Keep the conditions that put all DISTINCT copies in the same place.
+    fn keep_common_prefix(&mut self, other: &Self) -> bool {
+        let prefix = self
+            .terms
+            .iter()
+            .zip(&other.terms)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let differs = prefix < self.terms.len() || prefix < other.terms.len();
+        self.terms.truncate(prefix);
+        self.spelling.truncate(prefix);
+        // Both keys come from the same ORDER BY expression at each position.
+        // If either evaluation needs an observed spelling, so does the merged key.
+        for (source, other) in self.spelling.iter_mut().zip(&other.spelling) {
+            if source.is_none() {
+                source.clone_from(other);
+            }
+        }
+        differs
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SpellingKey {
     Variable(Variable),
     StrOf(Variable),
@@ -764,14 +797,17 @@ pub(crate) fn merge(a: &Solution, b: &Solution) -> Solution {
     let mut out = a.clone();
     for (k, v) in b.iter() {
         let mut origin = b.origin(k);
+        let mut spelling_dependent = b.spelling_dependent.contains(k);
         if a.get(k) == Some(v) {
             origin = origin.shared(a.origin(k));
+            spelling_dependent |= a.spelling_dependent.contains(k);
         }
         out.bind(
             k.clone(),
             Binding {
                 term: v.clone(),
                 origin,
+                spelling_dependent,
             },
         );
     }
@@ -1095,21 +1131,17 @@ impl<'a> Evaluator<'a> {
                         let n = self.fresh_id();
                         s.insert(row_variable(), int_term(n as i128));
                     }
-                    let ((v, read_open), reads_spelling) = self.tracking_spelling(|| {
-                        self.tracking(|| self.soft(self.binding(expression, cx, &s)))
-                    });
+                    let (v, read_open) =
+                        self.tracking(|| self.soft(self.binding(expression, cx, &s)));
                     open |= read_open;
-                    if let Some(v) = v? {
+                    if let Some(mut v) = v? {
                         if s.get(variable).is_some_and(|old| *old != v.term) {
                             // a variable already in scope cannot be extended
                             return unsupported("BIND of a variable that is in scope");
                         }
-                        let mut v = v;
-                        if reads_spelling && v.origin == Origin::Exact {
-                            v.origin = Origin::SpellingDependent;
-                        }
                         if s.contains_key(variable) {
                             v.origin = v.origin.shared(s.origin(variable));
+                            v.spelling_dependent |= s.spelling_dependent.contains(variable);
                         }
                         s.bind(variable.clone(), v);
                     }
@@ -1249,15 +1281,11 @@ impl<'a> Evaluator<'a> {
         let Keyed {
             solutions,
             keys,
-            unplaced,
             open_conditions,
         } = self.eval_keyed(inner, &cx)?;
         // A top slice's cuts are the comparison's to check, so they do not make the rows
-        // open. A row that DISTINCT kept from copies with different keys has a place that
-        // the keys do not describe, so a slice of the rows is open, and their order is not
-        // checked.
-        let rows_open = self.chose.get() || unplaced && slice.is_some();
-        let order_unchecked = unplaced && keys.is_some();
+        // open.
+        let rows_open = self.chose.get();
         let n = solutions.len();
         let (from, to) = match slice {
             Some((start, length)) => {
@@ -1272,7 +1300,7 @@ impl<'a> Evaluator<'a> {
         let row_of = |s: &Solution| -> Vec<Option<Term>> {
             variables.iter().map(|v| s.get(v).cloned()).collect()
         };
-        let order = if (keys.is_some() || slice.is_some()) && !order_unchecked {
+        let order = if keys.is_some() || slice.is_some() {
             let (ks, descending) = keys.unwrap_or_else(|| (vec![None; n], Vec::new()));
             Some(TopOrder {
                 items: solutions
@@ -1303,7 +1331,6 @@ impl<'a> Evaluator<'a> {
             open: variables.iter().map(|v| open_vars.contains(v)).collect(),
             origins,
             order,
-            order_unchecked,
         })
     }
 
@@ -1384,7 +1411,7 @@ impl<'a> Evaluator<'a> {
                         let ((k, open), reads_spelling) = self.tracking_spelling(|| {
                             self.tracking(|| self.soft(self.expr(e, cx, &s)))
                         });
-                        if reads_spelling {
+                        let source = if reads_spelling {
                             let observed = match e {
                                 Expression::Variable(v) => SpellingKey::Variable(v.clone()),
                                 Expression::FunctionCall(Function::Str, args) => match &args[..] {
@@ -1393,8 +1420,11 @@ impl<'a> Evaluator<'a> {
                                 },
                                 _ => SpellingKey::Unobserved,
                             };
-                            spelling.push((i, observed));
-                        }
+                            Some(observed)
+                        } else {
+                            None
+                        };
+                        spelling.push(source);
                         keys.push(k?);
                         if open && fixed == expression.len() {
                             fixed = i;
@@ -1425,14 +1455,13 @@ impl<'a> Evaluator<'a> {
                     .into_iter()
                     .map(|(mut terms, mut spelling, fixed, s)| {
                         terms.truncate(fixed);
-                        spelling.retain(|(i, _)| *i < fixed);
+                        spelling.truncate(fixed);
                         (Some(SortKey { terms, spelling }), s)
                     })
                     .unzip();
                 Ok(Keyed {
                     solutions,
                     keys: Some((keys, descending)),
-                    unplaced: false,
                     open_conditions,
                 })
             }
@@ -1454,9 +1483,8 @@ impl<'a> Evaluator<'a> {
             GraphPattern::Distinct { inner } => {
                 let Keyed {
                     solutions,
-                    keys,
-                    unplaced: unplaced_any,
-                    open_conditions,
+                    mut keys,
+                    mut open_conditions,
                 } = self.eval_keyed(inner, cx)?;
                 // open values may be equal or not in another answer
                 if self.binds_open(inner) {
@@ -1465,7 +1493,6 @@ impl<'a> Evaluator<'a> {
                 let mut first: HashMap<BTreeMap<Variable, Term>, usize> = HashMap::new();
                 let mut kept = Vec::new();
                 let mut distinct: Vec<Solution> = Vec::new();
-                let mut unplaced = HashSet::new();
                 for (i, s) in solutions.into_iter().enumerate() {
                     match first.get(&visible(&s)) {
                         None => {
@@ -1473,37 +1500,28 @@ impl<'a> Evaluator<'a> {
                             kept.push(i);
                             distinct.push(s);
                         }
-                        // Which copy DISTINCT keeps is open, and it places the row
-                        // differently when the copies have different keys, so the kept
-                        // row's key does not fix its place.
                         Some(&slot) => {
                             // If an exact term also produced this row, it must still be
                             // represented even if the computed binding changes spelling.
                             distinct[slot].origins.retain(|v, o| *o == s.origin(v));
+                            distinct[slot]
+                                .spelling_dependent
+                                .extend(s.spelling_dependent);
                             let f = kept[slot];
-                            if let Some((k, _)) = &keys
-                                && k[f] != k[i]
+                            if let Some((k, _)) = &mut keys
+                                && let Some(other) = k[i].take()
+                                && let Some(first) = &mut k[f]
                             {
-                                unplaced.insert(f);
+                                open_conditions |= first.keep_common_prefix(&other);
                             }
                         }
                     }
                 }
                 Ok(Keyed {
-                    unplaced: unplaced_any || !unplaced.is_empty(),
                     open_conditions,
                     solutions: distinct,
-                    keys: keys.map(|(k, d)| {
-                        let k = kept
-                            .iter()
-                            .map(|&i| {
-                                if unplaced.contains(&i) {
-                                    None
-                                } else {
-                                    k[i].clone()
-                                }
-                            })
-                            .collect();
+                    keys: keys.map(|(mut k, d)| {
+                        let k = kept.into_iter().map(|i| k[i].take()).collect();
                         (k, d)
                     }),
                 })
@@ -1521,7 +1539,6 @@ impl<'a> Evaluator<'a> {
             _ => Ok(Keyed {
                 solutions: self.eval(p, cx)?,
                 keys: None,
-                unplaced: false,
                 open_conditions: false,
             }),
         }
@@ -1821,6 +1838,9 @@ impl<'a> Evaluator<'a> {
                         Binding {
                             term: t.clone(),
                             origin,
+                            spelling_dependent: members
+                                .iter()
+                                .any(|s| s.spelling_dependent.contains(v)),
                         },
                     );
                 }
@@ -2013,6 +2033,10 @@ impl<'a> Evaluator<'a> {
                     Binding {
                         term: term.clone(),
                         origin,
+                        spelling_dependent: values
+                            .iter()
+                            .flatten()
+                            .any(|b| &b.term == term && b.spelling_dependent),
                     }
                 })
             }

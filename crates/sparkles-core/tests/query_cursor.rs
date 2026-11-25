@@ -7232,6 +7232,90 @@ fn reference_str_1093_compares_order_using_observed_spellings() {
     ));
 }
 
+#[test]
+fn reference_str_1093_rejects_inversions_with_ambiguous_matches() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?s {
+        { VALUES ?s { "02" "10" } } UNION { BIND(STR(2 + 0) AS ?s) }
+    } ORDER BY ?s"#;
+    let two = &[r#""02""#][..];
+    let ten = &[r#""10""#][..];
+    assert!(matches!(
+        check_str_1093(query, &[two, two, ten]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(query, &[ten, two, two]).is_err());
+}
+
+#[test]
+fn reference_str_1093_keeps_distinct_sort_prefixes() {
+    use reference::check::Outcome;
+    let query = r#"SELECT DISTINCT ?n ?s {
+        { VALUES (?n ?s) { (0 "first") (1 "2") } }
+        UNION { BIND(1 AS ?n) BIND(STR(1 + 1) AS ?s) }
+    } ORDER BY ?n ?s"#;
+    let first = &["0", r#""first""#][..];
+    let second = &["1", r#""2""#][..];
+    assert!(check_str_1093(query, &[second, first]).is_err());
+    assert!(check_str_1093(&format!("{query} LIMIT 1"), &[second]).is_err());
+    assert_eq!(
+        check_str_1093(query, &[first, second]),
+        Ok(Outcome::Compared)
+    );
+
+    let differing_suffix = r#"SELECT DISTINCT ?n ?s {
+        VALUES (?n ?s ?suffix) { (0 "first" 0) (1 "2" 0) (1 "2" 1) }
+    } ORDER BY ?n ?suffix"#;
+    assert!(check_str_1093(differing_suffix, &[second, first]).is_err());
+    assert!(check_str_1093(&format!("{differing_suffix} LIMIT 1"), &[second]).is_err());
+    assert!(matches!(
+        check_str_1093(differing_suffix, &[first, second]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_keeps_spelling_dependencies_of_numeric_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+        BIND(STRLEN(?s) AS ?len)
+        BIND(?len + 1 AS ?key)
+    }"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    for key in ["?len", "?key"] {
+        assert!(matches!(
+            check_str_1093(&format!("{query} ORDER BY {key}"), &[ten, two]),
+            Ok(Outcome::OrderUnchecked(_))
+        ));
+        assert!(check_str_1093(&format!("{query} ORDER BY ?n {key}"), &[ten, two]).is_err());
+    }
+}
+
+#[test]
+fn reference_str_1093_keeps_order_after_spelling_invariant_metadata() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+    }"#;
+    let two = &["2", r#""2""#][..];
+    let ten = &["10", r#""10""#][..];
+    for metadata in ["LANG(?s)", "DATATYPE(STR(?n + 0))"] {
+        let ordered = format!("{query} ORDER BY {metadata} ?n");
+        assert!(check_str_1093(&ordered, &[ten, two]).is_err());
+        assert_eq!(check_str_1093(&ordered, &[two, ten]), Ok(Outcome::Compared));
+    }
+    let dependent = format!(r#"{query} ORDER BY LANG(STRLANG("x", IF(?s = "2", "en", "fr"))) ?n"#);
+    let padded = &["2", r#""002""#][..];
+    assert!(matches!(
+        check_str_1093(&dependent, &[ten, padded]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
 /// The reference evaluator's own cases: the choices that it notes, the scope of the
 /// solution that LATERAL substitutes, BNODE across a join and its sort order.
 #[test]
