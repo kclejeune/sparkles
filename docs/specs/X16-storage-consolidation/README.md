@@ -1,10 +1,10 @@
 # X16: Storage consolidation
 
-> **Status:** implemented in part (Phases 1–2)
+> **Status:** implemented in part (Phases 1, 2, 3 stage 1, 4, 5 apart from `imbl`, and item 846)
 
-This spec covers a first-release format cutoff, budgeted readers through one Control trait, a shared commit publish tail, one load plan, partitioned vocabularies with per-range generations, and the remaining replica, clone and format-policy work. Phases 1 and 2 have shipped, and
-[roadmap item 455](../../ROADMAP.md) holds the remaining work. Items 479, 484 and 830 to 833 hold
-the initial phases.
+This spec covers a first-release format cutoff, budgeted readers through one Control trait, a shared commit publish tail, one load plan, partitioned vocabularies with per-range generations, and the remaining replica, clone and format-policy work. Phases 1, 2, 3 stage 1, 4, 5 apart from `imbl` and item 846 have shipped, and
+[roadmap item 455](../../ROADMAP.md) holds the remaining work. Items 830, 833 and 1152 hold
+the remaining initial phases.
 
 Read the [design](SPEC.md), its ordered [plan](SPEC.md#plan), its later
 [candidate phases](SPEC.md#candidate-phases), its [decisions](SPEC.md#decisions)

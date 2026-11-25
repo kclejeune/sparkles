@@ -119,7 +119,12 @@ impl ReaderState {
         while head.len() < n {
             check()?;
             let start = head.len();
-            head.resize(start + (n - start).min(INPUT_BUFFER_BYTES), 0);
+            let target = start + (n - start).min(INPUT_BUFFER_BYTES);
+            if target > head.capacity() {
+                let cap = head.capacity().saturating_mul(2).max(target).min(n);
+                head.reserve_exact(cap - head.len());
+            }
+            head.resize(target, 0);
             match reader.read(&mut head[start..]) {
                 Ok(k) => {
                     head.truncate(start + k);
@@ -145,6 +150,23 @@ impl ReaderSource {
             reader: Some(Box::new(reader)),
             decoded: false,
             controls: Arc::default(),
+        }))
+    }
+
+    /// A stream whose compression has already been decoded (such as an HTTP `LOAD` body
+    /// decoded under its outbound response budget). Every read still checks the write
+    /// controls once [`decode`](Self::decode) installs them.
+    pub(crate) fn new_decoded(reader: impl Read + Send + 'static) -> ReaderSource {
+        let controls: Controls = Arc::default();
+        let raw = Controlled {
+            inner: Box::new(reader),
+            controls: Arc::clone(&controls),
+        };
+        ReaderSource(Mutex::new(ReaderState {
+            head: Vec::new(),
+            reader: Some(Box::new(raw)),
+            decoded: true,
+            controls,
         }))
     }
 
@@ -199,8 +221,13 @@ impl ReaderSource {
         Ok(())
     }
 
-    fn decoded(&self) -> bool {
+    pub(crate) fn decoded(&self) -> bool {
         self.0.lock().decoded
+    }
+
+    #[cfg(test)]
+    pub(crate) fn head_capacity(&self) -> usize {
+        self.0.lock().head.capacity()
     }
 
     /// The whole stream, from its first byte. A second call fails.
@@ -443,6 +470,18 @@ impl Source {
     ) -> Source {
         let mut src = Source::from_bytes(Vec::new(), format, graph);
         src.data = SourceData::reader(reader);
+        src.name = "<reader>".into();
+        src
+    }
+
+    /// A source read once from an already-decompressed `reader`.
+    pub(crate) fn from_decoded_reader(
+        reader: impl Read + Send + 'static,
+        format: impl Into<RdfSyntax>,
+        graph: Option<NamedNode>,
+    ) -> Source {
+        let mut src = Source::from_bytes(Vec::new(), format, graph);
+        src.data = SourceData::Reader(ReaderSource::new_decoded(reader));
         src.name = "<reader>".into();
         src
     }

@@ -214,3 +214,28 @@ C05's default mapping passes each cell through CSVW's datatype and URL template 
 which the mapping engine does not have. A Parquet file of 10,000,000 rows
 and two columns, 227 MB on disk, maps to 20,000,000 triples in 11.6 s with a peak of
 46 MB, since the file is read one row group at a time.
+
+### Bulk SPARQL LOAD
+
+A single-operation SPARQL `LOAD` takes the bulk rebuild path once its estimated quad count
+or probed decompressed stream length exceeds `bulk_threshold` ([spec X16](../../specs/X16-storage-consolidation/SPEC.md#outcome)).
+The table below compares the default bulk threshold against forced transactional execution
+(`bulk_threshold = u64::MAX`) when loading 1,000,000 N-Triples quads (~80 MiB) into a
+1,000-quad seeded store through the ignored `sparql_load_profile` harness in release builds,
+with one process per arm so `VmHWM` measures each arm cleanly.
+
+| 1,000,000 quads | Bulk wall | Transactional wall | Bulk peak RSS | Transactional peak RSS | First busy sample (bulk HTTP) | Max reader latency (bulk) |
+|---|---:|---:|---:|---:|---:|---:|
+| Persistent file `LOAD` | 1.811 s | 3.009 s | 575 MiB | 1,011 MiB | — | 5 to 27 µs |
+| Persistent loopback HTTP `LOAD` | 1.376 s | 2.287 s | 560 MiB | 1,014 MiB | 12.8 ms | 5 to 27 µs |
+| In-memory file `LOAD` | 1.192 s | 2.090 s | 798 MiB | 1,013 MiB | — | 5 to 27 µs |
+| In-memory loopback HTTP `LOAD` | 1.750 s | 2.190 s | 778 MiB | 1,016 MiB | 13.8 ms | 5 to 27 µs |
+
+*Measured at commit `59862356` on an 8-vCPU, 16 GiB Boat worker (`sparql_load_profile`,
+release build, one process per arm). Boat worker timings are approximate directional
+figures rather than a quiet Intel host A/B comparison, and are recorded directly from the
+ad-hoc profile harness without a separate raw run file under `runs/`. The lock probe polls
+`try_write_with(no_wait)` every 1 ms and reports the first observed busy sample
+(`first_busy`), which estimates pre-lock fetch and probe time at millisecond resolution
+rather than timing the writer's full hold interval. Every bulk arm left an empty delta and
+kept concurrent snapshot reads lock-free.*
