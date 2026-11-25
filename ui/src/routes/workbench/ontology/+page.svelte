@@ -105,6 +105,7 @@
   import Discussions from '$components/Discussions.svelte';
   import WatchButton from '$components/WatchButton.svelte';
   import BulkEdit from '$components/BulkEdit.svelte';
+  import OntoPatterns from '$components/OntoPatterns.svelte';
   import OntoImports from '$components/OntoImports.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
@@ -118,6 +119,7 @@
     ['history', 'History'],
     ['discussions', 'Discussions'],
     ['bulk', 'Bulk edits'],
+    ['patterns', 'Patterns'],
     ['imports', 'Imports'],
   ];
 
@@ -1614,6 +1616,18 @@
               onedit={(op, label) =>
                 // the plan was read without the imports, and its edit reads and writes the same
                 edit(op, label, undefined, null, { graph, imports: false })}
+            />{/key}
+        </div>
+      </section>
+    {:else if tab === 'patterns' && summary}
+      <section class="panel" aria-label="Pattern axiom generation">
+        <div class="panel-body">
+          {#key `${target}|${graph}`}<OntoPatterns
+              {target}
+              {sel}
+              {etag}
+              {readonly}
+              oncommitted={discussed}
             />{/key}
         </div>
       </section>

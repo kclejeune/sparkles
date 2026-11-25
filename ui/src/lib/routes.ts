@@ -19,7 +19,7 @@ export type Editor = 'ontology' | 'thesaurus' | 'shapes';
 
 /**
  * The Ontology editor's tabs: the tree (no `tab`), DL Query, the header, the history, the
- * discussions, bulk edits and the imports.
+ * discussions, bulk edits, pattern generation and the imports.
  * The tree's entity kind is `kind` (no `kind`: classes).
  */
 export const ONTOLOGY_TABS = [
@@ -29,6 +29,7 @@ export const ONTOLOGY_TABS = [
   'history',
   'discussions',
   'bulk',
+  'patterns',
   'imports',
 ] as const;
 export type OntologyTab = (typeof ONTOLOGY_TABS)[number];
