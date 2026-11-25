@@ -701,6 +701,15 @@ fn assert_parity_batches(
     if non_empty {
         assert!(!expected.is_empty(), "fixture returned 0 rows for `{body}`");
     }
+    fn find_ps_info(
+        p: &sparkles_core::sparql::PlanInfo,
+    ) -> Option<&sparkles_core::sparql::PlanInfo> {
+        if p.operator == "PathSearch" {
+            return Some(p);
+        }
+        p.children.iter().find_map(find_ps_info)
+    }
+    let eager_ps_counters = find_ps_info(eager.plan()).and_then(|p| p.counters.clone());
     for batch_rows in [1, 2, 7, 64, 4096] {
         let (got, plan, work_stream) = drain_strict(snap, &q, opts, batch_rows);
         assert_eq!(
@@ -724,6 +733,10 @@ fn assert_parity_batches(
         assert_eq!(
             ps.full_input_before_output, expect_full_input,
             "full_input_before_output mismatch for `{body}`: {ps:#?}"
+        );
+        assert_eq!(
+            ps.operator.counters, eager_ps_counters,
+            "PathSearch counters mismatch at batch_rows={batch_rows} for `{body}`"
         );
     }
 }
@@ -1108,4 +1121,205 @@ fn path_search_1122_1123_budgets_cancellation_and_errors() {
             "error mismatch for `{bad_q}`"
         );
     }
+}
+
+/// Round-1 parity regressions: weighted `allShortest` + `path:maxLength` + `path:maxVisited`
+/// on the three-edge graph (`s -> t`, `s -> a`, `a -> t`), plus grouped multiset / `pathIndex`
+/// / `ORDER BY` parity, mid-pull cancellation, pre-admission refusal and memory release.
+#[test]
+fn path_search_r1_parity_cancellation_and_release() {
+    // 1. Weighted `allShortest` with `path:maxLength 1` on `s -> t`, `s -> a`, `a -> t`.
+    let three = Store::in_memory(StoreOptions::default());
+    load(
+        &three,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:t .\n\
+         ex:s ex:p ex:a .\n\
+         ex:a ex:p ex:t .\n",
+        RdfFormat::Turtle,
+    );
+    let snap3 = three.snapshot();
+    let opts = QueryOptions::default();
+    assert_parity_batches(
+        &snap3,
+        "SELECT ?p ?i ?es ?eo ?c { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    // `maxVisited 3`: both eager and streaming stop at cost 2 > best 1 and succeed with
+    // identical `visited` counters.
+    assert_parity_batches(
+        &snap3,
+        "SELECT ?p ?c { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 3 ; path:pathIndex ?p ; path:cost ?c } }",
+        &opts,
+        true,
+        false,
+    );
+    // `maxVisited 2`: both eager and streaming fail with the exact same `path:maxVisited`
+    // error on full drain.
+    let q_mv2 = format!(
+        "{P}SELECT ?p ?c {{ SERVICE path:search {{ [] path:source ex:s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:weight ex:w ; path:maxLength 1 ; path:maxVisited 2 ; path:pathIndex ?p ; path:cost ?c }} }}"
+    );
+    let strict = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let eager_mv2 = query(snap3.clone(), &q_mv2, &opts)
+        .err()
+        .expect("expected eager maxVisited error");
+    let stream_mv2 = select_cursor(snap3.clone(), &q_mv2, &opts, &strict)
+        .and_then(|mut c| {
+            while c.next_batch()?.is_some() {}
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(format!("{stream_mv2}"), format!("{eager_mv2}"));
+
+    // 2. Grouped output with two VALUES rows binding the same source and two tied shortest
+    //    paths: full multiset + `pathIndex` parity and exact ordered parity under ORDER BY.
+    let diamond = Store::in_memory(StoreOptions::default());
+    load(
+        &diamond,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:a . ex:a ex:p ex:t .\n\
+         ex:s ex:p ex:b . ex:b ex:p ex:t .\n",
+        RdfFormat::Turtle,
+    );
+    let dsnap = diamond.snapshot();
+    assert_parity_batches(
+        &dsnap,
+        "SELECT ?tag ?p ?i ?es ?eo { VALUES (?tag ?s) { (\"first\" ex:s) (\"second\" ex:s) } SERVICE path:search { [] path:source ?s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo } }",
+        &opts,
+        true,
+        true,
+    );
+    let q_ord = format!(
+        "{P}SELECT ?tag ?p ?i ?es ?eo {{ VALUES (?tag ?s) {{ (\"first\" ex:s) (\"second\" ex:s) }} SERVICE path:search {{ [] path:source ?s ; path:target ex:t ; path:predicate ex:p ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo }} }} ORDER BY ?tag ?p ?i"
+    );
+    let eager_ord: Vec<_> = query(dsnap.clone(), &q_ord, &opts)
+        .unwrap()
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|r| r.values().to_vec())
+        .collect();
+    let mut c_ord = select_cursor(dsnap.clone(), &q_ord, &opts, &strict).unwrap();
+    let mut stream_ord = Vec::new();
+    while let Some(b) = c_ord.next_batch().unwrap() {
+        for i in 0..b.len() {
+            stream_ord.push(b.row(i).unwrap().values().to_vec());
+        }
+    }
+    assert_eq!(stream_ord, eager_ord);
+
+    // 3. Mid-pull cancellation and memory release after completion, early close, and error.
+    let store = graph_store();
+    let snap = store.snapshot();
+    let q_multi = format!(
+        "{P}SELECT ?t ?p ?i {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 4 ; path:pathIndex ?p ; path:edgeIndex ?i }} }}"
+    );
+    // 3a. Mid-pull cancel after first batch succeeds.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_opts = QueryOptions {
+        no_cache: true,
+        cancel: Some(cancel.clone()),
+        ..Default::default()
+    };
+    let mut c = select_cursor(snap.clone(), &q_multi, &cancel_opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().unwrap().is_some());
+    cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(c.next_batch(), Err(Error::Cancelled)));
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 3b. Release on early drop after one batch.
+    let mut c = select_cursor(snap.clone(), &q_multi, &opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().unwrap().is_some());
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 3c. Release on full drain.
+    let q_short = format!(
+        "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:length ?l }} }}"
+    );
+    let mut c = select_cursor(snap.clone(), &q_short, &opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    while c.next_batch().unwrap().is_some() {}
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 3d. Release on runtime error (`maxVisited` exceeded).
+    let q_err = format!(
+        "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:maxVisited 3 ; path:length ?l }} }}"
+    );
+    let mut c = select_cursor(snap.clone(), &q_err, &opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().is_err());
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 4. Tight-budget pre-allocation refusal on long predicate list and wide group input.
+    let multi_pred = Store::in_memory(StoreOptions::default());
+    let mut mp_data = String::new();
+    for i in 0..120 {
+        mp_data.push_str(&format!("<urn:a> <urn:mp:{i}> <urn:b> .\n"));
+    }
+    load(&multi_pred, &mp_data, RdfFormat::Turtle);
+    let pred_list: String = (0..120)
+        .map(|i| format!("<urn:mp:{i}>"))
+        .collect::<Vec<_>>()
+        .join(" , ");
+    let q_long_preds = format!(
+        "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:a> ; path:target ?t ; path:predicate {pred_list} ; path:length ?l }} }}"
+    );
+    let probe_preds = select_cursor(multi_pred.snapshot(), &q_long_preds, &opts, &strict).unwrap();
+    let pred_open_bytes = probe_preds.memory_meter().live_bytes();
+    drop(probe_preds);
+    let pred_opts = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(pred_open_bytes + 512),
+        ..Default::default()
+    };
+    let mut c = select_cursor(multi_pred.snapshot(), &q_long_preds, &pred_opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    let res = c.next_batch().map(|b| b.is_some());
+    assert!(
+        matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "expected pre-allocation refusal on long predicate list: {res:?}"
+    );
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    let wide_vars: String = (0..40)
+        .map(|i| format!("?v{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let wide_vals: String = (0..40)
+        .map(|i| format!("{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let q_wide_group = format!(
+        "{P}SELECT ?s ?t ?l {wide_vars} {{ VALUES (?s {wide_vars}) {{ (<urn:s:0> {wide_vals}) }} SERVICE path:search {{ [] path:source ?s ; path:target ?t ; path:predicate <urn:q> ; path:length ?l }} }}"
+    );
+    let probe_wide = select_cursor(snap.clone(), &q_wide_group, &opts, &strict).unwrap();
+    let wide_open_bytes = probe_wide.memory_meter().live_bytes();
+    drop(probe_wide);
+    let wide_opts = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(wide_open_bytes + 512),
+        ..Default::default()
+    };
+    let mut c = select_cursor(snap, &q_wide_group, &wide_opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    let res = c.next_batch().map(|b| b.is_some());
+    assert!(
+        matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "expected pre-allocation refusal on wide group input: {res:?}"
+    );
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
 }

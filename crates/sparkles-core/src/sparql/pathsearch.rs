@@ -40,12 +40,10 @@ use crate::id::Id;
 use crate::index::{Perm, pad};
 use crate::store::Chunk;
 use oxrdf::Term;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use spargebra::algebra::GraphPattern;
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
-use sparkles_budget::sizes::{
-    table_bytes as physical_table_bytes, table_capacity, table_grown, vec_grown,
-};
+use sparkles_budget::sizes::vec_grown;
 use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -3146,14 +3144,17 @@ pub fn run(
                     let mut best: Option<Cost> = None;
                     let mut out = Vec::new();
                     eng.yen(s, t, |p, c| {
+                        if let Some(b) = best
+                            && c > b
+                        {
+                            return Ok(false);
+                        }
                         if p.len() as u32 > spec.max_len.unwrap() || (p.len() as u32) < spec.min_len
                         {
                             return Ok(true);
                         }
-                        match best {
-                            None => best = Some(c),
-                            Some(b) if c > b => return Ok(false),
-                            Some(_) => {}
+                        if best.is_none() {
+                            best = Some(c);
                         }
                         out.push(p.to_vec());
                         Ok(all)
@@ -3532,35 +3533,110 @@ pub(crate) fn stream_eligible(spec: &PathSearchSpec) -> bool {
     spec.limit.is_none()
 }
 
+type HbMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
+type HbSet<T> = hashbrown::HashSet<T, FxBuildHasher>;
+
 #[inline]
 fn vec_bytes<T>(cap: usize) -> u64 {
     (cap as u64).saturating_mul(size_of::<T>() as u64)
 }
 
 #[inline]
-fn table_bytes<T>(capacity: usize) -> u64 {
-    physical_table_bytes(capacity, size_of::<T>()) as u64
+fn map_bytes<K: Eq + std::hash::Hash, V>(m: &HbMap<K, V>) -> u64 {
+    m.allocation_size() as u64
 }
 
-/// Additional bytes while the old and new hash tables are both live.
 #[inline]
-fn table_growth<T>(capacity: usize, len: usize) -> u64 {
-    let new = table_grown(capacity, len, 1);
-    if new == capacity {
+fn set_bytes<T: Eq + std::hash::Hash>(s: &HbSet<T>) -> u64 {
+    s.allocation_size() as u64
+}
+
+/// Upper bound on the new allocation when inserting one non-present entry into a hashbrown
+/// table with `len` live items, `cap` reported capacity (`len + growth_left`), and
+/// `alloc_bytes` physical allocation bytes.
+#[inline]
+fn hb_growth_for_one<E>(len: usize, cap: usize, alloc_bytes: u64) -> u64 {
+    if len < cap {
         0
+    } else if alloc_bytes == 0 {
+        super::charged::table_bound(1, size_of::<E>())
     } else {
-        table_bytes::<T>(new)
+        // When `growth_left == 0` (`len == cap`), hashbrown either reuses a tombstone,
+        // rehashes in place (0 bytes allocated), or doubles its bucket count. Doubling
+        // buckets from `B` to `2*B` allocates strictly less than `2 * alloc_bytes` for
+        // every `B >= 4` and entry layout, even when deletions dropped `cap` well below
+        // the physical table's full capacity.
+        alloc_bytes.saturating_mul(2)
     }
 }
 
-/// Additional bytes when a hash table that may contain tombstones inserts one entry.
-#[inline]
-fn table_growth_tomb<T>(capacity: usize, len: usize, tombstones: usize) -> u64 {
-    if capacity == 0 || len.saturating_add(tombstones) >= capacity {
-        table_bytes::<T>(table_grown(capacity, capacity, 1))
-    } else {
-        0
+/// Sort `slice` by `key` with zero extra heap allocation and bounded `ctx.check()` polling.
+fn sort_checked_by_key<T, K: Ord>(slice: &mut [T], ctx: &Ctx, key: impl Fn(&T) -> K) -> Result<()> {
+    ctx.check()?;
+    let n = slice.len();
+    if n <= 4096 {
+        slice.sort_unstable_by_key(key);
+        return Ok(());
     }
+    // Zero-allocation in-place heapsort (O(n log n) worst case) with periodic polling.
+    let mut ticks = 0usize;
+    let sift_down = |s: &mut [T], mut root: usize, end: usize, ticks: &mut usize| -> Result<()> {
+        loop {
+            let left = 2 * root + 1;
+            if left >= end {
+                return Ok(());
+            }
+            *ticks += 1;
+            if (*ticks).is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            let right = left + 1;
+            let mut swap = root;
+            if key(&s[swap]) < key(&s[left]) {
+                swap = left;
+            }
+            if right < end && key(&s[swap]) < key(&s[right]) {
+                swap = right;
+            }
+            if swap == root {
+                return Ok(());
+            }
+            s.swap(root, swap);
+            root = swap;
+        }
+    };
+    let mut start = n / 2;
+    while start > 0 {
+        start -= 1;
+        sift_down(slice, start, n, &mut ticks)?;
+    }
+    let mut end = n;
+    while end > 1 {
+        end -= 1;
+        slice.swap(0, end);
+        sift_down(slice, 0, end, &mut ticks)?;
+    }
+    ctx.check()
+}
+
+/// Sort and deduplicate a `Vec<u64>` with zero extra heap allocation and bounded `ctx.check()`.
+fn sort_dedup_u64_checked(v: &mut Vec<u64>, ctx: &Ctx) -> Result<()> {
+    sort_checked_by_key(v.as_mut_slice(), ctx, |&x| x)?;
+    if v.len() <= 1 {
+        return Ok(());
+    }
+    let mut w = 1usize;
+    for r in 1..v.len() {
+        if r.is_multiple_of(4096) {
+            ctx.check()?;
+        }
+        if v[r] != v[w - 1] {
+            v[w] = v[r];
+            w += 1;
+        }
+    }
+    v.truncate(w);
+    Ok(())
 }
 
 fn push_vec<T>(
@@ -3607,8 +3683,8 @@ fn push_heap<T: Ord>(
     }
 }
 
-fn insert_set<T: Eq + std::hash::Hash>(
-    s: &mut FxHashSet<T>,
+fn insert_hb_set<T: Eq + std::hash::Hash>(
+    s: &mut HbSet<T>,
     item: T,
     charge: &mut super::ctx::OwnedCharge,
     base: u64,
@@ -3616,51 +3692,28 @@ fn insert_set<T: Eq + std::hash::Hash>(
     if s.contains(&item) {
         return Ok((false, base));
     }
-    let old_cap = s.capacity();
-    let growth = table_growth::<T>(old_cap, s.len());
+    let old_bytes = set_bytes(s);
+    let growth = hb_growth_for_one::<T>(s.len(), s.capacity(), old_bytes);
     if growth != 0 {
-        let old_bytes = table_bytes::<T>(old_cap);
         charge.resize(base.saturating_add(growth))?;
         let inserted = s.insert(item);
-        let actual = table_bytes::<T>(s.capacity());
+        let actual = set_bytes(s);
+        debug_assert!(
+            actual <= old_bytes.max(growth),
+            "hashbrown set grew to {actual} bytes beyond predicted {growth}"
+        );
         let next = base.saturating_sub(old_bytes).saturating_add(actual);
         charge.resize(next)?;
         Ok((inserted, next))
     } else {
-        Ok((s.insert(item), base))
-    }
-}
-
-fn insert_set_tomb<T: Eq + std::hash::Hash>(
-    s: &mut FxHashSet<T>,
-    tombstones: &mut usize,
-    item: T,
-    charge: &mut super::ctx::OwnedCharge,
-    base: u64,
-) -> Result<(bool, u64)> {
-    if s.contains(&item) {
-        return Ok((false, base));
-    }
-    let old_cap = s.capacity();
-    let growth = table_growth_tomb::<T>(old_cap, s.len(), *tombstones);
-    if growth != 0 {
-        let old_bytes = table_bytes::<T>(old_cap);
-        charge.resize(base.saturating_add(growth))?;
         let inserted = s.insert(item);
-        if s.capacity() != old_cap {
-            *tombstones = 0;
-        }
-        let actual = table_bytes::<T>(s.capacity());
-        let next = base.saturating_sub(old_bytes).saturating_add(actual);
-        charge.resize(next)?;
-        Ok((inserted, next))
-    } else {
-        Ok((s.insert(item), base))
+        debug_assert_eq!(set_bytes(s), old_bytes);
+        Ok((inserted, base))
     }
 }
 
-fn insert_map<K: Eq + std::hash::Hash, V>(
-    m: &mut FxHashMap<K, V>,
+fn insert_hb_map<K: Eq + std::hash::Hash, V>(
+    m: &mut HbMap<K, V>,
     key: K,
     val: V,
     charge: &mut super::ctx::OwnedCharge,
@@ -3669,54 +3722,29 @@ fn insert_map<K: Eq + std::hash::Hash, V>(
     if let Some(slot) = m.get_mut(&key) {
         return Ok((Some(std::mem::replace(slot, val)), base));
     }
-    let old_cap = m.capacity();
-    let growth = table_growth::<(K, V)>(old_cap, m.len());
+    let old_bytes = map_bytes(m);
+    let growth = hb_growth_for_one::<(K, V)>(m.len(), m.capacity(), old_bytes);
     if growth != 0 {
-        let old_bytes = table_bytes::<(K, V)>(old_cap);
         charge.resize(base.saturating_add(growth))?;
         let prev = m.insert(key, val);
-        let actual = table_bytes::<(K, V)>(m.capacity());
+        let actual = map_bytes(m);
+        debug_assert!(
+            actual <= old_bytes.max(growth),
+            "hashbrown map grew to {actual} bytes beyond predicted {growth}"
+        );
         let next = base.saturating_sub(old_bytes).saturating_add(actual);
         charge.resize(next)?;
         Ok((prev, next))
     } else {
-        Ok((m.insert(key, val), base))
-    }
-}
-
-fn insert_map_tomb<K: Eq + std::hash::Hash, V>(
-    m: &mut FxHashMap<K, V>,
-    tombstones: &mut usize,
-    key: K,
-    val: V,
-    charge: &mut super::ctx::OwnedCharge,
-    base: u64,
-) -> Result<(Option<V>, u64)> {
-    if let Some(slot) = m.get_mut(&key) {
-        return Ok((Some(std::mem::replace(slot, val)), base));
-    }
-    let old_cap = m.capacity();
-    let growth = table_growth_tomb::<(K, V)>(old_cap, m.len(), *tombstones);
-    if growth != 0 {
-        let old_bytes = table_bytes::<(K, V)>(old_cap);
-        charge.resize(base.saturating_add(growth))?;
         let prev = m.insert(key, val);
-        if m.capacity() != old_cap {
-            *tombstones = 0;
-        }
-        let actual = table_bytes::<(K, V)>(m.capacity());
-        let next = base.saturating_sub(old_bytes).saturating_add(actual);
-        charge.resize(next)?;
-        Ok((prev, next))
-    } else {
-        Ok((m.insert(key, val), base))
+        debug_assert_eq!(map_bytes(m), old_bytes);
+        Ok((prev, base))
     }
 }
 
-fn push_map_vec<K: Eq + std::hash::Hash, V>(
-    m: &mut FxHashMap<K, Vec<V>>,
+fn push_hb_map_vec<K: Eq + std::hash::Hash, V>(
+    m: &mut HbMap<K, Vec<V>>,
     vec_bytes_total: &mut u64,
-    tombstones: &mut usize,
     key: K,
     val: V,
     charge: &mut super::ctx::OwnedCharge,
@@ -3741,9 +3769,8 @@ fn push_map_vec<K: Eq + std::hash::Hash, V>(
             Ok(base)
         }
     } else {
-        let old_cap = m.capacity();
-        let old_m = table_bytes::<(K, Vec<V>)>(old_cap);
-        let m_growth = table_growth_tomb::<(K, Vec<V>)>(old_cap, m.len(), *tombstones);
+        let old_m = map_bytes(m);
+        let m_growth = hb_growth_for_one::<(K, Vec<V>)>(m.len(), m.capacity(), old_m);
         let v_cap = vec_grown(0, 0, 1, size_of::<V>());
         let new_v = vec_bytes::<V>(v_cap);
         charge.resize(base.saturating_add(m_growth).saturating_add(new_v))?;
@@ -3751,10 +3778,11 @@ fn push_map_vec<K: Eq + std::hash::Hash, V>(
         v.push(val);
         let actual_v = vec_bytes::<V>(v.capacity());
         m.insert(key, v);
-        if m.capacity() != old_cap {
-            *tombstones = 0;
-        }
-        let actual_m = table_bytes::<(K, Vec<V>)>(m.capacity());
+        let actual_m = map_bytes(m);
+        debug_assert!(
+            actual_m <= old_m.max(m_growth),
+            "hashbrown map<vec> grew to {actual_m} bytes beyond predicted {m_growth}"
+        );
         *vec_bytes_total = vec_bytes_total.saturating_add(actual_v);
         let next = base
             .saturating_sub(old_m)
@@ -3768,8 +3796,8 @@ fn push_map_vec<K: Eq + std::hash::Hash, V>(
 /// Pre-admitted edge maps built from a nested edge pattern child cursor (item 1123).
 #[derive(Default)]
 pub(crate) struct ChargedPatternEdges {
-    by_start: FxHashMap<u64, Vec<u64>>,
-    by_end: FxHashMap<u64, Vec<u64>>,
+    by_start: HbMap<u64, Vec<u64>>,
+    by_end: HbMap<u64, Vec<u64>>,
     vec_bytes: u64,
 }
 
@@ -3779,8 +3807,8 @@ impl ChargedPatternEdges {
     }
 
     pub(crate) fn retained_bytes(&self) -> u64 {
-        table_bytes::<(u64, Vec<u64>)>(self.by_start.capacity())
-            .saturating_add(table_bytes::<(u64, Vec<u64>)>(self.by_end.capacity()))
+        map_bytes(&self.by_start)
+            .saturating_add(map_bytes(&self.by_end))
             .saturating_add(self.vec_bytes)
     }
 
@@ -3795,7 +3823,6 @@ impl ChargedPatternEdges {
             return Ok(());
         };
         let mut base = self.retained_bytes();
-        let mut tomb = 0usize;
         for i in 0..batch.len() {
             if i.is_multiple_of(4096) {
                 ctx.check()?;
@@ -3804,19 +3831,17 @@ impl ChargedPatternEdges {
             if a.is_undef() || b.is_undef() {
                 continue;
             }
-            base = push_map_vec(
+            base = push_hb_map_vec(
                 &mut self.by_start,
                 &mut self.vec_bytes,
-                &mut tomb,
                 a.0,
                 b.0,
                 charge,
                 base,
             )?;
-            base = push_map_vec(
+            base = push_hb_map_vec(
                 &mut self.by_end,
                 &mut self.vec_bytes,
-                &mut tomb,
                 b.0,
                 a.0,
                 charge,
@@ -3834,8 +3859,7 @@ impl ChargedPatternEdges {
                 ticks = 0;
                 ctx.check()?;
             }
-            v.sort_unstable();
-            v.dedup();
+            sort_dedup_u64_checked(v, ctx)?;
         }
         ctx.check()
     }
@@ -3845,11 +3869,9 @@ impl ChargedPatternEdges {
 struct ChargedTree {
     root: u64,
     forward: bool,
-    first: FxHashMap<u64, (Parent, u32)>,
-    first_tomb: usize,
-    extra: FxHashMap<u64, Vec<Parent>>,
+    first: HbMap<u64, (Parent, u32)>,
+    extra: HbMap<u64, Vec<Parent>>,
     extra_vec_bytes: u64,
-    extra_tomb: usize,
     order: Vec<(u64, u32)>,
 }
 
@@ -3858,18 +3880,16 @@ impl ChargedTree {
         Self {
             root,
             forward,
-            first: FxHashMap::default(),
-            first_tomb: 0,
-            extra: FxHashMap::default(),
+            first: HbMap::default(),
+            extra: HbMap::default(),
             extra_vec_bytes: 0,
-            extra_tomb: 0,
             order: Vec::new(),
         }
     }
 
     fn retained_bytes(&self) -> u64 {
-        table_bytes::<(u64, (Parent, u32))>(self.first.capacity())
-            .saturating_add(table_bytes::<(u64, Vec<Parent>)>(self.extra.capacity()))
+        map_bytes(&self.first)
+            .saturating_add(map_bytes(&self.extra))
             .saturating_add(self.extra_vec_bytes)
             .saturating_add(vec_bytes::<(u64, u32)>(self.order.capacity()))
     }
@@ -3894,14 +3914,7 @@ impl ChargedTree {
         charge: &mut super::ctx::OwnedCharge,
         base: u64,
     ) -> Result<u64> {
-        let (_, next) = insert_map_tomb(
-            &mut self.first,
-            &mut self.first_tomb,
-            y,
-            (parent, level),
-            charge,
-            base,
-        )?;
+        let (_, next) = insert_hb_map(&mut self.first, y, (parent, level), charge, base)?;
         Ok(next)
     }
 
@@ -3912,10 +3925,9 @@ impl ChargedTree {
         charge: &mut super::ctx::OwnedCharge,
         base: u64,
     ) -> Result<u64> {
-        push_map_vec(
+        push_hb_map_vec(
             &mut self.extra,
             &mut self.extra_vec_bytes,
-            &mut self.extra_tomb,
             y,
             parent,
             charge,
@@ -3925,7 +3937,6 @@ impl ChargedTree {
 
     fn remove_extra(&mut self, y: u64) -> u64 {
         if let Some(old) = self.extra.remove(&y) {
-            self.extra_tomb += 1;
             let freed = vec_bytes::<Parent>(old.capacity());
             self.extra_vec_bytes = self.extra_vec_bytes.saturating_sub(freed);
             freed
@@ -3943,10 +3954,8 @@ impl ChargedTree {
         push_vec(&mut self.order, item, charge, base)
     }
 
-    fn retain_settled(&mut self, settled: &FxHashSet<u64>) {
-        let before = self.first.len();
+    fn retain_settled(&mut self, settled: &HbSet<u64>) {
         self.first.retain(|k, _| settled.contains(k));
-        self.first_tomb += before.saturating_sub(self.first.len());
     }
 
     fn build_ranks(
@@ -3954,18 +3963,18 @@ impl ChargedTree {
         ctx: &Ctx,
         charge: &mut super::ctx::OwnedCharge,
         base: u64,
-    ) -> Result<(FxHashMap<u64, u32>, u64)> {
-        let cap = table_capacity(self.order.len());
-        let bytes = table_bytes::<(u64, u32)>(cap);
+    ) -> Result<(HbMap<u64, u32>, u64)> {
+        let bytes = super::charged::table_bound(self.order.len(), size_of::<(u64, u32)>());
         charge.resize(base.saturating_add(bytes))?;
-        let mut rank = FxHashMap::with_capacity_and_hasher(self.order.len(), Default::default());
+        let mut rank = HbMap::with_capacity_and_hasher(self.order.len(), Default::default());
         for (i, &(n, _)) in self.order.iter().enumerate() {
             if i.is_multiple_of(4096) {
                 ctx.check()?;
             }
             rank.insert(n, i as u32);
         }
-        let actual = table_bytes::<(u64, u32)>(rank.capacity());
+        let actual = map_bytes(&rank);
+        debug_assert!(actual <= bytes);
         let next = base.saturating_add(actual);
         charge.resize(next)?;
         Ok((rank, next))
@@ -3980,8 +3989,7 @@ struct TreePathIter {
     stack: Vec<(u64, usize)>,
     low: Vec<u32>,
     links: Vec<(u64, Parent)>,
-    on: FxHashSet<u64>,
-    on_tomb: usize,
+    on: HbSet<u64>,
     steps: u64,
 }
 
@@ -3990,7 +3998,7 @@ impl TreePathIter {
         tree: &ChargedTree,
         m: u64,
         all: bool,
-        rank: Option<&FxHashMap<u64, u32>>,
+        rank: Option<&HbMap<u64, u32>>,
         charge: &mut super::ctx::OwnedCharge,
         base: u64,
     ) -> Result<Option<Self>> {
@@ -4003,13 +4011,13 @@ impl TreePathIter {
             .unwrap_or(0);
         let init_bytes = vec_bytes::<(u64, usize)>(4)
             .saturating_add(vec_bytes::<u32>(4))
-            .saturating_add(table_bytes::<u64>(table_capacity(1)));
+            .saturating_add(super::charged::table_bound(1, size_of::<u64>()));
         charge.resize(base.saturating_add(init_bytes))?;
         let mut stack = Vec::with_capacity(4);
         stack.push((m, 0));
         let mut low = Vec::with_capacity(4);
         low.push(init_rank);
-        let mut on = FxHashSet::with_capacity_and_hasher(1, Default::default());
+        let mut on = HbSet::with_capacity_and_hasher(1, Default::default());
         on.insert(m);
         let iter = Self {
             all,
@@ -4019,7 +4027,6 @@ impl TreePathIter {
             low,
             links: Vec::new(),
             on,
-            on_tomb: 0,
             steps: 0,
         };
         charge.resize(base.saturating_add(iter.retained_bytes()))?;
@@ -4030,7 +4037,7 @@ impl TreePathIter {
         vec_bytes::<(u64, usize)>(self.stack.capacity())
             .saturating_add(vec_bytes::<u32>(self.low.capacity()))
             .saturating_add(vec_bytes::<(u64, Parent)>(self.links.capacity()))
-            .saturating_add(table_bytes::<u64>(self.on.capacity()))
+            .saturating_add(set_bytes(&self.on))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4038,8 +4045,8 @@ impl TreePathIter {
         &mut self,
         ctx: &Ctx,
         tree: &ChargedTree,
-        cost: Option<&FxHashMap<u64, Cost>>,
-        rank: Option<&FxHashMap<u64, u32>>,
+        cost: Option<&HbMap<u64, Cost>>,
+        rank: Option<&HbMap<u64, u32>>,
         forbid: &dyn Fn(u64) -> bool,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
@@ -4065,7 +4072,10 @@ impl TreePathIter {
                 )?;
                 let mut edges = Vec::with_capacity(self.links.len());
                 if self.forward {
-                    for (node, q) in self.links.iter().rev() {
+                    for (idx, (node, q)) in self.links.iter().rev().enumerate() {
+                        if idx.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
                         edges.push(Edge {
                             from: q.node,
                             to: *node,
@@ -4074,7 +4084,10 @@ impl TreePathIter {
                         });
                     }
                 } else {
-                    for (node, q) in &self.links {
+                    for (idx, (node, q)) in self.links.iter().enumerate() {
+                        if idx.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
                         edges.push(Edge {
                             from: *node,
                             to: q.node,
@@ -4086,9 +4099,7 @@ impl TreePathIter {
                 self.stack.pop();
                 self.low.pop();
                 self.links.pop();
-                if self.on.remove(&x) {
-                    self.on_tomb += 1;
-                }
+                self.on.remove(&x);
                 return Ok(Some(edges));
             }
             let i = top.1;
@@ -4117,15 +4128,13 @@ impl TreePathIter {
                     base = push_vec(&mut self.links, (x, q), charge, base)?;
                     base = push_vec(&mut self.stack, (q.node, 0), charge, base)?;
                     base = push_vec(&mut self.low, low_top.min(rank_of(q.node)), charge, base)?;
-                    let _ = insert_set_tomb(&mut self.on, &mut self.on_tomb, q.node, charge, base)?;
+                    let _ = insert_hb_set(&mut self.on, q.node, charge, base)?;
                 }
                 None => {
                     self.stack.pop();
                     self.low.pop();
                     self.links.pop();
-                    if self.on.remove(&x) {
-                        self.on_tomb += 1;
-                    }
+                    self.on.remove(&x);
                 }
             }
         }
@@ -4141,8 +4150,8 @@ impl TreePathIter {
         x: u64,
         q: u64,
         low: u32,
-        cost: &FxHashMap<u64, Cost>,
-        rank: &FxHashMap<u64, u32>,
+        cost: &HbMap<u64, Cost>,
+        rank: &HbMap<u64, u32>,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
     ) -> Result<bool> {
@@ -4159,10 +4168,10 @@ impl TreePathIter {
             return Ok(true);
         }
         let base_fixed = outer_bytes.saturating_add(self.retained_bytes());
-        let mut seen: FxHashSet<u64> = FxHashSet::default();
+        let mut seen: HbSet<u64> = HbSet::default();
         let mut todo: Vec<u64> = Vec::new();
         let mut base = base_fixed;
-        (_, base) = insert_set(&mut seen, q, charge, base)?;
+        (_, base) = insert_hb_set(&mut seen, q, charge, base)?;
         base = push_vec(&mut todo, q, charge, base)?;
         let mut found = false;
         'search: while let Some(z) = todo.pop() {
@@ -4192,7 +4201,7 @@ impl TreePathIter {
                     }
                     _ => {}
                 }
-                let (inserted, next_base) = insert_set(&mut seen, y, charge, base)?;
+                let (inserted, next_base) = insert_hb_set(&mut seen, y, charge, base)?;
                 base = next_base;
                 if inserted {
                     base = push_vec(&mut todo, y, charge, base)?;
@@ -4208,6 +4217,7 @@ impl TreePathIter {
 
 /// Pre-admitted `without_loops` cutting out zero-weight cycles from joined halves.
 fn without_loops_charged(
+    ctx: &Ctx,
     s: u64,
     edges: Vec<Edge>,
     charge: &mut super::ctx::OwnedCharge,
@@ -4215,7 +4225,8 @@ fn without_loops_charged(
 ) -> Result<Vec<Edge>> {
     let edges_bytes = vec_bytes::<Edge>(edges.capacity());
     let out_bytes = vec_bytes::<Edge>(edges.len());
-    let at_bytes = table_bytes::<(u64, usize)>(table_capacity(edges.len().saturating_add(1)));
+    let at_bytes =
+        super::charged::table_bound(edges.len().saturating_add(1), size_of::<(u64, usize)>());
     charge.resize(
         base_excluding_edges
             .saturating_add(edges_bytes)
@@ -4223,12 +4234,29 @@ fn without_loops_charged(
             .saturating_add(at_bytes),
     )?;
     let mut out: Vec<Edge> = Vec::with_capacity(edges.len());
-    let mut at: FxHashMap<u64, usize> =
-        FxHashMap::with_capacity_and_hasher(edges.len().saturating_add(1), Default::default());
+    let mut at: HbMap<u64, usize> =
+        HbMap::with_capacity_and_hasher(edges.len().saturating_add(1), Default::default());
+    let actual_at = map_bytes(&at);
+    debug_assert!(actual_at <= at_bytes);
+    charge.resize(
+        base_excluding_edges
+            .saturating_add(edges_bytes)
+            .saturating_add(vec_bytes::<Edge>(out.capacity()))
+            .saturating_add(actual_at),
+    )?;
     at.insert(s, 0);
+    let mut ticks = 0usize;
     for e in edges {
+        ticks += 1;
+        if ticks.is_multiple_of(4096) {
+            ctx.check()?;
+        }
         if let Some(&i) = at.get(&e.to) {
             for d in out.drain(i..) {
+                ticks += 1;
+                if ticks.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
                 at.remove(&d.to);
             }
             at.insert(e.to, i);
@@ -4243,18 +4271,223 @@ fn without_loops_charged(
     Ok(out)
 }
 
+struct StreamBans<'b> {
+    nodes: &'b HbSet<u64>,
+    edges: &'b HbSet<Edge>,
+}
+
+trait ChargedSink {
+    const CHECKS: bool;
+    fn put(
+        &mut self,
+        x: u64,
+        step: Step,
+        charge: Option<(&mut super::ctx::OwnedCharge, u64)>,
+    ) -> Result<()>;
+    fn len(&self) -> usize;
+}
+
+impl ChargedSink for Vec<(u64, Step)> {
+    const CHECKS: bool = false;
+    #[inline]
+    fn put(
+        &mut self,
+        x: u64,
+        step: Step,
+        charge: Option<(&mut super::ctx::OwnedCharge, u64)>,
+    ) -> Result<()> {
+        if let Some((charge, base_excluding_out)) = charge {
+            let base = base_excluding_out.saturating_add(vec_bytes::<(u64, Step)>(self.capacity()));
+            let _ = push_vec(self, (x, step), charge, base)?;
+        } else {
+            self.push((x, step));
+        }
+        Ok(())
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+}
+
+impl ChargedSink for Count {
+    const CHECKS: bool = true;
+    #[inline]
+    fn put(
+        &mut self,
+        _: u64,
+        _: Step,
+        _: Option<(&mut super::ctx::OwnedCharge, u64)>,
+    ) -> Result<()> {
+        self.0 += 1;
+        Ok(())
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_lane_charged<O: ChargedSink>(
+    dedup: bool,
+    sweeps: &mut u64,
+    ctx: &Ctx,
+    spec: &PathSearchSpec,
+    lane: &Lane,
+    frontier: &[u64],
+    rev: bool,
+    skip_self: bool,
+    out: &mut O,
+    cap: usize,
+    mut charge: Option<(&mut super::ctx::OwnedCharge, u64)>,
+) -> Result<()> {
+    let snap = &ctx.snap;
+    let (kc, nc, pc) = lane.cols();
+    let gc = lane.perm.col_of(crate::index::G);
+    let mask = (1 << kc) | (1 << nc) | (1 << gc) | pc.map_or(0, |c| 1 << c);
+    let graph = &spec.graph;
+    let fixed_p = lane.p.unwrap_or(0);
+    let excl: &[u64] = if lane.p.is_none() { &spec.exclude } else { &[] };
+    let mut last: Option<(u64, u64, u64)> = None;
+    let mut emit = |x: u64, node: u64, p: u64, g: u64, out: &mut O| -> Result<()> {
+        if !graph.accepts(g) || (skip_self && node == x) {
+            return Ok(());
+        }
+        if !excl.is_empty() && excl.binary_search(&p).is_ok() {
+            return Ok(());
+        }
+        if dedup && last == Some((x, node, p)) {
+            return Ok(());
+        }
+        last = Some((x, node, p));
+        let ch = charge.as_mut().map(|(c, b)| (&mut **c, *b));
+        out.put(x, Step { node, p, rev }, ch)
+    };
+    let rows = match lane.p {
+        Some(p) => snap.estimate(lane.perm, &[p]),
+        None => snap.len(),
+    };
+    let sweep = ctx.opt.batched_paths
+        && frontier.len() >= 64
+        && (frontier.len() as u64).saturating_mul(SWEEP_RATIO) >= rows;
+    if !sweep {
+        let mut scanned = 0usize;
+        for &x in frontier {
+            let key_buf;
+            let key: &[u64] = match lane.p {
+                Some(p) => {
+                    key_buf = [p, x];
+                    &key_buf
+                }
+                None => std::slice::from_ref(&x),
+            };
+            snap.scan_between_cols(lane.perm, pad(key, 0), pad(key, u64::MAX), mask, |c| {
+                match c {
+                    Chunk::Block(b, s, e) => {
+                        for i in s..e {
+                            scanned += 1;
+                            if scanned.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            let p = pc.map_or(fixed_p, |c| b.cols[c][i]);
+                            emit(x, b.cols[nc][i], p, b.cols[gc][i], out)?;
+                            if out.len() >= cap {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Chunk::Row(k) => {
+                        scanned += 1;
+                        if scanned.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        emit(x, k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
+                    }
+                }
+                if O::CHECKS {
+                    ctx.check()?;
+                }
+                Ok(out.len() < cap)
+            })?;
+        }
+        return Ok(());
+    }
+    *sweeps += 1;
+    let (first, last_node) = (frontier[0], frontier[frontier.len() - 1]);
+    let (lo_buf, hi_buf);
+    let (lo, hi): (&[u64], &[u64]) = match lane.p {
+        Some(p) => {
+            lo_buf = [p, first];
+            hi_buf = [p, last_node];
+            (&lo_buf, &hi_buf)
+        }
+        None => (
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&last_node),
+        ),
+    };
+    let mut j = 0;
+    let mut scanned = 0usize;
+    snap.scan_between_cols(lane.perm, pad(lo, 0), pad(hi, u64::MAX), mask, |c| {
+        ctx.check()?;
+        match c {
+            Chunk::Block(b, s, e) => {
+                let keys = &b.cols[kc][s..e];
+                let mut i = 0;
+                while i < keys.len() && j < frontier.len() {
+                    scanned += 1;
+                    if scanned.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
+                    let (k, f) = (keys[i], frontier[j]);
+                    if k < f {
+                        i += keys[i..].partition_point(|&x| x < f);
+                    } else if k > f {
+                        j += frontier[j..].partition_point(|&x| x < k);
+                    } else {
+                        while i < keys.len() && keys[i] == f {
+                            scanned += 1;
+                            if scanned.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            let r = s + i;
+                            let p = pc.map_or(fixed_p, |c| b.cols[c][r]);
+                            emit(f, b.cols[nc][r], p, b.cols[gc][r], out)?;
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            Chunk::Row(k) => {
+                scanned += 1;
+                if scanned.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
+                j += frontier[j..].partition_point(|&x| x < k[kc]);
+                if j < frontier.len() && frontier[j] == k[kc] {
+                    emit(k[kc], k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
+                }
+            }
+        }
+        Ok(j < frontier.len())
+    })?;
+    Ok(())
+}
+
 /// Owned, `Send` graph-reading engine shared across all streaming path-search jobs.
 struct SearchContext {
     dedup: bool,
     succ: Vec<Side>,
     pred: Vec<Side>,
+    empty_steps: std::sync::Arc<[Step]>,
     sinks: bool,
     degree: DegreeCount,
     pattern: ChargedPatternEdges,
-    cache: FxHashMap<(u64, bool), std::sync::Arc<[Step]>>,
+    cache: HbMap<(u64, bool), std::sync::Arc<[Step]>>,
     cache_step_bytes: u64,
-    weights: FxHashMap<(u64, u64, u64), f64>,
-    hubs: FxHashMap<u64, bool>,
+    weights: HbMap<(u64, u64, u64), f64>,
+    hubs: HbMap<u64, bool>,
     roots: Vec<u64>,
     visited: u64,
     visited_total: u64,
@@ -4272,7 +4505,12 @@ enum BidiWeightedOutcome {
 }
 
 impl SearchContext {
-    fn open(ctx: &Ctx, spec: &PathSearchSpec, pattern: ChargedPatternEdges) -> Result<Self> {
+    fn open(
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        pattern: ChargedPatternEdges,
+        charge: &mut super::ctx::OwnedCharge,
+    ) -> Result<Self> {
         let lane = |p: Option<u64>, subject_side: bool, is_pattern: bool| Lane {
             perm: match (p.is_some(), subject_side) {
                 (true, true) => Perm::Pso,
@@ -4284,31 +4522,32 @@ impl SearchContext {
             subject_side,
             pattern: is_pattern,
         };
-        let groups: Vec<(Lane, Lane, Direction)> = match (&spec.edge_pattern, &spec.predicates) {
-            (Some(_), _) => vec![(
-                lane(None, true, true),
-                lane(None, false, true),
-                spec.direction,
-            )],
-            (None, Some(ps)) => ps
-                .iter()
-                .zip(&spec.directions)
-                .map(|(&p, &d)| (lane(Some(p), true, false), lane(Some(p), false, false), d))
-                .collect(),
-            (None, None) => vec![(
-                lane(None, true, false),
-                lane(None, false, false),
-                spec.direction,
-            )],
-        };
         let side = |lane: Lane, rev: bool, skip_self: bool| Side {
             lane,
             rev,
             skip_self,
         };
-        let (mut succ, mut pred) = (Vec::new(), Vec::new());
-        for &(s, o, d) in &groups {
-            match d {
+        let side_len: usize = match (&spec.edge_pattern, &spec.predicates) {
+            (Some(_), _) | (None, None) => usize::from(spec.direction == Direction::Both) + 1,
+            (None, Some(ps)) => ps
+                .iter()
+                .zip(&spec.directions)
+                .map(|(_, &d)| usize::from(d == Direction::Both) + 1)
+                .sum(),
+        };
+        let empty_arc_bytes = (2 * size_of::<usize>()) as u64;
+        let side_bytes = vec_bytes::<Side>(side_len).saturating_mul(2);
+        charge.resize(
+            pattern
+                .retained_bytes()
+                .saturating_add(side_bytes)
+                .saturating_add(empty_arc_bytes),
+        )?;
+        let mut succ = Vec::with_capacity(side_len);
+        let mut pred = Vec::with_capacity(side_len);
+        let empty_steps: std::sync::Arc<[Step]> = std::sync::Arc::from([]);
+        let push_primary =
+            |succ: &mut Vec<Side>, pred: &mut Vec<Side>, s: Lane, o: Lane, d: Direction| match d {
                 Direction::Forward | Direction::Both => {
                     succ.push(side(s, false, false));
                     pred.push(side(o, false, false));
@@ -4317,12 +4556,58 @@ impl SearchContext {
                     succ.push(side(o, true, false));
                     pred.push(side(s, true, false));
                 }
+            };
+        let push_reverse =
+            |succ: &mut Vec<Side>, pred: &mut Vec<Side>, s: Lane, o: Lane, d: Direction| {
+                if d == Direction::Both {
+                    succ.push(side(o, true, true));
+                    pred.push(side(s, true, true));
+                }
+            };
+        match (&spec.edge_pattern, &spec.predicates) {
+            (Some(_), _) => {
+                let (s, o, d) = (
+                    lane(None, true, true),
+                    lane(None, false, true),
+                    spec.direction,
+                );
+                push_primary(&mut succ, &mut pred, s, o, d);
+                push_reverse(&mut succ, &mut pred, s, o, d);
             }
-        }
-        for &(s, o, d) in &groups {
-            if d == Direction::Both {
-                succ.push(side(o, true, true));
-                pred.push(side(s, true, true));
+            (None, Some(ps)) => {
+                for (idx, (&p, &d)) in ps.iter().zip(&spec.directions).enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
+                    push_primary(
+                        &mut succ,
+                        &mut pred,
+                        lane(Some(p), true, false),
+                        lane(Some(p), false, false),
+                        d,
+                    );
+                }
+                for (idx, (&p, &d)) in ps.iter().zip(&spec.directions).enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
+                    push_reverse(
+                        &mut succ,
+                        &mut pred,
+                        lane(Some(p), true, false),
+                        lane(Some(p), false, false),
+                        d,
+                    );
+                }
+            }
+            (None, None) => {
+                let (s, o, d) = (
+                    lane(None, true, false),
+                    lane(None, false, false),
+                    spec.direction,
+                );
+                push_primary(&mut succ, &mut pred, s, o, d);
+                push_reverse(&mut succ, &mut pred, s, o, d);
             }
         }
         let sinks = succ
@@ -4335,17 +4620,18 @@ impl SearchContext {
             None => DegreeCount::Scan,
             Some(_) => degree_count(ctx, &spec.graph)?,
         };
-        Ok(Self {
+        let search = Self {
             dedup: spec.graph.multi(),
             succ,
             pred,
+            empty_steps,
             sinks,
             degree,
             pattern,
-            cache: FxHashMap::default(),
+            cache: HbMap::default(),
             cache_step_bytes: 0,
-            weights: FxHashMap::default(),
-            hubs: FxHashMap::default(),
+            weights: HbMap::default(),
+            hubs: HbMap::default(),
             roots: Vec::new(),
             visited: 0,
             visited_total: 0,
@@ -4353,19 +4639,21 @@ impl SearchContext {
             sweeps: 0,
             skipped_hubs: 0,
             paths_found: 0,
-        })
+        };
+        charge.resize(search.retained_bytes())?;
+        Ok(search)
     }
 
     fn retained_bytes(&self) -> u64 {
-        let cache = self
-            .cache_step_bytes
-            .saturating_add(table_bytes::<((u64, bool), std::sync::Arc<[Step]>)>(
-                self.cache.capacity(),
-            ));
-        let hubs = table_bytes::<(u64, bool)>(self.hubs.capacity());
-        let weights = table_bytes::<((u64, u64, u64), f64)>(self.weights.capacity());
+        let lanes = vec_bytes::<Side>(self.succ.capacity())
+            .saturating_add(vec_bytes::<Side>(self.pred.capacity()))
+            .saturating_add((2 * size_of::<usize>()) as u64);
+        let cache = self.cache_step_bytes.saturating_add(map_bytes(&self.cache));
+        let hubs = map_bytes(&self.hubs);
+        let weights = map_bytes(&self.weights);
         self.pattern
             .retained_bytes()
+            .saturating_add(lanes)
             .saturating_add(cache)
             .saturating_add(hubs)
             .saturating_add(weights)
@@ -4439,7 +4727,7 @@ impl SearchContext {
         }
         let h = self.degree_above(ctx, spec, x, limit)?;
         let base = outer_bytes.saturating_add(self.retained_bytes());
-        let _ = insert_map(&mut self.hubs, x, h, charge, base)?;
+        let _ = insert_hb_map(&mut self.hubs, x, h, charge, base)?;
         Ok(h)
     }
 
@@ -4469,13 +4757,20 @@ impl SearchContext {
             return Ok(false);
         }
         let snap = &ctx.snap;
-        let key = |lane: &Lane, x: u64| -> Vec<u64> { lane.p.into_iter().chain([x]).collect() };
         let mut upper = 0u64;
         for s in &self.succ {
             if s.lane.pattern {
                 upper += self.pattern_degree(s, x);
             } else {
-                upper += snap.count(s.lane.perm, &key(&s.lane, x))?;
+                let key_buf;
+                let key: &[u64] = match s.lane.p {
+                    Some(p) => {
+                        key_buf = [p, x];
+                        &key_buf
+                    }
+                    None => std::slice::from_ref(&x),
+                };
+                upper += snap.count(s.lane.perm, key)?;
             }
         }
         if upper <= limit {
@@ -4518,12 +4813,26 @@ impl SearchContext {
             .unwrap_or(usize::MAX)
             .saturating_add(1);
         let mut out = Count(0);
-        let sides = self.succ.clone();
-        for s in &sides {
+        let dedup = self.dedup;
+        for s in &self.succ {
             if s.lane.pattern {
-                out.0 = out.0.saturating_add(self.pattern_degree(s, x) as usize);
+                let map = if s.lane.subject_side {
+                    &self.pattern.by_start
+                } else {
+                    &self.pattern.by_end
+                };
+                let ns = map.get(&x).map_or(&[][..], Vec::as_slice);
+                let n = ns.len();
+                let deg = if s.skip_self && ns.binary_search(&x).is_ok() {
+                    n - 1
+                } else {
+                    n
+                };
+                out.0 = out.0.saturating_add(deg);
             } else {
-                self.scan_lane(
+                scan_lane_charged(
+                    dedup,
+                    &mut self.sweeps,
                     ctx,
                     spec,
                     &s.lane,
@@ -4532,7 +4841,7 @@ impl SearchContext {
                     s.skip_self,
                     &mut out,
                     cap,
-                    &mut |_| Ok(()),
+                    None,
                 )?;
             }
             if out.0 >= cap {
@@ -4648,37 +4957,46 @@ impl SearchContext {
         if frontier.is_empty() {
             return Ok(());
         }
-        let sides = if succ {
-            self.succ.clone()
-        } else {
-            self.pred.clone()
-        };
         let base = outer_bytes.saturating_add(self.retained_bytes());
-        for s in &sides {
+        let dedup = self.dedup;
+        let sides = if succ { &self.succ } else { &self.pred };
+        for s in sides {
             let start = out.len();
-            let mut cur_cap = out.capacity();
             if s.lane.pattern {
-                self.pattern_lane(
-                    ctx,
-                    &s.lane,
-                    frontier,
-                    s.rev,
-                    s.skip_self,
-                    out,
-                    &mut |new_len| {
-                        if new_len > cur_cap {
-                            let elem = size_of::<(u64, Step)>();
-                            let next_c = vec_grown(cur_cap, new_len - 1, 1, elem);
-                            charge.resize(base.saturating_add(
-                                next_c.saturating_add(cur_cap) as u64 * elem as u64,
-                            ))?;
-                            cur_cap = next_c;
+                let map = if s.lane.subject_side {
+                    &self.pattern.by_start
+                } else {
+                    &self.pattern.by_end
+                };
+                let mut scanned = 0usize;
+                let mut cur_base = base.saturating_add(vec_bytes::<(u64, Step)>(out.capacity()));
+                for &x in frontier {
+                    for &node in map.get(&x).map_or(&[][..], Vec::as_slice) {
+                        scanned += 1;
+                        if scanned.is_multiple_of(4096) {
+                            ctx.check()?;
                         }
-                        Ok(())
-                    },
-                )?;
+                        if !(s.skip_self && node == x) {
+                            cur_base = push_vec(
+                                out,
+                                (
+                                    x,
+                                    Step {
+                                        node,
+                                        p: 0,
+                                        rev: s.rev,
+                                    },
+                                ),
+                                charge,
+                                cur_base,
+                            )?;
+                        }
+                    }
+                }
             } else {
-                self.scan_lane(
+                scan_lane_charged(
+                    dedup,
+                    &mut self.sweeps,
                     ctx,
                     spec,
                     &s.lane,
@@ -4687,20 +5005,9 @@ impl SearchContext {
                     s.skip_self,
                     out,
                     usize::MAX,
-                    &mut |new_len| {
-                        if new_len > cur_cap {
-                            let elem = size_of::<(u64, Step)>();
-                            let next_c = vec_grown(cur_cap, new_len - 1, 1, elem);
-                            charge.resize(base.saturating_add(
-                                next_c.saturating_add(cur_cap) as u64 * elem as u64,
-                            ))?;
-                            cur_cap = next_c;
-                        }
-                        Ok(())
-                    },
+                    Some((charge, base)),
                 )?;
             }
-            charge.resize(base.saturating_add(vec_bytes::<(u64, Step)>(out.capacity())))?;
             if !succ && (s.lane.pattern || s.lane.subject_side) {
                 let snap = &ctx.snap;
                 let mut w = start;
@@ -4719,168 +5026,6 @@ impl SearchContext {
         ctx.check()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn pattern_lane(
-        &self,
-        ctx: &Ctx,
-        lane: &Lane,
-        frontier: &[u64],
-        rev: bool,
-        skip_self: bool,
-        out: &mut Vec<(u64, Step)>,
-        admit_len: &mut dyn FnMut(usize) -> Result<()>,
-    ) -> Result<()> {
-        let map = if lane.subject_side {
-            &self.pattern.by_start
-        } else {
-            &self.pattern.by_end
-        };
-        let mut scanned = 0usize;
-        for &x in frontier {
-            for &node in map.get(&x).map_or(&[][..], Vec::as_slice) {
-                scanned += 1;
-                if scanned.is_multiple_of(4096) {
-                    ctx.check()?;
-                }
-                if !(skip_self && node == x) {
-                    admit_len(out.len().saturating_add(1))?;
-                    out.push((x, Step { node, p: 0, rev }));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn scan_lane<O: Sink>(
-        &mut self,
-        ctx: &Ctx,
-        spec: &PathSearchSpec,
-        lane: &Lane,
-        frontier: &[u64],
-        rev: bool,
-        skip_self: bool,
-        out: &mut O,
-        cap: usize,
-        admit_len: &mut dyn FnMut(usize) -> Result<()>,
-    ) -> Result<()> {
-        let snap = &ctx.snap;
-        let (kc, nc, pc) = lane.cols();
-        let gc = lane.perm.col_of(crate::index::G);
-        let prefix: Vec<u64> = lane.p.into_iter().collect();
-        let mask = (1 << kc) | (1 << nc) | (1 << gc) | pc.map_or(0, |c| 1 << c);
-        let graph = &spec.graph;
-        let dedup = self.dedup;
-        let fixed_p = lane.p.unwrap_or(0);
-        let excl: &[u64] = if lane.p.is_none() { &spec.exclude } else { &[] };
-        let mut last: Option<(u64, u64, u64)> = None;
-        let mut emit = |x: u64, node: u64, p: u64, g: u64, out: &mut O| -> Result<()> {
-            if !graph.accepts(g) || (skip_self && node == x) {
-                return Ok(());
-            }
-            if !excl.is_empty() && excl.binary_search(&p).is_ok() {
-                return Ok(());
-            }
-            if dedup && last == Some((x, node, p)) {
-                return Ok(());
-            }
-            last = Some((x, node, p));
-            admit_len(out.len().saturating_add(1))?;
-            out.put(x, Step { node, p, rev });
-            Ok(())
-        };
-        let rows = match lane.p {
-            Some(p) => snap.estimate(lane.perm, &[p]),
-            None => snap.len(),
-        };
-        let sweep = ctx.opt.batched_paths
-            && frontier.len() >= 64
-            && (frontier.len() as u64).saturating_mul(SWEEP_RATIO) >= rows;
-        if !sweep {
-            let mut scanned = 0usize;
-            for &x in frontier {
-                let mut key = prefix.clone();
-                key.push(x);
-                snap.scan_between_cols(lane.perm, pad(&key, 0), pad(&key, u64::MAX), mask, |c| {
-                    match c {
-                        Chunk::Block(b, s, e) => {
-                            for i in s..e {
-                                scanned += 1;
-                                if scanned.is_multiple_of(4096) {
-                                    ctx.check()?;
-                                }
-                                let p = pc.map_or(fixed_p, |c| b.cols[c][i]);
-                                emit(x, b.cols[nc][i], p, b.cols[gc][i], out)?;
-                                if out.len() >= cap {
-                                    return Ok(false);
-                                }
-                            }
-                        }
-                        Chunk::Row(k) => {
-                            scanned += 1;
-                            if scanned.is_multiple_of(4096) {
-                                ctx.check()?;
-                            }
-                            emit(x, k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
-                        }
-                    }
-                    if O::CHECKS {
-                        ctx.check()?;
-                    }
-                    Ok(out.len() < cap)
-                })?;
-            }
-            return Ok(());
-        }
-        self.sweeps += 1;
-        let (first, last_node) = (frontier[0], frontier[frontier.len() - 1]);
-        let (mut lo, mut hi) = (prefix.clone(), prefix);
-        lo.push(first);
-        hi.push(last_node);
-        let mut j = 0;
-        let mut scanned = 0usize;
-        snap.scan_between_cols(lane.perm, pad(&lo, 0), pad(&hi, u64::MAX), mask, |c| {
-            ctx.check()?;
-            match c {
-                Chunk::Block(b, s, e) => {
-                    let keys = &b.cols[kc][s..e];
-                    let mut i = 0;
-                    while i < keys.len() && j < frontier.len() {
-                        scanned += 1;
-                        if scanned.is_multiple_of(4096) {
-                            ctx.check()?;
-                        }
-                        let (k, f) = (keys[i], frontier[j]);
-                        if k < f {
-                            i += keys[i..].partition_point(|&x| x < f);
-                        } else if k > f {
-                            j += frontier[j..].partition_point(|&x| x < k);
-                        } else {
-                            while i < keys.len() && keys[i] == f {
-                                let r = s + i;
-                                let p = pc.map_or(fixed_p, |c| b.cols[c][r]);
-                                emit(f, b.cols[nc][r], p, b.cols[gc][r], out)?;
-                                i += 1;
-                            }
-                        }
-                    }
-                }
-                Chunk::Row(k) => {
-                    scanned += 1;
-                    if scanned.is_multiple_of(4096) {
-                        ctx.check()?;
-                    }
-                    j += frontier[j..].partition_point(|&x| x < k[kc]);
-                    if j < frontier.len() && frontier[j] == k[kc] {
-                        emit(k[kc], k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
-                    }
-                }
-            }
-            Ok(j < frontier.len())
-        })?;
-        Ok(())
-    }
-
     fn neighbours(
         &mut self,
         ctx: &Ctx,
@@ -4891,11 +5036,11 @@ impl SearchContext {
         outer_bytes: u64,
     ) -> Result<std::sync::Arc<[Step]>> {
         if self.sink(ctx, x, succ) {
-            return Ok(std::sync::Arc::from(Vec::new()));
+            return Ok(self.empty_steps.clone());
         }
         if self.blocked(ctx, spec, x, charge, outer_bytes)? {
             self.skipped_hubs += 1;
-            return Ok(std::sync::Arc::from(Vec::new()));
+            return Ok(self.empty_steps.clone());
         }
         if let Some(n) = self.cache.get(&(x, succ)) {
             return Ok(n.clone());
@@ -4903,10 +5048,21 @@ impl SearchContext {
         let mut out = Vec::new();
         self.expand_all(ctx, spec, &[x], succ, &mut out, charge, outer_bytes)?;
         let out_bytes = vec_bytes::<(u64, Step)>(out.capacity());
+        if out.is_empty() {
+            let steps = self.empty_steps.clone();
+            let base = outer_bytes
+                .saturating_add(self.retained_bytes())
+                .saturating_add(out_bytes);
+            let _ = insert_hb_map(&mut self.cache, (x, succ), steps.clone(), charge, base)?;
+            drop(out);
+            charge.resize(outer_bytes.saturating_add(self.retained_bytes()))?;
+            return Ok(steps);
+        }
         let added = vec_bytes::<Step>(out.len()).saturating_add((2 * size_of::<usize>()) as u64);
-        let growth = table_growth::<((u64, bool), std::sync::Arc<[Step]>)>(
-            self.cache.capacity(),
+        let growth = hb_growth_for_one::<((u64, bool), std::sync::Arc<[Step]>)>(
             self.cache.len(),
+            self.cache.capacity(),
+            map_bytes(&self.cache),
         );
         charge.resize(
             outer_bytes
@@ -4940,10 +5096,9 @@ impl SearchContext {
         if let Some(&x) = self.weights.get(&key) {
             return Ok(x);
         }
-        let base_fixed = outer_bytes.saturating_add(self.retained_bytes());
-        let x = lookup_weight_charged(ctx, spec, w, key, charge, base_fixed)?;
+        let x = lookup_weight_charged(ctx, spec, w, key)?;
         let w_base = outer_bytes.saturating_add(self.retained_bytes());
-        let _ = insert_map(&mut self.weights, key, x, charge, w_base)?;
+        let _ = insert_hb_map(&mut self.weights, key, x, charge, w_base)?;
         Ok(x)
     }
 
@@ -4960,7 +5115,10 @@ impl SearchContext {
             return Ok(Cost::of(edges.len() as f64));
         }
         let mut sum = Cost::ZERO;
-        for e in edges {
+        for (idx, e) in edges.iter().enumerate() {
+            if idx.is_multiple_of(4096) {
+                ctx.check()?;
+            }
             let w = self.weight(ctx, spec, &e.map(&real), charge, outer_bytes)?;
             sum = sum.add(Cost::of(w));
         }
@@ -4991,7 +5149,7 @@ impl SearchContext {
         all: bool,
         virt: u64,
         close: bool,
-        bans: Option<&Bans>,
+        bans: Option<&StreamBans>,
         charge: &mut super::ctx::OwnedCharge,
         outer_excluding_tree: u64,
     ) -> Result<Vec<u64>> {
@@ -5052,7 +5210,10 @@ impl SearchContext {
                 .saturating_add(tree.retained_bytes())
                 .saturating_add(found_bytes)
                 .saturating_add(vec_bytes::<(u64, Step)>(more.capacity()));
-            for (_, s) in more {
+            for (idx, (_, s)) in more.into_iter().enumerate() {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
                 base = push_vec(&mut found, (VIRT, s), charge, base)?;
             }
         }
@@ -5118,7 +5279,7 @@ impl SearchContext {
             .saturating_add(vec_bytes::<u64>(next.capacity()));
         charge.resize(base)?;
         self.visit(spec, next.len() as u64)?;
-        next.sort_unstable();
+        sort_checked_by_key(&mut next, ctx, |&y| y)?;
         for (i, &y) in next.iter().enumerate() {
             if i.is_multiple_of(4096) {
                 ctx.check()?;
@@ -5150,7 +5311,7 @@ impl SearchContext {
         self.set_roots(spec, &[root], charge, outer_bytes)?;
         let mut tree = ChargedTree::new(root, forward);
         let mut frontier: Vec<u64> = Vec::new();
-        let mut missing: FxHashSet<u64> = FxHashSet::default();
+        let mut missing: HbSet<u64> = HbSet::default();
         let mut base = self.retained_bytes().saturating_add(outer_bytes);
         base = push_vec(&mut frontier, root, charge, base)?;
         if let Some(ts) = targets {
@@ -5159,7 +5320,7 @@ impl SearchContext {
                     ctx.check()?;
                 }
                 let key = if close && x == root { VIRT } else { x };
-                (_, base) = insert_set(&mut missing, key, charge, base)?;
+                (_, base) = insert_hb_set(&mut missing, key, charge, base)?;
             }
         }
         let mut depth = 0u32;
@@ -5167,7 +5328,7 @@ impl SearchContext {
         self.visit(spec, 1)?;
         while !frontier.is_empty() && depth < max {
             let f_bytes = vec_bytes::<u64>(frontier.capacity());
-            let m_bytes = table_bytes::<u64>(missing.capacity());
+            let m_bytes = set_bytes(&missing);
             let next = self.grow_tree(
                 ctx,
                 spec,
@@ -5184,7 +5345,10 @@ impl SearchContext {
             frontier = next;
             depth += 1;
             if targets.is_some() {
-                for y in &frontier {
+                for (idx, y) in frontier.iter().enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
                     missing.remove(y);
                 }
                 if missing.is_empty() {
@@ -5196,7 +5360,7 @@ impl SearchContext {
                     .saturating_add(outer_bytes)
                     .saturating_add(tree.retained_bytes())
                     .saturating_add(vec_bytes::<u64>(frontier.capacity()))
-                    .saturating_add(table_bytes::<u64>(missing.capacity())),
+                    .saturating_add(set_bytes(&missing)),
             )?;
         }
         drop(frontier);
@@ -5218,7 +5382,7 @@ impl SearchContext {
         tt: u64,
         virt: u64,
         all: bool,
-        bans: Option<&Bans>,
+        bans: Option<&StreamBans>,
         max: Option<u32>,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
@@ -5344,12 +5508,12 @@ impl SearchContext {
         targets: Option<&[u64]>,
         all: bool,
         close: bool,
-        banned_nodes: Option<&FxHashSet<u64>>,
-        banned_edges: Option<&FxHashSet<Edge>>,
+        banned_nodes: Option<&HbSet<u64>>,
+        banned_edges: Option<&HbSet<Edge>>,
         virt: u64,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
-    ) -> Result<(ChargedTree, FxHashMap<u64, Cost>)> {
+    ) -> Result<(ChargedTree, HbMap<u64, Cost>)> {
         self.set_roots(
             spec,
             &[if root == VIRT { virt } else { root }],
@@ -5357,10 +5521,10 @@ impl SearchContext {
             outer_bytes,
         )?;
         let mut tree = ChargedTree::new(root, forward);
-        let mut dist: FxHashMap<u64, Cost> = FxHashMap::default();
-        let mut settled: FxHashSet<u64> = FxHashSet::default();
+        let mut dist: HbMap<u64, Cost> = HbMap::default();
+        let mut settled: HbSet<u64> = HbSet::default();
         let mut heap: BinaryHeap<Reverse<(Cost, u64)>> = BinaryHeap::new();
-        let mut missing: FxHashSet<u64> = FxHashSet::default();
+        let mut missing: HbSet<u64> = HbSet::default();
         let mut base = self.retained_bytes().saturating_add(outer_bytes);
         if let Some(ts) = targets {
             for (i, &x) in ts.iter().enumerate() {
@@ -5368,10 +5532,10 @@ impl SearchContext {
                     ctx.check()?;
                 }
                 let key = if close && x == virt { VIRT } else { x };
-                (_, base) = insert_set(&mut missing, key, charge, base)?;
+                (_, base) = insert_hb_set(&mut missing, key, charge, base)?;
             }
         }
-        (_, base) = insert_map(&mut dist, root, Cost::ZERO, charge, base)?;
+        (_, base) = insert_hb_map(&mut dist, root, Cost::ZERO, charge, base)?;
         base = push_heap(&mut heap, Reverse((Cost::ZERO, root)), charge, base)?;
         let mut n = 0u64;
         let mut last_cost: Option<Cost> = None;
@@ -5379,7 +5543,7 @@ impl SearchContext {
             if last_cost.is_some_and(|c| d > c) {
                 break;
             }
-            let (inserted, next_base) = insert_set(&mut settled, u, charge, base)?;
+            let (inserted, next_base) = insert_hb_set(&mut settled, u, charge, base)?;
             base = next_base;
             if !inserted {
                 continue;
@@ -5407,10 +5571,10 @@ impl SearchContext {
             let scan = if u == VIRT { virt } else { u };
             let local_outer = outer_bytes
                 .saturating_add(tree.retained_bytes())
-                .saturating_add(table_bytes::<(u64, Cost)>(dist.capacity()))
-                .saturating_add(table_bytes::<u64>(settled.capacity()))
+                .saturating_add(map_bytes(&dist))
+                .saturating_add(set_bytes(&settled))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u64)>>(heap.capacity()))
-                .saturating_add(table_bytes::<u64>(missing.capacity()));
+                .saturating_add(set_bytes(&missing));
             let mut cached_steps: Option<std::sync::Arc<[Step]>> = None;
             let mut out_steps: Vec<(u64, Step)> = Vec::new();
             if banned_nodes.is_some() {
@@ -5470,10 +5634,10 @@ impl SearchContext {
                 let real = |x: u64| if x == VIRT { virt } else { x };
                 let step_outer = outer_bytes
                     .saturating_add(tree.retained_bytes())
-                    .saturating_add(table_bytes::<(u64, Cost)>(dist.capacity()))
-                    .saturating_add(table_bytes::<u64>(settled.capacity()))
+                    .saturating_add(map_bytes(&dist))
+                    .saturating_add(set_bytes(&settled))
                     .saturating_add(vec_bytes::<Reverse<(Cost, u64)>>(heap.capacity()))
-                    .saturating_add(table_bytes::<u64>(missing.capacity()))
+                    .saturating_add(set_bytes(&missing))
                     .saturating_add(out_bytes);
                 let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
                 let nd = d.add(Cost::of(w));
@@ -5492,7 +5656,7 @@ impl SearchContext {
                     }
                     _ if tied => {}
                     _ => {
-                        (_, cur_base) = insert_map(&mut dist, y, nd, charge, cur_base)?;
+                        (_, cur_base) = insert_hb_map(&mut dist, y, nd, charge, cur_base)?;
                         cur_base = tree.insert_first(y, parent, 0, charge, cur_base)?;
                         let freed = tree.remove_extra(y);
                         cur_base = cur_base.saturating_sub(freed);
@@ -5506,10 +5670,10 @@ impl SearchContext {
                 .retained_bytes()
                 .saturating_add(outer_bytes)
                 .saturating_add(tree.retained_bytes())
-                .saturating_add(table_bytes::<(u64, Cost)>(dist.capacity()))
-                .saturating_add(table_bytes::<u64>(settled.capacity()))
+                .saturating_add(map_bytes(&dist))
+                .saturating_add(set_bytes(&settled))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u64)>>(heap.capacity()))
-                .saturating_add(table_bytes::<u64>(missing.capacity()));
+                .saturating_add(set_bytes(&missing));
             charge.resize(base)?;
         }
         tree.retain_settled(&settled);
@@ -5521,7 +5685,7 @@ impl SearchContext {
             self.retained_bytes()
                 .saturating_add(outer_bytes)
                 .saturating_add(tree.retained_bytes())
-                .saturating_add(table_bytes::<(u64, Cost)>(dist.capacity())),
+                .saturating_add(map_bytes(&dist)),
         )?;
         Ok((tree, dist))
     }
@@ -5533,34 +5697,34 @@ impl SearchContext {
         spec: &PathSearchSpec,
         s: u64,
         t: u64,
-        banned_nodes: Option<&FxHashSet<u64>>,
-        banned_edges: Option<&FxHashSet<Edge>>,
+        banned_nodes: Option<&HbSet<u64>>,
+        banned_edges: Option<&HbSet<Edge>>,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
     ) -> Result<Option<(Vec<Edge>, f64)>> {
         debug_assert!(s != t && s != VIRT && t != VIRT);
         self.set_roots(spec, &[s, t], charge, outer_bytes)?;
         let mut trees = [ChargedTree::new(s, true), ChargedTree::new(t, false)];
-        let mut dist: [FxHashMap<u64, Cost>; 2] = Default::default();
-        let mut settled: [FxHashSet<u64>; 2] = Default::default();
+        let mut dist: [HbMap<u64, Cost>; 2] = Default::default();
+        let mut settled: [HbSet<u64>; 2] = Default::default();
         let mut heaps: [BinaryHeap<Reverse<(Cost, u64)>>; 2] = Default::default();
         let mut base = self.retained_bytes().saturating_add(outer_bytes);
         for (i, r) in [s, t].into_iter().enumerate() {
-            (_, base) = insert_map(&mut dist[i], r, Cost::ZERO, charge, base)?;
+            (_, base) = insert_hb_map(&mut dist[i], r, Cost::ZERO, charge, base)?;
             base = push_heap(&mut heaps[i], Reverse((Cost::ZERO, r)), charge, base)?;
         }
         let local_bytes =
             |trees: &[ChargedTree; 2],
-             dist: &[FxHashMap<u64, Cost>; 2],
-             settled: &[FxHashSet<u64>; 2],
+             dist: &[HbMap<u64, Cost>; 2],
+             settled: &[HbSet<u64>; 2],
              heaps: &[BinaryHeap<Reverse<(Cost, u64)>>; 2]| {
                 trees[0]
                     .retained_bytes()
                     .saturating_add(trees[1].retained_bytes())
-                    .saturating_add(table_bytes::<(u64, Cost)>(dist[0].capacity()))
-                    .saturating_add(table_bytes::<(u64, Cost)>(dist[1].capacity()))
-                    .saturating_add(table_bytes::<u64>(settled[0].capacity()))
-                    .saturating_add(table_bytes::<u64>(settled[1].capacity()))
+                    .saturating_add(map_bytes(&dist[0]))
+                    .saturating_add(map_bytes(&dist[1]))
+                    .saturating_add(set_bytes(&settled[0]))
+                    .saturating_add(set_bytes(&settled[1]))
                     .saturating_add(vec_bytes::<Reverse<(Cost, u64)>>(heaps[0].capacity()))
                     .saturating_add(vec_bytes::<Reverse<(Cost, u64)>>(heaps[1].capacity()))
             };
@@ -5590,7 +5754,7 @@ impl SearchContext {
                 .retained_bytes()
                 .saturating_add(outer_bytes)
                 .saturating_add(local_bytes(&trees, &dist, &settled, &heaps));
-            (_, base) = insert_set(&mut settled[side], u, charge, base)?;
+            (_, base) = insert_hb_set(&mut settled[side], u, charge, base)?;
             if u != trees[side].root {
                 let _ = trees[side].push_order((u, 0), charge, base)?;
             }
@@ -5648,7 +5812,7 @@ impl SearchContext {
                     continue;
                 }
                 let mut cur_base = self.retained_bytes().saturating_add(step_outer);
-                (_, cur_base) = insert_map(&mut dist[side], y, nd, charge, cur_base)?;
+                (_, cur_base) = insert_hb_map(&mut dist[side], y, nd, charge, cur_base)?;
                 cur_base = trees[side].insert_first(
                     y,
                     Parent {
@@ -5740,9 +5904,13 @@ impl SearchContext {
                 .saturating_add(vec_bytes::<Edge>(combined_len)),
         )?;
         let mut combined = Vec::with_capacity(combined_len);
-        combined.extend(a);
-        combined.extend(z);
-        let path = without_loops_charged(s, combined, charge, base_no_trees)?;
+        for (idx, edge) in a.into_iter().chain(z).enumerate() {
+            if idx.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            combined.push(edge);
+        }
+        let path = without_loops_charged(ctx, s, combined, charge, base_no_trees)?;
         let path_outer = outer_bytes.saturating_add(vec_bytes::<Edge>(path.capacity()));
         let cost = self.path_cost(ctx, spec, &path, charge, path_outer)?;
         Ok(Some((path, cost)))
@@ -5765,30 +5933,30 @@ impl SearchContext {
         let real = |x: u64| if x == VIRT { s } else { x };
         self.set_roots(spec, &[s, t], charge, outer_bytes)?;
         let mut trees = [ChargedTree::new(s, true), ChargedTree::new(tt, false)];
-        let mut dist: [FxHashMap<u64, Cost>; 2] = Default::default();
-        let mut settled: [FxHashSet<u64>; 2] = Default::default();
+        let mut dist: [HbMap<u64, Cost>; 2] = Default::default();
+        let mut settled: [HbSet<u64>; 2] = Default::default();
         let mut heaps: [BinaryHeap<Reverse<(Cost, u64)>>; 2] = Default::default();
-        let mut meets: FxHashSet<Edge> = FxHashSet::default();
+        let mut meets: HbSet<Edge> = HbSet::default();
         let mut base = self.retained_bytes().saturating_add(outer_bytes);
         for (i, r) in [s, tt].into_iter().enumerate() {
-            (_, base) = insert_map(&mut dist[i], r, Cost::ZERO, charge, base)?;
+            (_, base) = insert_hb_map(&mut dist[i], r, Cost::ZERO, charge, base)?;
             base = push_heap(&mut heaps[i], Reverse((Cost::ZERO, r)), charge, base)?;
         }
         let local_bytes = |trees: &[ChargedTree; 2],
-                           dist: &[FxHashMap<u64, Cost>; 2],
-                           settled: &[FxHashSet<u64>; 2],
+                           dist: &[HbMap<u64, Cost>; 2],
+                           settled: &[HbSet<u64>; 2],
                            heaps: &[BinaryHeap<Reverse<(Cost, u64)>>; 2],
-                           meets: &FxHashSet<Edge>| {
+                           meets: &HbSet<Edge>| {
             trees[0]
                 .retained_bytes()
                 .saturating_add(trees[1].retained_bytes())
-                .saturating_add(table_bytes::<(u64, Cost)>(dist[0].capacity()))
-                .saturating_add(table_bytes::<(u64, Cost)>(dist[1].capacity()))
-                .saturating_add(table_bytes::<u64>(settled[0].capacity()))
-                .saturating_add(table_bytes::<u64>(settled[1].capacity()))
+                .saturating_add(map_bytes(&dist[0]))
+                .saturating_add(map_bytes(&dist[1]))
+                .saturating_add(set_bytes(&settled[0]))
+                .saturating_add(set_bytes(&settled[1]))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u64)>>(heaps[0].capacity()))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u64)>>(heaps[1].capacity()))
-                .saturating_add(table_bytes::<Edge>(meets.capacity()))
+                .saturating_add(set_bytes(meets))
         };
         let mut best: Option<Cost> = None;
         let mut best_edge: Option<Edge> = None;
@@ -5829,7 +5997,7 @@ impl SearchContext {
                 .retained_bytes()
                 .saturating_add(outer_bytes)
                 .saturating_add(local_bytes(&trees, &dist, &settled, &heaps, &meets));
-            (_, base) = insert_set(&mut settled[side], u, charge, base)?;
+            (_, base) = insert_hb_set(&mut settled[side], u, charge, base)?;
             if u != trees[side].root {
                 let _ = trees[side].push_order((u, 0), charge, base)?;
             }
@@ -5899,7 +6067,7 @@ impl SearchContext {
                     }
                     _ if settled[side].contains(&y) => {}
                     _ => {
-                        (_, cur_base) = insert_map(&mut dist[side], y, nd, charge, cur_base)?;
+                        (_, cur_base) = insert_hb_map(&mut dist[side], y, nd, charge, cur_base)?;
                         cur_base = trees[side].insert_first(y, parent, 0, charge, cur_base)?;
                         let freed = trees[side].remove_extra(y);
                         cur_base = cur_base.saturating_sub(freed);
@@ -5927,7 +6095,7 @@ impl SearchContext {
                         }
                         if all {
                             let m_base = self.retained_bytes().saturating_add(check_outer);
-                            let _ = insert_set(&mut meets, e, charge, m_base)?;
+                            let _ = insert_hb_set(&mut meets, e, charge, m_base)?;
                         }
                     }
                 }
@@ -6019,11 +6187,17 @@ impl SearchContext {
                     .saturating_add(vec_bytes::<Edge>(combined_len)),
             )?;
             let mut p = Vec::with_capacity(combined_len);
-            p.extend(a);
-            p.push(e);
-            p.extend(z);
-            let mut p = without_loops_charged(s, p, charge, base_no_trees)?;
-            for edge in &mut p {
+            for (idx, edge) in a.into_iter().chain(std::iter::once(e)).chain(z).enumerate() {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
+                p.push(edge);
+            }
+            let mut p = without_loops_charged(ctx, s, p, charge, base_no_trees)?;
+            for (idx, edge) in p.iter_mut().enumerate() {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
                 *edge = edge.map(real);
             }
             let cost = self.path_cost(
@@ -6063,9 +6237,9 @@ impl SearchContext {
             .saturating_add(outer_bytes)
             .saturating_add(trees[0].retained_bytes())
             .saturating_add(trees[1].retained_bytes())
-            .saturating_add(table_bytes::<(u64, Cost)>(dist[0].capacity()))
-            .saturating_add(table_bytes::<(u64, Cost)>(dist[1].capacity()))
-            .saturating_add(table_bytes::<Edge>(meets.capacity()));
+            .saturating_add(map_bytes(&dist[0]))
+            .saturating_add(map_bytes(&dist[1]))
+            .saturating_add(set_bytes(&meets));
         charge.resize(jbase)?;
         for (idx, &e) in meets.iter().enumerate() {
             if idx.is_multiple_of(4096) {
@@ -6080,9 +6254,9 @@ impl SearchContext {
             let w_outer = outer_bytes
                 .saturating_add(trees[0].retained_bytes())
                 .saturating_add(trees[1].retained_bytes())
-                .saturating_add(table_bytes::<(u64, Cost)>(dist[0].capacity()))
-                .saturating_add(table_bytes::<(u64, Cost)>(dist[1].capacity()))
-                .saturating_add(table_bytes::<Edge>(meets.capacity()))
+                .saturating_add(map_bytes(&dist[0]))
+                .saturating_add(map_bytes(&dist[1]))
+                .saturating_add(set_bytes(&meets))
                 .saturating_add(vec_bytes::<(Edge, Cost)>(joins.capacity()));
             let w = Cost::of(self.weight(ctx, spec, &e.map(real), charge, w_outer)?);
             let total_c = dist[0][&e.from].add(w).add(dist[1][&e.to]);
@@ -6105,14 +6279,14 @@ impl SearchContext {
             return Ok(BidiWeightedOutcome::FallbackSingleSource);
         }
         joins.retain(|j| j.1 == mu);
-        joins.sort_unstable_by_key(|(e, _)| (e.from, e.to, e.p, e.rev));
+        sort_checked_by_key(&mut joins, ctx, |(e, _)| (e.from, e.to, e.p, e.rev))?;
         let mut rbase = self
             .retained_bytes()
             .saturating_add(outer_bytes)
             .saturating_add(trees[0].retained_bytes())
             .saturating_add(trees[1].retained_bytes())
-            .saturating_add(table_bytes::<(u64, Cost)>(dist[0].capacity()))
-            .saturating_add(table_bytes::<(u64, Cost)>(dist[1].capacity()))
+            .saturating_add(map_bytes(&dist[0]))
+            .saturating_add(map_bytes(&dist[1]))
             .saturating_add(vec_bytes::<(Edge, Cost)>(joins.capacity()));
         charge.resize(rbase)?;
         let (rank0, next_rbase) = trees[0].build_ranks(ctx, charge, rbase)?;
@@ -6155,7 +6329,8 @@ impl SearchContext {
         charge.resize(
             self.retained_bytes()
                 .saturating_add(outer_bytes)
-                .saturating_add(job.retained_bytes()),
+                .saturating_add(job.retained_bytes())
+                .saturating_add(size_of::<BidiWeightedAllJob>() as u64),
         )?;
         Ok(BidiWeightedOutcome::Stream(Box::new(job)))
     }
@@ -6168,8 +6343,8 @@ impl SearchContext {
         from: u64,
         to: u64,
         virt: u64,
-        banned_nodes: &FxHashSet<u64>,
-        banned_edges: &FxHashSet<Edge>,
+        banned_nodes: &HbSet<u64>,
+        banned_edges: &HbSet<Edge>,
         budget: Option<u32>,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
@@ -6231,7 +6406,7 @@ impl SearchContext {
             )?;
             return Ok(p.map(|e| (e, c)));
         }
-        let bans = Bans {
+        let bans = StreamBans {
             nodes: banned_nodes,
             edges: banned_edges,
         };
@@ -6299,8 +6474,12 @@ impl SearchContext {
                 .saturating_add(vec_bytes::<Edge>(combined_len)),
         )?;
         let mut p = Vec::with_capacity(combined_len);
-        p.extend(a);
-        p.extend(z);
+        for (idx, edge) in a.into_iter().chain(z).enumerate() {
+            if idx.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            p.push(edge);
+        }
         let c = p.len() as f64;
         charge.resize(base_plain.saturating_add(vec_bytes::<Edge>(p.capacity())))?;
         Ok(Some((p, c)))
@@ -6326,8 +6505,6 @@ fn lookup_weight_charged(
     spec: &PathSearchSpec,
     w: Option<u64>,
     (s, p, o): (u64, u64, u64),
-    charge: &mut super::ctx::OwnedCharge,
-    base_fixed: u64,
 ) -> Result<f64> {
     let default = spec.default_weight;
     let (Some(w), Some(reifies)) = (w, spec.reifies) else {
@@ -6347,59 +6524,105 @@ fn lookup_weight_charged(
         return Ok(default);
     };
     let graph = &spec.graph;
-    let mut reifiers: Vec<u64> = Vec::new();
-    let mut base = base_fixed;
-    for (idx, k) in ctx
-        .snap
-        .scan_keys(Perm::Pos, &[reifies, tt.0])?
-        .into_iter()
-        .enumerate()
-    {
-        if idx.is_multiple_of(4096) {
-            ctx.check()?;
-        }
-        if graph.accepts(k[3]) {
-            base = push_vec(&mut reifiers, k[2], charge, base)?;
-        }
-    }
     let mut best: Option<f64> = None;
-    for (idx, r) in reifiers.iter().copied().enumerate() {
-        if idx.is_multiple_of(4096) {
-            ctx.check()?;
-        }
-        for k in ctx.snap.scan_keys(Perm::Pso, &[w, r])? {
-            if !graph.accepts(k[3]) {
-                continue;
+    let mut last_reifier: Option<u64> = None;
+    let mut scanned = 0usize;
+    let scan_weights = |reifier: u64, best: &mut Option<f64>| -> Result<()> {
+        let mut inner_scanned = 0usize;
+        let mut handle_weight = |val_id: u64, g: u64| -> Result<()> {
+            if !graph.accepts(g) {
+                return Ok(());
             }
             let v = ctx
-                .value(Id(k[2]))
+                .value(Id(val_id))
                 .as_ref()
                 .and_then(super::value::approx_f64);
             match v {
                 Some(v) if v >= 0.0 && v.is_finite() => {
-                    best = Some(best.map_or(v, |b: f64| b.min(v)));
+                    *best = Some(best.map_or(v, |b: f64| b.min(v)));
+                    Ok(())
                 }
                 _ => {
-                    drop(reifiers);
-                    let _ = charge.resize(base_fixed);
                     let t = ctx
-                        .term(Id(k[2]))
+                        .term(Id(val_id))
                         .map_or_else(|| "?".to_string(), |t| t.to_string());
-                    return Err(bad(format!("the weight {t} is not a non-negative number")));
+                    Err(bad(format!("the weight {t} is not a non-negative number")))
                 }
             }
-        }
-    }
-    drop(reifiers);
-    charge.resize(base_fixed)?;
+        };
+        ctx.snap.scan_checked(
+            Perm::Pso,
+            &[w, reifier],
+            || ctx.check(),
+            |c| {
+                match c {
+                    Chunk::Block(b, s_idx, e_idx) => {
+                        for i in s_idx..e_idx {
+                            inner_scanned += 1;
+                            if inner_scanned.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            handle_weight(b.cols[2][i], b.cols[3][i])?;
+                        }
+                    }
+                    Chunk::Row(k) => {
+                        inner_scanned += 1;
+                        if inner_scanned.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        handle_weight(k[2], k[3])?;
+                    }
+                }
+                Ok(true)
+            },
+        )
+    };
+    ctx.snap.scan_checked(
+        Perm::Pos,
+        &[reifies, tt.0],
+        || ctx.check(),
+        |c| {
+            match c {
+                Chunk::Block(b, s_idx, e_idx) => {
+                    for i in s_idx..e_idx {
+                        scanned += 1;
+                        if scanned.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        if graph.accepts(b.cols[3][i]) {
+                            let r = b.cols[2][i];
+                            if last_reifier != Some(r) {
+                                last_reifier = Some(r);
+                                scan_weights(r, &mut best)?;
+                            }
+                        }
+                    }
+                }
+                Chunk::Row(k) => {
+                    scanned += 1;
+                    if scanned.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
+                    if graph.accepts(k[3]) {
+                        let r = k[2];
+                        if last_reifier != Some(r) {
+                            last_reifier = Some(r);
+                            scan_weights(r, &mut best)?;
+                        }
+                    }
+                }
+            }
+            Ok(true)
+        },
+    )?;
     Ok(best.unwrap_or(default))
 }
 
 /// Resumable stream over a single-source/single-target BFS or Dijkstra [`ChargedTree`].
 struct TreeStreamJob {
     tree: ChargedTree,
-    cost: Option<FxHashMap<u64, Cost>>,
-    rank: Option<FxHashMap<u64, u32>>,
+    cost: Option<HbMap<u64, Cost>>,
+    rank: Option<HbMap<u64, u32>>,
     root: u64,
     forward: bool,
     all: bool,
@@ -6469,10 +6692,7 @@ impl TreeStreamJob {
             .retained_bytes()
             .saturating_add(outer_bytes)
             .saturating_add(tree.retained_bytes())
-            .saturating_add(
-                cost.as_ref()
-                    .map_or(0, |c| table_bytes::<(u64, Cost)>(c.capacity())),
-            );
+            .saturating_add(cost.as_ref().map_or(0, map_bytes));
         charge.resize(base)?;
         let rank = if all && cost.is_some() {
             let (r, next_base) = tree.build_ranks(ctx, charge, base)?;
@@ -6485,11 +6705,17 @@ impl TreeStreamJob {
         charge.resize(base.saturating_add(vec_bytes::<u64>(end_count)))?;
         let mut ends: Vec<u64> = Vec::with_capacity(end_count);
         if let Some(ts) = targets {
-            for &t in ts {
+            for (idx, &t) in ts.iter().enumerate() {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
                 ends.push(if t == root { VIRT } else { t });
             }
         } else {
-            for &(n, _) in &tree.order {
+            for (idx, &(n, _)) in tree.order.iter().enumerate() {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
                 ends.push(n);
             }
         }
@@ -6525,16 +6751,8 @@ impl TreeStreamJob {
     fn retained_bytes(&self) -> u64 {
         self.tree
             .retained_bytes()
-            .saturating_add(
-                self.cost
-                    .as_ref()
-                    .map_or(0, |c| table_bytes::<(u64, Cost)>(c.capacity())),
-            )
-            .saturating_add(
-                self.rank
-                    .as_ref()
-                    .map_or(0, |r| table_bytes::<(u64, u32)>(r.capacity())),
-            )
+            .saturating_add(self.cost.as_ref().map_or(0, map_bytes))
+            .saturating_add(self.rank.as_ref().map_or(0, map_bytes))
             .saturating_add(vec_bytes::<u64>(self.ends.capacity()))
             .saturating_add(self.iter.as_ref().map_or(0, TreePathIter::retained_bytes))
     }
@@ -6565,16 +6783,8 @@ impl TreeStreamJob {
                     .retained_bytes()
                     .saturating_add(outer_bytes)
                     .saturating_add(self.tree.retained_bytes())
-                    .saturating_add(
-                        self.cost
-                            .as_ref()
-                            .map_or(0, |c| table_bytes::<(u64, Cost)>(c.capacity())),
-                    )
-                    .saturating_add(
-                        self.rank
-                            .as_ref()
-                            .map_or(0, |r| table_bytes::<(u64, u32)>(r.capacity())),
-                    )
+                    .saturating_add(self.cost.as_ref().map_or(0, map_bytes))
+                    .saturating_add(self.rank.as_ref().map_or(0, map_bytes))
                     .saturating_add(vec_bytes::<u64>(self.ends.capacity()));
                 if let Some(mut edges) = it.next_path(
                     ctx,
@@ -6586,7 +6796,10 @@ impl TreeStreamJob {
                     outer_for_iter,
                 )? {
                     let root = self.root;
-                    for e in &mut edges {
+                    for (idx, e) in edges.iter_mut().enumerate() {
+                        if idx.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
                         *e = e.map(|x| if x == VIRT { root } else { x });
                     }
                     let len = edges.len();
@@ -6732,7 +6945,10 @@ impl BidiUnweightedJob {
                             .saturating_add(vec_bytes::<Edge>(back.capacity()));
                         charge.resize(base_all.saturating_add(vec_bytes::<Edge>(len)))?;
                         let mut e = Vec::with_capacity(len);
-                        for edge in front.iter().chain(back.iter()) {
+                        for (idx, edge) in front.iter().chain(back.iter()).enumerate() {
+                            if idx.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
                             e.push(edge.map(real));
                         }
                         e
@@ -6805,8 +7021,8 @@ struct BidiWeightedAllJob {
     t: u64,
     tt: u64,
     trees: [ChargedTree; 2],
-    dist: [FxHashMap<u64, Cost>; 2],
-    ranks: [FxHashMap<u64, u32>; 2],
+    dist: [HbMap<u64, Cost>; 2],
+    ranks: [HbMap<u64, u32>; 2],
     top0: Cost,
     joins: Vec<(Edge, Cost)>,
     join_idx: usize,
@@ -6823,10 +7039,10 @@ impl BidiWeightedAllJob {
         self.trees[0]
             .retained_bytes()
             .saturating_add(self.trees[1].retained_bytes())
-            .saturating_add(table_bytes::<(u64, Cost)>(self.dist[0].capacity()))
-            .saturating_add(table_bytes::<(u64, Cost)>(self.dist[1].capacity()))
-            .saturating_add(table_bytes::<(u64, u32)>(self.ranks[0].capacity()))
-            .saturating_add(table_bytes::<(u64, u32)>(self.ranks[1].capacity()))
+            .saturating_add(map_bytes(&self.dist[0]))
+            .saturating_add(map_bytes(&self.dist[1]))
+            .saturating_add(map_bytes(&self.ranks[0]))
+            .saturating_add(map_bytes(&self.ranks[1]))
             .saturating_add(vec_bytes::<(Edge, Cost)>(self.joins.capacity()))
     }
 
@@ -6881,7 +7097,10 @@ impl BidiWeightedAllJob {
                     charge,
                     outer_it,
                 )? {
-                    for edge in &mut edges {
+                    for (idx, edge) in edges.iter_mut().enumerate() {
+                        if idx.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
                         *edge = edge.map(real);
                     }
                     let len = edges.len();
@@ -6942,12 +7161,16 @@ impl BidiWeightedAllJob {
                         .saturating_add(vec_bytes::<Edge>(back.capacity()));
                     charge.resize(base_all.saturating_add(vec_bytes::<Edge>(len)))?;
                     let mut path = Vec::with_capacity(len);
-                    for edge in front
+                    for (idx, edge) in front
                         .iter()
                         .copied()
                         .chain(std::iter::once(e))
                         .chain(back.iter().copied())
+                        .enumerate()
                     {
+                        if idx.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
                         path.push(edge.map(real));
                     }
                     drop(back);
@@ -7058,12 +7281,11 @@ struct YenJob {
     need_expand: bool,
     a: Vec<(Vec<Edge>, Cost)>,
     a_edge_bytes: u64,
-    seen: FxHashSet<Vec<Edge>>,
+    seen: HbSet<Vec<Edge>>,
     seen_edge_bytes: u64,
     heap: BinaryHeap<Reverse<(Cost, usize, u64)>>,
-    cands: FxHashMap<u64, (Vec<Edge>, Cost)>,
+    cands: HbMap<u64, (Vec<Edge>, Cost)>,
     cands_edge_bytes: u64,
-    cands_tomb: usize,
     seq: u64,
 }
 
@@ -7099,12 +7321,11 @@ impl YenJob {
             need_expand: false,
             a: Vec::new(),
             a_edge_bytes: 0,
-            seen: FxHashSet::default(),
+            seen: HbSet::default(),
             seen_edge_bytes: 0,
             heap: BinaryHeap::new(),
-            cands: FxHashMap::default(),
+            cands: HbMap::default(),
             cands_edge_bytes: 0,
-            cands_tomb: 0,
             seq: 0,
         }
     }
@@ -7112,14 +7333,12 @@ impl YenJob {
     fn retained_bytes(&self) -> u64 {
         vec_bytes::<(Vec<Edge>, Cost)>(self.a.capacity())
             .saturating_add(self.a_edge_bytes)
-            .saturating_add(table_bytes::<Vec<Edge>>(self.seen.capacity()))
+            .saturating_add(set_bytes(&self.seen))
             .saturating_add(self.seen_edge_bytes)
             .saturating_add(vec_bytes::<Reverse<(Cost, usize, u64)>>(
                 self.heap.capacity(),
             ))
-            .saturating_add(table_bytes::<(u64, (Vec<Edge>, Cost))>(
-                self.cands.capacity(),
-            ))
+            .saturating_add(map_bytes(&self.cands))
             .saturating_add(self.cands_edge_bytes)
     }
 
@@ -7162,8 +7381,8 @@ impl YenJob {
         let budget = if spec.weighted() { None } else { spec.max_len };
         if !self.initialized {
             self.initialized = true;
-            let none_n = FxHashSet::default();
-            let none_e = FxHashSet::default();
+            let none_n = HbSet::default();
+            let none_e = HbSet::default();
             let spur_outer = outer_bytes.saturating_add(self.retained_bytes());
             let Some((first, _)) = search.run_spur(
                 ctx, spec, s, tt, s, &none_n, &none_e, budget, charge, spur_outer,
@@ -7194,7 +7413,7 @@ impl YenJob {
             let clone_cap = vec_bytes::<Edge>(first_clone.capacity());
             base = base.saturating_add(clone_cap);
             self.seen_edge_bytes = self.seen_edge_bytes.saturating_add(clone_cap);
-            (_, base) = insert_set(&mut self.seen, first_clone, charge, base)?;
+            (_, base) = insert_hb_set(&mut self.seen, first_clone, charge, base)?;
             self.a_edge_bytes = self.a_edge_bytes.saturating_add(first_bytes);
             let _ = push_vec(&mut self.a, (first, first_cost), charge, base)?;
             self.need_expand = false;
@@ -7212,7 +7431,10 @@ impl YenJob {
                 charge.resize(base_before.saturating_add(nodes_bytes))?;
                 let mut nodes: Vec<u64> = Vec::with_capacity(cur_len.saturating_add(1));
                 nodes.push(s);
-                for e in &self.a.last().unwrap().0 {
+                for (idx, e) in self.a.last().unwrap().0.iter().enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
                     nodes.push(e.to);
                 }
                 let nodes_cap_bytes = vec_bytes::<u64>(nodes.capacity());
@@ -7223,8 +7445,8 @@ impl YenJob {
                         Some(m) => Some(m - i as u32),
                         None => None,
                     };
-                    let mut banned_edges: FxHashSet<Edge> = FxHashSet::default();
-                    let mut banned_nodes: FxHashSet<u64> = FxHashSet::default();
+                    let mut banned_edges: HbSet<Edge> = HbSet::default();
+                    let mut banned_nodes: HbSet<u64> = HbSet::default();
                     let mut loop_base = search
                         .retained_bytes()
                         .saturating_add(outer_bytes)
@@ -7233,21 +7455,30 @@ impl YenJob {
                     {
                         let cur_edges = &self.a.last().unwrap().0;
                         let root_slice = &cur_edges[..i];
+                        let mut cmp_work = 0usize;
                         for (p, _) in &self.a {
+                            cmp_work += if p.len() > i { i.max(1) } else { 1 };
+                            if cmp_work >= 4096 {
+                                cmp_work = 0;
+                                ctx.check()?;
+                            }
                             if p.len() > i && p[..i] == *root_slice {
                                 (_, loop_base) =
-                                    insert_set(&mut banned_edges, p[i], charge, loop_base)?;
+                                    insert_hb_set(&mut banned_edges, p[i], charge, loop_base)?;
                             }
                         }
                     }
-                    for &nd in &nodes[..i] {
-                        (_, loop_base) = insert_set(&mut banned_nodes, nd, charge, loop_base)?;
+                    for (nd_idx, &nd) in nodes[..i].iter().enumerate() {
+                        if nd_idx.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        (_, loop_base) = insert_hb_set(&mut banned_nodes, nd, charge, loop_base)?;
                     }
                     let spur_outer = outer_bytes
                         .saturating_add(self.retained_bytes())
                         .saturating_add(nodes_cap_bytes)
-                        .saturating_add(table_bytes::<Edge>(banned_edges.capacity()))
-                        .saturating_add(table_bytes::<u64>(banned_nodes.capacity()));
+                        .saturating_add(set_bytes(&banned_edges))
+                        .saturating_add(set_bytes(&banned_nodes));
                     let sp = search.run_spur(
                         ctx,
                         spec,
@@ -7282,8 +7513,17 @@ impl YenJob {
                         .saturating_add(sp_bytes);
                     charge.resize(path_base.saturating_add(vec_bytes::<Edge>(total_len)))?;
                     let mut path = Vec::with_capacity(total_len);
-                    path.extend_from_slice(&self.a.last().unwrap().0[..i]);
-                    path.extend(sp);
+                    for (idx, edge) in self.a.last().unwrap().0[..i]
+                        .iter()
+                        .copied()
+                        .chain(sp)
+                        .enumerate()
+                    {
+                        if idx.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        path.push(edge);
+                    }
                     let path_bytes = vec_bytes::<Edge>(path.capacity());
                     if !self.seen.contains(&path) {
                         let c = search.exact_cost(
@@ -7310,16 +7550,10 @@ impl YenJob {
                         let seen_cap = vec_bytes::<Edge>(seen_copy.capacity());
                         cbase = cbase.saturating_add(seen_cap);
                         self.seen_edge_bytes = self.seen_edge_bytes.saturating_add(seen_cap);
-                        (_, cbase) = insert_set(&mut self.seen, seen_copy, charge, cbase)?;
+                        (_, cbase) = insert_hb_set(&mut self.seen, seen_copy, charge, cbase)?;
                         self.cands_edge_bytes = self.cands_edge_bytes.saturating_add(path_bytes);
-                        (_, cbase) = insert_map_tomb(
-                            &mut self.cands,
-                            &mut self.cands_tomb,
-                            self.seq,
-                            (path, c),
-                            charge,
-                            cbase,
-                        )?;
+                        (_, cbase) =
+                            insert_hb_map(&mut self.cands, self.seq, (path, c), charge, cbase)?;
                         let _ =
                             push_heap(&mut self.heap, Reverse((c, len, self.seq)), charge, cbase)?;
                         self.seq += 1;
@@ -7346,7 +7580,6 @@ impl YenJob {
                     return Ok(None);
                 };
                 let (next_edges, next_cost) = self.cands.remove(&id).unwrap();
-                self.cands_tomb += 1;
                 let moved = vec_bytes::<Edge>(next_edges.capacity());
                 self.cands_edge_bytes = self.cands_edge_bytes.saturating_sub(moved);
                 self.a_edge_bytes = self.a_edge_bytes.saturating_add(moved);
@@ -7354,7 +7587,8 @@ impl YenJob {
                     .retained_bytes()
                     .saturating_add(outer_bytes)
                     .saturating_add(self.retained_bytes());
-                let _ = push_vec(&mut self.a, (next_edges, next_cost), charge, cur_base)?;
+                let settled = push_vec(&mut self.a, (next_edges, next_cost), charge, cur_base)?;
+                charge.resize(settled)?;
             }
             let (cur_len, cur_cost) = {
                 let (ref e, c) = *self.a.last().unwrap();
@@ -7404,7 +7638,10 @@ impl YenJob {
                     .saturating_add(self.retained_bytes());
                 charge.resize(base_e.saturating_add(vec_bytes::<Edge>(cur_len)))?;
                 let mut out = Vec::with_capacity(cur_len);
-                for edge in &self.a.last().unwrap().0 {
+                for (idx, edge) in self.a.last().unwrap().0.iter().enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
                     out.push(edge.map(real));
                 }
                 out
@@ -7428,15 +7665,14 @@ impl YenJob {
 struct AllPathsJob {
     forward: bool,
     root: u64,
-    targets: Option<FxHashSet<u64>>,
+    targets: Option<HbSet<u64>>,
     close: bool,
     max_len: u32,
     min_len: u32,
     pending_zero: bool,
     pending_push: Option<u64>,
-    dist: Option<FxHashMap<u64, u32>>,
-    on_path: FxHashSet<u64>,
-    on_tomb: usize,
+    dist: Option<HbMap<u64, u32>>,
+    on_path: HbSet<u64>,
     stack: Vec<(u64, std::sync::Arc<[Step]>, usize)>,
     edges: Vec<Edge>,
     steps: u64,
@@ -7459,15 +7695,15 @@ impl AllPathsJob {
         search.begin();
         let max_len = spec.max_len.unwrap_or(0);
         let min_len = spec.min_len;
-        let mut target_set: Option<FxHashSet<u64>> = None;
+        let mut target_set: Option<HbSet<u64>> = None;
         let mut base = search.retained_bytes().saturating_add(outer_bytes);
         if let Some(ts) = targets {
-            let mut set = FxHashSet::default();
+            let mut set = HbSet::default();
             for (i, &t) in ts.iter().enumerate() {
                 if i.is_multiple_of(4096) {
                     ctx.check()?;
                 }
-                (_, base) = insert_set(&mut set, t, charge, base)?;
+                (_, base) = insert_hb_set(&mut set, t, charge, base)?;
             }
             target_set = Some(set);
         }
@@ -7482,8 +7718,7 @@ impl AllPathsJob {
             pending_zero: min_len == 0 && close,
             pending_push: None,
             dist: None,
-            on_path: FxHashSet::default(),
-            on_tomb: 0,
+            on_path: HbSet::default(),
             stack: Vec::new(),
             edges: Vec::new(),
             steps: 0,
@@ -7501,7 +7736,7 @@ impl AllPathsJob {
             return Ok(st);
         }
         if let Some(ts) = targets {
-            let mut d: FxHashMap<u64, u32> = FxHashMap::default();
+            let mut d: HbMap<u64, u32> = HbMap::default();
             let mut frontier: Vec<u64> = Vec::new();
             let mut bfs_base = search
                 .retained_bytes()
@@ -7511,23 +7746,22 @@ impl AllPathsJob {
                 if i.is_multiple_of(4096) {
                     ctx.check()?;
                 }
-                (_, bfs_base) = insert_map(&mut d, t, 0, charge, bfs_base)?;
+                (_, bfs_base) = insert_hb_map(&mut d, t, 0, charge, bfs_base)?;
                 bfs_base = push_vec(&mut frontier, t, charge, bfs_base)?;
             }
-            frontier.sort_unstable();
-            frontier.dedup();
+            sort_dedup_u64_checked(&mut frontier, ctx)?;
             search.set_roots(
                 spec,
                 &frontier,
                 charge,
                 outer_bytes
                     .saturating_add(st.retained_bytes())
-                    .saturating_add(table_bytes::<(u64, u32)>(d.capacity()))
+                    .saturating_add(map_bytes(&d))
                     .saturating_add(vec_bytes::<u64>(frontier.capacity())),
             )?;
             let mut level = 0u32;
             while !frontier.is_empty() && level < max_len {
-                let d_bytes = table_bytes::<(u64, u32)>(d.capacity());
+                let d_bytes = map_bytes(&d);
                 let frontier_bytes = vec_bytes::<u64>(frontier.capacity());
                 let mut found = Vec::new();
                 search.expand(
@@ -7558,7 +7792,8 @@ impl AllPathsJob {
                         ctx.check()?;
                     }
                     if !d.contains_key(&step.node) {
-                        (_, loop_base) = insert_map(&mut d, step.node, level, charge, loop_base)?;
+                        (_, loop_base) =
+                            insert_hb_map(&mut d, step.node, level, charge, loop_base)?;
                         loop_base = push_vec(&mut next, step.node, charge, loop_base)?;
                         added_nodes += 1;
                         if added_nodes.is_multiple_of(1024) {
@@ -7570,14 +7805,14 @@ impl AllPathsJob {
                 if rem > 0 {
                     search.visit(spec, rem)?;
                 }
-                next.sort_unstable();
+                sort_checked_by_key(&mut next, ctx, |&y| y)?;
                 frontier = next;
                 charge.resize(
                     search
                         .retained_bytes()
                         .saturating_add(outer_bytes)
                         .saturating_add(st.retained_bytes())
-                        .saturating_add(table_bytes::<(u64, u32)>(d.capacity()))
+                        .saturating_add(map_bytes(&d))
                         .saturating_add(vec_bytes::<u64>(frontier.capacity())),
                 )?;
             }
@@ -7600,7 +7835,7 @@ impl AllPathsJob {
             .retained_bytes()
             .saturating_add(outer_bytes)
             .saturating_add(st.retained_bytes());
-        let _ = insert_set_tomb(&mut st.on_path, &mut st.on_tomb, root, charge, cur_base)?;
+        let _ = insert_hb_set(&mut st.on_path, root, charge, cur_base)?;
         let root_ns = search.neighbours(
             ctx,
             spec,
@@ -7618,16 +7853,10 @@ impl AllPathsJob {
     }
 
     fn retained_bytes(&self) -> u64 {
-        let targets = self
-            .targets
-            .as_ref()
-            .map_or(0, |t| table_bytes::<u64>(t.capacity()));
-        let dist = self
-            .dist
-            .as_ref()
-            .map_or(0, |d| table_bytes::<(u64, u32)>(d.capacity()));
+        let targets = self.targets.as_ref().map_or(0, set_bytes);
+        let dist = self.dist.as_ref().map_or(0, map_bytes);
         let stack = vec_bytes::<(u64, std::sync::Arc<[Step]>, usize)>(self.stack.capacity());
-        let on_path = table_bytes::<u64>(self.on_path.capacity());
+        let on_path = set_bytes(&self.on_path);
         let edges = vec_bytes::<Edge>(self.edges.capacity());
         targets
             .saturating_add(dist)
@@ -7666,7 +7895,7 @@ impl AllPathsJob {
                 .retained_bytes()
                 .saturating_add(outer_bytes)
                 .saturating_add(self.retained_bytes());
-            let _ = insert_set_tomb(&mut self.on_path, &mut self.on_tomb, y, charge, cur_base)?;
+            let _ = insert_hb_set(&mut self.on_path, y, charge, cur_base)?;
             let ns = search.neighbours(
                 ctx,
                 spec,
@@ -7690,9 +7919,7 @@ impl AllPathsJob {
             let (x, ns, i) = (top.0, top.1.clone(), top.2);
             if i >= ns.len() {
                 self.stack.pop();
-                if self.on_path.remove(&x) {
-                    self.on_tomb += 1;
-                }
+                self.on_path.remove(&x);
                 self.edges.pop();
                 continue;
             }
@@ -7751,9 +7978,19 @@ impl AllPathsJob {
                     )?;
                     let mut ordered = Vec::with_capacity(plen);
                     if self.forward {
-                        ordered.extend_from_slice(&self.edges);
+                        for (idx, &edge) in self.edges.iter().enumerate() {
+                            if idx.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            ordered.push(edge);
+                        }
                     } else {
-                        ordered.extend(self.edges.iter().rev().copied());
+                        for (idx, &edge) in self.edges.iter().rev().enumerate() {
+                            if idx.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            ordered.push(edge);
+                        }
                     }
                     let cost = search.path_cost(
                         ctx,
@@ -7795,7 +8032,7 @@ impl AllPathsJob {
                 .retained_bytes()
                 .saturating_add(outer_bytes)
                 .saturating_add(self.retained_bytes());
-            let _ = insert_set_tomb(&mut self.on_path, &mut self.on_tomb, y, charge, cur_base)?;
+            let _ = insert_hb_set(&mut self.on_path, y, charge, cur_base)?;
             let child_ns = search.neighbours(
                 ctx,
                 spec,
@@ -7833,11 +8070,19 @@ impl ActiveJob {
             ActiveJob::One(f) => f
                 .as_ref()
                 .map_or(0, |p| vec_bytes::<Edge>(p.edges.capacity())),
-            ActiveJob::All(st) => st.retained_bytes(),
-            ActiveJob::Tree(st) => st.retained_bytes(),
-            ActiveJob::BidiUnweighted(st) => st.retained_bytes(),
-            ActiveJob::BidiWeightedAll(st) => st.retained_bytes(),
-            ActiveJob::Yen(st) => st.retained_bytes(),
+            ActiveJob::All(st) => {
+                (size_of::<AllPathsJob>() as u64).saturating_add(st.retained_bytes())
+            }
+            ActiveJob::Tree(st) => {
+                (size_of::<TreeStreamJob>() as u64).saturating_add(st.retained_bytes())
+            }
+            ActiveJob::BidiUnweighted(st) => {
+                (size_of::<BidiUnweightedJob>() as u64).saturating_add(st.retained_bytes())
+            }
+            ActiveJob::BidiWeightedAll(st) => {
+                (size_of::<BidiWeightedAllJob>() as u64).saturating_add(st.retained_bytes())
+            }
+            ActiveJob::Yen(st) => (size_of::<YenJob>() as u64).saturating_add(st.retained_bytes()),
         }
     }
 
@@ -7852,11 +8097,40 @@ impl ActiveJob {
         match self {
             ActiveJob::None => Ok(None),
             ActiveJob::One(f) => Ok(f.take()),
-            ActiveJob::All(st) => st.next_path(ctx, spec, search, charge, outer_bytes),
-            ActiveJob::Tree(st) => st.next_path(ctx, spec, search, charge, outer_bytes),
-            ActiveJob::BidiUnweighted(st) => st.next_path(ctx, search, charge, outer_bytes),
-            ActiveJob::BidiWeightedAll(st) => st.next_path(ctx, spec, search, charge, outer_bytes),
-            ActiveJob::Yen(st) => st.next_path(ctx, spec, search, charge, outer_bytes),
+            ActiveJob::All(st) => st.next_path(
+                ctx,
+                spec,
+                search,
+                charge,
+                outer_bytes.saturating_add(size_of::<AllPathsJob>() as u64),
+            ),
+            ActiveJob::Tree(st) => st.next_path(
+                ctx,
+                spec,
+                search,
+                charge,
+                outer_bytes.saturating_add(size_of::<TreeStreamJob>() as u64),
+            ),
+            ActiveJob::BidiUnweighted(st) => st.next_path(
+                ctx,
+                search,
+                charge,
+                outer_bytes.saturating_add(size_of::<BidiUnweightedJob>() as u64),
+            ),
+            ActiveJob::BidiWeightedAll(st) => st.next_path(
+                ctx,
+                spec,
+                search,
+                charge,
+                outer_bytes.saturating_add(size_of::<BidiWeightedAllJob>() as u64),
+            ),
+            ActiveJob::Yen(st) => st.next_path(
+                ctx,
+                spec,
+                search,
+                charge,
+                outer_bytes.saturating_add(size_of::<YenJob>() as u64),
+            ),
         }
     }
 }
@@ -7872,21 +8146,17 @@ struct InputState {
     table: Table,
     _table_charge: super::ctx::OwnedCharge,
     in_cols: Vec<Option<usize>>,
-    rows_by_pair: FxHashMap<(u64, u64), Vec<u32>>,
-    rows_by_source: FxHashMap<u64, Vec<u32>>,
-    rows_by_target: FxHashMap<u64, Vec<u32>>,
+    rows_by_pair: HbMap<(u64, u64), Vec<u32>>,
+    rows_by_source: HbMap<u64, Vec<u32>>,
+    rows_by_target: HbMap<u64, Vec<u32>>,
     row_vec_bytes: u64,
 }
 
 impl InputState {
     fn index_bytes(&self) -> u64 {
-        table_bytes::<((u64, u64), Vec<u32>)>(self.rows_by_pair.capacity())
-            .saturating_add(table_bytes::<(u64, Vec<u32>)>(
-                self.rows_by_source.capacity(),
-            ))
-            .saturating_add(table_bytes::<(u64, Vec<u32>)>(
-                self.rows_by_target.capacity(),
-            ))
+        map_bytes(&self.rows_by_pair)
+            .saturating_add(map_bytes(&self.rows_by_source))
+            .saturating_add(map_bytes(&self.rows_by_target))
             .saturating_add(self.row_vec_bytes)
             .saturating_add(vec_bytes::<Option<usize>>(self.in_cols.capacity()))
     }
@@ -7948,8 +8218,6 @@ impl CurrentEmission {
 /// Owned, `Send` resumable reader for every `SERVICE path:search` without `path:limit`
 /// (items 829, 1122 and 1123).
 pub(crate) struct Reader {
-    spec: PathSearchSpec,
-    vars: Vec<VarId>,
     cols: RowCols,
     search: SearchContext,
     input: Option<InputState>,
@@ -7963,12 +8231,11 @@ pub(crate) struct Reader {
     active_is_forward: bool,
     current: Option<CurrentEmission>,
     next_path_id: u32,
-    terms: FxHashMap<(u64, u64, u64), Id>,
+    terms: HbMap<(u64, u64, u64), Id>,
     path_row: Vec<Id>,
     in_row: Vec<Id>,
     row_buf: Vec<Id>,
     charge: super::ctx::OwnedCharge,
-    counters: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Reader {
@@ -7981,7 +8248,7 @@ impl Reader {
         mut charge: super::ctx::OwnedCharge,
     ) -> Result<Self> {
         let cols = RowCols::new(spec, vars);
-        let search = SearchContext::open(ctx, spec, pattern)?;
+        let search = SearchContext::open(ctx, spec, pattern, &mut charge)?;
         let mut forward: Vec<ForwardJob> = Vec::new();
         let mut forward_target_bytes = 0u64;
         let mut backward: Vec<u64> = Vec::new();
@@ -8001,23 +8268,30 @@ impl Reader {
                     (PathEnd::Var(_), None) => None,
                 }
             };
-            let in_cols: Vec<Option<usize>> = vars.iter().map(|v| table.col_of(*v)).collect();
+            let in_cols_bytes = vec_bytes::<Option<usize>>(vars.len());
+            charge.resize(search.retained_bytes().saturating_add(in_cols_bytes))?;
+            let mut in_cols = Vec::with_capacity(vars.len());
+            for (j, v) in vars.iter().enumerate() {
+                if j.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
+                in_cols.push(table.col_of(*v));
+            }
             let mut state = InputState {
                 table,
                 _table_charge: table_charge,
                 in_cols,
-                rows_by_pair: FxHashMap::default(),
-                rows_by_source: FxHashMap::default(),
-                rows_by_target: FxHashMap::default(),
+                rows_by_pair: HbMap::default(),
+                rows_by_source: HbMap::default(),
+                rows_by_target: HbMap::default(),
                 row_vec_bytes: 0,
             };
-            let mut fwd_any: FxHashSet<u64> = FxHashSet::default();
-            let mut fwd_targets: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+            let mut fwd_any: HbSet<u64> = HbSet::default();
+            let mut fwd_targets: HbMap<u64, Vec<u64>> = HbMap::default();
             let mut fwd_t_vec_bytes = 0u64;
-            let mut bwd_set: FxHashSet<u64> = FxHashSet::default();
+            let mut bwd_set: HbSet<u64> = HbSet::default();
             let mut base = search.retained_bytes().saturating_add(state.index_bytes());
             charge.resize(base)?;
-            let mut tomb = 0usize;
             for i in 0..state.table.len() {
                 if i.is_multiple_of(4096) {
                     ctx.check()?;
@@ -8027,19 +8301,17 @@ impl Reader {
                 let row_id = i as u32;
                 match (src, tgt) {
                     (Some(s), Some(t)) => {
-                        base = push_map_vec(
+                        base = push_hb_map_vec(
                             &mut state.rows_by_pair,
                             &mut state.row_vec_bytes,
-                            &mut tomb,
                             (s, t),
                             row_id,
                             &mut charge,
                             base,
                         )?;
-                        base = push_map_vec(
+                        base = push_hb_map_vec(
                             &mut fwd_targets,
                             &mut fwd_t_vec_bytes,
-                            &mut tomb,
                             s,
                             t,
                             &mut charge,
@@ -8047,28 +8319,26 @@ impl Reader {
                         )?;
                     }
                     (Some(s), None) => {
-                        base = push_map_vec(
+                        base = push_hb_map_vec(
                             &mut state.rows_by_source,
                             &mut state.row_vec_bytes,
-                            &mut tomb,
                             s,
                             row_id,
                             &mut charge,
                             base,
                         )?;
-                        (_, base) = insert_set(&mut fwd_any, s, &mut charge, base)?;
+                        (_, base) = insert_hb_set(&mut fwd_any, s, &mut charge, base)?;
                     }
                     (None, Some(t)) => {
-                        base = push_map_vec(
+                        base = push_hb_map_vec(
                             &mut state.rows_by_target,
                             &mut state.row_vec_bytes,
-                            &mut tomb,
                             t,
                             row_id,
                             &mut charge,
                             base,
                         )?;
-                        (_, base) = insert_set(&mut bwd_set, t, &mut charge, base)?;
+                        (_, base) = insert_hb_set(&mut bwd_set, t, &mut charge, base)?;
                     }
                     (None, None) => {
                         return Err(bad(
@@ -8078,28 +8348,25 @@ impl Reader {
                 }
             }
             // Collect all distinct forward sources (union of `fwd_any` and `fwd_targets`).
-            for &s in &fwd_any {
+            for (idx, &s) in fwd_any.iter().enumerate() {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
                 if !fwd_targets.contains_key(&s) {
-                    let old_cap = fwd_targets.capacity();
-                    let growth = table_growth::<(u64, Vec<u64>)>(old_cap, fwd_targets.len());
-                    if growth != 0 {
-                        let old_m = table_bytes::<(u64, Vec<u64>)>(old_cap);
-                        charge.resize(base.saturating_add(growth))?;
-                        fwd_targets.insert(s, Vec::new());
-                        let actual_m = table_bytes::<(u64, Vec<u64>)>(fwd_targets.capacity());
-                        base = base.saturating_sub(old_m).saturating_add(actual_m);
-                        charge.resize(base)?;
-                    } else {
-                        fwd_targets.insert(s, Vec::new());
-                    }
+                    (_, base) = insert_hb_map(&mut fwd_targets, s, Vec::new(), &mut charge, base)?;
                 }
             }
             let fwd_len = fwd_targets.len();
             charge.resize(base.saturating_add(vec_bytes::<ForwardJob>(fwd_len)))?;
             forward.reserve_exact(fwd_len);
+            let mut ticks = 0usize;
             for (s, mut ts) in fwd_targets {
-                ts.sort_unstable();
-                ts.dedup();
+                ticks += ts.len().max(1);
+                if ticks >= 4096 {
+                    ticks = 0;
+                    ctx.check()?;
+                }
+                sort_dedup_u64_checked(&mut ts, ctx)?;
                 forward_target_bytes =
                     forward_target_bytes.saturating_add(vec_bytes::<u64>(ts.capacity()));
                 forward.push(ForwardJob {
@@ -8109,24 +8376,33 @@ impl Reader {
                 });
             }
             drop(fwd_any);
-            forward.sort_unstable_by_key(|j| j.source);
+            sort_checked_by_key(&mut forward, ctx, |j| j.source)?;
             let bwd_len = bwd_set.len();
             let bwd_base = search
                 .retained_bytes()
                 .saturating_add(state.index_bytes())
                 .saturating_add(vec_bytes::<ForwardJob>(forward.capacity()))
                 .saturating_add(forward_target_bytes)
-                .saturating_add(table_bytes::<u64>(bwd_set.capacity()));
+                .saturating_add(set_bytes(&bwd_set));
             charge.resize(bwd_base.saturating_add(vec_bytes::<u64>(bwd_len)))?;
             backward.reserve_exact(bwd_len);
-            backward.extend(bwd_set);
-            backward.sort_unstable();
+            for (idx, t) in bwd_set.into_iter().enumerate() {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
+                backward.push(t);
+            }
+            sort_checked_by_key(&mut backward, ctx, |&t| t)?;
             Some(state)
         } else {
+            let base = search.retained_bytes();
             match (&spec.source, &spec.target) {
                 (PathEnd::Const(s), PathEnd::Const(t)) => {
+                    let add = vec_bytes::<ForwardJob>(1).saturating_add(vec_bytes::<u64>(1));
+                    charge.resize(base.saturating_add(add))?;
                     let ts = vec![t.0];
                     forward_target_bytes = vec_bytes::<u64>(ts.capacity());
+                    forward.reserve_exact(1);
                     forward.push(ForwardJob {
                         source: s.0,
                         any: false,
@@ -8134,6 +8410,8 @@ impl Reader {
                     });
                 }
                 (PathEnd::Const(s), PathEnd::Var(_)) => {
+                    charge.resize(base.saturating_add(vec_bytes::<ForwardJob>(1)))?;
+                    forward.reserve_exact(1);
                     forward.push(ForwardJob {
                         source: s.0,
                         any: true,
@@ -8141,6 +8419,8 @@ impl Reader {
                     });
                 }
                 (PathEnd::Var(_), PathEnd::Const(t)) => {
+                    charge.resize(base.saturating_add(vec_bytes::<u64>(1)))?;
+                    backward.reserve_exact(1);
                     backward.push(t.0);
                 }
                 (PathEnd::Var(_), PathEnd::Var(_)) => {
@@ -8152,13 +8432,21 @@ impl Reader {
             None
         };
         let width = vars.len();
-        let path_row = vec![Id::UNDEF; width];
-        let in_row = vec![Id::UNDEF; width];
-        let row_buf = vec![Id::UNDEF; width];
-        let counters = search.counters(spec);
+        let pre_scratch = search
+            .retained_bytes()
+            .saturating_add(input_state.as_ref().map_or(0, InputState::index_bytes))
+            .saturating_add(vec_bytes::<ForwardJob>(forward.capacity()))
+            .saturating_add(forward_target_bytes)
+            .saturating_add(vec_bytes::<u64>(backward.capacity()));
+        let scratch_bytes = vec_bytes::<Id>(width).saturating_mul(3);
+        charge.resize(pre_scratch.saturating_add(scratch_bytes))?;
+        let mut path_row = Vec::with_capacity(width);
+        path_row.resize(width, Id::UNDEF);
+        let mut in_row = Vec::with_capacity(width);
+        in_row.resize(width, Id::UNDEF);
+        let mut row_buf = Vec::with_capacity(width);
+        row_buf.resize(width, Id::UNDEF);
         let mut reader = Self {
-            spec: spec.clone(),
-            vars: vars.to_vec(),
             cols,
             search,
             input: input_state,
@@ -8172,23 +8460,25 @@ impl Reader {
             active_is_forward: true,
             current: None,
             next_path_id: 0,
-            terms: FxHashMap::default(),
+            terms: HbMap::default(),
             path_row,
             in_row,
             row_buf,
             charge,
-            counters,
         };
         reader.update_charge()?;
         Ok(reader)
     }
 
-    pub(crate) fn counters(&self) -> &serde_json::Map<String, serde_json::Value> {
-        &self.counters
+    pub(crate) fn counters(
+        &self,
+        spec: &PathSearchSpec,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        self.search.counters(spec)
     }
 
     fn terms_bytes(&self) -> u64 {
-        table_bytes::<((u64, u64, u64), Id)>(self.terms.capacity())
+        map_bytes(&self.terms)
     }
 
     fn current_bytes(&self) -> u64 {
@@ -8234,25 +8524,22 @@ impl Reader {
 
     /// Open the next scheduled job into `self.active`, returning `false` when all jobs
     /// are exhausted.
-    fn open_next_job(&mut self, ctx: &Ctx) -> Result<bool> {
+    fn open_next_job(&mut self, ctx: &Ctx, spec: &PathSearchSpec) -> Result<bool> {
         self.active = ActiveJob::None;
         let outer = self.fixed_bytes_excluding_active();
         self.charge
             .resize(self.search.retained_bytes().saturating_add(outer))?;
-        let weighted = self.spec.weighted();
-        let all = matches!(self.spec.algorithm, Algorithm::AllShortest);
-        let need_edges = self.spec.per_edge() || weighted;
+        let weighted = spec.weighted();
+        let all = matches!(spec.algorithm, Algorithm::AllShortest);
+        let need_edges = spec.per_edge() || weighted;
         let yen_shortest = weighted
-            && self.spec.max_len.is_some()
-            && matches!(
-                self.spec.algorithm,
-                Algorithm::Shortest | Algorithm::AllShortest
-            );
+            && spec.max_len.is_some()
+            && matches!(spec.algorithm, Algorithm::Shortest | Algorithm::AllShortest);
         if self.fwd_idx < self.forward.len() {
             self.active_is_forward = true;
             let s = self.forward[self.fwd_idx].source;
             let any = self.forward[self.fwd_idx].any;
-            match self.spec.algorithm {
+            match spec.algorithm {
                 Algorithm::Shortest | Algorithm::AllShortest if yen_shortest => {
                     if any {
                         return Err(bad(
@@ -8262,11 +8549,23 @@ impl Reader {
                     let t = self.forward[self.fwd_idx].targets[self.fwd_target_idx];
                     self.fwd_target_idx += 1;
                     if self.fwd_target_idx >= self.forward[self.fwd_idx].targets.len() {
+                        let old = std::mem::take(&mut self.forward[self.fwd_idx].targets);
+                        self.forward_target_bytes = self
+                            .forward_target_bytes
+                            .saturating_sub(vec_bytes::<u64>(old.capacity()));
+                        drop(old);
                         self.fwd_idx += 1;
                         self.fwd_target_idx = 0;
                     }
+                    let outer = self.fixed_bytes_excluding_active();
+                    self.charge.resize(
+                        self.search
+                            .retained_bytes()
+                            .saturating_add(outer)
+                            .saturating_add(size_of::<YenJob>() as u64),
+                    )?;
                     self.active =
-                        ActiveJob::Yen(Box::new(YenJob::open(&self.spec, &mut self.search, s, t)));
+                        ActiveJob::Yen(Box::new(YenJob::open(spec, &mut self.search, s, t)));
                 }
                 Algorithm::Shortest | Algorithm::AllShortest => {
                     let cur_idx = self.fwd_idx;
@@ -8274,17 +8573,31 @@ impl Reader {
                     let t0 = self.forward[cur_idx].targets.first().copied();
                     let moved_targets = std::mem::take(&mut self.forward[cur_idx].targets);
                     let moved_bytes = vec_bytes::<u64>(moved_targets.capacity());
-                    let targets_opt: Option<Vec<u64>> = (!any).then_some(moved_targets);
+                    let targets_opt: Option<Vec<u64>> = if any {
+                        drop(moved_targets);
+                        self.forward_target_bytes =
+                            self.forward_target_bytes.saturating_sub(moved_bytes);
+                        None
+                    } else {
+                        Some(moved_targets)
+                    };
                     self.fwd_idx += 1;
                     self.fwd_target_idx = 0;
+                    let mut outer = self.fixed_bytes_excluding_active();
+                    if any {
+                        self.charge
+                            .resize(self.search.retained_bytes().saturating_add(outer))?;
+                    }
                     if single && !weighted {
                         drop(targets_opt);
                         self.forward_target_bytes =
                             self.forward_target_bytes.saturating_sub(moved_bytes);
-                        let outer = self.fixed_bytes_excluding_active();
+                        outer = self.fixed_bytes_excluding_active();
+                        self.charge
+                            .resize(self.search.retained_bytes().saturating_add(outer))?;
                         let t = t0.unwrap();
                         self.search.begin();
-                        if self.spec.min_len == 0 && s == t {
+                        if spec.min_len == 0 && s == t {
                             self.search.paths_found += 1;
                             self.active = ActiveJob::One(Some(Found {
                                 start: s,
@@ -8297,13 +8610,13 @@ impl Reader {
                             let tt = if s == t { VIRT } else { t };
                             let Some((f, b, meet)) = self.search.run_bidi(
                                 ctx,
-                                &self.spec,
+                                spec,
                                 s,
                                 tt,
                                 s,
                                 all,
                                 None,
-                                self.spec.max_len,
+                                spec.max_len,
                                 &mut self.charge,
                                 outer,
                             )?
@@ -8386,7 +8699,10 @@ impl Reader {
                                                 .saturating_add(vec_bytes::<Edge>(len)),
                                         )?;
                                         let mut p = Vec::with_capacity(len);
-                                        for edge in a.into_iter().chain(z) {
+                                        for (idx, edge) in a.into_iter().chain(z).enumerate() {
+                                            if idx.is_multiple_of(4096) {
+                                                ctx.check()?;
+                                            }
                                             p.push(edge.map(real));
                                         }
                                         p
@@ -8403,19 +8719,26 @@ impl Reader {
                                     }));
                                 }
                             } else {
-                                self.active =
-                                    ActiveJob::BidiUnweighted(Box::new(BidiUnweightedJob {
-                                        s,
-                                        t,
-                                        f,
-                                        b,
-                                        meet,
-                                        meet_idx: 0,
-                                        need_edges,
-                                        front_iter: None,
-                                        cur_front: None,
-                                        back_iter: None,
-                                    }));
+                                let job = BidiUnweightedJob {
+                                    s,
+                                    t,
+                                    f,
+                                    b,
+                                    meet,
+                                    meet_idx: 0,
+                                    need_edges,
+                                    front_iter: None,
+                                    cur_front: None,
+                                    back_iter: None,
+                                };
+                                self.charge.resize(
+                                    self.search
+                                        .retained_bytes()
+                                        .saturating_add(outer)
+                                        .saturating_add(job.retained_bytes())
+                                        .saturating_add(size_of::<BidiUnweightedJob>() as u64),
+                                )?;
+                                self.active = ActiveJob::BidiUnweighted(Box::new(job));
                             }
                         }
                     } else {
@@ -8424,7 +8747,7 @@ impl Reader {
                         if both_ends {
                             let t = t0.unwrap();
                             self.search.begin();
-                            if self.spec.min_len == 0 && s == t {
+                            if spec.min_len == 0 && s == t {
                                 self.search.paths_found += 1;
                                 self.active = ActiveJob::One(Some(Found {
                                     start: s,
@@ -8436,7 +8759,7 @@ impl Reader {
                             } else {
                                 match self.search.run_dijkstra_pair_all(
                                     ctx,
-                                    &self.spec,
+                                    spec,
                                     s,
                                     t,
                                     all,
@@ -8460,11 +8783,17 @@ impl Reader {
                             }
                         }
                         if single && weighted && !both_ends {
+                            drop(targets_opt);
+                            self.forward_target_bytes =
+                                self.forward_target_bytes.saturating_sub(moved_bytes);
+                            outer = self.fixed_bytes_excluding_active();
+                            self.charge
+                                .resize(self.search.retained_bytes().saturating_add(outer))?;
                             let t = t0.unwrap();
                             self.search.begin();
                             if let Some((edges, cost)) = self.search.run_dijkstra_pair(
                                 ctx,
-                                &self.spec,
+                                spec,
                                 s,
                                 t,
                                 None,
@@ -8483,29 +8812,40 @@ impl Reader {
                                     cost,
                                 }));
                             }
-                        } else if !both_ends || fallback_from_both {
-                            let close = any
-                                || targets_opt
-                                    .as_ref()
-                                    .is_some_and(|ts| ts.binary_search(&s).is_ok());
-                            let job = TreeStreamJob::open(
-                                ctx,
-                                &self.spec,
-                                &mut self.search,
-                                s,
-                                true,
-                                targets_opt.as_deref(),
-                                all,
-                                close,
-                                !both_ends,
-                                &mut self.charge,
-                                outer,
-                            )?;
-                            self.active = ActiveJob::Tree(Box::new(job));
+                        } else {
+                            if !both_ends || fallback_from_both {
+                                let close = any
+                                    || targets_opt
+                                        .as_ref()
+                                        .is_some_and(|ts| ts.binary_search(&s).is_ok());
+                                let job = TreeStreamJob::open(
+                                    ctx,
+                                    spec,
+                                    &mut self.search,
+                                    s,
+                                    true,
+                                    targets_opt.as_deref(),
+                                    all,
+                                    close,
+                                    !both_ends,
+                                    &mut self.charge,
+                                    outer,
+                                )?;
+                                self.charge.resize(
+                                    self.search
+                                        .retained_bytes()
+                                        .saturating_add(outer)
+                                        .saturating_add(job.retained_bytes())
+                                        .saturating_add(size_of::<TreeStreamJob>() as u64),
+                                )?;
+                                self.active = ActiveJob::Tree(Box::new(job));
+                            }
+                            if targets_opt.is_some() {
+                                drop(targets_opt);
+                                self.forward_target_bytes =
+                                    self.forward_target_bytes.saturating_sub(moved_bytes);
+                            }
                         }
-                        drop(targets_opt);
-                        self.forward_target_bytes =
-                            self.forward_target_bytes.saturating_sub(moved_bytes);
                     }
                 }
                 Algorithm::KShortest => {
@@ -8515,22 +8855,46 @@ impl Reader {
                     let t = self.forward[self.fwd_idx].targets[self.fwd_target_idx];
                     self.fwd_target_idx += 1;
                     if self.fwd_target_idx >= self.forward[self.fwd_idx].targets.len() {
+                        let old = std::mem::take(&mut self.forward[self.fwd_idx].targets);
+                        self.forward_target_bytes = self
+                            .forward_target_bytes
+                            .saturating_sub(vec_bytes::<u64>(old.capacity()));
+                        drop(old);
                         self.fwd_idx += 1;
                         self.fwd_target_idx = 0;
                     }
+                    let outer = self.fixed_bytes_excluding_active();
+                    self.charge.resize(
+                        self.search
+                            .retained_bytes()
+                            .saturating_add(outer)
+                            .saturating_add(size_of::<YenJob>() as u64),
+                    )?;
                     self.active =
-                        ActiveJob::Yen(Box::new(YenJob::open(&self.spec, &mut self.search, s, t)));
+                        ActiveJob::Yen(Box::new(YenJob::open(spec, &mut self.search, s, t)));
                 }
                 Algorithm::All => {
                     let cur_idx = self.fwd_idx;
                     let moved_targets = std::mem::take(&mut self.forward[cur_idx].targets);
                     let moved_bytes = vec_bytes::<u64>(moved_targets.capacity());
-                    let targets_opt: Option<Vec<u64>> = (!any).then_some(moved_targets);
+                    let targets_opt: Option<Vec<u64>> = if any {
+                        drop(moved_targets);
+                        self.forward_target_bytes =
+                            self.forward_target_bytes.saturating_sub(moved_bytes);
+                        None
+                    } else {
+                        Some(moved_targets)
+                    };
                     self.fwd_idx += 1;
                     self.fwd_target_idx = 0;
+                    let outer = self.fixed_bytes_excluding_active();
+                    if any {
+                        self.charge
+                            .resize(self.search.retained_bytes().saturating_add(outer))?;
+                    }
                     let job = AllPathsJob::open(
                         ctx,
-                        &self.spec,
+                        spec,
                         &mut self.search,
                         s,
                         true,
@@ -8538,13 +8902,22 @@ impl Reader {
                         &mut self.charge,
                         outer,
                     )?;
-                    drop(targets_opt);
-                    self.forward_target_bytes =
-                        self.forward_target_bytes.saturating_sub(moved_bytes);
+                    if targets_opt.is_some() {
+                        drop(targets_opt);
+                        self.forward_target_bytes =
+                            self.forward_target_bytes.saturating_sub(moved_bytes);
+                    }
+                    let post_outer = self.fixed_bytes_excluding_active();
+                    self.charge.resize(
+                        self.search
+                            .retained_bytes()
+                            .saturating_add(post_outer)
+                            .saturating_add(job.retained_bytes())
+                            .saturating_add(size_of::<AllPathsJob>() as u64),
+                    )?;
                     self.active = ActiveJob::All(Box::new(job));
                 }
             }
-            self.counters = self.search.counters(&self.spec);
             self.update_charge()?;
             return Ok(true);
         }
@@ -8552,7 +8925,7 @@ impl Reader {
             self.active_is_forward = false;
             let t = self.backward[self.bwd_idx];
             self.bwd_idx += 1;
-            match self.spec.algorithm {
+            match spec.algorithm {
                 Algorithm::KShortest => {
                     return Err(bad("path:kShortest needs a bound source"));
                 }
@@ -8564,7 +8937,7 @@ impl Reader {
                     }
                     let job = TreeStreamJob::open(
                         ctx,
-                        &self.spec,
+                        spec,
                         &mut self.search,
                         t,
                         false,
@@ -8575,12 +8948,19 @@ impl Reader {
                         &mut self.charge,
                         outer,
                     )?;
+                    self.charge.resize(
+                        self.search
+                            .retained_bytes()
+                            .saturating_add(outer)
+                            .saturating_add(job.retained_bytes())
+                            .saturating_add(size_of::<TreeStreamJob>() as u64),
+                    )?;
                     self.active = ActiveJob::Tree(Box::new(job));
                 }
                 Algorithm::All => {
                     let job = AllPathsJob::open(
                         ctx,
-                        &self.spec,
+                        spec,
                         &mut self.search,
                         t,
                         false,
@@ -8588,39 +8968,54 @@ impl Reader {
                         &mut self.charge,
                         outer,
                     )?;
+                    self.charge.resize(
+                        self.search
+                            .retained_bytes()
+                            .saturating_add(outer)
+                            .saturating_add(job.retained_bytes())
+                            .saturating_add(size_of::<AllPathsJob>() as u64),
+                    )?;
                     self.active = ActiveJob::All(Box::new(job));
                 }
             }
-            self.counters = self.search.counters(&self.spec);
             self.update_charge()?;
             return Ok(true);
         }
         Ok(false)
     }
 
-    fn pull_next_path(&mut self, ctx: &Ctx) -> Result<Option<(Found, bool)>> {
+    fn pull_next_path(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+    ) -> Result<Option<(Found, bool)>> {
         loop {
             ctx.check()?;
             let outer = self.fixed_bytes_excluding_active();
             if let Some(found) =
                 self.active
-                    .next_path(ctx, &self.spec, &mut self.search, &mut self.charge, outer)?
+                    .next_path(ctx, spec, &mut self.search, &mut self.charge, outer)?
             {
-                self.counters = self.search.counters(&self.spec);
                 return Ok(Some((found, self.active_is_forward)));
             }
-            if !self.open_next_job(ctx)? {
-                self.counters = self.search.counters(&self.spec);
+            if !self.open_next_job(ctx, spec)? {
                 return Ok(None);
             }
         }
     }
 
     /// Fill `out` with up to `cap` rows. Returns `true` when the search is exhausted.
-    pub(crate) fn next(&mut self, ctx: &Ctx, out: &mut Table, cap: usize) -> Result<bool> {
-        let per_edge = self.spec.per_edge();
-        let weighted = self.spec.weighted();
-        let width = self.vars.len();
+    pub(crate) fn next(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        vars: &[VarId],
+        out: &mut Table,
+        cap: usize,
+    ) -> Result<bool> {
+        let per_edge = spec.per_edge();
+        let weighted = spec.weighted();
+        let width = vars.len();
         let int = |n: usize| Id::from_i64(n as i64).unwrap_or(Id::UNDEF);
         let set = |c: Option<usize>, id: Id, row: &mut [Id]| {
             if let Some(c) = c {
@@ -8631,7 +9026,7 @@ impl Reader {
         while out.len() < cap {
             ctx.check()?;
             if self.current.is_none() {
-                let Some((found, is_forward)) = self.pull_next_path(ctx)? else {
+                let Some((found, is_forward)) = self.pull_next_path(ctx, spec)? else {
                     self.active = ActiveJob::None;
                     self.input = None;
                     self.forward.clear();
@@ -8639,8 +9034,7 @@ impl Reader {
                     self.forward_target_bytes = 0;
                     self.backward.clear();
                     self.backward.shrink_to_fit();
-                    self.terms.clear();
-                    self.terms.shrink_to_fit();
+                    self.terms = HbMap::default();
                     self.update_charge()?;
                     return Ok(true);
                 };
@@ -8725,6 +9119,10 @@ impl Reader {
                     }
                 }
                 while out.len() < cap {
+                    ticks += 1;
+                    if ticks.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
                     let edge_k = {
                         let cur = self.current.as_mut().expect("current emission");
                         if cur.edge_at >= n_rows {
@@ -8777,7 +9175,7 @@ impl Reader {
                                         }
                                     };
                                     let total = self.total_bytes();
-                                    let _ = insert_map(
+                                    let _ = insert_hb_map(
                                         &mut self.terms,
                                         (s, p, o),
                                         computed,
@@ -8885,7 +9283,8 @@ mod tree_tests {
         };
         let ctx = Arc::new(Ctx::new(snap.clone()));
         let mut held = super::super::ctx::OwnedCharge::new(&ctx, 0).unwrap();
-        let mut search = SearchContext::open(&ctx, &spec, ChargedPatternEdges::new()).unwrap();
+        let mut search =
+            SearchContext::open(&ctx, &spec, ChargedPatternEdges::new(), &mut held).unwrap();
         let mut state = AllPathsJob::open(
             &ctx,
             &spec,
@@ -9131,5 +9530,250 @@ mod tree_tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].len(), L as usize);
         assert!(calls.get() <= 2, "{} checks", calls.get());
+    }
+
+    #[test]
+    fn hb_table_growth_after_deletions_admits_old_plus_new_and_tombstone_reuse() {
+        use crate::store::{Store, StoreOptions};
+        use std::sync::Arc;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+
+        // Build a 32-bucket HbSet with 28 live entries (0 headroom), then delete 14 to
+        // leave 14 live entries and 14 tombstones (reported capacity drops while physical
+        // allocation stays at 32 buckets).
+        let ctx_unbounded = Arc::new(Ctx::new(snap.clone()));
+        let mut charge = super::super::ctx::OwnedCharge::new(&ctx_unbounded, 0).unwrap();
+        let mut set: HbSet<u64> = HbSet::default();
+        let mut base = 0u64;
+        for k in 0..28u64 {
+            let (_, next) = insert_hb_set(&mut set, k, &mut charge, base).unwrap();
+            base = next;
+        }
+        let alloc_32 = set_bytes(&set);
+        assert!(alloc_32 > 0);
+        assert_eq!(base, alloc_32);
+        for k in 0..14u64 {
+            assert!(set.remove(&k));
+        }
+        assert_eq!(set.len(), 14);
+        assert_eq!(
+            set_bytes(&set),
+            alloc_32,
+            "physical allocation stays at 32 buckets after deletions"
+        );
+
+        // Under a tight budget that covers old + 32-bucket growth but NOT old + 64-bucket
+        // growth (`3 * alloc_32`), an insertion when `len == cap` must refuse BEFORE
+        // allocating a 64-bucket table.
+        if set.len() == set.capacity() {
+            let mut tight = Ctx::new(snap.clone());
+            tight.mem_limit = alloc_32 + alloc_32; // too small for old + 2*old
+            let tight = Arc::new(tight);
+            let mut tight_charge = super::super::ctx::OwnedCharge::new(&tight, alloc_32).unwrap();
+            let err = insert_hb_set(&mut set, 10_000, &mut tight_charge, alloc_32);
+            assert!(
+                matches!(err, Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory),
+                "expected pre-allocation memory refusal: {err:?}"
+            );
+            assert_eq!(set_bytes(&set), alloc_32);
+            assert_eq!(tight_charge.bytes(), alloc_32);
+        }
+
+        // Now allow old + 2*old and insert keys until we see both tombstone reuse /
+        // in-place rehash (allocation stays at `alloc_32`) and allocating growth to 64
+        // buckets (charge settles to exact 64-bucket `allocation_size()`).
+        let mut saw_growth = false;
+        let mut key = 100u64;
+        while !saw_growth && key < 500 {
+            let before = set_bytes(&set);
+            let (_, next) = insert_hb_set(&mut set, key, &mut charge, base).unwrap();
+            base = next;
+            let after = set_bytes(&set);
+            assert_eq!(base, after);
+            assert_eq!(charge.bytes(), after);
+            if after > before {
+                saw_growth = true;
+            }
+            key += 1;
+        }
+        assert!(saw_growth, "expected table to grow past 32 buckets");
+
+        // Same verification for HbMap<u64, u64>.
+        let mut map: HbMap<u64, u64> = HbMap::default();
+        let mut mcharge = super::super::ctx::OwnedCharge::new(&ctx_unbounded, 0).unwrap();
+        let mut mbase = 0u64;
+        for k in 0..28u64 {
+            let (_, next) = insert_hb_map(&mut map, k, k * 2, &mut mcharge, mbase).unwrap();
+            mbase = next;
+        }
+        let m_alloc_32 = map_bytes(&map);
+        for k in 0..14u64 {
+            assert!(map.remove(&k).is_some());
+        }
+        assert_eq!(map_bytes(&map), m_alloc_32);
+        for k in 100..200u64 {
+            let (_, next) = insert_hb_map(&mut map, k, k * 2, &mut mcharge, mbase).unwrap();
+            mbase = next;
+            assert_eq!(mbase, map_bytes(&map));
+            assert_eq!(mcharge.bytes(), map_bytes(&map));
+        }
+    }
+
+    #[test]
+    fn streaming_weight_lookup_handles_many_reifiers_and_many_weights_with_cancellation() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("@prefix ex: <http://example.org/> .\n");
+        data.push_str("ex:s ex:p ex:t1 .\nex:s ex:p ex:t2 .\n");
+        for i in 0..5000 {
+            let w = if i == 4200 { "2.5" } else { "10.0" };
+            data.push_str(&format!("<< ex:s ex:p ex:t1 ~ ex:r{i} >> ex:w {w} .\n"));
+        }
+        data.push_str("<< ex:s ex:p ex:t2 ~ ex:singleR >> ex:w 5.0 .\n");
+        for i in 0..5000 {
+            let w = if i == 4500 { "0.5" } else { "9.0" };
+            data.push_str(&format!("ex:singleR ex:w {w} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let find = |iri| snap.lookup_iri(iri).unwrap();
+        let s = find("http://example.org/s");
+        let p = find("http://example.org/p");
+        let t1 = find("http://example.org/t1");
+        let t2 = find("http://example.org/t2");
+        let w = find("http://example.org/w");
+        let reifies = find(RDF_REIFIES);
+        let spec = PathSearchSpec {
+            algorithm: Algorithm::Shortest,
+            source: PathEnd::Const(s),
+            target: PathEnd::Const(t1),
+            predicates: Some(vec![p.0]),
+            directions: vec![Direction::Forward],
+            direction: Direction::Forward,
+            exclude: Vec::new(),
+            max_degree: None,
+            edge_pattern: None,
+            min_len: 1,
+            max_len: None,
+            k: 1,
+            limit: None,
+            max_visited: 100_000,
+            weight: Some(Some(w.0)),
+            default_weight: 1.0,
+            reifies: Some(reifies.0),
+            path_index: None,
+            edge_index: None,
+            edge_s: None,
+            edge_p: None,
+            edge_o: None,
+            edge: None,
+            length: None,
+            cost: None,
+            graph: GraphFilter::Default,
+        };
+        let ctx = Arc::new(Ctx::new(snap));
+        assert_eq!(
+            lookup_weight_charged(&ctx, &spec, Some(w.0), (s.0, p.0, t1.0)).unwrap(),
+            2.5
+        );
+        assert_eq!(
+            lookup_weight_charged(&ctx, &spec, Some(w.0), (s.0, p.0, t2.0)).unwrap(),
+            0.5
+        );
+        ctx.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            lookup_weight_charged(&ctx, &spec, Some(w.0), (s.0, p.0, t1.0)),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            lookup_weight_charged(&ctx, &spec, Some(w.0), (s.0, p.0, t2.0)),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn checked_sort_pattern_finish_and_cached_exact_cost_poll_cancellation() {
+        use crate::store::{Store, StoreOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let ctx = Arc::new(Ctx::new(snap));
+
+        // 1. `sort_dedup_u64_checked` on >4096 elements produces sorted unique output.
+        let mut big: Vec<u64> = (0..10_000u64).rev().map(|i| i / 2).collect();
+        sort_dedup_u64_checked(&mut big, &ctx).unwrap();
+        assert_eq!(big.len(), 5000);
+        assert!(big.windows(2).all(|w| w[0] < w[1]));
+
+        // 2. `ChargedPatternEdges::finish` on a single 10,000-entry adjacency list cancels.
+        let mut pat = ChargedPatternEdges::new();
+        pat.by_start
+            .insert(1, (0..10_000u64).rev().collect::<Vec<u64>>());
+        ctx.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(pat.finish(&ctx), Err(Error::Cancelled)));
+
+        // 3. `SearchContext::exact_cost` on 5,000 cached edges polls cancellation even
+        //    when every weight lookup hits the cache.
+        let ctx_cost = Arc::new(Ctx::new(store.snapshot()));
+        let mut held = super::super::ctx::OwnedCharge::new(&ctx_cost, 0).unwrap();
+        let spec = PathSearchSpec {
+            algorithm: Algorithm::Shortest,
+            source: PathEnd::Const(Id(1)),
+            target: PathEnd::Const(Id(2)),
+            predicates: None,
+            directions: Vec::new(),
+            direction: Direction::Forward,
+            exclude: Vec::new(),
+            max_degree: None,
+            edge_pattern: None,
+            min_len: 1,
+            max_len: None,
+            k: 1,
+            limit: None,
+            max_visited: 100_000,
+            weight: Some(Some(10)),
+            default_weight: 1.0,
+            reifies: Some(11),
+            path_index: None,
+            edge_index: None,
+            edge_s: None,
+            edge_p: None,
+            edge_o: None,
+            edge: None,
+            length: None,
+            cost: None,
+            graph: GraphFilter::Default,
+        };
+        let mut search =
+            SearchContext::open(&ctx_cost, &spec, ChargedPatternEdges::new(), &mut held).unwrap();
+        let edge = Edge {
+            from: 1,
+            to: 2,
+            p: 3,
+            rev: false,
+        };
+        let base = search.retained_bytes();
+        let _ = insert_hb_map(&mut search.weights, edge.triple(), 2.0, &mut held, base).unwrap();
+        let edges = vec![edge; 5000];
+        ctx_cost.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            search.exact_cost(&ctx_cost, &spec, &edges, |x| x, &mut held, 0),
+            Err(Error::Cancelled)
+        ));
     }
 }

@@ -372,14 +372,22 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   consumer can let a remote transfer reach its outbound timeout. While a streamed
   history query reads, retention keeps the commits it has still to read and the change
   log cannot be turned off. All three streamed readers report `growingState` because
-  the output batch size does not bound their retained state.
+  the output batch size does not bound their retained state. A `SERVICE path:search`
+  without `path:limit` also streams natively through a resumable reader across all
+  four algorithms, constant or variable endpoints, group inputs and nested edge
+  patterns, charging its search state and any group or edge-pattern input to the
+  memory budget and reporting `fullInputBeforeOutput` when it reads a group or nested
+  edge pattern. Over a group input, the reader emits each discovered path across its
+  matching group rows without materializing all paths, matching eager answers in full
+  multiset, `pathIndex` numbering and search counters while allowing row order across
+  group rows that share an endpoint to vary without `ORDER BY`.
 * A SILENT SERVICE, a SERVICE response whose results come before its head, a view
   read, a spatial scan or relation over constants, a spatial join, a vector ORDER BY, a
-  nearest-neighbour search, a path search without a limit and a property function over
-  constants and a registered property function without prefix output still need
-  materialization, so the strict policy refuses them and automatic execution runs them
-  eagerly, as [roadmap item 829](../ROADMAP.md) tracks. Automatic execution runs every
-  kind in these lists eagerly until a same-host measurement admits it.
+  nearest-neighbour search, a property function over constants and a registered
+  property function without prefix output still need materialization, so the strict
+  policy refuses them and automatic execution runs them eagerly, as
+  [roadmap item 829](../ROADMAP.md) tracks. Automatic execution runs every kind in
+  these lists eagerly until a same-host measurement admits it.
 * A cursor scan keeps its place inside an index block between batches without charging
   the block to the query, since the block cache holds its decoded columns, and it
   decodes the block again when the cache has dropped it. A scan inside a plan therefore

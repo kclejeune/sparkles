@@ -1313,8 +1313,12 @@ at a time through resumable iterators, so a `LIMIT` over a graph with many tied 
 paths stops without materializing every path. Searches over a group input or a nested
 edge pattern without `path:limit` read their group rows into a charged buffer and stream
 edge-pattern batches into pre-admitted adjacency maps before streaming matching paths
-batch by batch, reporting `fullInputBeforeOutput` on the `PathSearch` node and matching
-eager answers, `pathIndex` numbering and work counts at every batch size.
+batch by batch, reporting `fullInputBeforeOutput` on the `PathSearch` node. Grouped
+streaming emits each discovered path across its matching group rows without
+materializing every path of a search, matching eager execution in full solution
+multiset, `pathIndex` numbering, per-node search counters and work counts at every batch
+size while allowing row order across group rows that share an endpoint to vary when no
+`ORDER BY` is present.
 
 View reads stay refused under the strict policy, since a view's result is decoded under
 its lock against the circuit's latest pass, and [item 1121](../../ROADMAP.md) keeps a

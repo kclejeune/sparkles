@@ -92,7 +92,7 @@ impl PathSearch {
                 pattern.finish(ctx)?;
             }
             let reader = Reader::open(ctx, spec, &self.node.vars, input, pattern, charge)?;
-            self.counters = Some(reader.counters().clone());
+            self.counters = Some(reader.counters(spec));
             self.reader = Some(reader);
         }
         let Some(reader) = &mut self.reader else {
@@ -122,12 +122,12 @@ impl PathSearch {
                 }
                 b.reconcile()?;
             }
-            ended = reader.next(ctx, &mut b.table, target)?;
+            ended = reader.next(ctx, spec, &self.node.vars, &mut b.table, target)?;
             if ended {
                 break;
             }
         }
-        self.counters = Some(reader.counters().clone());
+        self.counters = Some(reader.counters(spec));
         if ended {
             self.reader = None;
         }

@@ -1207,6 +1207,25 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
             (i * 7 + 3) % 1500
         ));
     }
+    // Wide-weight fallback graph, hub graph for `path:maxDegree`, and a high-reifier edge.
+    data.push_str(
+        "<urn:w:0> <urn:we> <urn:w:1> . <urn:w:1> <urn:we> <urn:w:2> .\n\
+         <urn:w:0> <urn:we> <urn:w:3> . <urn:w:3> <urn:we> <urn:w:2> .\n\
+         << <urn:w:0> <urn:we> <urn:w:1> >> <urn:w> 1.0 .\n\
+         << <urn:w:1> <urn:we> <urn:w:2> >> <urn:w> 1e12 .\n\
+         << <urn:w:0> <urn:we> <urn:w:3> >> <urn:w> 1e12 .\n\
+         << <urn:w:3> <urn:we> <urn:w:2> >> <urn:w> 1.0 .\n\
+         <urn:h:0> <urn:he> <urn:hub> . <urn:h:0> <urn:he> <urn:alt> . <urn:alt> <urn:he> <urn:h:1> .\n",
+    );
+    for i in 1..=20 {
+        data.push_str(&format!("<urn:hub> <urn:he> <urn:h:{i}> .\n"));
+    }
+    data.push_str("<urn:mr:0> <urn:mre> <urn:mr:1> .\n");
+    for i in 0..2000 {
+        data.push_str(&format!(
+            "<< <urn:mr:0> <urn:mre> <urn:mr:1> ~ <urn:mrr:{i}> >> <urn:w> 2.0 .\n"
+        ));
+    }
     s.load(&[Source::from_bytes(
         data.into_bytes(),
         RdfFormat::Turtle,
@@ -1229,21 +1248,45 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
             ),
         ),
         (
+            "allShortest const weighted maxLength Yen",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:3> ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "allShortest wide-weight fallback",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
             "shortest variable target",
             format!(
                 "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:n:0> ; path:target ?t ; path:predicate <urn:e> ; path:length ?l }} }}"
             ),
         ),
         (
-            "allShortest variable target",
+            "shortest backward variable source",
             format!(
-                "{P}SELECT ?t ?p ?l {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target ?t ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:length ?l }} }}"
+                "{P}SELECT ?s ?l {{ SERVICE path:search {{ [] path:source ?s ; path:target <urn:n:50> ; path:predicate <urn:e> ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "allShortest variable target with edge term",
+            format!(
+                "{P}SELECT ?t ?p ?i ?e ?l {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target ?t ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edge ?e ; path:length ?l }} }}"
             ),
         ),
         (
             "shortest over group no limit",
             format!(
                 "{P}SELECT ?s ?l {{ ?s <urn:k> ?k FILTER(?k < 15) SERVICE path:search {{ [] path:source ?s ; path:target <urn:n:50> ; path:predicate <urn:e> ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "mixed bound and unbound targets in group",
+            format!(
+                "{P}SELECT ?s ?t ?l {{ VALUES (?s ?t) {{ (<urn:n:0> <urn:n:10>) (<urn:n:0> <urn:n:20>) (<urn:n:0> UNDEF) (<urn:n:1> <urn:n:30>) }} SERVICE path:search {{ [] path:source ?s ; path:target ?t ; path:predicate <urn:e> ; path:length ?l }} }}"
             ),
         ),
         (
@@ -1256,6 +1299,24 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
             "allShortest over group and edge pattern",
             format!(
                 "{P}SELECT ?s ?p ?l {{ ?s <urn:k> ?k FILTER(?k < 5) SERVICE path:search {{ [] path:source ?s ; path:target <urn:n:20> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:length ?l ; path:start ?x ; path:end ?y . ?x <urn:e> ?y }} }}"
+            ),
+        ),
+        (
+            "path:all over group and edge pattern",
+            format!(
+                "{P}SELECT ?s ?t ?p ?l {{ ?s <urn:k> ?k FILTER(?k < 3) SERVICE path:search {{ [] path:source ?s ; path:target ?t ; path:algorithm path:all ; path:maxLength 2 ; path:pathIndex ?p ; path:length ?l ; path:start ?x ; path:end ?y . ?x <urn:e> ?y }} }}"
+            ),
+        ),
+        (
+            "allShortest with maxDegree hub cache",
+            format!(
+                "{P}SELECT ?p ?i ?es ?eo {{ SERVICE path:search {{ [] path:source <urn:h:0> ; path:target <urn:h:1> ; path:predicate <urn:he> ; path:algorithm path:allShortest ; path:maxDegree 4 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo }} }}"
+            ),
+        ),
+        (
+            "weighted shortest high-reifier streaming lookup",
+            format!(
+                "{P}SELECT ?c {{ SERVICE path:search {{ [] path:source <urn:mr:0> ; path:target <urn:mr:1> ; path:predicate <urn:mre> ; path:weight <urn:w> ; path:cost ?c }} }}"
             ),
         ),
         (
