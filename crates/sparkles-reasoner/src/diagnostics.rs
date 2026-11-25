@@ -644,11 +644,12 @@ pub struct LiteralTypings {
 
 /// [`LiteralTypings`] paired with an opaque budget guard that keeps pooled summary
 /// credit alive until this wrapper drops. Declared with `typings` before `_held` so
-/// `facts` drops before credit returns.
-#[derive(Clone, Debug, Default)]
+/// `facts` drops before credit returns. Moving the wrapper transfers the facts and
+/// their admission together.
+#[derive(Debug, Default)]
 pub struct GuardedLiteralTypings {
     typings: LiteralTypings,
-    _held: Option<Arc<crate::budget::Held>>,
+    _held: Option<crate::budget::Held>,
 }
 
 impl PartialEq for GuardedLiteralTypings {
@@ -674,7 +675,7 @@ impl AsRef<LiteralTypings> for GuardedLiteralTypings {
 }
 
 impl GuardedLiteralTypings {
-    pub(crate) fn new(typings: LiteralTypings, held: Option<Arc<crate::budget::Held>>) -> Self {
+    pub(crate) fn new(typings: LiteralTypings, held: Option<crate::budget::Held>) -> Self {
         Self {
             typings,
             _held: held,

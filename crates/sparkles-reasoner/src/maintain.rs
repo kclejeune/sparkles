@@ -94,6 +94,20 @@ impl Cache {
         *self.on_take_detached.lock() = Some(Box::new(hook));
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_locked(&self) -> bool {
+        self.kept.is_locked()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kept_snap_strong_count(&self) -> Option<usize> {
+        self.kept
+            .lock()
+            .kept
+            .as_ref()
+            .map(|k| Arc::strong_count(&k.closure.terms.snap))
+    }
+
     /// Charge closures kept in this cache to `parent` instead of holding no retained pool credit.
     pub fn with_retained_parent(mut self, parent: Option<crate::ParentHandle>) -> Cache {
         self.retained_parent = parent;
@@ -1333,89 +1347,21 @@ fn read_saved(
 /// materialization were, so a caller that reports them checks that its rules are sound
 /// for OWL 2.
 ///
-/// The cache's lock is held only for a pass over the kept generalized facts that compares
-/// ids, which keeps the `rdf:type` facts with a literal subject and an object the check
-/// decides. Their subjects are decoded after the lock is released, so a run that waits
-/// for the cache, and the writers behind it, do not wait for the decoding. A typing whose
-/// subject is a term the rules made is decoded under the lock, since only the closure
-/// knows it. Nothing is kept between calls, and an in-memory dataset has no typings while
-/// a run has its closure out of the cache.
+/// The cache's lock is held only to copy candidate `(subject, object)` ids and
+/// deduplicated rule-local keys for `rdf:type` facts with a literal subject and IRI
+/// object. Store vocabulary lookup, term decoding, and datatype validation all run after
+/// the lock is released, so runs that wait for the cache do not wait for decoding.
+/// Nothing is kept between calls, and an in-memory dataset has no typings while a run has
+/// its closure out of the cache.
 pub fn literal_typings(
     store: &Store,
     commit: u64,
     cache: Option<&Cache>,
 ) -> anyhow::Result<Option<LiteralTypings>> {
-    if let Some(c) = cache {
-        let ty_term = Term::NamedNode(rdf::TYPE.into_owned());
-        let mut found = Vec::new();
-        let mut pending: Vec<(u64, u64)> = Vec::new();
-        let mut datatypes: FxHashMap<u64, Option<NamedNode>> = FxHashMap::default();
-        let snap = {
-            let slot = c.kept.lock();
-            match slot.kept.as_ref() {
-                Some(k) if k.dataset_id == store.dataset_id() && k.commit == commit => {
-                    let terms = &k.closure.terms;
-                    let ty = terms.snap.lookup_iri(rdf::TYPE.as_str()).map(|i| i.0);
-                    let mut predicates: FxHashMap<u64, bool> = FxHashMap::default();
-                    for t in &k.generalized {
-                        let is_type = match ty {
-                            Some(ty) => t[1] == ty,
-                            None => *predicates
-                                .entry(t[1])
-                                .or_insert_with(|| terms.term(t[1]).as_ref() == Some(&ty_term)),
-                        };
-                        if !is_type || terms.kind(t[0]) != crate::terms::Kind::Literal {
-                            continue;
-                        }
-                        let dt = datatypes
-                            .entry(t[2])
-                            .or_insert_with(|| match terms.term(t[2]) {
-                                Some(Term::NamedNode(n))
-                                    if crate::diagnostics::decidable_range(n.as_str()) =>
-                                {
-                                    Some(n)
-                                }
-                                _ => None,
-                            });
-                        let Some(dt) = dt else {
-                            continue;
-                        };
-                        if Id(t[0]).tag() == sparkles_core::id::Tag::Local {
-                            let Some(s) = terms.term(t[0]) else {
-                                continue;
-                            };
-                            found.extend(LiteralTypings::violation(
-                                &s,
-                                &ty_term,
-                                &Term::NamedNode(dt.clone()),
-                            ));
-                        } else {
-                            pending.push((t[0], t[2]));
-                        }
-                    }
-                    Some(terms.snap.clone())
-                }
-                _ => None,
-            }
-        };
-        let Some(snap) = snap else {
-            return saved(store, commit);
-        };
-        pending.sort_unstable();
-        for (s, dt) in pending {
-            let (Some(s), Some(Some(dt))) = (snap.term(Id(s)), datatypes.get(&dt)) else {
-                continue;
-            };
-            found.extend(LiteralTypings::violation(
-                &s,
-                &ty_term,
-                &Term::NamedNode(dt.clone()),
-            ));
-        }
-        return Ok(Some(LiteralTypings {
-            commit,
-            facts: found,
-        }));
+    if let Some(cache) = cache
+        && let Some(typings) = diagnostic_summary::literal_typings_cached(store, commit, cache)?
+    {
+        return Ok(Some(typings));
     }
     saved(store, commit)
 }

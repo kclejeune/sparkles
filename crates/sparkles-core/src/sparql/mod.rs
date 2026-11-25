@@ -1752,7 +1752,7 @@ fn prepare_query_input_policy(
     // so its planning keeps what it retains uncharged, as before.
     ctx.attach_owner();
     ctx.check()?;
-    let rewrite_guard = rewritten.as_ref().and_then(|r| r.memory_guard());
+    let rewrite_guard = rewritten.and_then(|r| r.memory_guard);
     Ok(PreparedQuery {
         ctx,
         node,

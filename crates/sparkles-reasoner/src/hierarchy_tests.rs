@@ -1149,13 +1149,58 @@ fn owl_ql_single_group_union_admits_branches_and_keeps_credit_through_planning()
     );
     assert_eq!(tight_pool.granted(), 0);
 
-    // 3. Full SPARQL query handoff through planner returns credit to 0 after execution.
+    // The variable-predicate pattern starts a session during query preparation.
+    // Inspect the exact guard from the rewrite at that point.
+    type RewriteGuard = dyn std::any::Any + Send + Sync;
+    struct ObservingProvider {
+        inner: crate::query::QueryReasoner,
+        guard: std::sync::Mutex<Option<std::sync::Weak<RewriteGuard>>>,
+        started: std::sync::atomic::AtomicBool,
+    }
+    impl ReasoningProvider for ObservingProvider {
+        fn label(&self) -> String {
+            self.inner.label()
+        }
+        fn start(
+            &self,
+            req: SessionRequest,
+        ) -> sparkles_core::Result<Box<dyn sparkles_core::sparql::reasoning::ReasoningSession>>
+        {
+            let guard = self.guard.lock().unwrap();
+            assert!(guard.as_ref().is_some_and(|guard| guard.strong_count() > 0));
+            self.started
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.inner.start(req)
+        }
+        fn rewrite_guarded(
+            &self,
+            query: &spargebra::Query,
+            bound: &[(String, oxrdf::Term)],
+            req: &SessionRequest,
+        ) -> sparkles_core::Result<Option<sparkles_core::sparql::reasoning::GuardedRewritten>>
+        {
+            let rewritten = self.inner.rewrite_guarded(query, bound, req)?;
+            *self.guard.lock().unwrap() = rewritten
+                .as_ref()
+                .and_then(|result| result.memory_guard.as_ref())
+                .map(Arc::downgrade);
+            Ok(rewritten)
+        }
+    }
+    let observer = Arc::new(ObservingProvider {
+        inner: ql,
+        guard: std::sync::Mutex::new(None),
+        started: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mixed_q =
+        "PREFIX ex: <http://ex.org/> SELECT ?s ?p ?o WHERE { ?s a ex:A . OPTIONAL { ?s ?p ?o } }";
     let opts = sparkles_core::sparql::QueryOptions {
         pool: Some(pool.clone()),
-        reasoning: Some(Arc::new(ql)),
+        reasoning: Some(observer.clone()),
         ..Default::default()
     };
-    let result = sparkles_core::sparql::query(store.snapshot(), q_str, &opts).unwrap();
+    let result = sparkles_core::sparql::query(store.snapshot(), mixed_q, &opts).unwrap();
+    assert!(observer.started.load(std::sync::atomic::Ordering::Relaxed));
     drop(result);
     assert_eq!(pool.granted(), 0);
 }
@@ -2076,4 +2121,384 @@ fn cross_domain_transfer_refused_with_foreign_domain() {
     cache.clear();
     assert_eq!(pool_a.domain_stats().work_reserved, 0);
     assert_eq!(pool_a.domain_stats().retained_reserved, 0);
+}
+
+#[test]
+fn diagnostic_summary_deduplicates_repeated_local_subjects() {
+    // One repeated 16 KiB rule-local literal subject typed with 25 distinct classes.
+    // Un-deduplicated sizing charges 25 * 16 KiB = 400 KiB and refuses a 256 KiB cap;
+    // deduplicated sizing charges the 16 KiB key once (~144 KiB peak with decode scratch).
+    let store_a = Store::in_memory(StoreOptions::default());
+    let mut ttl_a = format!(
+        "<urn:item> <urn:seed> \"{}\" .\n",
+        "s".repeat(16 * 1024 - 4)
+    );
+    for i in 0..25 {
+        ttl_a.push_str(&format!("<urn:item> <urn:cls> <urn:c{i}> .\n"));
+    }
+    load_turtle(&store_a, &ttl_a);
+    let profile_a = crate::Profile::Rules(
+        "[local_subj: (?x <urn:seed> ?s) (?x <urn:cls> ?c) strConcat(?s, \"_loc\", ?l) \
+         -> (?l <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?c)]"
+            .into(),
+    );
+    let cache_a = crate::Cache::default();
+    let r_a = crate::materialize_incremental(
+        &store_a,
+        &profile_a,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache_a),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let commit_a = r_a.receipt.unwrap().commit.seq;
+    let pool_a = QueryPool::new(256 * 1024);
+    let typings_a = crate::literal_typings_controlled_guarded(
+        &store_a,
+        commit_a,
+        Some(&cache_a),
+        &crate::diagnostics::DiagnosticControls {
+            max_memory: Some(256 * 1024),
+            memory_parent: Some(pool_a.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .expect("repeated local subject summary fits under 256 KiB");
+    assert!(typings_a.facts.is_empty());
+    drop(typings_a);
+    assert_eq!(pool_a.granted(), 0);
+}
+
+#[test]
+fn diagnostic_summary_deduplicates_many_local_objects() {
+    // 70 distinct 4 KiB rule-local class IRIs assigned to 20 literal
+    // subjects (1,400 triples). Without full deduplication (32-slot stack cache), 38 classes
+    // miss on all 20 subjects (>3 MiB estimate) and refuse a 768 KiB cap. Exact deduplication
+    // charges each of the 70 local class keys once (~280 KiB + candidates/map + decode scratch).
+    let store_b = Store::in_memory(StoreOptions::default());
+    let mut ttl_b = String::new();
+    for i in 0..20 {
+        ttl_b.push_str(&format!("<urn:s{i}> <urn:val> \"lit{i}\" .\n"));
+    }
+    load_turtle(&store_b, &ttl_b);
+    let pad = "k".repeat(4 * 1024);
+    let mut rules_b = String::new();
+    for c in 0..70 {
+        rules_b.push_str(&format!(
+            "[c{c}: (?x <urn:val> ?v) -> (?v <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:local_class_{c:03}_{pad}>)]\n"
+        ));
+    }
+    let profile_b = crate::Profile::Rules(rules_b);
+    let cache_b = crate::Cache::default();
+    let r_b = crate::materialize_incremental(
+        &store_b,
+        &profile_b,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache_b),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let commit_b = r_b.receipt.unwrap().commit.seq;
+    let pool_b = QueryPool::new(768 * 1024);
+    let typings_b = crate::literal_typings_controlled_guarded(
+        &store_b,
+        commit_b,
+        Some(&cache_b),
+        &crate::diagnostics::DiagnosticControls {
+            max_memory: Some(768 * 1024),
+            memory_parent: Some(pool_b.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .expect("70 distinct repeated local class IRIs fit under 768 KiB");
+    assert!(typings_b.facts.is_empty());
+    drop(typings_b);
+    assert_eq!(pool_b.granted(), 0);
+}
+
+#[test]
+fn diagnostic_summary_error_drops_terms_and_snapshot_before_synchronous_trim() {
+    use sparkles_budget::MemoryDomain;
+    use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let subject_bytes = 192 * 1024;
+    load_turtle(
+        &store,
+        &format!("<urn:item> <urn:seed> \"{}\" .", "z".repeat(subject_bytes)),
+    );
+    let class = "z".repeat(1280 * 1024);
+    let profile = crate::Profile::Rules(format!(
+        "[local: (?x <urn:seed> ?s) strConcat(?s, \"!\", ?l) \
+         -> (?l <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:{class}>)]"
+    ));
+    let cache = Arc::new(crate::Cache::default());
+    let run = crate::materialize_incremental(
+        &store,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let commit = run.receipt.unwrap().commit.seq;
+    let snapshot_refs = cache.kept_snap_strong_count().unwrap();
+
+    // The snapshot and the decoded subject each reserve more than the release
+    // slack, and both fit the cap together. The object decode exceeds the cap.
+    // The error therefore triggers one trim for the subject and one for the snapshot.
+    const CAP: u64 = 4 * 1024 * 1024;
+    let owned = Arc::new(AtomicU64::new(0));
+    let live_before_decode = Arc::new(AtomicIsize::new(0));
+    let live_at_first_trim = Arc::new(AtomicIsize::new(0));
+    let trims = Arc::new(AtomicUsize::new(0));
+    let snap_count_at_last_trim = Arc::new(AtomicUsize::new(0));
+    let take_owned = owned.clone();
+    let give_owned = owned.clone();
+    let decode_cb = live_before_decode.clone();
+    let first_trim_cb = live_at_first_trim.clone();
+    let trims_cb = trims.clone();
+    let snap_count_cb = snap_count_at_last_trim.clone();
+    let cache_cb = cache.clone();
+    let parent = MemoryDomain::new().parent(
+        move |bytes| {
+            let previous = take_owned.load(Ordering::SeqCst);
+            if previous.saturating_add(bytes) > CAP {
+                return Err(sparkles_budget::ParentRefused::Limit {
+                    limit: CAP,
+                    requested: bytes,
+                    scope: sparkles_budget::Scope::Work,
+                });
+            }
+            take_owned.fetch_add(bytes, Ordering::SeqCst);
+            if previous != 0 {
+                decode_cb.store(crate::alloc_probe::live_bytes(), Ordering::SeqCst);
+            }
+            Ok(())
+        },
+        move |bytes| {
+            give_owned.fetch_sub(bytes, Ordering::SeqCst);
+            if trims_cb.fetch_add(1, Ordering::SeqCst) == 0 {
+                first_trim_cb.store(crate::alloc_probe::live_bytes(), Ordering::SeqCst);
+            }
+            if let Some(count) = cache_cb.kept_snap_strong_count() {
+                snap_count_cb.store(count, Ordering::SeqCst);
+            }
+        },
+    );
+
+    let err = crate::literal_typings_controlled_guarded(
+        &store,
+        commit,
+        Some(&cache),
+        &crate::diagnostics::DiagnosticControls {
+            memory_parent: Some(parent),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            BudgetFailure::from_anyhow(&err),
+            Some(BudgetFailure::Parent { .. })
+        ),
+        "{err:#}"
+    );
+    assert_eq!(trims.load(Ordering::SeqCst), 2);
+    let added =
+        live_at_first_trim.load(Ordering::SeqCst) - live_before_decode.load(Ordering::SeqCst);
+    let snap_count = snap_count_at_last_trim.load(Ordering::SeqCst);
+    assert!(
+        added < (subject_bytes / 2) as isize && snap_count == snapshot_refs,
+        "payload must drop before credit returns, first trim had {added} extra live bytes, last trim had {snap_count} snapshot references, expected {snapshot_refs}"
+    );
+    assert_eq!(owned.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn diagnostic_summary_resolves_rdf_type_and_decodes_outside_cache_lock() {
+    use sparkles_budget::MemoryDomain;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    // In this compacted store, looking up `rdf:type` scans an FSST-coded
+    // 64 KiB sibling suffix. The small diagnostic budget must refuse that scratch
+    // allocation while the cache slot is unlocked.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        dir.path(),
+        StoreOptions {
+            build: sparkles_core::builder::BuildOptions {
+                vocab_codec: Some(sparkles_core::builder::VocabCodec::Fsst),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let long_suffix = "a".repeat(65_536);
+    let mut ttl = format!(
+        "<urn:item> <urn:val> \"not-an-int\" .\n\
+         <urn:s> <http://www.w3.org/1999/02/22-rdf-syntax-ns#a> \"1\" .\n\
+         <urn:s> <http://www.w3.org/1999/02/22-rdf-syntax-ns#b{long_suffix}> \"2\" .\n\
+         <urn:s> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:C> .\n"
+    );
+    for i in 0..sparkles_core::vocab::FC_BLOCK {
+        ttl.push_str(&format!(
+            "<urn:s> <http://www.w3.org/1999/02/22-rdf-syntax-ns#z{i:03}> \"x\" .\n"
+        ));
+    }
+    load_turtle(&store, &ttl);
+    store.compact().unwrap();
+    let snap = store.snapshot();
+    assert!(snap.generation.vocab.is_fsst());
+    let mut lookup_scratch = 0;
+    let type_id = snap
+        .lookup_key_controlled::<sparkles_core::Error>(
+            &sparkles_core::id::iri_key(oxrdf::vocab::rdf::TYPE.as_str()),
+            |old, new| {
+                lookup_scratch = lookup_scratch.max(old + new);
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+    assert!(type_id.is_some());
+    assert!(
+        lookup_scratch > 4 * 1024,
+        "the lookup must reach the long suffix"
+    );
+
+    let profile = crate::Profile::Rules(
+        "[type: (?x <urn:val> ?v) -> (?v <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]"
+            .into(),
+    );
+    let cache = Arc::new(crate::Cache::default());
+    let r = crate::materialize_incremental(
+        &store,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let commit = r.receipt.unwrap().commit.seq;
+
+    let saw_take = Arc::new(AtomicBool::new(false));
+    let saw_locked_during_cb = Arc::new(AtomicBool::new(false));
+    let owned = Arc::new(AtomicU64::new(0));
+    let take_owned = owned.clone();
+    let give_owned = owned.clone();
+    let saw_take_cb = saw_take.clone();
+    let locked_take = saw_locked_during_cb.clone();
+    let locked_give = saw_locked_during_cb.clone();
+    let cache_take = cache.clone();
+    let cache_give = cache.clone();
+    let domain = MemoryDomain::new();
+    let parent = domain.parent(
+        move |n| {
+            saw_take_cb.store(true, Ordering::SeqCst);
+            if cache_take.is_locked() {
+                locked_take.store(true, Ordering::SeqCst);
+            }
+            take_owned.fetch_add(n, Ordering::SeqCst);
+            Ok(())
+        },
+        move |n| {
+            if cache_give.is_locked() {
+                locked_give.store(true, Ordering::SeqCst);
+            }
+            give_owned.fetch_sub(n, Ordering::SeqCst);
+        },
+    );
+    let typings = crate::literal_typings_controlled_guarded(
+        &store,
+        commit,
+        Some(&cache),
+        &crate::diagnostics::DiagnosticControls {
+            memory_parent: Some(parent),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .expect("compacted FSST summary");
+    assert_eq!(typings.facts.len(), 1);
+    assert!(saw_take.load(Ordering::SeqCst));
+    assert!(
+        !saw_locked_during_cb.load(Ordering::SeqCst),
+        "cache.kept must never be locked during controlled lookup or budget callbacks"
+    );
+    drop(typings);
+    assert_eq!(owned.load(Ordering::SeqCst), 0);
+
+    // Refusing under a 4 KiB budget proves FSST suffix lookup scratch is admitted before decoding.
+    let tiny_pool = QueryPool::new(4 * 1024);
+    let err = crate::literal_typings_controlled_guarded(
+        &store,
+        commit,
+        Some(&cache),
+        &crate::diagnostics::DiagnosticControls {
+            max_memory: Some(4 * 1024),
+            memory_parent: Some(tiny_pool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            BudgetFailure::from_anyhow(&err),
+            Some(BudgetFailure::Local(_))
+        ),
+        "expected FSST lookup scratch budget refusal, got: {err:#}"
+    );
+    assert_eq!(tiny_pool.granted(), 0);
+}
+
+#[test]
+fn public_diagnostic_summary_reads_rule_local_terms() {
+    // The predicate, literal subject and datatype are all absent from the store vocabulary.
+    let local_store = Store::in_memory(StoreOptions::default());
+    load_turtle(&local_store, "<urn:item> <urn:seed> \"not-an\" .");
+    let local_profile = crate::Profile::Rules(
+        "[local_all: (?x <urn:seed> ?s) strConcat(?s, \"-int\", ?l) \
+         -> (?l <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]"
+            .into(),
+    );
+    let local_cache = crate::Cache::default();
+    let local_r = crate::materialize_incremental(
+        &local_store,
+        &local_profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&local_cache),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let local_commit = local_r.receipt.unwrap().commit.seq;
+    let public_typings = crate::literal_typings(&local_store, local_commit, Some(&local_cache))
+        .unwrap()
+        .expect("public literal_typings with rule-local terms");
+    assert_eq!(public_typings.commit, local_commit);
+    assert_eq!(public_typings.facts.len(), 1);
+    assert_eq!(public_typings.facts[0].0.value(), "not-an-int");
+    assert_eq!(
+        public_typings.facts[0].1.as_str(),
+        "http://www.w3.org/2001/XMLSchema#integer"
+    );
 }

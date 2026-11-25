@@ -1093,6 +1093,100 @@ impl Rendered {
     }
 }
 
+// The prefix plus the largest decimal usize on supported targets.
+const FRESH_NAME_BYTES: usize = "__ql".len() + 20;
+
+/// Size the temporary branch from its compact atoms and borrowed terms.
+fn estimate_rendered_bytes(
+    q: &Cq,
+    consts: &[Term],
+    names: &[Variable],
+    iri: impl Fn(u32) -> usize,
+) -> usize {
+    let term_len = |t: T| -> usize {
+        match t {
+            T::Const(c) => match &consts[c as usize] {
+                Term::NamedNode(n) => n.as_str().len(),
+                Term::Literal(l) => {
+                    l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+                }
+                _ => 64,
+            },
+            T::Free => FRESH_NAME_BYTES,
+            T::Var(v) => names[v as usize].as_str().len(),
+        }
+    };
+    let pattern_slot = size_of::<TriplePattern>().max(3 * 48);
+    let binding_slot = size_of::<(u32, Expression)>().max(128);
+    let rdf_type_len = oxrdf::vocab::rdf::TYPE.as_str().len();
+    let patterns: usize = q.atoms.iter().fold(0usize, |acc, a| {
+        let atom_bytes = match *a {
+            Atom::C(c, x) => term_len(x)
+                .saturating_add(rdf_type_len)
+                .saturating_add(iri(c))
+                .saturating_add(pattern_slot),
+            Atom::R(p, s, o) => term_len(s)
+                .saturating_add(iri(p))
+                .saturating_add(term_len(o))
+                .saturating_add(pattern_slot),
+        };
+        acc.saturating_add(atom_bytes)
+    });
+    let mut binds: usize = 0;
+    let mut bind_names: usize = 0;
+    for &(v, t) in &q.binds {
+        // The binding vector reserves a slot even for a binding that gives no value.
+        binds = binds.saturating_add(binding_slot);
+        if t != T::Free {
+            binds = binds.saturating_add(term_len(t));
+            bind_names = bind_names.saturating_add(names[v as usize].as_str().len());
+        }
+    }
+    let set_bytes = q
+        .atoms
+        .len()
+        .saturating_mul(2)
+        .saturating_add(q.binds.len())
+        .saturating_mul(std::mem::size_of::<u32>())
+        .saturating_add(std::mem::size_of::<(Vec<u32>, Vec<Rendered>)>());
+    patterns
+        .saturating_add(binds)
+        .saturating_add(bind_names)
+        .saturating_add(64)
+        .saturating_add(set_bytes)
+}
+
+/// Build the sorted, deduplicated list of bound variables of `q` into a pre-sized `Vec`
+/// without allocating intermediate hash sets.
+fn bound_vars_sorted(q: &Cq) -> Vec<u32> {
+    let mut out = Vec::with_capacity(
+        q.atoms
+            .len()
+            .saturating_mul(2)
+            .saturating_add(q.binds.len()),
+    );
+    for a in &q.atoms {
+        for t in a.terms() {
+            if let T::Var(v) = t {
+                out.push(v);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    let atom_var_count = out.len();
+    for &(v, t) in &q.binds {
+        match t {
+            T::Const(_) => out.push(v),
+            T::Var(w) if out[..atom_var_count].binary_search(&w).is_ok() => out.push(v),
+            _ => {}
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// What became of one basic graph pattern.
 enum Outcome {
     /// no inclusion changes it
@@ -1282,34 +1376,39 @@ impl Rewriter<'_> {
         if branches.len() == 1 && branches[0] == start {
             return Ok(Outcome::Unchanged);
         }
-        let iri = |s: u32| -> NamedNode {
+        let iri = |s: u32| -> &str {
             if s >= base {
-                extra[(s - base) as usize].clone()
+                extra[(s - base) as usize].as_str()
             } else {
-                NamedNode::new_unchecked(
-                    tbox.names[s as usize]
-                        .clone()
-                        .expect("a branch names no property of the normalization"),
-                )
+                tbox.names[s as usize]
+                    .as_deref()
+                    .expect("a branch names no property of the normalization")
             }
         };
-        // each variable of the pattern under its own name, and each blank node under a
-        // variable of its own, the same in every branch
-        let mut names: Vec<Variable> = Vec::with_capacity(bgp.vars.len());
+        // The branches share names for the query's variables and for blank nodes.
+        let names_bytes = bgp.vars.iter().fold(0usize, |bytes, (term, _)| {
+            let len = match term {
+                TermPattern::Variable(v) => v.as_str().len(),
+                _ => FRESH_NAME_BYTES,
+            };
+            bytes.saturating_add(size_of::<Variable>().saturating_add(len))
+        });
+        let mut groups_held = crate::budget::Held::try_new(&self.budget, names_bytes)
+            .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+        let mut names = Vec::with_capacity(bgp.vars.len());
+        let mut visible_len = 0;
+        let mut visible_bytes = 0usize;
         for (x, _) in &bgp.vars {
             names.push(match x {
-                TermPattern::Variable(v) => v.clone(),
+                TermPattern::Variable(v) => {
+                    visible_len += 1;
+                    visible_bytes =
+                        visible_bytes.saturating_add(size_of::<Variable>() + v.as_str().len());
+                    v.clone()
+                }
                 _ => self.fresh_var(),
             });
         }
-        let visible: Vec<Variable> = bgp
-            .vars
-            .iter()
-            .filter_map(|(x, _)| match x {
-                TermPattern::Variable(v) => Some(v.clone()),
-                _ => None,
-            })
-            .collect();
         let n = branches.len();
         // the branches grouped by the variables they give a value: a branch that gives
         // every variable one answers as the stored and derived facts would, and one that
@@ -1317,9 +1416,12 @@ impl Rewriter<'_> {
         // of them gives the same values to the ones it names.
         // `groups_held` is declared before `groups` so temporary rendered branches drop
         // before their credit returns.
-        let mut groups_held = crate::budget::Held::new(&self.budget);
         let mut groups: Vec<(Vec<u32>, Vec<Rendered>)> = Vec::new();
         for q in &branches {
+            let est_bytes = estimate_rendered_bytes(q, &bgp.consts, &names, |s| iri(s).len());
+            groups_held
+                .try_grow(est_bytes)
+                .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
             let tp = |t: T, rw: &mut Self| -> TermPattern {
                 match t {
                     T::Const(c) => match &bgp.consts[c as usize] {
@@ -1337,11 +1439,11 @@ impl Rewriter<'_> {
                     Atom::C(c, x) => TriplePattern {
                         subject: tp(x, self),
                         predicate: NamedNodePattern::NamedNode(oxrdf::vocab::rdf::TYPE.into()),
-                        object: TermPattern::NamedNode(iri(c)),
+                        object: TermPattern::NamedNode(NamedNode::new_unchecked(iri(c))),
                     },
                     Atom::R(p, s, o) => TriplePattern {
                         subject: tp(s, self),
-                        predicate: NamedNodePattern::NamedNode(iri(p)),
+                        predicate: NamedNodePattern::NamedNode(NamedNode::new_unchecked(iri(p))),
                         object: tp(o, self),
                     },
                 });
@@ -1359,8 +1461,7 @@ impl Rewriter<'_> {
                 };
                 binds.push((v, expression));
             }
-            let mut set: Vec<u32> = q.bound_vars().into_iter().collect();
-            set.sort_unstable();
+            let set = bound_vars_sorted(q);
             let bind_names = binds
                 .iter()
                 .map(|(v, _)| names[*v as usize].as_str().len())
@@ -1370,9 +1471,6 @@ impl Rewriter<'_> {
                 binds,
                 bind_names,
             };
-            groups_held
-                .try_grow(b.bytes())
-                .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
             match groups.iter_mut().find(|(s, _)| *s == set) {
                 Some((_, g)) => g.push(b),
                 None => groups.push((set, vec![b])),
@@ -1433,7 +1531,10 @@ impl Rewriter<'_> {
         // Admit both the first emitted copy of every branch and every wider-group
         // `NOT EXISTS` copy while `groups_held` stays charged for the overlapping
         // temporary `Rendered` state.
-        let mut bytes = 0usize;
+        let mut bytes = names_bytes;
+        if visible_len < names.len() {
+            bytes = bytes.saturating_add(visible_bytes);
+        }
         for (set, group) in &groups {
             bytes = bytes.saturating_add(group.iter().map(Rendered::bytes).sum::<usize>());
             for (s, g) in &groups {
@@ -1467,22 +1568,27 @@ impl Rewriter<'_> {
             });
         }
         drop(groups);
-        drop(groups_held);
         let union = union_of(parts).expect("the rewriting keeps the query it starts from");
         // each solution of the pattern's variables and blank nodes once, as matching the
         // stored and derived facts gives it, with the blank nodes then left out
         let mut gp = GraphPattern::Distinct {
             inner: Box::new(GraphPattern::Project {
                 inner: Box::new(union),
-                variables: names.clone(),
+                variables: names,
             }),
         };
-        if visible.len() < names.len() {
+        if visible_len < bgp.vars.len() {
+            let mut visible = Vec::with_capacity(visible_len);
+            visible.extend(bgp.vars.iter().filter_map(|(term, _)| match term {
+                TermPattern::Variable(v) => Some(v.clone()),
+                _ => None,
+            }));
             gp = GraphPattern::Project {
                 inner: Box::new(gp),
                 variables: visible,
             };
         }
+        drop(groups_held);
         let mut counters = serde_json::Map::new();
         counters.insert("patterns".into(), patterns.len().into());
         counters.insert("branches".into(), n.into());

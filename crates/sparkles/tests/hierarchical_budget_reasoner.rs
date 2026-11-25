@@ -387,3 +387,41 @@ fn public_rewritten_and_literal_typings_struct_literals_compile_and_work() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(pool.granted(), 0);
 }
+
+#[test]
+fn only_unguarded_payloads_implement_clone() {
+    use sparkles::reasoning::reasoner::diagnostics::{GuardedLiteralTypings, LiteralTypings};
+    use sparkles::sparql::reasoning::{GuardedRewritten, Rewritten};
+    use std::marker::PhantomData;
+
+    // Method resolution takes the inherent method for a Clone payload and
+    // borrows the probe again to find the fallback for other payloads.
+    trait WithoutClone {
+        fn payload_is_clone(&self) -> bool {
+            false
+        }
+    }
+    impl<T> WithoutClone for &T {}
+    struct Probe<T>(PhantomData<T>);
+    impl<T: Clone> Probe<T> {
+        fn payload_is_clone(&self) -> bool {
+            true
+        }
+    }
+
+    let guarded_query = &Probe::<GuardedRewritten>(PhantomData);
+    let guarded_typings = &Probe::<GuardedLiteralTypings>(PhantomData);
+    let query = &Probe::<Rewritten>(PhantomData);
+    let typings = &Probe::<LiteralTypings>(PhantomData);
+    assert_eq!(
+        (
+            guarded_query.payload_is_clone(),
+            guarded_typings.payload_is_clone()
+        ),
+        (false, false),
+    );
+    assert_eq!(
+        (query.payload_is_clone(), typings.payload_is_clone()),
+        (true, true)
+    );
+}

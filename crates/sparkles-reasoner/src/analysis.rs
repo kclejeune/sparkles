@@ -222,7 +222,7 @@ impl AnalysisContext {
         let taken = self.typings.lock().unwrap().take();
         taken.map(|(mut typings, held)| {
             typings.commit = commit;
-            crate::diagnostics::GuardedLiteralTypings::new(typings, Some(Arc::new(held)))
+            crate::diagnostics::GuardedLiteralTypings::new(typings, Some(held))
         })
     }
 }

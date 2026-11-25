@@ -171,8 +171,8 @@ pub struct Rewritten {
 /// A [`Rewritten`] query paired with an optional opaque credit guard that keeps
 /// rewritten algebra allocations charged until planning and execution release them.
 /// Declared with `rewritten` before `memory_guard` so the algebra drops before credit
-/// returns.
-#[derive(Clone, Debug)]
+/// returns. Moving the wrapper transfers the query and its admission together.
+#[derive(Debug)]
 pub struct GuardedRewritten {
     pub rewritten: Rewritten,
     pub memory_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,

@@ -276,3 +276,65 @@ fn a_copy_is_charged_with_a_bound_literals_language() {
     };
     assert!(b.bytes() >= tag.len(), "{}", b.bytes());
 }
+
+/// Each temporary rendered branch must be admitted against `groups_held` BEFORE allocating
+/// owned patterns, bindings, or fresh variables (`self.fresh_var()`).
+#[test]
+fn temporary_branch_is_admitted_before_rendering_or_fresh_var_allocation() {
+    let long_prop = format!("p_{}", "x".repeat(16 * 1024));
+    let t = tbox(&format!(
+        "@prefix ex: <{EX}> . @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+         ex:A a owl:Class . ex:{long_prop} a owl:ObjectProperty ; rdfs:domain ex:A ."
+    ));
+    let patterns = vec![TriplePattern {
+        subject: TermPattern::Variable(Variable::new_unchecked("s")),
+        predicate: NamedNodePattern::NamedNode(oxrdf::vocab::rdf::TYPE.into()),
+        object: TermPattern::NamedNode(NamedNode::new_unchecked(format!("{EX}A"))),
+    }];
+
+    // 4 KiB pool easily admits PerfectRef's two compact Cqs (~200 B) and the tiny first
+    // branch (?s a ex:A), but cannot admit rendering the second branch (?s ex:p_<16 KiB> ?__ql1).
+    let pool = sparkles_core::sparql::pool::QueryPool::new(4 * 1024);
+    let budget =
+        crate::budget::Budget::with_parent(Some(16 * 1024 * 1024), Some(pool.work_parent()));
+    let mut counts = FxHashMap::default();
+    counts.insert("?s".to_string(), 2);
+    let stop = || Ok(());
+    let mut rw = Rewriter {
+        tbox: &t,
+        max_union: DEFAULT_MAX_UNION,
+        stop: &stop,
+        bound: FxHashMap::default(),
+        counts,
+        all_distinguished: false,
+        fresh: 0,
+        path_warned: false,
+        derive: Vec::new(),
+        nodes: Vec::new(),
+        warnings: Vec::new(),
+        emitted_held: crate::budget::Held::new(&budget),
+        budget: budget.clone(),
+    };
+    let err = match rw.bgp(&patterns) {
+        Ok(_) => panic!("expected ServerMemory refusal on large temporary branch"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            sparkles_core::Error::BudgetExceeded(sparkles_core::Budget {
+                kind: sparkles_core::BudgetKind::ServerMemory,
+                ..
+            })
+        ),
+        "expected ServerMemory refusal, got: {err:?}"
+    );
+    assert_eq!(
+        rw.fresh, 0,
+        "fresh_var() must not run before temporary branch admission succeeds"
+    );
+    drop(rw);
+    drop(budget);
+    assert_eq!(pool.granted(), 0);
+}
