@@ -212,9 +212,10 @@ class LongrunTests(unittest.TestCase):
             left = []
             for k in kids:
                 try:
-                    if "Z" not in open(f"/proc/{k}/stat").read().split(")")[-1].split()[0]:
-                        left.append(k)
-                except FileNotFoundError:
+                    with open(f"/proc/{k}/stat") as fh:
+                        if "Z" not in fh.read().split(")")[-1].split()[0]:
+                            left.append(k)
+                except (FileNotFoundError, ProcessLookupError):
                     pass
             return left
 
