@@ -832,11 +832,11 @@ pub(crate) fn decode_frame_into(bytes: &[u8], out: &mut [u64]) -> Result<()> {
 
 /// Decode the same LZ4/zigzag-varint format with admitted local storage. The
 /// ordinary fast decoder stays unchanged for callers without preparation limits.
-fn decode_point_column_limited(
+fn decode_point_column_with<C: crate::budgeted::Control>(
     bytes: &[u8],
     rows: usize,
     scratch: &mut Vec<u8>,
-    limit: &crate::history::ReadLimit<'_>,
+    limit: &C,
     admitted: u64,
 ) -> Result<Col> {
     limit.check(admitted)?;
@@ -851,14 +851,7 @@ fn decode_point_column_limited(
     if size > scratch.capacity() {
         scratch
             .try_reserve_exact(size.saturating_sub(scratch.len()))
-            .map_err(|_| {
-                let cap = limit.memory.unwrap_or(u64::MAX);
-                Error::BudgetExceeded(crate::Budget {
-                    kind: crate::BudgetKind::Memory,
-                    limit: cap,
-                    requested: cap.saturating_add(1),
-                })
-            })?;
+            .map_err(|_| limit.refused())?;
     }
     scratch.resize(size, 0);
     let actual = lz4_flex::block::decompress_into(&bytes[4..], scratch)
@@ -867,14 +860,9 @@ fn decode_point_column_limited(
         return Err(bad("decompressed length differs from its prefix"));
     }
     let mut values = Vec::new();
-    values.try_reserve_exact(rows).map_err(|_| {
-        let cap = limit.memory.unwrap_or(u64::MAX);
-        Error::BudgetExceeded(crate::Budget {
-            kind: crate::BudgetKind::Memory,
-            limit: cap,
-            requested: cap.saturating_add(1),
-        })
-    })?;
+    values
+        .try_reserve_exact(rows)
+        .map_err(|_| limit.refused())?;
     let (mut position, mut previous) = (0usize, 0u64);
     for row in 0..rows {
         if row.is_multiple_of(1024) {
@@ -1212,19 +1200,13 @@ pub(crate) struct Segments {
 }
 
 impl Segments {
-    fn open(path: &Path, perm: Perm, blocks: &[BlockMeta]) -> Result<Segments> {
-        Self::open_inner(path, perm, blocks, None)
-    }
-
-    fn open_inner(
+    fn open_with<C: crate::budgeted::BudgetControl>(
         path: &Path,
         perm: Perm,
         blocks: &[BlockMeta],
-        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+        control: &mut C,
     ) -> Result<Segments> {
-        if let Some(budget) = budget.as_deref_mut() {
-            budget.check()?;
-        }
+        control.check(0)?;
         let bad = |m: String| Error::Corrupt(format!("{}.seg: {m}", perm.name()));
         let f = File::open(path)?;
         let map = map_random(&f)?;
@@ -1235,22 +1217,15 @@ impl Segments {
         if !supported_segment_rows(seg_rows) {
             return Err(bad(format!("segment size {seg_rows} is not supported")));
         }
-        let mut start = if let Some(budget) = budget.as_deref_mut() {
-            let mut entries = Vec::new();
-            let count = blocks
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| budget.exhausted())?;
-            budget.reserve(&mut entries, count)?;
-            entries
-        } else {
-            Vec::with_capacity(blocks.len() + 1)
-        };
+        let count = blocks
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| control.exhausted())?;
+        let mut start = Vec::new();
+        control.reserve(&mut start, count)?;
         let mut n = 0usize;
         for m in blocks {
-            if let Some(budget) = budget.as_deref_mut() {
-                budget.check()?;
-            }
+            control.check(0)?;
             start.push(n);
             n = n
                 .checked_add((m.rows as usize).div_ceil(seg_rows))
@@ -1276,18 +1251,8 @@ impl Segments {
         if map.len() <= READ_AT_OPEN {
             will_need(IoFile::of_perm(perm), &map, 0, map.len());
         }
-        let (hinted, sparse_reads) = match budget {
-            Some(budget) => (
-                budget.filled(blocks.len().div_ceil(64))?,
-                budget.filled(blocks.len())?,
-            ),
-            None => (
-                (0..blocks.len().div_ceil(64))
-                    .map(|_| Default::default())
-                    .collect(),
-                (0..blocks.len()).map(|_| Default::default()).collect(),
-            ),
-        };
+        let hinted = control.filled(blocks.len().div_ceil(64))?;
+        let sparse_reads = control.filled(blocks.len())?;
         Ok(Segments {
             map,
             seg_rows,
@@ -1417,64 +1382,36 @@ impl PermIndex {
     /// Open the permutation in `dir`. Every index format this build reads is segmented,
     /// so the permutation needs its `.seg` file.
     pub fn open(dir: &Path, perm: Perm) -> Result<PermIndex> {
-        Self::open_layout_inner(dir, perm, true, None)
+        Self::open_with(dir, perm, true, &mut crate::budgeted::Unlimited)
     }
 
     /// Open a permutation in the whole-column layout of the pre-release format 2, which
     /// the tests write as a reference decoder. No store opens one.
     #[cfg(test)]
     fn open_whole_columns(dir: &Path, perm: Perm) -> Result<PermIndex> {
-        Self::open_layout_inner(dir, perm, false, None)
+        Self::open_with(dir, perm, false, &mut crate::budgeted::Unlimited)
     }
 
-    pub(crate) fn open_controlled(
-        dir: &Path,
-        perm: Perm,
-        budget: &mut crate::store::cold::ColdBudget<'_>,
-    ) -> Result<crate::store::cold::Loaded<PermIndex>> {
-        budget.check()?;
-        let start = budget.used();
-        let value = Self::open_layout_inner(dir, perm, true, Some(budget))?;
-        Ok(crate::store::cold::Loaded {
-            value,
-            charge: budget.used() - start,
-        })
-    }
-
-    fn open_layout_inner(
+    pub(crate) fn open_with<C: crate::budgeted::BudgetControl>(
         dir: &Path,
         perm: Perm,
         segmented: bool,
-        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+        control: &mut C,
     ) -> Result<PermIndex> {
+        control.check(0)?;
         let path = dir.join(format!("{}.meta", perm.name()));
-        let meta = match budget.as_deref_mut() {
-            Some(budget) => budget.read_file(&path)?,
-            None => std::fs::read(&path)?,
-        };
+        let meta = control.read_file(&path)?;
         if meta.len() % META_BYTES != 0 {
+            control.drop_vec(meta);
             return Err(Error::Corrupt(format!("{} metadata size", perm.name())));
         }
-        let blocks: Vec<BlockMeta> = if let Some(budget) = budget.as_deref_mut() {
-            let mut blocks = Vec::new();
-            budget.reserve(&mut blocks, meta.len() / META_BYTES)?;
-            for record in meta.as_chunks::<META_BYTES>().0 {
-                budget.check()?;
-                blocks.push(BlockMeta::read(record));
-            }
-            blocks
-        } else {
-            meta.as_chunks::<META_BYTES>()
-                .0
-                .iter()
-                .map(|record| BlockMeta::read(record))
-                .collect()
-        };
-        if let Some(budget) = budget.as_deref_mut() {
-            budget.drop_vec(meta);
-        } else {
-            drop(meta);
+        let mut blocks = Vec::new();
+        control.reserve(&mut blocks, meta.len() / META_BYTES)?;
+        for record in meta.as_chunks::<META_BYTES>().0 {
+            control.check(0)?;
+            blocks.push(BlockMeta::read(record));
         }
+        control.drop_vec(meta);
         let rows = blocks
             .last()
             .map(|block| block.row_start.checked_add(block.rows as u64))
@@ -1482,9 +1419,7 @@ impl PermIndex {
             .ok_or_else(|| Error::Corrupt("index row count overflow".into()))?;
         let f = File::open(dir.join(format!("{}.dat", perm.name())))?;
         let data = if f.metadata()?.len() > 0 {
-            if let Some(budget) = budget.as_deref_mut() {
-                budget.charge(64)?;
-            }
+            control.charge(64)?;
             Some(Arc::new(map_random(&f)?))
         } else {
             None
@@ -1497,19 +1432,13 @@ impl PermIndex {
                     perm.name()
                 )));
             }
-            let value = if let Some(budget) = budget.as_deref_mut() {
-                budget.charge(std::mem::size_of::<Segments>() as u64 + 32)?;
-                Segments::open_inner(&path, perm, &blocks, Some(budget))?
-            } else {
-                Segments::open(&path, perm, &blocks)?
-            };
+            control.charge(std::mem::size_of::<Segments>() as u64 + 32)?;
+            let value = Segments::open_with(&path, perm, &blocks, control)?;
             Some(Arc::new(value))
         } else {
             None
         };
-        if let Some(budget) = budget {
-            budget.charge(64)?;
-        }
+        control.charge(64)?;
         Ok(PermIndex {
             perm,
             data,
@@ -2643,7 +2572,7 @@ impl PermIndex {
                     &lo_key,
                     &hi_key,
                     bc,
-                    &|| Ok(()),
+                    &crate::budgeted::Unlimited,
                     |_, s, e| {
                         total += (e - s) as u64;
                         Ok(true)
@@ -2751,16 +2680,23 @@ impl PermIndex {
         mask_of: impl Fn(usize) -> ColMask,
         f: impl FnMut(&Block, usize, usize) -> Result<bool>,
     ) -> Result<()> {
-        self.for_each_key_range_masked_checked(cache, lo_key, hi_key, mask_of, &|| Ok(()), f)
+        self.for_each_key_range_masked_with(
+            cache,
+            lo_key,
+            hi_key,
+            mask_of,
+            &crate::budgeted::Unlimited,
+            f,
+        )
     }
 
-    pub(crate) fn for_each_key_range_masked_checked(
+    pub(crate) fn for_each_key_range_masked_with<C: crate::budgeted::Control>(
         &self,
         cache: &BlockCache,
         lo_key: &Key,
         hi_key: &Key,
         mask_of: impl Fn(usize) -> ColMask,
-        check: &impl Fn() -> Result<()>,
+        control: &C,
         mut f: impl FnMut(&Block, usize, usize) -> Result<bool>,
     ) -> Result<()> {
         let (lo, hi) = self.key_block_range(lo_key, hi_key);
@@ -2776,14 +2712,14 @@ impl PermIndex {
             }
         };
         for b in lo..hi {
-            check()?;
+            control.check(0)?;
             let m = &self.blocks[b];
             let mask = columns(b);
             let whole = m.first >= *lo_key && m.last <= *hi_key;
             if !whole && let Some(span) = self.read_span(cache, b, lo_key, hi_key, mask) {
                 // a few rows of the block: the segments that can hold them, one by one
                 if !self
-                    .for_each_segment_rows(cache, b, span, lo_key, hi_key, mask, check, &mut f)?
+                    .for_each_segment_rows(cache, b, span, lo_key, hi_key, mask, control, &mut f)?
                 {
                     break;
                 }
@@ -2796,7 +2732,7 @@ impl PermIndex {
                     cache.get_cols_hinted(self, b, mask, hint)?
                 }
             };
-            check()?;
+            control.check(0)?;
             let go_on = if whole {
                 f(&blk, 0, blk.len())?
             } else {
@@ -2815,7 +2751,7 @@ impl PermIndex {
     /// the bound columns of the range): `f(segment, start_row, end_row)` with rows of the
     /// segment, until it returns `false`. Returns whether it never did.
     #[allow(clippy::too_many_arguments)]
-    fn for_each_segment_rows(
+    fn for_each_segment_rows<C: crate::budgeted::Control>(
         &self,
         cache: &BlockCache,
         b: usize,
@@ -2823,13 +2759,13 @@ impl PermIndex {
         lo_key: &Key,
         hi_key: &Key,
         mask: ColMask,
-        check: &impl Fn() -> Result<()>,
+        control: &C,
         mut f: impl FnMut(&Block, usize, usize) -> Result<bool>,
     ) -> Result<bool> {
         for s in s0..s1 {
-            check()?;
+            control.check(0)?;
             let blk = cache.get_segment(self, b, s, mask, true)?;
-            check()?;
+            control.check(0)?;
             let (a, z) = blk.key_range(lo_key, hi_key);
             if a < z && !f(&blk, a, z)? {
                 return Ok(false);
@@ -2947,7 +2883,7 @@ impl PermIndex {
                             Error::Corrupt("prepared column ends past the index".into())
                         })?;
                     *output =
-                        decode_point_column_limited(frame, rows, &mut scratch, &limit, workspace)
+                        decode_point_column_with(frame, rows, &mut scratch, &limit, workspace)
                             .map_err(|error| preparation.sanitize(error))?;
                     crate::ioacct::column_decoded(self.perm, rows, length);
                     preparation.check()?;
@@ -2970,19 +2906,43 @@ impl PermIndex {
         preparation.check().map_err(E::from)
     }
 
-    /// Bounded point lookup for historical replay. Fresh local scratch avoids the
-    /// ordinary decoder's unaccounted thread-local buffer; cache identity is shared.
-    pub(crate) fn contains_limited(
+    /// Point lookup of a full key under `limit`. An accounting carrier uses fresh local
+    /// scratch so the lookup stays inside its budget; any other carrier uses the fast
+    /// shared-cache path with zero control overhead.
+    pub(crate) fn contains_with<C: crate::budgeted::Control>(
         &self,
         cache: &BlockCache,
         key: &Key,
-        limit: &crate::history::ReadLimit<'_>,
+        limit: &C,
         held: u64,
     ) -> Result<bool> {
         limit.check(held)?;
         let b = self.blocks.partition_point(|block| block.last < *key);
         if b >= self.blocks.len() || self.blocks[b].first > *key {
             return Ok(false);
+        }
+        if !C::ACCOUNTS {
+            if let Some(span) = self.read_span(cache, b, key, key, ALL_COLS) {
+                let mut found = false;
+                self.for_each_segment_rows(
+                    cache,
+                    b,
+                    span,
+                    key,
+                    key,
+                    ALL_COLS,
+                    limit,
+                    |_, _, _| {
+                        found = true;
+                        Ok(false)
+                    },
+                )?;
+                return Ok(found);
+            }
+            let blk = cache.get(self, b)?;
+            limit.check(0)?;
+            let (s, e) = blk.prefix_range(key);
+            return Ok(s < e);
         }
         // A full key occurs in at most one segment. Budgeted probes keep that
         // choice even when a previous unlimited reader marked the block dense.
@@ -3055,7 +3015,7 @@ impl PermIndex {
                 let frame = data.get(offset..end).ok_or_else(|| {
                     Error::Corrupt("bounded point column ends past the index".into())
                 })?;
-                *output = decode_point_column_limited(
+                *output = decode_point_column_with(
                     frame,
                     rows,
                     &mut scratch,
@@ -3079,30 +3039,7 @@ impl PermIndex {
 
     /// Point lookup of a full key.
     pub fn contains(&self, cache: &BlockCache, key: &Key) -> Result<bool> {
-        let b = self.blocks.partition_point(|m| m.last < *key);
-        if b >= self.blocks.len() || self.blocks[b].first > *key {
-            return Ok(false);
-        }
-        if let Some(span) = self.read_span(cache, b, key, key, ALL_COLS) {
-            let mut found = false;
-            self.for_each_segment_rows(
-                cache,
-                b,
-                span,
-                key,
-                key,
-                ALL_COLS,
-                &|| Ok(()),
-                |_, _, _| {
-                    found = true;
-                    Ok(false)
-                },
-            )?;
-            return Ok(found);
-        }
-        let blk = cache.get(self, b)?;
-        let (s, e) = blk.prefix_range(key);
-        Ok(s < e)
+        self.contains_with(cache, key, &crate::budgeted::Unlimited, 0)
     }
 }
 
@@ -3208,13 +3145,13 @@ mod tests {
         for index in [&segmented, &whole] {
             let cache = BlockCache::new(32 << 20);
             for key in keys.iter().step_by(509) {
-                assert!(index.contains_limited(&cache, key, &limit, 0).unwrap());
+                assert!(index.contains_with(&cache, key, &limit, 0).unwrap());
                 assert!(index.contains(&cache, key).unwrap());
-                assert!(index.contains_limited(&cache, key, &limit, 0).unwrap());
+                assert!(index.contains_with(&cache, key, &limit, 0).unwrap());
                 let mut absent = *key;
                 absent[3] ^= 1 << 50;
                 assert_eq!(
-                    index.contains_limited(&cache, &absent, &limit, 0).unwrap(),
+                    index.contains_with(&cache, &absent, &limit, 0).unwrap(),
                     index.contains(&cache, &absent).unwrap()
                 );
             }
@@ -3223,7 +3160,7 @@ mod tests {
                 ..limit
             };
             assert!(matches!(
-                index.contains_limited(&cache, &keys[0], &tiny, 0),
+                index.contains_with(&cache, &keys[0], &tiny, 0),
                 Err(Error::BudgetExceeded(_))
             ));
         }
@@ -3244,8 +3181,7 @@ mod tests {
         let frame = encode_column(&values, &mut encoding);
         let mut scratch = Vec::new();
         let decoded =
-            decode_point_column_limited(&frame, values.len(), &mut scratch, &limit, 1 << 20)
-                .unwrap();
+            decode_point_column_with(&frame, values.len(), &mut scratch, &limit, 1 << 20).unwrap();
         assert_eq!(&*decoded, values.as_slice());
         assert_eq!(&*decoded, &*decode_column(&frame, values.len()).unwrap());
         for damaged in [
@@ -3254,7 +3190,7 @@ mod tests {
             &frame[..frame.len() / 2],
         ] {
             assert!(
-                decode_point_column_limited(damaged, values.len(), &mut scratch, &limit, 1 << 20)
+                decode_point_column_with(damaged, values.len(), &mut scratch, &limit, 1 << 20)
                     .is_err()
             );
         }
@@ -3320,12 +3256,12 @@ mod tests {
         let mut encode_scratch = Vec::new();
         let encoded_max_delta = encode_column(&[1 << 63], &mut encode_scratch);
         let maximum =
-            decode_point_column_limited(&encoded_max_delta, 1, &mut scratch, &limit, 0).unwrap();
+            decode_point_column_with(&encoded_max_delta, 1, &mut scratch, &limit, 0).unwrap();
         assert_eq!(&*maximum, &[1 << 63]);
 
         let round_trip = [0u64, 1 << 63, u64::MAX];
         let encoded_round_trip = encode_column(&round_trip, &mut encode_scratch);
-        let decoded_round_trip = decode_point_column_limited(
+        let decoded_round_trip = decode_point_column_with(
             &encoded_round_trip,
             round_trip.len(),
             &mut scratch,
@@ -3336,13 +3272,8 @@ mod tests {
         assert_eq!(&*decoded_round_trip, &round_trip);
 
         for byte in (2u8..=0x7f).chain([0x80, 0xff]) {
-            let result = decode_point_column_limited(
-                &ten_byte_delta_frame(byte),
-                1,
-                &mut scratch,
-                &limit,
-                0,
-            );
+            let result =
+                decode_point_column_with(&ten_byte_delta_frame(byte), 1, &mut scratch, &limit, 0);
             assert!(matches!(result, Err(Error::Corrupt(_))), "byte {byte:#x}");
         }
     }
@@ -3363,15 +3294,17 @@ mod tests {
             held: 0,
         };
         let mut budget = ColdBudget::new(limit).unwrap();
-        let loaded = PermIndex::open_controlled(directory, Perm::Spo, &mut budget).unwrap();
-        assert_eq!(loaded.value.rows, normal.rows);
-        assert_eq!(loaded.value.blocks.len(), normal.blocks.len());
-        assert_eq!(loaded.value.segmented(), normal.segmented());
-        assert_eq!(budget.used(), loaded.charge);
+        let start = budget.used();
+        let value = PermIndex::open_with(directory, Perm::Spo, true, &mut budget).unwrap();
+        let charge = budget.used() - start;
+        assert_eq!(value.rows, normal.rows);
+        assert_eq!(value.blocks.len(), normal.blocks.len());
+        assert_eq!(value.segmented(), normal.segmented());
+        assert_eq!(budget.used(), charge);
         let cache = BlockCache::new(1 << 20);
-        assert!(loaded.value.contains(&cache, &keys[12_345]).unwrap());
-        drop(loaded.value);
-        budget.release(loaded.charge);
+        assert!(value.contains(&cache, &keys[12_345]).unwrap());
+        drop(value);
+        budget.release(charge);
         assert_eq!(budget.used(), 0);
         let mut low = ColdBudget::new(ReadLimit {
             memory: Some(16),
@@ -3379,8 +3312,79 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            PermIndex::open_controlled(directory, Perm::Spo, &mut low),
+            PermIndex::open_with(directory, Perm::Spo, true, &mut low),
             Err(Error::BudgetExceeded(_))
+        ));
+        // Uncapped ReadLimit still honours cancellation and deadline on contains_with
+        // and open_with, and for_each_key_range_masked_with agrees between Unlimited and
+        // FnControl while stopping cleanly on cancellation.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancelled_opts = crate::history::HistoryOptions {
+            cancel: Some(cancel),
+            deadline: None,
+        };
+        let uncapped_cancelled = ReadLimit {
+            options: &cancelled_opts,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            normal.contains_with(&cache, &keys[0], &uncapped_cancelled, 0),
+            Err(Error::Cancelled)
+        ));
+        let expired_opts = crate::history::HistoryOptions {
+            cancel: None,
+            deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        };
+        let uncapped_expired = ReadLimit {
+            options: &expired_opts,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            normal.contains_with(&cache, &keys[0], &uncapped_expired, 0),
+            Err(Error::Timeout)
+        ));
+        let lo = keys[0];
+        let hi = keys[100];
+        let mut plain_rows = Vec::new();
+        normal
+            .for_each_key_range_masked(
+                &cache,
+                &lo,
+                &hi,
+                |_| ALL_COLS,
+                |b, s, e| {
+                    plain_rows.extend((s..e).map(|i| b.key(i)));
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        let mut controlled_rows = Vec::new();
+        normal
+            .for_each_key_range_masked_with(
+                &cache,
+                &lo,
+                &hi,
+                |_| ALL_COLS,
+                &crate::budgeted::FnControl(|| Ok(())),
+                |b, s, e| {
+                    controlled_rows.extend((s..e).map(|i| b.key(i)));
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(plain_rows, controlled_rows);
+        assert!(matches!(
+            normal.for_each_key_range_masked_with(
+                &cache,
+                &lo,
+                &hi,
+                |_| ALL_COLS,
+                &crate::budgeted::FnControl(|| Err(Error::Cancelled)),
+                |_, _, _| Ok(true),
+            ),
+            Err(Error::Cancelled)
         ));
     }
 

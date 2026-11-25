@@ -100,16 +100,42 @@ impl Linked {
 }
 
 pub(crate) fn read_link(gen_dir: &Path) -> Result<Option<LinkFile>> {
+    Ok(read_link_with(gen_dir, &mut crate::budgeted::Unlimited)?.map(|loaded| loaded.value))
+}
+
+pub(crate) fn read_link_with<C: crate::budgeted::BudgetControl>(
+    gen_dir: &Path,
+    control: &mut C,
+) -> Result<Option<cold::Loaded<LinkFile>>> {
     let path = gen_dir.join(LINK_FILE);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match control.read_file(&path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
-    let f: LinkFile = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
-    check_link(&path, &f)?;
-    Ok(Some(f))
+    let label = (!C::ACCOUNTS).then(|| path.display().to_string());
+    let loaded: cold::Loaded<LinkFile> =
+        control.json(&bytes, label.as_deref().unwrap_or(LINK_FILE))?;
+    control.drop_vec(bytes);
+    check_link(&path, &loaded.value)?;
+    if !C::ACCOUNTS {
+        return Ok(Some(loaded));
+    }
+    let mut retained = std::mem::size_of::<LinkFile>() as u64
+        + loaded.value.segments.capacity() as u64 * std::mem::size_of::<Segment>() as u64;
+    for segment in &loaded.value.segments {
+        control.check(0)?;
+        retained = retained
+            .saturating_add(segment.generation.capacity() as u64)
+            .saturating_add(segment.path.capacity() as u64);
+    }
+    if let Some(overlay) = &loaded.value.overlay {
+        retained = retained.saturating_add(overlay.sha256.capacity() as u64);
+    }
+    Ok(Some(cold::Loaded {
+        value: cold::retain_parse(loaded, retained, control)?,
+        charge: retained,
+    }))
 }
 
 pub(super) fn check_link(path: &Path, f: &LinkFile) -> Result<()> {
@@ -169,53 +195,151 @@ impl Generation {
         read_only: bool,
         cache: &Arc<BlockCache>,
     ) -> Result<Generation> {
-        let ds_root = dataset_root_of(branch_root)?;
-        let base_dir = file.segments[0].dir(&ds_root);
-        let prefix: Vec<(PathBuf, u64)> = file
-            .segments
-            .iter()
-            .map(|s| (s.dir(&ds_root).join("delta.vocab"), s.dvocab_len))
-            .collect();
-        let dvocab = DeltaVocab::open_layered(&prefix, &gen_dir.join("delta.vocab"), read_only)?;
-        let mut g = Generation::open_with(&base_dir, name, dvocab)?;
-        g.dir = Some(gen_dir.to_path_buf());
+        Ok(Self::open_linked_with(
+            gen_dir,
+            name,
+            branch_root,
+            cold::Loaded {
+                value: file,
+                charge: 0,
+            },
+            read_only,
+            cache,
+            &mut crate::budgeted::Unlimited,
+        )?
+        .value)
+    }
+
+    pub(crate) fn open_linked_with<C: crate::budgeted::BudgetControl>(
+        gen_dir: &Path,
+        name: &str,
+        branch_root: &Path,
+        loaded: cold::Loaded<LinkFile>,
+        read_only: bool,
+        cache: &BlockCache,
+        control: &mut C,
+    ) -> Result<cold::Loaded<Generation>> {
+        let start = control
+            .used()
+            .checked_sub(loaded.charge)
+            .expect("link metadata was admitted by the same budget");
+        let file = loaded.value;
+        let root_charge = branch_root.as_os_str().len() as u64 + 64;
+        control.charge(root_charge)?;
+        let dataset_root = dataset_root_of(branch_root)?;
+        let (base, vocab) = if C::ACCOUNTS {
+            let opened = cold::open_link_vocabulary(gen_dir, &dataset_root, &file, control)?;
+            (opened.base, opened.vocab)
+        } else {
+            let base = cold::Loaded {
+                value: file.segments[0].dir(&dataset_root),
+                charge: 0,
+            };
+            let prefix: Vec<(PathBuf, u64)> = file
+                .segments
+                .iter()
+                .map(|s| (s.dir(&dataset_root).join("delta.vocab"), s.dvocab_len))
+                .collect();
+            let vocab =
+                control.open_dvocab_layered(&prefix, &gen_dir.join("delta.vocab"), read_only)?;
+            (base, vocab)
+        };
+        let written_by = if C::ACCOUNTS {
+            None
+        } else {
+            base.value.parent().and_then(commit::read_written_by)
+        };
+        let mut generation = Self::open_base_with(
+            &base.value,
+            name,
+            written_by.as_deref(),
+            Some(vocab),
+            control,
+        )?
+        .value;
+        control.charge(gen_dir.as_os_str().len() as u64 + 64)?;
+        generation.dir = Some(gen_dir.to_path_buf());
         let mut delta = Delta::default();
-        for s in &file.segments {
+        let mut delta_charge = 0u64;
+        for segment in &file.segments {
+            let source = if C::ACCOUNTS {
+                cold::segment_dir(segment, &dataset_root, control)?
+            } else {
+                cold::Loaded {
+                    value: segment.dir(&dataset_root),
+                    charge: 0,
+                }
+            };
             // A child of a relinked branch inherits its immutable base overlay as
             // well as its log. The layered vocabulary keeps the same prefix IDs.
-            if let Some(inherited) = read_link(&s.dir(&ds_root))?
-                && let Some(overlay) = inherited.overlay
-            {
-                apply_overlay(&s.dir(&ds_root), &overlay, &mut g, cache, &mut delta)?;
+            if let Some(inherited) = read_link_with(&source.value, control)? {
+                if let Some(overlay) = &inherited.value.overlay {
+                    apply_overlay_with(
+                        &source.value,
+                        overlay,
+                        &mut generation,
+                        cache,
+                        &mut delta,
+                        &mut delta_charge,
+                        control,
+                    )?;
+                }
+                drop(inherited.value);
+                control.release(inherited.charge);
             }
-            let path = s.dir(&ds_root).join("wal.log");
-            let from = wal::WalPoint {
-                seq: s.base_seq,
-                offset: 0,
-            };
-            let to = wal::WalPoint {
-                seq: s.end_seq,
-                offset: s.wal_end,
-            };
+            // WAL replay owns and admits the delta itself. Keep all dictionary,
+            // descriptor and link storage in the same remaining allowance.
+            control.release(delta_charge);
+            control.check(0)?;
             wal::apply_forward(
-                &path,
-                &g,
+                &source.value.join("wal.log"),
+                &generation,
                 cache,
                 &mut delta,
-                from,
-                to,
-                &crate::budgeted::Unlimited,
+                wal::WalPoint {
+                    seq: segment.base_seq,
+                    offset: 0,
+                },
+                wal::WalPoint {
+                    seq: segment.end_seq,
+                    offset: segment.wal_end,
+                },
+                &*control,
             )?;
+            if C::ACCOUNTS {
+                delta_charge = history_limited::preparation_delta_bytes(&delta);
+                control.charge(delta_charge)?;
+            }
+            drop(source.value);
+            control.release(source.charge);
         }
         if let Some(overlay) = &file.overlay {
-            apply_overlay(gen_dir, overlay, &mut g, cache, &mut delta)?;
+            apply_overlay_with(
+                gen_dir,
+                overlay,
+                &mut generation,
+                cache,
+                &mut delta,
+                &mut delta_charge,
+                control,
+            )?;
         }
-        g.link = Some(Arc::new(Linked {
+        control.charge(std::mem::size_of::<Linked>() as u64 + 64)?;
+        generation.link = Some(Arc::new(Linked {
             file,
             base_delta: delta,
-            base_dir,
+            base_dir: base.value,
         }));
-        Ok(g)
+        // base.value now belongs to Linked; its admission stays retained.
+        drop(dataset_root);
+        control.release(root_charge);
+        let charge = control.used() - start;
+        generation.cold_bytes = charge;
+        control.check(0)?;
+        Ok(cold::Loaded {
+            value: generation,
+            charge,
+        })
     }
 
     /// Give this generation's permutations the block-cache identities of `other`'s when
@@ -241,37 +365,81 @@ impl Generation {
     }
 }
 
-fn apply_overlay(
+#[allow(clippy::too_many_arguments)]
+fn apply_overlay_with<C: crate::budgeted::BudgetControl>(
     dir: &Path,
     overlay: &Overlay,
     generation: &mut Generation,
     cache: &BlockCache,
     delta: &mut Delta,
+    delta_charge: &mut u64,
+    control: &mut C,
 ) -> Result<()> {
-    let bytes = checked_overlay(dir, overlay)?;
-    for rec in bytes.as_chunks::<WAL_REC>().0 {
-        let q = wal::record_quad(rec);
-        let in_base = generation
-            .perm(Perm::Spo)
-            .contains(cache, &Perm::Spo.to_key(&q))?;
-        apply(delta, &q, rec[0] == WAL_INSERT, in_base);
+    let path = dir.join(OVERLAY_FILE);
+    let bytes = read_verified_overlay_with(&path, overlay, control)?;
+    for record in bytes.as_chunks::<WAL_REC>().0 {
+        control.check(0)?;
+        if !matches!(record[0], WAL_INSERT | WAL_DELETE) {
+            control.drop_vec(bytes);
+            return Err(Error::Corrupt(format!(
+                "{}: invalid base overlay operation",
+                path.display()
+            )));
+        }
+        let quad = wal::record_quad(record);
+        let in_base = if C::ACCOUNTS {
+            control.release(*delta_charge);
+            control.check(0)?;
+            let mutation = history_limited::preparation_mutation_bytes(delta);
+            control.check(mutation)?;
+            generation.perm(Perm::Spo).contains_with(
+                cache,
+                &Perm::Spo.to_key(&quad),
+                &*control,
+                mutation,
+            )?
+        } else {
+            generation
+                .perm(Perm::Spo)
+                .contains(cache, &Perm::Spo.to_key(&quad))?
+        };
+        apply(delta, &quad, record[0] == WAL_INSERT, in_base);
+        if C::ACCOUNTS {
+            *delta_charge = history_limited::preparation_delta_bytes(delta);
+            control.charge(*delta_charge)?;
+        }
     }
     generation.meta.next_bnode = generation.meta.next_bnode.max(overlay.next_bnode);
-    Ok(())
+    control.drop_vec(bytes);
+    control.check(0)
 }
 
-fn checked_overlay(dir: &Path, overlay: &Overlay) -> Result<Vec<u8>> {
-    let path = dir.join(OVERLAY_FILE);
-    let bytes = std::fs::read(&path)?;
-    if bytes.len() as u64 != overlay.bytes
-        || !bytes.len().is_multiple_of(WAL_REC)
-        || overlay_checksum(&bytes) != overlay.sha256
-    {
+fn read_verified_overlay_with<C: crate::budgeted::BudgetControl>(
+    path: &Path,
+    overlay: &Overlay,
+    control: &mut C,
+) -> Result<Vec<u8>> {
+    let bytes = control.read_file(path)?;
+    let digest = control.sha256(&bytes)?;
+    let hex = b"0123456789abcdef";
+    let matches = overlay.sha256.len() == 64
+        && digest.iter().enumerate().all(|(index, byte)| {
+            overlay.sha256.as_bytes()[index * 2] == hex[(byte >> 4) as usize]
+                && overlay.sha256.as_bytes()[index * 2 + 1] == hex[(byte & 15) as usize]
+        });
+    if bytes.len() as u64 != overlay.bytes || !bytes.len().is_multiple_of(WAL_REC) || !matches {
+        control.drop_vec(bytes);
         return Err(Error::Corrupt(format!(
             "{}: invalid base overlay length or checksum",
             path.display()
         )));
     }
+    Ok(bytes)
+}
+
+fn checked_overlay(dir: &Path, overlay: &Overlay) -> Result<Vec<u8>> {
+    let path = dir.join(OVERLAY_FILE);
+    let bytes = read_verified_overlay_with(&path, overlay, &mut crate::budgeted::Unlimited)?;
     for rec in bytes.as_chunks::<WAL_REC>().0 {
         if !matches!(rec[0], WAL_INSERT | WAL_DELETE) {
             return Err(Error::Corrupt(format!(

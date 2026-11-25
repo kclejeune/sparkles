@@ -461,14 +461,37 @@ fn absent_reader() -> u32 {
     1
 }
 
-/// Parse the content of a `dataset.json`. The version members are checked on the raw
-/// JSON first, so that a file from a newer release whose other members changed shape is
-/// refused as [`Error::Unsupported`] and not reported as damaged.
+/// Parse the content of a `dataset.json` under `control`. The version members are checked
+/// on the raw JSON first, so that a file from a newer release whose other members changed
+/// shape is refused as [`Error::Unsupported`] and not reported as damaged. When
+/// `PROJECT_FIELDS` is true, unknown extensions are discarded cooperatively under
+/// accounting control rather than materialized into `extra`.
+fn parse_dataset_with<C: crate::budgeted::BudgetControl, const PROJECT_FIELDS: bool>(
+    bytes: &[u8],
+    control: &mut C,
+) -> Result<(DatasetFile, u64)> {
+    control.check(0)?;
+    let start = control.used();
+    let result = (|| {
+        let raw: crate::store::cold::Loaded<serde_json::Value> =
+            control.json(bytes, "dataset.json")?;
+        check_dataset_value(&raw.value)?;
+        let parsed: DatasetFile = if PROJECT_FIELDS {
+            control.value_fields(raw.value, DATASET_FIELDS, "dataset.json")?
+        } else {
+            control.value(raw.value, "dataset.json")?
+        };
+        control.check(0)?;
+        Ok((parsed, raw.charge))
+    })();
+    if result.is_err() {
+        control.release(control.used() - start);
+    }
+    result
+}
+
 fn parse_dataset(bytes: &[u8]) -> Result<DatasetFile> {
-    let v: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
-    check_dataset_value(&v)?;
-    serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))
+    Ok(parse_dataset_with::<_, false>(bytes, &mut crate::budgeted::Unlimited)?.0)
 }
 
 /// Share version refusal with the bounded read-only decoder. This check grants
@@ -521,62 +544,52 @@ pub(crate) fn check_dataset_value_as(v: &serde_json::Value, reader: u32) -> Resu
     )))
 }
 
-/// Decode the same identity and version contract without mutable Store startup.
-/// Both Serde passes and their live buffers use the caller's preparation budget.
-pub(crate) fn read_dataset_file_controlled(
+/// Decode the dataset identity and version contract under `control`. Under
+/// [`crate::budgeted::Unlimited`], all accounting and chunking compile away.
+pub(crate) fn read_dataset_file_with<C: crate::budgeted::BudgetControl>(
     root: &Path,
-    budget: &mut crate::store::cold::ColdBudget<'_>,
+    control: &mut C,
 ) -> Result<Option<uuid::Uuid>> {
-    let start = budget.used();
-    budget.charge(
+    let start = control.used();
+    control.charge(
         (root.as_os_str().len() as u64)
             .saturating_mul(2)
             .saturating_add(128),
     )?;
     let result = (|| {
-        let bytes = match budget.read_file(&root.join("dataset.json")) {
+        let bytes = match control.read_file(&root.join("dataset.json")) {
             Ok(bytes) => bytes,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        let id = dataset_id_bytes_controlled(&bytes, budget)?;
-        budget.drop_vec(bytes);
-        budget.check()?;
+        let id = dataset_id_bytes_with(&bytes, control)?;
+        control.drop_vec(bytes);
+        control.check(0)?;
         Ok(Some(id))
     })();
     // Closure-owned paths, parser scratch and containers have dropped even on
     // interruption or version refusal. Only a scalar UUID escapes this scope.
-    budget.release(budget.used() - start);
+    control.release(control.used() - start);
     result.and_then(|value| {
-        budget.check()?;
+        control.check(0)?;
         Ok(value)
     })
 }
 
-/// Decode an already admitted original dataset document with the same version
-/// and field grammar as the named cold reader. Only a scalar identity escapes.
-pub(crate) fn dataset_id_bytes_controlled(
+/// Decode an already admitted original dataset document under `control`, returning only
+/// its scalar identity.
+pub(crate) fn dataset_id_bytes_with<C: crate::budgeted::BudgetControl>(
     bytes: &[u8],
-    budget: &mut crate::store::cold::ColdBudget<'_>,
+    control: &mut C,
 ) -> Result<uuid::Uuid> {
-    budget.check()?;
-    let start = budget.used();
-    let result = (|| {
-        let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
-        check_dataset_value(&raw.value)?;
-        let parsed: DatasetFile = budget.value_fields(raw.value, DATASET_FIELDS)?;
-        let id = parsed.id;
-        drop(parsed);
-        budget.release(raw.charge);
-        budget.check()?;
-        Ok(id)
-    })();
-    if result.is_err() {
-        budget.release(budget.used() - start);
-    }
-    result
+    let (parsed, charge) = parse_dataset_with::<_, true>(bytes, control)?;
+    let id = parsed.id;
+    drop(parsed);
+    control.release(charge);
+    control.check(0)?;
+    Ok(id)
 }
 
 /// Exercise the actual closed scalar reader with caller-attributed allocation
@@ -593,7 +606,7 @@ pub fn read_dataset_identity_limited_for_test(
         memory: Some(max_memory_bytes),
         held: 0,
     })?;
-    read_dataset_file_controlled(root, &mut budget)
+    read_dataset_file_with(root, &mut budget)
 }
 
 /// The versions `<root>/dataset.json` records, if it exists and this build reads it.
@@ -753,7 +766,7 @@ pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> R
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
-        let mut f = parse_gen_commit(&path, &b)?;
+        let mut f = parse_gen_commit_with(&path, &b, &mut crate::budgeted::Unlimited)?.value;
         if f.dataset_id == old_id {
             f.dataset_id = new_id;
             crate::store::write_atomic(&path, &serde_json::to_vec_pretty(&f).unwrap())?;
@@ -922,7 +935,7 @@ pub(crate) fn read_dataset_created(root: Option<&Path>) -> Option<i64> {
 
 /// `<root>/dataset.json`: the dataset id, if the database has one yet.
 pub(crate) fn read_dataset_file(root: &Path) -> Result<Option<uuid::Uuid>> {
-    Ok(read_dataset(root)?.map(|f| f.id))
+    read_dataset_file_with(root, &mut crate::budgeted::Unlimited)
 }
 
 pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) -> Vec<u8> {
@@ -1056,14 +1069,7 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
 }
 
 pub(crate) fn read_gen_commit_full(dir: &Path) -> Result<Option<RetainedGenerationCommit>> {
-    let path = dir.join("commit.json");
-    let b = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let f = parse_gen_commit(&path, &b)?;
-    Ok(Some(decode_gen_commit_file(f, &path)?))
+    Ok(read_gen_commit_with(dir, &mut crate::budgeted::Unlimited)?.map(|loaded| loaded.value))
 }
 
 /// Physical generation identity decoded without opening or recovering a Store.
@@ -1099,73 +1105,82 @@ fn decode_gen_commit_file(f: GenCommitFile, path: &Path) -> Result<RetainedGener
     })
 }
 
-pub(crate) fn read_gen_commit_controlled(
+pub(crate) fn read_gen_commit_with<C: crate::budgeted::BudgetControl>(
     dir: &Path,
-    budget: &mut crate::store::cold::ColdBudget<'_>,
+    control: &mut C,
 ) -> Result<Option<crate::store::cold::Loaded<RetainedGenerationCommit>>> {
-    let start = budget.used();
+    let start = control.used();
     let result = (|| {
         let path = dir.join("commit.json");
-        let bytes = match budget.read_file(&path) {
+        let bytes = match control.read_file(&path) {
             Ok(bytes) => bytes,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                budget.check()?;
+                control.check(0)?;
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        let decoded = decode_gen_commit_bytes_controlled(&path, &bytes, budget)?;
-        budget.drop_vec(bytes);
+        let decoded = decode_gen_commit_bytes_with(&path, &bytes, control)?;
+        control.drop_vec(bytes);
         Ok(Some(decoded))
     })();
     if result.is_err() {
-        budget.release(budget.used() - start);
+        control.release(control.used() - start);
     }
     result
 }
 
-/// Decode the same historical codec from caller-admitted borrowed bytes. The
+/// Decode the generation commit codec from borrowed bytes under `control`. The
 /// path labels diagnostics only; this never opens or recovers a source. A caller
-/// retains its input owner/charge until this call returns. Neither decoded data
-/// nor successful parsing confers a physical source or imported replay identity.
-pub(crate) fn decode_gen_commit_bytes_controlled(
+/// retains its input owner/charge until this call returns.
+pub(crate) fn decode_gen_commit_bytes_with<C: crate::budgeted::BudgetControl>(
     path: &Path,
     bytes: &[u8],
-    budget: &mut crate::store::cold::ColdBudget<'_>,
+    control: &mut C,
 ) -> Result<crate::store::cold::Loaded<RetainedGenerationCommit>> {
-    let start = budget.used();
+    let start = control.used();
     let result = (|| {
-        let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
-        check_gen_commit_value(path, &parsed.value)?;
-        let file: GenCommitFile = budget.value(parsed.value)?;
-        check_gen_binding(path, &file, bytes)?;
-        let value = decode_gen_commit_file(file, path)?;
-        let charge =
-            std::mem::size_of::<RetainedGenerationCommit>() as u64 + value.origin.capacity() as u64;
-        if charge > parsed.charge {
-            budget.charge(charge - parsed.charge)?;
+        let parsed = parse_gen_commit_with(path, bytes, control)?;
+        let value = decode_gen_commit_file(parsed.value, path)?;
+        let charge = if C::ACCOUNTS {
+            let charge = std::mem::size_of::<RetainedGenerationCommit>() as u64
+                + value.origin.capacity() as u64;
+            if charge > parsed.charge {
+                control.charge(charge - parsed.charge)?;
+            } else {
+                control.release(parsed.charge - charge);
+            }
+            charge
         } else {
-            budget.release(parsed.charge - charge);
-        }
-        budget.check()?;
+            0
+        };
+        control.check(0)?;
         Ok(crate::store::cold::Loaded { value, charge })
     })();
     if result.is_err() {
         // Only this decoder's temporaries dropped; caller-held input survives.
-        budget.release(budget.used() - start);
+        control.release(control.used() - start);
     }
     result
 }
 
-/// Parse `gen-NNNN/commit.json`, refusing a `format` this build does not read.
-fn parse_gen_commit(path: &Path, b: &[u8]) -> Result<GenCommitFile> {
-    let value: serde_json::Value = serde_json::from_slice(b)
-        .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
-    check_gen_commit_value(path, &value)?;
-    let file: GenCommitFile = serde_json::from_value(value)
-        .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
-    check_gen_binding(path, &file, b)?;
-    Ok(file)
+/// Parse `gen-NNNN/commit.json` under `control`, refusing a `format` this build does not
+/// read before interpreting the payload schema.
+fn parse_gen_commit_with<C: crate::budgeted::BudgetControl>(
+    path: &Path,
+    bytes: &[u8],
+    control: &mut C,
+) -> Result<crate::store::cold::Loaded<GenCommitFile>> {
+    let label = (!C::ACCOUNTS).then(|| path.display().to_string());
+    let label = label.as_deref().unwrap_or("commit.json");
+    let parsed: crate::store::cold::Loaded<serde_json::Value> = control.json(bytes, label)?;
+    check_gen_commit_value(path, &parsed.value)?;
+    let file: GenCommitFile = control.value(parsed.value, label)?;
+    check_gen_binding(path, &file, bytes)?;
+    Ok(crate::store::cold::Loaded {
+        value: file,
+        charge: parsed.charge,
+    })
 }
 
 /// Pure small-document transformation for a genuine closed import producer.
@@ -1205,11 +1220,8 @@ pub(crate) fn reidentified_generation_bytes(
         memory: Some(allowance),
         held: 0,
     })?;
-    let parsed: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
     let label = Path::new("original-import/commit.json");
-    check_gen_commit_value(label, &parsed.value)?;
-    let mut file: GenCommitFile = budget.value(parsed.value)?;
-    check_gen_binding(label, &file, bytes)?;
+    let mut file = parse_gen_commit_with(label, bytes, &mut budget)?.value;
     if file.dataset_id != old {
         return Err(Error::Corrupt(
             "original generation belongs to another physical source".into(),
@@ -1396,44 +1408,41 @@ pub(crate) fn decode_header(h: &[u8]) -> Option<(uuid::Uuid, u64)> {
 /// Read the valid, consecutive records of a catalog file without modifying it (used by
 /// lock-free readers such as `sparkles log`).
 pub fn read_catalog(path: &Path) -> Result<Option<(uuid::Uuid, Vec<CommitInfo>)>> {
-    let mut buf = Vec::new();
-    match File::open(path) {
-        Ok(mut f) => f.read_to_end(&mut buf)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let Some((id, first)) = decode_header(&buf) else {
+    let mut out = Vec::new();
+    let Some((id, _, _)) = walk_catalog_with(path, &mut crate::budgeted::Unlimited, |c, _| {
+        out.push(c);
+        Ok(())
+    })?
+    else {
         return Ok(None);
     };
-    let mut out = Vec::new();
-    for (i, r) in buf[REC..].as_chunks::<REC>().0.iter().enumerate() {
-        match decode_record(r) {
-            Some(c) if c.seq == first + i as u64 => out.push(c),
-            _ => break,
-        }
-    }
     Ok(Some((id, out)))
 }
 
-/// Stream the same valid consecutive prefix as read_catalog. A caller can retain
-/// only the requested commit and head instead of copying an entire catalog.
-pub(crate) fn walk_catalog_controlled(
+/// Stream the valid consecutive prefix of a commit catalog under `control`. A caller can
+/// retain only the requested commit and head instead of copying an entire catalog.
+pub(crate) fn walk_catalog_with<C: crate::budgeted::BudgetControl>(
     path: &Path,
-    budget: &mut crate::store::cold::ColdBudget<'_>,
-    mut visit: impl FnMut(CommitInfo, &mut crate::store::cold::ColdBudget<'_>) -> Result<()>,
+    control: &mut C,
+    mut visit: impl FnMut(CommitInfo, &mut C) -> Result<()>,
 ) -> Result<Option<(uuid::Uuid, u64, Option<CommitInfo>)>> {
     use std::io::BufReader;
-    budget.check()?;
+    control.check(0)?;
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            budget.check()?;
+            control.check(0)?;
             return Ok(None);
         }
         Err(error) => return Err(error.into()),
     };
-    let capacity = (budget.available() / 8).clamp(REC as u64, 64 << 10);
-    budget.charge(capacity)?;
+    let capacity = if C::ACCOUNTS {
+        let cap = (control.remaining() / 8).clamp(REC as u64, 64 << 10);
+        control.charge(cap)?;
+        cap
+    } else {
+        64 << 10
+    };
     let mut reader = BufReader::with_capacity(capacity as usize, file);
     let result = (|| {
         let mut record = [0; REC];
@@ -1442,29 +1451,28 @@ pub(crate) fn walk_catalog_controlled(
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(error) => return Err(error.into()),
         }
-        budget.check()?;
+        control.check(0)?;
         // A known primary-file magic with a future version must refuse before
         // any valid-prefix/reconciliation path can treat it as a missing catalog.
         if &record[..8] == MAGIC {
-            crate::formats::COMMITS.check(
-                "retained commit catalog",
-                u32::from_le_bytes(record[8..12].try_into().unwrap()),
-                None,
-            )?;
+            let version = u32::from_le_bytes(record[8..12].try_into().unwrap());
+            if C::ACCOUNTS || version > 1 {
+                crate::formats::COMMITS.check("retained commit catalog", version, None)?;
+            }
         }
         match reader.read_exact(&mut record[12..]) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(error) => return Err(error.into()),
         }
-        budget.check()?;
+        control.check(0)?;
         let Some((id, first)) = decode_header(&record) else {
             return Ok(None);
         };
         let mut last = None;
         let mut offset = 0u64;
         loop {
-            budget.check()?;
+            control.check(0)?;
             match reader.read_exact(&mut record) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -1476,20 +1484,22 @@ pub(crate) fn walk_catalog_controlled(
             if first.checked_add(offset) != Some(commit.seq) {
                 break;
             }
-            visit(commit, budget)?;
+            visit(commit, control)?;
             last = Some(commit);
             let Some(next) = offset.checked_add(1) else {
                 break;
             };
             offset = next;
         }
-        budget.check()?;
+        control.check(0)?;
         Ok(Some((id, first, last)))
     })();
     drop(reader);
-    budget.release(capacity);
+    if C::ACCOUNTS {
+        control.release(capacity);
+    }
     result.and_then(|value| {
-        budget.check()?;
+        control.check(0)?;
         Ok(value)
     })
 }
@@ -2031,7 +2041,7 @@ mod tests {
                 held: 0,
             })
             .unwrap();
-            let actual = read_dataset_file_controlled(root.path(), &mut budget);
+            let actual = read_dataset_file_with(root.path(), &mut budget);
             match read_dataset_file(root.path()) {
                 Ok(expected) => assert_eq!(actual.unwrap(), expected),
                 Err(Error::Unsupported(_)) => assert!(matches!(actual, Err(Error::Unsupported(_)))),
@@ -2052,7 +2062,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            read_dataset_file_controlled(root.path(), &mut tiny),
+            read_dataset_file_with(root.path(), &mut tiny),
             Err(Error::BudgetExceeded(_))
         ));
         assert_eq!(tiny.used(), 0);
@@ -2069,7 +2079,7 @@ mod tests {
         .unwrap();
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(matches!(
-            read_dataset_file_controlled(root.path(), &mut budget),
+            read_dataset_file_with(root.path(), &mut budget),
             Err(Error::Cancelled)
         ));
         assert_eq!(budget.used(), 0);
@@ -2112,7 +2122,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            read_dataset_file_controlled(root.path(), &mut budget).unwrap(),
+            read_dataset_file_with(root.path(), &mut budget).unwrap(),
             Some(id)
         );
         assert_eq!(budget.used(), 0);
@@ -2128,7 +2138,7 @@ mod tests {
         };
         budget.observe_keys(&observer);
         assert!(matches!(
-            read_dataset_file_controlled(root.path(), &mut budget),
+            read_dataset_file_with(root.path(), &mut budget),
             Err(Error::Cancelled)
         ));
         assert_eq!(budget.used(), 0);
@@ -2140,7 +2150,7 @@ mod tests {
         for field in ["format", "minimumReader"] {
             let bytes = format!("{{\"{field}\":\"{}\"}}", "x".repeat(512 << 10)).into_bytes();
             std::fs::write(root.path().join("dataset.json"), &bytes).unwrap();
-            let error = read_dataset_file_controlled(root.path(), &mut budget).unwrap_err();
+            let error = read_dataset_file_with(root.path(), &mut budget).unwrap_err();
             assert!(matches!(error, Error::Corrupt(_)));
             assert!(error.to_string().len() < 128);
             assert_eq!(budget.used(), 0);
@@ -2174,7 +2184,7 @@ mod tests {
                     })
                     .unwrap();
                     let mut visits = 0;
-                    let result = walk_catalog_controlled(&path, &mut budget, |_, _| {
+                    let result = walk_catalog_with(&path, &mut budget, |_, _| {
                         visits += 1;
                         Ok(())
                     });
@@ -2232,7 +2242,7 @@ mod tests {
             held: 0,
         })
         .unwrap();
-        let loaded = read_gen_commit_controlled(dir.path(), &mut budget)
+        let loaded = read_gen_commit_with(dir.path(), &mut budget)
             .unwrap()
             .unwrap();
         let normal = read_gen_commit(dir.path()).unwrap().unwrap();
@@ -2253,7 +2263,7 @@ mod tests {
         value["format"] = 123.into();
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(matches!(
-            read_gen_commit_controlled(dir.path(), &mut budget),
+            read_gen_commit_with(dir.path(), &mut budget),
             Err(Error::Unsupported(_))
         ));
         assert_eq!(budget.used(), 0);
@@ -2262,7 +2272,7 @@ mod tests {
         std::fs::write(&path, &future).unwrap();
         budget.charge(17).unwrap();
         assert!(matches!(
-            read_gen_commit_controlled(dir.path(), &mut budget),
+            read_gen_commit_with(dir.path(), &mut budget),
             Err(Error::Unsupported(_))
         ));
         assert_eq!(budget.used(), 17);
@@ -2326,7 +2336,7 @@ mod tests {
             budget.charge(pressure).unwrap();
             let before = budget.used();
             cancel.store(kind == 3, Ordering::SeqCst);
-            let result = decode_gen_commit_bytes_controlled(
+            let result = decode_gen_commit_bytes_with(
                 Path::new("diagnostic-only/commit.json"),
                 &bytes,
                 &mut budget,
@@ -2382,7 +2392,7 @@ mod tests {
         .unwrap();
         let mut count = 0;
         let mut selected = None;
-        let summary = walk_catalog_controlled(&path, &mut budget, |commit, _| {
+        let summary = walk_catalog_with(&path, &mut budget, |commit, _| {
             assert_eq!(commit, normal.1[count]);
             count += 1;
             if commit.seq == 42 {
@@ -2428,7 +2438,7 @@ mod tests {
         })
         .unwrap();
         let mut visits = 0;
-        let result = walk_catalog_controlled(&path, &mut budget, |_, _| {
+        let result = walk_catalog_with(&path, &mut budget, |_, _| {
             visits += 1;
             if visits == 8 {
                 cancel.store(true, Ordering::Relaxed);
@@ -2561,7 +2571,13 @@ mod tests {
             let raw = serde_json::to_vec_pretty(&file).unwrap();
             let before = raw.clone();
             let result = reidentified_generation_bytes(&raw, old, new, &preparation).unwrap();
-            let decoded = parse_gen_commit(Path::new("diagnostic"), &result.value).unwrap();
+            let decoded = parse_gen_commit_with(
+                Path::new("diagnostic"),
+                &result.value,
+                &mut crate::budgeted::Unlimited,
+            )
+            .unwrap()
+            .value;
             assert_eq!(decoded.dataset_id, new);
             assert_eq!(decoded.origin, "compaction");
             assert_eq!(
@@ -2570,7 +2586,13 @@ mod tests {
                     .commit,
                 commit
             );
-            let decoded = parse_gen_commit(Path::new("diagnostic"), &result.value).unwrap();
+            let decoded = parse_gen_commit_with(
+                Path::new("diagnostic"),
+                &result.value,
+                &mut crate::budgeted::Unlimited,
+            )
+            .unwrap()
+            .value;
             let expected = match binding {
                 ConfigurationBinding::Known { configuration } => {
                     ConfigurationBinding::ImportedUnbound {
@@ -2602,7 +2624,13 @@ mod tests {
         let preparation = Preparation::new(Control::none(), 4 << 20).unwrap();
         let room = preparation.room();
         let output = reidentified_generation_bytes(&raw, old, new, &preparation).unwrap();
-        let parsed = parse_gen_commit(Path::new("diagnostic"), &output.value).unwrap();
+        let parsed = parse_gen_commit_with(
+            Path::new("diagnostic"),
+            &output.value,
+            &mut crate::budgeted::Unlimited,
+        )
+        .unwrap()
+        .value;
         assert_eq!(parsed.format, 1);
         assert_eq!(parsed.configuration_binding, None);
         assert_eq!(parsed.extra, file.extra);
@@ -2787,5 +2815,120 @@ mod tests {
             Err(Error::BudgetExceeded(_))
         ));
         assert_eq!(small.room(), room);
+    }
+
+    #[test]
+    fn unified_commit_readers_match_unlimited_and_stop_on_uncapped_cancel_and_timeout() {
+        use crate::history::{HistoryOptions, ReadLimit};
+        use crate::store::cold::ColdBudget;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let ds_bytes = dataset_file_bytes(id, "create", 1_700_000_000_000);
+        std::fs::write(dir.path().join("dataset.json"), &ds_bytes).unwrap();
+        let commit = sample_commit(5);
+        std::fs::write(
+            dir.path().join("commit.json"),
+            gen_commit_bytes(id, "create", &commit),
+        )
+        .unwrap();
+        let cat_path = dir.path().join("commits.bin");
+        let mut cat_bytes = Vec::new();
+        cat_bytes.extend_from_slice(&encode_header(id, 5));
+        cat_bytes.extend_from_slice(&encode_record(&commit));
+        std::fs::write(&cat_path, &cat_bytes).unwrap();
+
+        // Unlimited and uncapped ColdBudget agree identically.
+        let options = HistoryOptions::default();
+        let mut uncapped = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            read_dataset_file_with(dir.path(), &mut crate::budgeted::Unlimited).unwrap(),
+            read_dataset_file_with(dir.path(), &mut uncapped).unwrap()
+        );
+        let u_gen = read_gen_commit_with(dir.path(), &mut crate::budgeted::Unlimited)
+            .unwrap()
+            .unwrap()
+            .value;
+        let c_gen = read_gen_commit_with(dir.path(), &mut uncapped)
+            .unwrap()
+            .unwrap();
+        assert_eq!(u_gen.dataset_id, c_gen.value.dataset_id);
+        assert_eq!(u_gen.commit, c_gen.value.commit);
+        assert_eq!(u_gen.origin, c_gen.value.origin);
+        drop(c_gen.value);
+        uncapped.release(c_gen.charge);
+
+        let mut u_commits = Vec::new();
+        walk_catalog_with(&cat_path, &mut crate::budgeted::Unlimited, |c, _| {
+            u_commits.push(c);
+            Ok(())
+        })
+        .unwrap();
+        let mut c_commits = Vec::new();
+        walk_catalog_with(&cat_path, &mut uncapped, |c, _| {
+            c_commits.push(c);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(u_commits, c_commits);
+        assert_eq!(uncapped.used(), 0);
+
+        // Uncapped ColdBudget still stops cleanly on cancellation and timeout.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_opts = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        let mut cancelled = ColdBudget::new(ReadLimit {
+            options: &cancel_opts,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            read_dataset_file_with(dir.path(), &mut cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            read_gen_commit_with(dir.path(), &mut cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            walk_catalog_with(&cat_path, &mut cancelled, |_, _| Ok(())),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(cancelled.used(), 0);
+
+        let expired_opts = HistoryOptions {
+            cancel: None,
+            deadline: Some(Instant::now() + Duration::from_millis(5)),
+        };
+        let mut expired = ColdBudget::new(ReadLimit {
+            options: &expired_opts,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(matches!(
+            read_dataset_file_with(dir.path(), &mut expired),
+            Err(Error::Timeout)
+        ));
+        assert!(matches!(
+            walk_catalog_with(&cat_path, &mut expired, |_, _| Ok(())),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(expired.used(), 0);
     }
 }

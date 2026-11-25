@@ -1132,9 +1132,9 @@ fn activation_branch(root: &Path, preparation: &Preparation) -> Result<Activatio
         held: 0,
     };
     let mut budget = super::cold::ColdBudget::new(limit)?;
-    let id = crate::commit::read_dataset_file_controlled(root, &mut budget)?
+    let id = crate::commit::read_dataset_file_with(root, &mut budget)?
         .ok_or_else(|| unavailable("activation branch has no dataset identity"))?;
-    let physical = crate::commit::read_gen_commit_controlled(&generation, &mut budget)?
+    let physical = crate::commit::read_gen_commit_with(&generation, &mut budget)?
         .ok_or_else(|| unavailable("activation current generation has no commit identity"))?;
     if physical.value.dataset_id != id {
         return Err(unavailable("activation generation has a foreign identity"));
@@ -1213,7 +1213,7 @@ fn activation_retained_generations(root: &Path, id: Uuid, preparation: &Preparat
                 memory: Some(allowance),
                 held: 0,
             })?;
-            let physical = crate::commit::read_gen_commit_controlled(&directory, &mut budget)?;
+            let physical = crate::commit::read_gen_commit_with(&directory, &mut budget)?;
             if let Some(physical) = &physical
                 && (physical.value.dataset_id != id
                     || physical.value.configuration != ConfigurationBinding::LegacyUnbound)

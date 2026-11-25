@@ -59,7 +59,7 @@ pub(super) fn validate(root: &Path, required: bool, preparation: &Preparation) -
         memory: Some(allowance),
         held: 0,
     })?;
-    let family = commit::read_dataset_file_controlled(root, &mut budget)?;
+    let family = commit::read_dataset_file_with(root, &mut budget)?;
     if family.is_none() && (required || published.is_some()) {
         return Err(managed_history::unavailable(
             "copied dataset identity is missing",
@@ -174,7 +174,7 @@ fn inspect_branch(
                 .saturating_mul(8)
                 .saturating_add(8192),
         )?;
-        let branch = commit::read_dataset_file_controlled(root, budget)?;
+        let branch = commit::read_dataset_file_with(root, budget)?;
         if branch.is_none() && family.is_some() {
             return Err(managed_history::unavailable(
                 "copied branch identity is missing",
@@ -267,7 +267,7 @@ fn inspect_generation(
 ) -> Result<()> {
     let start = budget.used();
     let result = (|| {
-        let (base, binding, branch) = match commit::read_gen_commit_controlled(directory, budget)? {
+        let (base, binding, branch) = match commit::read_gen_commit_with(directory, budget)? {
             Some(identity) => {
                 if family.is_none() {
                     return Err(managed_history::unavailable(

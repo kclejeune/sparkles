@@ -63,7 +63,7 @@ pub(super) fn selected_metadata(
                 ))
             });
             let key = Perm::Spo.to_key(&quad);
-            let in_base = spo.contains_limited(cache, &key, &budget.owned_limit()?, held)?;
+            let in_base = spo.contains_with(cache, &key, &budget.owned_limit()?, held)?;
             let present = delta.ins[Perm::Spo.index()].contains(&key)
                 || (in_base && !delta.del[Perm::Spo.index()].contains(&key));
             touched.push((key, index, present, in_base));

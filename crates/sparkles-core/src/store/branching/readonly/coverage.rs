@@ -40,7 +40,7 @@ fn ranges(
                 (root.as_os_str().len() as u64 + name.len() as u64 + 128).saturating_mul(4),
             )?;
             let path = entry.path();
-            let identity = match commit::read_gen_commit_controlled(&path, budget) {
+            let identity = match commit::read_gen_commit_with(&path, budget) {
                 Ok(Some(identity)) => identity,
                 Ok(None) => {
                     drop(path);

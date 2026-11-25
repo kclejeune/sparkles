@@ -854,23 +854,20 @@ fn passes(
     // them. Each name's storage is admitted before it is allocated.
     let mut named = Buffer::new(preparation)?;
     let mut names_held = preparation.reserve(0)?;
-    snap.for_each_graph_id_checked(
-        || preparation.check(),
-        |graph| {
-            preparation.with_term(snap, graph, |term| {
-                if let Some(Term::NamedNode(node)) = term {
-                    let iri = node.as_str();
-                    names_held.merge(preparation.reserve(iri.len() as u64)?);
-                    let mut name = String::new();
-                    name.try_reserve_exact(iri.len())
-                        .map_err(|_| preparation.exhausted())?;
-                    name.push_str(iri);
-                    named.push(name)?;
-                }
-                Ok(())
-            })
-        },
-    )?;
+    snap.for_each_graph_id_with(preparation, |graph| {
+        preparation.with_term(snap, graph, |term| {
+            if let Some(Term::NamedNode(node)) = term {
+                let iri = node.as_str();
+                names_held.merge(preparation.reserve(iri.len() as u64)?);
+                let mut name = String::new();
+                name.try_reserve_exact(iri.len())
+                    .map_err(|_| preparation.exhausted())?;
+                name.push_str(iri);
+                named.push(name)?;
+            }
+            Ok(())
+        })
+    })?;
     let (named, _named_held) = named.into_parts();
     let opts = crate::sparql::QueryOptions {
         default_graph_extra: named,

@@ -53,14 +53,7 @@ impl<T> WeakLink<T> {
     }
 
     pub fn upgrade(&self) -> Option<Arc<T>> {
-        let mut state = self.state.lock();
-        loop {
-            match &state.phase {
-                Phase::Open(weak) => return weak.upgrade(),
-                Phase::Closed => return None,
-                Phase::Closing => self.changed.wait(&mut state),
-            }
-        }
+        crate::history::uncontrolled(self.upgrade_with(&crate::budgeted::Unlimited))
     }
 
     /// Never wait for a contended link or a closing reservation.
@@ -74,14 +67,31 @@ impl<T> WeakLink<T> {
     }
 
     pub fn upgrade_controlled(&self, opts: &crate::guard::WriteOptions) -> Result<Option<Arc<T>>> {
+        self.upgrade_with(opts)
+    }
+
+    pub(crate) fn upgrade_with<C: crate::budgeted::Control>(
+        &self,
+        control: &C,
+    ) -> Result<Option<Arc<T>>> {
+        if !C::CHECKS {
+            let mut state = self.state.lock();
+            loop {
+                match &state.phase {
+                    Phase::Open(weak) => return Ok(weak.upgrade()),
+                    Phase::Closed => return Ok(None),
+                    Phase::Closing => self.changed.wait(&mut state),
+                }
+            }
+        }
         loop {
-            opts.check()?;
+            control.check(0)?;
             match self.try_upgrade() {
-                Err(Error::WriterBusy) if !opts.no_wait => {
+                Err(Error::WriterBusy) if !control.no_wait() => {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 result => {
-                    opts.check()?;
+                    control.check(0)?;
                     return result;
                 }
             }

@@ -378,7 +378,7 @@ impl Store {
         };
         let retained = snapshot
             .retained_preparation_bytes()
-            .checked_add(snapshot.generation.retained_bytes_limited(&limit)?)
+            .checked_add(snapshot.generation.retained_bytes_with(&limit)?)
             .and_then(|bytes| bytes.checked_add(1024))
             .ok_or_else(|| preparation.exhausted())?;
         if retained > allowance {

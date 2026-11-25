@@ -719,7 +719,7 @@ impl ConfigurationCapture {
                 .ok_or_else(bad)?;
             let extent = reader.extent();
             let bytes = budget.read_from(&mut reader, extent)?;
-            let decoded = crate::commit::decode_gen_commit_bytes_controlled(
+            let decoded = crate::commit::decode_gen_commit_bytes_with(
                 Path::new("captured-primary/commit.json"),
                 &bytes,
                 &mut budget,
@@ -4255,7 +4255,7 @@ mod tests {
             let extent = reader.extent();
             let bytes = budget.read_from(&mut reader, extent).unwrap();
             let input_charge = budget.used();
-            let loaded = crate::commit::decode_gen_commit_bytes_controlled(
+            let loaded = crate::commit::decode_gen_commit_bytes_with(
                 Path::new("captured-diagnostic-only/commit.json"),
                 &bytes,
                 &mut budget,
