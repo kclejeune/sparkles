@@ -199,6 +199,54 @@ fn drawing_on(
 /// threads, and the other five derive millions, as F24's measured effect records.
 const ROOTED_WORK_BOUND: usize = 1 << 19;
 
+/// Optional per-class rooted work allowance above [`ROOTED_WORK_BOUND`] for a rooted run
+/// without counting, gated independently behind `SPARKLES_ROOTED_BOUND_PER_CLASS=1` (off
+/// by default until qualified on the 2×2 matrix).
+const ROOTED_WORK_PER_CLASS: usize = 32;
+
+/// Whether the distinct-class scaled rooted work bound is enabled
+/// (`SPARKLES_ROOTED_BOUND_PER_CLASS=1`), off by default.
+fn rooted_bound_per_class() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ROOTED_BOUND_PER_CLASS_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SPARKLES_ROOTED_BOUND_PER_CLASS").is_some_and(|v| v == "1")
+    })
+}
+
+/// The default non-counting rooted work bound for `distinct_named_classes` visible named
+/// classes in the input signature.
+fn rooted_work_bound(distinct_named_classes: usize, per_class: bool) -> usize {
+    if per_class {
+        ROOTED_WORK_BOUND.max(ROOTED_WORK_PER_CLASS.saturating_mul(distinct_named_classes))
+    } else {
+        ROOTED_WORK_BOUND
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROOTED_BOUND_PER_CLASS_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static LAST_ROOTED_WORK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn with_rooted_bound_per_class<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOTED_BOUND_PER_CLASS_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = ROOTED_BOUND_PER_CLASS_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
 /// Policy selected for a rooted, non-counting Tier D attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RootedBoundPolicy {
@@ -2932,7 +2980,7 @@ impl Saturation {
         kept_bytes: usize,
         limits: &Limits,
         attempt: AttemptProvenance,
-    ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
+    ) -> Result<(Axioms, Index, usize, OutsideEl, usize), Error> {
         let budget = numeric::Budget::new(
             limits,
             held_bytes + kept_bytes,
@@ -2945,7 +2993,15 @@ impl Saturation {
         self.interner.dt_run = None;
         self.numeric_halt |= self.interner.ranges.check().is_err();
         self.interner.ranges.end();
-        result.map(|(ax, ix, peak, outside)| (ax, ix, peak.max(budget.peak()), outside))
+        result.map(|(ax, ix, peak, outside, visible_named_classes)| {
+            (
+                ax,
+                ix,
+                peak.max(budget.peak()),
+                outside,
+                visible_named_classes,
+            )
+        })
     }
 
     fn build_inner(
@@ -2956,7 +3012,7 @@ impl Saturation {
         held_bytes: usize,
         limits: &Limits,
         attempt: AttemptProvenance,
-    ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
+    ) -> Result<(Axioms, Index, usize, OutsideEl, usize), Error> {
         let mut ax = Axioms::default();
         let mut partial: BTreeMap<&AxiomKind, &'static str> = BTreeMap::new();
         let mut chains: Vec<&AxiomKind> = Vec::new();
@@ -3283,7 +3339,13 @@ impl Saturation {
         if self.hide_internal {
             self.interner.hide_prefix(dl_reduce::PREFIX);
         }
+        // Count distinct visible named classes once from `met_classes` (excluding
+        // owl:Thing, owl:Nothing, individuals/nominals, internal reduction classes, and
+        // any double-counting from explicit `Declaration(Class(...))` axioms) without a
+        // second scan over `met_classes`.
+        let classes_before = ax.classes.len();
         ax.classes.extend(self.interner.met_classes());
+        let visible_named_classes = ax.classes.len() - classes_before;
         if let Some(b) = &self.interner.ranges.budget {
             b.baseline(self.interner.bytes() + ax.bytes())?;
         }
@@ -3367,7 +3429,7 @@ impl Saturation {
         excluded.dedup();
         self.excluded = excluded;
         outside_el.taken = taken.len();
-        Ok((ax, ix, peak, outside_el))
+        Ok((ax, ix, peak, outside_el, visible_named_classes))
     }
 
     /// Whether a run of Tier D may be rooted: when the EL part has no keys, top
@@ -3670,7 +3732,7 @@ impl Saturation {
         // the normalized premises of the changed axioms, which stay until the
         // invalidation
         let premises_bytes = premises.as_ref().map_or(0, |p| p.bytes());
-        let (mut ax, mut ix, mut normalized_peak, outside_el) = self.build(
+        let (mut ax, mut ix, mut normalized_peak, outside_el, visible_named_classes) = self.build(
             axioms,
             &outside,
             threads,
@@ -3971,14 +4033,18 @@ impl Saturation {
                 } else {
                     dl_rules::AdaptivePolicy::PROVISIONAL
                 };
+                let fallback_fixed =
+                    rooted_work_bound(visible_named_classes, rooted_bound_per_class());
                 let selected = select_rooted_bound(
                     limits.dl_work,
                     limits.dl_steps,
                     adaptive_on,
                     policy,
-                    ROOTED_WORK_BOUND,
+                    fallback_fixed,
                 );
                 let effective_cap = selected.work_limit();
+                #[cfg(test)]
+                LAST_ROOTED_WORK_LIMIT.with(|c| c.set(effective_cap));
                 d.set_work_limit(effective_cap);
                 if limits.dl_steps
                     && (matches!(selected, RootedBoundPolicy::Adaptive(_)) || diag_on)
@@ -7628,7 +7694,7 @@ mod tests {
             })
             .collect();
         let mut s = Saturation::default();
-        let (_, ix, _, _) = s
+        let (_, ix, _, _, _) = s
             .build(
                 &axioms,
                 &outside,
@@ -8728,6 +8794,271 @@ mod tests {
         assert!(
             card_delta >= 199 * 1000,
             "expected DataMinCardinality DataRange payload growth across repeats, delta={card_delta}"
+        );
+    }
+
+    #[test]
+    fn rooted_work_bound_scales_by_distinct_visible_named_classes() {
+        // Unit check on both sides of 16,384 (= 524,288 / 32) and 398,583 (ore_ont_15803).
+        assert_eq!(rooted_work_bound(0, false), ROOTED_WORK_BOUND);
+        assert_eq!(rooted_work_bound(398_583, false), ROOTED_WORK_BOUND);
+        assert_eq!(rooted_work_bound(0, true), ROOTED_WORK_BOUND);
+        assert_eq!(rooted_work_bound(16_384, true), ROOTED_WORK_BOUND);
+        assert_eq!(rooted_work_bound(16_385, true), 32 * 16_385);
+        assert_eq!(rooted_work_bound(398_583, true), 12_754_656);
+
+        // End-to-end check: explicit Declaration(Class(...)) axioms must NOT double-count
+        // named classes, and individuals/nominals/owl:Thing/owl:Nothing must not inflate it.
+        let make_ontology = |n: usize, with_declarations: bool| -> Vec<Axiom> {
+            let mut ax = Vec::with_capacity(if with_declarations { 2 * n + 4 } else { n + 4 });
+            let a = Individual::named("http://example.org/b#a");
+            let b = Individual::named("http://example.org/b#b");
+            let p =
+                ObjectPropertyExpression::Property(ObjectProperty::new("http://example.org/b#p"));
+            // Force rooted Tier D via disjunction + nominal.
+            let c0 = Class::new("http://example.org/b#C0");
+            let c1 = Class::new("http://example.org/b#C1");
+            ax.push(Axiom::new(AxiomKind::ClassAssertion(
+                ClassExpression::ObjectUnionOf(std::collections::BTreeSet::from([
+                    ClassExpression::Class(c0.clone()),
+                    ClassExpression::Class(c1.clone()),
+                ])),
+                a.clone(),
+            )));
+            ax.push(Axiom::new(AxiomKind::ObjectPropertyAssertion(p, a, b)));
+            if with_declarations {
+                ax.push(Axiom::new(AxiomKind::Declaration(Entity::Class(
+                    Class::thing(),
+                ))));
+                ax.push(Axiom::new(AxiomKind::Declaration(Entity::Class(
+                    Class::nothing(),
+                ))));
+            }
+            for i in 0..n {
+                let ci = Class::new(format!("http://example.org/b#C{i}"));
+                if with_declarations {
+                    ax.push(Axiom::new(AxiomKind::Declaration(Entity::Class(
+                        ci.clone(),
+                    ))));
+                }
+                if i > 0 {
+                    ax.push(Axiom::new(AxiomKind::SubClassOf(
+                        ClassExpression::Class(ci),
+                        ClassExpression::Class(c0.clone()),
+                    )));
+                }
+            }
+            ax
+        };
+
+        // 16,385 distinct named classes: with and without declarations must set the exact
+        // same scaled bound `32 * 16_385 = 524_320` (not `32 * 32_770`!).
+        let no_decl = make_ontology(16_385, false);
+        let with_decl = make_ontology(16_385, true);
+        let limits_rooted = Limits {
+            threads: 1,
+            rooted: true,
+            ..Limits::default()
+        };
+        let lim_off = with_rooted_bound_per_class(false, || {
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.set(0));
+            let mut k = Classifier::of(&with_decl);
+            let _ = k.classify(&limits_rooted).unwrap();
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.get())
+        });
+        assert_eq!(
+            lim_off, ROOTED_WORK_BOUND,
+            "default-off keeps fixed 524,288"
+        );
+
+        let lim_no_decl = with_rooted_bound_per_class(true, || {
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.set(0));
+            let mut k = Classifier::of(&no_decl);
+            let _ = k.classify(&limits_rooted).unwrap();
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.get())
+        });
+        let lim_with_decl = with_rooted_bound_per_class(true, || {
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.set(0));
+            let mut k = Classifier::of(&with_decl);
+            let _ = k.classify(&limits_rooted).unwrap();
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.get())
+        });
+        assert_eq!(lim_no_decl, 32 * 16_385);
+        assert_eq!(
+            lim_with_decl, lim_no_decl,
+            "explicit declarations must not double-count visible named classes"
+        );
+
+        // Explicit `Limits::dl_work` override wins even when per-class scaling is on.
+        let lim_override = with_rooted_bound_per_class(true, || {
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.set(0));
+            let mut k = Classifier::of(&with_decl);
+            let _ = k
+                .classify(&Limits {
+                    dl_work: Some(77_777),
+                    ..limits_rooted.clone()
+                })
+                .unwrap();
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.get())
+        });
+        assert_eq!(lim_override, 77_777);
+
+        // Below 16,384 classes stays at floor 524,288 even with declarations.
+        let small = make_ontology(100, true);
+        let lim_small = with_rooted_bound_per_class(true, || {
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.set(0));
+            let mut k = Classifier::of(&small);
+            let _ = k.classify(&limits_rooted).unwrap();
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.get())
+        });
+        assert_eq!(lim_small, ROOTED_WORK_BOUND);
+
+        // Counted+rooted preserves DL_WORK_BOUND (does not hit the non-counting rooted branch).
+        let mut small_counted = make_ontology(100, true);
+        small_counted.push(Axiom::new(AxiomKind::FunctionalObjectProperty(
+            ObjectPropertyExpression::Property(ObjectProperty::new("http://example.org/b#p")),
+        )));
+        let lim_counted = with_rooted_bound_per_class(true, || {
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.set(0));
+            let mut k = Classifier::of(&small_counted);
+            let _ = k
+                .classify(&Limits {
+                    counting: true,
+                    ..limits_rooted.clone()
+                })
+                .unwrap();
+            LAST_ROOTED_WORK_LIMIT.with(|c| c.get())
+        });
+        assert_eq!(
+            lim_counted, 0,
+            "counted+rooted run with counting axiom must preserve DL_WORK_BOUND branch"
+        );
+    }
+
+    #[test]
+    fn shared_facts_dl1061_suite_and_el_invariance() {
+        // 1. All 9 dl1061 fixtures pass with shared_facts ON across cautious/eager,
+        //    1t/4t, dl_steps true/false, and rooted_marker_repair off/on, matching OFF.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl1061");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "ofn"))
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 9);
+        let z = Class::new("http://example.org/n#Z");
+        let ans = Class::new("http://example.org/n#Ans");
+        let mut repair_off_checked = 0usize;
+        let mut repair_on_checked = 0usize;
+        for path in &files {
+            let ax = crate::ofn_read::parse(&std::fs::read_to_string(path).unwrap())
+                .unwrap()
+                .axioms;
+            let name = path.file_name().unwrap().to_string_lossy();
+            for (threads, expansion, dl_steps, repair) in [
+                (1, Expansion::Cautious, true, false),
+                (4, Expansion::Cautious, false, false),
+                (1, Expansion::Eager, true, false),
+                (1, Expansion::Cautious, true, true),
+                (4, Expansion::Eager, false, true),
+            ] {
+                let limits = Limits {
+                    threads,
+                    expansion,
+                    dl_steps,
+                    rooted: true,
+                    rooted_marker_repair: repair,
+                    ..Limits::default()
+                };
+                let off = dl_root::with_marker_diag_override(repair, || {
+                    dl_rules::with_shared_facts_override(false, || {
+                        let mut k = Classifier::of(&ax);
+                        (k.classify(&limits).unwrap(), k.excluded().len())
+                    })
+                });
+                let on = dl_root::with_marker_diag_override(repair, || {
+                    dl_rules::with_shared_facts_override(true, || {
+                        let mut k = Classifier::of(&ax);
+                        (k.classify(&limits).unwrap(), k.excluded().len())
+                    })
+                });
+                assert_eq!(off.0.consistency, on.0.consistency, "{name}");
+                assert_eq!(off.0.complete, on.0.complete, "{name}");
+                assert_eq!(off.1, on.1, "{name} excluded");
+                assert_eq!(off.0.stats.tier, Tier::Disjunctive, "{name} off tier");
+                assert_eq!(on.0.stats.tier, Tier::Disjunctive, "{name} on tier");
+                assert!(off.0.stats.dl_work > 0 && on.0.stats.dl_work > 0, "{name}");
+                if repair {
+                    repair_on_checked += 1;
+                    assert!(
+                        off.0.complete && on.0.complete,
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=true): must complete"
+                    );
+                    assert_eq!(
+                        off.1, 0,
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=true): must have 0 exclusions"
+                    );
+                    assert!(
+                        !on.0.stats.dl_rooted_declined && !on.0.stats.dl_over_budget,
+                        "{name}: must not decline or exhaust budget with repair=true"
+                    );
+                    assert!(
+                        off.0.taxonomy.is_subclass(&z, &ans),
+                        "{name}: OFF must entail Z ⊑ Ans with repair=true"
+                    );
+                    assert!(
+                        on.0.taxonomy.is_subclass(&z, &ans),
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=true): misses Z ⊑ Ans"
+                    );
+                    assert_eq!(
+                        on.0.stats.dl_marker_deficits,
+                        [0, 0, 0],
+                        "{name}: real marker deficits must be zero with repair=true"
+                    );
+                } else if on.0.complete && on.1 == 0 {
+                    repair_off_checked += 1;
+                    assert!(
+                        off.0.taxonomy.is_subclass(&z, &ans),
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=false): OFF misses Z ⊑ Ans"
+                    );
+                    assert!(
+                        on.0.taxonomy.is_subclass(&z, &ans),
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=false): ON misses Z ⊑ Ans"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            repair_on_checked,
+            files.len() * 2,
+            "every repair=true run across all 9 dl1061 fixtures must complete and be verified"
+        );
+        assert!(
+            repair_off_checked > 0,
+            "repair=false checks must be non-vacuous"
+        );
+
+        // 2. Zero EL and non-rooted DL regression: identical taxonomy and work.
+        let el_ofn = "Prefix(:=<http://example.org/el#>)\nOntology(<http://example.org/el>\n  SubClassOf(:A :B)\n  SubClassOf(:B :C)\n  SubClassOf(:C ObjectSomeValuesFrom(:r :D))\n)";
+        let el_ax = crate::ofn_read::parse(el_ofn).unwrap().axioms;
+        let el_off = dl_rules::with_shared_facts_override(false, || {
+            Classifier::of(&el_ax).classify(&Limits::default()).unwrap()
+        });
+        let el_on = dl_rules::with_shared_facts_override(true, || {
+            Classifier::of(&el_ax).classify(&Limits::default()).unwrap()
+        });
+        assert_eq!(el_off.stats.dl_work, 0);
+        assert_eq!(el_on.stats.dl_work, 0);
+        assert_eq!(
+            el_off.taxonomy.is_subclass(
+                &Class::new("http://example.org/el#A"),
+                &Class::new("http://example.org/el#C")
+            ),
+            el_on.taxonomy.is_subclass(
+                &Class::new("http://example.org/el#A"),
+                &Class::new("http://example.org/el#C")
+            )
         );
     }
 }
