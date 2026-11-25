@@ -4691,23 +4691,28 @@ impl Store {
         let filter = self.prefix_filter.lock().clone();
         let removed = self.removed_prefixes.lock();
         let mut cur = self.prefixes.lock();
-        let before = cur.len();
+        let mut next: Option<BTreeMap<String, String>> = None;
         let mut skipped = 0usize;
         for (k, v) in p {
-            if cur.contains_key(&k)
+            let map = next.as_ref().unwrap_or(&*cur);
+            if map.contains_key(&k)
                 || removed.contains(&k)
                 || filter.as_ref().is_some_and(|f| !f(&k))
             {
                 continue;
             }
-            if self.prefixes_full(cur.len() + removed.len())
+            if self.prefixes_full(map.len() + removed.len())
                 || k.len() > MAX_PREFIX_NAME_BYTES
                 || v.len() > MAX_PREFIX_IRI_BYTES
             {
                 skipped += 1;
                 continue;
             }
-            cur.insert(k, v);
+            next.get_or_insert_with(|| cur.clone()).insert(k, v);
+        }
+        if let Some(next) = next {
+            self.save_prefixes(&next)?;
+            *cur = next;
         }
         if skipped > 0 {
             tracing::warn!(
@@ -4715,14 +4720,6 @@ impl Store {
                 "{skipped} prefixes of the loaded data were not added (at most {} per dataset, names of {MAX_PREFIX_NAME_BYTES} bytes, IRIs of {MAX_PREFIX_IRI_BYTES})",
                 self.opts.max_prefixes
             );
-        }
-        if cur.len() != before
-            && let Some(root) = &self.root
-        {
-            write_atomic(
-                &root.join("prefixes.json"),
-                &serde_json::to_vec_pretty(&*cur).unwrap(),
-            )?;
         }
         Ok(())
     }
@@ -5568,21 +5565,34 @@ impl Store {
                     return Err(SparqlLoadError::Store(rollback_error));
                 }
                 txn.guard.next_bnode = txn.start_bnode;
-                let drained = self.after_refusal(error, Some(o));
-                if is_source
-                    && !matches!(
-                        drained,
-                        Error::Poisoned | Error::Cancelled | Error::Timeout | Error::WriterBusy
-                    )
-                {
-                    return Err(SparqlLoadError::Source(drained));
-                }
-                return Err(SparqlLoadError::Store(drained));
+                return Err(self.classify_refusal_after_drain(is_source, error, o));
             }
             let r = with_early_refusal(txn.commit(), early).map_err(SparqlLoadError::Store)?;
             self.add_prefixes(prefixes)
                 .map_err(SparqlLoadError::Store)?;
             Ok(r)
+        }
+    }
+
+    /// Drain group commit after a failed transactional load and classify the resulting
+    /// error. A source error that drain turns into a store-level refusal (poisoned,
+    /// cancelled, timed out, or busy) becomes [`SparqlLoadError::Store`].
+    pub(crate) fn classify_refusal_after_drain(
+        &self,
+        is_source: bool,
+        error: Error,
+        o: &crate::guard::WriteOptions,
+    ) -> SparqlLoadError {
+        let drained = self.after_refusal(error, Some(o));
+        if is_source
+            && !matches!(
+                drained,
+                Error::Poisoned | Error::Cancelled | Error::Timeout | Error::WriterBusy
+            )
+        {
+            SparqlLoadError::Source(drained)
+        } else {
+            SparqlLoadError::Store(drained)
         }
     }
 
@@ -5868,8 +5878,13 @@ impl Store {
         let started = std::time::Instant::now();
         // the head state before the bulk commit, whose changes the change log records
         let prior = self.snapshot();
-        // a running compaction gives up: this rebuild makes a new generation itself
-        w.tap = None;
+        // A running compaction gives up once this rebuild is going to replace the
+        // generation. Under `skip_if_unchanged`, keep the tap alive until the candidate
+        // passes the no-change, branch-protection, fit, guard, dry-run and publish
+        // checks, so duplicate-only loads and refusals leave an active compaction alone.
+        if !bulk.skip_if_unchanged {
+            w.tap = None;
+        }
         self.compaction.rebuilding.store(true, Ordering::Relaxed);
         let _rebuilding = compaction::Rebuilding(&self.compaction.rebuilding);
         let message = match o.message.as_ref() {
@@ -6097,6 +6112,9 @@ impl Store {
                 let _ = std::fs::remove_dir_all(&dir);
             }
             return Err(SparqlLoadError::Store(e));
+        }
+        if bulk.skip_if_unchanged {
+            w.tap = None;
         }
         let annotation;
         if let Some(root) = &self.root {

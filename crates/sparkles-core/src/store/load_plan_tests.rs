@@ -1755,8 +1755,10 @@ fn sparql_load_silent_http_limit_preserves_group_poisoned_and_writer_busy() {
         "Store(Poisoned) must take precedence over LoadHttpBody's recorded limit error: {load_res:?}"
     );
 
-    // 2. When after_refusal returns Error::WriterBusy under no_wait=true, load_sparql must
-    // classify it as SparqlLoadError::Store(Error::WriterBusy) (not Source).
+    // 2. Under no_wait=true while a group-commit fence is in flight, writer admission
+    // refuses the load before parsing with Store(WriterBusy) (which LOAD SILENT surfaces),
+    // and the post-refusal drain classifier itself also keeps a WriterBusy drain result as
+    // SparqlLoadError::Store rather than downgrading it to Source.
     let tmp = tempfile::tempdir().unwrap();
     let bad_nt = tmp.path().join("bad.nt");
     std::fs::write(&bad_nt, "not valid ntriples\n").unwrap();
@@ -1799,10 +1801,26 @@ fn sparql_load_silent_http_limit_preserves_group_poisoned_and_writer_busy() {
         no_wait: true,
         ..WriteOptions::default()
     };
+    // Direct check of refusal-drain classification: after_refusal returns Error::WriterBusy
+    // for an in-flight group under no_wait=true, and the classifier must keep it Store.
+    let classified = s2.classify_refusal_after_drain(
+        true,
+        Error::RdfParse("not valid ntriples".into()),
+        &no_wait,
+    );
+    assert!(
+        matches!(classified, SparqlLoadError::Store(Error::WriterBusy)),
+        "after_refusal WriterBusy must stay SparqlLoadError::Store: {}",
+        match classified {
+            SparqlLoadError::Source(e) => format!("Source({e:?})"),
+            SparqlLoadError::Store(e) => format!("Store({e:?})"),
+        }
+    );
+    // Writer-entry refusal check: try_write_with refuses before parsing under no_wait=true.
     let res = s2.load_sparql(&src, CommitKind::Update, &no_wait);
     assert!(
         matches!(res, Err(SparqlLoadError::Store(Error::WriterBusy))),
-        "after_refusal WriterBusy must stay SparqlLoadError::Store: {}",
+        "writer-entry WriterBusy must stay SparqlLoadError::Store: {}",
         match res {
             Ok(_) => "Ok".to_string(),
             Err(SparqlLoadError::Source(e)) => format!("Source({e:?})"),
@@ -1822,6 +1840,21 @@ fn sparql_load_silent_http_limit_preserves_group_poisoned_and_writer_busy() {
     let _ = go2_tx.send(());
     s2.set_failpoint("group-sealed", None);
     first2.join().unwrap().unwrap();
+
+    // Once the group is idle, the same refusal classifier preserves a source parse error.
+    let classified_idle = s2.classify_refusal_after_drain(
+        true,
+        Error::RdfParse("not valid ntriples".into()),
+        &no_wait,
+    );
+    assert!(
+        matches!(classified_idle, SparqlLoadError::Source(Error::RdfParse(_))),
+        "idle source error must stay SparqlLoadError::Source: {}",
+        match classified_idle {
+            SparqlLoadError::Source(e) => format!("Source({e:?})"),
+            SparqlLoadError::Store(e) => format!("Store({e:?})"),
+        }
+    );
 }
 
 #[test]
@@ -2039,8 +2072,10 @@ fn sparql_load_bulk_unchanged_protected_quota_and_prefixes() {
         Some("http://ex.org/fresh/")
     );
 
-    // Reopen to confirm the prefix persisted without allocating a quad commit, then replace
-    // prefixes.json with a directory so persisting a second fresh prefix fails under SILENT.
+    // Reopen to confirm the prefix persisted without allocating a quad commit, then inject
+    // a failure before rename (preserving prefixes.json) so persisting a second fresh prefix
+    // fails under SILENT without polluting memory, retries cleanly once repaired, and
+    // survives reopen.
     drop(persistent);
     let persistent = Store::open(
         &db_path,
@@ -2056,9 +2091,8 @@ fn sparql_load_bulk_unchanged_protected_quota_and_prefixes() {
         Some("http://ex.org/fresh/")
     );
 
-    let prefixes_path = db_path.join("prefixes.json");
-    std::fs::remove_file(&prefixes_path).unwrap();
-    std::fs::create_dir(&prefixes_path).unwrap();
+    let prefixes_tmp = db_path.join("prefixes.tmp");
+    std::fs::create_dir(&prefixes_tmp).unwrap();
     let err = update(
         &persistent,
         &format!("LOAD SILENT <{}>", file_url(&same_ttl2_path)),
@@ -2066,7 +2100,192 @@ fn sparql_load_bulk_unchanged_protected_quota_and_prefixes() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::Io(_)), "{err:?}");
-    std::fs::remove_dir(&prefixes_path).unwrap();
+    assert!(
+        !persistent.prefixes().contains_key("fresh2"),
+        "failed prefix persistence must not leave the prefix in memory"
+    );
+    assert_eq!(
+        persistent.prefixes().get("fresh").map(String::as_str),
+        Some("http://ex.org/fresh/")
+    );
+
+    std::fs::remove_dir(&prefixes_tmp).unwrap();
+    let retry = update(
+        &persistent,
+        &format!("LOAD SILENT <{}>", file_url(&same_ttl2_path)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let retry_r = retry.commit.as_ref().unwrap();
+    assert!(!retry_r.committed);
+    assert_eq!(retry_r.commit.seq, head_seq);
+    assert_eq!(
+        persistent.prefixes().get("fresh2").map(String::as_str),
+        Some("http://ex.org/fresh2/")
+    );
+
+    drop(persistent);
+    let reopened = Store::open(
+        &db_path,
+        StoreOptions {
+            bulk_threshold: E,
+            ..StoreOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(reopened.snapshot().commit, head_seq);
+    assert_eq!(
+        reopened.prefixes().get("fresh").map(String::as_str),
+        Some("http://ex.org/fresh/")
+    );
+    assert_eq!(
+        reopened.prefixes().get("fresh2").map(String::as_str),
+        Some("http://ex.org/fresh2/")
+    );
+}
+
+#[test]
+fn sparql_load_bulk_refusal_and_duplicate_preserve_active_compaction() {
+    use crate::error::Error;
+    use crate::sparql::{QueryOptions, update::update};
+    use crate::store::CompactOptions;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file_url = |p: &std::path::Path| format!("file://{}", p.display());
+
+    let large_bytes = ntriples(0, E + 2);
+    let large_nt = tmp.path().join("large.nt");
+    std::fs::write(&large_nt, &large_bytes).unwrap();
+
+    let extra_nt = tmp.path().join("extra.nt");
+    std::fs::write(&extra_nt, ntriples(10_000, E + 2)).unwrap();
+
+    let large_str = std::str::from_utf8(&large_bytes).unwrap();
+    let same_ttl_path = tmp.path().join("same_prefix.ttl");
+    std::fs::write(
+        &same_ttl_path,
+        format!("@prefix fresh: <http://ex.org/fresh/> .\n{large_str}"),
+    )
+    .unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("db");
+    let persistent = Store::open(
+        &db_path,
+        StoreOptions {
+            bulk_threshold: E,
+            ..StoreOptions::default()
+        },
+    )
+    .unwrap();
+    let first = update(
+        &persistent,
+        &format!("LOAD <{}>", file_url(&large_nt)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(first.commit.as_ref().unwrap().committed && first.commit.as_ref().unwrap().commit.bulk);
+    update(
+        &persistent,
+        "INSERT DATA { <http://ex.org/delta1> <http://ex.org/p> 1 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let head_seq = persistent.snapshot().commit;
+
+    // 1. On a protected branch, a refused changing bulk LOAD (live or dry-run) and a
+    // duplicate-only live bulk LOAD must both leave an active compaction's tap intact.
+    persistent.set_branch_protected("main", true).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let extra_url = file_url(&extra_nt);
+    let same_url = file_url(&same_ttl_path);
+    persistent.set_failpoint(
+        "compact-built",
+        Some(Arc::new({
+            let ran = Arc::clone(&ran);
+            let extra_url = extra_url.clone();
+            let same_url = same_url.clone();
+            move |st: &Store| {
+                let err = update(st, &format!("LOAD <{extra_url}>"), &QueryOptions::default())
+                    .unwrap_err();
+                assert!(matches!(err, Error::Branch(_)), "{err:?}");
+
+                let mut dry = QueryOptions::default();
+                dry.write.dry_run = Some(Default::default());
+                let err = update(st, &format!("LOAD <{extra_url}>"), &dry).unwrap_err();
+                assert!(matches!(err, Error::Branch(_)), "{err:?}");
+
+                let dup =
+                    update(st, &format!("LOAD <{same_url}>"), &QueryOptions::default()).unwrap();
+                let dup_r = dup.commit.as_ref().unwrap();
+                assert!(!dup_r.committed);
+                assert_eq!(dup_r.commit.seq, head_seq);
+                ran.store(true, Ordering::Release);
+            }
+        })),
+    );
+    let report = persistent.compact_with(&CompactOptions::default()).unwrap();
+    persistent.set_failpoint("compact-built", None);
+    assert!(ran.load(Ordering::Acquire));
+    assert_eq!(
+        report.abandoned, None,
+        "protected refusal and duplicate-only bulk LOAD must not abort compaction: {report:?}"
+    );
+    assert_eq!(persistent.snapshot().commit, head_seq);
+    assert_eq!(
+        persistent.prefixes().get("fresh").map(String::as_str),
+        Some("http://ex.org/fresh/")
+    );
+
+    // 2. Once unprotected, a changing live bulk LOAD during compaction commits a new
+    // generation and abandons the active compaction as before.
+    persistent.set_branch_protected("main", false).unwrap();
+    update(
+        &persistent,
+        "INSERT DATA { <http://ex.org/delta2> <http://ex.org/p> 2 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let ran2 = Arc::new(AtomicBool::new(false));
+    persistent.set_failpoint(
+        "compact-built",
+        Some(Arc::new({
+            let ran2 = Arc::clone(&ran2);
+            let extra_url = extra_url.clone();
+            move |st: &Store| {
+                let committed =
+                    update(st, &format!("LOAD <{extra_url}>"), &QueryOptions::default()).unwrap();
+                let r = committed.commit.as_ref().unwrap();
+                assert!(r.committed && r.commit.bulk);
+                ran2.store(true, Ordering::Release);
+            }
+        })),
+    );
+    let report2 = persistent.compact_with(&CompactOptions::default()).unwrap();
+    persistent.set_failpoint("compact-built", None);
+    assert!(ran2.load(Ordering::Acquire));
+    assert!(
+        report2.abandoned.is_some(),
+        "changing bulk LOAD must supersede active compaction: {report2:?}"
+    );
+    let final_seq = persistent.snapshot().commit;
+    assert!(final_seq > head_seq + 1);
+
+    drop(persistent);
+    let reopened = Store::open(
+        &db_path,
+        StoreOptions {
+            bulk_threshold: E,
+            ..StoreOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(reopened.snapshot().commit, final_seq);
+    assert_eq!(
+        reopened.prefixes().get("fresh").map(String::as_str),
+        Some("http://ex.org/fresh/")
+    );
 }
 
 /// Measures wall time, 1 ms lock-probe samples (`first_busy_ms` estimating pre-lock time
