@@ -58,10 +58,13 @@
     ontologyEntities,
     ontologyKindLabels,
     classificationNote,
+    consistencyInfo,
+    inferredNodeStatus,
     ontologyLabelsFor,
     ontologyEntity,
     ontologyHead,
     ontologySummary,
+    parseDeadlineInput,
     RDFS_LABEL,
     renameUpdate,
     savePolicy,
@@ -77,6 +80,8 @@
     type AxiomJson,
     type AxiomItem,
     type Classification,
+    type ClassificationExpansion,
+    type ClassifyOptions,
     type DlAnswer,
     type DlQueryResult,
     type DlReasoning,
@@ -798,6 +803,15 @@
   let classifying = $state(false);
   let classifyAbort: AbortController | null = null;
   let inferredScope: { target: string; selection: Selection; commit: number } | null = null;
+  let classifyPartial = $state(false);
+  let classifyDeadline = $state('');
+  let classifyExpansion = $state<ClassificationExpansion>('cautious');
+  const parsedDeadline = $derived(parseDeadlineInput(classifyDeadline));
+  const classifyOptions = $derived<ClassifyOptions>({
+    partial: classifyPartial || undefined,
+    timeoutMs: parsedDeadline.timeoutMs,
+    expansion: classifyExpansion,
+  });
   const inferredLabels = new SvelteMap<string, Lit[]>();
   const inferredBatch = new LabelBatch(
     (iris) => {
@@ -829,8 +843,13 @@
   }
   async function classify() {
     if (!summary || classifying) return;
+    if (parsedDeadline.error) {
+      classifyError = parsedDeadline.error;
+      return;
+    }
     const my = ++classifySeq;
     const input = { target, selection: { ...sel }, commit: summary.commit };
+    const options = { ...classifyOptions };
     classifyAbort?.abort();
     const abort = new AbortController();
     classifyAbort = abort;
@@ -842,6 +861,7 @@
         input.selection,
         abort.signal,
         `commit:${input.commit}`,
+        options,
       );
       if (my !== classifySeq) return;
       inferredScope = { ...input, commit: c.commit };
@@ -866,6 +886,16 @@
     return () => classifyAbort?.abort();
   });
   const inferred = $derived(classification ? taxonomyTree(classification) : null);
+  const inferredIncomplete = $derived(new Set(classification?.incomplete ?? []));
+  const inferredConsistency = $derived(
+    classification
+      ? consistencyInfo(
+          classification.consistency,
+          classification.consistent,
+          classification.partial,
+        )
+      : null,
+  );
   const inferredIriName = (iri: string) => {
     if (iriForm.mode !== 'label') return iri;
     inferredBatch.want(iri);
@@ -1881,13 +1911,51 @@
                           >{classificationNote(classification)}</span
                         >{/if}
                     </h2>
-                    <button
-                      class="btn sm ghost"
-                      disabled={classifying || !summary}
-                      onclick={() => void classify()}>Classify tree</button
-                    >
-                    <p class="faint">This explicit action reads the full taxonomy in POST pages.</p>
-                    {#if classification?.nodesTruncated}<p class="note">
+                    <div class="classify-controls">
+                      <label
+                        class="check"
+                        title="Ask the disjunctive classifier to return proved subsumptions if the deadline stops it"
+                      >
+                        <input type="checkbox" bind:checked={classifyPartial} />
+                        Allow partial
+                      </label>
+                      <label class="classify-field">
+                        <span>Deadline (s)</span>
+                        <input
+                          class="input sm"
+                          type="text"
+                          inputmode="decimal"
+                          size="6"
+                          placeholder="No limit"
+                          aria-label="Classification deadline in seconds"
+                          aria-invalid={!!parsedDeadline.error}
+                          bind:value={classifyDeadline}
+                        />
+                      </label>
+                      <label class="classify-field">
+                        <span>Expansion</span>
+                        <select
+                          class="select sm"
+                          aria-label="Expansion strategy"
+                          bind:value={classifyExpansion}
+                        >
+                          <option value="cautious">Cautious</option>
+                          <option value="eager">Eager</option>
+                        </select>
+                      </label>
+                      <button
+                        class="btn sm ghost"
+                        disabled={classifying || !summary || !!parsedDeadline.error}
+                        onclick={() => void classify()}>Classify tree</button
+                      >
+                    </div>
+                    {#if parsedDeadline.error}<p class="problem pad-x" role="alert">
+                        {parsedDeadline.error}
+                      </p>{/if}
+                    <p class="faint pad-x small">
+                      This explicit action reads the taxonomy in POST pages.
+                    </p>
+                    {#if classification?.nodesTruncated}<p class="note pad-x">
                         The browser's taxonomy display limit was reached.
                       </p>{/if}
                     <div class="tree-scroll">
@@ -1895,16 +1963,53 @@
                           <span class="spinner"></span> Classifying…
                         </p>{/if}
                       {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
-                      {#if inferred}
-                        {#if classification && (classification.consistency === 'inconsistent' || (!classification.consistency && !classification.consistent))}
-                          <p class="error-box" role="alert">
-                            The ontology is inconsistent, so every class is unsatisfiable.
+                      {#if inferred && classification}
+                        <div class="classify-status" role="status">
+                          {#if classification.tier}
+                            <span class="badge">{classification.tier.toUpperCase()}</span>
+                          {/if}
+                          {#if classification.partial}
+                            <span class="badge warn"
+                              >Partial · {fmtCount(
+                                classification.incompleteCount ?? inferredIncomplete.size,
+                                'open class',
+                                'open classes',
+                              )}</span
+                            >
+                          {/if}
+                          {#if inferredConsistency}
+                            <span
+                              class="badge"
+                              class:ok={inferredConsistency.tone === 'ok'}
+                              class:warn={inferredConsistency.tone === 'warn'}
+                              class:danger={inferredConsistency.tone === 'danger'}
+                              >{inferredConsistency.label}</span
+                            >
+                          {/if}
+                        </div>
+                        {#if classification.partial}
+                          <p class="warn-box" role="status">
+                            Partial hierarchy ({classification.tier?.toUpperCase() ??
+                              'classification'}). Proved subsumptions are shown;
+                            {fmtCount(
+                              classification.incompleteCount ?? inferredIncomplete.size,
+                              'class',
+                              'classes',
+                            )} marked open may miss inferred superclasses or equivalences.
+                            {#if (classification.incompleteCount ?? 0) > (classification.incomplete?.length ?? 0)}
+                              Showing markers for the first {fmtInt(
+                                classification.incomplete?.length ?? 0,
+                              )} of {fmtInt(classification.incompleteCount ?? 0)} open classes.
+                            {/if}
                           </p>
-                        {:else if classification?.consistency === 'unknown'}
-                          <p class="note">
-                            {classification.partial
-                              ? 'Consistency is unknown because the classification stopped before deciding it.'
-                              : 'Consistency is unknown, since the classification left out part of the input.'}
+                        {/if}
+                        {#if inferredConsistency?.state === 'inconsistent'}
+                          <p class="error-box" role="alert">
+                            {inferredConsistency.detail}
+                          </p>
+                        {:else if inferredConsistency?.state === 'unknown'}
+                          <p class="warn-box" role="status">
+                            {inferredConsistency.detail}
                           </p>
                         {/if}
                         <OntoTree
@@ -1917,7 +2022,10 @@
                               for (const c of inferred?.classesOf.get(id) ?? [])
                                 inferredBatch.want(c);
                           }}
-                          badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
+                          badge={(id) =>
+                            inferredNodeStatus(id, inferred.classesOf, inferredIncomplete).badge}
+                          badgeTone={(id) =>
+                            inferredNodeStatus(id, inferred.classesOf, inferredIncomplete).tone}
                           open={openSet('inferred')}
                           selected={selected ? (inferred.nodeOf.get(selected) ?? null) : null}
                           keep={inferredKeep}
@@ -2027,6 +2135,12 @@
               {#if frameError}<p class="error-box" role="alert">{frameError}</p>{/if}
               {#if inferredOn && frameKind === 'Class' && inferred && selected}
                 {@const sup = inferredParents(selected)}
+                {#if inferredIncomplete.has(selected)}
+                  <p class="inferred-sup warn-box" role="status">
+                    <span class="badge warn">Open</span> This class was left open in the partial classification
+                    and may miss inferred superclasses.
+                  </p>
+                {/if}
                 {#if sup.length}
                   <p class="inferred-sup">
                     <span class="faint">Inferred direct superclasses:</span>
@@ -2069,6 +2183,7 @@
                         commit={frameCommit}
                         items={frameItems}
                         pins={frameCommit === summary?.commit ? inferredPins : undefined}
+                        classifyOptions={parsedDeadline.error ? undefined : classifyOptions}
                         onopen={(iri) => nav({ iri, view: null })}
                       />
                     {/key}
@@ -2620,6 +2735,43 @@
   .col-title .faint {
     font-weight: 400;
     font-size: var(--fs-xs);
+  }
+  .classify-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    padding: 0 10px 6px;
+    font-size: var(--fs-xs);
+  }
+  .classify-field {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-2);
+  }
+  .classify-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 0 6px;
+  }
+  .badge.warn {
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+  }
+  .warn-box {
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+    color: var(--warn);
+    border-radius: var(--r);
+    padding: 6px 8px;
+    font-size: var(--fs-xs);
+    margin: 4px 0 6px;
+  }
+  .pad-x {
+    padding: 0 10px;
   }
   .tree-scroll {
     flex: 1;

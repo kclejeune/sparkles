@@ -1206,11 +1206,22 @@ const keptClassifications = new WeakMap();
 const classificationKey = (graph, imports, mode) =>
   JSON.stringify([graph, imports !== false && imports !== 'false', mode ?? 'lenient']);
 const fingerprint = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-function mockClassification(ds, graph, commit, body, taxonomy) {
+function mockClassification(ds, graph, commit, body, taxonomy, opts = {}) {
   const input = classificationKey(graph, body.imports, body.mode);
   const boundStoreId = `mock:${ds.name}@${ds.branchName ?? 'main'}`;
-  const inputFingerprint = fingerprint([boundStoreId, commit, input, !!body.assertions]);
-  const contentFingerprint = fingerprint(taxonomy.nodes);
+  const partial = !!opts.partial;
+  const incomplete = opts.incomplete ?? [];
+  const consistency = opts.consistency ?? 'consistent';
+  const tier = opts.tier ?? 'el';
+  const inputFingerprint = fingerprint([
+    boundStoreId,
+    commit,
+    input,
+    !!body.assertions,
+    !!body.partial,
+    body.expansion ?? 'cautious',
+  ]);
+  const contentFingerprint = fingerprint([taxonomy.nodes, tier, partial, consistency, incomplete]);
   const sources = [
     { kind: 'requestedGraph', ordinal: 0, graph },
     { kind: 'resolvedGraph', ordinal: 1, graph, requested: true },
@@ -1252,13 +1263,16 @@ function mockClassification(ds, graph, commit, body, taxonomy) {
     taxonomy,
     sources,
     name,
+    incomplete,
+    incompleteSet: new Set(incomplete),
     outcome: {
-      tier: 'el',
-      partial: false,
-      complete: true,
-      consistency: 'consistent',
+      tier,
+      partial,
+      complete: !partial,
+      consistency,
       excludedCount: 0,
-      incompleteCount: 0,
+      incompleteCount: incomplete.length,
+      unmappedCount: 0,
     },
     identity: {
       boundStoreId,
@@ -1288,16 +1302,21 @@ function mockClassificationRows(kept, part, about, languages) {
         : part === 'parents' && node
           ? node.parents.map((p) => nodes[p])
           : [];
+  const incompleteSet = kept.incompleteSet ?? new Set();
   if (part === 'equivalents')
     return (node?.classes ?? [])
       .filter((c) => c !== about)
       .toSorted()
-      .map((iri) => kept.name(iri, languages));
+      .map((iri) => ({
+        ...kept.name(iri, languages),
+        ...(incompleteSet.has(iri) ? { incomplete: true } : {}),
+      }));
   return rows.map((n) => ({
     ...kept.name(n.classes[0], languages),
     equivalenceCount: n.classes.length,
     children: n.children,
     parents: n.parents.length,
+    ...(n.classes.some((c) => incompleteSet.has(c)) ? { incomplete: true } : {}),
   }));
 }
 
@@ -2293,15 +2312,46 @@ export async function handleOntology(req, res, url, seg, ctx) {
   }
   if (req.method === 'POST' && sub === 'classify') {
     const body = JSON.parse((await readBody(req)) || '{}');
+    if (body.expansion != null && body.expansion !== 'cautious' && body.expansion !== 'eager')
+      return (fail(res, 400, `expansion must be cautious or eager, not '${body.expansion}'`), true);
+    const rawTimeout = p.get('timeout');
+    const timeoutSecs =
+      rawTimeout != null && Number.isFinite(Number(rawTimeout)) && Number(rawTimeout) > 0
+        ? Number(rawTimeout)
+        : null;
     const o = readOntology(ds, body.graph ?? graph);
     const c = classify(o);
+    const partialRequested = !!body.partial || p.get('partial') === 'true';
+    const isPartial = partialRequested && timeoutSecs != null;
+    const allNamed = c.nodes
+      .slice(2)
+      .flatMap((n) => n.classes)
+      .sort();
+    const unknownConsistency = isPartial && timeoutSecs <= 0.5;
+    const incomplete = isPartial
+      ? unknownConsistency
+        ? allNamed
+        : allNamed.length <= 1
+          ? allNamed
+          : allNamed.filter((_, idx) => idx % 2 === 1)
+      : [];
+    const incompleteSet = new Set(incomplete);
+    const partialOpts = isPartial
+      ? {
+          tier: 'disjunctive',
+          partial: true,
+          consistency: unknownConsistency ? 'unknown' : 'consistent',
+          incomplete,
+        }
+      : {};
     const cached = keptClassifications.get(ds);
     const key = classificationKey(body.graph ?? graph, body.imports, body.mode);
+    const canKeep = !body.assertions && !isPartial;
     const kept =
-      !body.assertions && cached?.input === key && cached.result.classifiedCommit === head()
+      canKeep && cached?.input === key && cached.result.classifiedCommit === head()
         ? cached
-        : mockClassification(ds, body.graph ?? graph, head(), body, c);
-    if (!body.assertions) keptClassifications.set(ds, kept);
+        : mockClassification(ds, body.graph ?? graph, head(), body, c, partialOpts);
+    if (canKeep) keptClassifications.set(ds, kept);
     const limit = body.limit ?? 100;
     const offset = body.offset ?? 0;
     const nodes = c.nodes.slice(offset, offset + limit).map((n) => ({
@@ -2319,7 +2369,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
         node: i,
         iri: body.about,
         unsatisfiable: false,
-        incomplete: false,
+        incomplete: incompleteSet.has(body.about),
         parentClasses: n.parents.map((x) => c.nodes[x].classes[0]),
       };
     }
@@ -2343,14 +2393,14 @@ export async function handleOntology(req, res, url, seg, ctx) {
           result: kept.result,
           outcome: kept.outcome,
           unsatisfiable: false,
-          incomplete: false,
+          incomplete: incompleteSet.has(body.about),
           parents: projected('parents'),
           equivalents: projected('equivalents'),
           excluded: projected('excluded'),
           sources: projected('sources'),
           retention: {
-            kept: !body.assertions,
-            resultId: body.assertions ? null : kept.result.resultId,
+            kept: canKeep,
+            resultId: canKeep ? kept.result.resultId : null,
           },
         },
       });
@@ -2360,9 +2410,14 @@ export async function handleOntology(req, res, url, seg, ctx) {
       ...opened(o),
       classificationSource: kept.identity,
       resultId: kept.result.resultId,
-      tier: 'el',
-      consistent: true,
-      complete: true,
+      tier: kept.outcome.tier,
+      partial: kept.outcome.partial,
+      consistent: kept.outcome.consistency !== 'inconsistent',
+      consistency: kept.outcome.consistency,
+      complete: kept.outcome.complete,
+      completeForTaken: !kept.outcome.partial,
+      incompleteCount: incomplete.length,
+      incomplete: incomplete.slice(0, limit),
       reused: false,
       classes: c.classes,
       nodeCount: c.nodes.length,

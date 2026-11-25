@@ -83,8 +83,9 @@ it to Horn ontologies without individuals, as [the Horn rules](#the-horn-rules)
 describe, and to ALCHI ontologies without individuals that need case analysis, as
 [the disjunctive rules](#the-disjunctive-rules) describe. The export of inferred axioms and the removal of redundant ones are delivered
 as the ROBOT-compatible commands of items 634, 635 and 637, and the existential
-superclasses as `materialize`, item 636. The other phases remain under
-[item 457](../../ROADMAP.md).
+superclasses as `materialize`, item 636. The other phases remain under [item 457](../../ROADMAP.md).
+
+Item 719 adds partial-classification controls and display to the Ontology Workbench. Both the explicit inferred-tree run and the class frame accept a partial-answer toggle, a deadline in seconds sent as the `timeout` query parameter and the `cautious` or `eager` expansion strategy on `POST /$/ontology/{ds}/classify`. When a partial answer returns, the Workbench displays the partial status with its tier and open-class count, marks classes in the `incomplete` set as open in the inferred class tree and class frame, and renders `unknown` consistency distinctly from `consistent` and `inconsistent` verdicts. Partial tree responses are kept to their first page with a truncation notice rather than stitching across unretained runs, while unexpected partial answers on runs that did not request them remain rejected.
 
 Integer, decimal and rational literals use exact arbitrary-precision canonical values,
 including values beyond 128 bits. Construction and copied storage obey the classifier's
@@ -2479,8 +2480,9 @@ the flag, since none of them can say that a taxonomy is partial. The command lin
 otherwise clean. Each surface's tests classify a generated ALCHI ontology under deadlines
 from a fiftieth of a full run's time upwards, and check that a partial answer is never
 complete, that it lists its open classes and that its consistency agrees with the full run
-or is unknown, which an inconsistent ontology gives when stopped early. The Workbench does
-not ask for partial answers, item 719.
+or is unknown, which an inconsistent ontology gives when stopped early. Item 719 extends
+the Workbench with deadline, partial-answer and expansion controls and displays partial
+hierarchies, open classes and unknown consistency, as [Outcome](#outcome) records.
 
 A run of the disjunctive rules has the Horn rules' memory budget, 64 times the estimated
 bytes of its index and axioms, at least 1 GiB, and no more than the caller's. The clause

@@ -280,7 +280,7 @@ describe('one pinned class frame', () => {
       incompleteCount: 3,
       unmappedCount: 0,
     };
-    server((c) =>
+    const calls = server((c) =>
       c.init.method === 'POST'
         ? response({
             commit: 7,
@@ -305,7 +305,16 @@ describe('one pinned class frame', () => {
     );
     const controller = new ClassificationFrame();
     await controller.reset(view);
-    await controller.classify();
+    await controller.classify({ partial: true, timeoutMs: 2500, expansion: 'eager' });
+    const post = calls[1];
+    expect(post.url.searchParams.get('at')).toBe('commit:7');
+    expect(post.url.searchParams.get('timeout')).toBe('2.5');
+    expect(JSON.parse(String(post.init.body))).toMatchObject({
+      projection: 'frame',
+      about: 'urn:A',
+      partial: true,
+      expansion: 'eager',
+    });
     expect(controller.isolated).toBe(true);
     expect(controller.reply?.status).toBe('available');
     expect(controller.reply?.outcome).toEqual(partialOutcome);

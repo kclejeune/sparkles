@@ -603,4 +603,109 @@ describe('source-pinned inferred regions', () => {
     expect(calls[0].init.method ?? 'GET').toBe('GET');
     model.drop();
   });
+  it('tracks incomplete classes from kept hierarchy rows and entity status', async () => {
+    const result: ClassificationResult = {
+      resultId: 'kept-partial',
+      classifiedCommit: 7,
+      boundStoreId: 'branch',
+      familyId: 'family',
+      inputFingerprint: 'input',
+      sourceFingerprint: 'source',
+      contentFingerprint: 'content',
+      imports: 'dataset',
+      mode: 'lenient',
+      assertions: false,
+      elOnly: false,
+      partialRequested: true,
+      expansion: 'cautious',
+      sourceCounts: { requestedGraphs: 1, resolvedGraphs: 1, imports: 0, warnings: 0 },
+      capabilities: ['namedClassRoots', 'namedClassDirectChildren'],
+      justifications: 'unavailable',
+    };
+    server((call) => {
+      const q = call.url.searchParams;
+      const part = q.get('part') as 'roots' | 'children';
+      const about = q.get('about');
+      const rows =
+        part === 'roots'
+          ? [
+              {
+                iri: 'urn:OpenRoot',
+                label: 'OpenRoot',
+                labelLang: 'en',
+                children: 1,
+                parents: 1,
+                equivalenceCount: 1,
+                incomplete: true,
+              },
+              {
+                iri: 'urn:ClosedRoot',
+                label: 'ClosedRoot',
+                labelLang: 'en',
+                children: 0,
+                parents: 1,
+                equivalenceCount: 1,
+                incomplete: false,
+              },
+            ]
+          : [
+              {
+                iri: 'urn:OpenChild',
+                label: 'OpenChild',
+                labelLang: 'en',
+                children: 0,
+                parents: 1,
+                equivalenceCount: 1,
+                incomplete: true,
+              },
+            ];
+      return {
+        commit: 7,
+        status: 'available',
+        result,
+        reason: null,
+        activity: null,
+        staleCommit: null,
+        outcome: {
+          tier: 'disjunctive',
+          partial: true,
+          complete: false,
+          consistency: 'unknown',
+          excludedCount: 0,
+          incompleteCount: 2,
+          unmappedCount: 0,
+        },
+        entity: about
+          ? {
+              iri: about,
+              present: true,
+              representative: about,
+              unsatisfiable: false,
+              incomplete: about === 'urn:OpenRoot',
+              children: 1,
+              parents: 1,
+              equivalenceCount: 1,
+            }
+          : null,
+        page: {
+          part,
+          about,
+          offset: 0,
+          limit: 100,
+          total: rows.length,
+          items: rows,
+          nextOffset: null,
+        },
+      };
+    });
+    const model = new InferredTree();
+    model.reset(view, 'Class');
+    await model.tree.load(null);
+    expect(model.incomplete['urn:OpenRoot']).toBe(true);
+    expect(model.incomplete['urn:ClosedRoot']).toBe(false);
+    await model.tree.load('urn:OpenRoot');
+    expect(model.incomplete['urn:OpenChild']).toBe(true);
+    model.drop();
+    expect(model.incomplete).toEqual({});
+  });
 });

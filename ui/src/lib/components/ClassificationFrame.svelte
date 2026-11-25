@@ -8,8 +8,16 @@
     type ClassificationExcluded,
     type ClassificationSourceRow,
   } from '$lib/classification-read';
+  import { fmtCount } from '$lib/format';
   import { iriForm } from '$lib/iri-form.svelte';
-  import { OWL_THING, type AxiomItem } from '$lib/ontology';
+  import {
+    consistencyInfo,
+    OWL_THING,
+    parseDeadlineInput,
+    type AxiomItem,
+    type ClassificationExpansion,
+    type ClassifyOptions,
+  } from '$lib/ontology';
   import type { InferredPins } from '$lib/inferred-read';
 
   let {
@@ -23,6 +31,7 @@
     onopen,
     href,
     pins,
+    classifyOptions,
   }: {
     target: string;
     graph: string | null;
@@ -34,11 +43,38 @@
     onopen?: (iri: string) => void;
     href?: (iri: string) => string | null;
     pins?: InferredPins;
+    classifyOptions?: ClassifyOptions;
   } = $props();
   const model = new ClassificationFrame(
     () => pins?.classificationId,
     (result) => pins?.acceptClassification(result.resultId) ?? true,
   );
+  let partial = $state(false);
+  let deadline = $state('');
+  let expansion = $state<ClassificationExpansion>('cautious');
+  $effect(() => {
+    if (!classifyOptions) return;
+    const nextPartial = !!classifyOptions.partial;
+    const nextDeadline =
+      classifyOptions.timeoutMs != null && classifyOptions.timeoutMs > 0
+        ? String(Number((classifyOptions.timeoutMs / 1000).toFixed(3)))
+        : '';
+    const nextExpansion = classifyOptions.expansion ?? 'cautious';
+    untrack(() => {
+      partial = nextPartial;
+      deadline = nextDeadline;
+      expansion = nextExpansion;
+    });
+  });
+  const parsedDeadline = $derived(parseDeadlineInput(deadline));
+  function runClassify() {
+    if (parsedDeadline.error) return;
+    void model.classify({
+      partial: partial || undefined,
+      timeoutMs: parsedDeadline.timeoutMs,
+      expansion,
+    });
+  }
   // The read has pinned labels but no proven historical prefix map. Rendering
   // preferences therefore fall back to the complete IRI outside label mode.
   const display = (row: ClassificationName) =>
@@ -93,6 +129,9 @@
   ]);
   const result = $derived(model.reply?.result);
   const outcome = $derived(model.reply?.outcome);
+  const consistency = $derived(
+    outcome ? consistencyInfo(outcome.consistency, undefined, outcome.partial) : null,
+  );
   const finished = $derived(
     ['parents', 'equivalents'].every((p) => {
       const page = model.parts[p as ClassificationPart];
@@ -100,6 +139,44 @@
     }),
   );
 </script>
+
+{#snippet classifyForm(buttonLabel: string)}
+  <div class="classify-controls">
+    <label
+      class="check"
+      title="Return proved subsumptions if the deadline stops a disjunctive classification"
+    >
+      <input type="checkbox" bind:checked={partial} />
+      Allow partial
+    </label>
+    <label class="field">
+      <span>Deadline (s)</span>
+      <input
+        class="input sm"
+        type="text"
+        inputmode="decimal"
+        size="6"
+        placeholder="No limit"
+        aria-label="Frame classification deadline in seconds"
+        aria-invalid={!!parsedDeadline.error}
+        bind:value={deadline}
+      />
+    </label>
+    <label class="field">
+      <span>Expansion</span>
+      <select class="select sm" aria-label="Frame expansion strategy" bind:value={expansion}>
+        <option value="cautious">Cautious</option>
+        <option value="eager">Eager</option>
+      </select>
+    </label>
+    <button
+      class="btn sm ghost"
+      disabled={model.computing || model.loading || !!parsedDeadline.error}
+      onclick={runClassify}>{buttonLabel}</button
+    >
+  </div>
+  {#if parsedDeadline.error}<p class="note error" role="alert">{parsedDeadline.error}</p>{/if}
+{/snippet}
 
 <section class="classified-frame" aria-label="Inferred class axioms" aria-live="polite">
   <div class="heading">
@@ -130,11 +207,28 @@
         : model.reply.reason === 'unsupportedScope'
           ? 'This view does not share a kept classification.'
           : 'No kept classification is available for this source.'}
-      <button class="btn sm ghost" disabled={model.computing} onclick={() => void model.classify()}
-        >Classify</button
-      >
     </p>
+    {@render classifyForm('Classify')}
   {:else if result && outcome}
+    <div class="status-row" role="status">
+      <span class="status-badge">{outcome.tier.toUpperCase()}</span>
+      {#if outcome.partial}
+        <span class="status-badge warn"
+          >Partial · {fmtCount(outcome.incompleteCount, 'open class', 'open classes')}</span
+        >
+      {/if}
+      {#if consistency}
+        <span
+          class="status-badge"
+          class:ok={consistency.tone === 'ok'}
+          class:warn={consistency.tone === 'warn'}
+          class:danger={consistency.tone === 'danger'}>{consistency.label}</span
+        >
+      {/if}
+      {#if model.reply?.entity?.incomplete}
+        <span class="status-badge warn">Open class</span>
+      {/if}
+    </div>
     <p class="provenance">
       Classified commit {result.classifiedCommit} · {outcome.tier.toUpperCase()} · {outcome.consistency}
     </p>
@@ -154,14 +248,14 @@
       {#if model.reply?.entity?.unsatisfiable}<p class="note error">
           This class is unsatisfiable.
         </p>{/if}
-      {#if outcome.consistency === 'unknown'}<p class="note">
+      {#if outcome.consistency === 'unknown'}<p class="note warn" role="status">
           {outcome.partial
             ? 'Consistency is unknown because the classification stopped before deciding it.'
             : 'Consistency is unknown.'}
         </p>{/if}
-      {#if model.reply?.entity?.incomplete}<p class="note">
+      {#if model.reply?.entity?.incomplete}<p class="note warn" role="status">
           {outcome.partial
-            ? 'This class is incomplete in this partial classification and may miss inferred clauses.'
+            ? 'This class is left open in this partial classification and may miss inferred clauses.'
             : outcome.excludedCount > 0 || outcome.unmappedCount > 0
               ? 'This class is incomplete because the classification excluded or could not map part of the input, and may miss inferred clauses.'
               : 'This class is incomplete and may miss inferred clauses.'}
@@ -188,6 +282,7 @@
                       onclick={() => onopen?.(row.iri)}>{display(row)}</button
                     >{:else}<span title={row.iri}>{display(row)}</span>{/if}
                   <span class="badge">Inferred</span>
+                  {#if row.incomplete}<span class="badge warn">Open</span>{/if}
                   {#if (row.equivalenceCount ?? 0) > 1}<span class="note"
                       >parent group of {row.equivalenceCount} equivalent classes</span
                     >{/if}
@@ -215,9 +310,9 @@
         <p class="note">No additional direct named-class clauses beyond the asserted frame.</p>
       {/if}
     {/if}
-    {#if outcome.partial}<p class="note">
-        This is a partial classification. It can miss clauses for {outcome.incompleteCount} incomplete
-        classes.
+    {#if outcome.partial}<p class="note warn" role="status">
+        This is a partial classification ({outcome.tier.toUpperCase()}). It leaves
+        {fmtCount(outcome.incompleteCount, 'class', 'classes')} open and can miss clauses for them.
       </p>{/if}
     {#if !outcome.complete && !outcome.partial && outcome.excludedCount > 0}<p class="note">
         The {outcome.tier.toUpperCase()} classification omitted or partly used {outcome.excludedCount}
@@ -231,6 +326,10 @@
     {#if model.isolated}<p class="note">
         This explicit result belongs to this view and is not retained for shared reads.
       </p>{/if}
+    <details class="reclassify">
+      <summary>Classify with deadline or partial options</summary>
+      {@render classifyForm('Classify')}
+    </details>
     <details>
       <summary>Classification source and coverage</summary>
       <p class="note">
@@ -324,6 +423,58 @@
   }
   .error {
     color: var(--danger);
+  }
+  .warn {
+    color: var(--warn);
+  }
+  .status-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 0.4rem 0 0.25rem;
+  }
+  .status-badge {
+    font-size: 0.72rem;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--surface-2, var(--hover));
+    color: var(--text-2);
+    font-weight: 500;
+  }
+  .status-badge.ok {
+    color: var(--ok);
+    background: var(--ok-soft);
+  }
+  .status-badge.warn {
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+  }
+  .status-badge.danger {
+    color: var(--danger);
+    background: var(--danger-soft);
+  }
+  .classify-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 0.75rem;
+    margin: 0.4rem 0;
+    font-size: 0.8rem;
+  }
+  .classify-controls .check,
+  .classify-controls .field {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    color: var(--text-2);
+  }
+  .reclassify {
+    margin: 0.5rem 0;
+    font-size: 0.85rem;
+  }
+  .badge.warn {
+    color: var(--warn);
   }
   .clause {
     margin-block: 0.75rem;

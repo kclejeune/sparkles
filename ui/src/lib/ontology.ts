@@ -234,14 +234,109 @@ export type Classification = {
   stats: { incremental: boolean; saturationMs: number; unmapped?: number };
 };
 
+export type ClassificationExpansion = 'cautious' | 'eager';
+
+export type ClassifyOptions = {
+  /** Ask the disjunctive classifier to return proved subsumptions when a deadline stops it. */
+  partial?: boolean;
+  /** Optional deadline in milliseconds, sent to the HTTP API as `?timeout=<seconds>`. */
+  timeoutMs?: number;
+  /** Disjunctive expansion strategy (`cautious` by default or `eager`). */
+  expansion?: ClassificationExpansion;
+};
+
+/** Format a positive millisecond deadline as a positive seconds string for `?timeout=`. */
+export function formatTimeoutSeconds(timeoutMs: number | undefined): string | undefined {
+  if (timeoutMs == null || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return undefined;
+  const secs = timeoutMs / 1000;
+  return secs >= 0.001 ? String(Number(secs.toFixed(3))) : String(secs);
+}
+
 /**
- * The Workbench heading's note on a classification: its tier when it is complete, and
- * otherwise what it left out, the excluded axioms and the triples of the input that map
- * to no axiom, either of which can make it incomplete.
+ * Parse a Workbench deadline input (in seconds, or with an explicit `ms` / `s` suffix).
+ * Blank input means no deadline.
+ */
+export function parseDeadlineInput(text: string): { timeoutMs?: number; error?: string } {
+  const raw = text.trim();
+  if (!raw) return {};
+  const match = /^([0-9]+(?:\.[0-9]+)?|\.[0-9]+)\s*(ms|s)?$/i.exec(raw);
+  if (!match) return { error: 'Enter a positive deadline in seconds (for example, 5 or 0.5).' };
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0)
+    return { error: 'Deadline must be greater than zero.' };
+  const unit = (match[2] ?? 's').toLowerCase();
+  const timeoutMs = unit === 'ms' ? value : value * 1000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+    return { error: 'Deadline must be greater than zero.' };
+  return { timeoutMs };
+}
+
+export type ConsistencyState = 'consistent' | 'inconsistent' | 'unknown';
+
+/** Resolve and describe classification consistency, keeping `unknown` distinct from both verdicts. */
+export function consistencyInfo(
+  consistency: Classification['consistency'],
+  consistent?: boolean,
+  partial?: boolean,
+): { state: ConsistencyState; label: string; tone: 'ok' | 'danger' | 'warn'; detail: string } {
+  const state: ConsistencyState =
+    consistency ?? (consistent === false ? 'inconsistent' : 'consistent');
+  if (state === 'inconsistent')
+    return {
+      state,
+      label: 'Inconsistent',
+      tone: 'danger',
+      detail: 'The ontology is inconsistent, so every class is unsatisfiable.',
+    };
+  if (state === 'unknown')
+    return {
+      state,
+      label: 'Consistency unknown',
+      tone: 'warn',
+      detail: partial
+        ? 'Consistency is unknown because the classification stopped before deciding it.'
+        : 'Consistency is unknown, since the classification left out part of the input.',
+    };
+  return {
+    state,
+    label: 'Consistent',
+    tone: 'ok',
+    detail: 'The ontology is consistent.',
+  };
+}
+
+/** Visual badge and tone for a taxonomy node `n:<node>` in the inferred class tree. */
+export function inferredNodeStatus(
+  id: string,
+  classesOf: Map<string, string[]>,
+  incomplete: ReadonlySet<string>,
+): { badge: string | null; tone: 'danger' | 'warn' | null; open: boolean; unsatisfiable: boolean } {
+  const unsatisfiable = id === 'n:1';
+  const classes = classesOf.get(id) ?? [];
+  const open = classes.some((c) => incomplete.has(c));
+  if (unsatisfiable && open)
+    return { badge: 'unsatisfiable · open', tone: 'danger', open: true, unsatisfiable: true };
+  if (unsatisfiable)
+    return { badge: 'unsatisfiable', tone: 'danger', open: false, unsatisfiable: true };
+  if (open) return { badge: 'open', tone: 'warn', open: true, unsatisfiable: false };
+  return { badge: null, tone: null, open: false, unsatisfiable: false };
+}
+
+/**
+ * The Workbench heading's note on a classification: its tier when it is complete, its
+ * partial status, tier and open-class count when stopped early, and otherwise what it
+ * left out, the excluded axioms and the triples of the input that map to no axiom.
  */
 export function classificationNote(c: Classification): string {
   if (c.complete) return `${c.tier?.toUpperCase() ?? 'Classification'} · commit ${c.commit}`;
   const parts: string[] = [];
+  if (c.partial) {
+    parts.push('Partial');
+    if (c.tier) parts.push(c.tier.toUpperCase());
+    const open = c.incompleteCount ?? c.incomplete?.length ?? 0;
+    if (open > 0) parts.push(fmtCount(open, 'open class', 'open classes'));
+    if (c.consistency === 'unknown') parts.push('consistency unknown');
+  }
   if (c.excludedCount > 0) parts.push(fmtCount(c.excludedCount, 'omitted or partly used axiom'));
   const unmapped = c.stats?.unmapped ?? 0;
   if (unmapped > 0) parts.push(`${fmtCount(unmapped, 'triple')} mapping to no axiom`);
@@ -602,24 +697,39 @@ export async function classifyOntology(
   sel: Selection,
   signal?: AbortSignal,
   at?: string,
+  options?: ClassifyOptions,
 ): Promise<Classification> {
   // This legacy full-tree action is explicit. Unlike bounded frame GET pages, its
   // later POST pages may compute again if no result is retained. Pin their inputs
   // and compare actual immutable content rather than per-computation UUIDs.
   const input = { graph: sel.graph, imports: sel.imports };
+  const timeoutSec = formatTimeoutSeconds(options?.timeoutMs);
+  const partialRequested = !!options?.partial;
   let selected = at;
   let offset = 0;
   let first: Classification | null = null;
   for (;;) {
-    const query = selected ? '?' + new URLSearchParams({ at: selected }) : '';
+    const params = new URLSearchParams();
+    if (selected) params.set('at', selected);
+    if (timeoutSec) params.set('timeout', timeoutSec);
+    const query = params.size ? '?' + params : '';
+    const payload: Record<string, unknown> = {
+      ...selBody(input),
+      nodes: true,
+      limit: 10_000,
+      offset,
+    };
+    if (partialRequested) payload.partial = true;
+    if (options?.expansion) payload.expansion = options.expansion;
     const res = await request(`/$/ontology/${enc(target)}/classify${query}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ ...selBody(input), nodes: true, limit: 10_000, offset }),
+      body: JSON.stringify(payload),
       signal,
     });
     const j = await readJson<Classification & { next?: number; offset?: number }>(res);
-    if (j.partial) throw new Error('A partial classification cannot fill the inferred tree.');
+    if (j.partial && !partialRequested)
+      throw new Error('A partial classification cannot fill the inferred tree.');
     const source = j.classificationSource;
     if (!source?.inputFingerprint || !source.contentFingerprint || source.commit !== j.commit)
       throw new Error('The classification has no stable source and content identity.');
@@ -629,10 +739,14 @@ export async function classifyOntology(
       if (selected?.startsWith('commit:') && j.commit !== Number(selected.slice(7)))
         throw new Error('The classification changed the requested commit.');
       first = { ...j, nodes: [...j.nodes] };
+      // Partial runs are not retained on the server, so a later page would run anew
+      // and could stop at a different state. Keep the first page and mark truncation.
+      if (j.partial) return j.next != null ? { ...first, nodesTruncated: true } : first;
       selected = `commit:${j.commit}`;
     } else {
       const before = first.classificationSource!;
       if (
+        j.partial ||
         j.commit !== first.commit ||
         source.boundStoreId !== before.boundStoreId ||
         source.familyId !== before.familyId ||
