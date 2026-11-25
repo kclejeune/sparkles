@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
+import * as http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startServer, stopServer } from '../../../ui/scripts/server-process.mjs';
+import { fetchLocal, startServer, stopServer } from '../../../ui/scripts/server-process.mjs';
 import { SparklesClient, factory, BudgetExceededError, ConflictError } from '../dist/index.js';
 
 const binary = process.env.SPARKLES_CLIENT_TEST_SERVER_BIN;
@@ -12,6 +14,21 @@ test(
   { skip: !binary, timeout: 30_000 },
   async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sparkles-client-server-'));
+    const proxyRequests = [];
+    const proxy = http.createServer((request, response) => {
+      proxyRequests.push(request.url);
+      response.writeHead(502).end();
+    });
+    proxy.on('connect', (request, socket) => {
+      proxyRequests.push(request.url);
+      socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+    });
+    proxy.listen(0, '127.0.0.1');
+    await once(proxy, 'listening');
+    const restoreProxy = http.setGlobalProxyFromEnv?.({
+      http_proxy: `http://127.0.0.1:${proxy.address().port}`,
+      no_proxy: 'localhost',
+    });
     let server;
     try {
       const { child, url: base } = await startServer(
@@ -39,7 +56,7 @@ test(
         { timeout: 15_000 },
       );
       server = child;
-      const client = new SparklesClient(base),
+      const client = new SparklesClient(base, { fetch: fetchLocal }),
         main = client.dataset('wiki');
       const inserted = await main.update('INSERT DATA { ex:s ex:p "héllo"@fr }', {
         prefixes: { ex: 'urn:' },
@@ -110,7 +127,10 @@ test(
       assert(await client.dataset('wiki', 'renamed').ask('ASK { <urn:t> <urn:p> 2 }'));
     } finally {
       if (server) await stopServer(server);
+      restoreProxy?.();
+      proxy.close();
       await rm(directory, { recursive: true, force: true });
+      assert.deepEqual(proxyRequests, []);
     }
   },
 );

@@ -732,7 +732,10 @@ run = "pnpm --dir js build"
 
 [tasks."node:test"]
 # The remote client's tests run against a debug server, so every Rust input counts.
-sources = ["@group:rust", "@group:js", "scripts/node-native.sh", "ui/scripts/server-process.mjs"]
+sources = [
+  "@group:rust", "@group:js", "scripts/node-native.sh",
+  "ui/scripts/ask-stub.mjs", "ui/scripts/seed-design.mjs", "ui/scripts/server-process.mjs",
+]
 outputs = []
 tools = { node = "24" }
 description = "Test Node bindings, remote client and transaction/lifecycle contracts, with the remote client's tests against a debug server"

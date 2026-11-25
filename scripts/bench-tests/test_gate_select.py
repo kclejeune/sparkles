@@ -152,6 +152,8 @@ class Selection(unittest.TestCase):
             "crates/sparkles-ffi/src/lib.rs": ["jvm:lint", "jvm:rust-test", "jvm:test"],
             "js/client/src/x.ts": ["node:fmt:check", "node:lint", "node:test", "node:client:check"],
             "crates/sparkles-node/src/lib.rs": ["node:fmt:check", "node:lint", "node:test", "node:client:check"],
+            "ui/scripts/seed-design.mjs": gs.GROUPS["node"],
+            "ui/scripts/ask-stub.mjs": gs.GROUPS["node"],
         }
         binding = {t for ts in cases.values() for t in ts}
         for f, want in cases.items():

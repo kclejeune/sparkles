@@ -2,13 +2,73 @@
 
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { appendFileSync, closeSync, openSync, readFileSync } from 'node:fs';
-import { Agent, get } from 'node:http';
+import { closeSync, openSync, readFileSync, writeSync } from 'node:fs';
+import { Agent, get, request } from 'node:http';
+import { pipeline, Readable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const direct = new Agent();
 const record =
   /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z +INFO sparkles: Sparkles \S+ listening on (http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4}))\/ \(UI at \/ui\/\), opening [0-9]+ datasets\r?\n/gm;
+
+/**
+ * Send a request directly to the local server and return redirects to the caller.
+ * @param {Request} input
+ * @returns {Promise<Response>}
+ */
+export async function fetchLocal(input) {
+  const url = new URL(input.url);
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1') {
+    throw new Error(`Expected a local Sparkles URL, got ${url}`);
+  }
+  return new Promise((resolve, reject) => {
+    const outgoing = request(
+      url,
+      {
+        agent: direct,
+        method: input.method,
+        headers: Object.fromEntries(input.headers),
+        signal: input.signal,
+      },
+      (incoming) => {
+        const headers = new Headers();
+        for (let i = 0; i < incoming.rawHeaders.length; i += 2) {
+          headers.append(incoming.rawHeaders[i], incoming.rawHeaders[i + 1]);
+        }
+        const status = incoming.statusCode;
+        const empty = input.method === 'HEAD' || status === 204 || status === 205 || status === 304;
+        if (empty) incoming.resume();
+        const body = empty
+          ? null
+          : Readable.toWeb(incoming, {
+              strategy: {
+                highWaterMark: incoming.readableHighWaterMark,
+                size: (chunk) => chunk.length,
+              },
+            });
+        resolve(
+          // Node fetch and node:stream/web use the same Web streams at runtime.
+          new Response(/** @type {BodyInit | null} */ (/** @type {unknown} */ (body)), {
+            headers,
+            status,
+            statusText: incoming.statusMessage,
+          }),
+        );
+      },
+    );
+    outgoing.once('error', reject);
+    if (input.body) {
+      const body = /** @type {import('node:stream/web').ReadableStream<Uint8Array>} */ (
+        /** @type {unknown} */ (input.body)
+      );
+      pipeline(Readable.fromWeb(body), outgoing, (error) => {
+        if (error) reject(error);
+      });
+    } else {
+      outgoing.end();
+    }
+  });
+}
 
 /** @param {string} output */
 function listenerUrl(output) {
@@ -28,13 +88,22 @@ function assertRunning(child) {
  * @param {number} graceMs
  */
 export async function stopServer(child, graceMs = 10_000) {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-  const exited = new Promise((resolve) => child.once('exit', resolve));
-  child.kill('SIGTERM');
-  const timer = setTimeout(() => child.kill('SIGKILL'), graceMs);
-  try {
-    await exited;
-  } finally {
+  if (child.pid && child.exitCode === null && child.signalCode === null) {
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    child.kill('SIGTERM');
+    const timer = setTimeout(() => child.kill('SIGKILL'), graceMs);
+    try {
+      await exited;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  // Drain final diagnostics, with a deadline in case a descendant inherited the pipe.
+  const stderr = child.stderr;
+  if (stderr && !stderr.closed) {
+    const drained = new Promise((resolve) => stderr.once('close', resolve));
+    const timer = setTimeout(() => stderr.destroy(), graceMs);
+    await drained;
     clearTimeout(timer);
   }
 }
@@ -83,10 +152,10 @@ export async function startServer(bin, args, log, options = {}) {
     stdio: ['ignore', echo ? 'inherit' : out, echo ? 'pipe' : out],
     env: { ...process.env, RUST_LOG: 'info', NO_COLOR: '1' },
   });
-  closeSync(out);
+  let captureLog = echo;
   if (echo) {
     child.stderr?.on('data', (data) => {
-      appendFileSync(log, data);
+      if (captureLog) writeSync(out, data);
       process.stderr.write(data);
     });
   }
@@ -116,6 +185,8 @@ export async function startServer(bin, args, log, options = {}) {
       { cause: error },
     );
   } finally {
+    captureLog = false;
+    closeSync(out);
     process.off('exit', kill);
   }
 }
@@ -145,9 +216,11 @@ export async function runSeedServer(bin, args, log, timeout, setup) {
       signal: controller.signal,
     });
     child = server.child;
-    const exited = once(child, 'exit');
     await setup(child, server.url);
-    if (!controller.signal.aborted) console.log(`ready ${server.url}`);
+    if (controller.signal.aborted) return;
+    assertRunning(child);
+    const exited = once(child, 'exit');
+    console.log(`ready ${server.url}`);
     const [code, signal] = await exited;
     if (!controller.signal.aborted) throw new Error(`sparkles serve exited with ${signal ?? code}`);
   } catch (error) {

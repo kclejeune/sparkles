@@ -31,7 +31,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { runSeedServer, waitForReady } from './server-process.mjs';
+import { fetchLocal, runSeedServer, waitForReady } from './server-process.mjs';
 
 const ROOT = resolve(import.meta.dirname, '../..');
 const BIN = process.env.SPARKLES_BIN ?? join(ROOT, 'target/debug/sparkles');
@@ -93,12 +93,15 @@ function load(dir, ds, file) {
 }
 
 async function call(url, method, path, body) {
-  const r = await fetch(url + path, {
-    method,
-    headers: body ? { 'content-type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const r = await fetchLocal(
+    new Request(url + path, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  );
   if (!r.ok) throw new Error(`${method} ${path} answered ${r.status}: ${await r.text()}`);
+  await r.body?.cancel();
 }
 
 async function main() {
