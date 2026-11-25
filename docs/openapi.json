@@ -46380,6 +46380,12 @@
                   "type": "string"
                 }
               },
+              "application/rdf-patch+thrift": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "type": "string"
+                }
+              },
               "application/x-sparkles+json": {
                 "schema": {
                   "allOf": [
@@ -46528,9 +46534,14 @@
                     }
                   ]
                 }
+              },
+              "text/rdf-patch": {
+                "schema": {
+                  "type": "string"
+                }
               }
             },
-            "description": "What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report when `dryRun=true`.",
+            "description": "What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report (JSON, or RDF Patch when `Accept` prefers `application/rdf-patch`, `text/rdf-patch`, or `application/rdf-patch+thrift`) when `dryRun=true`.",
             "headers": {
               "Sparkles-Branch": {
                 "description": "The branch, when it is not `main`.",
@@ -46553,6 +46564,25 @@
               "Sparkles-Dataset-Id": {
                 "description": "The dataset id.",
                 "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Dry-Run": {
+                "description": "Present and `true` on dry-run responses.",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Sparkles-Dry-Run-Outcome": {
+                "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.",
+                "schema": {
+                  "enum": [
+                    "commit",
+                    "no-change",
+                    "precondition-failed",
+                    "rejected",
+                    "storage-refused"
+                  ],
                   "type": "string"
                 }
               }
@@ -46649,13 +46679,37 @@
                       "type": "object"
                     },
                     {
+                      "$ref": "#/components/schemas/DryRunReport"
+                    },
+                    {
                       "$ref": "#/components/schemas/Error"
                     }
                   ]
                 }
               }
             },
-            "description": "Pattern evaluation errors (`pattern-errors`) or write validation refusal."
+            "description": "Pattern evaluation errors (`pattern-errors`), write validation refusal, or a dry-run validation rejection report.",
+            "headers": {
+              "Sparkles-Dry-Run": {
+                "description": "Present and `true` on dry-run responses.",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Sparkles-Dry-Run-Outcome": {
+                "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.",
+                "schema": {
+                  "enum": [
+                    "commit",
+                    "no-change",
+                    "precondition-failed",
+                    "rejected",
+                    "storage-refused"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
           },
           "507": {
             "$ref": "#/components/responses/InsufficientStorage"
@@ -47128,7 +47182,7 @@
             "description": "The preview of generated axioms, diff summary, and row diagnostics.",
             "headers": {
               "ETag": {
-                "description": "A weak entity tag naming the commit and ontology import-target digest, reusable as `If-Match` on apply.",
+                "description": "A weak entity tag naming the commit, ontology import-target digest, and dataset prefix digest, reusable as `If-Match` on apply.",
                 "schema": {
                   "type": "string"
                 }

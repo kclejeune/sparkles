@@ -313,21 +313,85 @@ pub fn reports_body(
 /// edit wrote and removed, at most [`MAX_LIMIT`] of each, so that a client can undo the
 /// edit exactly; `axiomsTruncated` says whether a list was cut.
 pub fn edit_body(e: &EditOutcome, r: &Renderer) -> J {
-    let list = |l: &[Axiom]| -> Vec<J> {
-        l.iter()
-            .take(MAX_LIMIT)
-            .map(|a| axiom_json(a, None, r))
-            .collect()
+    edit_body_bounded(e, r, usize::MAX)
+}
+
+/// Like [`edit_body`], additionally capping the serialized JSON byte footprint of
+/// `absent`, `declared`, `addedAxioms`, and `removedAxioms` at `max_bytes` (including the
+/// first rendered entry) and marking `axiomsTruncated` when any entry is omitted.
+pub fn edit_body_bounded(e: &EditOutcome, r: &Renderer, max_bytes: usize) -> J {
+    let mut used = 256usize;
+    let mut truncated = e.added_axioms.len() > MAX_LIMIT || e.removed_axioms.len() > MAX_LIMIT;
+
+    let mut absent = Vec::new();
+    for a in &e.absent {
+        if used >= max_bytes {
+            truncated = true;
+            break;
+        }
+        let s = r.axiom(a);
+        let entry_bytes = serde_json::to_string(&s)
+            .map_or(s.len().saturating_add(2), |j| j.len())
+            .saturating_add(1);
+        if used.saturating_add(entry_bytes) > max_bytes {
+            truncated = true;
+            break;
+        }
+        used = used.saturating_add(entry_bytes);
+        absent.push(s);
+    }
+
+    let mut declared = Vec::new();
+    for d in &e.declared {
+        if used >= max_bytes {
+            truncated = true;
+            break;
+        }
+        let s = r.entity(d);
+        let entry_bytes = serde_json::to_string(&s)
+            .map_or(s.len().saturating_add(2), |j| j.len())
+            .saturating_add(1);
+        if used.saturating_add(entry_bytes) > max_bytes {
+            truncated = true;
+            break;
+        }
+        used = used.saturating_add(entry_bytes);
+        declared.push(s);
+    }
+
+    let mut list_bounded = |l: &[Axiom]| -> Vec<J> {
+        let mut out = Vec::new();
+        for a in l.iter().take(MAX_LIMIT) {
+            if used >= max_bytes {
+                truncated = true;
+                break;
+            }
+            let j = axiom_json(a, None, r);
+            let entry_bytes = serde_json::to_string(&j)
+                .map_or(usize::MAX, |s| s.len())
+                .saturating_add(1);
+            if used.saturating_add(entry_bytes) > max_bytes {
+                truncated = true;
+                break;
+            }
+            used = used.saturating_add(entry_bytes);
+            out.push(j);
+        }
+        out
     };
+
+    let added_axioms = list_bounded(&e.added_axioms);
+    let removed_axioms = list_bounded(&e.removed_axioms);
+
     json!({
         "added": e.added,
         "present": e.present,
         "removed": e.removed,
-        "absent": e.absent.iter().map(|a| r.axiom(a)).collect::<Vec<_>>(),
-        "declared": e.declared.iter().map(|d| r.entity(d)).collect::<Vec<_>>(),
-        "addedAxioms": list(&e.added_axioms),
-        "removedAxioms": list(&e.removed_axioms),
-        "axiomsTruncated": e.added_axioms.len() > MAX_LIMIT || e.removed_axioms.len() > MAX_LIMIT,
+        "absent": absent,
+        "declared": declared,
+        "addedAxioms": added_axioms,
+        "removedAxioms": removed_axioms,
+        "axiomsTruncated": truncated,
         "inserted": e.inserted,
         "deleted": e.deleted,
         "kept": e.kept,

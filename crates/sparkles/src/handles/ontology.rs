@@ -1415,27 +1415,35 @@ impl Ontologies {
     }
 
     /// Acquire the writer lock, check preconditions, protected-branch status and target
-    /// graph write permissions, open the ontology from the writer head snapshot, run
-    /// `build` against that opened ontology to produce the [`EditRequest`] and an extra
-    /// return value, and commit the edit on that exact snapshot.
-    pub fn edit_from_head<T, E, F>(
+    /// graph write permissions, let `prepare_req` populate the head-bound request
+    /// (such as import targets captured under the writer lock), open the ontology from
+    /// the writer head snapshot, run `build` against that opened ontology to produce the
+    /// [`EditRequest`] and an extra return value, and commit the edit on that exact
+    /// snapshot.
+    ///
+    /// For dry runs (`opts.write.dry_run.is_some()`), any failing precondition is checked
+    /// before `build` runs and immediately reported through `txn.commit()` as a coherent
+    /// [`Error::DryRun`] preview with `Outcome::PreconditionFailed`.
+    pub fn edit_from_head<T, E, P, F>(
         &self,
-        req: &OntologyRequest,
+        base_req: &OntologyRequest,
         target_graph: Option<&GraphRef>,
         message: Option<&str>,
         opts: &QueryOptions,
+        prepare_req: P,
         build: F,
     ) -> std::result::Result<(EditOutcome, T), EditFromHeadError<E>>
     where
+        P: FnOnce(&Arc<Snapshot>, &mut OntologyRequest),
         F: FnOnce(&Opened) -> std::result::Result<(EditRequest, T), E>,
     {
-        req.validate().map_err(EditFromHeadError::Store)?;
-        if req.at.is_some() {
+        base_req.validate().map_err(EditFromHeadError::Store)?;
+        if base_req.at.is_some() {
             return Err(EditFromHeadError::Store(Error::invalid(
                 "an edit starts from the head: leave out 'at'",
             )));
         }
-        if req.inferences {
+        if base_req.inferences {
             return Err(EditFromHeadError::Store(Error::invalid(
                 "an edit changes the asserted axioms: leave out 'inferences'",
             )));
@@ -1461,7 +1469,7 @@ impl Ontologies {
         txn.check_protected().map_err(EditFromHeadError::Store)?;
         let target = target_graph
             .cloned()
-            .unwrap_or_else(|| req.graphs()[0].clone());
+            .unwrap_or_else(|| base_req.graphs()[0].clone());
         let target_id = match &target {
             GraphRef::Default => Id::DEFAULT_GRAPH,
             GraphRef::Named(g) => txn
@@ -1474,9 +1482,22 @@ impl Ontologies {
         };
         txn.check_graph_writable(target_id)
             .map_err(EditFromHeadError::Store)?;
+        if txn.is_dry_run()
+            && let Err(pre_err) = txn.check_precondition()
+        {
+            // Report stale preconditions through the normal dry-run commit preview so the
+            // response carries dry-run headers and `outcome: "precondition-failed"` (412)
+            // instead of running `build` against a stale snapshot.
+            return match txn.commit() {
+                Err(e) => Err(EditFromHeadError::Store(e)),
+                Ok(_) => Err(EditFromHeadError::Store(pre_err)),
+            };
+        }
         let head = txn.base().clone();
+        let mut req = base_req.clone();
+        prepare_req(&head, &mut req);
         let o = self
-            .open_at(&head, req, &opts)
+            .open_at(&head, &req, &opts)
             .map_err(EditFromHeadError::Store)?;
         let (edit, extra_val) = build(&o).map_err(EditFromHeadError::Build)?;
         for ax in edit.add.iter().chain(&edit.remove) {
@@ -1488,7 +1509,7 @@ impl Ontologies {
                 txn,
                 head,
                 o,
-                req,
+                &req,
                 &edit,
                 target_id,
                 None,
@@ -1737,24 +1758,20 @@ impl Ontologies {
                 continue;
             }
             // present after the removals above: a form this edit removed is not
-            let mut present = true;
-            for form in ax.normal_forms() {
+            let present = ax.for_each_normal_form(|form| -> Result<bool> {
                 let kept =
-                    if done.get(&form) == Some(&true) {
+                    if done.get(form.as_ref()) == Some(&true) {
                         // removed here, but it may still be read from a graph outside the
                         // scope, or as an assertion this transaction left
-                        o.ontology.axioms.get(&form).is_some_and(|origins| {
+                        o.ontology.axioms.get(form.as_ref()).is_some_and(|origins| {
                             origins.iter().any(|x| !scope.contains(&x.graph))
-                        }) || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some()
+                        }) || assertion_quads(&o, form.as_ref(), &txn, &all_graphs)?.is_some()
                     } else {
-                        o.ontology.contains(&form)
-                            || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some()
+                        o.ontology.contains(form.as_ref())
+                            || assertion_quads(&o, form.as_ref(), &txn, &all_graphs)?.is_some()
                     };
-                if !kept {
-                    present = false;
-                    break;
-                }
-            }
+                Ok(kept)
+            })?;
             if present {
                 outcome.present += 1;
                 continue;
@@ -1885,7 +1902,7 @@ fn encode(
     })
 }
 
-/// Error returned by [`OntologyHandle::edit_from_head`].
+/// Error returned by [`Ontologies::edit_from_head`].
 pub enum EditFromHeadError<E> {
     Store(Error),
     Build(E),
@@ -1894,17 +1911,13 @@ pub enum EditFromHeadError<E> {
 impl Opened {
     /// Whether `ax` is already present in this opened ontology, checking both the loaded
     /// terminology (`self.ontology`) and store-resident ABox assertions on `self.snapshot`
-    /// across all graphs read — matching [`OntologyHandle::edit`].
+    /// across all graphs read — matching [`Ontologies::edit`].
     pub fn contains_axiom(&self, ax: &Axiom) -> Result<bool> {
         let all_graphs: BTreeSet<u32> = (0..self.graphs.len() as u32).collect();
-        for form in ax.normal_forms() {
-            if !self.ontology.contains(&form)
-                && snapshot_assertion_quads(self, &form, &all_graphs, None)?.is_none()
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        ax.for_each_normal_form(|form| {
+            Ok(self.ontology.contains(form.as_ref())
+                || snapshot_assertion_quads(self, form.as_ref(), &all_graphs, None)?.is_some())
+        })
     }
 }
 

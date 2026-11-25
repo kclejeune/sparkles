@@ -430,6 +430,10 @@ pub struct AppState {
     pub graphql_limits: sparkles_graphql::plan::Limits,
     /// Per-request budgets.
     pub limits: Limits,
+    /// Optional test-only override for ontology pattern evaluation limits and response
+    /// byte ceiling (`(Limits, max_response_bytes)`).
+    #[cfg(all(test, feature = "ontology"))]
+    pub(crate) pattern_test_limits: Mutex<Option<(sparkles::owl::patterns::Limits, usize)>>,
     /// Emit one `sparkles::access` event per request.
     pub access_log: bool,
     pub metrics: crate::obs::Metrics,
@@ -837,6 +841,8 @@ impl AppState {
             watches: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
+            #[cfg(all(test, feature = "ontology"))]
+            pattern_test_limits: Mutex::new(None),
         }
     }
 
@@ -918,6 +924,8 @@ impl AppState {
             gsp_direct_naming: GspDirectNaming::default(),
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
+            #[cfg(all(test, feature = "ontology"))]
+            pattern_test_limits: Mutex::new(None),
         }
     }
 

@@ -21374,7 +21374,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report when `dryRun=true`. */
+            /** @description What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report (JSON, or RDF Patch when `Accept` prefers `application/rdf-patch`, `text/rdf-patch`, or `application/rdf-patch+thrift`) when `dryRun=true`. */
             200: {
                 headers: {
                     /** @description The branch, when it is not `main`. */
@@ -21385,6 +21385,10 @@ export interface operations {
                     "Sparkles-Commit"?: number;
                     /** @description The dataset id. */
                     "Sparkles-Dataset-Id"?: string;
+                    /** @description Present and `true` on dry-run responses. */
+                    "Sparkles-Dry-Run"?: boolean;
+                    /** @description The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses. */
+                    "Sparkles-Dry-Run-Outcome"?: "commit" | "no-change" | "precondition-failed" | "rejected" | "storage-refused";
                     [name: string]: unknown;
                 };
                 content: {
@@ -21432,6 +21436,7 @@ export interface operations {
                         }[];
                     } | components["schemas"]["DryRunReport"];
                     "application/rdf-patch": string;
+                    "application/rdf-patch+thrift": string;
                     "application/x-sparkles+json": components["schemas"]["Receipt"] & {
                         absent?: string[];
                         added?: number;
@@ -21475,6 +21480,7 @@ export interface operations {
                             type?: string;
                         }[];
                     };
+                    "text/rdf-patch": string;
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -21484,9 +21490,13 @@ export interface operations {
             408: components["responses"]["Timeout"];
             412: components["responses"]["PreconditionFailed"];
             413: components["responses"]["PayloadTooLarge"];
-            /** @description Pattern evaluation errors (`pattern-errors`) or write validation refusal. */
+            /** @description Pattern evaluation errors (`pattern-errors`), write validation refusal, or a dry-run validation rejection report. */
             422: {
                 headers: {
+                    /** @description Present and `true` on dry-run responses. */
+                    "Sparkles-Dry-Run"?: boolean;
+                    /** @description The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses. */
+                    "Sparkles-Dry-Run-Outcome"?: "commit" | "no-change" | "precondition-failed" | "rejected" | "storage-refused";
                     [name: string]: unknown;
                 };
                 content: {
@@ -21507,7 +21517,7 @@ export interface operations {
                         rowsProcessed: number;
                         rowsSkipped: number;
                         rowsWithErrors: number;
-                    } | components["schemas"]["Error"];
+                    } | components["schemas"]["DryRunReport"] | components["schemas"]["Error"];
                 };
             };
             507: components["responses"]["InsufficientStorage"];
@@ -21612,7 +21622,7 @@ export interface operations {
             /** @description The preview of generated axioms, diff summary, and row diagnostics. */
             200: {
                 headers: {
-                    /** @description A weak entity tag naming the commit and ontology import-target digest, reusable as `If-Match` on apply. */
+                    /** @description A weak entity tag naming the commit, ontology import-target digest, and dataset prefix digest, reusable as `If-Match` on apply. */
                     ETag?: string;
                     /** @description The branch, when it is not `main`. */
                     "Sparkles-Branch"?: string;

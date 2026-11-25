@@ -6915,6 +6915,20 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
+    /// Whether this transaction is running as a dry-run preview.
+    pub fn is_dry_run(&self) -> bool {
+        self.opts.dry_run.is_some()
+    }
+
+    /// Check this transaction's precondition (`If-Match` / `If-None-Match`) against its
+    /// base snapshot under the held writer lock.
+    pub fn check_precondition(&self) -> Result<()> {
+        if let Some(p) = &self.opts.precondition {
+            p.check(&self.base)?;
+        }
+        Ok(())
+    }
+
     /// Let this transaction change the managed graphs of the capability's owner (see
     /// [`crate::managed`]), before it changes anything. A transaction that started
     /// from a speculative group-commit state waits for that state to be durable and

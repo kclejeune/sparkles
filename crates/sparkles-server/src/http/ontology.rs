@@ -25,8 +25,8 @@ use sparkles_reasoner::inputs::{GraphRef, ImportMode};
 
 pub(crate) use onto::wire::{
     AxiomQuery, ClassifyQuery, DEFAULT_LIMIT, MAX_LIMIT, SummaryView, axiom_page, check_body,
-    classify_body, diff_body, diff_lines, edit_body, expansion_of, head_body, mentioned, page_body,
-    summary_body,
+    classify_body, diff_body, diff_lines, edit_body, edit_body_bounded, expansion_of, head_body,
+    mentioned, page_body, summary_body,
 };
 
 fn bad(m: impl Into<String>) -> ApiError {

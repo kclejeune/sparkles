@@ -1396,9 +1396,24 @@ fn ontology(p: &mut Paths) {
     if let Some(m) = preview_headers.as_object_mut() {
         m.insert(
             "ETag".into(),
-            json!({ "description": "A weak entity tag naming the commit and ontology import-target digest, reusable as `If-Match` on apply.", "schema": { "type": "string" } }),
+            json!({ "description": "A weak entity tag naming the commit, ontology import-target digest, and dataset prefix digest, reusable as `If-Match` on apply.", "schema": { "type": "string" } }),
         );
     }
+    let mut apply_headers = commit_headers();
+    if let Some(m) = apply_headers.as_object_mut() {
+        m.insert(
+            "Sparkles-Dry-Run".into(),
+            json!({ "description": "Present and `true` on dry-run responses.", "schema": { "type": "boolean" } }),
+        );
+        m.insert(
+            "Sparkles-Dry-Run-Outcome".into(),
+            json!({ "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.", "schema": { "type": "string", "enum": ["commit", "no-change", "precondition-failed", "rejected", "storage-refused"] } }),
+        );
+    }
+    let dry_run_headers = json!({
+        "Sparkles-Dry-Run": { "description": "Present and `true` on dry-run responses.", "schema": { "type": "boolean" } },
+        "Sparkles-Dry-Run-Outcome": { "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.", "schema": { "type": "string", "enum": ["commit", "no-change", "precondition-failed", "rejected", "storage-refused"] } }
+    });
     let pattern_apply_ok = json!({
         "type": "object",
         "properties": {
@@ -1533,19 +1548,22 @@ fn ontology(p: &mut Paths) {
             )
             .resp_h(
                 "200",
-                "What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report when `dryRun=true`.",
+                "What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report (JSON, or RDF Patch when `Accept` prefers `application/rdf-patch`, `text/rdf-patch`, or `application/rdf-patch+thrift`) when `dryRun=true`.",
                 Some(json!({
                     "application/json": { "schema": { "anyOf": [pattern_apply_ok.clone(), sref("DryRunReport")] } },
                     "application/x-sparkles+json": { "schema": { "allOf": [sref("Receipt"), pattern_apply_ok] } },
-                    "application/rdf-patch": { "schema": { "type": "string" } }
+                    "application/rdf-patch": text(),
+                    "text/rdf-patch": text(),
+                    "application/rdf-patch+thrift": binary()
                 })),
-                commit_headers(),
+                apply_headers,
             )
             .errors(&[400, 403, 404, 408, 412, 413, 507])
-            .resp(
+            .resp_h(
                 "422",
-                "Pattern evaluation errors (`pattern-errors`) or write validation refusal.",
-                Some(json!({ "application/json": { "schema": { "anyOf": [pattern_errors, sref("Error")] } } })),
+                "Pattern evaluation errors (`pattern-errors`), write validation refusal, or a dry-run validation rejection report.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [pattern_errors, sref("DryRunReport"), sref("Error")] } } })),
+                dry_run_headers,
             ),
     );
     p.add(

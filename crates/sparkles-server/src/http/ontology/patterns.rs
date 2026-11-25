@@ -11,21 +11,243 @@
 //!   preview parity.
 
 use super::*;
-use sparkles::handles::ontology::EditFromHeadError;
-use sparkles::owl::manchester;
+use sparkles::handles::ontology::{EditFromHeadError, ImportTargets, Opened};
+use sparkles::owl::manchester::{self, Vocabulary};
 use sparkles::owl::patterns::{
     self, CancelReason, ColumnDeclaration, ColumnDirective, Delimiter, EvalError, Limits,
     PatternResult, PatternRule, PatternSpec, PatternSyntax, RuleAnnotation, TemplateMode,
 };
-use sparkles::owl::{Axiom, Entity, EntityKind, write as owl_write};
+use sparkles::owl::{Entity, EntityKind, write as owl_write};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const DEFAULT_PREVIEW_LIMIT: usize = 200;
 const MAX_PREVIEW_LIMIT: usize = 2_000;
-/// Maximum approximate serialized bytes accumulated across rendered preview axioms.
-const MAX_PREVIEW_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum serialized JSON bytes accumulated across preview or apply responses.
+const MAX_PATTERN_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(test)]
+fn pattern_limits_and_response_cap(st: &AppState) -> (Limits, usize) {
+    st.pattern_test_limits
+        .lock()
+        .unwrap_or((Limits::default(), MAX_PATTERN_RESPONSE_BYTES))
+}
+
+#[cfg(not(test))]
+fn pattern_limits_and_response_cap(_st: &AppState) -> (Limits, usize) {
+    (Limits::default(), MAX_PATTERN_RESPONSE_BYTES)
+}
+
+/// Snapshot of mutable resolution metadata (import targets + dataset prefixes) captured
+/// once so precondition checking, ontology opening, vocabulary construction, and dry-run
+/// reporting all observe the exact same resolution context.
+#[derive(Clone)]
+struct PatternResolutionContext {
+    import_targets: ImportTargets,
+    prefixes: BTreeMap<String, String>,
+    import_digest: Option<String>,
+    pattern_digest: String,
+}
+
+fn pattern_context_digest(
+    imports_mode: ImportMode,
+    import_targets: &ImportTargets,
+    prefixes: &BTreeMap<String, String>,
+) -> String {
+    // Deterministic FNV-1a 64-bit hash over imports mode, import targets, and sorted prefixes.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |s: &str| {
+        for b in s.bytes().chain([0xff]) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    match imports_mode {
+        ImportMode::None => eat("none"),
+        ImportMode::Dataset | ImportMode::Fetch => {
+            eat("dataset");
+            if !import_targets.is_empty() {
+                eat(&format!("{:016x}", import_targets.digest()));
+            }
+        }
+    }
+    eat("prefixes");
+    for (k, v) in prefixes {
+        eat(k);
+        eat(v);
+    }
+    format!("{h:016x}")
+}
+
+fn capture_resolution_context(
+    st: &AppState,
+    ds: &Arc<Dataset>,
+    imports_mode: ImportMode,
+) -> PatternResolutionContext {
+    let import_targets = if imports_mode == ImportMode::None {
+        ImportTargets::default()
+    } else {
+        imports::targets(st, ds)
+    };
+    let prefixes = ds.store.prefixes();
+    let import_digest = (imports_mode != ImportMode::None && !import_targets.is_empty())
+        .then(|| format!("{:016x}", import_targets.digest()));
+    let pattern_digest = pattern_context_digest(imports_mode, &import_targets, &prefixes);
+    PatternResolutionContext {
+        import_targets,
+        prefixes,
+        import_digest,
+        pattern_digest,
+    }
+}
+
+fn capture_resolution_context_once(
+    slot: &parking_lot::Mutex<Option<PatternResolutionContext>>,
+    st: &AppState,
+    ds: &Arc<Dataset>,
+    imports_mode: ImportMode,
+) -> PatternResolutionContext {
+    let mut guard = slot.lock();
+    if let Some(existing) = guard.as_ref() {
+        return existing.clone();
+    }
+    let fresh = capture_resolution_context(st, ds, imports_mode);
+    *guard = Some(fresh.clone());
+    fresh
+}
+
+struct PlannedPatternWrite {
+    new_indices: Vec<usize>,
+    statuses: Vec<&'static str>,
+    existing_count: usize,
+    auto_declarations: Vec<Entity>,
+    estimated_triples: usize,
+}
+
+enum PlanError {
+    Cancel(CancelReason),
+    Ontology(Error),
+    TripleLimit(String),
+}
+
+/// Shared planning and pre-allocation budget boundary used by BOTH `preview()` and
+/// `apply()` (including `dryRun=true`). Computes exact new vs existing axioms,
+/// auto-declarations, and zero-allocation projected RDF triple + byte costs before
+/// materializing any triples or response payloads.
+fn plan_pattern_write(
+    opened: &Opened,
+    result: &PatternResult,
+    declare: bool,
+    limits: &Limits,
+    cancel_fn: &mut dyn FnMut() -> Result<(), CancelReason>,
+) -> std::result::Result<PlannedPatternWrite, PlanError> {
+    let mut new_indices: Vec<usize> = Vec::new();
+    let mut existing_count = 0usize;
+    let mut statuses: Vec<&'static str> = Vec::with_capacity(result.axioms.len());
+    for (i, item) in result.axioms.iter().enumerate() {
+        if i.is_multiple_of(64) {
+            cancel_fn().map_err(PlanError::Cancel)?;
+        }
+        let present = opened
+            .contains_axiom(&item.axiom)
+            .map_err(PlanError::Ontology)?;
+        if present {
+            existing_count += 1;
+            statuses.push("existing");
+        } else {
+            new_indices.push(i);
+            statuses.push("new");
+        }
+    }
+
+    let auto_declarations: Vec<Entity> = if declare {
+        let declared_existing: HashSet<&Entity> = opened
+            .ontology
+            .axiom_set()
+            .filter_map(|a| match &a.kind {
+                sparkles::owl::AxiomKind::Declaration(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        let mut auto = BTreeSet::new();
+        for (i, &idx) in new_indices.iter().enumerate() {
+            if i.is_multiple_of(64) {
+                cancel_fn().map_err(PlanError::Cancel)?;
+            }
+            let ax = &result.axioms[idx].axiom;
+            if matches!(ax.kind, sparkles::owl::AxiomKind::Declaration(_)) {
+                continue;
+            }
+            for e in ax.signature() {
+                if e.is_builtin()
+                    || declared_existing.contains(&e)
+                    || e.kind() == EntityKind::NamedIndividual
+                {
+                    continue;
+                }
+                auto.insert(e);
+            }
+        }
+        for &idx in &new_indices {
+            if let sparkles::owl::AxiomKind::Declaration(e) = &result.axioms[idx].axiom.kind {
+                auto.remove(e);
+            }
+        }
+        auto.into_iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    let max_projected_bytes = limits.max_total_expanded_bytes.saturating_mul(2);
+    let mut estimated_triples = 0usize;
+    let mut estimated_bytes = 0usize;
+    for (i, &idx) in new_indices.iter().enumerate() {
+        if i.is_multiple_of(64) {
+            cancel_fn().map_err(PlanError::Cancel)?;
+        }
+        let (triples, bytes) = owl_write::axiom_projection_cost(&result.axioms[idx].axiom);
+        estimated_triples = estimated_triples.saturating_add(triples);
+        estimated_bytes = estimated_bytes.saturating_add(bytes);
+        if estimated_triples > limits.max_triples {
+            return Err(PlanError::TripleLimit(format!(
+                "projected RDF triples exceeded the limit of {}",
+                limits.max_triples
+            )));
+        }
+        if estimated_bytes > max_projected_bytes {
+            return Err(PlanError::TripleLimit(format!(
+                "projected RDF payload exceeded the {max_projected_bytes} byte limit"
+            )));
+        }
+    }
+    for (i, e) in auto_declarations.iter().enumerate() {
+        if i.is_multiple_of(64) {
+            cancel_fn().map_err(PlanError::Cancel)?;
+        }
+        estimated_triples = estimated_triples.saturating_add(1);
+        estimated_bytes = estimated_bytes.saturating_add(e.iri().as_str().len().saturating_add(64));
+        if estimated_triples > limits.max_triples {
+            return Err(PlanError::TripleLimit(format!(
+                "projected RDF triples exceeded the limit of {}",
+                limits.max_triples
+            )));
+        }
+        if estimated_bytes > max_projected_bytes {
+            return Err(PlanError::TripleLimit(format!(
+                "projected RDF payload exceeded the {max_projected_bytes} byte limit"
+            )));
+        }
+    }
+
+    Ok(PlannedPatternWrite {
+        new_indices,
+        statuses,
+        existing_count,
+        auto_declarations,
+        estimated_triples,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OnError {
@@ -56,8 +278,11 @@ fn parse_entity_kind(s: &str) -> ApiResult<EntityKind> {
     }
 }
 
-fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiResult<ParsedInput> {
-    let limits = Limits::default();
+fn parse_input(
+    o: &serde_json::Map<String, J>,
+    allow_apply_fields: bool,
+    limits: &Limits,
+) -> ApiResult<ParsedInput> {
     let table_obj = match o.get("table") {
         Some(J::Object(m)) => m,
         _ => return Err(bad("table: an object with 'data' and optional 'format'")),
@@ -638,22 +863,28 @@ pub(crate) async fn preview(
             "graph", "imports", "mode", "table", "spec", "declare", "target", "limit",
         ],
     )?;
-    let req = request_body(&o, request_of(&st, &ds, &params)?)?;
+    let req = request_body(&o, request_params(&params)?)?;
     if req.inferences {
         return Err(bad(
             "pattern preview reads the asserted axioms: leave out 'inferences'",
         ));
     }
-    let parsed = parse_input(&o, false)?;
+    let (limits, max_response_bytes) = pattern_limits_and_response_cap(&st);
+    let parsed = parse_input(&o, false, &limits)?;
     let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     opts.cancel = Some(cancel);
+    let st_eval = st.clone();
     blocking(move || {
-        let limits = Limits::default();
+        let mut req = req;
+        // Capture import targets and dataset prefixes ONCE so opening, evaluation,
+        // rendering, and the emitted preview entity tag all observe one consistent state.
+        let res_ctx = capture_resolution_context(&st_eval, &ds, req.imports);
+        req.import_targets = res_ctx.import_targets.clone();
         let handle = ds.dataset.ontology();
         let opts = handle.anchored(&opts).map_err(ontology_error)?;
         let opened = handle.open(&req, &opts).map_err(ontology_error)?;
-        let vocab = handle.vocabulary(&opened);
+        let vocab = Vocabulary::of_ontology(&opened.ontology, res_ctx.prefixes.clone());
         let cancel_ref = opts.cancel.clone();
         let deadline = opts.deadline;
         let mut cancel_fn = || check_cancel(cancel_ref.as_ref(), deadline);
@@ -667,8 +898,21 @@ pub(crate) async fn preview(
         )
         .map_err(eval_error)?;
 
-        // Merge dataset prefixes with spec prefixes for clean OFN and Manchester rendering.
-        let mut render_prefixes: Vec<(String, String)> = ds.store.prefixes().into_iter().collect();
+        let planned = plan_pattern_write(&opened, &result, parsed.declare, &limits, &mut cancel_fn)
+            .map_err(|e| match e {
+                PlanError::Cancel(r) => eval_error(r.into()),
+                PlanError::Ontology(err) => ontology_error(err),
+                PlanError::TripleLimit(msg) => {
+                    err_code(StatusCode::INSUFFICIENT_STORAGE, "triple-limit", msg)
+                }
+            })?;
+
+        // Merge captured dataset prefixes with spec prefixes for clean OFN and Manchester rendering.
+        let mut render_prefixes: Vec<(String, String)> = res_ctx
+            .prefixes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         for (k, v) in &parsed.spec.prefixes {
             let clean = k.trim().trim_end_matches(':');
             if !clean.is_empty() && !v.trim().is_empty() {
@@ -690,132 +934,76 @@ pub(crate) async fn preview(
         }
         let manch_r = manchester::Renderer::of_vocabulary(&render_vocab);
 
-        // Compute exact new vs existing status matching `ontology::edit`, including
-        // store-resident ABox assertions on `opened.snapshot`.
-        let mut new_axioms: Vec<&Axiom> = Vec::new();
-        let mut existing_count = 0usize;
-        let mut statuses: Vec<&'static str> = Vec::with_capacity(result.axioms.len());
-        for (i, item) in result.axioms.iter().enumerate() {
-            if i.is_multiple_of(64) {
-                cancel_fn().map_err(|r| eval_error(r.into()))?;
-            }
-            let present = opened.contains_axiom(&item.axiom).map_err(ontology_error)?;
-            if present {
-                existing_count += 1;
-                statuses.push("existing");
-            } else {
-                new_axioms.push(&item.axiom);
-                statuses.push("new");
-            }
-        }
-
-        let auto_declarations: Vec<Entity> = if parsed.declare {
-            let declared_existing: HashSet<&Entity> = opened
-                .ontology
-                .axiom_set()
-                .filter_map(|a| match &a.kind {
-                    sparkles::owl::AxiomKind::Declaration(e) => Some(e),
-                    _ => None,
-                })
-                .collect();
-            let mut auto = BTreeSet::new();
-            for ax in &new_axioms {
-                if matches!(ax.kind, sparkles::owl::AxiomKind::Declaration(_)) {
-                    continue;
-                }
-                for e in ax.signature() {
-                    if e.is_builtin()
-                        || declared_existing.contains(&e)
-                        || e.kind() == EntityKind::NamedIndividual
-                    {
-                        continue;
-                    }
-                    auto.insert(e);
-                }
-            }
-            for ax in &new_axioms {
-                if let sparkles::owl::AxiomKind::Declaration(e) = &ax.kind {
-                    auto.remove(e);
-                }
-            }
-            auto.into_iter().collect()
-        } else {
-            Vec::new()
-        };
-
-        let mut fresh = owl_write::counter("pat");
-        let mut estimated_triples = 0usize;
-        for (i, ax) in new_axioms.iter().enumerate() {
-            if i.is_multiple_of(64) {
-                cancel_fn().map_err(|r| eval_error(r.into()))?;
-            }
-            estimated_triples =
-                estimated_triples.saturating_add(owl_write::axiom_triples(ax, &mut fresh).len());
-            if estimated_triples > limits.max_triples {
-                return Err(err_code(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "triple-limit",
-                    format!(
-                        "projected RDF triples exceeded the limit of {}",
-                        limits.max_triples
-                    ),
-                ));
-            }
-        }
-        for e in &auto_declarations {
-            estimated_triples = estimated_triples.saturating_add(
-                owl_write::axiom_triples(&Axiom::declaration(e.clone()), &mut fresh).len(),
-            );
-            if estimated_triples > limits.max_triples {
-                return Err(err_code(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "triple-limit",
-                    format!(
-                        "projected RDF triples exceeded the limit of {}",
-                        limits.max_triples
-                    ),
-                ));
-            }
-        }
+        // Account for fixed envelope, headers, diagnostics, and auto-declarations BEFORE
+        // rendering axioms, using actual JSON-serialized byte lengths so escaping is never
+        // undercounted and even the first axiom respects `max_response_bytes`.
+        let diagnostics_val = diagnostics_json(&result);
+        let headers_bytes = serde_json::to_string(&result.headers).map_or(0, |s| s.len());
+        let diagnostics_bytes = serde_json::to_string(&diagnostics_val).map_or(0, |s| s.len());
+        let mut rendered_bytes = 512usize
+            .saturating_add(headers_bytes)
+            .saturating_add(diagnostics_bytes);
 
         let mut truncated = result.axioms.len() > parsed.limit;
+        let mut auto_decl_json: Vec<J> = Vec::with_capacity(planned.auto_declarations.len());
+        for (i, e) in planned.auto_declarations.iter().enumerate() {
+            if i.is_multiple_of(64) {
+                cancel_fn().map_err(|r| eval_error(r.into()))?;
+            }
+            if rendered_bytes >= max_response_bytes {
+                truncated = true;
+                break;
+            }
+            let entry = json!({
+                "iri": e.iri().as_str(),
+                "kind": e.kind().name(),
+            });
+            let entry_bytes = serde_json::to_string(&entry)
+                .map_or(usize::MAX, |s| s.len())
+                .saturating_add(1);
+            if rendered_bytes.saturating_add(entry_bytes) > max_response_bytes {
+                truncated = true;
+                break;
+            }
+            rendered_bytes = rendered_bytes.saturating_add(entry_bytes);
+            auto_decl_json.push(entry);
+        }
+
         let mut axioms_json: Vec<J> = Vec::with_capacity(result.axioms.len().min(parsed.limit));
-        let mut rendered_bytes = 0usize;
         for (i, (item, status)) in result
             .axioms
             .iter()
-            .zip(statuses)
+            .zip(planned.statuses)
             .take(parsed.limit)
             .enumerate()
         {
             if i.is_multiple_of(64) {
                 cancel_fn().map_err(|r| eval_error(r.into()))?;
             }
-            let ofn = ofn_r.axiom(&item.axiom);
-            let manchester = manch_r.axiom(&item.axiom);
-            let ax_json = sparkles::owl::json::axiom(&item.axiom);
-            // Bound serialized preview response bytes before accumulating arbitrarily large JSON.
-            let est_entry_bytes = ofn
-                .len()
-                .saturating_add(manchester.as_deref().map_or(0, str::len))
-                .saturating_add(item.rows.len().saturating_mul(8))
-                .saturating_add(ax_json.to_string().len())
-                .saturating_add(128);
-            if !axioms_json.is_empty()
-                && rendered_bytes.saturating_add(est_entry_bytes) > MAX_PREVIEW_RESPONSE_BYTES
-            {
+            if rendered_bytes >= max_response_bytes {
                 truncated = true;
                 break;
             }
-            rendered_bytes = rendered_bytes.saturating_add(est_entry_bytes);
-            axioms_json.push(json!({
+            let ofn = ofn_r.axiom(&item.axiom);
+            let manchester = manch_r.axiom(&item.axiom);
+            let ax_json = sparkles::owl::json::axiom(&item.axiom);
+            let entry = json!({
                 "type": item.axiom.axiom_type().name(),
                 "ofn": ofn,
                 "manchester": manchester,
                 "axiom": ax_json,
                 "rows": item.rows,
                 "status": status,
-            }));
+            });
+            let entry_bytes = serde_json::to_string(&entry)
+                .map_or(usize::MAX, |s| s.len())
+                .saturating_add(1);
+            if rendered_bytes.saturating_add(entry_bytes) > max_response_bytes {
+                truncated = true;
+                break;
+            }
+            rendered_bytes = rendered_bytes.saturating_add(entry_bytes);
+            axioms_json.push(entry);
         }
 
         let target_graph = parsed
@@ -836,21 +1024,22 @@ pub(crate) async fn preview(
             "rowsSkipped": result.rows_skipped,
             "rowsWithErrors": result.rows_with_errors,
             "generated": result.axioms.len(),
-            "newAxioms": new_axioms.len(),
-            "existingAxioms": existing_count,
-            "autoDeclarations": auto_declarations.iter().map(|e| json!({
-                "iri": e.iri().as_str(),
-                "kind": e.kind().name(),
-            })).collect::<Vec<_>>(),
-            "estimatedTriples": estimated_triples,
+            "newAxioms": planned.new_indices.len(),
+            "existingAxioms": planned.existing_count,
+            "autoDeclarations": auto_decl_json,
+            "estimatedTriples": planned.estimated_triples,
             "axioms": axioms_json,
             "axiomsTruncated": truncated,
-            "diagnostics": diagnostics_json(&result),
+            "diagnostics": diagnostics_val,
             "diagnosticsTruncated": result.diagnostics_truncated,
         });
 
         let seq = opened.snapshot.commit;
-        let tag = conditional::etag(ds.store.dataset_id(), seq, &tag_format("owl", &req));
+        let tag = conditional::etag(
+            ds.store.dataset_id(),
+            seq,
+            &format!("owl-patterns.{}", res_ctx.pattern_digest),
+        );
         let resp = conditional::with_etag(Json(body).into_response(), &tag, false);
         Ok(with_commit(resp, &ds, seq))
     })
@@ -860,12 +1049,15 @@ pub(crate) async fn preview(
 enum ApplyBuildError {
     Eval(EvalError),
     PatternErrors(Box<PatternResult>),
+    TripleLimit(String),
+    Ontology(Error),
 }
 
 /// `POST /$/ontology/{ds}/patterns/apply`: evaluate spreadsheet rows and a pattern
 /// specification under the writer lock and commit all generated axioms in one atomic
 /// commit, honoring write authorization, protected branches, `If-Match` preconditions
-/// (with import-target digest parity), and `dryRun=true`.
+/// (with import-target and dataset-prefix digest parity), projected triple limits, and
+/// `dryRun=true`.
 pub(crate) async fn apply(
     State(st): St,
     Path(name): Path<String>,
@@ -886,33 +1078,39 @@ pub(crate) async fn apply(
             "graph", "imports", "mode", "table", "spec", "declare", "target", "message", "onError",
         ],
     )?;
-    let req = request_body(&o, request_of(&st, &ds, &params)?)?;
+    let req = request_body(&o, request_params(&params)?)?;
     if req.inferences {
         return Err(bad(
             "a pattern commit changes the asserted axioms: leave out 'inferences'",
         ));
     }
-    let parsed = parse_input(&o, true)?;
+    let (limits, max_response_bytes) = pattern_limits_and_response_cap(&st);
+    let parsed = parse_input(&o, true, &limits)?;
     let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Update);
     let restricted = opts.graphs.is_some();
     let wanted = receipt_wanted(&params, &headers);
     let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers, Some(&p))?;
     wopts.opts.graphs = opts.graphs.clone();
+
+    // Shared resolution-context slot populated ONCE under the writer lock and reused by
+    // the precondition check, ontology opening, vocabulary construction, and dry-run
+    // report so import-map and prefix changes can never split the check from evaluation.
+    let shared_ctx: Arc<parking_lot::Mutex<Option<PatternResolutionContext>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    let imports_mode = req.imports;
+
     if wopts.opts.precondition.is_none() {
         let st_pre = st.clone();
         let ds_pre = ds.clone();
-        let imports_mode = req.imports;
-        wopts.opts.precondition = conditional::write_precondition_with_import_digest(
+        let slot_pre = shared_ctx.clone();
+        wopts.opts.precondition = conditional::write_precondition_with_pattern_context(
             &headers,
             ds.store.dataset_id(),
             &Target::Dataset,
             move || {
-                if imports_mode == ImportMode::None {
-                    None
-                } else {
-                    let targets = imports::targets(&st_pre, &ds_pre);
-                    (!targets.is_empty()).then(|| format!("{:016x}", targets.digest()))
-                }
+                let ctx =
+                    capture_resolution_context_once(&slot_pre, &st_pre, &ds_pre, imports_mode);
+                (ctx.import_digest, ctx.pattern_digest)
             },
         );
     }
@@ -942,10 +1140,6 @@ pub(crate) async fn apply(
 
     let st_eval = st.clone();
     blocking(move || {
-        let mut req = req;
-        // Refresh import targets immediately before acquiring the writer lock so the
-        // opened ontology matches the import map checked by the precondition.
-        req.import_targets = imports::targets(&st_eval, &ds);
         let handle = ds.dataset.ontology();
         let commit_msg = parsed
             .message
@@ -954,20 +1148,45 @@ pub(crate) async fn apply(
         let eval_cancel = opts.cancel.clone();
         let eval_deadline = opts.deadline;
 
+        let slot_prepare = shared_ctx.clone();
+        let st_prepare = st_eval.clone();
+        let ds_prepare = ds.clone();
+        let slot_build = shared_ctx.clone();
+        let st_build = st_eval.clone();
+        let ds_build = ds.clone();
+
+        let target_for_head = parsed.target.clone();
+        let msg_for_head = commit_msg.clone();
+
         let res = handle.edit_from_head(
             &req,
-            parsed.target.as_ref(),
-            Some(&commit_msg),
+            target_for_head.as_ref(),
+            Some(&msg_for_head),
             &opts,
-            |opened| {
-                let vocab = handle.vocabulary(opened);
+            move |_head, locked_req| {
+                let ctx = capture_resolution_context_once(
+                    &slot_prepare,
+                    &st_prepare,
+                    &ds_prepare,
+                    locked_req.imports,
+                );
+                locked_req.import_targets = ctx.import_targets;
+            },
+            move |opened| {
+                let ctx = capture_resolution_context_once(
+                    &slot_build,
+                    &st_build,
+                    &ds_build,
+                    imports_mode,
+                );
+                let vocab = Vocabulary::of_ontology(&opened.ontology, ctx.prefixes.clone());
                 let mut cancel_fn = || check_cancel(eval_cancel.as_ref(), eval_deadline);
                 let result = patterns::evaluate_with_cancel(
                     &parsed.table_data,
                     parsed.delimiter,
                     &parsed.spec,
                     &vocab,
-                    &Limits::default(),
+                    &limits,
                     &mut cancel_fn,
                 )
                 .map_err(ApplyBuildError::Eval)?;
@@ -980,6 +1199,16 @@ pub(crate) async fn apply(
                     return Err(ApplyBuildError::PatternErrors(Box::new(result)));
                 }
 
+                // Enforce the exact same projected triple and byte ceilings as preview()
+                // before mutating the transaction, under both `abort` and `skip` and in
+                // both ordinary apply and `dryRun=true`.
+                plan_pattern_write(opened, &result, parsed.declare, &limits, &mut cancel_fn)
+                    .map_err(|e| match e {
+                        PlanError::Cancel(r) => ApplyBuildError::Eval(r.into()),
+                        PlanError::Ontology(err) => ApplyBuildError::Ontology(err),
+                        PlanError::TripleLimit(msg) => ApplyBuildError::TripleLimit(msg),
+                    })?;
+
                 let edit = EditRequest {
                     add: result.axioms.iter().map(|g| g.axiom.clone()).collect(),
                     remove: Vec::new(),
@@ -987,14 +1216,24 @@ pub(crate) async fn apply(
                     graph: parsed.target.clone(),
                     message: Some(commit_msg.clone()),
                 };
-                Ok((edit, result))
+                Ok((edit, (result, ctx.prefixes)))
             },
         );
 
-        let (e, result) = match (res, dry) {
+        let (e, (result, used_prefixes)) = match (res, dry) {
             (Ok(pair), _) => pair,
             (Err(EditFromHeadError::Build(ApplyBuildError::PatternErrors(result))), _) => {
                 return Ok(pattern_errors_response(&result));
+            }
+            (Err(EditFromHeadError::Build(ApplyBuildError::TripleLimit(msg))), _) => {
+                return Err(err_code(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "triple-limit",
+                    msg,
+                ));
+            }
+            (Err(EditFromHeadError::Build(ApplyBuildError::Ontology(err))), _) => {
+                return Err(ontology_error(err));
             }
             (Err(EditFromHeadError::Build(ApplyBuildError::Eval(err))), _) => {
                 return Err(eval_error(err));
@@ -1010,9 +1249,13 @@ pub(crate) async fn apply(
             }
         };
 
-        let mut body = edit_body(&e, &renderer(&ds));
+        let pattern_json = pattern_summary_json(&result);
+        let pattern_bytes = serde_json::to_string(&pattern_json).map_or(0, |s| s.len());
+        let remaining_bytes = max_response_bytes.saturating_sub(pattern_bytes);
+        let render = Renderer::new(used_prefixes.iter().map(|(p, n)| (p.as_str(), n.as_str())));
+        let mut body = edit_body_bounded(&e, &render, remaining_bytes);
         if let Some(map) = body.as_object_mut() {
-            map.insert("pattern".to_string(), pattern_summary_json(&result));
+            map.insert("pattern".to_string(), pattern_json);
         }
         Ok(write_response(
             &ds,

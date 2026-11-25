@@ -3589,3 +3589,354 @@ async fn patterns_apply_refuses_read_only_server() {
         StatusCode::FORBIDDEN
     );
 }
+
+#[tokio::test]
+async fn patterns_r2_triple_limit_parity_dry_run_precondition_prefix_etag_and_response_caps() {
+    let s = persistent();
+    let ds = s._state.get("h").unwrap();
+
+    // 1. Triple-limit parity (507 triple-limit) across preview, apply (abort & skip), and
+    //    apply?dryRun=true under tight max_triples, leaving head unchanged.
+    {
+        let lim = sparkles::owl::patterns::Limits {
+            max_triples: 4,
+            ..Default::default()
+        };
+        *s._state.pattern_test_limits.lock() = Some((lim, 16 * 1024 * 1024));
+    }
+    let over_triples_body = json!({
+        "table": {
+            "data": "ID,Parent\nID,SC %\nex:C1,ex:Person\nex:C2,ex:Person\nex:C3,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "declare": true
+    });
+    let head_before = ds.store.head_commit().seq;
+
+    let prev_507 = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        over_triples_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        prev_507.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        prev_507.text()
+    );
+    assert_eq!(prev_507.json()["code"], "triple-limit");
+
+    let apply_abort_507 = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply",
+        over_triples_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        apply_abort_507.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        apply_abort_507.text()
+    );
+    assert_eq!(apply_abort_507.json()["code"], "triple-limit");
+    assert_eq!(ds.store.head_commit().seq, head_before);
+
+    let mut over_skip = over_triples_body.clone();
+    over_skip["onError"] = json!("skip");
+    let apply_skip_507 = post(&s.app, "/$/ontology/h/patterns/apply", over_skip).await;
+    assert_eq!(
+        apply_skip_507.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        apply_skip_507.text()
+    );
+    assert_eq!(apply_skip_507.json()["code"], "triple-limit");
+    assert_eq!(ds.store.head_commit().seq, head_before);
+
+    let dry_507 = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?dryRun=true",
+        over_triples_body,
+    )
+    .await;
+    assert_eq!(
+        dry_507.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        dry_507.text()
+    );
+    assert_eq!(dry_507.json()["code"], "triple-limit");
+    assert_eq!(ds.store.head_commit().seq, head_before);
+
+    // Reset limits for subsequent checks.
+    *s._state.pattern_test_limits.lock() = None;
+
+    // 2. Stale If-Match + dryRun=true + invalid table row MUST return 412 with dry-run
+    //    precondition-failed headers, NOT 422 pattern-errors.
+    let invalid_table = json!({
+        "table": { "data": "ID,Parent\nID,SC %\nex:Bad,not valid (\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let stale_tag = format!(
+        "W/\"{}:0:owl-patterns.0000000000000000\"",
+        ds.store.dataset_id()
+    );
+    let dry_stale = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/patterns/apply?dryRun=true",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &stale_tag),
+        ],
+        &invalid_table.to_string(),
+    )
+    .await;
+    assert_eq!(
+        dry_stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "stale dry-run If-Match must win over 422 pattern-errors: {}",
+        dry_stale.text()
+    );
+    assert_eq!(
+        dry_stale
+            .headers
+            .get("sparkles-dry-run")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        dry_stale
+            .headers
+            .get("sparkles-dry-run-outcome")
+            .and_then(|v| v.to_str().ok()),
+        Some("precondition-failed")
+    );
+
+    // 3. Same-head dataset prefix rebind MUST invalidate the pattern preview ETag (412).
+    ds.store.set_prefix("dyn", "http://dyn1.org/").unwrap();
+    let prefix_body = json!({
+        "table": { "data": "ID,Parent\nID,SC %\ndyn:Heart,ex:Person\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let prev_pref = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        prefix_body.clone(),
+    )
+    .await;
+    assert_eq!(prev_pref.status, StatusCode::OK, "{}", prev_pref.text());
+    let pref_tag = prev_pref.headers[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        pref_tag.contains(":owl-patterns."),
+        "expected owl-patterns ETag, got {pref_tag}"
+    );
+    let head_same = ds.store.head_commit().seq;
+    // Mutate dataset prefix with NO commit.
+    ds.store.set_prefix("dyn", "http://dyn2.org/").unwrap();
+    assert_eq!(ds.store.head_commit().seq, head_same);
+
+    let apply_rebound = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/patterns/apply",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &pref_tag),
+        ],
+        &prefix_body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        apply_rebound.status,
+        StatusCode::PRECONDITION_FAILED,
+        "same-head prefix rebind must invalidate preview ETag: {}",
+        apply_rebound.text()
+    );
+    assert_eq!(ds.store.head_commit().seq, head_same);
+
+    // 4. Queued apply under writer-lock contention: if import map changes while queued
+    //    for the writer lock, apply must check and evaluate under ONE single context
+    //    captured after acquiring the writer lock.
+    let prev_q = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        prefix_body.clone(),
+    )
+    .await;
+    assert_eq!(prev_q.status, StatusCode::OK);
+    let tag_q = prev_q.headers[header::ETAG].to_str().unwrap().to_string();
+    let imp_get = get(&s.app, "/$/ontology/h/imports").await;
+    let imp_etag = imp_get.headers[header::ETAG].to_str().unwrap().to_string();
+
+    // Hold the dataset writer lock so the apply task queues behind it.
+    let held_txn = ds
+        .store
+        .try_write_with(
+            sparkles::commit::CommitKind::Update,
+            sparkles::guard::WriteOptions::default(),
+        )
+        .unwrap();
+    let app_clone = s.app.clone();
+    let body_str = prefix_body.to_string();
+    let tag_q_clone = tag_q.clone();
+    let apply_task = tokio::spawn(async move {
+        send(
+            &app_clone,
+            "POST",
+            "/$/ontology/h/patterns/apply",
+            &[
+                ("content-type", "application/json"),
+                ("if-match", &tag_q_clone),
+            ],
+            &body_str,
+        )
+        .await
+    });
+    // Give the apply request a moment to parse and block on the writer lock, then mutate
+    // the import map while it is queued before releasing the writer lock.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let patch_imp = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/h/imports",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &imp_etag),
+        ],
+        &json!({ "set": { "http://ex.org/queued-imp": "http://ex.org/g-queued" } }).to_string(),
+    )
+    .await;
+    assert_eq!(patch_imp.status, StatusCode::OK, "{}", patch_imp.text());
+    drop(held_txn);
+
+    let queued_resp = apply_task.await.unwrap();
+    assert_eq!(
+        queued_resp.status,
+        StatusCode::PRECONDITION_FAILED,
+        "queued apply must observe the import map under the writer lock and fail 412: {}",
+        queued_resp.text()
+    );
+
+    // 5. Tight byte limits on preview (long namespace + annotations) and apply response
+    //    ceiling (truncating addedAxioms cleanly, including entry 0 on preview).
+    let long_ns = format!("http://example.org/{}/", "n".repeat(1_500));
+    let long_ns_body = json!({
+        "table": { "data": "ID,Note\nID,A rdfs:comment\np:1,hello\np:2,world\np:3,again\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "p": long_ns }
+        }
+    });
+    {
+        let lim = sparkles::owl::patterns::Limits {
+            max_total_expanded_bytes: 5_000,
+            ..Default::default()
+        };
+        *s._state.pattern_test_limits.lock() = Some((lim, 512));
+    }
+    let prev_budget = post(&s.app, "/$/ontology/h/patterns/preview", long_ns_body).await;
+    assert_eq!(prev_budget.status, StatusCode::OK, "{}", prev_budget.text());
+    let pbj = prev_budget.json();
+    assert_eq!(pbj["valid"], false, "{pbj}");
+    assert!(
+        pbj["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "expansion-bytes-limit"),
+        "expected expansion-bytes-limit diagnostic: {pbj}"
+    );
+
+    // Replicated >A annotation bytes on preview also hit expansion-bytes-limit before cloning.
+    let rep_ann_body = json!({
+        "table": {
+            "data": format!(
+                "ID,Parents,Note\nID,SC % SPLIT=|,>A rdfs:comment\nex:Rep,ex:A|ex:B|ex:C|ex:D|ex:E|ex:F|ex:G|ex:H|ex:I|ex:J,{}\n",
+                "z".repeat(600)
+            )
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let prev_rep = post(&s.app, "/$/ontology/h/patterns/preview", rep_ann_body).await;
+    assert_eq!(prev_rep.status, StatusCode::OK, "{}", prev_rep.text());
+    let prj = prev_rep.json();
+    assert_eq!(prj["valid"], false, "{prj}");
+    assert!(
+        prj["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "expansion-bytes-limit"),
+        "expected replicated >A expansion-bytes-limit diagnostic: {prj}"
+    );
+
+    // Preview response byte ceiling must also cap even entry 0 when tight.
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 600));
+    }
+    let small_ok_body = json!({
+        "table": {
+            "data": "ID,Parent\nID,SC %\nex:CapA,ex:Person\nex:CapB,ex:Person\nex:CapC,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let prev_capped = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        small_ok_body.clone(),
+    )
+    .await;
+    assert_eq!(prev_capped.status, StatusCode::OK, "{}", prev_capped.text());
+    let pcj = prev_capped.json();
+    assert_eq!(pcj["axiomsTruncated"], true, "{pcj}");
+    assert_eq!(
+        pcj["axioms"].as_array().unwrap().len(),
+        0,
+        "entry 0 must not bypass tight preview response byte cap: {pcj}"
+    );
+
+    // Apply response byte ceiling bounds addedAxioms while still committing cleanly.
+    let apply_capped = post(&s.app, "/$/ontology/h/patterns/apply", small_ok_body).await;
+    assert_eq!(
+        apply_capped.status,
+        StatusCode::OK,
+        "{}",
+        apply_capped.text()
+    );
+    let acj = apply_capped.json();
+    assert_eq!(acj["committed"], true, "{acj}");
+    assert_eq!(acj["axiomsTruncated"], true, "{acj}");
+    assert!(
+        acj["addedAxioms"].as_array().unwrap().len() < acj["added"].as_u64().unwrap() as usize,
+        "apply response byte cap must bound rendered addedAxioms: {acj}"
+    );
+
+    *s._state.pattern_test_limits.lock() = None;
+}

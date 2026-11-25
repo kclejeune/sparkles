@@ -25,8 +25,18 @@ pub(super) const SPARKLES_COMMIT_MESSAGE: &str = "sparkles-commit-message";
 /// (`GET /$/ontology/{ds}`), and `owl-head`, the tag of its head (`view=head`), which an
 /// edit of its axioms can name, and `owl-tree` and `owl-term`, the tags of the ontology
 /// browser's hierarchy and term reads.
-const FORMATS: [&str; 10] = [
-    "ttl", "nt", "nq", "trig", "rdf", "jsonld", "owl", "owl-head", "owl-tree", "owl-term",
+const FORMATS: [&str; 11] = [
+    "ttl",
+    "nt",
+    "nq",
+    "trig",
+    "rdf",
+    "jsonld",
+    "owl",
+    "owl-head",
+    "owl-tree",
+    "owl-term",
+    "owl-patterns",
 ];
 
 /// The entity tag of a Graph Store representation read at commit `seq`.
@@ -94,14 +104,16 @@ fn names_commit(opaque: &str, id: DatasetId, seq: u64) -> bool {
     FORMATS.contains(&fmt) && s.parse() == Ok(seq) && d.parse::<DatasetId>() == Ok(id)
 }
 
-/// Like [`names_commit`], but for ontology tags (`owl*`) also requires the optional
-/// `.<hex>` import-target digest to match `expected_digest`.
+/// Like [`names_commit`], but for ontology tags (`owl*`) requires the optional `.<hex>`
+/// digest to match `expected_import_digest`, and for `owl-patterns` tags requires the
+/// combined `(import_targets, prefixes)` digest to match `expected_pattern_digest`.
 #[cfg(feature = "ontology")]
-fn names_commit_with_import_digest(
+fn names_commit_with_pattern_digests(
     opaque: &str,
     id: DatasetId,
     seq: u64,
-    expected_digest: Option<&str>,
+    expected_import_digest: Option<&str>,
+    expected_pattern_digest: &str,
 ) -> bool {
     let mut parts = opaque.rsplitn(3, ':');
     let (Some(fmt_full), Some(s), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
@@ -114,8 +126,10 @@ fn names_commit_with_import_digest(
     if !(FORMATS.contains(&fmt) && s.parse() == Ok(seq) && d.parse::<DatasetId>() == Ok(id)) {
         return false;
     }
-    if matches!(fmt, "owl" | "owl-head" | "owl-tree" | "owl-term") {
-        tag_digest == expected_digest
+    if fmt == "owl-patterns" {
+        tag_digest == Some(expected_pattern_digest)
+    } else if matches!(fmt, "owl" | "owl-head" | "owl-tree" | "owl-term") {
+        tag_digest == expected_import_digest
     } else {
         true
     }
@@ -254,13 +268,15 @@ pub(super) fn write_precondition(
 }
 
 /// Like [`write_precondition`], but enforces import-target digest parity for ontology
-/// entity tags (`owl*`) using the live digest computed by `expected_digest`.
+/// entity tags (`owl*`) and combined import-target + dataset-prefix digest parity for
+/// pattern preview entity tags (`owl-patterns.<hex>`), using the `(import_digest,
+/// pattern_digest)` pair computed by `expected_digests`.
 #[cfg(feature = "ontology")]
-pub(super) fn write_precondition_with_import_digest(
+pub(super) fn write_precondition_with_pattern_context(
     headers: &HeaderMap,
     dataset_id: DatasetId,
     target: &Target,
-    expected_digest: impl Fn() -> Option<String> + Send + Sync + 'static,
+    expected_digests: impl Fn() -> (Option<String>, String) + Send + Sync + 'static,
 ) -> Option<Precondition> {
     let if_match = tags(headers, header::IF_MATCH);
     let if_none = tags(headers, header::IF_NONE_MATCH);
@@ -278,11 +294,17 @@ pub(super) fn write_precondition_with_import_digest(
                 .is_some_and(|g| head.count(Perm::Gspo, &[g.0]).unwrap_or(0) > 0),
             None => true,
         };
-        let digest = expected_digest();
+        let (import_digest, pattern_digest) = expected_digests();
         let current = |l: &[String]| {
             exists
                 && l.iter().any(|o| {
-                    names_commit_with_import_digest(o, dataset_id, head.commit, digest.as_deref())
+                    names_commit_with_pattern_digests(
+                        o,
+                        dataset_id,
+                        head.commit,
+                        import_digest.as_deref(),
+                        &pattern_digest,
+                    )
                 })
         };
         let fail = |m: String| Err(Error::PreconditionFailed(m));
@@ -295,7 +317,7 @@ pub(super) fn write_precondition_with_import_digest(
                     exists && l.iter().any(|o| names_commit(o, dataset_id, head.commit));
                 if same_commit {
                     return fail(
-                        "If-Match: the ontology import map changed since the tag was issued".into(),
+                        "If-Match: the ontology import map or dataset prefixes changed since the tag was issued".into(),
                     );
                 }
                 return fail(format!(
