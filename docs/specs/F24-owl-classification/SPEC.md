@@ -5125,6 +5125,62 @@ clauses that hold x, about 380,000 of 866,000 conclusions in four seconds. With 
 200 million it finishes after 4.7 million conclusions in 4.4 s on four threads of a build
 without link-time optimization. Item 1075 follows these equalities.
 
+#### Item 1075: binary splitting over disjunctive equalities of constants
+
+When a rooted non-counting classification enables `Limits::rooted_eq_split` or sets
+`SPARKLES_ROOTED_EQ_SPLIT=1`, the classifier resolves explosive root disjunctive
+equalities between named constants by binary semantic case splitting outside the
+consequence-based calculus. The switch is off by default, and the alternative block-order
+restriction on the rooted literal order remains deferred because its global transitivity
+and completeness transfer across mixed contexts are unproved.
+
+The soundness and completeness argument rests on two properties. First, for any ontology
+`O` and any two distinct named individuals `u` and `v` from the original input signature,
+every model of `O` satisfies either `u = v` or `u ≠ v`. Consequently `O` is consistent if
+and only if at least one of the two branches `O ∪ {u = v}` and `O ∪ {u ≠ v}` is
+consistent, and a class subsumption or individual class assertion holds in `O` if and only
+if it holds in every consistent leaf of the binary split tree. Second, before projecting
+any consistent leaf into the split accumulator, the classifier closes subsumptions over
+all met classes including internal reduction classes and verifies that no real nominal in
+the leaf, including anonymous witnesses and any active universal-property hub, reaches an
+unsatisfiable class. It then projects subsumptions and public instances onto the original
+visible signature, treating unconstrained declared-only individuals as instances of every
+class subsuming `owl:Thing`, and intersects the projected relations across all consistent
+leaves. If every leaf is inconsistent, the ontology is inconsistent and every visible
+class is unsatisfiable.
+
+Candidate discovery inspects empty-body root clauses that contain at least one positive
+equality between two distinct original named individuals not already decided in the
+current branch partition or disequality set. Pure equality disjunctions take priority over
+mixed disjunctions, with deterministic tie-breaking by clause head length and original
+individual rank. At depth zero, the root populates the best candidate while saturation
+runs, and a branch forks once total rooted work crosses the probe threshold of 16,384
+conclusions, or immediately on a pure equality disjunction at depth one and below. The
+equality child merges `u` and `v` in its branch partition, remaps all inherited branch
+disequalities and closes immediately as inconsistent on a self-disequality collision, and
+the disequality child adds `DifferentIndividuals(u, v)`. All prefix work before forks and
+restarts is charged in `Stats::dl_rooted_spent` disjointly from terminal leaf work in
+`Stats::dl_work`, so the combined total stays within one frozen `attempt_bound` across
+every branch, bounded by default depth and leaf caps of 8 and 32. If no fork occurs, the
+run preserves its ordinary context index and incremental state. If a fork occurs, the
+classifier retains a compact `SplitAnswer` holding the intersected taxonomy and public
+instances so `Classifier::describe` and `Saturation::describe` answer without keeping a
+branch index, and clears that answer on any edit or strict `Error::Incomplete` refusal.
+Every branch partition, disequality list, clause and dynamic conjunction insertion,
+leaf closure, taxonomy construction and retained answer is pre-admitted against the
+single memory ledger and caller pool before allocation.
+
+On the `shoi-042` fixture in a release build on the worker host, enabling
+`Limits::rooted_eq_split` with `Limits::rooted_merge` finishes in 15 to 17 ms across one
+and four threads under both cautious and eager expansion, with two splits, three
+consistent leaves, two merge restarts, 18,103 prefix conclusions and 21,144 leaf
+conclusions for a total of 39,247 derived conclusions against the 524,288 bound. With
+`Limits::rooted_merge` off it finishes in 18 to 19 ms across all four configurations with
+18,032 prefix conclusions and 30,595 leaf conclusions for a total of 48,627 conclusions.
+Every configuration matches HermiT's taxonomy and exact individual instances with zero
+excluded axioms and no fallback. Across all 50 `shoi` fixtures with both switches on, all
+50 complete within the 524,288 bound with zero taxonomy differences against HermiT.
+
 ### Anonymous individuals and top-property inclusions
 
 Items 1281 and 1282 close the two cheapest gaps of item 1272's census of what
