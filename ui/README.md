@@ -233,8 +233,8 @@ when it is stale, and `SPARKLES_FMT_BLESS=1` rewrites it.
 ## End-to-end tests
 
 `tests/e2e` holds Playwright smoke tests of the UI against a real `sparkles serve`.
-`global-setup.ts` starts `../target/debug/sparkles` (or `$SPARKLES_BIN`) twice on free
-ports of 127.0.0.1, each with a temporary data directory. The first server has an auth
+`global-setup.ts` starts `../target/debug/sparkles` (or `$SPARKLES_BIN`) twice on
+kernel-assigned loopback ports, each with a temporary data directory. The first server has an auth
 configuration with a user `alice`, who has a password, and a static server-admin API
 token. The setup loads a small dataset (`data.ts`) into it in two commits, enables
 full-text search and signs `alice` in. The dataset has labels, comments for full-text

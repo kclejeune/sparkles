@@ -4,10 +4,12 @@
 //! dataset's `memory.scratchBranches.ttl`.
 #![cfg(all(feature = "mcp", unix))]
 
+mod common;
+
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
@@ -73,27 +75,9 @@ fn exists(dir: &Path) -> bool {
         .any(|b| b["name"] == BRANCH)
 }
 
-struct Server(Child);
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// A port that was free a moment ago, as the other serve tests pick one.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// The running server and its log.
 struct Running {
-    server: Server,
+    server: common::ServerProcess,
     port: u16,
     log: PathBuf,
 }
@@ -104,7 +88,7 @@ impl Running {
     }
 
     fn alive(&mut self) -> bool {
-        self.server.0.try_wait().unwrap().is_none()
+        self.server.try_wait().unwrap().is_none()
     }
 
     /// Wait until the log holds `needle`. A child that exits meanwhile gives `None`.
@@ -146,18 +130,12 @@ impl Running {
     }
 }
 
-/// Start `sparkles serve` over `dir/db`, identify the child by its own log line about
-/// the address it bound, wait for the line with the server's decision about scratch
-/// branch expiry, and then for HTTP readiness. Another process may take the port between
-/// the probe and the child's bind, and the child then exits, so the start is repeated on
-/// a new port, up to 5 times. The decision line comes after the sweeper was started or
-/// left off, so a case that watches the branch from there sees the whole outcome.
+/// Start over `dir/db` and wait for the decision about scratch-branch expiry before
+/// checking readiness. The decision follows the registration of the sweeper.
 fn serve(dir: &Path, extra: &[&str]) -> Running {
     let log = dir.join("serve.log");
-    for _ in 0..5 {
-        let port = free_port();
-        let child = Command::new(BIN)
-            .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
+    let (server, port) = common::ServerProcess::start(
+        common::serve()
             .arg("--data")
             .arg(dir.join("data"))
             .arg("--loc")
@@ -165,32 +143,21 @@ fn serve(dir: &Path, extra: &[&str]) -> Running {
             .arg("--mcp")
             .args(extra)
             .env_remove("SPARKLES_BACKUP_CONFIG")
-            .env("RUST_LOG", "info")
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(&log).unwrap())
-            .spawn()
-            .unwrap();
-        let mut r = Running {
-            server: Server(child),
-            port,
-            log: log.clone(),
-        };
-        let listening = format!("listening on http://127.0.0.1:{port}/");
-        if r.wait_for(&listening, Duration::from_secs(60)).is_none() {
-            continue;
-        }
-        r.wait_for("scratch-branch expiry: ", Duration::from_secs(30))
-            .expect("the server exited before deciding about expiry");
-        let t0 = Instant::now();
-        let deadline = Duration::from_secs(60);
-        while !r.ready(deadline.saturating_sub(t0.elapsed())) {
-            assert!(r.alive(), "server exited\n{}", r.log());
-            assert!(t0.elapsed() < deadline, "server not ready");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        return r;
+            .env("RUST_LOG", "info"),
+        &log,
+    );
+    let mut running = Running { server, port, log };
+    running
+        .wait_for("scratch-branch expiry: ", Duration::from_secs(30))
+        .expect("the server exited before deciding about expiry");
+    let t0 = Instant::now();
+    let deadline = Duration::from_secs(60);
+    while !running.ready(deadline.saturating_sub(t0.elapsed())) {
+        assert!(running.alive(), "server exited\n{}", running.log());
+        assert!(t0.elapsed() < deadline, "server not ready");
+        std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("no server started in 5 attempts");
+    running
 }
 
 /// What a server started with `extra` over a database with the dataset setting `ttl`

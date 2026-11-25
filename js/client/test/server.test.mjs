@@ -1,25 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { createServer } from 'node:net';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SparklesClient, factory, BudgetExceededError, ConflictError } from '../dist/index.js';
 
 const binary = process.env.SPARKLES_CLIENT_TEST_SERVER_BIN;
-async function freePort() {
-  const socket = createServer();
-  await new Promise((resolve, reject) =>
-    socket.listen(0, '127.0.0.1', resolve).once('error', reject),
-  );
-  const port = socket.address().port;
-  await new Promise((resolve, reject) =>
-    socket.close((error) => (error ? reject(error) : resolve())),
-  );
-  return port;
-}
-
 test(
   'real Sparkles server: memory branch isolation, streaming queries, snapshots, GSP ETags, history and typed administration',
   { skip: !binary, timeout: 30_000 },
@@ -28,26 +15,29 @@ test(
     let server;
     let output = '';
     try {
-      const port = await freePort();
-      server = spawn(binary, [
-        'serve',
-        '--data',
-        directory,
-        '--host',
-        '127.0.0.1',
-        '--port',
-        String(port),
-        '--mem',
-        'wiki',
-        '--cache-mb',
-        '16',
-        '--result-cache-mb',
-        '0',
-        '--history-cache-mb',
-        '16',
-        '--service-cache-mb',
-        '0',
-      ]);
+      server = spawn(
+        binary,
+        [
+          'serve',
+          '--data',
+          directory,
+          '--host',
+          '127.0.0.1',
+          '--port',
+          '0',
+          '--mem',
+          'wiki',
+          '--cache-mb',
+          '16',
+          '--result-cache-mb',
+          '0',
+          '--history-cache-mb',
+          '16',
+          '--service-cache-mb',
+          '0',
+        ],
+        { env: { ...process.env, RUST_LOG: 'info' } },
+      );
       server.stderr.on('data', (data) => {
         output += data;
       });
@@ -58,17 +48,22 @@ test(
       server.once('error', (error) => {
         startupError = error;
       });
-      const base = `http://127.0.0.1:${port}`;
       const startupDeadline = Date.now() + 15_000;
+      let base;
       for (;;) {
-        try {
-          if ((await fetch(base + '/$/datasets')).ok) break;
-        } catch {
-          /* Await startup. */
-        }
         if (startupError) throw startupError;
         if (server.exitCode !== null || server.signalCode !== null || Date.now() >= startupDeadline)
           throw new Error('Server did not start: ' + output);
+        base ??= output.match(
+          / listening on (http:\/\/127\.0\.0\.1:[1-9][0-9]*)\/ \(UI at \/ui\/\)/,
+        )?.[1];
+        if (base) {
+          try {
+            if ((await fetch(base + '/$/ready', { signal: AbortSignal.timeout(1000) })).ok) break;
+          } catch {
+            /* Await startup. */
+          }
+        }
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
       const client = new SparklesClient(base),
@@ -141,7 +136,7 @@ test(
       assert.equal(renamed.response.status, 200);
       assert(await client.dataset('wiki', 'renamed').ask('ASK { <urn:t> <urn:p> 2 }'));
     } finally {
-      if (server && server.exitCode === null) {
+      if (server?.pid && server.exitCode === null && server.signalCode === null) {
         const exited = new Promise((resolve) => server.once('exit', resolve));
         server.kill('SIGTERM');
         await exited;

@@ -4,46 +4,30 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use serde_json::{Value as J, json};
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
-
 struct Server {
-    child: Child,
+    child: common::ServerProcess,
     port: u16,
 }
 
 impl Server {
-    /// Start on the first free port of `ports`.
-    fn start(
-        ports: std::ops::Range<u16>,
-        data: &Path,
-        extra: &[&str],
-        log: &Path,
-        env: &[(&str, &str)],
-    ) -> Server {
-        let port = ports
-            .clone()
-            .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .unwrap_or_else(|| panic!("a free port in {ports:?}"));
-        let log = std::fs::File::create(log).unwrap();
-        let child = Command::new(BIN)
-            .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-            .arg("--data")
-            .arg(data)
-            .args(extra)
-            .envs(env.iter().copied())
-            .env_remove("SPARKLES_BACKUP_CONFIG")
-            .env("RUST_LOG", "info")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+    fn start(data: &Path, extra: &[&str], log: &Path, env: &[(&str, &str)]) -> Server {
+        let (child, port) = common::ServerProcess::start(
+            common::serve()
+                .arg("--data")
+                .arg(data)
+                .args(extra)
+                .envs(env.iter().copied())
+                .env_remove("SPARKLES_BACKUP_CONFIG")
+                .env("RUST_LOG", "info"),
+            log,
+        );
         let s = Server { child, port };
         let t0 = Instant::now();
         while s.get("/$/ready").0 != 200 {
@@ -90,13 +74,6 @@ impl Server {
 
     fn running(&mut self) -> bool {
         self.child.try_wait().unwrap().is_none()
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -157,7 +134,6 @@ fn watch_config_reloads_a_configmap_and_keeps_a_bad_version_out() {
     let log = dir.path().join("server.log");
     let cfg = cm_dir.join("models.json");
     let mut s = Server::start(
-        48050..48060,
         &data,
         &["--model-config", cfg.to_str().unwrap()],
         &log,
@@ -199,7 +175,6 @@ fn without_watch_config_a_change_is_not_read() {
     std::fs::write(&cfg, models(&["first"])).unwrap();
     let log = dir.path().join("server.log");
     let s = Server::start(
-        48060..48070,
         &data,
         &["--model-config", cfg.to_str().unwrap()],
         &log,

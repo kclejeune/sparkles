@@ -3521,17 +3521,22 @@ fn run() -> Result<()> {
                     bail!("--unix-socket needs a Unix platform");
                 }
                 let scheme = if tls_cert.is_some() { "https" } else { "http" };
-                // the address and port the socket bound, which differ from a `--host`
-                // name or `--port 0`, for recognising SERVICE calls to this server
-                if let Some(addr) = tcp.as_ref().and_then(|l| l.local_addr().ok()) {
+                let addr = if let Some(listener) = &tcp {
+                    // Recognise SERVICE calls to the actual socket address.
+                    let bound = listener
+                        .local_addr()
+                        .context("reading the listener address")?;
                     let _ = st.listener.set(http::self_service::Listener {
                         scheme,
-                        ip: addr.ip(),
-                        port: addr.port(),
+                        ip: bound.ip(),
+                        port: bound.port(),
                     });
-                }
+                    if port == 0 { bound.to_string() } else { addr }
+                } else {
+                    addr
+                };
                 let listening = match &unix_socket {
-                    Some(p) => format!("unix:{}", p.display()),
+                    Some(path) => format!("unix:{}", path.display()),
                     None => format!("{scheme}://{addr}/"),
                 };
                 tracing::info!(

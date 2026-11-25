@@ -4,45 +4,31 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use serde_json::Value as J;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
 struct Server {
-    child: Child,
+    child: common::ServerProcess,
     base: String,
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    (39300..39400)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .expect("a free port in 39300..39400")
-}
-
 fn start(data: &Path, extra: &[&str], log: &Path) -> Server {
-    let port = free_port();
-    let child = Command::new(BIN)
-        .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-        .arg("--data")
-        .arg(data)
-        .args(extra)
-        .env_remove("SPARKLES_AUTH_CONFIG")
-        .env_remove("SPARKLES_BACKUP_CONFIG")
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(log).unwrap())
-        .spawn()
-        .unwrap();
+    let (child, port) = common::ServerProcess::start(
+        common::serve()
+            .arg("--data")
+            .arg(data)
+            .args(extra)
+            .env_remove("SPARKLES_AUTH_CONFIG")
+            .env_remove("SPARKLES_BACKUP_CONFIG")
+            .env("RUST_LOG", "info"),
+        log,
+    );
     Server {
         child,
         base: format!("http://127.0.0.1:{port}"),
@@ -152,16 +138,26 @@ fn a_dataset_that_does_not_open_leaves_the_others_serving() {
     drop(s);
 
     let log = dir.path().join("require.log");
-    let mut s = start(&data, &["--require-all-datasets"], &log);
+    let mut child = common::serve()
+        .arg("--data")
+        .arg(&data)
+        .arg("--require-all-datasets")
+        .env_remove("SPARKLES_AUTH_CONFIG")
+        .env_remove("SPARKLES_BACKUP_CONFIG")
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
     let t0 = Instant::now();
     let status = loop {
-        if let Some(st) = s.child.try_wait().unwrap() {
+        if let Some(st) = child.try_wait().unwrap() {
             break st;
         }
-        assert!(
-            t0.elapsed() < Duration::from_secs(60),
-            "the server kept running"
-        );
+        if t0.elapsed() >= Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the server kept running");
+        }
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(!status.success());
@@ -171,4 +167,68 @@ fn a_dataset_that_does_not_open_leaves_the_others_serving() {
     // the registry still names both datasets
     let reg = std::fs::read_to_string(data.join("config.json")).unwrap();
     assert!(reg.contains("\"a\"") && reg.contains("\"bad\""), "{reg}");
+}
+
+#[test]
+fn port_zero_reports_each_servers_own_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied = holder.local_addr().unwrap();
+    let first_log = dir.path().join("first.log");
+    // A previous launch in an appended log must not supply the new child's address.
+    std::fs::write(
+        &first_log,
+        format!("Sparkles test listening on http://{occupied}/ (UI at /ui/), opening 0 datasets\n"),
+    )
+    .unwrap();
+    let mut first = start(&dir.path().join("first"), &["--mem", "first"], &first_log);
+    let mut second = start(
+        &dir.path().join("second"),
+        &["--mem", "second"],
+        &dir.path().join("second.log"),
+    );
+
+    assert_ne!(first.base, format!("http://{occupied}"));
+    assert_ne!(second.base, format!("http://{occupied}"));
+    assert_ne!(first.base, second.base);
+    assert_eq!(settled(&mut first).0, 200);
+    assert_eq!(settled(&mut second).0, 200);
+    assert_eq!(
+        get(&format!("{}/$/datasets/first", first.base)).unwrap().0,
+        200
+    );
+    assert_eq!(
+        get(&format!("{}/$/datasets/first", second.base)).unwrap().0,
+        404
+    );
+    assert_eq!(
+        get(&format!("{}/$/datasets/second", second.base))
+            .unwrap()
+            .0,
+        200
+    );
+}
+
+#[test]
+fn an_explicit_port_in_use_fails_to_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = holder.local_addr().unwrap();
+    let out = Command::new(BIN)
+        .args([
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &addr.port().to_string(),
+        ])
+        .arg("--data")
+        .arg(dir.path().join("data"))
+        .env_remove("SPARKLES_AUTH_CONFIG")
+        .env_remove("SPARKLES_BACKUP_CONFIG")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains(&format!("binding {addr}")), "{err}");
 }

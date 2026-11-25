@@ -111,6 +111,10 @@ out.
 sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
 ```
 
+Set `--port 0` to let the operating system choose the TCP port. The server logs the
+bound address at INFO on stderr during startup. Use `/$/ready` to check when the
+datasets are open.
+
 The server and CLI use [mimalloc](https://github.com/microsoft/mimalloc) as their
 allocator. It comes from the `mimalloc` cargo feature of `sparkles-server`, which is on
 by default. The `sparkles` library leaves the choice of allocator to its embedder. The

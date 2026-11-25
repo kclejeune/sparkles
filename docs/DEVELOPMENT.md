@@ -469,6 +469,10 @@ still fails the run. The batch gate adds one rerun of each failed test, alone, a
 [Reruns of failed tests](#reruns-of-failed-tests) describes, and `mise run test` itself
 retries no other test.
 
+Test harnesses that start `sparkles serve` use `--port 0` to let the kernel assign a
+loopback port when the child binds. They read the address from that child's startup log
+before making any HTTP requests. Tests that need an open dataset also wait for `/$/ready`.
+
 ### Partitioned test runs
 
 `mise run test:partitioned` builds every test binary once with `mbx nextest archive`,
@@ -608,7 +612,8 @@ documentation entry pages).
 ### Jena client tests
 
 `mise run test:jena-clients` (`scripts/test-jena-clients.sh`) builds a debug server, starts
-it on a temporary data directory on port 5230 with `--gsp-direct-naming`, and runs
+it with a temporary data directory, a kernel-assigned loopback port and
+`--gsp-direct-naming`, and runs
 `testsuite/jena-clients/JenaClients.java` with Java's single-file launcher. The program
 uses Jena's `RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP`
 and `UpdateExecHTTP` with every query send mode, result format and RDF syntax Jena has,
@@ -624,8 +629,8 @@ another port. The task is not part of `mise run ci`.
 ### Browser integration tests
 
 `mise run ui:e2e` builds the formatter's WebAssembly module, the UI with the module and a
-debug server. It starts two `sparkles serve` processes on free ports of 127.0.0.1, each
-with a temporary data directory. The first has a small dataset and an auth configuration
+debug server. It starts two `sparkles serve` processes on kernel-assigned loopback
+ports, each with a temporary data directory. The first has a small dataset and an auth configuration
 with users and API tokens. The second runs without auth and allows private outbound
 addresses. The task then runs the Playwright tests in `ui/tests/e2e` in headless Chromium
 and stops the servers. The Pattern pane, the plan's pattern and **Apply to query** in the

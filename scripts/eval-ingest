@@ -52,7 +52,6 @@ import json
 import os
 import pathlib
 import re
-import socket
 import subprocess
 import sys
 import tempfile
@@ -62,6 +61,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from decimal import Decimal, InvalidOperation
+
+from sparkles_test_server import stop_server, wait_for_listener
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_SET = ROOT / "testsuite" / "ingest" / "sample.json"
@@ -357,12 +358,6 @@ def write_report(out, runs):
 # --- the self-test --------------------------------------------------------------------
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def code_points(text, needle):
     b = text.index(needle)
     a = len(text[:b])
@@ -485,15 +480,17 @@ def self_test(args):
     db = tmp / "org"
     subprocess.run([str(sparkles), "load", "--loc", str(db), str(data)], check=True,
                    stdout=subprocess.DEVNULL)
-    port = free_port()
-    server = subprocess.Popen(
-        [str(sparkles), "serve", "--port", str(port), "--data", str(tmp / "data"),
-         "--loc", f"org={db}", "--mcp", "--mcp-allow-update"],
-        stdout=open(tmp / "serve.log", "w"),
-        stderr=subprocess.STDOUT,
-    )
+    log_path = tmp / "serve.log"
+    with log_path.open("w") as log_file:
+        server = subprocess.Popen(
+            [str(sparkles), "serve", "--host", "127.0.0.1", "--port", "0", "--data",
+             str(tmp / "data"), "--loc", f"org={db}", "--mcp", "--mcp-allow-update"],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "RUST_LOG": "info"},
+        )
     try:
-        client = Client(f"http://127.0.0.1:{port}")
+        client = Client(wait_for_listener(server, log_path, time.monotonic() + 60))
         for _ in range(300):
             try:
                 client.get("/$/ready")
@@ -535,11 +532,7 @@ def self_test(args):
             sys.exit(1)
         print(f"self-test passed; report in {report.parent}")
     finally:
-        server.terminate()
-        try:
-            server.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            server.kill()
+        stop_server(server, timeout=20)
 
 
 def main():
