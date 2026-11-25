@@ -56,7 +56,14 @@ enum Key {
     /// The value of the id in this column.
     Column(usize),
     /// A pure expression over the run's columns.
-    Expr(Expr),
+    Expr { expr: Expr, exact: bool },
+}
+
+impl Key {
+    fn expression(expr: Expr) -> Self {
+        let exact = cfg!(feature = "geo") && !expr.parallel_order_key();
+        Self::Expr { expr, exact }
+    }
 }
 
 pub(super) struct External {
@@ -106,7 +113,7 @@ impl External {
                             Key::Column(input.iter().position(|x| x == v).expect("an input column"))
                         }
                         _ if crate::sparql::exprcache::impurity(expr).is_none() => {
-                            Key::Expr(expr.clone())
+                            Key::expression(expr.clone())
                         }
                         _ => {
                             let var = ctx.var(&format!("\u{1}spill key {i}"));
@@ -117,7 +124,7 @@ impl External {
                     };
                     rewritten.push(match &key {
                         Key::Column(c) => (Expr::Var(columns[*c]), *asc),
-                        Key::Expr(e) => (e.clone(), *asc),
+                        Key::Expr { expr, .. } => (expr.clone(), *asc),
                     });
                     sorted.push((key, *asc));
                 }
@@ -382,19 +389,28 @@ impl Head {
                 bytes += (keys.len() * len * size_of::<SortKey>()) as u64;
                 charge.resize(bytes)?;
                 let step = ctx.reservation_step();
-                let mut admit = |payload: u64| {
-                    bytes = bytes.saturating_add(payload);
-                    if bytes > charge.bytes() && charge.resize(bytes.saturating_add(step)).is_err()
-                    {
-                        charge.resize(bytes)?;
-                    }
-                    Ok(())
-                };
                 decoded.reserve_exact(keys.len());
                 let mut table = crate::sparql::table::Table::new(vars.clone());
                 table.cols = columns;
                 table.len = len;
                 for (key, _) in keys {
+                    let step = if matches!(key, Key::Expr { exact: true, .. }) {
+                        // Geometry serialization may need all the unused credit,
+                        // including the slack held by earlier keys.
+                        charge.resize(bytes)?;
+                        0
+                    } else {
+                        step
+                    };
+                    let mut admit = |payload: u64| {
+                        bytes = bytes.saturating_add(payload);
+                        if bytes > charge.bytes()
+                            && (step == 0 || charge.resize(bytes.saturating_add(step)).is_err())
+                        {
+                            charge.resize(bytes)?;
+                        }
+                        Ok(())
+                    };
                     let column = match key {
                         Key::Column(c) => {
                             let mut values = Vec::with_capacity(len);
@@ -408,7 +424,9 @@ impl Head {
                             }
                             values
                         }
-                        Key::Expr(e) => exec::spill_order_keys(ctx, &table, e, &mut admit)?,
+                        Key::Expr { expr, .. } => {
+                            exec::spill_order_keys(ctx, &table, expr, &mut admit)?
+                        }
                     };
                     decoded.push(column);
                 }
@@ -644,7 +662,7 @@ fn spill_merge_head_admits_wide_order_keys_incrementally() {
         ArithOp::Mul,
     );
     let keys = Keys::Values {
-        keys: vec![(Key::Expr(expr), true)],
+        keys: vec![(Key::expression(expr), true)],
         vars: vec![var],
     };
     assert!(matches!(
@@ -654,4 +672,109 @@ fn spill_merge_head_admits_wide_order_keys_incrementally() {
     assert!(ctx.mem_peak() >= 640 << 10, "peak {}", ctx.mem_peak());
     assert_eq!(ctx.live_bytes(), 0);
     assert_eq!(spill.reserved_bytes(), 0);
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn spill_merge_keeps_credit_between_rows_of_geometry_key() {
+    assert_spill_merge_keeps_geometry_key(false);
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn spill_merge_releases_column_slack_before_geometry_key() {
+    assert_spill_merge_keeps_geometry_key(true);
+}
+
+#[cfg(all(test, feature = "geo"))]
+fn assert_spill_merge_keeps_geometry_key(column_key: bool) {
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use crate::sparql::{expr::Func, value::Value};
+    use crate::spill::{Spill, SpillOptions};
+    use spargebra::algebra::Function;
+
+    let dir = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: dir.path().to_path_buf(),
+        max_bytes: 1 << 30,
+        query_bytes: 1 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+    let query = Arc::new(spill.query(None));
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.geo = GeoMemo::with_budget(0);
+    let row = ctx.var("row");
+    let column = ctx.var("column");
+    let first = Id::from_i64(1).unwrap();
+    let geometry_row = Id::from_i64(2).unwrap();
+    let competing = Id::from_i64(3).unwrap();
+    let blank = Id::bnode(42);
+    let write_run = |rows: &[Id], values: &[Id]| {
+        let mut writer = query.create(SpillKind::SortRun, 2).unwrap();
+        writer.write(&[rows, values], rows.len()).unwrap();
+        Arc::new(writer.finish().unwrap())
+    };
+    let runs = vec![
+        write_run(&[competing], &[blank]),
+        write_run(&[first, geometry_row], &[Id::UNDEF, blank]),
+    ];
+
+    let wkt = format!("LINESTRING({}0 0)", "0 0, 1 1, ".repeat(7000));
+    let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+    let geometry_bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+    let literal =
+        oxrdf::Literal::new_typed_literal(wkt, oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL));
+    let id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+    let as_wkt = Expr::Call(
+        Func::Ext(format!("{}asWKT", crate::geo::vocab::GEOF)),
+        vec![Expr::Lit(id, Value::from_literal(&literal))],
+    );
+    let length = Expr::Call(
+        Func::Builtin(Function::StrLen),
+        vec![Expr::Call(Func::Builtin(Function::Str), vec![as_wkt])],
+    );
+    let is_row = |id| {
+        Box::new(Expr::SameTerm(
+            Box::new(Expr::Var(row)),
+            Box::new(Expr::Const(id)),
+        ))
+    };
+    let zero = Expr::Const(Id::from_i64(0).unwrap());
+    let mut keys = Vec::new();
+    let (other_rows, payload) = if column_key {
+        keys.push((Key::Column(1), true));
+        (zero, 2 * SortKey::new(ctx.value(blank)).payload_bytes())
+    } else {
+        let text = Value::Str("x".repeat(20_000).into());
+        let payload = SortKey::new(Some(text.clone())).payload_bytes();
+        (
+            Expr::If(
+                is_row(first),
+                Box::new(Expr::Lit(Id::UNDEF, text)),
+                Box::new(zero),
+            ),
+            payload,
+        )
+    };
+    let expr = Expr::If(is_row(geometry_row), Box::new(length), Box::new(other_rows));
+    keys.push((Key::expression(expr), true));
+    let frame_bytes = 2 * 256 + 3 * (2 * 8 + (keys.len() * size_of::<SortKey>()) as u64);
+    let keys = Keys::Values {
+        keys,
+        vars: vec![row, column],
+    };
+    let evaluator = ctx.nvars() as u64 * 16 + 128;
+    let setup = ctx.live_bytes();
+    // The first head is already live when the second head evaluates its WKT.
+    ctx.mem_limit = setup + frame_bytes + evaluator + payload + geometry_bytes;
+    assert!(ctx.reservation_step() < geometry_bytes);
+    let ctx = ctx.into_shared();
+    let mut merge = Merger::new(&ctx, runs, &keys, 2).unwrap();
+    let mut out = [Vec::new(), Vec::new()];
+    assert_eq!(merge.next(&ctx, &keys, &mut out, 3).unwrap(), 3);
+    assert_eq!(out[0], [first, competing, geometry_row]);
+    assert_eq!(ctx.live_bytes(), setup + geometry_bytes);
 }

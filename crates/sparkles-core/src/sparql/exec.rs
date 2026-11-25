@@ -6739,6 +6739,9 @@ fn key_rows_retained(
         for i in 0..t.len() {
             values.push(eval_retained(i, charge, bytes)?);
         }
+        if let Some(charge) = charge {
+            charge.resize(*bytes)?;
+        }
         Ok(values)
     })
 }
@@ -12104,6 +12107,87 @@ fn parallel_full_sort_keeps_credit_for_later_geometry_keys() {
             setup + geometry_bytes,
             "{threads} threads"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "geo")]
+#[test]
+fn full_sort_releases_serial_key_slack_before_geometry_column() {
+    use super::expr::Func;
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use spargebra::algebra::Function;
+
+    let wkt = format!("LINESTRING({}0 0)", "0 0, 1 1, ".repeat(7000));
+    let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+    let geometry_bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+    let literal =
+        oxrdf::Literal::new_typed_literal(wkt, oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL));
+    let text = Value::Str("x".repeat(20_000).into());
+    let key_bytes = key_payload(&Some(text.clone()));
+    for (rows, threads) in [
+        (PAR_THRESHOLD, 1),
+        (PAR_THRESHOLD, 4),
+        (8 * PAR_THRESHOLD, 1),
+    ] {
+        let (mut ctx, table) = parallel_full_sort_fixture(rows);
+        ctx.geo = GeoMemo::with_budget(0);
+        let var = table.vars[0];
+        let unbound = ctx.var("unbound");
+        let id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+        let [first, second, ..] = table.cols[0][..] else {
+            unreachable!("the fixture has at least two rows");
+        };
+        let key_for = |row, value| {
+            Expr::If(
+                Box::new(Expr::SameTerm(
+                    Box::new(Expr::Var(var)),
+                    Box::new(Expr::Const(row)),
+                )),
+                Box::new(value),
+                Box::new(Expr::Var(unbound)),
+            )
+        };
+        let as_wkt = Expr::Call(
+            Func::Ext(format!("{}asWKT", crate::geo::vocab::GEOF)),
+            vec![Expr::Lit(id, Value::from_literal(&literal))],
+        );
+        let length = Expr::Call(
+            Func::Builtin(Function::StrLen),
+            vec![Expr::Call(Func::Builtin(Function::Str), vec![as_wkt])],
+        );
+        let keys = [
+            (key_for(first, Expr::Lit(Id::UNDEF, text.clone())), true),
+            (key_for(second, length), true),
+        ];
+        let slots = (rows * size_of::<Option<Value>>()) as u64 + 128;
+        let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 2 * 128 + 1024;
+        let evaluator = ctx.nvars() as u64 * 16 + 128;
+        let setup = ctx.live_bytes();
+        ctx.mem_limit = setup + sort + evaluator + 2 * slots + key_bytes + geometry_bytes;
+        assert!(ctx.reservation_step() < geometry_bytes);
+        let ctx = ctx.into_shared();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let sorted = pool
+            .install(|| order_by_rows(&ctx, table, &keys, None, &mut ExprReport::default()))
+            .unwrap();
+        let (unbound_rows, bound_rows) = sorted.cols[0].split_at(rows - 2);
+        assert_eq!(
+            bound_rows,
+            &[second, first],
+            "{rows} rows, {threads} threads"
+        );
+        assert!(
+            unbound_rows
+                .iter()
+                .map(|id| id.as_i64())
+                .eq((1..=rows as i64 - 2).rev()),
+            "{rows} rows, {threads} threads"
+        );
+        assert_eq!(ctx.live_bytes(), setup + geometry_bytes);
     }
 }
 
