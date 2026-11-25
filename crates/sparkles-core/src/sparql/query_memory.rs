@@ -102,7 +102,7 @@ impl Account {
             return Ok(());
         }
         #[cfg(test)]
-        LIVE_GROWS.with(|n| n.set(n.get() + 1));
+        let _ = LIVE_GROWS.try_with(|n| n.set(n.get() + 1));
         let ahead = own_live.next_multiple_of(LIVE_STEP).max(own_live);
         match grant.charge(ahead - self.eager) {
             Ok(()) => self.eager = ahead,
@@ -446,6 +446,54 @@ fn reserve_more_credit(
     Ok(())
 }
 
+const INLINE_RETURN_SCOPES: usize = 8;
+
+static NEXT_RETURN_SCOPE_TID: AtomicU64 = AtomicU64::new(1);
+
+struct OverflowReturnScope {
+    tid: u64,
+    index: usize,
+    ledger_addr: usize,
+    count: u64,
+}
+
+static OVERFLOW_RETURN_SCOPES: Mutex<Vec<OverflowReturnScope>> = Mutex::new(Vec::new());
+
+/// Inline, `!Drop` per-thread stack of active upstream return scopes. Because it
+/// is `const`-initialized and needs no destructor, native TLS never destroys it
+/// before application TLS drop guards run.
+struct InlineReturnScopes {
+    len: std::cell::Cell<usize>,
+    tid: std::cell::Cell<u64>,
+    slots: [std::cell::Cell<(*const QueryMemoryLedger, u64)>; INLINE_RETURN_SCOPES],
+}
+
+impl InlineReturnScopes {
+    const fn new() -> Self {
+        Self {
+            len: std::cell::Cell::new(0),
+            tid: std::cell::Cell::new(0),
+            slots: [const { std::cell::Cell::new((std::ptr::null(), 0)) }; INLINE_RETURN_SCOPES],
+        }
+    }
+
+    fn thread_id(&self) -> u64 {
+        let tid = self.tid.get();
+        if tid != 0 {
+            return tid;
+        }
+        let tid = NEXT_RETURN_SCOPE_TID.fetch_add(1, Ordering::Relaxed);
+        debug_assert_ne!(tid, 0, "return scope thread id overflow");
+        self.tid.set(tid);
+        tid
+    }
+}
+
+const _: () = {
+    assert!(!std::mem::needs_drop::<std::cell::Cell<usize>>());
+    assert!(!std::mem::needs_drop::<InlineReturnScopes>());
+};
+
 thread_local! {
     /// Depth of optional-prefetch backing releases (`Release::finish`) currently
     /// executing on this thread, preventing self- or cross-ledger deadlock if a
@@ -461,26 +509,31 @@ thread_local! {
     /// (including synchronous parent callbacks and its own staged clear) while
     /// still observing concurrent returns from other threads and avoiding
     /// cross-ledger misattribution.
-    static ACTIVE_UPSTREAM_RETURN_SCOPES: std::cell::RefCell<Vec<(*const QueryMemoryLedger, u64)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static ACTIVE_UPSTREAM_RETURN_SCOPES: InlineReturnScopes = const { InlineReturnScopes::new() };
 }
 
-struct ActiveUpstreamOp;
+struct ActiveUpstreamOp {
+    tracked: bool,
+}
 
 impl ActiveUpstreamOp {
     fn enter() -> Self {
-        ACTIVE_UPSTREAM_OPS.with(|depth| depth.set(depth.get() + 1));
-        Self
+        let tracked = ACTIVE_UPSTREAM_OPS
+            .try_with(|depth| depth.set(depth.get() + 1))
+            .is_ok();
+        Self { tracked }
     }
 }
 
 impl Drop for ActiveUpstreamOp {
     fn drop(&mut self) {
-        ACTIVE_UPSTREAM_OPS.with(|depth| {
-            let cur = depth.get();
-            debug_assert!(cur > 0, "active upstream op depth");
-            depth.set(cur - 1);
-        });
+        if self.tracked {
+            let _ = ACTIVE_UPSTREAM_OPS.try_with(|depth| {
+                let cur = depth.get();
+                debug_assert!(cur > 0, "active upstream op depth");
+                depth.set(cur - 1);
+            });
+        }
     }
 }
 
@@ -491,39 +544,86 @@ impl Drop for ActiveUpstreamOp {
 struct UpstreamReturnScope<'a> {
     ledger: &'a QueryMemoryLedger,
     return_epoch: u64,
-    index: usize,
+    index: Option<usize>,
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl<'a> UpstreamReturnScope<'a> {
     fn enter(ledger: &'a QueryMemoryLedger, return_epoch: u64) -> Self {
         let ledger_ptr = std::ptr::from_ref(ledger);
-        let index = ACTIVE_UPSTREAM_RETURN_SCOPES.with(|scopes| {
-            let mut scopes = scopes.borrow_mut();
-            let index = scopes.len();
-            scopes.push((ledger_ptr, 0));
-            index
-        });
+        let index = ACTIVE_UPSTREAM_RETURN_SCOPES
+            .try_with(|scopes| {
+                let index = scopes.len.get();
+                if index < INLINE_RETURN_SCOPES {
+                    scopes.slots[index].set((ledger_ptr, 0));
+                } else {
+                    let tid = scopes.thread_id();
+                    OVERFLOW_RETURN_SCOPES.lock().push(OverflowReturnScope {
+                        tid,
+                        index,
+                        ledger_addr: ledger_ptr as usize,
+                        count: 0,
+                    });
+                }
+                scopes.len.set(index + 1);
+                index
+            })
+            .ok();
         Self {
             ledger,
             return_epoch,
             index,
+            _not_send: std::marker::PhantomData,
         }
     }
 
     fn record_return(ledger: &QueryMemoryLedger) {
         let ledger_ptr = std::ptr::from_ref(ledger);
-        ACTIVE_UPSTREAM_RETURN_SCOPES.with(|scopes| {
-            for (ptr, count) in scopes.borrow_mut().iter_mut() {
-                if std::ptr::eq(*ptr, ledger_ptr) {
-                    *count = count.wrapping_add(1);
+        let _ = ACTIVE_UPSTREAM_RETURN_SCOPES.try_with(|scopes| {
+            let len = scopes.len.get();
+            if len == 0 {
+                return;
+            }
+            for slot in &scopes.slots[..len.min(INLINE_RETURN_SCOPES)] {
+                let (ptr, count) = slot.get();
+                if std::ptr::eq(ptr, ledger_ptr) {
+                    slot.set((ptr, count.wrapping_add(1)));
+                }
+            }
+            if len > INLINE_RETURN_SCOPES {
+                let tid = scopes.tid.get();
+                debug_assert_ne!(tid, 0, "overflow return scopes have thread id");
+                let ledger_addr = ledger_ptr as usize;
+                let mut overflow = OVERFLOW_RETURN_SCOPES.lock();
+                for entry in overflow.iter_mut() {
+                    if entry.tid == tid && entry.ledger_addr == ledger_addr {
+                        entry.count = entry.count.wrapping_add(1);
+                    }
                 }
             }
         });
     }
 
     fn other_returned(&self) -> bool {
-        let self_returns =
-            ACTIVE_UPSTREAM_RETURN_SCOPES.with(|scopes| scopes.borrow()[self.index].1);
+        let Some(index) = self.index else {
+            return false;
+        };
+        let Ok(self_returns) = ACTIVE_UPSTREAM_RETURN_SCOPES.try_with(|scopes| {
+            if index < INLINE_RETURN_SCOPES {
+                scopes.slots[index].get().1
+            } else {
+                let tid = scopes.tid.get();
+                OVERFLOW_RETURN_SCOPES
+                    .lock()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.tid == tid && entry.index == index)
+                    .expect("active overflow upstream return scope")
+                    .count
+            }
+        }) else {
+            return false;
+        };
         self.ledger
             .upstream_return_epoch
             .load(Ordering::Acquire)
@@ -534,15 +634,36 @@ impl<'a> UpstreamReturnScope<'a> {
 
 impl Drop for UpstreamReturnScope<'_> {
     fn drop(&mut self) {
+        let Some(index) = self.index else {
+            return;
+        };
         let ledger_ptr = std::ptr::from_ref(self.ledger);
-        ACTIVE_UPSTREAM_RETURN_SCOPES.with(|scopes| {
-            let mut scopes = scopes.borrow_mut();
-            let popped = scopes.pop();
-            debug_assert_eq!(scopes.len(), self.index, "LIFO upstream return scope");
-            debug_assert!(
-                popped.is_some_and(|(ptr, _)| std::ptr::eq(ptr, ledger_ptr)),
-                "matching upstream return scope ledger"
-            );
+        let _ = ACTIVE_UPSTREAM_RETURN_SCOPES.try_with(|scopes| {
+            let len = scopes.len.get();
+            debug_assert_eq!(len, index + 1, "LIFO upstream return scope");
+            if index < INLINE_RETURN_SCOPES {
+                let (ptr, _) = scopes.slots[index].replace((std::ptr::null(), 0));
+                debug_assert!(
+                    std::ptr::eq(ptr, ledger_ptr),
+                    "matching upstream return scope ledger"
+                );
+            } else {
+                let tid = scopes.tid.get();
+                let mut overflow = OVERFLOW_RETURN_SCOPES.lock();
+                let pos = overflow
+                    .iter()
+                    .rposition(|entry| entry.tid == tid && entry.index == index)
+                    .expect("active overflow upstream return scope");
+                let popped = overflow.swap_remove(pos);
+                debug_assert_eq!(
+                    popped.ledger_addr, ledger_ptr as usize,
+                    "matching upstream return scope ledger"
+                );
+                if overflow.is_empty() && overflow.capacity() > 64 {
+                    overflow.shrink_to_fit();
+                }
+            }
+            scopes.len.set(index);
         });
     }
 }
@@ -562,12 +683,15 @@ impl Drop for WaiterGuard<'_> {
 /// `reclaim_in_flight` and wakes waiters on drop.
 struct InFlightPrefetchRelease<'a> {
     ledger: &'a QueryMemoryLedger,
+    tracked: bool,
 }
 
 impl<'a> InFlightPrefetchRelease<'a> {
     fn enter(ledger: &'a QueryMemoryLedger) -> Self {
-        ACTIVE_PREFETCH_RELEASES.with(|depth| depth.set(depth.get() + 1));
-        Self { ledger }
+        let tracked = ACTIVE_PREFETCH_RELEASES
+            .try_with(|depth| depth.set(depth.get() + 1))
+            .is_ok();
+        Self { ledger, tracked }
     }
 
     fn finish_with(self, release: Release) {
@@ -577,11 +701,13 @@ impl<'a> InFlightPrefetchRelease<'a> {
 
 impl Drop for InFlightPrefetchRelease<'_> {
     fn drop(&mut self) {
-        ACTIVE_PREFETCH_RELEASES.with(|depth| {
-            let cur = depth.get();
-            debug_assert!(cur > 0, "active prefetch release depth");
-            depth.set(cur - 1);
-        });
+        if self.tracked {
+            let _ = ACTIVE_PREFETCH_RELEASES.try_with(|depth| {
+                let cur = depth.get();
+                debug_assert!(cur > 0, "active prefetch release depth");
+                depth.set(cur - 1);
+            });
+        }
         let guard = self.ledger.lock();
         let next_epoch = self.ledger.reclaim_epoch.load(Ordering::Relaxed) + 1;
         // Publish the incremented epoch BEFORE decrementing `reclaim_in_flight` so a
@@ -645,7 +771,7 @@ impl QueryMemoryLedger {
     #[inline]
     fn lock(&self) -> parking_lot::MutexGuard<'_, State> {
         #[cfg(test)]
-        LEDGER_OPS.with(|n| n.set(n.get() + 1));
+        let _ = LEDGER_OPS.try_with(|n| n.set(n.get() + 1));
         self.state.lock()
     }
     /// A ledger that takes over an eager context's fast account (see
@@ -659,7 +785,7 @@ impl QueryMemoryLedger {
         peak: u64,
     ) -> Arc<Self> {
         #[cfg(test)]
-        LEDGER_OPS.with(|n| n.set(n.get() + 1));
+        let _ = LEDGER_OPS.try_with(|n| n.set(n.get() + 1));
         debug_assert!(grant.is_none() || eager >= live, "eager covers live");
         Arc::new(Self {
             live: AtomicU64::new(live),
@@ -1089,12 +1215,18 @@ impl QueryMemoryLedger {
         Ok(AdmitStep::Done)
     }
     fn in_active_prefetch_release(&self) -> bool {
-        ACTIVE_PREFETCH_RELEASES.with(|depth| depth.get() != 0)
+        ACTIVE_PREFETCH_RELEASES
+            .try_with(|depth| depth.get() != 0)
+            .unwrap_or(true)
     }
 
     fn can_wait_for_upstream_growth(&self) -> bool {
-        ACTIVE_PREFETCH_RELEASES.with(|depth| depth.get() == 0)
-            && ACTIVE_UPSTREAM_OPS.with(|depth| depth.get() == 0)
+        ACTIVE_PREFETCH_RELEASES
+            .try_with(|depth| depth.get() == 0)
+            .unwrap_or(false)
+            && ACTIVE_UPSTREAM_OPS
+                .try_with(|depth| depth.get() == 0)
+                .unwrap_or(false)
     }
 
     fn wait_for_upstream_growth(&self, guard: &mut parking_lot::MutexGuard<'_, State>) {
@@ -4620,6 +4752,257 @@ mod tests {
         ledger_b.release_receiving(owner_b.id, 4096);
         assert_eq!(used_a.load(Ordering::Relaxed), 0);
         assert_eq!(used_b.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn nested_upstream_growth_and_staged_return_in_tls_destructor() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        const MAX_REENTRANT_ATTEMPTS: usize = 8;
+
+        struct TlsGuard {
+            action: Option<Box<dyn FnOnce() + Send>>,
+            outcome_tx: mpsc::Sender<std::result::Result<(), String>>,
+        }
+
+        impl Drop for TlsGuard {
+            fn drop(&mut self) {
+                let Some(action) = self.action.take() else {
+                    return;
+                };
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).map_err(
+                    |payload| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_owned())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_owned())
+                    },
+                );
+                let _ = self.outcome_tx.send(res);
+            }
+        }
+
+        thread_local! {
+            static GUARD: std::cell::RefCell<Option<TlsGuard>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        // 1) Ample-budget upstream growth triggered from a TLS destructor
+        // registered BEFORE the thread's first nested ledger reservation.
+        let outer = QueryMemoryLedger::seeded(None, 0, 0, 0);
+        let parent = outer.child_parent(None, 2 * LIVE_STEP).unwrap();
+        let nested = QueryMemoryLedger::nested(None, parent);
+        let owner = nested.owner(None).unwrap();
+
+        // 2) Reentrant staged-return stable refusal also triggered inside the
+        // same TLS destructor so both `UpstreamReturnScope::enter` and
+        // `UpstreamReturnScope::record_return` are exercised during teardown
+        // without looping.
+        let ref_outer = QueryMemoryLedger::seeded(None, 0, 0, 0);
+        let ref_outer_parent = ref_outer.child_parent(None, LIVE_STEP + 1).unwrap();
+        let held_leases: Arc<Mutex<Vec<MemoryLease>>> = Arc::new(Mutex::new(Vec::new()));
+        let ref_nested_cell =
+            Arc::new(std::sync::OnceLock::<std::sync::Weak<QueryMemoryLedger>>::new());
+        let ref_owner_cell = Arc::new(std::sync::OnceLock::<Arc<MemoryOwner>>::new());
+        let armed = Arc::new(AtomicBool::new(false));
+        let in_reentrant = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let take_parent = ref_outer_parent.clone();
+        let take_leases = held_leases.clone();
+        let take_nested = ref_nested_cell.clone();
+        let take_owner = ref_owner_cell.clone();
+        let take_armed = armed.clone();
+        let take_in_reentrant = in_reentrant.clone();
+        let take_attempts = attempts.clone();
+        let give_leases = held_leases.clone();
+
+        let wrapper = MemoryDomain::unpooled().parent(
+            move |n| {
+                if take_armed.load(Ordering::Acquire) {
+                    if take_in_reentrant.load(Ordering::Acquire) {
+                        let lease = take_parent.reserve(n)?;
+                        take_leases.lock().push(lease);
+                        let nested = take_nested.get().unwrap().upgrade().unwrap();
+                        let owner = take_owner.get().unwrap();
+                        nested
+                            .reserve(owner, 1 << 20, 1, false)
+                            .expect("slack-backed temporary ordinary charge must succeed");
+                        return Ok(());
+                    }
+                    let attempt = take_attempts.fetch_add(1, Ordering::AcqRel) + 1;
+                    if attempt <= MAX_REENTRANT_ATTEMPTS {
+                        let nested = take_nested.get().unwrap().upgrade().unwrap();
+                        let owner = take_owner.get().unwrap();
+                        take_in_reentrant.store(true, Ordering::Release);
+                        let re_res = nested.reserve_receiving(owner, 2, 1);
+                        take_in_reentrant.store(false, Ordering::Release);
+                        assert!(matches!(
+                            re_res,
+                            Err(Error::BudgetExceeded(b))
+                                if b.kind == BudgetKind::Memory && b.limit == 2
+                        ));
+                        nested.release(owner.id, 1);
+                    }
+                }
+                let lease = take_parent.reserve(n)?;
+                take_leases.lock().push(lease);
+                Ok(())
+            },
+            move |mut n| {
+                let mut leases = give_leases.lock();
+                while n > 0 {
+                    let last = leases.last_mut().expect("tracked upstream lease");
+                    let take = n.min(last.bytes());
+                    if take == last.bytes() {
+                        drop(leases.pop());
+                    } else {
+                        let part = last.split(take).unwrap();
+                        drop(part);
+                    }
+                    n -= take;
+                }
+            },
+        );
+        let ref_nested = QueryMemoryLedger::nested(None, wrapper);
+        ref_nested_cell.set(Arc::downgrade(&ref_nested)).unwrap();
+        let ref_owner = ref_nested.owner(None).unwrap();
+        assert!(ref_owner_cell.set(ref_owner.clone()).is_ok());
+
+        let (tx, rx) = mpsc::channel();
+        let n_grow = nested.clone();
+        let o_grow = owner.clone();
+        let n_ref = ref_nested.clone();
+        let o_ref = ref_owner.clone();
+        let armed_for_drop = armed.clone();
+
+        let t = std::thread::spawn(move || {
+            let n_grow_drop = n_grow.clone();
+            let o_grow_drop = o_grow.clone();
+            let n_ref_drop = n_ref.clone();
+            let o_ref_drop = o_ref.clone();
+
+            // Register the application TLS drop guard BEFORE any nested ledger
+            // reservation initializes ledger TLS on this thread.
+            GUARD.with(|slot| {
+                *slot.borrow_mut() = Some(TlsGuard {
+                    action: Some(Box::new(move || {
+                        // Upstream growth inside TLS destructor.
+                        n_grow_drop
+                            .reserve(&o_grow_drop, 2 * LIVE_STEP, LIVE_STEP, false)
+                            .expect("upstream growth during TLS teardown must succeed");
+                        assert_eq!(n_grow_drop.live.load(Ordering::Acquire), LIVE_STEP + 1);
+                        n_grow_drop.release(o_grow_drop.id, LIVE_STEP + 1);
+
+                        // Stable refusal with reentrant staged return inside TLS destructor.
+                        armed_for_drop.store(true, Ordering::Release);
+                        let refusal =
+                            n_ref_drop.reserve(&o_ref_drop, 1 << 20, LIVE_STEP + 1, false);
+                        armed_for_drop.store(false, Ordering::Release);
+                        assert!(
+                            matches!(
+                                refusal,
+                                Err(Error::BudgetExceeded(b))
+                                    if b.kind == BudgetKind::Memory && b.limit == LIVE_STEP + 1
+                            ),
+                            "stable refusal during TLS teardown must return BudgetExceeded: {refusal:?}"
+                        );
+                        n_ref_drop.release(o_ref_drop.id, 1);
+                    })),
+                    outcome_tx: tx,
+                });
+            });
+
+            // Initialize ledger upstream growth on this thread AFTER registering
+            // the application TLS guard so any `Drop` ledger TLS key would be
+            // destroyed before `GUARD` on glibc.
+            n_grow
+                .reserve(&o_grow, 2 * LIVE_STEP, 1, false)
+                .expect("initial one-byte reservation must acquire one LIVE_STEP");
+            n_ref
+                .reserve(&o_ref, 1 << 20, 1, false)
+                .expect("initial one-byte reservation on refusal ledger must succeed");
+        });
+
+        let outcome = recv_bounded(&rx, "TLS destructor guard did not run or hung");
+        t.join().unwrap();
+        outcome.expect("TLS destructor upstream growth and staged return must not panic");
+
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            2,
+            "reentrant stable refusal during TLS teardown must not loop"
+        );
+        assert_eq!(ref_nested.upstream_return_epoch.load(Ordering::Acquire), 2);
+        assert_eq!(nested.live.load(Ordering::Acquire), 0);
+        assert_eq!(ref_nested.live.load(Ordering::Acquire), 0);
+
+        drop(owner);
+        drop(nested);
+        drop(ref_owner);
+        drop(ref_nested);
+        assert_eq!(outer.live.load(Ordering::Acquire), 0);
+        assert_eq!(ref_outer.live.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn upstream_return_scope_overflow_tracks_same_thread_vs_concurrent_returns() {
+        let ledger_a = QueryMemoryLedger::seeded(None, 0, 0, 0);
+        let ledger_b = QueryMemoryLedger::seeded(None, 0, 0, 0);
+
+        let depth = INLINE_RETURN_SCOPES + 3;
+        let mut scopes = Vec::with_capacity(depth);
+        for i in 0..depth {
+            let target = if i % 2 == 0 { &ledger_a } else { &ledger_b };
+            let epoch = target.upstream_return_epoch.load(Ordering::Acquire);
+            scopes.push(UpstreamReturnScope::enter(target, epoch));
+        }
+
+        // Same-thread staged return on `ledger_a` must be discounted by every
+        // active `ledger_a` scope (both inline and overflow) and ignored by
+        // `ledger_b` scopes.
+        UpstreamReturnScope::record_return(&ledger_a);
+        ledger_a
+            .upstream_return_epoch
+            .fetch_add(1, Ordering::Release);
+        for scope in &scopes {
+            assert!(
+                !scope.other_returned(),
+                "same-thread return must not trigger other_returned"
+            );
+        }
+
+        // A concurrent return on `ledger_a` (advancing epoch without recording
+        // on this thread) must be observed by both inline and overflow scopes
+        // targeting `ledger_a`, but not by `ledger_b` scopes.
+        ledger_a
+            .upstream_return_epoch
+            .fetch_add(1, Ordering::Release);
+        for (i, scope) in scopes.iter().enumerate() {
+            assert_eq!(
+                scope.other_returned(),
+                i % 2 == 0,
+                "concurrent return on ledger_a must be observed only by ledger_a scopes (index {i})"
+            );
+        }
+
+        // Drop in LIFO order and ensure overflow bookkeeping drains cleanly.
+        while let Some(scope) = scopes.pop() {
+            drop(scope);
+        }
+        ACTIVE_UPSTREAM_RETURN_SCOPES.with(|s| {
+            assert_eq!(s.len.get(), 0, "inline scope stack must return to empty");
+            let tid = s.tid.get();
+            assert!(
+                OVERFLOW_RETURN_SCOPES
+                    .lock()
+                    .iter()
+                    .all(|entry| entry.tid != tid),
+                "overflow scopes for this thread must be completely drained"
+            );
+        });
     }
 }
 
