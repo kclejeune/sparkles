@@ -7907,6 +7907,146 @@ fn reference_str_1093_r6_bounds_count_distinct_star_pair_scan() {
 }
 
 #[test]
+fn reference_str_1093_r7_bounds_count_distinct_star_bucket_refinement() {
+    use reference::check::Outcome;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    fn balanced_union(branches: &[String]) -> String {
+        match branches {
+            [] => unreachable!(),
+            [single] => single.clone(),
+            _ => {
+                let mid = branches.len() / 2;
+                format!(
+                    "{{ {} UNION {} }}",
+                    balanced_union(&branches[..mid]),
+                    balanced_union(&branches[mid..])
+                )
+            }
+        }
+    }
+
+    let peeling_union = |count: usize, prefix: &str| -> String {
+        let branches: Vec<String> = (1..=count)
+            .map(|i| {
+                if i < count {
+                    format!(
+                        "{{ BIND(1 AS ?{prefix}{i}) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{prefix}{}) }}",
+                        i + 1
+                    )
+                } else {
+                    format!("{{ BIND(1 AS ?{prefix}{i}) }}")
+                }
+            })
+            .collect();
+        balanced_union(&branches)
+    };
+
+    let grouped_slice = |count: usize| -> String {
+        let body = peeling_union(count, "v");
+        format!(
+            "SELECT ?g WHERE {{ \
+                {{ VALUES (?g ?x) {{ (1 1) (1 2) }} }} \
+                UNION {{ {body} BIND(2 AS ?g) }} \
+            }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+        )
+    };
+
+    let count_only = |count: usize| -> String {
+        let body = peeling_union(count, "v");
+        format!("SELECT (COUNT(DISTINCT *) AS ?count) WHERE {{ {body} }}")
+    };
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+
+    // Small peeling chain (10 rows, 9 refinement passes, 0 pair checks) fits
+    // within the proof budget and still proves COUNT(DISTINCT *) fixed.
+    let default_oracle = reference::Reference::new(Vec::new());
+    let small_slice = grouped_slice(10);
+    assert!(check(&default_oracle, &small_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &small_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+
+    // Tight work_limit bounds recursive bucket refinement conservatively without
+    // failing evaluation: 30 peeling rows evaluate well under work_limit(1_000)
+    // but need more refinement work than the remaining proof budget allows.
+    let tight = reference::Reference::new(Vec::new()).with_work_limit(1_000);
+    let medium_slice = grouped_slice(30);
+    assert!(matches!(
+        check(&tight, &medium_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&tight, &count_only(30), &[&["30"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Peeling chain exceeding the default proof budget (240 rows, 0 pair checks)
+    // retains spelling dependency conservatively and still compares without ORDER BY.
+    let over_budget_slice = grouped_slice(240);
+    assert!(matches!(
+        check(&default_oracle, &over_budget_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&default_oracle, &count_only(240), &[&["240"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Shared cross-group proof budget: a single 120-row peeling group fits within
+    // the default budget (~36k), while three such groups (~108k) exhaust it.
+    let single_120_slice = grouped_slice(120);
+    assert!(check(&default_oracle, &single_120_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &single_120_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+    let multi_group_slice = format!(
+        "SELECT ?g WHERE {{ \
+            {{ VALUES (?g ?x) {{ (1 1) (1 2) }} }} \
+            UNION {{ {} BIND(2 AS ?g) }} \
+            UNION {{ {} BIND(3 AS ?g) }} \
+            UNION {{ {} BIND(4 AS ?g) }} \
+        }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1",
+        peeling_union(120, "a"),
+        peeling_union(120, "b"),
+        peeling_union(120, "c"),
+    );
+    assert!(matches!(
+        check(&default_oracle, &multi_group_slice, &[one]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    // Large peeling chain under the optimizer work limit completes quickly and
+    // compares cleanly without ORDER BY.
+    let large = reference::Reference::new(Vec::new()).with_work_limit(20_000_000);
+    assert_eq!(
+        check(&large, &count_only(600), &[&["600"]]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
 fn reference_str_1093_r5_keeps_min_max_fixed_across_strict_term_classes() {
     use reference::check::Outcome;
     let two = &["2"][..];

@@ -602,7 +602,7 @@ pub(crate) struct Evaluator<'a> {
     pub chose: Cell<bool>,
     pub notes: Cell<Notes>,
     work: Cell<u64>,
-    distinct_pair_work: Cell<u64>,
+    distinct_proof_work: Cell<u64>,
     /// The variables that hold open values somewhere in the evaluation.
     pub open_vars: RefCell<HashSet<Variable>>,
     /// Whether the expression being evaluated read an open value.
@@ -869,13 +869,36 @@ fn always_distinct(a: &Solution, b: &Solution) -> bool {
             .any(|v| always_distinct_on(a, b, v))
 }
 
-/// Maximum pairwise checks used across a query to prove `COUNT(DISTINCT *)`
+/// Maximum work units used across a query to prove `COUNT(DISTINCT *)`
 /// independent of computed numeric spellings before falling back conservatively.
-const DISTINCT_COUNT_PAIR_BUDGET: u64 = 100_000;
+/// Covers both recursive bucket refinement and pairwise distinctness checks.
+const DISTINCT_COUNT_PROOF_BUDGET: u64 = 100_000;
+
+fn charge_distinct_refinement(members: &[&Solution], budget: &mut u64) -> bool {
+    if (members.len() as u64) > *budget {
+        return false;
+    }
+    let mut pass_cost = 0u64;
+    for (visited, s) in members.iter().enumerate() {
+        let row_cost = 1u64
+            .saturating_add(s.terms.len() as u64)
+            .saturating_add(s.spelling.len() as u64);
+        pass_cost = pass_cost.saturating_add(row_cost);
+        if pass_cost > *budget {
+            *budget = budget.saturating_sub((visited + 1) as u64);
+            return false;
+        }
+    }
+    *budget -= pass_cost;
+    true
+}
 
 fn distinct_count_depends_on_spelling(members: &[Solution], budget: &mut u64) -> bool {
     if members.len() <= 1 || !members.iter().any(Solution::has_visible_spelling) {
         return false;
+    }
+    if (members.len() as u64) > *budget {
+        return true;
     }
     let refs: Vec<&Solution> = members.iter().collect();
     distinct_count_bucket_depends_on_spelling(&refs, budget)
@@ -883,24 +906,38 @@ fn distinct_count_depends_on_spelling(members: &[Solution], budget: &mut u64) ->
 
 fn distinct_count_bucket_depends_on_spelling(members: &[&Solution], budget: &mut u64) -> bool {
     use SpellingDependency as Spelling;
-    if members.len() <= 1 || !members.iter().any(|s| s.has_visible_spelling()) {
+    if members.len() <= 1 {
         return false;
     }
+    if !charge_distinct_refinement(members, budget) {
+        return true;
+    }
     let mut stability: HashMap<&Variable, Spelling> = HashMap::new();
-    for s in members {
+    let mut has_spelling = Vec::with_capacity(members.len());
+    for &s in members {
+        let mut dep = false;
         for v in s.terms.keys().filter(|v| !is_hidden(v)) {
+            let sp = s.var_spelling(v);
+            if sp != Spelling::None {
+                dep = true;
+            }
             let entry = stability.entry(v).or_default();
-            *entry = (*entry).max(s.var_spelling(v));
+            *entry = (*entry).max(sp);
         }
         for (v, &sp) in &s.spelling {
             if !is_hidden(v) && !s.terms.contains_key(v) && sp != Spelling::None {
+                dep = true;
                 stability.insert(v, Spelling::Term);
             }
         }
+        has_spelling.push(dep);
+    }
+    if !has_spelling.iter().any(|&dep| dep) {
+        return false;
     }
     let mut bucket_index: HashMap<Vec<(&Variable, FixedBucketValue<'_>)>, usize> = HashMap::new();
-    let mut buckets: Vec<Vec<&Solution>> = Vec::new();
-    for &s in members {
+    let mut buckets: Vec<(Vec<&Solution>, bool)> = Vec::new();
+    for (&s, &dep) in members.iter().zip(&has_spelling) {
         let key = s
             .terms
             .iter()
@@ -915,20 +952,27 @@ fn distinct_count_bucket_depends_on_spelling(members: &[&Solution], budget: &mut
             .collect();
         let idx = *bucket_index.entry(key).or_insert_with(|| {
             let idx = buckets.len();
-            buckets.push(Vec::new());
+            buckets.push((Vec::new(), false));
             idx
         });
-        buckets[idx].push(s);
+        buckets[idx].0.push(s);
+        buckets[idx].1 |= dep;
     }
+    drop(bucket_index);
+    drop(stability);
     if buckets.len() > 1 {
-        return buckets
-            .into_iter()
-            .any(|group| distinct_count_bucket_depends_on_spelling(&group, budget));
+        drop(has_spelling);
+        return buckets.into_iter().any(|(group, group_has_spelling)| {
+            group.len() > 1
+                && group_has_spelling
+                && distinct_count_bucket_depends_on_spelling(&group, budget)
+        });
     }
+    drop(buckets);
     let mut dep = Vec::new();
     let mut fixed = Vec::new();
-    for &s in members {
-        if s.has_visible_spelling() {
+    for (&s, &is_dep) in members.iter().zip(&has_spelling) {
+        if is_dep {
             dep.push(s);
         } else {
             fixed.push(s);
@@ -1134,7 +1178,7 @@ impl<'a> Evaluator<'a> {
             chose: Cell::new(false),
             notes: Cell::new(Notes::default()),
             work: Cell::new(0),
-            distinct_pair_work: Cell::new(0),
+            distinct_proof_work: Cell::new(0),
             open_vars: RefCell::new(HashSet::new()),
             read_open: Cell::new(false),
             read_spelling: Cell::new(false),
@@ -1214,11 +1258,11 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// Remaining pair-comparison budget for proving `COUNT(DISTINCT *)` independent
-    /// of computed numeric spellings within this evaluation.
-    fn distinct_pair_budget(&self) -> u64 {
-        let spent = self.distinct_pair_work.get();
-        let cap = DISTINCT_COUNT_PAIR_BUDGET.saturating_sub(spent);
+    /// Remaining proof budget for proving `COUNT(DISTINCT *)` independent of
+    /// computed numeric spellings within this evaluation.
+    fn distinct_proof_budget(&self) -> u64 {
+        let spent = self.distinct_proof_work.get();
+        let cap = DISTINCT_COUNT_PROOF_BUDGET.saturating_sub(spent);
         match self.data.work_limit {
             Some(limit) => {
                 let total_used = self.work.get().saturating_add(spent);
@@ -2128,11 +2172,11 @@ impl<'a> Evaluator<'a> {
                     }
                     let n = members.iter().map(visible).collect::<HashSet<_>>().len();
                     let mut binding = Binding::number(int_term(n as i128));
-                    let initial_budget = self.distinct_pair_budget();
+                    let initial_budget = self.distinct_proof_budget();
                     let mut budget = initial_budget;
                     let depends = distinct_count_depends_on_spelling(members, &mut budget);
-                    self.distinct_pair_work.set(
-                        self.distinct_pair_work
+                    self.distinct_proof_work.set(
+                        self.distinct_proof_work
                             .get()
                             .saturating_add(initial_budget - budget),
                     );
