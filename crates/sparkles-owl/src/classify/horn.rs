@@ -1175,9 +1175,6 @@ struct Norm<'a, 'b> {
     it: &'a mut Interner,
     rb: Option<&'a RoleBox>,
     out: Out,
-    /// whether the ontology has individuals, which leaves at-least restrictions above
-    /// one out (F24, "The Horn rules with individuals")
-    individuals: bool,
     budget: Option<&'a mut PairBudget<'b>>,
     stop: &'a dyn Fn() -> bool,
     halt: Option<Halt>,
@@ -1531,6 +1528,12 @@ impl Norm<'_, '_> {
         Ok(self.it.node(Node::Exist(r, n)))
     }
 
+    /// Unfolds `≥n p.f` into `n` existential restrictions with fresh, pairwise disjoint
+    /// subclasses of `f` (Kazakov's Lemma 2). This preserves satisfiability and named-class
+    /// subsumptions beside individuals in the Horn fragment, as the direct power `I^κ`
+    /// preserves every Horn axiom, nominals and EL data axioms while giving each tuple whose
+    /// coordinates satisfy `≥n p.f` in `I` at least `2^κ` distinct successors to colour
+    /// (F24, "The Horn rules with individuals", roadmap item 867).
     fn at_least(
         &mut self,
         n: u32,
@@ -1540,11 +1543,6 @@ impl Norm<'_, '_> {
     ) -> Result<Ex, Why> {
         if n == 0 {
             return Ok(TOP);
-        }
-        if n > 1 && self.individuals {
-            // Lemma 2's fresh disjoint fillers are argued for tree-shaped models, and a
-            // nominal is a shared successor (roadmap item 867)
-            return Err("an at-least restriction above one beside individuals");
         }
         let r = if n == 1 {
             self.role(p)?
@@ -2160,10 +2158,6 @@ pub fn normalize(
 ) -> Result<Vec<bool>, Halt> {
     let mut taken = vec![false; axioms.len()];
     let mut h = HornAx::default();
-    // whether the run has individuals: those the EL axioms interned, and those the axioms
-    // here name, anonymous ones among them (roadmap item 1281)
-    let individuals =
-        !it.individuals.is_empty() || axioms.iter().any(|k| super::index::holds_individual(k));
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles
@@ -2190,7 +2184,6 @@ pub fn normalize(
             it,
             rb: None,
             out: Out::default(),
-            individuals,
             budget: None,
             stop,
             halt: None,
@@ -2276,7 +2269,6 @@ pub fn normalize(
             it,
             rb: Some(&rb),
             out: Out::default(),
-            individuals,
             budget: Some(&mut budget),
             stop,
             halt: None,

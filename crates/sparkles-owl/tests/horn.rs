@@ -488,12 +488,13 @@ fn axioms_the_horn_rules_cannot_take_stay_left_out() {
     assert_eq!(ex.len(), 0, "{ex:#?}");
     assert_eq!(out.stats.outside_el.taken, 1);
     assert_eq!(out.stats.tier, Tier::Horn);
-    // an at-least restriction above one stays out beside individuals (item 867)
+    // an at-least restriction above one is taken beside individuals (item 867)
     let (out, ex) = run("SubClassOf(:A ObjectMinCardinality(2 :r :B))
          SubClassOf(:A ObjectAllValuesFrom(:r :C))
          ClassAssertion(:A :a)");
-    assert_eq!(ex.len(), 1, "{ex:#?}");
-    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(ex.len(), 0, "{ex:#?}");
+    assert_eq!(out.stats.outside_el.taken, 2);
+    assert_eq!(out.stats.tier, Tier::Horn);
 }
 
 #[test]

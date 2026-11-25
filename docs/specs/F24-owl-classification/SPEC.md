@@ -103,6 +103,22 @@ rules on ontologies with individuals, functional data properties and top propert
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.
 
+Item 867 enables at-least restrictions above one beside individuals in the Horn rules,
+using Kazakov's Lemma 2 unfolding into fresh, pairwise disjoint subclasses of the filler
+up to `MAX_AT_LEAST`. For Horn ontologies with individuals, nominals, at-most-one
+restrictions, keys, top properties and OWL 2 EL data axioms, the unfolding preserves
+satisfiability and all named-class subsumptions, including named-class unsatisfiability,
+by a direct-power argument over `I^κ` in which every tuple whose coordinates all satisfy
+`≥n r.C` in `I` has at least `2^κ` distinct successors to colour with the fresh classes.
+When a non-Horn finite data range enters through the datatype checker, the Horn saturation
+stays sound because the checker emits only valid Horn implications and reports unresolved
+data covers as used in part. All 50 `horn-sroiq` fixtures in the `dl603` suite now
+classify whole alongside the 50 `horn-shiq` fixtures with exact HermiT 1.4.5.519 taxonomy
+parity, together with new hand fixtures covering satisfiable and unsatisfiable
+restrictions, nominals, functionality, at-most restrictions, inverses, subproperties,
+keys, self restrictions, anonymous individuals, EL datatypes, `DifferentIndividuals`,
+asymmetric roles, non-Horn data covers and incremental updates.
+
 Item 972 is the second phase of [the datatype checker](#the-datatype-checker). A data
 property whose component has a universal restriction, a cardinality, an enumeration of
 several values, a facet, a union, a complement, a datatype outside OWL 2 EL or a
@@ -1948,11 +1964,10 @@ changes nothing for them. `Limits::rooted` lifts the refusal of individuals for 
 disjunctive rules under the further conditions of its section, as it does today. When the
 disjunctive rules decline an ontology, the Horn rules take what they can of it, with its
 individuals, and leave out and report the axioms that need case analysis and the axioms
-they left out before, which are at-least restrictions above 64, data restrictions outside
-OWL 2 EL, and axioms over property hierarchies that are not regular or whose automata
-pass the bound. A run with individuals also leaves out at-least restrictions above one,
-for the reason the normalization paragraph gives, which item 867 follows, and chains
-through the top property stay partial, as item 663 records.
+they left out before, which are at-least restrictions above 64, data restrictions that
+neither OWL 2 EL nor the datatype checker accepts, and axioms over property hierarchies
+that are not regular or whose automata pass the bound. Chains through the top property
+stay partial, as item 663 records.
 
 **One saturation.** Kazakov's rules read a context as the set of instances of its
 conjunction, and every conclusion of a context holds of each of its instances. The EL
@@ -1972,17 +1987,86 @@ individuals in a positive position is not Horn and stays with the disjunctive ru
 normalization takes a class assertion `C(a)` as `{a} ⊑ C`, so that a Horn class
 expression in an assertion reaches the rules, and an object property assertion over an
 inverse property as the assertion over the property the other way round. The other
-assertions are EL axioms already. A run with individuals leaves out and reports an
-at-least restriction above one, where a run without them unfolds it as the paper's Lemma
-2 does into fresh, pairwise disjoint fillers. The lemma's argument expands a model of
-the ontology to one of the unfolding, and it colours each element's successors with the
-fresh fillers, which it can do because the paper's models are trees in which no two
-elements share a successor. A nominal is a shared successor, and the argument is not
-made here for models with them, though no Horn axiom bounds an element's successors to
-a finite set, so an expansion that adds fresh successors may exist. Leaving the
-restriction out is a sound weakening that the run reports, no file of the lane's gate
-has such a restriction beside individuals, and item 867 holds the argument or the
-rule that takes them. Lemma 2 stays for runs without individuals.
+assertions are EL axioms already. A run with individuals takes a positive at-least
+restriction above one, up to `MAX_AT_LEAST` over a simple role, by unfolding `≥n r.C`
+into `n` existential restrictions `∃r.B_1 ⊓ … ⊓ ∃r.B_n` with fresh, pairwise disjoint
+subclasses `B_i ⊑ C`, as Kazakov's Lemma 2 does without individuals.
+
+Every model of the unfolding is a model of the original ontology, because pairwise
+disjointness forces the `n` successors to be distinct. For the converse in the Horn
+fragment with individuals, take any model `I` of the original ontology and set
+`κ = max(ℵ_0, |Δ^I|)`. When `|Δ^I| = 1`, no element satisfies `≥n r.C` for `n ≥ 2`, so
+interpreting every `B_i` as empty suffices. When `|Δ^I| ≥ 2`, form the direct power `I^κ`
+with domain `(Δ^I)^κ`, coordinatewise atomic classes and object roles, and each named
+individual interpreted as its constant tuple `(a^I)_{α < κ}`, lifting a fixed satisfying
+valuation of the existentially quantified anonymous individuals in `I` to constant tuples
+as well. By structural induction after root-level dualization, every negative-position
+Horn expression `G` satisfies `G^{I^κ} ⊆ (G^I)^κ` and every positive-position Horn
+expression `H` satisfies `(H^I)^κ ⊆ H^{I^κ}`, because positive nominals are singletons,
+positive at-most restrictions have bound at most one, and no positive disjunctions occur.
+Role inclusions, chains, inverses, `ObjectHasSelf`, reflexivity, irreflexivity,
+asymmetry, disjointness, universal object roles, assertions, individual equalities and
+inequalities, and keys over named individuals all hold in `I^κ`.
+
+For OWL 2 EL data properties, resolve all EL `DatatypeDefinition` axioms first so that
+every EL data range reduces to empty, a singleton `{v}`, a proper EL datatype `T`, or
+`rdfs:Literal`. The OWL 2 EL datatypes form disjoint chains of finite height beneath
+`rdfs:Literal`, and every proper EL datatype `T` has an infinite top atomic cell
+`T^∘ = T \ ⋃_{T' ⊊ T} T'`. Distinguish the source data domain `Δ_D` from the target data
+domain `Δ_D'` of `I^κ`. Under the full OWL 2 datatype map, `rdfs:Literal` already
+contains values outside every proper EL chain, such as `xsd:boolean` values that do not
+occur in EL data axioms, so `Δ_D' = Δ_D`. Over the strict EL datatype map alone, where
+`Δ_D` has no value outside the proper EL chains, set `Δ_D' = Δ_D ∪ {u_⊤}` by adding one
+fresh value `u_⊤` to `rdfs:Literal` outside every proper EL datatype. Pick one fresh
+representative `u_T ∈ T^∘ ⊆ Δ_D'` avoiding all finitely many literal values in the
+ontology for each EL datatype `T`, using `u_⊤` for `rdfs:Literal` when `Δ_D'` is
+extended. Define `φ : (Δ_D)^κ → Δ_D'` by `φ(v⃗) = v` when `v⃗ = (v)_{α < κ}` is constant
+and `φ(v⃗) = u_{T(v⃗)}` otherwise, where `T(v⃗)` is the unique smallest EL datatype or
+`rdfs:Literal` containing `{v_α : α < κ}`. For every EL data property `d`, including
+`owl:topDataProperty` and any role forced universal by inclusions, set
+`d^{I^κ}(x) = Δ_D'` when `d^I(c) = Δ_D` and `d^{I^κ}(x) = d^I(c)` otherwise on each
+constant tuple `x = (c)_{α < κ}`, and set
+`d^{I^κ}(x) = {φ(v⃗) : v⃗ ∈ ∏_{α < κ} d^I(x_α)}` on each non-constant tuple `x`. On
+`owl:topDataProperty` and any universal superrole, every constant tuple receives `Δ_D'`,
+and every non-constant tuple's full product `(Δ_D)^κ` produces all values of `Δ_D` via
+constant vectors `(v)_{α < κ}` together with `u_⊤`, when `Δ_D'` is extended, via any
+non-constant vector combining values from two disjoint proper EL chains such as an
+`xsd:integer` and an `xsd:string`. Applying the same map `φ` to every data property
+preserves `SubDataPropertyOf` and preserves `FunctionalDataProperty` because
+`|d^I(x_α)| ≤ 1 < |Δ_D|` gives `|∏ d^I(x_α)| ≤ 1` and never makes a fiber equal to
+`Δ_D`. It preserves `DataPropertyRange`, `DataHasValue` in both polarities because no
+`u_T` equals an ontology literal, and `DataSomeValuesFrom` in both polarities because
+`u_{T(v⃗)} ∈ T^∘ ∩ T` forces `T(v⃗) ⊆ T` on the tree of disjoint EL chains. On constant
+tuples, `DataPropertyAssertion` and `NegativeDataPropertyAssertion` hold because `u_⊤` is
+distinct from every literal in `Δ_D`, and `HasKey` on named individuals holds without
+spurious collisions because dummy values never enter non-full diagonal fibers and any two
+diagonal fibers that share `u_⊤` were both equal to `Δ_D` in `I`, so those named
+individuals already shared an existing value of `Δ_D` in `I`.
+
+For each occurrence of `≥n r.C` processed bottom-up with already-unfolded filler `C'`,
+every tuple `x` in `((≥n r.C)^I)^κ` has at least `n^κ ≥ 2^κ` distinct `r`-successors in
+`(C^I)^κ ⊆ (C')^{I^κ}`, while `|Δ^{I^κ}| = |Δ^I|^κ = 2^κ`, so transfinite recursion
+assigns `n` distinct unassigned `r`-successors of each `x` to `B_1, …, B_n ⊆ (C')^{I^κ}`
+without reusing any element. Unfolding therefore preserves satisfiability and all
+named-class subsumptions `A ⊑ B`, including named-class unsatisfiability, because any
+counterexample `a ∈ A^I \ B^I` lifts to the constant tuple `(a)_{α < κ} ∈ A^{I^κ} \ B^{I^κ}`
+with named extensions left uncoloured. Arbitrary non-Horn subsumptions over the original
+signature need not be preserved, as `∀owl:topObjectProperty.{a, b, c} ⊑ owl:Nothing`
+beside `DifferentIndividuals(:a :b :c)`, `IrreflexiveObjectProperty(:r)` and
+`owl:Thing ⊑ ≥2 r.owl:Thing` illustrates.
+
+When an ontology also contains a non-Horn finite data range handled by the datatype
+checker, such as `DataOneOf` over three values alongside `≤1 r.(d = v)` restrictions, the
+unfolded ontology can be semantically stronger under full case analysis over data values.
+The Horn saturation still stays sound on such ontologies because the datatype checker
+emits only valid Horn implications `⋀ Γ ⊑ ψ`: `owl:Nothing` for incompatible local
+premises, a single entailed body atom, or a shared told positive consequence of a cover.
+Non-told uses such as at-most qualifiers cannot trigger a grouped told consequence, and
+any unresolved cover sets a diagnostic and is reported as used in part. Replacing each
+checker atom with a fresh atomic class interpreted coordinatewise as a unary predicate
+from `I` rather than from concrete OWL data values, and replacing the checker axioms with
+the finite set of emitted Horn implications, yields a pure Horn ontology satisfied by `I`
+whose unfolding `I^κ` models, so every Horn derivation stays sound.
 
 Three mechanisms of the EL rules of individuals have to reach the links and contexts of
 the Horn rules.
@@ -2308,8 +2392,7 @@ holds the judgements, the exclusions, the generator and the timings, which the
 discusses.
 
 **Out of scope.** Enumerations of several individuals in a positive position need case
-analysis and stay with the rooted run. At-least restrictions above one beside
-individuals are item 867, and chains through the top property stay in item 663. A cheaper
+analysis and stay with the rooted run. Chains through the top property stay in item 663. A cheaper
 witness criterion is not built. Item 1281 later took anonymous individuals, as
 [Anonymous individuals and top-property inclusions](#anonymous-individuals-and-top-property-inclusions)
 describes. Data cardinalities
