@@ -1534,20 +1534,55 @@ impl DlSt {
     /// or among its units made no inference that the changed rules give or take. A clause
     /// the store subsumed on arrival was a premise of none. The equalities and the interned
     /// literals of runs that count or have a root are not read, and count as marked.
+    #[cfg(test)]
     pub fn names_changed(&self, changed: &[bool]) -> bool {
+        let mut noop = |_| Ok(());
+        self.names_changed_poll(changed, &mut noop)
+            .expect("noop poll never fails")
+    }
+
+    /// Like [`DlSt::names_changed`], polling `tick` across markers, edges, and stored clauses.
+    pub(super) fn names_changed_poll(
+        &self,
+        changed: &[bool],
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<bool, super::Error> {
         let hit = |e: Ex| changed.get(e as usize).copied().unwrap_or(true);
-        self.hyps.iter().any(|&a| hit(a))
-            || self.neg.iter().any(|&a| hit(a))
-            || self.edges.iter().any(|&(e, _)| hit(e))
-            || self.store.clauses.iter().any(|s| {
-                s.c.body().iter().chain(s.c.head()).any(|l| match l.kind() {
+        for &a in &self.hyps {
+            tick(1)?;
+            if hit(a) {
+                return Ok(true);
+            }
+        }
+        for &a in &self.neg {
+            tick(1)?;
+            if hit(a) {
+                return Ok(true);
+            }
+        }
+        for &(e, _) in &self.edges {
+            tick(1)?;
+            if hit(e) {
+                return Ok(true);
+            }
+        }
+        for s in &self.store.clauses {
+            tick(1)?;
+            for l in s.c.body().iter().chain(s.c.head()) {
+                tick(1)?;
+                let matched = match l.kind() {
                     X | Y => hit(l.atom()),
                     F => hit(l.fun()) || hit(l.atom()),
                     RL => hit(l.fun()),
                     RY => false,
                     _ => true,
-                })
-            })
+                };
+                if matched {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Removes the contexts in `gone` from the predecessors that registered, which
@@ -1556,45 +1591,170 @@ impl DlSt {
         self.dpreds.retain(|(u, _)| !gone.contains(u));
     }
 
+    /// Peak temporary scratch bytes needed by [`DlSt::shift_contexts`] when shifting dynamic
+    /// context ids from `from` upward. Each hash table is rebuilt sequentially with
+    /// `with_capacity_and_hasher(old.len(), ..)` and drops its old table before the next
+    /// table starts, so the peak overlap is the maximum single rebuilt table.
+    pub fn shift_scratch(
+        &self,
+        from: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<usize, super::Error> {
+        let mut peak = 0usize;
+        let mut has_pred_in = false;
+        for &v in self.pred_in.keys() {
+            tick(1)?;
+            if v >= from {
+                has_pred_in = true;
+                break;
+            }
+        }
+        if has_pred_in {
+            peak = peak.max(hash_table_bytes(
+                self.pred_in.len(),
+                std::mem::size_of::<(Ex, Vec<u32>)>(),
+            ));
+        }
+        let mut has_pred_seen = false;
+        for &(v, _) in &self.pred_seen {
+            tick(1)?;
+            if v >= from {
+                has_pred_seen = true;
+                break;
+            }
+        }
+        if has_pred_seen {
+            peak = peak.max(hash_table_bytes(
+                self.pred_seen.len(),
+                std::mem::size_of::<(Ex, u32)>(),
+            ));
+        }
+        let mut has_sent = false;
+        for &(v, _) in &self.sent {
+            tick(1)?;
+            if v >= from {
+                has_sent = true;
+                break;
+            }
+        }
+        if has_sent {
+            peak = peak.max(hash_table_bytes(
+                self.sent.len(),
+                std::mem::size_of::<(Ex, Ex)>(),
+            ));
+        }
+        if let Some(r) = self.root.as_deref() {
+            let mut has_pending = false;
+            for &v in r.pred_pending.keys() {
+                tick(1)?;
+                if v >= from {
+                    has_pending = true;
+                    break;
+                }
+            }
+            if has_pending {
+                peak = peak.max(hash_table_bytes(
+                    r.pred_pending.len(),
+                    std::mem::size_of::<(Ex, Vec<u32>)>(),
+                ));
+            }
+        }
+        Ok(peak)
+    }
+
     /// Adds `delta` to every context id from `from` upward that the state names, as
     /// [`State::shift_contexts`] does for the rest of the state.
-    pub fn shift_contexts(&mut self, from: Ex, delta: Ex) {
+    pub fn shift_contexts(
+        &mut self,
+        from: Ex,
+        delta: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
         let up = |e: Ex| if e >= from { e + delta } else { e };
         for (u, _) in &mut self.dpreds {
             *u = up(*u);
+            tick(1)?;
         }
         for (_, v) in &mut self.edges {
             *v = up(*v);
+            tick(1)?;
         }
         debug_assert!(
             self.edges
                 .windows(2)
                 .all(|w| (w[0].1, w[0].0) < (w[1].1, w[1].0))
         );
-        if self.pred_in.keys().any(|&v| v >= from) {
-            self.pred_in = std::mem::take(&mut self.pred_in)
-                .into_iter()
-                .map(|(v, c)| (up(v), c))
-                .collect();
-            self.pred_seen = std::mem::take(&mut self.pred_seen)
-                .into_iter()
-                .map(|(v, c)| (up(v), c))
-                .collect();
+        let mut has_pred_in = false;
+        for &v in self.pred_in.keys() {
+            tick(1)?;
+            if v >= from {
+                has_pred_in = true;
+                break;
+            }
         }
-        if self.sent.iter().any(|&(v, _)| v >= from) {
-            self.sent = std::mem::take(&mut self.sent)
-                .into_iter()
-                .map(|(v, a)| (up(v), a))
-                .collect();
+        if has_pred_in {
+            let old = std::mem::take(&mut self.pred_in);
+            let mut next = FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
+            for (v, c) in old {
+                next.insert(up(v), c);
+                tick(1)?;
+            }
+            self.pred_in = next;
         }
-        if let Some(r) = self.root.as_deref_mut()
-            && r.pred_pending.keys().any(|&v| v >= from)
-        {
-            r.pred_pending = std::mem::take(&mut r.pred_pending)
-                .into_iter()
-                .map(|(v, c)| (up(v), c))
-                .collect();
+        let mut has_pred_seen = false;
+        for &(v, _) in &self.pred_seen {
+            tick(1)?;
+            if v >= from {
+                has_pred_seen = true;
+                break;
+            }
         }
+        if has_pred_seen {
+            let old = std::mem::take(&mut self.pred_seen);
+            let mut next = FxHashSet::with_capacity_and_hasher(old.len(), Default::default());
+            for (v, c) in old {
+                next.insert((up(v), c));
+                tick(1)?;
+            }
+            self.pred_seen = next;
+        }
+        let mut has_sent = false;
+        for &(v, _) in &self.sent {
+            tick(1)?;
+            if v >= from {
+                has_sent = true;
+                break;
+            }
+        }
+        if has_sent {
+            let old = std::mem::take(&mut self.sent);
+            let mut next = FxHashSet::with_capacity_and_hasher(old.len(), Default::default());
+            for (v, a) in old {
+                next.insert((up(v), a));
+                tick(1)?;
+            }
+            self.sent = next;
+        }
+        if let Some(r) = self.root.as_deref_mut() {
+            let mut has_pending = false;
+            for &v in r.pred_pending.keys() {
+                tick(1)?;
+                if v >= from {
+                    has_pending = true;
+                    break;
+                }
+            }
+            if has_pending {
+                let old = std::mem::take(&mut r.pred_pending);
+                let mut next = FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
+                for (v, c) in old {
+                    next.insert(up(v), c);
+                    tick(1)?;
+                }
+                r.pred_pending = next;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -180,16 +180,30 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
         }
     }
 
-    /// Replaces each member by `f` of it, which must keep distinct members distinct.
-    pub fn map(&mut self, f: impl Fn(T) -> T) {
+    /// Replaces each member by `f` of it, which must keep distinct members distinct,
+    /// dropping any old hash set before allocating the replacement from `self.list` so peak
+    /// memory never overlaps two tables, and polling `tick` across both passes.
+    pub fn map_poll(
+        &mut self,
+        f: impl Fn(T) -> T,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
         for x in &mut self.list {
             *x = f(*x);
+            tick(1)?;
         }
-        if let Some(set) = &mut self.set {
-            let mapped: FxHashSet<T> = set.iter().map(|&x| f(x)).collect();
+        if let Some(set) = self.set.take() {
+            drop(set);
+            let mut mapped: FxHashSet<T> =
+                FxHashSet::with_capacity_and_hasher(self.list.len(), Default::default());
+            for &x in &self.list {
+                mapped.insert(x);
+                tick(1)?;
+            }
             debug_assert_eq!(mapped.len(), self.list.len());
-            *set = mapped;
+            self.set = Some(mapped);
         }
+        Ok(())
     }
 
     pub fn bytes(&self) -> usize {
@@ -548,49 +562,81 @@ impl State {
         }
     }
 
+    /// Peak temporary scratch bytes needed by [`State::shift_contexts`] for this state when
+    /// shifting dynamic context ids from `from` upward, polling `tick` across table scans.
+    pub fn shift_scratch(
+        &self,
+        from: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<usize, super::Error> {
+        match self.extra.as_ref().and_then(|x| x.dl.as_deref()) {
+            Some(d) => d.shift_scratch(from, tick),
+            None => Ok(0),
+        }
+    }
+
     /// Adds `delta` to every context id from `from` upward that the state names, the
     /// ids of the contexts that a saturation creates above the index's, when the index
     /// of the next run has `delta` more expressions (roadmap item 753). The subsumers,
     /// the fillers and the roles are expressions and roles of the index and stay.
-    pub fn shift_contexts(&mut self, from: Ex, delta: Ex) {
+    pub fn shift_contexts(
+        &mut self,
+        from: Ex,
+        delta: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        fn any_poll<T>(
+            list: &[T],
+            pred: impl Fn(&T) -> bool,
+            tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+        ) -> Result<bool, super::Error> {
+            for x in list {
+                tick(1)?;
+                if pred(x) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         let up = |e: Ex| if e >= from { e + delta } else { e };
         for (_, srcs) in &mut self.back {
-            if srcs.list.iter().any(|&e| e >= from) {
-                srcs.map(up);
+            if any_poll(&srcs.list, |&e| e >= from, tick)? {
+                srcs.map_poll(up, tick)?;
             }
         }
-        if self.fwd.list.iter().any(|&(_, f)| f >= from) {
-            self.fwd.map(|(r, f)| (r, up(f)));
+        if any_poll(&self.fwd.list, |&(_, f)| f >= from, tick)? {
+            self.fwd.map_poll(|(r, f)| (r, up(f)), tick)?;
         }
         if let Some(x) = self.extra.as_mut() {
             debug_assert!(x.noms.is_empty() && x.links.is_empty());
             if let Some(d) = x.dl.as_deref_mut() {
-                d.shift_contexts(from, delta);
+                d.shift_contexts(from, delta, tick)?;
             }
-            if x.members.list.iter().any(|&e| e >= from) {
-                x.members.map(up);
+            if any_poll(&x.members.list, |&e| e >= from, tick)? {
+                x.members.map_poll(up, tick)?;
             }
             let h = &mut x.horn;
             debug_assert!(h.pending.is_empty() && h.merges.is_empty());
             h.forget_dominance();
-            if h.succ.list.iter().any(|&(_, n)| n >= from) {
-                h.succ.map(|(r, n)| (r, up(n)));
+            if any_poll(&h.succ.list, |&(_, n)| n >= from, tick)? {
+                h.succ.map_poll(|(r, n)| (r, up(n)), tick)?;
             }
-            if h.succ_in.list.iter().any(|&(n, _)| n >= from) {
-                h.succ_in.map(|(n, b)| (up(n), b));
+            if any_poll(&h.succ_in.list, |&(n, _)| n >= from, tick)? {
+                h.succ_in.map_poll(|(n, b)| (up(n), b), tick)?;
             }
-            if h.pred_in.list.iter().any(|&(m, _)| m >= from) {
-                h.pred_in.map(|(m, b)| (up(m), b));
+            if any_poll(&h.pred_in.list, |&(m, _)| m >= from, tick)? {
+                h.pred_in.map_poll(|(m, b)| (up(m), b), tick)?;
             }
-            if h.told.list.iter().any(|&(m, n)| m >= from || n >= from) {
-                h.told.map(|(m, n)| (up(m), up(n)));
+            if any_poll(&h.told.list, |&(m, n)| m >= from || n >= from, tick)? {
+                h.told.map_poll(|(m, n)| (up(m), up(n)), tick)?;
             }
             for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
-                if set.list.iter().any(|&e| e >= from) {
-                    set.map(up);
+                if any_poll(&set.list, |&e| e >= from, tick)? {
+                    set.map_poll(up, tick)?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Recomputes the members of the disjointness sets among the subsumers, whose
@@ -2482,18 +2528,25 @@ impl Dynamic {
     /// Moves the table's contexts to the ids from `base` upward, when the index of the
     /// next run has more expressions (roadmap item 753). The caller shifts the ids that
     /// the kept states name ([`State::shift_contexts`]).
-    pub fn rebase(&mut self, base: Ex) {
+    pub fn rebase(
+        &mut self,
+        base: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
         debug_assert!(base >= self.base);
         let delta = base - self.base;
         if delta == 0 {
-            return;
+            return Ok(());
         }
         self.base = base;
         for shard in self.shards.iter_mut() {
+            tick(1)?;
             for e in shard.get_mut().values_mut() {
                 *e += delta;
+                tick(1)?;
             }
         }
+        Ok(())
     }
 
     /// Whether the id is one of the table's contexts.

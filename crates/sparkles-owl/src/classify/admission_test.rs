@@ -39,6 +39,8 @@ pub(super) enum Point {
     TopChainGlobalMessage,
     TopChainWorldMessage,
     BeforePanicWake,
+    RebaseAdmit,
+    RebaseShift,
     Idle,
 }
 

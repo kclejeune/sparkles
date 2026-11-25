@@ -4,7 +4,9 @@
 //! random sequences of edits over generated ontologies and the fixtures.
 
 use proptest::prelude::*;
-use sparkles_owl::classify::{Classification, Classifier, Excluded, Expansion, Limits};
+use sparkles_owl::classify::{
+    Classification, Classifier, Consistency, Excluded, Expansion, Limits,
+};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
 
@@ -31,8 +33,20 @@ fn limits(threads: usize) -> Limits {
 }
 
 /// What two classifications must share: every subsumption between classes, the
-/// unsatisfiable classes, the consistency and the completeness.
-fn answer(o: &Classification) -> (Vec<(String, String)>, Vec<String>, bool, bool) {
+/// unsatisfiable classes, the legacy and full consistency status, overall and taken
+/// completeness, and the incomplete class list.
+#[allow(clippy::type_complexity)]
+fn answer(
+    o: &Classification,
+) -> (
+    Vec<(String, String)>,
+    Vec<String>,
+    bool,
+    Consistency,
+    bool,
+    bool,
+    Vec<String>,
+) {
     let t = &o.taxonomy;
     let cs: Vec<Class> = t.classes().cloned().collect();
     let mut pairs = Vec::new();
@@ -46,7 +60,20 @@ fn answer(o: &Classification) -> (Vec<(String, String)>, Vec<String>, bool, bool
     pairs.sort();
     let mut unsat: Vec<String> = t.unsatisfiable().map(|c| c.as_str().to_string()).collect();
     unsat.sort();
-    (pairs, unsat, o.consistent, o.complete)
+    let incomplete: Vec<String> = o
+        .incomplete
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect();
+    (
+        pairs,
+        unsat,
+        o.consistent,
+        o.consistency,
+        o.complete,
+        o.complete_for_taken,
+        incomplete,
+    )
 }
 
 /// Classifies the kept classifier and one that starts again over `held`, and checks
@@ -1689,6 +1716,36 @@ fn eager_switch_rooted_and_counting_stay_on_full_rebuild() {
     add(&mut kr, &mut held_r, "SubClassOf(:M :K)");
     let out = same_as_fresh_with(&mut kr, &held_r, &rooted_eager, "rooted eager");
     assert!(!out.stats.incremental);
+
+    // Post-counting fallback under Expansion::Eager (`dl_counting_over == true`, where
+    // `no_counting` ran Tier D without the counting axioms) must not retain kept contexts.
+    let post_counting_eager = Limits {
+        threads: 1,
+        counting: true,
+        dl_work: Some(1),
+        expansion: Expansion::Eager,
+        ..Limits::default()
+    };
+    let mut held_pc = axioms(&format!(
+        "{UNIONS}\nSubClassOf(:A ObjectMaxCardinality(2 :r :B))"
+    ));
+    let mut kpc = Classifier::of(&held_pc);
+    let first_pc = kpc.classify(&post_counting_eager).unwrap();
+    assert!(
+        first_pc.stats.dl_counting_over,
+        "counting eager run with dl_work=1 did not take post-counting fallback"
+    );
+    add(&mut kpc, &mut held_pc, "SubClassOf(:M :K)");
+    let out = same_as_fresh_with(
+        &mut kpc,
+        &held_pc,
+        &eager_limits(1),
+        "after post-counting eager fallback",
+    );
+    assert!(
+        !out.stats.incremental,
+        "post-counting fallback retained eager contexts"
+    );
 }
 
 proptest! {
@@ -1912,105 +1969,161 @@ fn eager_kept_run_memory_budget_charge_cancellation_and_partial() {
     );
 
     // 2. Pool-credit `charge` refusal on an eager kept run retries fresh drawing on
-    // already-admitted credit without double-charging past `high + 256`.
-    let charged = Arc::new(AtomicUsize::new(0));
-    let cap = high + 256;
-    let (mut k, _) = started_eager(&padded, 1);
-    k.add(&axioms("SubClassOf(:M :K)"));
-    let c_ref = charged.clone();
-    let out = k
-        .classify(&Limits {
-            charge: Some(Arc::new(move |bytes| {
-                let prev = c_ref.fetch_add(bytes, Ordering::Relaxed);
-                if prev + bytes > cap {
-                    c_ref.fetch_sub(bytes, Ordering::Relaxed);
-                    false
-                } else {
-                    true
-                }
-            })),
-            ..eager_limits(1)
-        })
-        .unwrap();
-    assert_eq!(answer(&out), answer(&want));
-    assert_eq!(out.taxonomy, want.taxonomy);
-    assert!(charged.load(Ordering::Relaxed) <= cap);
-
-    // 3. Cancellation and deadline recovery under Expansion::Eager.
-    let mut stopped = 0;
-    for polls in 0..40usize {
-        let (mut k, mut held) = started_eager(UNIONS, 1);
-        add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:N :K)");
-        let seen = Arc::new(AtomicUsize::new(0));
-        let s = seen.clone();
-        let cancelled = Limits {
-            cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
-            ..eager_limits(1)
-        };
-        if k.classify(&cancelled).is_err() {
-            stopped += 1;
+    // already-admitted credit without double-charging past `cap`.
+    let mut saw_refusal_retry = false;
+    for more in [0usize, 64, 256, 1024] {
+        let charged = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let cap = high + more;
+        let (mut k, _) = started_eager(&padded, 1);
+        k.add(&axioms("SubClassOf(:M :K)"));
+        let c_ref = charged.clone();
+        let r_ref = refused.clone();
+        let out = k
+            .classify(&Limits {
+                charge: Some(Arc::new(move |bytes| {
+                    let prev = c_ref.fetch_add(bytes, Ordering::Relaxed);
+                    if prev + bytes > cap {
+                        c_ref.fetch_sub(bytes, Ordering::Relaxed);
+                        r_ref.fetch_add(1, Ordering::Relaxed);
+                        false
+                    } else {
+                        true
+                    }
+                })),
+                ..eager_limits(1)
+            })
+            .unwrap();
+        assert_eq!(answer(&out), answer(&want));
+        assert_eq!(out.taxonomy, want.taxonomy);
+        assert!(k.excluded().is_empty(), "{:?}", k.excluded());
+        assert!(charged.load(Ordering::Relaxed) <= cap);
+        if refused.load(Ordering::Relaxed) > 0 {
+            assert!(
+                !out.stats.incremental,
+                "charge refusal did not trigger a fresh retry"
+            );
+            saw_refusal_retry = true;
         }
-        let out = same_as_fresh_with(
-            &mut k,
-            &held,
-            &eager_limits(1),
-            &format!("eager after stop at poll {polls}"),
-        );
-        assert!(out.taxonomy.is_subclass(&c("A"), &c("L")));
-        add(&mut k, &mut held, "SubClassOf(:N :N2)");
-        let late = Limits {
-            deadline: Some(std::time::Instant::now()),
-            ..eager_limits(1)
-        };
-        assert!(k.classify(&late).is_err());
-        let out = same_as_fresh_with(&mut k, &held, &eager_limits(1), "eager after deadline");
-        assert!(out.taxonomy.is_subclass(&c("A"), &c("N2")));
     }
-    assert!(stopped > 0, "no eager run was cancelled");
+    assert!(
+        saw_refusal_retry,
+        "charge callback never refused a kept eager run to exercise drawing_on fresh retry"
+    );
 
-    // 4. `Limits::partial = true` stop mid-incremental under Expansion::Eager remains sound,
-    // stays unretained (`dirty = true`), and the next complete run starts fresh.
-    let mut saw_partial = false;
-    for polls in 1..60usize {
-        let (mut k, mut held) = started_eager(&padded, 1);
-        add(
-            &mut k,
-            &mut held,
-            "SubClassOf(:N1 ObjectUnionOf(:N2 :N3)) SubClassOf(:N2 :D) SubClassOf(:N3 :D)",
+    // 3. Cancellation and deadline recovery under Expansion::Eager on 1 and 4 threads.
+    for threads in [1usize, 4] {
+        let lim = eager_limits(threads);
+        let mut stopped = 0;
+        for polls in 0..40usize {
+            let (mut k, mut held) = started_eager(UNIONS, threads);
+            add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:N :K)");
+            let seen = Arc::new(AtomicUsize::new(0));
+            let s = seen.clone();
+            let cancelled = Limits {
+                cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
+                ..lim.clone()
+            };
+            if k.classify(&cancelled).is_err() {
+                stopped += 1;
+            }
+            let out = same_as_fresh_with(
+                &mut k,
+                &held,
+                &lim,
+                &format!("eager after stop at poll {polls} on {threads} threads"),
+            );
+            assert!(out.taxonomy.is_subclass(&c("A"), &c("L")));
+            add(&mut k, &mut held, "SubClassOf(:N :N2)");
+            let late = Limits {
+                deadline: Some(std::time::Instant::now()),
+                ..lim.clone()
+            };
+            assert!(k.classify(&late).is_err());
+            let out = same_as_fresh_with(
+                &mut k,
+                &held,
+                &lim,
+                &format!("eager after deadline on {threads} threads"),
+            );
+            assert!(out.taxonomy.is_subclass(&c("A"), &c("N2")));
+        }
+        assert!(
+            stopped > 0,
+            "no eager run was cancelled on {threads} threads"
         );
-        let seen = Arc::new(AtomicUsize::new(0));
-        let s = seen.clone();
-        let partial_lim = Limits {
-            partial: true,
-            cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
-            ..eager_limits(1)
-        };
-        if let Ok(part) = k.classify(&partial_lim)
-            && !part.complete_for_taken
-        {
-            saw_partial = true;
-            assert!(part.stats.incremental);
-            // Any class reported complete must agree with fresh classification.
-            let mut fresh = Classifier::of(&held);
-            let want = fresh.classify(&eager_limits(1)).unwrap();
-            let incomplete: std::collections::HashSet<&Class> = part.incomplete.iter().collect();
-            for cls in part.taxonomy.classes() {
-                if !incomplete.contains(cls) {
-                    for sup in want.taxonomy.classes() {
-                        assert_eq!(
-                            part.taxonomy.is_subclass(cls, sup),
-                            want.taxonomy.is_subclass(cls, sup),
-                            "partial eager answer disagreed on complete class {}",
-                            cls.as_str()
-                        );
+    }
+
+    // 4. `Limits::partial = true` stop mid-incremental under Expansion::Eager remains sound
+    // (complete classes match fresh, incomplete classes report only entailed positive
+    // subsumptions, non-Unknown consistency matches fresh), stays unretained (`dirty = true`),
+    // and the next complete run starts fresh, on both 1 and 4 threads.
+    for threads in [1usize, 4] {
+        let lim = eager_limits(threads);
+        let mut saw_partial = false;
+        for polls in 1..80usize {
+            let (mut k, mut held) = started_eager(&padded, threads);
+            add(
+                &mut k,
+                &mut held,
+                "SubClassOf(:N1 ObjectUnionOf(:N2 :N3)) SubClassOf(:N2 :D) SubClassOf(:N3 :D)",
+            );
+            let seen = Arc::new(AtomicUsize::new(0));
+            let s = seen.clone();
+            let partial_lim = Limits {
+                partial: true,
+                cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
+                ..lim.clone()
+            };
+            if let Ok(part) = k.classify(&partial_lim)
+                && !part.complete_for_taken
+            {
+                saw_partial = true;
+                assert!(part.stats.incremental);
+                let mut fresh = Classifier::of(&held);
+                let want = fresh.classify(&lim).unwrap();
+                if part.consistency != Consistency::Unknown {
+                    assert_eq!(part.consistency, want.consistency);
+                }
+                let incomplete: std::collections::HashSet<&Class> =
+                    part.incomplete.iter().collect();
+                for cls in part.taxonomy.classes() {
+                    if !incomplete.contains(cls) {
+                        for sup in want.taxonomy.classes() {
+                            assert_eq!(
+                                part.taxonomy.is_subclass(cls, sup),
+                                want.taxonomy.is_subclass(cls, sup),
+                                "partial eager answer disagreed on complete class {} ({threads}t)",
+                                cls.as_str()
+                            );
+                        }
+                    } else {
+                        for sup in part.taxonomy.classes() {
+                            if part.taxonomy.is_subclass(cls, sup) {
+                                assert!(
+                                    want.taxonomy.is_subclass(cls, sup),
+                                    "partial eager answer reported unsound subsumption {} ⊑ {} for incomplete class ({threads}t)",
+                                    cls.as_str(),
+                                    sup.as_str()
+                                );
+                            }
+                        }
                     }
                 }
+                // Partial runs are not retained (`dirty = true`), so the next run starts fresh.
+                let next = same_as_fresh_with(
+                    &mut k,
+                    &held,
+                    &lim,
+                    &format!("after eager partial on {threads} threads"),
+                );
+                assert!(!next.stats.incremental, "partial eager state was retained");
+                break;
             }
-            // Partial runs are not retained (`dirty = true`), so the next run starts fresh.
-            let next = same_as_fresh_with(&mut k, &held, &eager_limits(1), "after eager partial");
-            assert!(!next.stats.incremental, "partial eager state was retained");
-            break;
         }
+        assert!(
+            saw_partial,
+            "no incremental eager run stopped partially on {threads} threads"
+        );
     }
-    assert!(saw_partial, "no incremental eager run stopped partially");
 }
