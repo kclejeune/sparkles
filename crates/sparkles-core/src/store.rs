@@ -792,6 +792,39 @@ impl Snapshot {
         }
     }
 
+    /// Id of an IRI if it exists in this snapshot, checking live controls and admitting
+    /// the probe and coexisting vocabulary reconstruction buffers before allocating.
+    pub fn lookup_iri_controlled(
+        &self,
+        iri: &str,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Id>> {
+        check()?;
+        let Some(len) = iri.len().checked_add(1) else {
+            admit(usize::MAX)?;
+            return Err(Error::invalid("IRI key length overflow"));
+        };
+        admit(len)?;
+        check()?;
+        let mut key = Vec::with_capacity(len);
+        if key.capacity() > len {
+            admit(key.capacity())?;
+        }
+        key.push(b'<');
+        key.extend_from_slice(iri.as_bytes());
+        debug_assert_eq!(key.len(), len);
+        self.lookup_key_controlled(
+            &key,
+            |old, new| {
+                let bytes = key.capacity().saturating_add(old).saturating_add(new);
+                admit(bytes)
+            },
+            |_| Ok(()),
+            check,
+        )
+    }
+
     /// Id of a vocabulary key if it exists in this snapshot, checking live controls and
     /// admitting coexisting vocabulary reconstruction buffers during growth, then only the
     /// settled scratch allocation.

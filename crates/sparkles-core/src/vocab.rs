@@ -1511,6 +1511,36 @@ impl Vocab {
         Ok(result)
     }
 
+    /// Read a key while its owner accounts for old and new scratch during growth,
+    /// then only the settled allocation, polling `checkpoint` during block scanning
+    /// and suffix decoding. The callback runs while the scratch is live.
+    pub fn get_with_controlled_capacity_checked<T, E: From<crate::error::Error>>(
+        &self,
+        id: u64,
+        mut grow: impl FnMut(usize, usize) -> Result<(), E>,
+        mut settled: impl FnMut(usize) -> Result<(), E>,
+        mut checkpoint: impl FnMut(&'static str) -> Result<(), E>,
+        mut read: impl FnMut(&[u8]) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        checkpoint("starting vocabulary reconstruction")?;
+        if id >= self.len {
+            return Ok(None);
+        }
+        let mut result = None;
+        self.scan_block_capacity_controlled(
+            id as usize / FC_BLOCK,
+            1 << (id as usize % FC_BLOCK),
+            &mut grow,
+            &mut settled,
+            &mut checkpoint,
+            |_, key| {
+                result = Some(read(key)?);
+                Ok(false)
+            },
+        )?;
+        Ok(result)
+    }
+
     /// Reconstruct one key into admitted storage that the callback may retain.
     /// Growth covers both physical buffers; settlement follows old-buffer retirement.
     /// The callback's owner must keep that admission until its final allocation drops.

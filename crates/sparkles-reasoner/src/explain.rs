@@ -2647,6 +2647,466 @@ mod partial_tests {
     }
 
     #[test]
+    fn explanation_terms_init_avoids_fsst_literal_boundary_decode() {
+        use sparkles_core::{
+            builder::{BuildOptions, VocabCodec},
+            io::{RdfFormat, Source},
+            store::{Store, StoreOptions},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                build: BuildOptions {
+                    vocab_codec: Some(VocabCodec::Fsst),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Block 0 holds one short literal "a" at entry 0, immediately followed by a
+        // compressible 64 KiB first IRI at entry 1 and short <http://b.org/...> fillers
+        // filling the rest of block 0 so <http://ex.org/*> sits in block 1+.
+        // Add enough <http://m.org/...> IRIs to cross vocabmerge::SAMPLE_EVERY (4096) so
+        // the FSST IRI table (kind 1) is trained and compresses the 64 KiB IRI at entry 1.
+        let long = "z".repeat(65_536);
+        let mut data =
+            format!(r#"@prefix ex: <http://ex.org/> . ex:s ex:p "a", <http://a.org/{long}>"#);
+        for i in 2..sparkles_core::vocab::FC_BLOCK {
+            data.push_str(&format!(", <http://b.org/f{i:02}>"));
+        }
+        let sample_z = "z".repeat(256);
+        for i in 0..4112 {
+            data.push_str(&format!(", <http://m.org/k{i:04}_{sample_z}>"));
+        }
+        data.push_str(" .");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+        assert_eq!(snap.generation.vocab.first_triple(), 1);
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let lit = |s: &str| Term::Literal(oxrdf::Literal::new_simple_literal(s));
+        let extras = Extras::default();
+        let jena = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . [derive: (?x ex:p ?y) -> (?x ex:q ?y)]".into(),
+        );
+        let prog = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [rel: (?x ex:p \"a\") -> r(?x)] \
+             [out: r(?x) -> (?x ex:q \"a\")]"
+                .into(),
+        );
+
+        let measure_fresh = |f: Box<dyn FnOnce() -> anyhow::Result<bool> + Send + '_>| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || crate::alloc_probe::peak_and_largest_of(f))
+                    .join()
+                    .unwrap()
+            })
+        };
+
+        let mat_jena_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &jena,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let (res, peak, largest) = measure_fresh(Box::new(|| {
+            explain(
+                &mat_jena_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .map(|_| true)
+        }));
+        assert!(res.is_ok(), "materialized Jena failed: {res:?}");
+        assert!(
+            largest < 65_536,
+            "materialized Jena Terms init decoded 64 KiB boundary IRI (peak={peak}, largest={largest})"
+        );
+
+        let mat_prog_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &prog,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let (res, peak, largest) = measure_fresh(Box::new(|| {
+            explain(
+                &mat_prog_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .map(|_| true)
+        }));
+        assert!(res.is_ok(), "materialized program failed: {res:?}");
+        assert!(
+            largest < 65_536,
+            "materialized program Terms init decoded 64 KiB boundary IRI (peak={peak}, largest={largest})"
+        );
+
+        let reasoner = QueryReasoner::new(jena, &extras, crate::Inputs::default()).unwrap();
+        let demand_input = DemandInput {
+            reasoner: &reasoner,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let (res, peak, largest) = measure_fresh(Box::new(|| {
+            explain_demand(
+                &demand_input,
+                &[ex("s"), ex("q"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .map(|_| true)
+        }));
+        assert!(res.is_ok(), "demand explain failed: {res:?}");
+        assert!(
+            largest < 65_536,
+            "demand Terms init decoded 64 KiB boundary IRI (peak={peak}, largest={largest})"
+        );
+
+        let (res, peak, largest) = measure_fresh(Box::new(|| {
+            crate::whynot::why_not(
+                &demand_input,
+                &[ex("s"), ex("zabsent"), lit("a")],
+                &crate::whynot::WhyNotOptions::default(),
+            )
+            .map(|_| true)
+        }));
+        assert!(res.is_ok(), "why-not failed: {res:?}");
+        assert!(
+            largest < 65_536,
+            "why-not Terms init decoded 64 KiB boundary IRI (peak={peak}, largest={largest})"
+        );
+    }
+
+    #[test]
+    fn explanation_imports_and_named_graph_admit_fsst_scratch() {
+        use sparkles_core::{
+            builder::{BuildOptions, VocabCodec},
+            io::{RdfFormat, Source},
+            store::{Store, StoreOptions},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                build: BuildOptions {
+                    vocab_codec: Some(VocabCodec::Fsst),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let long = "z".repeat(65_536);
+        let fc = sparkles_core::vocab::FC_BLOCK;
+        // Zero literals so rank 0 is an IRI and the FSST IRI table trains directly.
+        // Block 0: rdf:first/nil/rest/type + fillers so Terms::new_in_controlled succeeds
+        //          without touching any 64 KiB block.
+        // Block 1: owl:a, 64 KiB owl:b{long}, owl:imports + fillers.
+        // Block 2: x:a, 64 KiB x:b{long}, x:g (named input graph), x:imp (imported graph) + fillers.
+        // Block 3+: z:* used by rules and target triple.
+        let mut data = String::from(
+            "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+             @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+             @prefix x: <http://x.org/> .\n\
+             @prefix z: <http://z.org/> .\n\
+             {\n  z:s z:p z:o, rdf:first, rdf:nil, rdf:rest, rdf:type",
+        );
+        for i in 0..(fc - 4) {
+            data.push_str(&format!(
+                ", <http://www.w3.org/1999/02/22-rdf-syntax-ns#z{i:02}>"
+            ));
+        }
+        data.push_str(&format!(", owl:a, <http://www.w3.org/2002/07/owl#b{long}>"));
+        for i in 0..(fc - 3) {
+            data.push_str(&format!(", <http://www.w3.org/2002/07/owl#z{i:02}>"));
+        }
+        data.push_str(&format!(", x:a, <http://x.org/b{long}>"));
+        for i in 0..(fc - 4) {
+            data.push_str(&format!(", <http://x.org/z{i:02}>"));
+        }
+        data.push_str(" .\n  z:s owl:imports x:imp .\n}\n");
+        data.push_str("x:g { z:s z:p z:o . }\n");
+        data.push_str("x:imp { z:s z:p z:o . }\n");
+        store
+            .load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+
+        let z = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://z.org/{local}")).unwrap())
+        };
+        let extras = Extras::default();
+        let rules = Profile::Rules(
+            "@prefix z: <http://z.org/> . [derive: (?x z:p ?y) -> (?x z:q ?y)]".into(),
+        );
+        let named_inputs = crate::Inputs {
+            data_graphs: vec![crate::inputs::GraphRef::Named("http://x.org/g".into())],
+            imports: crate::inputs::ImportMode::None,
+            ..Default::default()
+        };
+        let import_inputs = crate::Inputs {
+            data_graphs: vec![crate::inputs::GraphRef::Default],
+            imports: crate::inputs::ImportMode::Dataset,
+            ..Default::default()
+        };
+
+        for (label, inputs) in [
+            ("named-graph", named_inputs),
+            ("owl-imports", import_inputs),
+        ] {
+            let reasoner = QueryReasoner::new(rules.clone(), &extras, inputs).unwrap();
+            let input = DemandInput {
+                reasoner: &reasoner,
+                snap: snap.clone(),
+                readable: None,
+            };
+            let opts = ExplainOptions {
+                max_memory: Some(48 * 1024),
+                ..Default::default()
+            };
+            let (res, peak, largest) = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        crate::alloc_probe::peak_and_largest_of(|| {
+                            explain_demand(&input, &[z("s"), z("q"), z("o")], &opts)
+                        })
+                    })
+                    .join()
+                    .unwrap()
+            });
+            assert!(
+                largest < 65_536,
+                "{label} demand decoded 64 KiB FSST suffix (peak={peak}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some(),
+                "{label} demand expected ExplainBudgetExceeded"
+            );
+
+            let wn_opts = crate::whynot::WhyNotOptions {
+                explain: opts,
+                ..Default::default()
+            };
+            let (res, peak, largest) = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        crate::alloc_probe::peak_and_largest_of(|| {
+                            crate::whynot::why_not(&input, &[z("s"), z("q"), z("o")], &wn_opts)
+                        })
+                    })
+                    .join()
+                    .unwrap()
+            });
+            assert!(
+                largest < 65_536,
+                "{label} why-not decoded 64 KiB FSST suffix (peak={peak}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some(),
+                "{label} why-not expected ExplainBudgetExceeded"
+            );
+
+            let cancel_opts = ExplainOptions {
+                cancel: Some(Arc::new(AtomicBool::new(true))),
+                ..Default::default()
+            };
+            let (res, peak, largest) = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        crate::alloc_probe::peak_and_largest_of(|| {
+                            explain_demand(&input, &[z("s"), z("q"), z("o")], &cancel_opts)
+                        })
+                    })
+                    .join()
+                    .unwrap()
+            });
+            assert!(
+                largest < 65_536,
+                "{label} cancel decoded 64 KiB FSST suffix (peak={peak}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<sparkles_core::Error>()
+                    .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled)),
+                "{label} expected Cancelled"
+            );
+        }
+    }
+
+    #[test]
+    fn demand_vocab_classification_avoids_delta_literal_copies() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let long = "z".repeat(65_536);
+        let update = format!(
+            "INSERT DATA {{ <http://ex.org/other> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \"{long}\" }}"
+        );
+        sparkles_core::sparql::update::update(&store, &update, &Default::default()).unwrap();
+        let snap = store.snapshot();
+        let long_term = Term::Literal(oxrdf::Literal::new_simple_literal(long.clone()));
+        assert_eq!(
+            snap.lookup_term(&long_term).unwrap().tag(),
+            Tag::Delta,
+            "fixture requires long literal in delta vocabulary"
+        );
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let extras = Extras::default();
+        let base_rules = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . \
+             [r: (?x rdf:type \"a\") -> (?x ex:q ex:o)]"
+                .into(),
+        );
+        let target_rules = Profile::Rules(format!(
+            "@prefix ex: <http://ex.org/> . \
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . \
+             [r: (?x rdf:type \"{long}\") -> (?x ex:q ex:o)]"
+        ));
+
+        let base_reasoner =
+            QueryReasoner::new(base_rules, &extras, crate::Inputs::default()).unwrap();
+        let base_input = DemandInput {
+            reasoner: &base_reasoner,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let probe = demand_session(&base_input, &ExplainOptions::default(), true).unwrap();
+        let base_used = probe.budget().used();
+        drop(probe);
+
+        // Cap fits the single 64 KiB encoded compilation probe plus session overhead,
+        // while excluding two simultaneous 64 KiB owned copies (delta key + lexical String).
+        let cap = base_used + 80 * 1024;
+        assert!(cap < base_used + 2 * 65_536);
+
+        let target_reasoner =
+            QueryReasoner::new(target_rules, &extras, crate::Inputs::default()).unwrap();
+        let target_input = DemandInput {
+            reasoner: &target_reasoner,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let opts = ExplainOptions {
+            max_memory: Some(cap),
+            ..Default::default()
+        };
+
+        // Direct derive_ids check after Session::new drops its compilation probe:
+        // demand::Vocab::of must allocate zero 64 KiB copies of the delta literal.
+        let mut session = demand_session(&target_input, &opts, true).unwrap();
+        let target_ids = [
+            session.terms().try_id_for(&ex("s")).unwrap(),
+            session.terms().try_id_for(&ex("q")).unwrap(),
+            session.terms().try_id_for(&ex("o")).unwrap(),
+        ];
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            session.derive_ids(&[[
+                Some(target_ids[0]),
+                Some(target_ids[1]),
+                Some(target_ids[2]),
+            ]])
+        });
+        assert!(res.is_ok(), "derive_ids failed: {res:?}");
+        assert!(
+            largest < 32_768 && peak < 65_536,
+            "derive_ids copied delta literal during Vocab::of (peak={peak}, largest={largest})"
+        );
+        drop(session);
+
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            explain_demand(&target_input, &[ex("s"), ex("q"), ex("o")], &opts)
+        });
+        assert!(res.is_ok(), "explain_demand failed: {res:?}");
+        assert!(
+            peak < base_used + 112 * 1024,
+            "explain_demand spiked to two live copies of delta literal (peak={peak}, cap={cap}, largest={largest})"
+        );
+
+        let wn_opts = crate::whynot::WhyNotOptions {
+            explain: opts,
+            ..Default::default()
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            crate::whynot::why_not(
+                &target_input,
+                &[ex("s"), ex("unrelated"), ex("o")],
+                &wn_opts,
+            )
+        });
+        assert!(res.is_ok(), "why_not failed: {res:?}");
+        assert!(
+            peak < base_used + 112 * 1024,
+            "why_not spiked to two live copies of delta literal (peak={peak}, cap={cap}, largest={largest})"
+        );
+
+        // Verify demand::Vocab::of_controlled polls live controls without copying delta keys.
+        let parsed = crate::profile_rules(
+            &Profile::Rules(format!(
+                "@prefix ex: <http://ex.org/> . \
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . \
+             [r: (?x rdf:type \"{long}\") -> (?x ex:q ex:o)]"
+            )),
+            &extras,
+        )
+        .unwrap();
+        let ctrl_budget = Budget::unlimited();
+        let ctrl_terms = Terms::new_in(snap.clone(), &ctrl_budget).unwrap();
+        let mut ctrl_warnings = WorkingWarnings::new(&ctrl_budget);
+        let compiled =
+            engine::compile_info(&parsed, &ctrl_terms, &mut ctrl_warnings, false).unwrap();
+        let polls = Cell::new(0usize);
+        let (cancelled, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            crate::demand::Vocab::of_controlled(compiled.rules(), &ctrl_terms, || {
+                let n = polls.get() + 1;
+                polls.set(n);
+                if n >= 2 {
+                    Err(anyhow::Error::new(sparkles_core::Error::Cancelled))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        assert!(
+            largest < 16_384 && peak < 16_384,
+            "Vocab::of_controlled allocated on delta literal before cancel (peak={peak}, largest={largest})"
+        );
+        assert!(
+            cancelled
+                .err()
+                .expect("expected cancellation")
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+    }
+
+    #[test]
     fn proof_decode_admits_nested_triple_allocations() {
         let store = sparkles_core::store::Store::in_memory(Default::default());
         let mut term: Term = oxrdf::NamedNode::new_unchecked("urn:o").into();

@@ -828,14 +828,29 @@ impl Session {
         };
         let closures = (!shared.closures).then_some(false);
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
-        let resolved = match &req.readable {
-            Some(readable) => inputs::resolve_readable(&snap, &shared.inputs, &|g| readable(g)),
-            None => inputs::resolve(&snap, &shared.inputs),
+        let resolved = {
+            let mut check = session_check(&req.stop);
+            match &req.readable {
+                Some(readable) => inputs::resolve_readable_controlled(
+                    &snap,
+                    &shared.inputs,
+                    &|g| readable(g),
+                    &budget,
+                    &mut check,
+                ),
+                None => inputs::resolve_controlled(&snap, &shared.inputs, &budget, &mut check),
+            }
+            .map_err(|e| session_compile_error(e, "input graphs"))?
         };
         warnings
             .extend_borrowed(&resolved.warnings)
             .map_err(|e| memory_error(e, "input warnings"))?;
-        let mut graphs = resolved.ids(&snap);
+        let mut graphs = {
+            let mut check = session_check(&req.stop);
+            resolved
+                .ids_controlled(&snap, &budget, &mut check)
+                .map_err(|e| session_compile_error(e, "input graphs"))?
+        };
         tracing::debug!(target: "sparkles_reasoner::demand", "session: rules compiled and inputs resolved in {:?}", t0.elapsed());
         if let Some(readable) = &req.readable {
             graphs.retain(|g| readable(*g));
@@ -1389,7 +1404,8 @@ impl Session {
         // program's, since the schema pass and specialization may leave out the rules
         // that hold its IR features (item 839)
         let replay = self.compiled.replays_lists();
-        demand::transform(
+        let mut check = session_check(&self.stop);
+        demand::transform_controlled(
             rules,
             &self.terms,
             roots,
@@ -1397,11 +1413,13 @@ impl Session {
             pass,
             self.rewrite_linear,
             replay,
+            &mut check,
         )
         .map_err(|e| match e {
             TransformError::Memory(m) => memory_error(m, "the demand program"),
             TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
             TransformError::NotStratified => component(RULES_CODE, e.to_string()),
+            TransformError::Control(e) => session_compile_error(e, "the demand program"),
         })
     }
 
@@ -1582,7 +1600,12 @@ impl Session {
         self.compact = false;
         let iri = |s: &str| Term::NamedNode(oxrdf::NamedNode::new_unchecked(s));
         let rdf_type = self.id_of(&iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))?;
-        let vocab = Vocab::of(self.compiled.rules(), &self.terms);
+        let vocab = Vocab::of_controlled(
+            self.compiled.rules(),
+            &self.terms,
+            session_check(&self.stop),
+        )
+        .map_err(|e| session_compile_error(e, "the demand vocabulary"))?;
         let roots = demand::schema_roots(&vocab, rdf_type);
         self.make_graph()?;
         let t0 = std::time::Instant::now();

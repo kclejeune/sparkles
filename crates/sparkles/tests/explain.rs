@@ -1077,6 +1077,180 @@ fn demand_and_why_not_admit_fsst_rule_constant_scratch() {
 
 #[cfg(feature = "reasoning")]
 #[test]
+fn explanation_graph_name_lookups_admit_fsst_scratch() {
+    use sparkles::reasoning::{
+        ReasonRequest,
+        explain::ExplainMode,
+        reasoner::{GraphRef, Inputs, Profile},
+    };
+    use sparkles_core::{
+        builder::{BuildOptions, VocabCodec},
+        store::StoreOptions,
+    };
+
+    let z = |local: &str| Term::NamedNode(NamedNode::new(format!("http://z.org/{local}")).unwrap());
+    let long = "z".repeat(65_536);
+    let fc = sparkles_core::vocab::FC_BLOCK;
+
+    // 1. Named input graph <http://x.org/hr> sorts after a 64 KiB IRI in block 1
+    //    (block 0 holds rdf:* so Terms::new_in_controlled never touches block 1; zero
+    //    literals so rank 0 is an IRI and the FSST IRI table trains directly), while
+    //    rule constants and target triple IRIs live in <http://z.org/*> (block 2+).
+    let named_hr = "http://x.org/hr";
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open_with(
+        dir.path().join("db"),
+        StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Fsst),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut data = String::from(
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         @prefix x: <http://x.org/> .\n\
+         @prefix z: <http://z.org/> .\n\
+         x:hr { z:s z:p z:o, rdf:first, rdf:nil, rdf:rest, rdf:type",
+    );
+    for i in 0..(fc - 4) {
+        data.push_str(&format!(
+            ", <http://www.w3.org/1999/02/22-rdf-syntax-ns#z{i:02}>"
+        ));
+    }
+    data.push_str(&format!(", x:a, <http://x.org/b{long}>"));
+    for i in 0..(fc - 3) {
+        data.push_str(&format!(", <http://x.org/z{i:02}>"));
+    }
+    data.push_str(" . }\n");
+    ds.load_str(&data, RdfFormat::TriG).unwrap();
+    ds.store().compact().unwrap();
+    ds.reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::Rules(
+                "@prefix z: <http://z.org/> . [derive: (?x z:p ?y) -> (?x z:q ?y)]".into(),
+            ),
+            inputs: Inputs {
+                data_graphs: vec![GraphRef::Named(named_hr.into())],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+    for (source, mode) in [
+        (Some(ExplainSource::Materialized), ExplainMode::Why),
+        (None, ExplainMode::Why),
+        (Some(ExplainSource::Demand), ExplainMode::Why),
+        (Some(ExplainSource::Demand), ExplainMode::WhyNot),
+    ] {
+        let mut req = ExplainRequest::new([z("s"), z("q"), z("o")]);
+        req.source = source;
+        req.mode = mode;
+        req.max_memory = Some(48 * 1024);
+        let (result, alloc) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| caller_allocations::measure(|| ds.reasoning().explain(&req)))
+                .join()
+                .unwrap()
+        });
+        assert!(
+            alloc.largest < 65_536,
+            "named graph {source:?}/{mode:?} decoded 64 KiB FSST suffix (peak={}, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
+        let error = result.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&error, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+            "named graph {source:?}/{mode:?}: {error:?}"
+        );
+    }
+
+    for source in [ExplainSource::Materialized, ExplainSource::Demand] {
+        let mut req = ExplainRequest::new([z("s"), z("q"), z("o")]);
+        req.source = Some(source);
+        req.cancel = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let (result, alloc) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| caller_allocations::measure(|| ds.reasoning().explain(&req)))
+                .join()
+                .unwrap()
+        });
+        assert!(
+            alloc.largest < 65_536,
+            "cancelled named graph {source:?} decoded 64 KiB FSST suffix (peak={}, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
+        assert!(
+            matches!(result, Err(sparkles::Error::Cancelled)),
+            "cancelled named graph {source:?}: {result:?}"
+        );
+    }
+
+    // 2. Inferred graph <urn:x-sparkles:inferred> sorts after a 64 KiB IRI in the same
+    //    FSST block after compaction, covering explain() source selection and materialized_for.
+    let dir2 = tempfile::tempdir().unwrap();
+    let ds2 = Dataset::open_with(
+        dir2.path().join("db"),
+        StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Fsst),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut data2 = format!(
+        "@prefix z: <http://z.org/> .\n\
+         z:s z:p z:o, <urn:x-sparkles:a>, <urn:x-sparkles:b{long}>"
+    );
+    // Block 0: z:o, z:p, z:q (from reasoning), z:s + (fc - 4) fillers => block 1 starts at <urn:x-sparkles:a>.
+    for i in 0..(fc - 4) {
+        data2.push_str(&format!(", <http://z.org/z{i:02}>"));
+    }
+    data2.push_str(" .\n");
+    ds2.load_str(&data2, RdfFormat::Turtle).unwrap();
+    ds2.reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::Rules(
+                "@prefix z: <http://z.org/> . [derive: (?x z:p ?y) -> (?x z:q ?y)]".into(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+    ds2.store().compact().unwrap();
+
+    for source in [None, Some(ExplainSource::Materialized)] {
+        let mut req = ExplainRequest::new([z("s"), z("q"), z("o")]);
+        req.source = source;
+        req.max_memory = Some(48 * 1024);
+        let (result, alloc) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| caller_allocations::measure(|| ds2.reasoning().explain(&req)))
+                .join()
+                .unwrap()
+        });
+        assert!(
+            alloc.largest < 65_536,
+            "inferred graph {source:?} decoded 64 KiB FSST suffix (peak={}, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
+        let error = result.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&error, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+            "inferred graph {source:?}: {error:?}"
+        );
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
 fn demand_session_refuses_before_allocating_terms_table() {
     use sparkles::reasoning::{
         ReasonRequest,

@@ -1135,7 +1135,7 @@ thread_local! {
     static DELTA_KEY_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "geo"))]
 pub(crate) fn delta_key_copies() -> usize {
     DELTA_KEY_COPIES.with(|n| n.get())
 }

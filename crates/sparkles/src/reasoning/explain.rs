@@ -116,7 +116,6 @@ pub struct Explanation {
     pub why_not: Option<sparkles_reasoner::whynot::WhyNot>,
 }
 
-#[cfg(feature = "reasoning")]
 fn budget_error(m: String) -> crate::Error {
     crate::Error::Component(Box::new(
         crate::error::ComponentError::new("reasoner", REASONING_BUDGET, m.clone())
@@ -125,7 +124,6 @@ fn budget_error(m: String) -> crate::Error {
 }
 
 /// Fail when the request was cancelled or passed its deadline.
-#[cfg(feature = "reasoning")]
 fn check_controls(req: &ExplainRequest, deadline: Option<Instant>) -> Result<()> {
     if req
         .cancel
@@ -142,6 +140,28 @@ fn check_controls(req: &ExplainRequest, deadline: Option<Instant>) -> Result<()>
     Ok(())
 }
 
+fn lookup_iri_controlled(
+    snap: &Snapshot,
+    iri: &str,
+    max_memory: Option<usize>,
+    req: &ExplainRequest,
+    deadline: Option<Instant>,
+) -> Result<Option<Id>> {
+    let mut admit = |bytes: usize| -> Result<()> {
+        if let Some(limit) = max_memory
+            && bytes > limit
+        {
+            check_controls(req, deadline)?;
+            return Err(budget_error(format!(
+                "looking up an explanation graph needs {bytes} bytes, over its memory limit of {limit}"
+            )));
+        }
+        Ok(())
+    };
+    let mut check = || check_controls(req, deadline);
+    snap.lookup_iri_controlled(iri, &mut admit, &mut check)
+}
+
 /// The snapshot of the caller's view.
 fn view_of(access: Option<&Arc<GraphAccess>>, snap: &Arc<Snapshot>) -> Result<Arc<Snapshot>> {
     match access {
@@ -152,6 +172,10 @@ fn view_of(access: Option<&Arc<GraphAccess>>, snap: &Arc<Snapshot>) -> Result<Ar
 
 fn readable(access: Option<&Arc<GraphAccess>>, snap: &Arc<Snapshot>, g: Id) -> bool {
     access.is_none_or(|a| a.bound(snap).readable_id(snap, g))
+}
+
+fn readable_iri(access: Option<&Arc<GraphAccess>>, snap: &Arc<Snapshot>, iri: &str) -> bool {
+    access.is_none_or(|a| a.bound(snap).read.allows_iri(iri))
 }
 
 /// Explain `req.triple` in `ds`.
@@ -173,16 +197,25 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
     #[cfg(feature = "reasoning")]
     {
         let rec = ds.reasoning_record();
-        let use_demand = req.mode == ExplainMode::WhyNot
+        let use_demand = if req.mode == ExplainMode::WhyNot
             || req.source == Some(ExplainSource::Demand)
             || req.profile.is_some()
-            || (req.source.is_none()
-                && rec.as_ref().is_some_and(|r| {
-                    super::freshness(r, store, head.commit).stale != Some(false)
-                        || head
-                            .lookup_iri(super::INFERRED_GRAPH)
-                            .is_none_or(|g| !readable(access, &head, g))
-                }));
+        {
+            true
+        } else if req.source.is_none()
+            && let Some(r) = rec.as_ref()
+        {
+            if super::freshness(r, store, head.commit).stale != Some(false)
+                || !readable_iri(access, &head, super::INFERRED_GRAPH)
+            {
+                true
+            } else {
+                lookup_iri_controlled(&head, super::INFERRED_GRAPH, req.max_memory, req, deadline)?
+                    .is_none()
+            }
+        } else {
+            false
+        };
         if use_demand {
             return demand(ds, req, head, deadline);
         }
@@ -202,19 +235,23 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
     if let Some(on) = ds.reasoning().rdfs().get() {
         let leaves = match &on.source {
             SchemaSource::Fixed(_) => SchemaLeaves::Document,
-            SchemaSource::Graph(g) => {
-                let id = match g {
-                    None => Some(Id::DEFAULT_GRAPH),
-                    Some(iri) => head.lookup_iri(iri),
-                };
-                match id {
-                    Some(id) if readable(access, &head, id) => SchemaLeaves::Graph(id),
-                    _ => SchemaLeaves::Hidden,
+            SchemaSource::Graph(g) => match g {
+                None if readable(access, &head, Id::DEFAULT_GRAPH) => {
+                    SchemaLeaves::Graph(Id::DEFAULT_GRAPH)
                 }
-            }
+                None => SchemaLeaves::Hidden,
+                Some(iri) if readable_iri(access, &head, iri) => {
+                    match lookup_iri_controlled(&head, iri, req.max_memory, req, deadline)? {
+                        Some(id) => SchemaLeaves::Graph(id),
+                        None => SchemaLeaves::Hidden,
+                    }
+                }
+                Some(_) => SchemaLeaves::Hidden,
+            },
         };
         let view = view_of(access, &head)?;
-        let inferred = head.lookup_iri(super::INFERRED_GRAPH);
+        let inferred =
+            lookup_iri_controlled(&head, super::INFERRED_GRAPH, req.max_memory, req, deadline)?;
         let mut graphs = vec![Id::DEFAULT_GRAPH];
         graphs.extend(head.graph_ids()?);
         let include_inferred = {
@@ -395,30 +432,42 @@ fn materialized_for(
         };
         let view = view_of(access, &snap)?;
         let mut inputs: Vec<Id> = Vec::new();
-        let mut push_input = |n: &str| {
+        let mut push_input = |n: &str| -> Result<()> {
+            check_controls(req, deadline)?;
+            if !readable_iri(access, &snap, n) {
+                return Ok(());
+            }
             let id = if n == "default" {
                 Some(Id::DEFAULT_GRAPH)
             } else {
-                snap.lookup_iri(n)
+                lookup_iri_controlled(&snap, n, query.max_memory, req, deadline)?
             };
             if let Some(id) = id
-                && readable(access, &snap, id)
                 && !inputs.contains(&id)
             {
                 inputs.push(id);
             }
+            Ok(())
         };
         match &rec.input_graphs {
             Some(names) => {
                 for n in names {
-                    push_input(n);
+                    push_input(n)?;
                 }
             }
-            None => push_input("default"),
+            None => push_input("default")?,
         }
-        let inferred = snap
-            .lookup_iri(super::INFERRED_GRAPH)
-            .filter(|&g| readable(access, &snap, g));
+        let inferred = if readable_iri(access, &snap, super::INFERRED_GRAPH) {
+            lookup_iri_controlled(
+                &snap,
+                super::INFERRED_GRAPH,
+                query.max_memory,
+                req,
+                deadline,
+            )?
+        } else {
+            None
+        };
         let generalized =
             matches!(triple[0], Term::Literal(_)) || matches!(triple[1], Term::BlankNode(_));
         let lookup_triple = |snap: &Snapshot| -> Result<Option<[Id; 3]>> {

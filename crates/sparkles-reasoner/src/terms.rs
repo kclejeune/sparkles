@@ -202,7 +202,7 @@ impl Terms {
     pub fn new_in(snap: Arc<Snapshot>, budget: &Arc<Budget>) -> Result<Terms, BudgetFailure> {
         let fixed = 40 * size_of::<OnceLock<Box<[OnceLock<LocalTerm>]>>>();
         let fixed_credit = Held::try_new_exact(budget, fixed)?;
-        let lit_range = snap.generation.vocab.prefix_range(b"\"");
+        let lit_range = (0, snap.generation.vocab.first_triple());
         let mut t = Terms {
             snap,
             analysis: None,
@@ -268,7 +268,7 @@ impl Terms {
                 return Err(err.into());
             }
         };
-        let lit_range = snap.generation.vocab.prefix_range(b"\"");
+        let lit_range = (0, snap.generation.vocab.first_triple());
         let mut t = Terms {
             snap,
             analysis: None,
@@ -934,6 +934,77 @@ impl Terms {
             });
         }
         self.snap.term(i)
+    }
+
+    /// Inspect the IRI string of `id` from a borrowed vocabulary key without cloning
+    /// delta/local keys or allocating an owned `Term`, admitting base-vocabulary
+    /// reconstruction scratch against the term table's budget and polling `check`.
+    /// Returns `Ok(None)` immediately without reading vocabulary storage when `id` is
+    /// not an IRI.
+    pub(crate) fn with_iri_controlled<T>(
+        &self,
+        id: u64,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+        mut f: impl FnMut(&str) -> T,
+    ) -> anyhow::Result<Option<T>> {
+        check()?;
+        if self.kind(id) != Kind::Iri {
+            return Ok(None);
+        }
+        let i = Id(id);
+        match i.tag() {
+            Tag::Local => {
+                let Some(key) = self.local_key(id) else {
+                    return Ok(None);
+                };
+                Ok(key
+                    .strip_prefix(b"<")
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .map(&mut f))
+            }
+            Tag::Delta => Ok(self.snap.generation.dvocab.with(|v| {
+                v.get(i.payload())
+                    .and_then(|key| key.strip_prefix(b"<"))
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .map(&mut f)
+            })),
+            Tag::Vocab => {
+                let budget = self.budget();
+                let check = std::cell::RefCell::new(check);
+                let scratch = std::cell::RefCell::new(Held::new(&budget));
+                let result = self
+                    .snap
+                    .generation
+                    .vocab
+                    .get_with_controlled_capacity_checked(
+                        i.payload(),
+                        |old, new| -> anyhow::Result<()> {
+                            if let Err(err) = scratch.borrow_mut().try_set(old.saturating_add(new))
+                            {
+                                (check.borrow_mut())()?;
+                                return Err(err.into());
+                            }
+                            Ok(())
+                        },
+                        |capacity| -> anyhow::Result<()> {
+                            if let Err(err) = scratch.borrow_mut().try_set(capacity) {
+                                (check.borrow_mut())()?;
+                                return Err(err.into());
+                            }
+                            Ok(())
+                        },
+                        |_| (check.borrow_mut())(),
+                        |key| -> anyhow::Result<Option<T>> {
+                            Ok(key
+                                .strip_prefix(b"<")
+                                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                                .map(&mut f))
+                        },
+                    )?;
+                Ok(result.flatten())
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Decode under the proof budget, keeping the value's credit with the result.
