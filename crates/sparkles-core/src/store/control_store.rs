@@ -352,11 +352,10 @@ impl Store {
         let mut io = tail.lock();
         w.poisoned = true;
         let r = (|| -> Result<()> {
-            w.wal.as_mut().expect("checked").flush()?;
             if let wal::Direct::Open(d) = &mut io.direct {
                 d.invalidate();
             }
-            let file = w.wal.as_ref().expect("checked").get_ref();
+            let file = w.wal.as_ref().expect("checked");
             wal::write_all_at(
                 file,
                 &wal::header_record_of(crate::formats::WAL_CONTROL_VERSION),

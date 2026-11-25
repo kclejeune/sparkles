@@ -1358,7 +1358,9 @@ impl Store {
         if cancelled() {
             return Err(Error::Cancelled);
         }
-        cu.sync(&mut w.vocab_sync)?;
+        if let Some(g) = &self.group {
+            cu.sync(&mut g.vocab.lock())?;
+        }
         w.next_bnode = w.next_bnode.max(cu.next_bnode);
         let new_no = commit::generation_number(&name);
         if let Some(root) = &self.root {
@@ -1401,7 +1403,13 @@ impl Store {
                 &mut w,
                 &gen_,
                 NextLog {
-                    wal: cu.wal.take().expect("a persistent store has a log"),
+                    wal: Arc::new(
+                        cu.wal
+                            .take()
+                            .expect("a persistent store has a log")
+                            .into_inner()
+                            .map_err(|e| e.into_error())?,
+                    ),
                     tail: wal::Tail::new(cu.wal_len, cu.wal_len),
                     len: cu.wal_len,
                     index,

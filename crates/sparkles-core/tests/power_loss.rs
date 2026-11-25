@@ -128,7 +128,6 @@ fn base_commit(s: &Store, n: u32) {
 struct Config {
     group: bool,
     direct: bool,
-    idle_direct: bool,
     threads: u32,
     commits: u32,
 }
@@ -138,7 +137,6 @@ impl Config {
         StoreOptions {
             group_commit: self.group,
             wal_direct_writes: self.direct,
-            group_commit_idle_direct: self.idle_direct,
             ..Default::default()
         }
     }
@@ -201,15 +199,10 @@ fn child_writer() {
         return;
     };
     let f: Vec<&str> = spec.split(',').collect();
-    assert_eq!(
-        f.len(),
-        5,
-        "group, WAL direct, threads, commits, idle direct"
-    );
+    assert_eq!(f.len(), 4, "group, WAL direct, threads, commits");
     let cfg = Config {
         group: f[0] == "1",
         direct: f[1] == "1",
-        idle_direct: f[4] == "1",
         threads: f[2].parse().unwrap(),
         commits: f[3].parse().unwrap(),
     };
@@ -521,12 +514,11 @@ fn run_writer(
         .env(
             CHILD,
             format!(
-                "{},{},{},{},{}",
+                "{},{},{},{}",
                 u8::from(cfg.group),
                 u8::from(cfg.direct),
                 cfg.threads,
                 cfg.commits,
-                u8::from(cfg.idle_direct)
             ),
         )
         .env("SPARKLES_PL_DB", &db)
@@ -1438,11 +1430,11 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             "{name}: no fresh transaction began and was acknowledged during one successful text-file synchronization"
         );
     }
-    // With every commit grouped and the write-through handles on, the leaders write each
-    // fence's records and terms with `O_DSYNC` writes once the log has preallocated
-    // space, and no writer writes the log itself (X09 item 446). The crash images below
-    // then check those writes against the receipts.
-    if cfg.group && cfg.direct && !cfg.idle_direct {
+    // With every persistent commit fenced and the write-through handles on, the leaders
+    // write each fence's records and terms with `O_DSYNC` writes once the log has
+    // preallocated space (X09 item 446, X16 Phase 6). The crash images below then check
+    // those writes against the receipts.
+    if cfg.direct {
         let dsync = |name: &str| {
             log.iter()
                 .filter(
@@ -1600,7 +1592,7 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         log.len(),
         acked.len()
     );
-    if cfg.group && cfg.direct && !cfg.idle_direct && direct_io_available(&run.root) {
+    if cfg.direct && direct_io_available(&run.root) {
         assert!(
             split > 0,
             "{name}: no crash point fell between a fence's annotation write and its log write"
@@ -1656,17 +1648,6 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: true,
                 direct: true,
-                idle_direct: true,
-                threads: 4,
-                commits: 25,
-            },
-        ),
-        (
-            "group-direct-fences",
-            Config {
-                group: true,
-                direct: true,
-                idle_direct: false,
                 threads: 4,
                 commits: 25,
             },
@@ -1676,7 +1657,6 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: true,
                 direct: false,
-                idle_direct: true,
                 threads: 4,
                 commits: 25,
             },
@@ -1686,7 +1666,6 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: true,
                 direct: true,
-                idle_direct: false,
                 threads: 1,
                 commits: 25,
             },
@@ -1696,7 +1675,6 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: true,
                 direct: false,
-                idle_direct: false,
                 threads: 1,
                 commits: 25,
             },
@@ -1706,7 +1684,6 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: false,
                 direct: true,
-                idle_direct: true,
                 threads: 2,
                 commits: 25,
             },
@@ -1716,7 +1693,6 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: false,
                 direct: false,
-                idle_direct: true,
                 threads: 2,
                 commits: 25,
             },
@@ -1748,7 +1724,6 @@ fn crash_images_of_a_dataset_with_full_text_search_grouped() {
         Config {
             group: true,
             direct: false,
-            idle_direct: false,
             threads: 4,
             commits: 25,
         },
@@ -1771,7 +1746,6 @@ fn crash_images_of_a_dataset_with_full_text_search_ordinary() {
         Config {
             group: false,
             direct: false,
-            idle_direct: true,
             threads: 2,
             commits: 15,
         },
@@ -1796,7 +1770,6 @@ fn background_full_text_checkpoints(group: bool) {
         Config {
             group,
             direct: false,
-            idle_direct: false,
             threads: 4,
             commits: 50,
         },
@@ -1821,23 +1794,26 @@ fn crash_images_during_background_full_text_checkpoints_grouped() {
 
 const RETRY: &str = "SPARKLES_PL_RETRY";
 
-/// The writer process of `a_failed_first_annotation_sync_keeps_later_messages`: two serial
-/// updates that carry a message each. Prints `LINE first ...` and `LINE second ...`.
+/// The writer process of `a_failed_first_annotation_sync_keeps_later_messages`:
+/// - `bulk`: a bulk commit calls `Annotations::append` before switching `CURRENT`, so a
+///   failed first annotation sync cuts the record back, keeps the header, and lets the
+///   second commit succeed in the same store instance.
+/// - `ordinary` / `group`: a WAL commit writes its annotation in parallel with its WAL
+///   records under the group fence contract (X16 Phase 6), so a failed first annotation
+///   sync poisons the store; the second commit in the same store is refused as poisoned,
+///   and reopening preserves the header and lets the next message succeed.
 #[test]
 fn child_annotation_retry() {
     let Ok(spec) = std::env::var(RETRY) else {
         return;
     };
     let db = PathBuf::from(std::env::var("SPARKLES_PL_DB").unwrap());
-    let s = Store::open(
-        &db,
-        StoreOptions {
-            group_commit: spec == "group",
-            group_commit_idle_direct: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let opts = StoreOptions {
+        group_commit: spec == "group",
+        bulk_threshold: if spec == "bulk" { 0 } else { 250_000 },
+        ..Default::default()
+    };
+    let s = Store::open(&db, opts).unwrap();
     // faults count the calls after the store has opened
     std::fs::write(std::env::var("SPARKLES_IO_ARM").unwrap(), b"armed").unwrap();
     for (name, k) in [("first", 0), ("second", 1)] {
@@ -1848,9 +1824,16 @@ fn child_annotation_retry() {
                 ..Default::default()
             },
         );
-        let ids = w.encode_quad(&quad(1, k), &mut Default::default()).unwrap();
-        w.insert(ids).unwrap();
-        match w.commit() {
+        let staged = w
+            .encode_quad(&quad(1, k), &mut Default::default())
+            .and_then(|ids| {
+                if spec == "bulk" {
+                    w.insert_bulk(vec![ids])
+                } else {
+                    w.insert(ids).map(|_| ())
+                }
+            });
+        match staged.and_then(|_| w.commit()) {
             Ok(r) => println!("LINE {name} ok {}", r.commit.seq),
             Err(e) => println!("LINE {name} err {e}"),
         }
@@ -1859,8 +1842,12 @@ fn child_annotation_retry() {
 }
 
 /// The first annotation of a database creates `annotations.bin` and its header. When the
-/// sync of that first record fails, the record is taken back and the header stays, so the
-/// next message lands after the header and survives a reopen.
+/// sync of that first record fails:
+/// - for a bulk commit (`Annotations::append`), the record is taken back and the header
+///   stays, so the next message lands after the header in the same store and survives reopen;
+/// - for a WAL commit (group-of-one fence, X16 Phase 6), the fence poisons the writer
+///   while keeping the synced header, so the store refuses later writes until reopen, and
+///   after reopen the next message lands after the header and survives another reopen.
 fn annotation_retry(name: &str, mode: &str) {
     let root = work_root().join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1893,18 +1880,52 @@ fn annotation_retry(name: &str, mode: &str) {
         lines.iter().any(|l| l.starts_with("first err ")),
         "{name}: the first message was acknowledged: {lines:?}"
     );
-    assert!(
-        lines.iter().any(|l| l == "second ok 1"),
-        "{name}: the second message did not take sequence 1: {lines:?}"
-    );
-    let s = Store::open(&db, StoreOptions::default()).unwrap();
-    assert_eq!(s.snapshot().commit, 1, "{name}");
-    assert_eq!(
-        s.annotation(1).and_then(|a| a.message).as_deref(),
-        Some("second"),
-        "{name}: the acknowledged message was lost"
-    );
-    drop(s);
+    if mode == "bulk" {
+        assert!(
+            lines.iter().any(|l| l == "second ok 1"),
+            "{name}: the second message did not take sequence 1: {lines:?}"
+        );
+        let s = Store::open(&db, StoreOptions::default()).unwrap();
+        assert_eq!(s.snapshot().commit, 1, "{name}");
+        assert_eq!(
+            s.annotation(1).and_then(|a| a.message).as_deref(),
+            Some("second"),
+            "{name}: the acknowledged message was lost"
+        );
+        drop(s);
+    } else {
+        assert!(
+            lines.iter().any(|l| l.starts_with("second err ")),
+            "{name}: poisoned writer accepted a second write: {lines:?}"
+        );
+        let s = Store::open(&db, StoreOptions::default()).unwrap();
+        let recovered = s.snapshot().commit;
+        assert!(recovered <= 1, "{name}: unexpected commit {recovered}");
+        // the header survived; a fresh commit with a message lands cleanly after reopen
+        let mut w = s.write_with(
+            CommitKind::Update,
+            sparkles_core::guard::WriteOptions {
+                message: Some("after-reopen".into()),
+                ..Default::default()
+            },
+        );
+        let ids = w.encode_quad(&quad(2, 0), &mut Default::default()).unwrap();
+        w.insert(ids).unwrap();
+        let r = w.commit().unwrap();
+        assert_eq!(r.commit.seq, recovered + 1, "{name}");
+        drop(s);
+        let reopened = Store::open(&db, StoreOptions::default()).unwrap();
+        assert_eq!(reopened.snapshot().commit, recovered + 1, "{name}");
+        assert_eq!(
+            reopened
+                .annotation(recovered + 1)
+                .and_then(|a| a.message)
+                .as_deref(),
+            Some("after-reopen"),
+            "{name}: message after reopen was lost"
+        );
+        drop(reopened);
+    }
     let report = check(&db, &CheckOptions::default()).unwrap();
     assert!(
         report.status != Status::Error,
@@ -1916,8 +1937,8 @@ fn annotation_retry(name: &str, mode: &str) {
 
 #[test]
 fn a_failed_first_annotation_sync_keeps_later_messages() {
+    annotation_retry("ann-retry-bulk", "bulk");
     annotation_retry("ann-retry-ordinary", "ordinary");
-    // the idle direct path of group commit, which is on by default
     annotation_retry("ann-retry-group", "group");
 }
 
@@ -2004,21 +2025,18 @@ fn failed_synchronizations_fail_unacknowledged_commits_and_publish_nothing() {
     let grouped = Config {
         group: true,
         direct: false,
-        idle_direct: true,
         threads: 4,
         commits: 12,
     };
     let ordinary = Config {
         group: false,
         direct: false,
-        idle_direct: true,
         threads: 1,
         commits: 12,
     };
     let direct = Config {
         group: false,
         direct: true,
-        idle_direct: true,
         threads: 1,
         commits: 12,
     };
@@ -2039,14 +2057,7 @@ fn failed_synchronizations_fail_unacknowledged_commits_and_publish_nothing() {
     failed_sync("d-write", direct, "pwrite:wal.log:5");
     failed_sync("d-vocab", direct, "pwrite:delta.vocab:5");
     // the annotation file alone, in a run of fences
-    failed_sync(
-        "g-ann",
-        Config {
-            idle_direct: false,
-            ..grouped
-        },
-        "fdatasync:annotations.bin:2",
-    );
+    failed_sync("g-ann", grouped, "fdatasync:annotations.bin:2");
 }
 
 #[test]
@@ -2056,7 +2067,6 @@ fn a_single_writer_annotation_fence_fault_is_poisoning() {
         Config {
             group: true,
             direct: false,
-            idle_direct: false,
             threads: 1,
             commits: 12,
         },

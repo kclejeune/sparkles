@@ -873,13 +873,12 @@ fn model_runs(runs: u64, first: u64, faults: &'static [Fault], indexed: bool) {
         let fault = faults[rng.below(faults.len() as u64) as usize];
         let opts = StoreOptions {
             group_commit: true,
-            group_commit_idle_direct: rng.below(2) == 0,
             wal_direct_writes: rng.below(2) == 0,
             ..Default::default()
         };
         let what = format!(
-            "seed {seed:#x} (messages {messages}, {fault:?}, idle direct {}, direct {}, indexed {indexed})",
-            opts.group_commit_idle_direct, opts.wal_direct_writes
+            "seed {seed:#x} (messages {messages}, {fault:?}, direct {}, indexed {indexed})",
+            opts.wal_direct_writes
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
