@@ -443,7 +443,11 @@ impl View {
     ) -> Result<(QueryCursor, Option<graph::Spec>)> {
         let (grant, pool, parent) = match (ctx.grant(), &rebuild.fallback_pool) {
             (Some(grant), _) => (Some(grant.clone()), None, ctx.memory_parent()?),
-            (None, Some(pool)) => (None, Some(pool.clone()), pool.work_parent()),
+            (None, Some(pool)) => (
+                Some(Arc::new(pool.empty_grant())),
+                None,
+                pool.combine_unpooled_parent(ctx.memory_parent()?),
+            ),
             (None, None) => (None, None, ctx.memory_parent()?),
         };
         let child_opts = QueryOptions {
@@ -968,5 +972,105 @@ mod tests {
             .store(10_000_000_000, Ordering::Relaxed);
         std::thread::sleep(end.saturating_duration_since(Instant::now()));
         assert!(matches!(child.next_batch(), Err(Error::Timeout)));
+    }
+
+    #[test]
+    fn unpooled_pooled_rebuild_enforces_combined_outer_limit_and_checked_grant() {
+        use crate::access::{GraphAccess, GraphRule, Graphs};
+        use crate::error::BudgetKind;
+        use crate::sparql::pool::QueryPool;
+
+        let s = Store::in_memory(StoreOptions::default());
+        let mut nt = String::new();
+        for i in 0..4000 {
+            nt.push_str(&format!(
+                "<urn:s:{i}> <urn:p> \"payload-{i:04}-xxxxxxxxxxxxxxxx\" .\n"
+            ));
+        }
+        s.load(&[crate::io::Source::from_bytes(
+            nt.into_bytes(),
+            crate::io::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+
+        let pool = QueryPool::new(16 << 20);
+        let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY ?o";
+
+        for access in [
+            None,
+            Some(Arc::new(GraphAccess::graphs(
+                Graphs::Only(GraphRule {
+                    default_graph: true,
+                    ..Default::default()
+                }),
+                Graphs::none(),
+            ))),
+        ] {
+            let mut rb = rebuild(&s, q);
+            rb.access = access;
+            rb.fallback_pool = Some(pool.clone());
+
+            // 1. With room in both the outer limit and runtime pool, rebuild succeeds
+            //    even when `rb.access` triggers checked preparation.
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 1 << 20;
+            let ctx = ctx.into_shared();
+            let (mut child, _) = View::open_rebuild(&ctx, &CursorOptions::default(), &rb)
+                .expect("unpooled rebuild with room must succeed");
+            let mut rows = 0usize;
+            while let Some(batch) = child.next_batch().unwrap() {
+                rows += batch.len();
+            }
+            assert_eq!(rows, 4000);
+            drop(child);
+            assert_eq!(pool.granted(), 0);
+
+            // 2. With live outer state leaving too little room under `ctx.mem_limit`,
+            //    overlap must refuse with `BudgetKind::Memory` despite ample pool room.
+            let mut ctx2 = Ctx::new(s.snapshot());
+            ctx2.mem_limit = 1 << 20;
+            let ctx2 = ctx2.into_shared();
+            let outer_hold = OwnedCharge::new(&ctx2, 768 << 10).unwrap();
+            let combined = View::open_rebuild(&ctx2, &CursorOptions::default(), &rb).and_then(
+                |(mut child, _)| {
+                    while child.next_batch()?.is_some() {}
+                    Ok(())
+                },
+            );
+            assert!(
+                matches!(
+                    combined,
+                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                ),
+                "combined outer + child live memory must enforce outer mem_limit: {combined:?}"
+            );
+            drop(outer_hold);
+            assert_eq!(ctx2.live_bytes(), 0);
+            assert_eq!(pool.granted(), 0);
+
+            // 3. With the runtime pool full, rebuild must refuse with `ServerMemory` and
+            //    roll back any outer reservation cleanly.
+            let blocker = pool.work_parent().reserve(pool.capacity()).unwrap();
+            let mut ctx3 = Ctx::new(s.snapshot());
+            ctx3.mem_limit = 8 << 20;
+            let ctx3 = ctx3.into_shared();
+            let full = View::open_rebuild(&ctx3, &CursorOptions::default(), &rb).and_then(
+                |(mut child, _)| {
+                    while child.next_batch()?.is_some() {}
+                    Ok(())
+                },
+            );
+            assert!(
+                matches!(
+                    full,
+                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+                ),
+                "full runtime pool must refuse unpooled rebuild with ServerMemory: {full:?}"
+            );
+            assert_eq!(ctx3.live_bytes(), 0);
+            drop(blocker);
+            assert_eq!(pool.granted(), 0);
+        }
     }
 }

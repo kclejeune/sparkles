@@ -430,9 +430,10 @@ impl Runtime {
                     return Ok((Some(sp.clone()), Some(parent)));
                 }
                 if parent.domain() == unpooled_id {
-                    // An unpooled query reading a pooled dataset's view must still charge
-                    // the dataset's QueryPool during fallback evaluation.
-                    return Ok((Some(sp.clone()), Some(sp.work_parent())));
+                    // An unpooled query reading a pooled dataset's view must still enforce
+                    // both the outer query's aggregate limit and the dataset's QueryPool
+                    // during fallback evaluation.
+                    return Ok((Some(sp.clone()), Some(sp.combine_unpooled_parent(parent))));
                 }
                 return Err(Error::invalid(
                     "view read memory_parent belongs to another QueryPool without matching memory_pool",

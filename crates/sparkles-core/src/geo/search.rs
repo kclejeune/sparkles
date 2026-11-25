@@ -311,7 +311,9 @@ pub fn nearest_with(
         }
     }
     for r in view.overlay.skipped.iter().chain(view.skipped.iter()) {
-        if let Some(en) = re.entry(r.o)? {
+        if f.delta_valid(r)
+            && let Some(en) = re.entry(r.o)?
+        {
             st.rechecked += 1;
             let mut e = Entry::row(&lb, r, en);
             e.from_tail = true;
@@ -491,15 +493,20 @@ impl<'a> Filter<'a> {
         self.delta_row_unseen(r) && self.unseen_triple(r)
     }
 
-    /// [`Self::delta_row`] without the triple check (done at emission).
-    pub(crate) fn delta_row_unseen(&mut self, r: &Row) -> bool {
+    /// Whether an overlay or tail row matches graph, predicate, and snapshot liveness,
+    /// without mutating `quads` duplicate suppression (which runs at emission).
+    pub(crate) fn delta_valid(&self, r: &Row) -> bool {
         self.wanted(r)
             && if super::wgs84::is_pair(r.o) {
                 self.pair_live(r)
             } else {
                 self.snap.delta.ins[Perm::Pso.index()].contains(&r.pso())
             }
-            && self.quads.insert(*r)
+    }
+
+    /// [`Self::delta_row`] without the triple check (done at emission).
+    pub(crate) fn delta_row_unseen(&mut self, r: &Row) -> bool {
+        self.delta_valid(r) && self.quads.insert(*r)
     }
 
     /// Whether a row taken from the queue goes out: tail rows are checked now.
@@ -2296,15 +2303,18 @@ impl NearestIter {
                     admit,
                 )?;
             }
+            let f = Filter::new(&snap, &preds, &graph, dedup);
             for (idx, r) in view.tail.iter().enumerate() {
                 if idx.is_multiple_of(CHUNK) {
                     ctx.check()?;
+                }
+                if !f.delta_valid(&r.row) {
+                    continue;
                 }
                 let mut e = Entry::row(&lb, &r.row, r.entry.clone());
                 e.from_tail = true;
                 push_heap(&mut heap, e, 0, admit)?;
             }
-            let f = Filter::new(&snap, &preds, &graph, dedup);
             let mut re = Rechecked::new(ctx)?;
             for (idx, r) in base.skipped.iter().enumerate() {
                 if idx.is_multiple_of(CHUNK) {
@@ -2335,6 +2345,9 @@ impl NearestIter {
             {
                 if idx.is_multiple_of(CHUNK) {
                     ctx.check()?;
+                }
+                if !f.delta_valid(r) {
+                    continue;
                 }
                 if re.needs_growth(r.o) {
                     let heap_bytes = heap.capacity() as u64 * size_of::<Entry>() as u64;

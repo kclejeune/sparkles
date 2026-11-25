@@ -2172,3 +2172,201 @@ fn distinct_sum_checkpoint_recovery_matches_steady_state_bytes() {
     drop(too_tight);
     assert_eq!(pool.granted(), 0);
 }
+
+#[test]
+fn checked_streaming_rebuild_unpooled_reader_uses_runtime_pool() {
+    use sparkles_core::access::{GraphRule, Graphs};
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+
+    struct DefaultGraphHost;
+    impl Host for DefaultGraphHost {
+        fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+            Ok(Some(Arc::new(GraphAccess::graphs(
+                Graphs::Only(GraphRule {
+                    default_graph: true,
+                    ..Default::default()
+                }),
+                Graphs::none(),
+            ))))
+        }
+        fn stored_query(&self, _: &str) -> Result<String> {
+            Err(Error::NotFound("none".into()))
+        }
+    }
+
+    let store = Store::in_memory(StoreOptions::default());
+    load_rows(&store, "chk", 300, 32);
+
+    let pool = QueryPool::new(16 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(DefaultGraphHost));
+    rt.put(
+        &store,
+        "v_checked",
+        ViewDef::table("SELECT ?s ?o WHERE { ?s <urn:p> ?o }"),
+    )
+    .unwrap();
+    rt.round(&store);
+    let baseline = pool.granted();
+    assert!(baseline > 0);
+
+    let q = "PREFIX view: <urn:x-sparkles:view#> \
+             SELECT ?s ?o WHERE { SERVICE view:read { [] view:name \"v_checked\" ; view:bind ?s, ?o . } }";
+    let opts = QueryOptions {
+        pool: None,
+        views: Some(rt.clone()),
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        max_memory_bytes: Some(16 * MB),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor_opts = CursorOptions {
+        batch_rows: 32,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+
+    // 1. With room in the runtime pool, the checked streaming rebuild succeeds.
+    let mut cursor = select_cursor(store.snapshot(), q, &opts, &cursor_opts)
+        .expect("checked streaming rebuild must succeed when runtime pool has room");
+    let mut total = 0usize;
+    while let Some(batch) = cursor.next_batch().unwrap() {
+        total += batch.len();
+    }
+    assert_eq!(total, 300);
+    drop(cursor);
+    assert_eq!(pool.granted(), baseline);
+
+    // 2. With the runtime pool full, the checked streaming rebuild refuses with ServerMemory.
+    let blocker = pool
+        .work_parent()
+        .reserve(pool.capacity() - pool.granted())
+        .unwrap();
+    let res = select_cursor(store.snapshot(), q, &opts, &cursor_opts).and_then(|mut cursor| {
+        while cursor.next_batch()?.is_some() {}
+        Ok(())
+    });
+    assert!(
+        matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory),
+        "checked streaming rebuild against full runtime pool must refuse with ServerMemory, got {res:?}"
+    );
+    drop(blocker);
+    assert_eq!(pool.granted(), baseline);
+
+    rt.close(&store);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn unpooled_streaming_rebuild_enforces_combined_outer_and_child_memory_limit() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, Optimizations, select_cursor};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let mut nt = String::new();
+    for i in 0..12_000 {
+        nt.push_str(&format!("<urn:v:{i:05}> <urn:p> <urn:key:{i:05}> .\n"));
+        nt.push_str(&format!(
+            "<urn:out:{i:05}> <urn:outer> <urn:okey:{i:05}> .\n"
+        ));
+    }
+    store
+        .load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+
+    // Runtime pool has ample capacity so only the unpooled reader's local cap binds.
+    let pool = QueryPool::new(32 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(OpenHost));
+    rt.put(
+        &store,
+        "v_grouped",
+        ViewDef::table("SELECT ?k (COUNT(?s) AS ?c2) WHERE { ?s <urn:p> ?k } GROUP BY ?k"),
+    )
+    .unwrap();
+    rt.round(&store);
+    let baseline = pool.granted();
+
+    let cursor_opts = CursorOptions {
+        batch_rows: 16,
+        batch_bytes: 32 * 1024,
+        fallback: FallbackPolicy::RejectMaterialization,
+    };
+    let run = |q: &str, limit: u64| -> Result<(usize, u64)> {
+        let opts = QueryOptions {
+            pool: None,
+            views: Some(rt.clone()),
+            aggregate_errors: Some(AggregateErrors::Sparkles),
+            max_memory_bytes: Some(limit),
+            no_cache: true,
+            optimizations: Some(Optimizations {
+                probed_optional: false,
+                merge_left_join: false,
+                incremental_group: false,
+                grow_input: false,
+                decode_ahead: false,
+                parallel_decode: false,
+                ..Optimizations::ALL
+            }),
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(store.snapshot(), q, &opts, &cursor_opts)?;
+        let mut count = 0usize;
+        while let Some(batch) = cursor.next_batch()? {
+            count += batch.len();
+        }
+        let peak = cursor.stats().mem_peak_bytes;
+        Ok((count, peak))
+    };
+
+    // Both branches group 12,000 distinct IRI keys (pure Id hash-group tables, no
+    // `ValueCache` scaling with `max_memory_bytes`). `OPTIONAL` pulls its first probe
+    // batch from the left `GROUP BY` first, keeping all 12,000 outer groups LIVE while
+    // building the right side (`SERVICE view:read` rebuild of `v_grouped`).
+    let outer_only = "SELECT ?k (COUNT(?s) AS ?c1) WHERE { ?s <urn:outer> ?k } GROUP BY ?k";
+    let rebuild_only = "PREFIX view: <urn:x-sparkles:view#> \
+        SELECT ?k ?c2 WHERE { SERVICE view:read { [] view:name \"v_grouped\" ; view:bind ?k, ?c2 . } }";
+    let overlap_query = "PREFIX view: <urn:x-sparkles:view#> \
+        SELECT ?k ?c1 ?c2 WHERE { \
+            { SELECT ?k (COUNT(?s) AS ?c1) WHERE { ?s <urn:outer> ?k } GROUP BY ?k } \
+            OPTIONAL { SERVICE view:read { [] view:name \"v_grouped\" ; view:bind ?k, ?c2 . } } \
+        }";
+
+    let (outer_rows, outer_peak) = run(outer_only, 8 * MB).unwrap();
+    let (rebuild_rows, rebuild_peak) = run(rebuild_only, 8 * MB).unwrap();
+    let (overlap_rows, overlap_peak) = run(overlap_query, 8 * MB).unwrap();
+    assert_eq!(outer_rows, 12_000);
+    assert_eq!(rebuild_rows, 12_000);
+    assert_eq!(overlap_rows, 12_000);
+    let solo_max = outer_peak.max(rebuild_peak);
+    assert!(
+        overlap_peak > solo_max + 256 * KB,
+        "overlap peak ({overlap_peak}) must materially exceed either branch alone (outer={outer_peak}, rebuild={rebuild_peak})"
+    );
+
+    let between = solo_max + (overlap_peak - solo_max) / 2;
+    assert_eq!(run(outer_only, between).unwrap().0, 12_000);
+    assert_eq!(run(rebuild_only, between).unwrap().0, 12_000);
+    let err = run(overlap_query, between).expect_err("overlap must exceed reader limit");
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "overlap under ample pool must fail with reader BudgetKind::Memory, got {err:?}"
+    );
+    assert_eq!(pool.granted(), baseline);
+
+    rt.close(&store);
+    assert_eq!(pool.granted(), 0);
+}

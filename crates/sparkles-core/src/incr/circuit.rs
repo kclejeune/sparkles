@@ -320,6 +320,9 @@ pub struct Circuit {
     /// the index estimates the latest build computed, which tests read
     #[cfg(test)]
     pub(crate) build_estimated: u64,
+    /// number of times `publish_version_with_rows` allocated a published version
+    #[cfg(test)]
+    pub(crate) version_allocs: usize,
     /// query pool backing this circuit's accounting domain, when attached
     pool: Option<Arc<QueryPool>>,
     /// hierarchical budget for operator state, result, terms, provenance, history/tally,
@@ -533,6 +536,8 @@ impl Circuit {
             build_scanned: 0,
             #[cfg(test)]
             build_estimated: 0,
+            #[cfg(test)]
+            version_allocs: 0,
             pool: None,
             budget: ViewBudget::new(None, None),
         }
@@ -844,29 +849,107 @@ impl Circuit {
             + self.facts.bytes()
     }
 
-    /// Build a flat immutable [`ViewTable`] from the current result (in window order when
-    /// the query orders it).
-    fn build_view_table(&self) -> ViewTable {
+    fn version_row_count(&self) -> usize {
+        if let Some((w, _)) = self.root.result_window()
+            && w.positions
+        {
+            w.row_count()
+        } else {
+            self.result.len()
+        }
+    }
+
+    /// Projected new allocation bytes needed to publish a [`ViewVersion`] (matching
+    /// [`Self::version_bytes`] for newly allocated pieces), paired with the row count.
+    fn projected_version_alloc_bytes(&self, reuse_terms: bool) -> Result<(usize, u64)> {
+        let overflow = || super::budget::budget_error(sparkles_budget::ParentRefused::Overflow);
+        let row_count = self.version_row_count();
         let width = self.root.schema.len();
+        let rows_u64 = u64::try_from(row_count).map_err(|_| overflow())?;
+        let width_u64 = u64::try_from(width).map_err(|_| overflow())?;
+        let ids_bytes = rows_u64
+            .checked_mul(width_u64)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<Id>() as u64))
+            .ok_or_else(overflow)?;
+        let weights_bytes = rows_u64
+            .checked_mul(std::mem::size_of::<i64>() as u64)
+            .ok_or_else(overflow)?;
+        let table_bytes = (std::mem::size_of::<ViewTable>() as u64)
+            .checked_add(ids_bytes)
+            .and_then(|n| n.checked_add(weights_bytes))
+            .ok_or_else(overflow)?;
+        let has_pool = self.version_pool.is_some();
+        let table_total = if has_pool {
+            table_bytes.checked_add(16).ok_or_else(overflow)?
+        } else {
+            table_bytes
+        };
+        let cols_bytes = if self.version.is_some() {
+            0
+        } else {
+            let names: u64 = self.root.schema.iter().try_fold(0u64, |acc, &v| {
+                let len = u64::try_from(self.vars[v as usize].len()).map_err(|_| overflow())?;
+                acc.checked_add(len).ok_or_else(overflow)
+            })?;
+            let slots = width_u64
+                .checked_mul(std::mem::size_of::<String>() as u64)
+                .ok_or_else(overflow)?;
+            let base = slots.checked_add(names).ok_or_else(overflow)?;
+            if has_pool {
+                base.checked_add((32 + std::mem::size_of::<PublishedBytes>()) as u64)
+                    .ok_or_else(overflow)?
+            } else {
+                base
+            }
+        };
+        let reusing_terms = self
+            .version
+            .as_ref()
+            .is_some_and(|prev| reuse_terms && prev.terms.len() == self.terms.key_count());
+        let terms_bytes = if reusing_terms {
+            0
+        } else {
+            self.terms.projected_frozen_bytes(has_pool)?
+        };
+        let version_hdr = if has_pool {
+            (std::mem::size_of::<ViewVersion>() + 16 + std::mem::size_of::<PublishedBytes>() + 16)
+                as u64
+        } else {
+            (std::mem::size_of::<ViewVersion>() + 64) as u64
+        };
+        let total = version_hdr
+            .checked_add(cols_bytes)
+            .and_then(|n| n.checked_add(terms_bytes))
+            .and_then(|n| n.checked_add(table_total))
+            .ok_or_else(overflow)?;
+        Ok((row_count, total))
+    }
+
+    /// Build a flat immutable [`ViewTable`] from the current result (in window order when
+    /// the query orders it) without materializing temporary window rows.
+    fn build_view_table(&self, row_count: usize) -> ViewTable {
+        let width = self.root.schema.len();
+        let mut ids = Vec::with_capacity(row_count * width);
+        let mut weights = Vec::with_capacity(row_count);
+        let mut total_rows = 0u64;
         if let Some((w, cols)) = self.root.result_window()
             && w.positions
         {
-            let rows = w.rows();
-            let mut ids = Vec::with_capacity(rows.len() * width);
-            let mut weights = Vec::with_capacity(rows.len());
-            let mut total_rows = 0u64;
-            for (r, n) in rows {
-                if n > 0 {
-                    match cols {
-                        None => ids.extend_from_slice(&r),
-                        Some(cols) => {
-                            ids.extend(cols.iter().map(|c| c.map_or(Id::UNDEF, |i| r[i])));
+            let _ = w.for_each_row(
+                |r, n| -> std::result::Result<(), std::convert::Infallible> {
+                    if n > 0 {
+                        match cols {
+                            None => ids.extend_from_slice(r),
+                            Some(cols) => {
+                                ids.extend(cols.iter().map(|c| c.map_or(Id::UNDEF, |i| r[i])));
+                            }
                         }
+                        weights.push(n);
+                        total_rows = total_rows.saturating_add(n as u64);
                     }
-                    weights.push(n);
-                    total_rows = total_rows.saturating_add(n as u64);
-                }
-            }
+                    Ok(())
+                },
+            );
             return ViewTable {
                 width,
                 ids,
@@ -875,9 +958,6 @@ impl Circuit {
                 published: None,
             };
         }
-        let mut ids = Vec::with_capacity(self.result.len() * width);
-        let mut weights = Vec::with_capacity(self.result.len());
-        let mut total_rows = 0u64;
         for (r, w) in self.result.iter() {
             if w > 0 {
                 ids.extend_from_slice(r);
@@ -898,15 +978,43 @@ impl Circuit {
         self.publish_version(false);
     }
 
-    fn publish_updated_version(&mut self, remapped: bool) {
-        self.publish_version(!remapped);
+    fn publish_fresh_version_budgeted(&mut self) -> Result<()> {
+        self.publish_version_budgeted(false)
+    }
+
+    fn publish_updated_version_budgeted(&mut self, remapped: bool) -> Result<()> {
+        self.publish_version_budgeted(!remapped)
+    }
+
+    fn publish_version_budgeted(&mut self, reuse_terms: bool) -> Result<()> {
+        if !self.keep_result || self.snap.is_none() {
+            self.version = None;
+            return Ok(());
+        }
+        let (row_count, alloc_bytes) = self.projected_version_alloc_bytes(reuse_terms)?;
+        let target = self
+            .bytes()
+            .checked_add(alloc_bytes)
+            .ok_or_else(|| super::budget::budget_error(sparkles_budget::ParentRefused::Overflow))?;
+        self.budget.try_reserve_pass_to_cover(target)?;
+        self.publish_version_with_rows(reuse_terms, row_count);
+        Ok(())
     }
 
     fn publish_version(&mut self, reuse_terms: bool) {
+        let row_count = self.version_row_count();
+        self.publish_version_with_rows(reuse_terms, row_count);
+    }
+
+    fn publish_version_with_rows(&mut self, reuse_terms: bool, row_count: usize) {
         let Some(snap) = self.snap.clone().filter(|_| self.keep_result) else {
             self.version = None;
             return;
         };
+        #[cfg(test)]
+        {
+            self.version_allocs += 1;
+        }
         let pool = self.version_pool.as_ref();
         let (columns, published_columns) = if let Some(prev) = &self.version {
             (prev.columns.clone(), prev.published_columns.clone())
@@ -931,7 +1039,7 @@ impl Circuit {
                 Arc::new(terms)
             }
         };
-        let mut table = self.build_view_table();
+        let mut table = self.build_view_table(row_count);
         table.published = pool.map(|p| PublishedBytes::new(p, table.retained_bytes() + 16));
         let published = self.version_charge();
         self.version = Some(Arc::new(ViewVersion {
@@ -963,6 +1071,37 @@ impl Circuit {
         self.version = None;
         if self.version_pool.is_some() && self.snap.is_some() {
             self.publish_fresh_version();
+        }
+    }
+
+    /// Advance the version's commit and snapshot without copying rows or terms,
+    /// pre-admitting any newly allocated version state against `self.budget`.
+    fn bump_version_budgeted(&mut self, commit: u64, snap: Arc<Snapshot>) -> Result<()> {
+        if !self.keep_result {
+            self.version = None;
+            return Ok(());
+        }
+        if let Some(prev) = self.version.as_ref() {
+            let hdr = if self.version_pool.is_some() {
+                (std::mem::size_of::<ViewVersion>()
+                    + 16
+                    + std::mem::size_of::<PublishedBytes>()
+                    + 16) as u64
+            } else {
+                (std::mem::size_of::<ViewVersion>() + 64) as u64
+            };
+            let target = self.bytes().checked_add(hdr).ok_or_else(|| {
+                super::budget::budget_error(sparkles_budget::ParentRefused::Overflow)
+            })?;
+            self.budget.try_reserve_pass_to_cover(target)?;
+            let mut version = (**prev).clone();
+            version.commit = commit;
+            version.snap = snap;
+            version.published = self.version_charge();
+            self.version = Some(Arc::new(version));
+            Ok(())
+        } else {
+            self.publish_fresh_version_budgeted()
         }
     }
 
@@ -1180,6 +1319,7 @@ impl Circuit {
         self.terms = Terms::default();
         self.ann = AnnMap::default();
         self.facts.clear();
+        self.version = None;
         // the schema may have changed in changes no pass saw
         self.inferred = InferredFootprint::default();
         self.budget.shrink_state_to(0);
@@ -1221,13 +1361,14 @@ impl Circuit {
             drop(out_lease);
             return Err(e);
         }
+        // `out` has been consumed and dropped by `install_build_result_budgeted`.
+        drop(out_lease);
         self.ann.clear();
         if let Some((a, a_lease)) = ann {
             let res = self.absorb_budgeted(Some(a));
             drop(a_lease);
             if let Err(e) = res {
                 self.clear_state();
-                drop(out_lease);
                 return Err(e);
             }
         }
@@ -1235,14 +1376,14 @@ impl Circuit {
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;
-        self.publish_fresh_version();
-        if let Err(e) = self
-            .budget
-            .commit_pass_with_scratch(self.bytes(), &mut out_lease)
-        {
+        if let Err(e) = self.publish_fresh_version_budgeted() {
             self.applied = prev_applied;
             self.clear_state();
-            drop(out_lease);
+            return Err(e);
+        }
+        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+            self.applied = prev_applied;
+            self.clear_state();
             return Err(e);
         }
         Ok(())
@@ -1289,6 +1430,7 @@ impl Circuit {
         self.terms = Terms::default();
         self.ann = AnnMap::default();
         self.facts.clear();
+        self.version = None;
         self.budget.shrink_state_to(0);
         let budget_handle = self.budget.handle();
         let decoded = (|| {
@@ -1314,7 +1456,10 @@ impl Circuit {
         self.snap = Some(snap.clone());
         self.resolved = None;
         self.inferred = InferredFootprint::default();
-        self.publish_fresh_version();
+        if let Err(e) = self.publish_fresh_version_budgeted() {
+            self.clear_state();
+            return Err(e);
+        }
         if let Err(e) = self.budget.commit_pass(self.bytes()) {
             self.clear_state();
             return Err(e);
@@ -1500,14 +1645,26 @@ impl Circuit {
                 return Err(e);
             }
         }
+        let prev_applied = self.applied;
+        let prev_snap = self.snap.clone();
+        let prev_last = self.last;
         let commit = snap.commit;
         self.applied = commit;
         self.snap = Some(snap.clone());
         self.last = stats;
-        if out.is_empty() && !remapped && !self.ordered() {
-            self.bump_version(commit, snap);
+        let published = if out.is_empty() && !remapped && !self.ordered() {
+            self.bump_version_budgeted(commit, snap)
         } else {
-            self.publish_updated_version(remapped);
+            self.publish_updated_version_budgeted(remapped)
+        };
+        if let Err(e) = published {
+            self.applied = prev_applied;
+            self.snap = prev_snap;
+            self.last = prev_last;
+            drop(out);
+            drop(out_lease);
+            self.budget.abort_pass(self.bytes());
+            return Err(e);
         }
         // Keep `out_lease` intact while `out` is returned to the caller.
         if let Err(e) = self.budget.commit_pass(self.bytes()) {
@@ -1927,5 +2084,141 @@ mod tests {
             largest < witness_bytes,
             "absorption allocated a {largest}-byte buffer"
         );
+    }
+
+    #[test]
+    fn build_and_decode_pre_admit_published_version_before_allocating() {
+        use crate::error::BudgetKind;
+
+        let store = Store::in_memory(crate::store::StoreOptions::default());
+        let mut nt = String::new();
+        for i in 0..2000 {
+            nt.push_str(&format!(
+                "<urn:s{i:04}> <urn:p> \"{i}\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"
+            ));
+        }
+        store
+            .load(&[crate::io::Source::from_bytes(
+                nt.into_bytes(),
+                crate::io::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+
+        // Project 10 columns so the published flat `ViewTable::ids` buffer (2000 * 10 * 8
+        // = 160 KiB) is strictly larger than every allocation made while building or
+        // decoding the mutable circuit state.
+        let queries = [
+            "SELECT ?s ?o (?o AS ?c2) (?o AS ?c3) (?o AS ?c4) (?o AS ?c5) (?o AS ?c6) (?o AS ?c7) (?o AS ?c8) (?o AS ?c9) \
+             WHERE { ?s <urn:p> ?o }",
+            "SELECT ?s ?o (?o AS ?c2) (?o AS ?c3) (?o AS ?c4) (?o AS ?c5) (?o AS ?c6) (?o AS ?c7) (?o AS ?c8) (?o AS ?c9) \
+             WHERE { ?s <urn:p> ?o } ORDER BY ?o LIMIT 2000",
+        ];
+        let table_ids_bytes = 2000 * 10 * std::mem::size_of::<Id>();
+
+        for text in queries {
+            let parsed = parse_query(text, None, &[]).unwrap();
+            let compiled = || super::super::compile::compile(&parsed, None).unwrap();
+
+            let pool = QueryPool::new(16 << 20);
+            let mut reference = Circuit::new(compiled(), None);
+            reference.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+            reference.build(snap.clone(), &Control::none()).unwrap();
+            assert_eq!(reference.version_allocs, 1);
+            let steady = reference.bytes();
+            let version_bytes = reference.version_bytes();
+            assert!(
+                version_bytes as usize >= table_ids_bytes,
+                "version_bytes ({version_bytes}) must cover flat ViewTable::ids ({table_ids_bytes})"
+            );
+            let body = reference.encode(&snap).unwrap();
+            drop(reference);
+            assert_eq!(pool.granted(), 0);
+
+            // 1. Build with a local budget that fits the mutable state + build pass, but
+            //    refuses the published version before allocating `ViewTable::ids`.
+            let mut tight_build = Circuit::new(compiled(), None);
+            tight_build.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+            tight_build.max_memory_bytes = Some(steady - 1);
+            let mut build_res = Ok(());
+            let build_largest = crate::test_alloc::record_largest(|| {
+                build_res = tight_build.build(snap.clone(), &Control::none());
+            });
+            assert!(
+                matches!(
+                    build_res,
+                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                ),
+                "build 1 byte below steady must refuse publication with Memory: {build_res:?}"
+            );
+            assert_eq!(
+                tight_build.version_allocs, 0,
+                "build must refuse publication before entering version allocation for `{text}`"
+            );
+            assert!(
+                build_largest < table_ids_bytes,
+                "build allocated {build_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+            );
+            assert!(tight_build.version.is_none());
+            drop(tight_build);
+            assert_eq!(pool.granted(), 0);
+
+            // 2. Decode with a local budget that fits `body` + mutable state + reader IDs,
+            //    but refuses publication before allocating `ViewTable::ids`.
+            let decode_limit = body.len() as u64 + steady - 1;
+            let mut tight_decode = Circuit::new(compiled(), None);
+            tight_decode.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+            tight_decode.max_memory_bytes = Some(decode_limit);
+            let mut decode_res = Ok(());
+            let decode_largest = crate::test_alloc::record_largest(|| {
+                decode_res = tight_decode.decode(&body, &snap);
+            });
+            assert!(
+                matches!(
+                    decode_res,
+                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                ),
+                "decode 1 byte below publication total must refuse with Memory: {decode_res:?}"
+            );
+            assert_eq!(
+                tight_decode.version_allocs, 0,
+                "decode must refuse publication before entering version allocation for `{text}`"
+            );
+            assert!(
+                decode_largest < table_ids_bytes,
+                "decode allocated {decode_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+            );
+            assert!(tight_decode.version.is_none());
+            drop(tight_decode);
+            assert_eq!(pool.granted(), 0);
+
+            // 3. Shared QueryPool ceiling that fits mutable state + pass scratch, but
+            //    refuses publication with ServerMemory before allocating `ViewTable::ids`.
+            let tight_pool = QueryPool::new(steady - 1);
+            let mut pool_build = Circuit::new(compiled(), None);
+            pool_build.set_pool(Some(tight_pool.clone()), Some(tight_pool.work_parent()));
+            let mut pool_res = Ok(());
+            let pool_largest = crate::test_alloc::record_largest(|| {
+                pool_res = pool_build.build(snap.clone(), &Control::none());
+            });
+            assert!(
+                matches!(
+                    pool_res,
+                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+                ),
+                "build against tight QueryPool must refuse publication with ServerMemory: {pool_res:?}"
+            );
+            assert_eq!(
+                pool_build.version_allocs, 0,
+                "pooled build must refuse publication before entering version allocation for `{text}`"
+            );
+            assert!(
+                pool_largest < table_ids_bytes,
+                "pooled build allocated {pool_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+            );
+            drop(pool_build);
+            assert_eq!(tight_pool.granted(), 0);
+        }
     }
 }

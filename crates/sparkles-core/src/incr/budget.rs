@@ -730,6 +730,22 @@ impl ViewBudget {
         Ok(())
     }
 
+    /// Ensure `state_bytes + pass_bytes` covers at least `target_bytes` before allocating
+    /// a new retained structure (such as a published [`ViewVersion`]).
+    pub(crate) fn try_reserve_pass_to_cover(&self, target_bytes: u64) -> Result<()> {
+        let mut s = self.inner.lock();
+        let cur = s.state_bytes.saturating_add(s.pass_bytes);
+        if target_bytes > cur {
+            let delta = target_bytes - cur;
+            s.reserve_raw(delta).map_err(budget_error)?;
+            s.pass_bytes = s
+                .pass_bytes
+                .checked_add(delta)
+                .ok_or_else(|| budget_error(ParentRefused::Overflow))?;
+        }
+        Ok(())
+    }
+
     /// Lower persistent state accounting to `next_state_bytes` if it shrank (used when
     /// clearing state before a rebuild or transferring a circuit's budget across an
     /// inference switch after old operators are detached).
@@ -960,7 +976,9 @@ mod tests {
         let mut circuit = Circuit::new(compile(&q, None).unwrap(), None);
         circuit.set_pool(None, Some(parent.clone()));
         circuit.build(snap, &Control::none()).unwrap();
-        assert_eq!(weak_snap.strong_count(), 1);
+        // `circuit.snap` and its published `circuit.version.snap` both own `snap` and must
+        // drop strictly before `circuit.budget` returns credit to `parent`.
+        assert_eq!(weak_snap.strong_count(), 2);
         drop(circuit);
         assert!(
             release_count.load(Ordering::SeqCst) >= 1,

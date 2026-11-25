@@ -154,6 +154,32 @@ impl Terms {
         self.bytes
     }
 
+    /// Projected bytes of freezing this term table into a [`ViewTerms`], excluding the
+    /// shared local key backings already counted in [`Self::bytes`]. Matches
+    /// `ViewTerms::retained_bytes() - ViewTerms::key_storage_bytes()` (or
+    /// `ViewTerms::published_bytes() - ViewTerms::key_storage_bytes()` when `has_pool`).
+    pub(crate) fn projected_frozen_bytes(&self, has_pool: bool) -> crate::error::Result<u64> {
+        let keys = u64::try_from(self.keys.len())
+            .map_err(|_| super::budget::budget_error(sparkles_budget::ParentRefused::Overflow))?;
+        let table = (std::mem::size_of::<ViewTerms>() as u64)
+            .checked_add(
+                keys.checked_mul(std::mem::size_of::<FrozenKey>() as u64)
+                    .ok_or_else(|| {
+                        super::budget::budget_error(sparkles_budget::ParentRefused::Overflow)
+                    })?,
+            )
+            .and_then(|n| n.checked_add(16))
+            .ok_or_else(|| super::budget::budget_error(sparkles_budget::ParentRefused::Overflow))?;
+        if !has_pool {
+            return Ok(table);
+        }
+        let per_key_pub = (std::mem::size_of::<PublishedBytes>() + 16) as u64;
+        table
+            .checked_add(16)
+            .and_then(|n| n.checked_add(keys.checked_mul(per_key_pub)?))
+            .ok_or_else(|| super::budget::budget_error(sparkles_budget::ParentRefused::Overflow))
+    }
+
     /// Freeze the current local term table into an immutable snapshot.
     pub fn snapshot(&self) -> ViewTerms {
         self.snapshot_in(None)

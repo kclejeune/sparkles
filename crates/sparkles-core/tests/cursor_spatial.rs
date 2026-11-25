@@ -919,3 +919,94 @@ fn both_constant_relation_stops_after_the_first_witness_in_each_graph() {
         );
     }
 }
+
+#[test]
+fn streaming_nearest_ignores_oversized_skipped_tail_geometry_outside_graph_filter() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(
+        &s,
+        r#"
+        <http://example.org/near> <http://www.opengis.net/ont/geosparql#asWKT> "POINT(1 1)"^^<http://www.opengis.net/ont/geosparql#wktLiteral> .
+        "#,
+        RdfFormat::NQuads,
+    );
+    s.enable_geo(GeoConfig {
+        query_rewrite: true,
+        max_geometry_bytes: 256,
+        ..GeoConfig::default()
+    })
+    .unwrap();
+
+    // Insert a large WKT (> max_geometry_bytes) after index build into another named
+    // graph so it lands in the tail skipped list (`view.skipped`).
+    let mut big_wkt = String::from("LINESTRING(");
+    for i in 0..20_000 {
+        if i > 0 {
+            big_wkt.push(',');
+        }
+        let lon = 2.0 + (i % 100) as f64 * 0.001;
+        let lat = 2.0 + (i / 100) as f64 * 0.001;
+        big_wkt.push_str(&format!("{lon:.3} {lat:.3}"));
+    }
+    big_wkt.push(')');
+    assert!(big_wkt.len() > 200_000);
+    let nquad = format!(
+        "<http://example.org/otherGeom> <http://www.opengis.net/ont/geosparql#asWKT> \"{big_wkt}\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> <http://example.org/other> .\n"
+    );
+    load(&s, &nquad, RdfFormat::NQuads);
+    let snap = s.snapshot();
+
+    // Tight query memory cap: far smaller than `classify_controlled`'s ~4x lexical
+    // work charge for `big_wkt` (> 800 KiB), but ample for the tiny default-graph point.
+    let tight_opts = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(256 * 1024),
+        ..Default::default()
+    };
+
+    // Confirm that querying the named graph containing the oversized skipped tail
+    // geometry fails under the tight memory cap.
+    let other_q = format!(
+        "{P}SELECT ?g ?d {{ GRAPH ex:other {{ ?g geo:asWKT ?w }} BIND(geof:metricDistance(?w, \"POINT(1 1)\"^^geo:wktLiteral) AS ?d) FILTER(BOUND(?d)) }} ORDER BY ?d LIMIT 1"
+    );
+    let other_res = select_cursor(
+        snap.clone(),
+        &other_q,
+        &tight_opts,
+        &CursorOptions {
+            batch_rows: 1,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        },
+    )
+    .and_then(|mut c| {
+        while c.next_batch()?.is_some() {}
+        Ok(())
+    });
+    assert!(
+        matches!(
+            other_res,
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+        ),
+        "in-graph oversized skipped tail geometry must trip query memory cap, got {other_res:?}"
+    );
+
+    // Bounded streaming nearest search over the default graph must filter the
+    // out-of-graph skipped tail row before rechecking/parsing it and succeed.
+    let default_q = format!(
+        "{P}SELECT ?g ?d {{ ?g geo:asWKT ?w BIND(geof:metricDistance(?w, \"POINT(1 1)\"^^geo:wktLiteral) AS ?d) FILTER(BOUND(?d)) }} ORDER BY ?d LIMIT 1"
+    );
+    let (got, plan, _) = drain_strict(&snap, &default_q, &tight_opts, 1);
+    assert_eq!(got.len(), 1);
+    assert!(got[0].contains("http://example.org/near"), "got {got:?}");
+    assert!(plan_contains(&plan, "SpatialKnn"), "plan: {plan:#?}");
+    assert_eq!(
+        find_counter(&plan, "SpatialKnn", "rechecked"),
+        Some(0),
+        "out-of-graph skipped tail geometry must not be rechecked: {plan:#?}"
+    );
+
+    // Eager nearest search over the default graph must also succeed under the same cap.
+    let eager = query(snap, &default_q, &tight_opts).unwrap();
+    assert_eq!(eager.rows().unwrap().len(), 1);
+}
