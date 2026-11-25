@@ -366,6 +366,7 @@ pub fn exact_individual(n: &NamedIndividual) -> NamedIndividual {
 pub struct CanonMap {
     reps: Vec<NamedIndividual>,
     map: FxHashMap<NamedIndividual, u32>,
+    generated_hub: Option<NamedIndividual>,
     owned_bytes: usize,
     logical_bytes: usize,
 }
@@ -374,15 +375,22 @@ impl CanonMap {
     pub fn new_from_parts(
         reps: Vec<NamedIndividual>,
         map: FxHashMap<NamedIndividual, u32>,
+        generated_hub: Option<NamedIndividual>,
         owned_bytes: usize,
         logical_bytes: usize,
     ) -> Self {
         Self {
             reps,
             map,
+            generated_hub,
             owned_bytes,
             logical_bytes,
         }
+    }
+
+    #[inline]
+    pub fn generated_hub(&self) -> Option<&NamedIndividual> {
+        self.generated_hub.as_ref()
     }
 
     #[inline]

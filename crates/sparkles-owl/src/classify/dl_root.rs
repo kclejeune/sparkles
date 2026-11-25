@@ -616,8 +616,9 @@ fn const_eq<S: Sink>(
     if u == v {
         return None;
     }
-    let skip = &out.dl().merge_skip;
-    if !skip.is_empty() && (skip.contains(&u) || skip.contains(&v)) {
+    if let Some(skip) = out.dl().merge_skip
+        && (u == skip || v == skip)
+    {
         return None;
     }
     Some((u.min(v), u.max(v)))
@@ -9885,7 +9886,7 @@ Ontology(<http://example.org/g6>
     #[test]
     fn const_eq_rejects_disjunctive_conditional_inequality_and_function_terms() {
         let mut run = DlRun::new(false, Default::default());
-        run.merge_skip.push(99);
+        run.merge_skip = Some(99);
         let mk = |xl: XLit| match run.lits.lit(xl, |_| None) {
             Made::Lit(l) => l,
             other => panic!("expected literal for {xl:?}, got {other:?}"),

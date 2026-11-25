@@ -5288,3 +5288,522 @@ fn merge_restart_honors_class_scaled_bound_and_hub_skip_switch() {
     assert_eq!(out_hub_off.stats.dl_rooted_restarts, 0);
     assert_eq!(out_hub_on.consistent, out_hub_off.consistent);
 }
+
+/// Sol P1 #1 / Neon B1: asserted anonymous individuals (`union_individual`) and harvested
+/// anonymous individuals (`union_named`) must hash and look up identically in `Merge`,
+/// producing a single component and a flat `CanonMap` even for labels beginning with `_:`.
+#[test]
+fn merge_canonicalizes_anonymous_keys_across_asserted_and_harvested_paths() {
+    let mut m = Merge::default();
+    let mut admit = |_: usize| true;
+    let limits = Limits::default();
+
+    let bx = Individual::Anonymous(AnonymousIndividual::new("x"));
+    let by = Individual::Anonymous(AnonymousIndividual::new("y"));
+    assert_eq!(m.union_individual(&bx, &by, 0, &mut admit), Ok(true));
+    assert_eq!(m.names.len(), 2);
+
+    // Harvested name `"_:x"` must hit the existing entry rather than inserting a duplicate.
+    let nx = NamedIndividual::new("_:x");
+    let na = NamedIndividual::new("urn:tierd1291:a");
+    assert_eq!(m.union_named(&nx, &na, 0, &mut admit), Ok(true));
+    assert_eq!(
+        m.names.len(),
+        3,
+        "harvested _:x must reuse existing anonymous entry"
+    );
+    // Repeating the same union reports no new progress.
+    assert_eq!(m.union_named(&nx, &na, 0, &mut admit), Ok(false));
+
+    // Also cover a blank label that itself starts with `_:`: interner stores `_:_:nested`.
+    let bnest = Individual::Anonymous(AnonymousIndividual::new("_:nested"));
+    let bnest2 = Individual::Anonymous(AnonymousIndividual::new("_:nested2"));
+    assert_eq!(m.union_individual(&bnest, &bnest2, 0, &mut admit), Ok(true));
+    let nnest = NamedIndividual::new("_:_:nested");
+    let nb = NamedIndividual::new("urn:tierd1291:b");
+    assert_eq!(m.union_named(&nnest, &nb, 0, &mut admit), Ok(true));
+    assert_eq!(m.names.len(), 6);
+
+    let canon = m
+        .build_canon(0, &limits, &mut admit)
+        .ok()
+        .flatten()
+        .expect("non-empty canon");
+    assert_eq!(canon.len(), 4);
+    assert_eq!(canon.get(&NamedIndividual::new("_:x")), Some(&na));
+    assert_eq!(canon.get(&NamedIndividual::new("_:y")), Some(&na));
+    assert_eq!(canon.get(&NamedIndividual::new("_:_:nested")), Some(&nb));
+    assert_eq!(canon.get(&NamedIndividual::new("_:_:nested2")), Some(&nb));
+    // Every representative must itself be a fixed point (flat map).
+    for (_, rep) in canon.iter() {
+        assert!(
+            canon.get(rep).is_none(),
+            "CanonMap must be flat: representative {rep:?} is also an alias"
+        );
+    }
+}
+
+/// Sol P2 #3: `collect_same` must release prior Horn `worlds` via `reset()` before growing
+/// UF/`CanonMap` and include live `excluded` bytes in its admission base.
+#[test]
+fn collect_same_releases_prior_horn_worlds_and_admits_excluded() {
+    // Build a Horn ontology that populates a substantial `worlds` map (many classes
+    // reaching an individual through non-real contexts) plus an excluded disjunctive axiom
+    // when run without rooted Tier D.
+    let mut body = String::from(
+        "SubClassOf(:K ObjectAllValuesFrom(:p :D))\n\
+         SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         ClassAssertion(:A :u0)\n",
+    );
+    for i in 0..160usize {
+        body.push_str(&format!(
+            "SubClassOf(:W{i} ObjectOneOf(:u0))\n\
+             SubClassOf(:W{i} :Tag{i})\n"
+        ));
+    }
+    let base_ax = axioms(&body);
+    let mut k = Classifier::of(&base_ax);
+    // Run in Horn mode (`rooted: false`) so `k.sat.worlds` and `k.sat.excluded` are both
+    // populated on the reused classifier.
+    let first = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: false,
+            ..Limits::default()
+        })
+        .expect("initial Horn classify");
+    assert!(first.consistent);
+    assert!(
+        k.sat.worlds.len() >= 100,
+        "expected prior Horn run to populate worlds, got {}",
+        k.sat.worlds.len()
+    );
+    assert!(
+        !k.sat.excluded.is_empty(),
+        "expected prior Horn run to record excluded disjunctive axiom"
+    );
+
+    // Add long-IRI SameIndividual axioms and classify with `rooted_merge: true`.
+    let rep = NamedIndividual::new(format!("urn:tierd1291:rep_{}", "r".repeat(512)));
+    let mut added = Vec::new();
+    for i in 0..40usize {
+        let alias = NamedIndividual::new(format!("urn:tierd1291:z_{i:02}_{}", "a".repeat(512)));
+        added.push(Axiom::new(AxiomKind::SameIndividual(
+            [Individual::Named(rep.clone()), Individual::Named(alias)].into(),
+        )));
+    }
+    k.add(&added);
+
+    let (res, sample) = measure(|| {
+        k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+    });
+    let out = res.expect("reused rooted_merge classify");
+    assert!(out.complete);
+    assert_eq!(out.stats.dl_rooted_merged, 40);
+    assert!(
+        out.stats.peak_memory >= sample.peak,
+        "reused classifier peak_memory ({}) undercounted measured peak ({})",
+        out.stats.peak_memory,
+        sample.peak
+    );
+}
+
+/// Neon N3: when optional `collect_same` declines under `max_memory`, the refused
+/// unallocated bytes must NOT inflate `stats.peak_memory` above `max_memory` on a
+/// subsequent successful classification.
+#[test]
+fn collect_same_refusal_under_max_memory_does_not_inflate_peak_memory() {
+    // 200 distinct long-IRI SameIndividual pairs: during `collect_same::build_canon`,
+    // BOTH `Merge` UF and `CanonMap` hold copies of all 400 long IRIs simultaneously, so
+    // the prepass peak exceeds the ordinary EL run's peak. Under `cap` between the two,
+    // `collect_same` declines and the ordinary run succeeds with `peak_memory <= cap`.
+    let mut body = String::from("SubClassOf(:A :B)\n");
+    for i in 0..200usize {
+        body.push_str(&format!(
+            "SameIndividual(:p{i:03}a_{} :p{i:03}b_{})\n",
+            "x".repeat(1024),
+            "y".repeat(1024)
+        ));
+    }
+    let input = axioms(&body);
+
+    let mut k_off = Classifier::of(&input);
+    let off = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .expect("merge off");
+
+    let mut saw_declined_ok = false;
+    for extra in [0usize, 32 << 10, 64 << 10, 128 << 10, 256 << 10] {
+        let cap = off.stats.peak_memory + extra;
+        let mut k = Classifier::of(&input);
+        if let Ok(out) = k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            max_memory: Some(cap),
+            ..Limits::default()
+        }) && out.stats.dl_rooted_merged == 0
+        {
+            saw_declined_ok = true;
+            assert!(
+                out.stats.peak_memory <= cap,
+                "refused collect_same inflated peak_memory ({}) above max_memory ({cap})",
+                out.stats.peak_memory
+            );
+        }
+    }
+    assert!(
+        saw_declined_ok,
+        "expected at least one cap where collect_same declines and ordinary run succeeds"
+    );
+}
+
+/// Sol P2 #4: Item 805 `dl_reduce::plan_budgeted` must pre-admit actual mapped-signature
+/// and key-expansion bytes (including repeated long individual IRIs) while the partition
+/// is live, decline cleanly on caller refusal without allocating the refused key
+/// expansion, and cooperatively poll cancellation inside key expansion.
+#[test]
+fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
+    // 1. Direct counting-allocator check on `dl_reduce::plan_budgeted` with long IRIs.
+    let mut direct_body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         HasKey(:K (:r) ())\n",
+    );
+    for i in 0..8usize {
+        direct_body.push_str(&format!(
+            "ClassAssertion(:K :ind{i:02}_{})\n",
+            "l".repeat(1536)
+        ));
+    }
+    let direct_ax = axioms(&direct_body);
+    let direct_refs: Vec<&AxiomKind> = direct_ax.iter().map(|a| &a.kind).collect();
+    let mut admitted_peak = 0usize;
+    let ((planned_ok, retained), sample) = measure(|| {
+        let p = super::dl_reduce::plan_budgeted(
+            &direct_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                admitted_peak = admitted_peak.max(used);
+                true
+            },
+        )
+        .unwrap();
+        match p {
+            super::dl_reduce::Plan::Ready(red) => (true, red.retained_bytes()),
+            _ => (false, 0),
+        }
+    });
+    assert!(planned_ok);
+    assert!(
+        admitted_peak >= sample.peak,
+        "plan_budgeted admitted peak ({admitted_peak}) undercounted measured peak ({})",
+        sample.peak
+    );
+    assert!(
+        retained >= sample.live,
+        "Reduction::retained_bytes ({retained}) undercounted measured live ({})",
+        sample.live
+    );
+
+    // 2. End-to-end post-merge replan with long individual IRIs under a caller `charge`
+    //    callback that lets Pass 0 finish and refuses Pass 1 key expansion growth.
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:Z1 :OnlyDisj)\n\
+         SubClassOf(:Z2 :OnlyDisj)\n\
+         SubClassOf(ObjectOneOf(_:w0) :Bridge)\n\
+         SubClassOf(:Bridge ObjectOneOf(_:w1))\n\
+         HasKey(:K (:r) ())\n",
+    );
+    for i in 0..10usize {
+        body.push_str(&format!(
+            "ClassAssertion(:K :long{i:02}_{})\n",
+            "k".repeat(2048)
+        ));
+    }
+    let input = axioms(&body);
+
+    // Baseline unrestricted run confirms Pass 0 reduces, derives `_:w0 ≈ _:w1`, and restarts.
+    let mut base_k = Classifier::of(&input);
+    let base_out = base_k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("unrestricted baseline");
+    assert!(base_out.complete);
+    assert_eq!(base_out.stats.dl_rooted_restarts, 1);
+
+    // Fresh Horn baseline (original axioms without rooted reduction) to compare fallback.
+    let mut fresh_horn_k = Classifier::of(&input);
+    let fresh_horn = fresh_horn_k
+        .classify(&Limits {
+            threads: 1,
+            rooted: false,
+            ..Limits::default()
+        })
+        .expect("fresh Horn");
+
+    // Charge callback with a tight cap below the post-merge replan's actual key-expansion
+    // peak (with long IRIs) while comfortably above Horn fallback.
+    let cap = base_out.stats.peak_memory / 2;
+    let granted = Arc::new(AtomicUsize::new(0));
+    let refused = Arc::new(AtomicBool::new(false));
+    let granted_cb = granted.clone();
+    let refused_cb = refused.clone();
+    let charge = Arc::new(move |bytes: usize| -> bool {
+        let cur = granted_cb.load(Ordering::SeqCst);
+        if cur.saturating_add(bytes) > cap {
+            refused_cb.store(true, Ordering::SeqCst);
+            return false;
+        }
+        granted_cb.fetch_add(bytes, Ordering::SeqCst);
+        true
+    });
+    let mut k_refuse = Classifier::of(&input);
+    let (res, refuse_sample) = measure(|| {
+        k_refuse.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            charge: Some(charge),
+            ..Limits::default()
+        })
+    });
+    assert!(refused.load(Ordering::SeqCst), "charge refusal must be hit");
+    assert!(
+        refuse_sample.peak <= cap + (1 << 20),
+        "refused key expansion overshot cap: measured {} vs cap {cap}",
+        refuse_sample.peak
+    );
+    if let Ok(out) = res {
+        assert_eq!(out.stats.dl_rooted_merged, 0);
+        assert_eq!(out.consistent, fresh_horn.consistent);
+        assert_eq!(k_refuse.excluded(), fresh_horn_k.excluded());
+    }
+
+    // 3. Cooperative cancellation inside `key_budgeted` during post-merge replan.
+    let total_polls = Arc::new(AtomicUsize::new(0));
+    let tp_cb = total_polls.clone();
+    let mut k_count = Classifier::of(&input);
+    let _ = k_count
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            cancelled: Some(Arc::new(move || {
+                tp_cb.fetch_add(1, Ordering::SeqCst);
+                false
+            })),
+            ..Limits::default()
+        })
+        .expect("poll counting run");
+    let polls_total = total_polls.load(Ordering::SeqCst);
+    assert!(
+        polls_total >= 10,
+        "expected key expansion to poll multiple times, got {polls_total}"
+    );
+    // Cancel partway through key expansion (both Pass 0 and post-merge Pass 1).
+    let cancel_at = polls_total / 2;
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen_cb = seen.clone();
+    let mut k_cancel = Classifier::of(&input);
+    let err = k_cancel
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            cancelled: Some(Arc::new(move || {
+                seen_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
+            })),
+            ..Limits::default()
+        })
+        .expect_err("must cancel inside key expansion");
+    assert_eq!(err, Error::Cancelled);
+    assert!(
+        seen.load(Ordering::SeqCst) <= cancel_at + 4,
+        "cancellation did not stop promptly (polled {} times, cancel_at={cancel_at})",
+        seen.load(Ordering::SeqCst)
+    );
+    // Clean recovery on follow-up unrestricted call.
+    let recovered = k_cancel
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("follow-up classify after cancel");
+    assert!(recovered.complete);
+    assert_eq!(recovered.stats.dl_rooted_restarts, 1);
+}
+
+/// Neon N4: end-to-end cancellation-vs-`STOP_MERGE` stop-race test exercising cancellation
+/// both winning before `STOP_MERGE` and losing to `STOP_MERGE` (then caught at the restart
+/// boundary), plus multi-thread `dl_steps = false` concurrent race trials.
+#[test]
+fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:C0 ObjectOneOf(:a2))\n\
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)\n\
+         ClassAssertion(:Tag :a2)\n\
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a0)))\n\
+         SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)\n",
+    );
+    for i in 0..40usize {
+        body.push_str(&format!("SubClassOf(:P{i} :Q{i})\n"));
+    }
+    let input = axioms(&body);
+
+    // 1. Deterministic 1-thread sweep across every poll point from pre-merge saturation
+    //    through the STOP_MERGE restart boundary and Pass 1.
+    let count_polls = Arc::new(AtomicUsize::new(0));
+    let cp_cb = count_polls.clone();
+    let mut k_probe = Classifier::of(&input);
+    let base = k_probe
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            cancelled: Some(Arc::new(move || {
+                cp_cb.fetch_add(1, Ordering::SeqCst);
+                false
+            })),
+            ..Limits::default()
+        })
+        .expect("unrestricted run");
+    assert!(base.complete);
+    assert_eq!(base.stats.dl_rooted_restarts, 1);
+    let total_polls = count_polls.load(Ordering::SeqCst);
+    assert!(total_polls >= 4);
+
+    let mut saw_cancelled = 0usize;
+    let mut saw_cancelled_dirty = 0usize;
+    let mut saw_ok = 0usize;
+    let expected_instances = vec![
+        NamedIndividual::new("urn:tierd1291:a0"),
+        NamedIndividual::new("urn:tierd1291:a2"),
+    ];
+    for cancel_at in 1..=(total_polls + 2) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_cb = polls.clone();
+        let mut k = Classifier::of(&input);
+        let res = k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            cancelled: Some(Arc::new(move || {
+                polls_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
+            })),
+            ..Limits::default()
+        });
+        match res {
+            Err(Error::Cancelled) => {
+                saw_cancelled += 1;
+                assert!(
+                    !k.sat.dl_worked.load(Ordering::Relaxed),
+                    "cancel_at={cancel_at}: cancelled race must not set dl_worked"
+                );
+                match k.describe(&Class::new("urn:tierd1291:Tag")) {
+                    None => saw_cancelled_dirty += 1,
+                    Some(d) => {
+                        // Once Pass 1 saturation completes (`self.dirty = false`), a
+                        // cancellation during taxonomy construction keeps the complete
+                        // saturated state, which must already be sound and complete.
+                        assert_eq!(
+                            d.instances, expected_instances,
+                            "cancel_at={cancel_at}: post-saturation describe() must be complete"
+                        );
+                    }
+                }
+                // Follow-up unrestricted call must recover cleanly.
+                let after = k
+                    .classify(&Limits {
+                        threads: 1,
+                        rooted: true,
+                        rooted_merge: true,
+                        ..Limits::default()
+                    })
+                    .expect("recovery after cancel");
+                assert!(after.complete);
+                assert_eq!(after.stats.dl_rooted_restarts, 1);
+                assert!(after.taxonomy.is_subclass(
+                    &Class::new("urn:tierd1291:Probe"),
+                    &Class::new("urn:tierd1291:Hit")
+                ));
+            }
+            Ok(out) => {
+                saw_ok += 1;
+                assert!(out.complete);
+                assert_eq!(out.stats.dl_rooted_restarts, 1);
+                assert!(!out.stats.dl_rooted_over);
+                assert!(out.taxonomy.is_subclass(
+                    &Class::new("urn:tierd1291:Probe"),
+                    &Class::new("urn:tierd1291:Hit")
+                ));
+            }
+            Err(other) => {
+                panic!("cancel_at={cancel_at}: unexpected error in stop race: {other:?}")
+            }
+        }
+    }
+    assert!(saw_cancelled >= 2 && saw_cancelled_dirty >= 2 && saw_ok >= 1);
+
+    // 2. Multi-thread (`threads: 4, dl_steps: false`) concurrent cancellation vs STOP_MERGE.
+    for cancel_at in [1usize, 2, 3, 4, 5, 8, 12] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_cb = polls.clone();
+        let mut k = Classifier::of(&input);
+        let res = k.classify(&Limits {
+            threads: 4,
+            rooted: true,
+            rooted_merge: true,
+            dl_steps: false,
+            cancelled: Some(Arc::new(move || {
+                polls_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
+            })),
+            ..Limits::default()
+        });
+        match res {
+            Err(Error::Cancelled) => {
+                assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
+                let after = k
+                    .classify(&Limits {
+                        threads: 4,
+                        rooted: true,
+                        rooted_merge: true,
+                        dl_steps: false,
+                        ..Limits::default()
+                    })
+                    .expect("mt recovery");
+                assert!(after.complete);
+                assert!(after.taxonomy.is_subclass(
+                    &Class::new("urn:tierd1291:Probe"),
+                    &Class::new("urn:tierd1291:Hit")
+                ));
+            }
+            Ok(out) => {
+                assert!(out.complete);
+                assert!(!out.stats.dl_rooted_over);
+                assert_eq!(out.stats.dl_rooted_restarts, 1);
+            }
+            Err(other) => panic!("mt cancel_at={cancel_at}: unexpected error {other:?}"),
+        }
+    }
+}

@@ -3758,3 +3758,256 @@ fn merge_stop_never_returns_partial_taxonomy() {
     assert_eq!(out.stats.dl_rooted_restarts, 1);
     assert!(out.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
 }
+
+/// Sol P1 #1 / Neon B1 regression: starting with `SameIndividual(_:x _:y)` and deriving
+/// `_:x ≈ :a` in the root must deduplicate `_:x` across asserted and harvested paths,
+/// build a flat `CanonMap` (`_:x -> :a`, `_:y -> :a`), and finish with zero panic or
+/// spurious fallback.
+#[test]
+fn asserted_anonymous_same_individual_followed_by_root_derived_named_merge() {
+    let ax = axioms(
+        "SameIndividual(_:x _:y)
+         ClassAssertion(:Tag _:y)
+         SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))
+         SubClassOf(ObjectOneOf(_:x) :Bridge)
+         SubClassOf(:Bridge ObjectOneOf(:a))
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)",
+    );
+    let mut k_off = Classifier::of(&ax);
+    let off = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let d_off = k_off.describe(&c("Tag")).unwrap();
+
+    for (threads, expansion) in CONFIGS {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(out.complete, "{threads}t {expansion:?}");
+        assert!(!out.stats.dl_over_budget && !out.stats.dl_rooted_over);
+        assert_eq!(out.consistency, off.consistency);
+        assert_eq!(out.stats.dl_rooted_restarts, 1);
+        assert_eq!(out.stats.dl_rooted_merged, 2);
+        assert!(
+            out.taxonomy.is_subclass(&c("Probe"), &c("Hit")),
+            "{threads}t {expansion:?}: _:y assertion must reach :a via flat CanonMap"
+        );
+        assert_eq!(
+            out.taxonomy.is_subclass(&c("Probe"), &c("Hit")),
+            off.taxonomy.is_subclass(&c("Probe"), &c("Hit"))
+        );
+        let d_on = k.describe(&c("Tag")).unwrap();
+        assert_eq!(d_on.instances, vec![NamedIndividual::new(format!("{EX}a"))]);
+        assert!(
+            d_off.instances.iter().all(|i| d_on.instances.contains(i)),
+            "merge ON must retain every public instance from merge OFF"
+        );
+        assert!(
+            d_on.instances.iter().all(|i| !i.as_str().starts_with("_:")),
+            "anonymous individual leaked into describe(): {:?}",
+            d_on.instances
+        );
+    }
+}
+
+/// Sol P1 #2 / Neon B2 regression: if post-merge `dl_reduce::plan` declines on Pass 1
+/// (after Pass 0 reduced and derived aliases / hub merge), derived aliases and any
+/// generated hub must be cleared cleanly before Horn fallback runs on the original axioms,
+/// matching a fresh run on the original axioms and never leaking `urn:sparkles:internal:hub`.
+#[test]
+fn post_merge_reduction_decline_clears_derived_aliases_and_never_leaks_hub() {
+    // Part A (Sol P1 #2): Anonymous witness equality `_:w0 ≈ _:w1` derived ONLY from a
+    // disjunctive axiom beside `HasKey` over named individuals `:k00..:k07`. Merging
+    // anonymous witnesses leaves the named key count `n` unchanged on Pass 1, while
+    // `uf_bytes + canon_live_bytes` shrinks Pass 1's allowance so `dl_reduce::plan`
+    // succeeds on Pass 0 and declines on Pass 1. Horn fallback must NOT inherit
+    // `_:w0 ≈ _:w1` (must NOT entail `:Probe ⊑ :OnlyFromDisj`).
+    let w0 = format!("w0_{}", "a".repeat(2048));
+    let w1 = format!("w1_{}", "b".repeat(2048));
+    let mut body_a = format!(
+        "HasKey(:K (:r) ())
+         SubClassOf(ObjectOneOf(_:{w0}) ObjectUnionOf(:P :Q))
+         SubClassOf(:P ObjectOneOf(_:{w1}))
+         SubClassOf(:Q ObjectOneOf(_:{w1}))
+         ClassAssertion(:Flag _:{w1})
+         SubClassOf(:Probe ObjectSomeValuesFrom(:s ObjectOneOf(_:{w0})))
+         SubClassOf(ObjectSomeValuesFrom(:s :Flag) :OnlyFromDisj)\n"
+    );
+    for i in 0..8usize {
+        body_a.push_str(&format!("ClassAssertion(:K :k{i:02})\n"));
+    }
+    let ax_a = axioms(&body_a);
+    let mut fresh_a = Classifier::of(&ax_a);
+    let expected_a = fresh_a
+        .classify(&Limits {
+            threads: 1,
+            rooted: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(!fresh_a.excluded().is_empty());
+    assert!(
+        !expected_a
+            .taxonomy
+            .is_subclass(&c("Probe"), &c("OnlyFromDisj")),
+        "fresh Horn run must not derive disjunctive witness equality"
+    );
+
+    // Unrestricted merged run confirms Pass 0 reduces, derives `_:w0 ≈ _:w1`, and restarts.
+    let mut unres_a = Classifier::of(&ax_a);
+    let base_a = unres_a
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(base_a.complete);
+    assert_eq!(base_a.stats.dl_rooted_restarts, 1);
+    assert_eq!(base_a.stats.dl_rooted_merged, 1);
+    assert!(base_a.taxonomy.is_subclass(&c("Probe"), &c("OnlyFromDisj")));
+
+    // `n = 8` named individuals => `pairs = 28`, `total = 8*29 + 28 = 260` key axioms.
+    // `260 * 2048 = 532,480` B. At `cap = 260 * 2048 + 1024`, Pass 0 has
+    // `cap / 2048 == 260` (passes key limit), whereas after Pass 0 merges the two 2 KiB
+    // blank labels (`uf_bytes + canon_live_bytes > 8 KiB`), Pass 1 has
+    // `(cap - uf - canon) / 2048 < 260` (declines!). If Pass 0's own actual bytes exceed
+    // `533 KiB`, use `HasKey(:K (:r1 :r2) ())` or calibrate `cap` via a `charge` cap right
+    // below Pass 1's replan peak.
+    let mut body_a2 = format!(
+        "HasKey(:K (:r1 :r2 :r3) ())
+         SubClassOf(ObjectOneOf(_:{w0}) ObjectUnionOf(:P :Q))
+         SubClassOf(:P ObjectOneOf(_:{w1}))
+         SubClassOf(:Q ObjectOneOf(_:{w1}))
+         ClassAssertion(:Flag _:{w1})
+         SubClassOf(:Probe ObjectSomeValuesFrom(:s ObjectOneOf(_:{w0})))
+         SubClassOf(ObjectSomeValuesFrom(:s :Flag) :OnlyFromDisj)\n"
+    );
+    for i in 0..8usize {
+        body_a2.push_str(&format!("ClassAssertion(:K :k{i:02})\n"));
+    }
+    let ax_a2 = axioms(&body_a2);
+    let mut fresh_a2 = Classifier::of(&ax_a2);
+    let expected_a2 = fresh_a2
+        .classify(&Limits {
+            threads: 1,
+            rooted: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    // Use `charge` that allows Pass 0 (measured via a single-pass Pass 0 refusal threshold)
+    // and refuses Pass 1's replan growth while leaving Horn well within the cap.
+    // First find Pass 0's exact reduction + saturation charge by running with `max_memory`
+    // sweep between `expected_a2.stats.peak_memory` and `base_a2.stats.peak_memory`.
+    let mut unres_a2 = Classifier::of(&ax_a2);
+    let base_a2 = unres_a2
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(base_a2.complete);
+    assert_eq!(base_a2.stats.dl_rooted_restarts, 1);
+
+    // At `cap = key_axioms * 2048 + 1024` (where `key_axioms = 3*8*29 + 28 = 724`,
+    // `cap = 1,483,776`), Pass 0 has `724` allowed key axioms and Pass 1 drops below `724`
+    // once `uf_bytes + canon_live_bytes > 8 KiB`! Also verify via `charge` refusal.
+    let cap_a2 = (3 * 8 * 29 + 28) * 2048 + 1024;
+    let mut k_a2 = Classifier::of(&ax_a2);
+    let got_a2 = k_a2
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            max_memory: Some(cap_a2),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(!got_a2.complete, "Pass 1 reduction must decline into Horn");
+    assert_eq!(
+        got_a2.stats.dl_rooted_merged, 0,
+        "declined Pass 1 must clear derived aliases"
+    );
+    assert_eq!(got_a2.consistency, expected_a2.consistency);
+    assert_eq!(k_a2.excluded(), fresh_a2.excluded());
+    assert!(
+        !got_a2.taxonomy.is_subclass(&c("Probe"), &c("OnlyFromDisj")),
+        "Horn fallback after Pass 1 reduction decline must NOT inherit derived disjunctive alias"
+    );
+    assert_eq!(
+        k_a2.describe(&c("Flag")).unwrap().instances,
+        fresh_a2.describe(&c("Flag")).unwrap().instances
+    );
+
+    // Part B (Neon B2): Pass 0 synthesizes `urn:sparkles:internal:hub` via
+    // `owl:topObjectProperty` and merges `hub -> :a` alongside `HasKey` + long anonymous
+    // witness merge `_:w0 ≈ _:w1`. On Pass 1, reduction declines under `max_memory`.
+    // Verify `describe()` NEVER leaks `urn:sparkles:internal:hub` and matches a fresh run.
+    let mut body_b = format!(
+        "HasKey(:K (:r1 :r2 :r3) ())
+         SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))
+         SubClassOf(ObjectOneOf(_:{w0}) :Bridge)
+         SubClassOf(:Bridge ObjectOneOf(_:{w1}))
+         SubClassOf(:Q ObjectSomeValuesFrom(owl:topObjectProperty :Tag))
+         SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty :Seed) ObjectOneOf(:a))
+         ClassAssertion(:Seed :a)
+         ClassAssertion(:Tag :a)\n"
+    );
+    for i in 0..7usize {
+        body_b.push_str(&format!("ClassAssertion(:K :h{i:02})\n"));
+    }
+    let ax_b = axioms(&body_b);
+    let mut fresh_b = Classifier::of(&ax_b);
+    let expected_b = fresh_b
+        .classify(&Limits {
+            threads: 1,
+            rooted: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let fresh_desc_b = fresh_b.describe(&c("Tag")).unwrap();
+
+    // `n = 8` (`:a` + `:h00..:h06`) => `total = 724` key axioms; `cap_b = 724 * 2048 + 1024`.
+    // Pass 0 reduces both `HasKey` and `owl:topObjectProperty` (synthesizing `hub`),
+    // derives `hub ≈ :a` and `_:w0 ≈ _:w1`, and restarts; Pass 1 declines reduction.
+    let cap_b = (3 * 8 * 29 + 28) * 2048 + 1024;
+    let mut k_b = Classifier::of(&ax_b);
+    let got_b = k_b
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            max_memory: Some(cap_b),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(!got_b.complete, "Part B Pass 1 reduction must decline");
+    assert_eq!(got_b.stats.dl_rooted_merged, 0);
+    assert_eq!(got_b.consistency, expected_b.consistency);
+    assert_eq!(k_b.excluded(), fresh_b.excluded());
+    let d_b = k_b.describe(&c("Tag")).unwrap();
+    assert!(
+        d_b.instances
+            .iter()
+            .all(|i| !i.as_str().starts_with("urn:sparkles:internal:")),
+        "generated hub leaked into describe(): {:?}",
+        d_b.instances
+    );
+    assert_eq!(d_b.instances, fresh_desc_b.instances);
+}

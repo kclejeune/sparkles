@@ -101,7 +101,11 @@ impl Saturation {
                 .filter(|(e, _)| self.named_subsumers(*e).is_some())
                 .collect();
             if let Some(canon) = &self.interner.canon {
+                let hub = canon.generated_hub();
                 for (alias, rep) in canon.iter() {
+                    if hub.is_some_and(|h| h == alias) {
+                        continue;
+                    }
                     if let Some(id) = self.interner.individuals.get(rep)
                         && let Some(e) = self.interner.get(&Node::Nominal(id))
                         && self.named_subsumers(e).is_some()

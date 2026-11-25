@@ -594,9 +594,9 @@ pub struct DlRun {
     /// whether item 1061 phase 2 root unit constant-equality discovery is active during
     /// the current saturation round (default off, disabled after the main round)
     pub(super) merge: std::sync::atomic::AtomicBool,
-    /// constant IDs excluded from merge discovery (e.g. generated hub when
-    /// `SPARKLES_ROOTED_MERGE_HUB=0`)
-    pub(super) merge_skip: Vec<u32>,
+    /// constant ID excluded from merge discovery (e.g. generated hub when
+    /// `SPARKLES_ROOTED_MERGE_HUB=0`); inline so skipping the hub never allocates
+    pub(super) merge_skip: Option<u32>,
     /// winning merge-stop payload `(pairs, retained_vec_bytes)` moved in once after
     /// winning `STOP_MERGE` and taken by move after workers join; its bytes are carried
     /// in `Run::memory` via `DlGuard::commit`, not in `DlRun::bytes()`
@@ -650,10 +650,7 @@ impl DlRun {
         self
     }
     pub fn bytes(&self) -> usize {
-        self.table.bytes()
-            + self.lits.unadmitted_bytes()
-            + self.stores.load(Ordering::Relaxed)
-            + self.merge_skip.capacity() * std::mem::size_of::<u32>()
+        self.table.bytes() + self.lits.unadmitted_bytes() + self.stores.load(Ordering::Relaxed)
     }
     #[inline]
     pub(super) fn merge_enabled(&self) -> bool {
@@ -708,7 +705,7 @@ impl DlRun {
         *self.width_limit.get_mut() = 0;
         *self.exhausted.get_mut() = false;
         *self.merge.get_mut() = false;
-        self.merge_skip.clear();
+        self.merge_skip = None;
         *self.merged.get_mut() = None;
     }
     pub(super) fn grow(&self, bytes: usize) {

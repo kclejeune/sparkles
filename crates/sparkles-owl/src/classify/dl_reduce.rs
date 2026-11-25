@@ -38,7 +38,7 @@ use super::index::Gap;
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The IRI prefix of the names that the reductions make up.
 pub const PREFIX: &str = "urn:sparkles:internal:";
@@ -48,6 +48,19 @@ const KEY_AXIOMS: usize = 1 << 17;
 
 /// The bytes of memory budget that one reduction axiom may take.
 const AXIOM_BYTES: usize = 2048;
+
+/// Key-expansion steps between cooperative cancellation/deadline polls.
+const POLL_KEY: usize = if cfg!(test) { 64 } else { 1024 };
+
+/// Outcome of item 805 reduction planning.
+pub enum Plan {
+    /// No reduction is needed, or the ontology is structurally ineligible or Horn-only.
+    NotNeeded,
+    /// Reduction was needed and structurally eligible, but declined by key/memory budget.
+    Declined,
+    /// Reduction succeeded and produced rewritten axioms.
+    Ready(Reduction),
+}
 
 /// The axioms of a rewritten ontology.
 pub struct Reduction {
@@ -60,17 +73,44 @@ pub struct Reduction {
     /// the generated hub individual if this reduction introduced `owl:topObjectProperty`
     /// via `⊤ ⊑ ∃U.{hub}`, identifying the generated hub by provenance rather than prefix
     pub hub: Option<NamedIndividual>,
+    /// accumulated heap bytes owned inside `self.axioms` elements (strings, `BTreeSet`s,
+    /// `Box`ed expressions, and chain vectors), excluding `self.axioms`'s own `Vec` buffer
+    axiom_heap_bytes: usize,
 }
 
 impl Reduction {
+    /// Retained heap bytes of this reduction's containers, AST payloads, and hub IRI.
+    pub fn retained_bytes(&self) -> usize {
+        self.axioms
+            .capacity()
+            .saturating_mul(std::mem::size_of::<AxiomKind>())
+            .saturating_add(self.axiom_heap_bytes)
+            .saturating_add(
+                self.origin
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+            .saturating_add(self.replaced.capacity())
+            .saturating_add(self.hub.as_ref().map_or(0, |h| h.as_str().len()))
+    }
+
+    /// The number of axiom references that [`Reduction::all`] will collect.
+    pub fn all_len(&self, axioms: &[&AxiomKind]) -> usize {
+        let kept = self.replaced.iter().filter(|r| !**r).count();
+        debug_assert_eq!(self.replaced.len(), axioms.len());
+        kept.saturating_add(self.axioms.len())
+    }
+
     /// The axioms of the rewritten ontology.
     pub fn all<'a>(&'a self, axioms: &[&'a AxiomKind]) -> Vec<&'a AxiomKind> {
-        let mut all: Vec<&AxiomKind> = axioms
-            .iter()
-            .zip(&self.replaced)
-            .filter(|(_, r)| !**r)
-            .map(|(k, _)| *k)
-            .collect();
+        let mut all: Vec<&AxiomKind> = Vec::with_capacity(self.all_len(axioms));
+        all.extend(
+            axioms
+                .iter()
+                .zip(&self.replaced)
+                .filter(|(_, r)| !**r)
+                .map(|(k, _)| *k),
+        );
         all.extend(self.axioms.iter());
         all
     }
@@ -407,14 +447,257 @@ impl Cx {
     }
 }
 
+#[inline]
+fn dec_len(mut n: usize) -> usize {
+    let mut d = 1usize;
+    while n >= 10 {
+        n /= 10;
+        d += 1;
+    }
+    d
+}
+
+/// Safe upper bound on heap bytes owned by a `BTreeSet<T>` of `len` elements.
+#[inline]
+fn btree_set_bytes<T>(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let elem = std::mem::size_of::<T>();
+    let leaf = 32usize.saturating_add(11usize.saturating_mul(elem));
+    if len <= 11 {
+        return leaf;
+    }
+    let leaves = len.div_ceil(5);
+    let internals = leaves.div_ceil(5);
+    leaves.saturating_mul(leaf).saturating_add(
+        internals.saturating_mul(128usize.saturating_add(11usize.saturating_mul(elem))),
+    )
+}
+
+/// Safe upper bound on heap bytes owned by a `BTreeMap<K, V>` of `len` entries.
+#[inline]
+fn btree_map_bytes<K, V>(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let entry = std::mem::size_of::<K>().saturating_add(std::mem::size_of::<V>());
+    let leaf = 32usize.saturating_add(11usize.saturating_mul(entry));
+    if len <= 11 {
+        return leaf;
+    }
+    let leaves = len.div_ceil(5);
+    let internals = leaves.div_ceil(5);
+    leaves.saturating_mul(leaf).saturating_add(
+        internals.saturating_mul(128usize.saturating_add(11usize.saturating_mul(entry))),
+    )
+}
+
+#[inline]
+fn ind_heap_bytes(i: &Individual) -> usize {
+    match i {
+        Individual::Named(n) => n.as_str().len(),
+        Individual::Anonymous(a) => a.label().len(),
+    }
+}
+
+fn ce_heap_bytes(c: &ClassExpression) -> usize {
+    use ClassExpression as C;
+    match c {
+        C::Class(cl) => cl.as_str().len(),
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            btree_set_bytes::<ClassExpression>(cs.len())
+                .saturating_add(cs.iter().map(ce_heap_bytes).sum::<usize>())
+        }
+        C::ObjectComplementOf(f) => {
+            std::mem::size_of::<ClassExpression>().saturating_add(ce_heap_bytes(f))
+        }
+        C::ObjectOneOf(is) => btree_set_bytes::<Individual>(is.len())
+            .saturating_add(is.iter().map(ind_heap_bytes).sum::<usize>()),
+        C::ObjectSomeValuesFrom(p, f) | C::ObjectAllValuesFrom(p, f) => p
+            .named()
+            .as_str()
+            .len()
+            .saturating_add(std::mem::size_of::<ClassExpression>())
+            .saturating_add(ce_heap_bytes(f)),
+        C::ObjectHasValue(p, i) => p.named().as_str().len().saturating_add(ind_heap_bytes(i)),
+        C::ObjectHasSelf(p) => p.named().as_str().len(),
+        C::ObjectMinCardinality(_, p, f)
+        | C::ObjectMaxCardinality(_, p, f)
+        | C::ObjectExactCardinality(_, p, f) => {
+            p.named()
+                .as_str()
+                .len()
+                .saturating_add(f.as_deref().map_or(0, |inner| {
+                    std::mem::size_of::<ClassExpression>().saturating_add(ce_heap_bytes(inner))
+                }))
+        }
+        C::DataSomeValuesFrom(ps, _) | C::DataAllValuesFrom(ps, _) => ps
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DataProperty>())
+            .saturating_add(ps.iter().map(|p| p.as_str().len()).sum::<usize>()),
+        C::DataHasValue(p, _)
+        | C::DataMinCardinality(_, p, _)
+        | C::DataMaxCardinality(_, p, _)
+        | C::DataExactCardinality(_, p, _) => p.as_str().len(),
+    }
+}
+
+fn axiom_heap_bytes(k: &AxiomKind) -> usize {
+    use AxiomKind as K;
+    match k {
+        K::SubClassOf(a, b) => ce_heap_bytes(a).saturating_add(ce_heap_bytes(b)),
+        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
+            btree_set_bytes::<ClassExpression>(cs.len())
+                .saturating_add(cs.iter().map(ce_heap_bytes).sum::<usize>())
+        }
+        K::DisjointUnion(c, cs) => c
+            .as_str()
+            .len()
+            .saturating_add(btree_set_bytes::<ClassExpression>(cs.len()))
+            .saturating_add(cs.iter().map(ce_heap_bytes).sum::<usize>()),
+        K::ClassAssertion(c, i) => ce_heap_bytes(c).saturating_add(ind_heap_bytes(i)),
+        K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
+            p.named().as_str().len().saturating_add(ce_heap_bytes(c))
+        }
+        K::SubObjectPropertyOf(s, sup) => sup.named().as_str().len().saturating_add(match s {
+            SubObjectPropertyExpression::Expression(p) => p.named().as_str().len(),
+            SubObjectPropertyExpression::Chain(ps) => ps
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ObjectPropertyExpression>())
+                .saturating_add(ps.iter().map(|p| p.named().as_str().len()).sum::<usize>()),
+        }),
+        K::SymmetricObjectProperty(p) | K::TransitiveObjectProperty(p) => p.named().as_str().len(),
+        K::NegativeObjectPropertyAssertion(p, a, b) => p
+            .named()
+            .as_str()
+            .len()
+            .saturating_add(ind_heap_bytes(a))
+            .saturating_add(ind_heap_bytes(b)),
+        K::Declaration(e) => e.iri().as_str().len(),
+        _ => 0,
+    }
+}
+
+struct PlanBudget<'a, F: FnMut(usize) -> bool> {
+    live_base: usize,
+    held: usize,
+    admit: &'a mut F,
+}
+
+impl<F: FnMut(usize) -> bool> PlanBudget<'_, F> {
+    fn try_temp(&mut self, extra: usize) -> bool {
+        let Some(peak) = self
+            .live_base
+            .checked_add(self.held)
+            .and_then(|b| b.checked_add(extra))
+        else {
+            return false;
+        };
+        (self.admit)(peak)
+    }
+
+    fn try_add(&mut self, bytes: usize) -> bool {
+        let Some(next) = self.held.checked_add(bytes) else {
+            return false;
+        };
+        let Some(peak) = self.live_base.checked_add(next) else {
+            return false;
+        };
+        if !(self.admit)(peak) {
+            return false;
+        }
+        self.held = next;
+        true
+    }
+
+    fn release(&mut self, bytes: usize) {
+        self.held = self.held.saturating_sub(bytes);
+    }
+}
+
+fn push_axiom<F: FnMut(usize) -> bool>(
+    out: &mut Reduction,
+    budget: &mut PlanBudget<'_, F>,
+    origin_i: usize,
+    ax_heap: usize,
+    make: impl FnOnce() -> AxiomKind,
+) -> bool {
+    let ax_grow = if out.axioms.len() == out.axioms.capacity() {
+        let Some(new_cap) =
+            super::dl_clause::next_vec_cap(out.axioms.capacity(), std::mem::size_of::<AxiomKind>())
+        else {
+            return false;
+        };
+        let Some(bytes) = new_cap.checked_mul(std::mem::size_of::<AxiomKind>()) else {
+            return false;
+        };
+        bytes
+    } else {
+        0
+    };
+    let orig_grow = if out.origin.len() == out.origin.capacity() {
+        let Some(new_cap) =
+            super::dl_clause::next_vec_cap(out.origin.capacity(), std::mem::size_of::<usize>())
+        else {
+            return false;
+        };
+        let Some(bytes) = new_cap.checked_mul(std::mem::size_of::<usize>()) else {
+            return false;
+        };
+        bytes
+    } else {
+        0
+    };
+    let Some(peak_add) = ax_heap
+        .checked_add(ax_grow)
+        .and_then(|b| b.checked_add(orig_grow))
+    else {
+        return false;
+    };
+    if !budget.try_temp(peak_add) {
+        return false;
+    }
+    let old_ax_cap = out.axioms.capacity();
+    let old_orig_cap = out.origin.capacity();
+    out.axioms.push(make());
+    out.origin.push(origin_i);
+    let ax_delta = out
+        .axioms
+        .capacity()
+        .saturating_sub(old_ax_cap)
+        .saturating_mul(std::mem::size_of::<AxiomKind>());
+    let orig_delta = out
+        .origin
+        .capacity()
+        .saturating_sub(old_orig_cap)
+        .saturating_mul(std::mem::size_of::<usize>());
+    budget.held = budget
+        .held
+        .saturating_add(ax_heap)
+        .saturating_add(ax_delta)
+        .saturating_add(orig_delta);
+    out.axiom_heap_bytes = out.axiom_heap_bytes.saturating_add(ax_heap);
+    true
+}
+
+/// Outcome of scanning one axiom during `plan_budgeted`.
+enum Blocked {
+    Ok,
+    Ineligible,
+    BudgetDeclined,
+}
+
 /// Whether the axioms hold something that keeps a rooted run of Tier D from them whatever
 /// the rewriting does, data, the bottom property or a reflexive property, or a name with
-/// the prefix of the made-up names.
-fn blocked(
+/// the prefix of the made-up names, admitting each newly added canonical individual into
+/// `inds` against `budget`.
+fn blocked<F: FnMut(usize) -> bool>(
     k: &AxiomKind,
     inds: &mut BTreeSet<NamedIndividual>,
     canon: Option<&super::index::CanonMap>,
-) -> bool {
+    budget: &mut PlanBudget<'_, F>,
+) -> Blocked {
     let mut s = Signature::default();
     s.axiom(k);
     let mut bad = matches!(k, AxiomKind::ReflexiveObjectProperty(p) if !is_top(p));
@@ -428,14 +711,29 @@ fn blocked(
             Entity::ObjectProperty(p) if p.as_str() == vocab::OWL_BOTTOM_OBJECT_PROPERTY => {
                 bad = true
             }
-            Entity::NamedIndividual(i) => {
+            Entity::NamedIndividual(i) if !bad => {
                 let rep = canon.and_then(|m| m.get(i)).unwrap_or(i);
-                inds.insert(rep.clone());
+                if !inds.contains(rep) {
+                    let old_tree = btree_set_bytes::<NamedIndividual>(inds.len());
+                    let new_tree = btree_set_bytes::<NamedIndividual>(inds.len() + 1);
+                    let add = rep
+                        .as_str()
+                        .len()
+                        .saturating_add(new_tree.saturating_sub(old_tree));
+                    if !budget.try_add(add) {
+                        return Blocked::BudgetDeclined;
+                    }
+                    inds.insert(super::index::exact_individual(rep));
+                }
             }
             _ => {}
         }
     }
-    bad
+    if bad {
+        Blocked::Ineligible
+    } else {
+        Blocked::Ok
+    }
 }
 
 /// The rewriting of the axioms for a rooted run, or `None` when no axiom needs it, when
@@ -444,62 +742,137 @@ fn blocked(
 /// reductions pass the bound. `memory` is the run's memory budget. When `canon` is given,
 /// key subjects and object-key values range over the distinct canonical images of the
 /// original named signature.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn plan(
     axioms: &[&AxiomKind],
     memory: Option<usize>,
     canon: Option<&super::index::CanonMap>,
 ) -> Option<Reduction> {
+    match plan_budgeted(
+        axioms,
+        memory,
+        canon,
+        0,
+        &mut || Ok::<(), ()>(()),
+        &mut |_| true,
+    ) {
+        Ok(Plan::Ready(red)) => Some(red),
+        _ => None,
+    }
+}
+
+/// Plans item 805 reductions with cooperative polling and exact memory pre-admission
+/// against `live_base` (including any live merge partition and canonical map).
+pub fn plan_budgeted<E>(
+    axioms: &[&AxiomKind],
+    memory: Option<usize>,
+    canon: Option<&super::index::CanonMap>,
+    live_base: usize,
+    poll: &mut impl FnMut() -> Result<(), E>,
+    admit: &mut impl FnMut(usize) -> bool,
+) -> Result<Plan, E> {
     // an inclusion in the top property alone needs no rewriting, since the run takes it
     // as an axiom that adds nothing (roadmap item 1282)
     let wants = |k: &AxiomKind| {
         ax_has_top(k) && !super::index::top_inclusion(k)
             || matches!(k, AxiomKind::HasKey(_, ops, dps) if !ops.is_empty() && dps.is_empty())
     };
-    if !axioms.iter().any(|k| wants(k)) {
-        return None;
+    let mut needed = false;
+    for (i, k) in axioms.iter().enumerate() {
+        if i.is_multiple_of(super::POLL_AXIOMS) {
+            poll()?;
+        }
+        if wants(k) {
+            needed = true;
+            break;
+        }
     }
+    if !needed {
+        return Ok(Plan::NotNeeded);
+    }
+    let mut budget = PlanBudget {
+        live_base,
+        held: 0,
+        admit,
+    };
     let mut inds = BTreeSet::new();
-    for k in axioms {
+    for (i, k) in axioms.iter().enumerate() {
+        if i.is_multiple_of(super::POLL_AXIOMS) {
+            poll()?;
+        }
         // an inclusion in a top property is dropped below, and its subproperty, such as
         // a data property, keeps nothing from the rewriting
         if super::index::top_inclusion(k) {
             continue;
         }
-        if blocked(k, &mut inds, canon) {
-            return None;
+        match blocked(k, &mut inds, canon, &mut budget) {
+            Blocked::Ok => {}
+            Blocked::Ineligible => return Ok(Plan::NotNeeded),
+            Blocked::BudgetDeclined => return Ok(Plan::Declined),
         }
         if matches!(k, AxiomKind::HasKey(_, _, dps) if !dps.is_empty()) {
-            return None;
+            return Ok(Plan::NotNeeded);
         }
     }
-    if !axioms.iter().any(|k| !dl::shape(k).horn) {
-        return None;
+    let mut has_disj = false;
+    for (i, k) in axioms.iter().enumerate() {
+        if i.is_multiple_of(super::POLL_AXIOMS) {
+            poll()?;
+        }
+        if !dl::shape(k).horn {
+            has_disj = true;
+            break;
+        }
+    }
+    if !has_disj {
+        return Ok(Plan::NotNeeded);
+    }
+    let inds_tree_bytes = btree_set_bytes::<NamedIndividual>(inds.len());
+    let Some(inds_vec_bytes) = inds
+        .len()
+        .checked_mul(std::mem::size_of::<NamedIndividual>())
+    else {
+        return Ok(Plan::Declined);
+    };
+    if !budget.try_add(inds_vec_bytes) {
+        return Ok(Plan::Declined);
     }
     let inds: Vec<NamedIndividual> = inds.into_iter().collect();
+    budget.release(inds_tree_bytes);
+
     let n = inds.len();
     let pairs = n * n.saturating_sub(1) / 2;
     let limit = memory.map_or(KEY_AXIOMS, |m| (m / AXIOM_BYTES).min(KEY_AXIOMS));
+    if !budget.try_add(axioms.len()) {
+        return Ok(Plan::Declined);
+    }
     let mut cx = Cx::default();
     let mut out = Reduction {
         axioms: Vec::new(),
         origin: Vec::new(),
         replaced: vec![false; axioms.len()],
         hub: None,
+        axiom_heap_bytes: 0,
     };
     let mut first_use = None;
     let mut keys = 0usize;
     let mut total = 0usize;
     for (i, &k) in axioms.iter().enumerate() {
+        if i.is_multiple_of(super::POLL_AXIOMS) {
+            poll()?;
+        }
         if let AxiomKind::HasKey(c, ops, _) = k
             && !ops.is_empty()
         {
             let m = ops.len();
             total = total.saturating_add(m.saturating_mul(n).saturating_mul(pairs + 1) + pairs);
             if total > limit {
-                return None;
+                return Ok(Plan::Declined);
             }
             let before = cx.used;
-            let c = cx.ce(c).ok()?;
+            let Ok(c) = cx.ce(c) else {
+                return Ok(Plan::NotNeeded);
+            };
             let rs: Vec<ObjectPropertyExpression> = ops.iter().map(|p| cx.ope(p)).collect();
             if cx.used && !before {
                 first_use.get_or_insert(i);
@@ -509,29 +882,45 @@ pub fn plan(
             let c = match c {
                 ClassExpression::Class(_) => c,
                 c => {
+                    let name_len = PREFIX.len() + 1 + dec_len(keys);
+                    let eq_heap = btree_set_bytes::<ClassExpression>(2)
+                        .saturating_add(name_len)
+                        .saturating_add(ce_heap_bytes(&c));
                     let name = ClassExpression::Class(Class::new(format!("{PREFIX}k{keys}")));
-                    out.axioms
-                        .push(AxiomKind::EquivalentClasses([name.clone(), c].into()));
-                    out.origin.push(i);
+                    if !push_axiom(&mut out, &mut budget, i, eq_heap, || {
+                        AxiomKind::EquivalentClasses([name.clone(), c].into())
+                    }) {
+                        return Ok(Plan::Declined);
+                    }
                     name
                 }
             };
-            let made = key(keys, &c, &rs, &inds);
+            if !key_budgeted(keys, &c, &rs, &inds, i, &mut out, &mut budget, poll)? {
+                return Ok(Plan::Declined);
+            }
             keys += 1;
-            out.origin.extend(std::iter::repeat_n(i, made.len()));
-            out.axioms.extend(made);
             out.replaced[i] = true;
             continue;
         }
         if !ax_has_top(k) {
             continue;
         }
+        if !budget.try_temp(axiom_heap_bytes(k)) {
+            return Ok(Plan::Declined);
+        }
         let before = cx.used;
-        match cx.retarget(k).ok()? {
+        let Ok(rt) = cx.retarget(k) else {
+            return Ok(Plan::NotNeeded);
+        };
+        match rt {
             Rt::Drop => {}
             Rt::New(v) => {
-                out.origin.extend(std::iter::repeat_n(i, v.len()));
-                out.axioms.extend(v);
+                for ax in v {
+                    let ax_heap = axiom_heap_bytes(&ax);
+                    if !push_axiom(&mut out, &mut budget, i, ax_heap, || ax) {
+                        return Ok(Plan::Declined);
+                    }
+                }
             }
         }
         if cx.used && !before {
@@ -540,10 +929,14 @@ pub fn plan(
         out.replaced[i] = true;
     }
     if let Some(i) = first_use {
+        let hub_str = format!("{PREFIX}hub");
+        if !budget.try_add(hub_str.len()) {
+            return Ok(Plan::Declined);
+        }
+        out.hub = Some(NamedIndividual::new(hub_str));
         let up = ObjectPropertyExpression::Property(u());
         let thing = ClassExpression::Class(Class::thing());
-        out.hub = Some(NamedIndividual::new(format!("{PREFIX}hub")));
-        for k in [
+        for ax in [
             AxiomKind::SubClassOf(
                 thing,
                 ClassExpression::ObjectSomeValuesFrom(
@@ -554,93 +947,203 @@ pub fn plan(
             AxiomKind::SymmetricObjectProperty(up.clone()),
             AxiomKind::TransitiveObjectProperty(up),
         ] {
-            out.axioms.push(k);
-            out.origin.push(i);
+            let ax_heap = axiom_heap_bytes(&ax);
+            if !push_axiom(&mut out, &mut budget, i, ax_heap, || ax) {
+                return Ok(Plan::Declined);
+            }
         }
     }
     // the classes and individuals of the replaced axioms stay in the signature, though the
     // rewriting may drop them
-    let mut sig = Signature::default();
-    let mut at: FxHashMap<Entity, usize> = FxHashMap::default();
+    let mut sig_at: BTreeMap<Entity, usize> = BTreeMap::new();
+    let mut sig_str_bytes = 0usize;
     for (i, k) in axioms.iter().enumerate() {
+        if i.is_multiple_of(super::POLL_AXIOMS) {
+            poll()?;
+        }
         if out.replaced[i] {
             let mut one = Signature::default();
             one.axiom(k);
             for e in one.0 {
-                at.entry(e.clone()).or_insert(i);
-                sig.0.insert(e);
+                if !matches!(e, Entity::Class(_) | Entity::NamedIndividual(_)) {
+                    continue;
+                }
+                if !sig_at.contains_key(&e) {
+                    let old_tree = btree_map_bytes::<Entity, usize>(sig_at.len());
+                    let new_tree = btree_map_bytes::<Entity, usize>(sig_at.len() + 1);
+                    let str_len = e.iri().as_str().len();
+                    let add = str_len.saturating_add(new_tree.saturating_sub(old_tree));
+                    if !budget.try_add(add) {
+                        return Ok(Plan::Declined);
+                    }
+                    sig_str_bytes = sig_str_bytes.saturating_add(str_len);
+                    sig_at.insert(e, i);
+                }
             }
         }
     }
-    for e in sig.0 {
-        let k = match &e {
-            Entity::Class(c) => AxiomKind::Declaration(Entity::Class(c.clone())),
-            Entity::NamedIndividual(n) => AxiomKind::ClassAssertion(
-                ClassExpression::Class(Class::thing()),
-                Individual::Named(n.clone()),
-            ),
+    let sig_tree_bytes = btree_map_bytes::<Entity, usize>(sig_at.len());
+    for (step, (e, origin_i)) in sig_at.into_iter().enumerate() {
+        if step.is_multiple_of(super::POLL_AXIOMS) {
+            poll()?;
+        }
+        let (ax, ax_heap) = match e {
+            Entity::Class(c) => {
+                let h = c.as_str().len();
+                (AxiomKind::Declaration(Entity::Class(c)), h)
+            }
+            Entity::NamedIndividual(n) => {
+                let h = vocab::OWL_THING.len().saturating_add(n.as_str().len());
+                (
+                    AxiomKind::ClassAssertion(
+                        ClassExpression::Class(Class::thing()),
+                        Individual::Named(n),
+                    ),
+                    h,
+                )
+            }
             _ => continue,
         };
-        out.axioms.push(k);
-        out.origin.push(at[&e]);
+        if !push_axiom(&mut out, &mut budget, origin_i, ax_heap, || ax) {
+            return Ok(Plan::Declined);
+        }
     }
-    out.replaced.iter().any(|r| *r).then_some(out)
+    budget.release(sig_tree_bytes.saturating_add(sig_str_bytes));
+    if out.replaced.iter().any(|r| *r) {
+        Ok(Plan::Ready(out))
+    } else {
+        Ok(Plan::NotNeeded)
+    }
 }
 
-/// The class axioms that stand for the key `HasKey(c (rs) ())`, number `k`, over the
-/// named individuals `inds`.
-fn key(
+/// Emits the class axioms that stand for the key `HasKey(c (rs) ())`, number `k`, over the
+/// named individuals `inds`, admitting every axiom against `budget` and polling `poll`
+/// cooperatively. Returns `Ok(false)` when `budget` declines.
+#[allow(clippy::too_many_arguments)]
+fn key_budgeted<E, F: FnMut(usize) -> bool>(
     k: usize,
     c: &ClassExpression,
     rs: &[ObjectPropertyExpression],
     inds: &[NamedIndividual],
-) -> Vec<AxiomKind> {
+    origin_i: usize,
+    out: &mut Reduction,
+    budget: &mut PlanBudget<'_, F>,
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
     use ClassExpression as C;
-    let one = |i: &NamedIndividual| C::ObjectOneOf([Individual::Named(i.clone())].into());
-    let mut out = Vec::new();
     if inds.len() < 2 {
-        return out;
+        return Ok(true);
     }
+    let one = |i: &NamedIndividual| C::ObjectOneOf([Individual::Named(i.clone())].into());
+    let one_node = btree_set_bytes::<Individual>(1);
+    let inter2_node = btree_set_bytes::<ClassExpression>(2);
+    let box_ce = std::mem::size_of::<ClassExpression>();
+    let c_heap = ce_heap_bytes(c);
+    let v_prefix = PREFIX.len() + 1 + dec_len(k) + 1;
+    let m_prefix = PREFIX.len() + 1 + dec_len(k) + 1;
     // V_jb holds the r_j-values of b when b is a C
     let v = |j: usize, b: usize| Class::new(format!("{PREFIX}v{k}-{j}-{b}"));
+    let v_len = |j: usize, b: usize| v_prefix + dec_len(j) + 1 + dec_len(b);
+    let m_cls = |j: usize, a: usize, b: usize| Class::new(format!("{PREFIX}m{k}-{j}-{a}-{b}"));
+    let m_len =
+        |j: usize, a: usize, b: usize| m_prefix + dec_len(j) + 1 + dec_len(a) + 1 + dec_len(b);
+    let mut steps = 0usize;
     for (b, ib) in inds.iter().enumerate().skip(1) {
+        let ib_len = ib.as_str().len();
         for (j, r) in rs.iter().enumerate() {
-            out.push(AxiomKind::SubClassOf(
-                C::ObjectIntersectionOf([one(ib), c.clone()].into()),
-                C::ObjectAllValuesFrom(r.clone(), Box::new(C::Class(v(j, b)))),
-            ));
-        }
-    }
-    for (a, ia) in inds.iter().enumerate() {
-        for (b, ib) in inds.iter().enumerate().skip(a + 1) {
-            let mut body = vec![one(ia), c.clone()];
-            for (j, r) in rs.iter().enumerate() {
-                // M_jab: a has a named r_j-value that b, a C, has too
-                let m = Class::new(format!("{PREFIX}m{k}-{j}-{a}-{b}"));
-                for ic in inds {
-                    out.push(AxiomKind::SubClassOf(
-                        C::ObjectIntersectionOf(
-                            [
-                                one(ia),
-                                C::ObjectSomeValuesFrom(
-                                    r.clone(),
-                                    Box::new(C::ObjectIntersectionOf(
-                                        [one(ic), C::Class(v(j, b))].into(),
-                                    )),
-                                ),
-                            ]
-                            .into(),
-                        ),
-                        C::Class(m.clone()),
-                    ));
-                }
-                body.push(C::Class(m));
+            if steps.is_multiple_of(POLL_KEY) {
+                poll()?;
             }
-            out.push(AxiomKind::SubClassOf(
-                C::ObjectIntersectionOf(body.into_iter().collect()),
-                one(ib),
-            ));
+            steps += 1;
+            let ax_heap = inter2_node
+                .saturating_add(one_node)
+                .saturating_add(ib_len)
+                .saturating_add(c_heap)
+                .saturating_add(r.named().as_str().len())
+                .saturating_add(box_ce)
+                .saturating_add(v_len(j, b));
+            if !push_axiom(out, budget, origin_i, ax_heap, || {
+                AxiomKind::SubClassOf(
+                    C::ObjectIntersectionOf([one(ib), c.clone()].into()),
+                    C::ObjectAllValuesFrom(r.clone(), Box::new(C::Class(v(j, b)))),
+                )
+            }) {
+                return Ok(false);
+            }
         }
     }
-    out
+    let body_node = btree_set_bytes::<ClassExpression>(2usize.saturating_add(rs.len()));
+    for (a, ia) in inds.iter().enumerate() {
+        let ia_len = ia.as_str().len();
+        for (b, ib) in inds.iter().enumerate().skip(a + 1) {
+            let mut m_total_len = 0usize;
+            for (j, r) in rs.iter().enumerate() {
+                let r_len = r.named().as_str().len();
+                let vj_len = v_len(j, b);
+                let mj_len = m_len(j, a, b);
+                m_total_len = m_total_len.saturating_add(mj_len);
+                // M_jab: a has a named r_j-value that b, a C, has too
+                let m = m_cls(j, a, b);
+                let vj = v(j, b);
+                for ic in inds {
+                    if steps.is_multiple_of(POLL_KEY) {
+                        poll()?;
+                    }
+                    steps += 1;
+                    let ax_heap = inter2_node
+                        .saturating_add(one_node)
+                        .saturating_add(ia_len)
+                        .saturating_add(r_len)
+                        .saturating_add(box_ce)
+                        .saturating_add(inter2_node)
+                        .saturating_add(one_node)
+                        .saturating_add(ic.as_str().len())
+                        .saturating_add(vj_len)
+                        .saturating_add(mj_len);
+                    if !push_axiom(out, budget, origin_i, ax_heap, || {
+                        AxiomKind::SubClassOf(
+                            C::ObjectIntersectionOf(
+                                [
+                                    one(ia),
+                                    C::ObjectSomeValuesFrom(
+                                        r.clone(),
+                                        Box::new(C::ObjectIntersectionOf(
+                                            [one(ic), C::Class(vj.clone())].into(),
+                                        )),
+                                    ),
+                                ]
+                                .into(),
+                            ),
+                            C::Class(m.clone()),
+                        )
+                    }) {
+                        return Ok(false);
+                    }
+                }
+            }
+            if steps.is_multiple_of(POLL_KEY) {
+                poll()?;
+            }
+            steps += 1;
+            let final_heap = body_node
+                .saturating_add(one_node)
+                .saturating_add(ia_len)
+                .saturating_add(c_heap)
+                .saturating_add(m_total_len)
+                .saturating_add(one_node)
+                .saturating_add(ib.as_str().len());
+            if !push_axiom(out, budget, origin_i, final_heap, || {
+                let mut body = BTreeSet::new();
+                body.insert(one(ia));
+                body.insert(c.clone());
+                for j in 0..rs.len() {
+                    body.insert(C::Class(m_cls(j, a, b)));
+                }
+                AxiomKind::SubClassOf(C::ObjectIntersectionOf(body), one(ib))
+            }) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
