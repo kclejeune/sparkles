@@ -371,7 +371,8 @@ A key stops before the first open value or spelling it cannot recover. This incl
 a hidden aggregate key whose inputs, selection or distinct solution count depend on
 spelling, or a variable whose BIND may be unbound under a different spelling. A
 distinct solution count stays fixed when fixed bindings, fixed presence or distinct
-fixed metadata already separate every spelling-dependent pair. In MIN and MAX, a
+fixed metadata already separate every spelling-dependent pair within the evaluator's
+pair budget, and keeps its spelling dependency if that budget runs out. In MIN and MAX, a
 guaranteed candidate in a strictly better RDF term class rules out lexical-only
 candidates in worse classes. Metadata reads such as LANG and DATATYPE keep their
 place when the remaining input can change only lexically, as with UCASE on a computed

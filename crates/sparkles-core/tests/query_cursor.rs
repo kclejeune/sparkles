@@ -7734,6 +7734,179 @@ fn reference_str_1093_r5_keeps_count_distinct_star_fixed_with_discriminator() {
 }
 
 #[test]
+fn reference_str_1093_r6_bounds_count_distinct_star_pair_scan() {
+    use oxrdf::{GraphName, NamedNode, Quad};
+    use reference::check::Outcome;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    let member_pred = NamedNode::new_unchecked("urn:member");
+    let group_obj = NamedNode::new_unchecked("urn:group");
+    let make_quads = |count: usize| -> Vec<Quad> {
+        (0..count)
+            .map(|i| {
+                Quad::new(
+                    NamedNode::new_unchecked(format!("urn:item:{i}")),
+                    member_pred.clone(),
+                    group_obj.clone(),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    };
+
+    let rotating_grouped_slice = r#"SELECT ?g WHERE {
+        { VALUES (?g ?a ?b ?c) { (1 <urn:only> 0 0) } }
+        UNION {
+            { ?a <urn:member> <urn:group> . BIND(0 AS ?b) BIND(0 AS ?c) }
+            UNION {
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?a)
+                BIND(1 AS ?b) BIND(1 AS ?c)
+            }
+            UNION {
+                BIND(0 AS ?a)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?b)
+                BIND(2 AS ?c)
+            }
+            UNION {
+                BIND(1 AS ?a) BIND(2 AS ?b)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?c)
+            }
+            BIND(2 AS ?g)
+        }
+        BIND(STR(1 + 0) AS ?s)
+    } GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+
+    let rotating_count_only = r#"SELECT (COUNT(DISTINCT *) AS ?count) WHERE {
+        { ?a <urn:member> <urn:group> . BIND(0 AS ?b) BIND(0 AS ?c) }
+        UNION {
+            BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?a)
+            BIND(1 AS ?b) BIND(1 AS ?c)
+        }
+        UNION {
+            BIND(0 AS ?a)
+            BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?b)
+            BIND(2 AS ?c)
+        }
+        UNION {
+            BIND(1 AS ?a) BIND(2 AS ?b)
+            BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?c)
+        }
+        BIND(STR(1 + 0) AS ?s)
+    }"#;
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+
+    // Small unsplit group (13 rows -> 78 pairs <= budget) still proves fixed.
+    let small = reference::Reference::new(make_quads(10));
+    assert!(check(&small, rotating_grouped_slice, &[two]).is_err());
+    assert_eq!(
+        check(&small, rotating_grouped_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+
+    // Tight work_limit bounds the pair scan conservatively without failing evaluation.
+    let tight = reference::Reference::new(make_quads(60)).with_work_limit(1_000);
+    assert!(matches!(
+        check(&tight, rotating_grouped_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&tight, rotating_count_only, &[&["63"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Single unsplit bucket exceeding the pair budget (503 rows -> 126,253 pairs > 100,000)
+    // retains spelling dependency conservatively and still compares without ORDER BY.
+    let over_budget = reference::Reference::new(make_quads(500));
+    assert!(matches!(
+        check(&over_budget, rotating_grouped_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&over_budget, rotating_count_only, &[&["503"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Cross-bucket budget: 50 buckets of 73 rows each (2,628 pairs per bucket,
+    // 131,400 pairs combined > 100,000) exhausts the shared budget across buckets.
+    let in_bucket = NamedNode::new_unchecked("urn:inBucket");
+    let is_bucket = NamedNode::new_unchecked("urn:isBucket");
+    let yes = NamedNode::new_unchecked("urn:yes");
+    let mut bucket_quads = Vec::with_capacity(50 * 71);
+    for b in 0..50 {
+        let bucket = NamedNode::new_unchecked(format!("urn:b:{b}"));
+        bucket_quads.push(Quad::new(
+            bucket.clone(),
+            is_bucket.clone(),
+            yes.clone(),
+            GraphName::DefaultGraph,
+        ));
+        for i in 0..70 {
+            bucket_quads.push(Quad::new(
+                NamedNode::new_unchecked(format!("urn:item:{b}:{i}")),
+                in_bucket.clone(),
+                bucket.clone(),
+                GraphName::DefaultGraph,
+            ));
+        }
+    }
+    let multi_bucket_query = r#"SELECT ?g WHERE {
+        { VALUES (?g ?k ?a ?b ?c) { (1 <urn:only> <urn:only> 0 0) } }
+        UNION {
+            { ?a <urn:inBucket> ?k . BIND(0 AS ?b) BIND(0 AS ?c) }
+            UNION {
+                ?k <urn:isBucket> <urn:yes> .
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?a)
+                BIND(1 AS ?b) BIND(1 AS ?c)
+            }
+            UNION {
+                ?k <urn:isBucket> <urn:yes> .
+                BIND(0 AS ?a)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?b)
+                BIND(2 AS ?c)
+            }
+            UNION {
+                ?k <urn:isBucket> <urn:yes> .
+                BIND(1 AS ?a) BIND(2 AS ?b)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?c)
+            }
+            BIND(2 AS ?g)
+        }
+        BIND(STR(1 + 0) AS ?s)
+    } GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    let multi_bucket = reference::Reference::new(bucket_quads);
+    assert!(matches!(
+        check(&multi_bucket, multi_bucket_query, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    // Large group matching the review query shape under the optimizer work limit.
+    let large = reference::Reference::new(make_quads(5_000)).with_work_limit(20_000_000);
+    assert_eq!(
+        check(&large, rotating_count_only, &[&["5003"]]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
 fn reference_str_1093_r5_keeps_min_max_fixed_across_strict_term_classes() {
     use reference::check::Outcome;
     let two = &["2"][..];
