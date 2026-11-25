@@ -49,11 +49,13 @@ pub(crate) mod profiles;
 pub(crate) mod relevance;
 pub(crate) mod render;
 pub mod rest;
+mod retained;
 pub mod review_http;
 mod schema_history;
 mod schemas;
 mod search;
 mod semantic;
+mod session;
 mod share;
 mod stored;
 mod tasks;
@@ -63,6 +65,8 @@ mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validate;
 
+#[cfg(test)]
+mod credit_tests;
 #[cfg(test)]
 mod expiry_tests;
 #[cfg(test)]
@@ -312,8 +316,23 @@ pub struct McpServer {
 pub enum Outcome {
     /// `structuredContent`, also sent as one text block of compact JSON
     Structured(Value),
-    /// one text block and no `structuredContent` (sparql_query)
+    /// one text block and no `structuredContent`
     Text(String),
+    /// a compact query page retained under its query's `NativeBudget` / `QueryPool` credit
+    Retained(render::CompactPage),
+}
+
+impl Outcome {
+    /// Convert a tool outcome into an application JSON value for internal callers
+    /// (`ask`, `ingest`, `memory/brief`, tests).
+    pub(crate) fn into_json_value(self) -> Value {
+        match self {
+            Outcome::Structured(v) => v,
+            Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
+            Outcome::Retained(p) => serde_json::from_str(p.as_str())
+                .unwrap_or_else(|_| Value::String(p.as_str().into())),
+        }
+    }
 }
 
 /// The call named a tool this server does not offer (a protocol error).
@@ -358,11 +377,15 @@ impl McpServer {
     }
 
     fn call_error(&self, call: &Call, error: sparkles::Error) -> ToolError {
+        self.call_error_with_id(&call.request_id, error)
+    }
+
+    pub(crate) fn call_error_with_id(&self, request_id: &str, error: sparkles::Error) -> ToolError {
         errors::ErrorContext {
             timeout_secs: self.cfg().max_timeout.as_secs_f64(),
             max_timeout_secs: self.cfg().max_timeout.as_secs_f64(),
             prefix_names: &[],
-            request_id: &call.request_id,
+            request_id,
         }
         .engine(error)
     }
@@ -412,6 +435,19 @@ impl McpServer {
     }
 
     pub fn new(state: Arc<AppState>, cfg: McpConfig) -> McpServer {
+        Self::new_with_tasks(state, cfg, tasks::Tasks::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_task_ttl(
+        state: Arc<AppState>,
+        cfg: McpConfig,
+        task_ttl: Duration,
+    ) -> McpServer {
+        Self::new_with_tasks(state, cfg, tasks::Tasks::with_ttl(task_ttl))
+    }
+
+    fn new_with_tasks(state: Arc<AppState>, cfg: McpConfig, tasks: tasks::Tasks) -> McpServer {
         let read_only = state.read_only;
         let tools = schemas::tools(&cfg)
             .into_iter()
@@ -429,7 +465,7 @@ impl McpServer {
                 slots: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
                 pins: pins::Pins::default(),
                 tools,
-                tasks: tasks::Tasks::default(),
+                tasks,
                 subscriptions: Arc::new(Semaphore::new(notify::MAX_SUBSCRIPTIONS)),
                 cfg,
             }),

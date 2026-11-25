@@ -277,6 +277,9 @@ impl Tools<'_> {
                 };
                 let out = match self.recall(rargs)? {
                     Outcome::Text(t) => serde_json::from_str::<Value>(&t).unwrap_or_default(),
+                    Outcome::Retained(p) => {
+                        serde_json::from_str::<Value>(p.as_str()).unwrap_or_default()
+                    }
                     Outcome::Structured(v) => v,
                 };
                 (label, recall_facts(&out, &mut heads, &mut graph_iris))

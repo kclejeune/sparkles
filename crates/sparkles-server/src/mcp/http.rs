@@ -27,6 +27,8 @@
 //! Each tool call then runs as the request's principal (`adapter.rs`).
 
 use super::adapter::{Adapter, Transport};
+use super::retained::{Framing, ResponseSlot, SlotGuard};
+use super::session::{CreditedSessionManager, CreditedSseBody, HTTP_SSE_SLOT};
 use super::{McpConfig, McpServer};
 use crate::auth::Principal;
 use crate::ratelimit::Class;
@@ -38,11 +40,12 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::MethodRouter;
 use parking_lot::Mutex;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::session::local::SessionConfig;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// The largest JSON-RPC message (a `sparql_update` of 1 Mi characters, escaped).
@@ -232,8 +235,10 @@ pub struct GrantShare(pub Arc<sparkles::sparql::pool::PoolGrant>);
 struct Endpoint {
     state: Arc<AppState>,
     server: McpServer,
-    service: StreamableHttpService<Adapter, LocalSessionManager>,
-    sessions: Arc<LocalSessionManager>,
+    service: StreamableHttpService<Adapter, CreditedSessionManager>,
+    sessions: Arc<CreditedSessionManager>,
+    sse_keep_alive: Option<Duration>,
+    shutdown: CancellationToken,
     /// the principal (`Principal::id`) that opened each legacy session
     owners: Mutex<HashMap<String, String>>,
     max_sessions: usize,
@@ -242,10 +247,40 @@ struct Endpoint {
 
 /// The `/$/mcp` route, or `None` when the endpoint is off.
 pub fn route(state: &Arc<AppState>) -> Option<MethodRouter<Arc<AppState>>> {
+    route_inner(state, SessionConfig::default(), None)
+}
+
+#[cfg(test)]
+pub(crate) fn route_with_session_config(
+    state: &Arc<AppState>,
+    session_config: SessionConfig,
+    task_ttl: Option<Duration>,
+) -> Option<MethodRouter<Arc<AppState>>> {
+    route_inner(state, session_config, task_ttl)
+}
+
+fn route_inner(
+    state: &Arc<AppState>,
+    session_config: SessionConfig,
+    task_ttl: Option<Duration>,
+) -> Option<MethodRouter<Arc<AppState>>> {
     let conf = state.mcp.clone()?;
-    let server = McpServer::new(state.clone(), conf.cfg.clone());
+    #[cfg(test)]
+    let server = match task_ttl {
+        Some(ttl) => McpServer::new_with_task_ttl(state.clone(), conf.cfg.clone(), ttl),
+        None => McpServer::new(state.clone(), conf.cfg.clone()),
+    };
+    #[cfg(not(test))]
+    let server = {
+        let _ = task_ttl;
+        McpServer::new(state.clone(), conf.cfg.clone())
+    };
     let adapter = Adapter::with_transport(server.clone(), Transport::Http);
-    let sessions = Arc::new(LocalSessionManager::default());
+    let max_timeout_secs = conf.cfg.max_timeout.as_secs_f64();
+    let sessions = Arc::new(CreditedSessionManager::new(
+        session_config,
+        max_timeout_secs,
+    ));
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(conf.max_sessions > 0)
         .with_json_response(true)
@@ -255,12 +290,15 @@ pub fn route(state: &Arc<AppState>) -> Option<MethodRouter<Arc<AppState>>> {
         // every route; rmcp's would refuse every name but localhost
         .disable_allowed_hosts()
         .disable_allowed_origins();
+    let sse_keep_alive = config.sse_keep_alive;
     let service = StreamableHttpService::new(move || Ok(adapter.clone()), sessions.clone(), config);
     let ep = Arc::new(Endpoint {
         state: state.clone(),
         server,
         service,
         sessions,
+        sse_keep_alive,
+        shutdown: conf.shutdown.clone(),
         owners: Mutex::new(HashMap::new()),
         max_sessions: conf.max_sessions,
         require_auth: conf.require_auth,
@@ -570,17 +608,27 @@ impl Endpoint {
     }
 
     /// Hand the request to rmcp, and record the owner of a session it opens.
+    ///
+    /// Attaches a [`ResponseSlot`] so `Adapter` parks retained payloads instead of
+    /// copying them through `rmcp`, and scopes [`HTTP_SSE_SLOT`] so legacy session SSE
+    /// responses stream credited frames directly through [`CreditedSseBody`].
     async fn forward(&self, mut req: Request, p: &Principal) -> Response {
         // inside the rate limiter's scope: the tool keeps the permits while it works
         req.extensions_mut()
             .insert(HeldShare(Arc::new(crate::ratelimit::hold())));
+        let slot = ResponseSlot::open();
+        let mut slot_guard = SlotGuard::new(slot.clone());
+        req.extensions_mut().insert(slot.clone());
         // rmcp reads the Host even with its own check off; the server's check ran
         // already, and a request may come without one (HTTP/1.0, some proxies)
         if !req.headers().contains_key(header::HOST) && req.uri().authority().is_none() {
             req.headers_mut()
                 .insert(header::HOST, HeaderValue::from_static("localhost"));
         }
-        let resp = self.service.handle(req).await;
+        let sse_slot = Arc::new(Mutex::new(None));
+        let resp = HTTP_SSE_SLOT
+            .scope(sse_slot.clone(), self.service.handle(req))
+            .await;
         if let Some(id) = resp
             .headers()
             .get(SESSION_HEADER)
@@ -590,6 +638,27 @@ impl Endpoint {
             let mut owners = self.owners.lock();
             owners.retain(|s, _| open.keys().any(|k| k.as_ref() == s.as_str()));
             owners.insert(id.to_string(), p.access_id());
+        }
+        if let Some(sse_rx) = sse_slot.lock().take()
+            && resp.status() == StatusCode::OK
+        {
+            // Legacy session worker now owns `slot`'s lifecycle (until response send,
+            // cancellation, or session close).
+            slot_guard.disarm();
+            let (parts, _) = resp.into_parts();
+            let body = CreditedSseBody::new(sse_rx, self.sse_keep_alive, self.shutdown.clone());
+            return Response::from_parts(parts, Body::new(body));
+        }
+        if resp.status() == StatusCode::OK
+            && let Some(staged) = slot.take()
+        {
+            let bytes = staged
+                .into_frame_or_error(Framing::Json, self.server.cfg().max_timeout.as_secs_f64());
+            let (mut parts, _) = resp.into_parts();
+            if let Ok(len) = HeaderValue::from_str(&bytes.len().to_string()) {
+                parts.headers.insert(header::CONTENT_LENGTH, len);
+            }
+            return Response::from_parts(parts, Body::from(bytes));
         }
         resp.map(Body::new)
     }

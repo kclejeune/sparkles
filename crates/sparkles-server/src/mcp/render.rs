@@ -11,6 +11,11 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+mod bounded;
+mod bounded_page;
+pub use bounded_page::CompactPage;
+pub(in crate::mcp) use bounded_page::{owned_ask, owned_page};
+
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
@@ -155,6 +160,7 @@ impl<'p> Terms<'p> {
     }
 
     /// `PREFIX name: <ns>` line (with its newline) of prefix `id`.
+    #[cfg(test)]
     pub fn prefix_line(&self, id: usize) -> String {
         let (ns, name) = &self.prefixes.by_ns[id];
         let mut s = format!("PREFIX {name}: <");
@@ -378,12 +384,14 @@ impl RowSource<'_> {
 }
 
 /// One rendered row: its cells, the prefixes it used and its shortened terms.
+#[cfg(test)]
 struct Row {
     cells: Vec<Option<String>>,
     used: BTreeSet<usize>,
     shortened: usize,
 }
 
+#[cfg(test)]
 fn render_rows(page: &QueryPage, prefixes: &Prefixes) -> Vec<Row> {
     let mut out = Vec::with_capacity(page.rows.len());
     match &page.rows {
@@ -421,6 +429,7 @@ fn render_rows(page: &QueryPage, prefixes: &Prefixes) -> Vec<Row> {
 }
 
 /// The outcome of fitting rows into the byte budget.
+#[cfg(test)]
 struct Fit {
     returned: usize,
     truncated: Option<Reason>,
@@ -429,6 +438,7 @@ struct Fit {
 /// The largest number of leading rows whose document fits `max_bytes`, where `size(k,
 /// truncated)` is the size of the document with `k` rows. Rendering stops before the
 /// first row that would take the document past the budget.
+#[cfg(test)]
 fn fit(page: &QueryPage, n: usize, mut size: impl FnMut(usize, Option<Reason>) -> usize) -> Fit {
     let state = |k: usize| -> Option<Reason> {
         if k < n {
@@ -453,6 +463,7 @@ fn fit(page: &QueryPage, n: usize, mut size: impl FnMut(usize, Option<Reason>) -
     }
 }
 
+#[cfg(test)]
 fn human_total(page: &QueryPage) -> String {
     match page.total {
         Some(t) if page.total_is_lower_bound => format!("≥{t}"),
@@ -462,6 +473,7 @@ fn human_total(page: &QueryPage) -> String {
 }
 
 /// The first line of a table (without its newline).
+#[cfg(test)]
 fn status_line(page: &QueryPage, k: usize, truncated: Option<Reason>, shortened: usize) -> String {
     let mut s = format!("# {} · ", page.query_type);
     if k > 0 {
@@ -485,6 +497,7 @@ fn status_line(page: &QueryPage, k: usize, truncated: Option<Reason>, shortened:
 }
 
 /// The `# more:` line (with a leading newline), for a truncated table.
+#[cfg(test)]
 fn trailer(page: &QueryPage, k: usize, truncated: Option<Reason>) -> String {
     match truncated {
         None => String::new(),
@@ -500,6 +513,7 @@ fn trailer(page: &QueryPage, k: usize, truncated: Option<Reason>) -> String {
     }
 }
 
+#[cfg(test)]
 fn row_line(page: &QueryPage, row: &Row) -> String {
     let mut line = String::new();
     if page.vars.is_some() {
@@ -520,6 +534,7 @@ fn row_line(page: &QueryPage, row: &Row) -> String {
 }
 
 /// `format: "table"`: status line, PREFIX lines, header, rows, `# more:` trailer.
+#[cfg(test)]
 pub fn table(page: &QueryPage, prefixes: &Prefixes) -> String {
     let rows = render_rows(page, prefixes);
     let lines: Vec<String> = rows.iter().map(|r| row_line(page, r)).collect();
@@ -595,6 +610,7 @@ pub fn table(page: &QueryPage, prefixes: &Prefixes) -> String {
 }
 
 /// `format: "table"` for ASK, after what query-time reasoning derived.
+#[cfg(test)]
 pub fn ask_table(commit: u64, boolean: bool, reasoning: Option<&str>) -> String {
     let line = reasoning.map_or(String::new(), |h| format!("# reasoning: {h}\n"));
     format!("{line}# ASK · commit {commit}\n{boolean}")
@@ -651,6 +667,7 @@ struct JsonDoc<'a> {
 }
 
 /// `format: "json"`: the compact JSON document, at most `max_bytes` long.
+#[cfg(test)]
 pub fn json(page: &QueryPage, prefixes: &Prefixes) -> String {
     let rows = render_rows(page, prefixes);
     let cells: Vec<Vec<Option<String>>> = rows.iter().map(|r| r.cells.clone()).collect();
@@ -700,6 +717,7 @@ pub fn json(page: &QueryPage, prefixes: &Prefixes) -> String {
 }
 
 /// `format: "json"` for ASK.
+#[cfg(test)]
 pub fn ask_json(
     dataset: &str,
     commit: u64,
@@ -726,6 +744,7 @@ pub fn ask_json(
     .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn prefix_map(prefixes: &Prefixes, ids: &BTreeSet<usize>) -> BTreeMap<String, String> {
     ids.iter()
         .map(|&i| {

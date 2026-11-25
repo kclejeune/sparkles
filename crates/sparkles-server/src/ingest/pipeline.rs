@@ -10,7 +10,7 @@ use super::convert::{self, Converted, Format, Refusal};
 use super::{PdfRuntime, Status, Task};
 use crate::auth::{Level, Principal};
 use crate::mcp::errors::ToolError;
-use crate::mcp::{Call, McpServer, Outcome};
+use crate::mcp::{Call, McpServer};
 use crate::models::{Models, Pair, Role, StepRecord};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -289,10 +289,11 @@ impl Run<'_, '_> {
 
             preparation: None,
         };
-        Ok(match self.ctx.server.run_now(name, m, &mut call)? {
-            Outcome::Structured(v) => v,
-            Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
-        })
+        Ok(self
+            .ctx
+            .server
+            .run_now(name, m, &mut call)?
+            .into_json_value())
     }
 }
 

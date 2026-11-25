@@ -2535,7 +2535,7 @@ fn question_schema_ranking_cannot_reveal_a_hidden_predicate_from_cached_report()
             .unwrap()
         {
             Outcome::Structured(value) => value,
-            Outcome::Text(_) => panic!("expected structured schema"),
+            Outcome::Text(_) | Outcome::Retained(_) => panic!("expected structured schema"),
         }
     };
     // First populate the unrestricted report cache with the hidden predicate.

@@ -550,10 +550,18 @@ The remaining stage 4 ownership seams are tracked by their own items. Retaining 
 result table under its own lease belongs to the merge phase of item 453, linking the
 reasoner's budgets and incremental views into the query pool belongs to item 675, binding
 result buffers belong to item 1306, strict decoding across all callers belongs to item
-1308 and MCP native frame ownership belongs to item 1305. MCP tool results are still
-application copies of their rendered text, and a retained renderer would keep each
-response frame under its query's credit until the transport writes it, which needs an
-rmcp transport qualified for retained results, including session replay and tasks.
+1308 and the post-merge retained-source flip for MCP rendering belongs to item 1305.
+
+MCP tool results, resource reads and completed task results keep their rendered payloads
+and encoded wire frames under query memory credit until the transport writes or drops
+them. `sparql_query` renders compact table and JSON pages iteratively under `NativeBudget`
+with a single-row transient workspace rather than building uncredited full-result text
+copies. On crates.io `rmcp`, qualified stdio and Streamable HTTP transports,
+`Last-Event-ID` session replay buffers and background tasks carry staged responses and
+encode each wire frame directly into `Bytes` backed by `OwnedBytes` credit, releasing that
+credit on delivery, client disconnect, cancellation, TTL expiry or session close. Budget
+refusals release retained credit before returning an MCP error frame. Rendering directly
+from the post-merge leased result table follows the flip in the merge phase of item 453.
 
 ### Snapshot, mask and graph-access escapes
 

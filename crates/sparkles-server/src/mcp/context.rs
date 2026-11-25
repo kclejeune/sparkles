@@ -281,6 +281,7 @@ impl McpServer {
                 match self.run("describe_schema", args, call).await {
                     Ok(Outcome::Structured(v)) => Ok((kind, v.to_string())),
                     Ok(Outcome::Text(t)) => Ok((kind, t)),
+                    Ok(Outcome::Retained(p)) => Ok((kind, p.as_str().to_string())),
                     Err(e) => Err(ContextError::Tool(e)),
                 }
             }

@@ -35,6 +35,7 @@ fn read(server: &McpServer, principal: Principal, extra: Value) -> Value {
         .unwrap()
     {
         Outcome::Text(text) => serde_json::from_str(&text).unwrap(),
+        Outcome::Retained(page) => serde_json::from_str(page.as_str()).unwrap(),
         Outcome::Structured(_) => panic!("recall JSON is a text block"),
     }
 }

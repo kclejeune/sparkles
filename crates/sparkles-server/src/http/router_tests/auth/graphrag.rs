@@ -673,12 +673,10 @@ fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> s
     };
     m.insert("dataset".into(), "rag".into());
     let server = crate::mcp::McpServer::new(s.state.clone(), crate::mcp::McpConfig::default());
-    match server.run_now(name, m, &mut call).unwrap() {
-        crate::mcp::Outcome::Structured(v) => v,
-        crate::mcp::Outcome::Text(t) => {
-            serde_json::from_str(&t).unwrap_or(serde_json::Value::String(t))
-        }
-    }
+    server
+        .run_now(name, m, &mut call)
+        .unwrap()
+        .into_json_value()
 }
 
 /// `community_reports` and the communities of `recall` and the brief read through the
