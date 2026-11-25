@@ -849,17 +849,20 @@ pub(crate) fn principal_iri(p: &Principal) -> NamedNode {
     NamedNode::new_unchecked(out)
 }
 
-/// The caller's authority, checked under the authority registry's shared fence right
-/// before the commit publishes and held until it is published: the access generation
-/// the request was authenticated under is unchanged, and its session or token has not
-/// expired or been revoked.
+/// The caller's authority and declared-settings consistency, checked right before the
+/// commit publishes and held until it is published: the access generation the request
+/// was authenticated under is unchanged, its session or token has not expired or been
+/// revoked, and no settings reload has introduced evidence-settings drift.
 pub(super) struct CallerFence {
     pub(super) st: Arc<AppState>,
     pub(super) p: Principal,
+    pub(super) drift: crate::settings::evidence::DriftFence,
 }
 
 impl sparkles::evidence::AuthorityFence for CallerFence {
     fn enter(&self) -> sparkles::Result<Box<dyn std::any::Any>> {
+        let declared = self.st.settings.hold_evidence_declarations();
+        self.drift.check(&self.st)?;
         #[cfg(feature = "auth")]
         if let (Some(auth), Some(epoch)) = (&self.st.auth, self.p.access_epoch()) {
             let hold = auth.authority_registry().begin_hold();
@@ -872,10 +875,10 @@ impl sparkles::evidence::AuthorityFence for CallerFence {
                     "authorization changed before the proposal published; nothing was written",
                 ));
             }
-            return Ok(Box::new(hold));
+            return Ok(Box::new((hold, declared)));
         }
         let _ = (&self.st, &self.p);
-        Ok(Box::new(()))
+        Ok(Box::new(declared))
     }
 }
 
@@ -890,12 +893,14 @@ pub(crate) fn record_json(r: &sparkles::evidence::ProposedRecord) -> J {
     })
 }
 
-/// The caller's authority fence, for a proposal made outside `POST /{ds}/claims`.
+/// The caller's authority and drift fence, for a proposal made outside `POST /{ds}/claims`.
 pub(crate) fn caller_fence(
     st: Arc<AppState>,
+    main: &crate::state::Dataset,
     p: Principal,
-) -> Arc<dyn sparkles::evidence::AuthorityFence> {
-    Arc::new(CallerFence { st, p })
+) -> sparkles::Result<Arc<dyn sparkles::evidence::AuthorityFence>> {
+    let drift = crate::settings::evidence::DriftFence::capture(&st, main)?;
+    Ok(Arc::new(CallerFence { st, p, drift }))
 }
 
 /// Propose `input` on `logical`, a branch of `main` or `main` itself, as `p`, reading
@@ -909,6 +914,7 @@ pub(crate) fn propose_ingested(
     options: &ProposeOptions,
     control: &sparkles::task::Control,
 ) -> ApiResult<sparkles::evidence::Proposed> {
+    crate::settings::evidence::require_reconciled(st, main)?;
     type Policy = Option<Arc<sparkles::access::GraphAccess>>;
     let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
         std::collections::HashMap::new();
@@ -992,9 +998,11 @@ pub(super) fn propose_now(
     options.message = request.message.map(Arc::from);
     options.author = crate::http::author(&p);
     options.write = opts.graphs.clone();
+    let drift = crate::settings::evidence::DriftFence::capture(&st, &main)?;
     options.authority = Some(Arc::new(CallerFence {
         st: st.clone(),
         p: p.clone(),
+        drift,
     }));
     type Policy = Option<Arc<sparkles::access::GraphAccess>>;
     let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =

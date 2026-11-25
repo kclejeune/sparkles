@@ -355,11 +355,14 @@ pub enum ManagedErrorKind {
     /// The dataset was restored and its jobs recovery is pausing the restored work, so
     /// the transition was refused (spec C26 §7.3).
     JobsRecovering,
+    /// The server's declared evidence settings differ from the settings recorded on the
+    /// dataset, so typed evidence operations are refused until reconciled (spec C25, C19).
+    EvidenceSettingsDrift,
 }
 
 impl ManagedErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ManagedErrorKind; 27] = [
+    pub const ALL: [ManagedErrorKind; 28] = [
         ManagedErrorKind::Protected,
         ManagedErrorKind::Unavailable,
         ManagedErrorKind::UnsupportedProfile,
@@ -387,6 +390,7 @@ impl ManagedErrorKind {
         ManagedErrorKind::PublicationConflict,
         ManagedErrorKind::JobsOverloaded,
         ManagedErrorKind::JobsRecovering,
+        ManagedErrorKind::EvidenceSettingsDrift,
     ];
 
     /// The stable code of the kind.
@@ -419,6 +423,7 @@ impl ManagedErrorKind {
             ManagedErrorKind::PublicationConflict => "publication-conflict",
             ManagedErrorKind::JobsOverloaded => "jobs-overloaded",
             ManagedErrorKind::JobsRecovering => "jobs-recovering",
+            ManagedErrorKind::EvidenceSettingsDrift => "evidence-settings-drift",
         }
     }
 
@@ -494,7 +499,8 @@ impl ManagedError {
             | ManagedErrorKind::ConfigurationHistoryInactive
             | ManagedErrorKind::LeaseLost
             | ManagedErrorKind::PublicationConflict
-            | ManagedErrorKind::JobsRecovering => 409,
+            | ManagedErrorKind::JobsRecovering
+            | ManagedErrorKind::EvidenceSettingsDrift => 409,
             ManagedErrorKind::JobsOverloaded => 429,
             ManagedErrorKind::AuthorityChanged | ManagedErrorKind::ProjectionUnavailable => 503,
         }

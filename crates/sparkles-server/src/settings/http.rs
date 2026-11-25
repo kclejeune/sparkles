@@ -220,7 +220,7 @@ pub(crate) fn plan(
 }
 
 /// The `409` of a write to locked fields of `kind`.
-fn locked_error_of(kind: &str, fields: &[String], owner: &str) -> crate::http::ApiError {
+pub(crate) fn locked_error_of(kind: &str, fields: &[String], owner: &str) -> crate::http::ApiError {
     let shown: Vec<&str> = fields
         .iter()
         .map(|f| if f.is_empty() { kind } else { f.as_str() })
@@ -358,6 +358,42 @@ fn with_etag(r: &Resolved, dataset: &str) -> Response {
     tagged(Json(r.json(dataset)).into_response(), &r.etag)
 }
 
+fn evidence_response(state: super::evidence::EvidenceState, dataset: &str) -> ApiResult<Response> {
+    Ok(tagged(
+        Json(state.json(dataset)?).into_response(),
+        &state.resolved.etag,
+    ))
+}
+
+async fn write_kind(
+    st: Arc<AppState>,
+    ds: Arc<Dataset>,
+    kind: &'static Kind,
+    w: Write,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
+    if super::evidence::is(kind) {
+        refuse_read_only(&st)?;
+        let if_match = if_match(headers);
+        let op = op_of(w, kind)?;
+        return blocking(move || {
+            let state = super::evidence::write_c19(&st, &ds, op, if_match.as_deref())?;
+            evidence_response(state, &ds.name)
+        })
+        .await;
+    }
+    let r = write(st, ds.clone(), kind, w, headers).await?;
+    Ok(with_etag(&r, &ds.name))
+}
+
+/// Whether `p` may read the `evidence` settings of `ds` (C25 decision 7: needs `admin`).
+fn can_read_evidence(p: &Option<Extension<Principal>>, ds: &str) -> bool {
+    match p {
+        None => true,
+        Some(Extension(p)) => p.can(ds, crate::auth::Level::Admin),
+    }
+}
+
 fn tagged(mut resp: Response, etag: &str) -> Response {
     if let Ok(v) = HeaderValue::from_str(etag) {
         resp.headers_mut().insert(header::ETAG, v);
@@ -378,18 +414,26 @@ async fn status(State(st): St) -> Json<Value> {
     Json(st.settings.status_json(&st))
 }
 
-async fn get_all(State(st): St, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+async fn get_all(
+    State(st): St,
+    Path(name): Path<String>,
+    p: Option<Extension<Principal>>,
+) -> ApiResult<Json<Value>> {
     let ds = dataset(&st, &name)?;
+    let allow_evidence = can_read_evidence(&p, &ds.name);
     blocking(move || {
-        let kinds: Map<String, Value> = KINDS
+        let kinds = KINDS
             .iter()
+            .filter(|k| allow_evidence || !super::evidence::is(k))
             .map(|k| {
-                (
-                    k.name.to_string(),
-                    super::resolved(&st, &ds, k).json(&ds.name),
-                )
+                let value = if super::evidence::is(k) {
+                    super::evidence::inspect(&st, &ds).and_then(|state| state.json(&ds.name))?
+                } else {
+                    super::resolved(&st, &ds, k).json(&ds.name)
+                };
+                Ok((k.name.to_string(), value))
             })
-            .collect();
+            .collect::<ApiResult<Map<String, Value>>>()?;
         Ok(Json(json!({ "dataset": ds.name, "kinds": kinds })))
     })
     .await
@@ -398,10 +442,20 @@ async fn get_all(State(st): St, Path(name): Path<String>) -> ApiResult<Json<Valu
 async fn get_kind(
     State(st): St,
     Path((name, kind)): Path<(String, String)>,
+    p: Option<Extension<Principal>>,
 ) -> ApiResult<Response> {
     let ds = dataset(&st, &name)?;
     let kind = kind_of(&kind)?;
+    if super::evidence::is(kind) && !can_read_evidence(&p, &ds.name) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!("evidence settings need admin on /{}", ds.name),
+        ));
+    }
     blocking(move || {
+        if super::evidence::is(kind) {
+            return evidence_response(super::evidence::inspect(&st, &ds)?, &ds.name);
+        }
         let rt = runtime(&st, &ds, kind)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
         let models = st.models();
@@ -425,8 +479,7 @@ async fn put_kind(
 ) -> ApiResult<Response> {
     let ds = dataset(&st, &name)?;
     let kind = kind_of(&kind)?;
-    let r = write(st, ds.clone(), kind, Write::Put(body), &headers).await?;
-    Ok(with_etag(&r, &ds.name))
+    write_kind(st, ds, kind, Write::Put(body), &headers).await
 }
 
 async fn patch_kind(
@@ -437,8 +490,7 @@ async fn patch_kind(
 ) -> ApiResult<Response> {
     let ds = dataset(&st, &name)?;
     let kind = kind_of(&kind)?;
-    let r = write(st, ds.clone(), kind, Write::Patch(body), &headers).await?;
-    Ok(with_etag(&r, &ds.name))
+    write_kind(st, ds, kind, Write::Patch(body), &headers).await
 }
 
 #[derive(Deserialize)]
@@ -458,8 +510,7 @@ async fn delete_kind(
 ) -> ApiResult<Response> {
     let ds = dataset(&st, &name)?;
     let kind = kind_of(&kind)?;
-    let r = write(st, ds.clone(), kind, Write::Delete(q.field), &headers).await?;
-    Ok(with_etag(&r, &ds.name))
+    write_kind(st, ds, kind, Write::Delete(q.field), &headers).await
 }
 
 // ------------------------------------------------------ server-wide kinds (§11.3) ------

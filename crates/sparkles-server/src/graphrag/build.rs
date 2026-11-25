@@ -538,6 +538,8 @@ impl Run<'_> {
             ));
         }
         if let Some(e) = evidence {
+            crate::settings::evidence::require_reconciled(self.st, &self.ds)
+                .map_err(super::evidence::engine)?;
             e.check()?;
         }
         Ok(())
@@ -588,6 +590,10 @@ impl Run<'_> {
     /// evidence").
     fn prepare(&self, p: &Principal, previous: &BuildState) -> Result<Prepared, RunError> {
         let opts = options_of(self.st, &self.ds, p, self.cancel.clone());
+        if self.settings.review_policy.is_some() {
+            crate::settings::evidence::require_reconciled(self.st, &self.ds)
+                .map_err(super::evidence::engine)?;
+        }
         let mut ev = Evidence::admit(
             &self.ds,
             self.settings.review_policy.as_deref(),

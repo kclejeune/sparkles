@@ -211,9 +211,11 @@ fn prepare(
     options.message = message.map(Arc::from);
     options.author = crate::http::author(p);
     options.write = opts.graphs.clone();
+    let drift = crate::settings::evidence::DriftFence::capture(st, &main)?;
     options.authority = Some(Arc::new(CallerFence {
         st: st.clone(),
         p: p.clone(),
+        drift,
     }));
     Ok(Prepared {
         main,

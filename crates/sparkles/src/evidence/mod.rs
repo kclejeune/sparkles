@@ -132,8 +132,8 @@ pub use sparkles_core::evidence::{
 // ------------------------------------------------------------ settings ------------
 
 pub use sparkles_core::evidence::{
-    CanonicalSettings, ClaimKind, ConflictMode, IdentityInput, IdentityRelation, MatchingPolicy,
-    Policy, RecordKind, Settings, Sha256Digest,
+    CanonicalSettings, ClaimKind, ConflictMode, IdentityInput, IdentityRelation,
+    MAX_POLICY_NAME_BYTES, MatchingPolicy, Policy, RecordKind, Settings, Sha256Digest,
 };
 
 use crate::managed::{OwnerEntry, OwnerKind};

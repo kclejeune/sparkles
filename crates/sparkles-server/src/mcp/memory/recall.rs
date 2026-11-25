@@ -2242,6 +2242,8 @@ impl Tools<'_> {
                 .ok_or_else(|| ToolError::new("unknown-dataset", 404, "the dataset is gone"))?,
             None => ds.clone(),
         };
+        crate::settings::evidence::require_reconciled(&self.server.state, &main)
+            .map_err(|e| ctx.engine(e))?;
         let control = sparkles::task::Control {
             deadline: Some(deadline),
             ..sparkles::task::Control::with_cancel(self.call.cancel.clone())
