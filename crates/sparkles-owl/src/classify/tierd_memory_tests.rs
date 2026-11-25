@@ -7166,30 +7166,27 @@ fn disjoint_union_deduplication_polls_wide_rewritten_operands_and_cancels() {
     }
 
     // 3. Uncancelled 3-operand run emits `SubClassOf(d, owl:Nothing)` once and stays sound.
+    //    Measure planner allocations without any test probe installed so probe hooks and
+    //    trace buffers are excluded from `sample.peak` and `sample.live`.
     {
-        let trace = Arc::new(Mutex::new(Vec::new()));
-        let trace_probe = trace.clone();
         let mut admitted_peak = 0usize;
         let (red_opt, sample) = measure(|| {
-            with_merge_probe(
-                move |phase| trace_probe.lock().push(phase),
-                || match super::dl_reduce::plan_budgeted(
-                    &refs3,
-                    None,
-                    None,
-                    0,
-                    &mut || Ok::<(), ()>(()),
-                    &mut |used| {
-                        admitted_peak = admitted_peak.max(used);
-                        true
-                    },
-                )
-                .unwrap()
-                {
-                    super::dl_reduce::Plan::Ready(r) => Some(r),
-                    _ => None,
+            match super::dl_reduce::plan_budgeted(
+                &refs3,
+                None,
+                None,
+                0,
+                &mut || Ok::<(), ()>(()),
+                &mut |used| {
+                    admitted_peak = admitted_peak.max(used);
+                    true
                 },
             )
+            .unwrap()
+            {
+                super::dl_reduce::Plan::Ready(r) => Some(r),
+                _ => None,
+            }
         });
         let red = red_opt.expect("3-operand duplicate-image DisjointUnion must succeed");
         let empty_axioms = red
@@ -7218,6 +7215,26 @@ fn disjoint_union_deduplication_polls_wide_rewritten_operands_and_cancels() {
             red.retained_bytes(),
             sample.live
         );
+        drop(red);
+
+        // Verify probe pairing separately outside the counting-allocator sample.
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let plan = with_merge_probe(
+            move |phase| trace_probe.lock().push(phase),
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs3,
+                    None,
+                    None,
+                    0,
+                    &mut || Ok::<(), ()>(()),
+                    &mut |_| true,
+                )
+                .unwrap()
+            },
+        );
+        assert!(matches!(plan, super::dl_reduce::Plan::Ready(_)));
         let t = trace.lock().clone();
         let starts = t
             .iter()
@@ -7229,7 +7246,176 @@ fn disjoint_union_deduplication_polls_wide_rewritten_operands_and_cancels() {
             .count();
         assert_eq!(starts, 2);
         assert_eq!(dones, 2);
-        drop(red);
+    }
+}
+
+/// Sol P2 (r5): a duplicate rewritten operand arriving when `images` is at capacity
+/// (`len == capacity`, e.g. 1,024 entries) must not reserve unused vector doubling or
+/// hash-map growth before deduplication, so a tight grant covering actual allocations
+/// still succeeds.
+#[test]
+fn disjoint_union_full_vector_duplicate_does_not_reserve_unused_growth() {
+    let disj = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:FullVecZ")),
+        ClassExpression::ObjectUnionOf(
+            [
+                ClassExpression::Class(Class::new("urn:tierd1291:FullVecZ1")),
+                ClassExpression::Class(Class::new("urn:tierd1291:FullVecZ2")),
+            ]
+            .into(),
+        ),
+    );
+    let union_cls = Class::new("urn:tierd1291:FullVecUnion");
+    let top = ObjectPropertyExpression::Property(ObjectProperty::top());
+    let filler = ClassExpression::Class(Class::new("urn:tierd1291:FullVecA"));
+
+    // Variant order in `ClassExpression`:
+    //   ObjectSomeValuesFrom < ObjectHasValue < ObjectMinCardinality
+    // So 1 existential + 1,023 distinct `ObjectHasValue` fill `images` to len == cap == 1024
+    // before the trailing equivalent `ObjectMinCardinality(1, top, Some(filler))` is visited.
+    let first = ClassExpression::ObjectSomeValuesFrom(top.clone(), Box::new(filler.clone()));
+    let dup = ClassExpression::ObjectMinCardinality(1, top.clone(), Some(Box::new(filler)));
+    let mut base_ops = std::collections::BTreeSet::new();
+    base_ops.insert(first);
+    for i in 0..1023usize {
+        base_ops.insert(ClassExpression::ObjectHasValue(
+            top.clone(),
+            Individual::anonymous(format!("fv{i}")),
+        ));
+    }
+    assert_eq!(base_ops.len(), 1024);
+
+    let mut dup_ops = base_ops.clone();
+    assert!(dup_ops.insert(dup.clone()));
+    assert_eq!(dup_ops.len(), 1025);
+    assert_eq!(
+        dup_ops.last(),
+        Some(&dup),
+        "duplicate operand must sort last after 1,024 unique operands"
+    );
+
+    let du_no_dup = AxiomKind::DisjointUnion(union_cls.clone(), base_ops);
+    let du_with_dup = AxiomKind::DisjointUnion(union_cls, dup_ops);
+    let refs_no_dup = [&disj, &du_no_dup];
+    let refs_with_dup = [&disj, &du_with_dup];
+
+    // Baseline peak for the 1,024 unique operands alone.
+    let mut base_admitted_peak = 0usize;
+    let base_plan = super::dl_reduce::plan_budgeted(
+        &refs_no_dup,
+        None,
+        None,
+        0,
+        &mut || Ok::<(), ()>(()),
+        &mut |used| {
+            base_admitted_peak = base_admitted_peak.max(used);
+            true
+        },
+    )
+    .unwrap();
+    assert!(matches!(base_plan, super::dl_reduce::Plan::Ready(_)));
+    drop(base_plan);
+
+    // Measure the 1,025-operand (1,024 unique + 1 full-vector duplicate) run.
+    let mut admitted_peak = 0usize;
+    let (red_opt, sample) = measure(|| {
+        match super::dl_reduce::plan_budgeted(
+            &refs_with_dup,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                admitted_peak = admitted_peak.max(used);
+                true
+            },
+        )
+        .unwrap()
+        {
+            super::dl_reduce::Plan::Ready(r) => Some(r),
+            _ => None,
+        }
+    });
+    let red = red_opt.expect("unlimited full-vector duplicate DisjointUnion must succeed");
+    assert!(
+        admitted_peak >= sample.peak,
+        "admitted peak ({admitted_peak}) undercounted measured peak ({})",
+        sample.peak
+    );
+    assert!(
+        red.retained_bytes() >= sample.live,
+        "retained_bytes ({}) undercounted measured live ({})",
+        red.retained_bytes(),
+        sample.live
+    );
+    let empty_axioms = red
+        .axioms
+        .iter()
+        .filter(|ax| {
+            matches!(
+                ax,
+                AxiomKind::SubClassOf(_, ClassExpression::Class(c))
+                    if c.as_str() == crate::vocab::OWL_NOTHING
+            )
+        })
+        .count();
+    assert_eq!(empty_axioms, 1);
+    drop(red);
+
+    // A tight grant covering the 1,024-entry baseline plus the duplicate payload and its
+    // emitted `SubClassOf(d, owl:Nothing)` (far below a speculative 2,048-entry `images`
+    // doubling) must succeed rather than decline.
+    let tight_grant = base_admitted_peak + 4096;
+    assert!(
+        admitted_peak <= tight_grant,
+        "full-vector duplicate over-reserved: admitted_peak={admitted_peak} > tight_grant={tight_grant} (base={base_admitted_peak})"
+    );
+    let (tight_plan, tight_sample) = measure(|| {
+        super::dl_reduce::plan_budgeted(
+            &refs_with_dup,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| used <= tight_grant,
+        )
+        .unwrap()
+    });
+    assert!(
+        matches!(tight_plan, super::dl_reduce::Plan::Ready(_)),
+        "tight grant ({tight_grant}) covering actual allocations must succeed"
+    );
+    assert!(
+        tight_sample.peak <= tight_grant,
+        "measured peak ({}) exceeded tight grant ({tight_grant})",
+        tight_sample.peak
+    );
+    drop(tight_plan);
+
+    // Exact boundary check at `admitted_peak` and `admitted_peak - 1`.
+    for (grant, expect_ready) in [(admitted_peak, true), (admitted_peak - 1, false)] {
+        let (plan, boundary_sample) = measure(|| {
+            super::dl_reduce::plan_budgeted(
+                &refs_with_dup,
+                None,
+                None,
+                0,
+                &mut || Ok::<(), ()>(()),
+                &mut |used| used <= grant,
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            matches!(plan, super::dl_reduce::Plan::Ready(_)),
+            expect_ready,
+            "grant={grant} expected ready={expect_ready}"
+        );
+        assert!(
+            boundary_sample.peak <= grant,
+            "measured peak ({}) exceeded boundary grant ({grant})",
+            boundary_sample.peak
+        );
+        drop(plan);
     }
 }
 

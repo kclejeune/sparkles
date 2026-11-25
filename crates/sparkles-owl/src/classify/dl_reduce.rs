@@ -1582,36 +1582,15 @@ fn disjoint_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
         let Ok(d_bytes) = estimate_ce_polled(elem, poller)? else {
             unreachable!("retarget_eligible_polled already validated disjoint operands");
         };
-        let img_vec_grow = if images.len() == images.capacity() {
-            let Some(new_cap) = super::dl_clause::next_vec_cap(
-                images.capacity(),
-                std::mem::size_of::<DisjointImage>(),
-            ) else {
-                return Ok(false);
-            };
-            let Some(bytes) = new_cap.checked_mul(std::mem::size_of::<DisjointImage>()) else {
-                return Ok(false);
-            };
-            bytes
-        } else {
-            0
-        };
-        let hash_next = btree_map_bytes::<u64, usize>(by_hash.len() + 1);
-        let hash_delta = hash_next.saturating_sub(by_hash_tree_bytes);
-        let Some(need) = d_bytes
-            .checked_add(img_vec_grow)
-            .and_then(|b| b.checked_add(hash_delta))
-        else {
-            return Ok(false);
-        };
-        if !budget.try_temp(need) {
+        if !budget.try_temp(d_bytes) {
             return Ok(false);
         }
         let Ok(d) = cx.ce_polled(elem, poller)? else {
             unreachable!("retarget_eligible_polled already validated disjoint operands");
         };
         let h = hash_ce_polled(&d, poller)?;
-        let mut cur = by_hash.get(&h).copied();
+        let head = by_hash.get(&h).copied();
+        let mut cur = head;
         let mut found = None;
         while let Some(i) = cur {
             poller.tick()?;
@@ -1627,13 +1606,43 @@ fn disjoint_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
                 budget.held = budget.held.saturating_add(d_bytes);
             }
         } else {
+            let img_vec_grow = if images.len() == images.capacity() {
+                let Some(new_cap) = super::dl_clause::next_vec_cap(
+                    images.capacity(),
+                    std::mem::size_of::<DisjointImage>(),
+                ) else {
+                    return Ok(false);
+                };
+                let Some(bytes) = new_cap.checked_mul(std::mem::size_of::<DisjointImage>()) else {
+                    return Ok(false);
+                };
+                bytes
+            } else {
+                0
+            };
+            let (hash_next, hash_delta) = if head.is_none() {
+                let next = btree_map_bytes::<u64, usize>(by_hash.len() + 1);
+                (next, next.saturating_sub(by_hash_tree_bytes))
+            } else {
+                (by_hash_tree_bytes, 0)
+            };
+            if img_vec_grow > 0 || hash_delta > 0 {
+                let Some(need) = d_bytes
+                    .checked_add(img_vec_grow)
+                    .and_then(|b| b.checked_add(hash_delta))
+                else {
+                    return Ok(false);
+                };
+                if !budget.try_temp(need) {
+                    return Ok(false);
+                }
+            }
             let new_idx = images.len();
             let old_cap = images.capacity();
             let prev = by_hash.insert(h, new_idx);
             let actual_hash_delta = if prev.is_none() {
-                let delta = hash_next.saturating_sub(by_hash_tree_bytes);
                 by_hash_tree_bytes = hash_next;
-                delta
+                hash_delta
             } else {
                 0
             };
