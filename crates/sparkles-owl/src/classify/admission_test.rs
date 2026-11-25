@@ -406,6 +406,7 @@ pub(super) enum SplitAllocSite {
     SynthAxioms,
     LeafLive,
     StopHandoff,
+    MergeHandoff,
     ForkStack,
     ForkMergeClone,
     ForkNeq,
@@ -464,6 +465,7 @@ pub(super) enum MergePhase {
         restarts: usize,
         outcome: PlanKind,
     },
+    SplitHelperHandoff,
     SatStop {
         stop: u8,
         helper_ran: bool,
@@ -489,7 +491,7 @@ pub(super) enum MergePhase {
         used: usize,
         paid_before: usize,
         paid_after: usize,
-        delta: usize,
+        requested: usize,
         admitted: bool,
     },
     SplitLeafExportStart {

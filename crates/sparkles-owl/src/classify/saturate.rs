@@ -842,6 +842,21 @@ thread_local! {
     /// and [`HELPER`] in a run without steps, [`STEP_CALLER`] and [`STEP_HELPER`] in a run
     /// in steps, so that a test's callback knows where it is called.
     pub(super) static WORKER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Lets helpers pick up a context before the calling worker in split-enabled test runs.
+    static FORCE_HELPER_WORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn with_force_helper_work<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_HELPER_WORK.with(|f| f.set(self.0));
+        }
+    }
+    let prev = FORCE_HELPER_WORK.with(|f| f.replace(true));
+    let _reset = Reset(prev);
+    run()
 }
 #[cfg(test)]
 pub(super) const FIRST_WORKER: u8 = 1;
@@ -3312,6 +3327,32 @@ impl<'a> Run<'a> {
     fn worker<R: Rules>(&self, mut others: Option<&dyn Fn()>) {
         // dropped last, after what the worker holds
         let _halt = HaltOnPanic::new(self);
+        #[cfg(test)]
+        if R::DISJ
+            && FORCE_HELPER_WORK.with(|f| f.get())
+            && self
+                .bounds
+                .dl
+                .is_some_and(|d| d.split_mode() != super::dl_rules::SplitMode::Disabled)
+            && let Some(start) = others.take()
+        {
+            start();
+            if !self.roots.is_empty() {
+                let wait_until = Instant::now() + Duration::from_secs(2);
+                while !self.helper_worked.load(Ordering::Acquire)
+                    && !self.stopped()
+                    && self.pending.load(Ordering::Acquire) > 1
+                    && Instant::now() < wait_until
+                {
+                    std::thread::yield_now();
+                }
+                if self.helper_worked.load(Ordering::Acquire) {
+                    super::admission_test::emit_merge_phase(
+                        super::admission_test::MergePhase::SplitHelperHandoff,
+                    );
+                }
+            }
+        }
         if self.roots.len() >= EAGER_ROOTS
             && let Some(start) = others.take()
         {
@@ -3401,7 +3442,7 @@ impl<'a> Run<'a> {
             }
             #[cfg(test)]
             if WORKER.with(|w| w.get() == HELPER) {
-                self.helper_worked.store(true, Ordering::Relaxed);
+                self.helper_worked.store(true, Ordering::Release);
             }
             self.process::<R>(
                 next,

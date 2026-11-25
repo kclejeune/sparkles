@@ -7802,7 +7802,7 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
                     used,
                     paid_before,
                     paid_after,
-                    delta,
+                    requested,
                     admitted,
                 } => {
                     assert!(admitted, "unbounded shoi-042 charge must succeed");
@@ -7811,9 +7811,14 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
                         "watermark must not decrease within one charge: before={paid_before}, after={paid_after}"
                     );
                     assert_eq!(
-                        delta,
+                        requested,
+                        used.saturating_sub(paid_before),
+                        "each ledger {source:?} call must request precisely the amount above the current watermark (used={used}, paid_before={paid_before}, requested={requested})"
+                    );
+                    assert_eq!(
                         paid_after - paid_before,
-                        "accepted delta must equal watermark advance"
+                        requested,
+                        "watermark advance must equal real charge callback request"
                     );
                     assert!(
                         paid_before >= prev_paid_after,
@@ -7831,7 +7836,7 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
                     }
                     prev_paid_after = paid_after;
                     last_source = Some(source);
-                    ledger_deltas_sum = ledger_deltas_sum.saturating_add(delta);
+                    ledger_deltas_sum = ledger_deltas_sum.saturating_add(requested);
                 }
                 _ => {}
             }
@@ -8716,4 +8721,721 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             Err(other) => panic!("unexpected error on long-IRI STOP_SPLIT refusal: {other:?}"),
         }
     }
+}
+
+#[test]
+fn split_round4_reused_interner_owns_role_iri() {
+    use super::admission_test::{MergePhase, SplitAllocSite, with_merge_probe};
+
+    let pad256k = "r".repeat(256 * 1024);
+    let prior_ofn = format!(
+        "Prefix(:=<http://example.org/rp#>)\n\
+         Ontology(<http://example.org/rp>\n\
+           ObjectPropertyAssertion(:p_{pad256k} :x :y)\n\
+         )"
+    );
+    let prior_doc = crate::ofn_read::parse(&prior_ofn).unwrap();
+    let prior_refs: Vec<&AxiomKind> = prior_doc.axioms.iter().map(|a| &a.kind).collect();
+    let mut sat = Saturation::new();
+    let prior_out = sat
+        .classify(
+            &prior_refs,
+            None,
+            &Limits {
+                threads: 1,
+                el_only: true,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert!(prior_out.complete);
+    let role_iri_bytes = pad256k.len();
+    let entry_live = sat.leaf_live_bytes_without_canon_and_merge();
+    assert!(
+        entry_live >= role_iri_bytes,
+        "entry estimate ({entry_live}) must include the owned role IRI ({role_iri_bytes})"
+    );
+
+    let mut small_ax = Vec::new();
+    let a = crate::model::Individual::named("http://example.org/rps#a");
+    let b = crate::model::Individual::named("http://example.org/rps#b");
+    small_ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+        crate::model::ClassExpression::ObjectOneOf(std::collections::BTreeSet::from([
+            a.clone(),
+            b,
+        ])),
+        a,
+    )));
+    for i in 0..40usize {
+        small_ax.push(crate::model::Axiom::new(AxiomKind::Declaration(
+            crate::model::Entity::Class(Class::new(format!(
+                "http://example.org/rps#S{i:02}_{}",
+                "y".repeat(64)
+            ))),
+        )));
+    }
+    let small_refs: Vec<&AxiomKind> = small_ax.iter().map(|x| &x.kind).collect();
+    let cap_reuse = entry_live.saturating_add(3072);
+    let lim_reuse = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        max_memory: Some(cap_reuse),
+        ..Limits::default()
+    };
+    let mut sat_fresh = Saturation::new();
+    assert!(
+        sat_fresh
+            .classify(&small_refs, None, &lim_reuse)
+            .unwrap()
+            .complete,
+        "fresh saturation must fit easily under cap_reuse={cap_reuse}"
+    );
+    let orig_sig_ev = Arc::new(parking_lot::Mutex::new(None::<(usize, bool)>));
+    let ose = orig_sig_ev.clone();
+    let reuse_err = with_merge_probe(
+        move |p| {
+            if let MergePhase::SplitAlloc {
+                site: SplitAllocSite::OrigSig,
+                proposed,
+                admitted,
+            } = p
+            {
+                *ose.lock() = Some((proposed, admitted));
+            }
+        },
+        || sat.classify(&small_refs, None, &lim_reuse).unwrap_err(),
+    );
+    assert!(
+        matches!(reuse_err, Error::Memory { used, .. } if used > cap_reuse),
+        "reused saturation must refuse when prior role IRI bytes ({role_iri_bytes}) exceed cap {cap_reuse}, got {reuse_err:?}"
+    );
+    assert!(
+        matches!(*orig_sig_ev.lock(), Some((proposed, false)) if proposed > cap_reuse),
+        "role-IRI reuse refusal must occur at OrigSig with proposed > {cap_reuse}, got {:?}",
+        *orig_sig_ev.lock()
+    );
+    assert_eq!(
+        sat.interner.bytes(),
+        0,
+        "terminal refused classify must leave interner empty"
+    );
+}
+
+#[test]
+fn split_round4_leaf_export_charges_role_iri() {
+    use super::admission_test::{MergePhase, SplitAllocSite, with_merge_probe};
+
+    let pad320k = "q".repeat(320 * 1024);
+    let mut lf_ax = Vec::new();
+    let a = crate::model::Individual::named("http://example.org/rlf#a");
+    let b = crate::model::Individual::named("http://example.org/rlf#b");
+    let c = crate::model::Individual::named("http://example.org/rlf#c");
+    let rep = crate::model::Individual::named("http://example.org/rlf#rep");
+    let root = Class::new("http://example.org/rlf#Root");
+    let long_prop =
+        crate::model::ObjectProperty::new(format!("http://example.org/rlf#rel_{pad320k}"));
+    lf_ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+        crate::model::ClassExpression::ObjectOneOf(std::collections::BTreeSet::from([
+            b.clone(),
+            c.clone(),
+        ])),
+        a.clone(),
+    )));
+    lf_ax.push(crate::model::Axiom::new(
+        AxiomKind::ObjectPropertyAssertion(
+            crate::model::ObjectPropertyExpression::Property(long_prop),
+            a.clone(),
+            b.clone(),
+        ),
+    ));
+    lf_ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+        crate::model::ClassExpression::Class(root.clone()),
+        rep.clone(),
+    )));
+    for i in 0..300usize {
+        let ci = Class::new(format!("http://example.org/rlf#C{i:03}"));
+        lf_ax.push(crate::model::Axiom::sub_class_of(root.clone(), ci));
+    }
+    for i in 0..400usize {
+        let alias = crate::model::Individual::named(format!("http://example.org/rlf#i{i:03}"));
+        lf_ax.push(crate::model::Axiom::new(AxiomKind::SameIndividual(
+            std::collections::BTreeSet::from([rep.clone(), alias]),
+        )));
+    }
+    let lf_refs: Vec<&AxiomKind> = lf_ax.iter().map(|x| &x.kind).collect();
+    let lim_lf = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        ..Limits::default()
+    };
+    let export_watermarks = |refs: &[&AxiomKind]| {
+        let tally = Arc::new(AtomicUsize::new(0));
+        let charge = tally.clone();
+        let watermarks = Arc::new(parking_lot::Mutex::new((0, 0, 0)));
+        let record = watermarks.clone();
+        let out = with_merge_probe(
+            move |phase| {
+                let mut record = record.lock();
+                match phase {
+                    MergePhase::SplitAlloc {
+                        site: SplitAllocSite::LeafLive,
+                        proposed,
+                        admitted: true,
+                    } if record.0 == 0 => record.0 = proposed,
+                    MergePhase::SplitLeafExportStart { leaves: 0 } => {
+                        record.1 = tally.load(Ordering::Relaxed);
+                    }
+                    MergePhase::SplitLeafExportDone { leaves: 0 } => {
+                        record.2 = tally.load(Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            },
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+                    Saturation::new()
+                        .classify(
+                            refs,
+                            None,
+                            &Limits {
+                                charge: Some(Arc::new(move |more| {
+                                    charge.fetch_add(more, Ordering::Relaxed);
+                                    true
+                                })),
+                                ..lim_lf.clone()
+                            },
+                        )
+                        .unwrap()
+                })
+            },
+        );
+        assert!(out.complete && out.stats.dl_rooted_splits >= 1);
+        *watermarks.lock()
+    };
+
+    let short_property = AxiomKind::ObjectPropertyAssertion(
+        crate::model::ObjectPropertyExpression::Property(crate::model::ObjectProperty::new(
+            "http://example.org/rlf#rel_",
+        )),
+        a,
+        b,
+    );
+    let mut short_refs = lf_refs.clone();
+    short_refs[1] = &short_property;
+    let (short_live, _, _) = export_watermarks(&short_refs);
+    let (long_live, pre_w, post_w) = export_watermarks(&lf_refs);
+    assert!(short_live > 0);
+    assert!(
+        long_live >= short_live + pad320k.len(),
+        "LeafLive grew from {short_live} to {long_live} for an extra {} role IRI bytes",
+        pad320k.len()
+    );
+    assert!(
+        post_w > pre_w + 512,
+        "role-IRI leaf export watermark ({post_w}) must exceed pre-export ({pre_w})"
+    );
+    let lf_cap = pre_w + (post_w - pre_w) / 2;
+    let saw_ref = Arc::new(AtomicBool::new(false));
+    let sr = saw_ref.clone();
+    let mut sat_cap = Saturation::new();
+    let res = with_merge_probe(
+        move |p| {
+            if matches!(p, MergePhase::SplitLeafExportRefused) {
+                sr.store(true, Ordering::Release);
+            }
+        },
+        || {
+            super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+                sat_cap.classify(
+                    &lf_refs,
+                    None,
+                    &Limits {
+                        max_memory: Some(lf_cap),
+                        ..lim_lf
+                    },
+                )
+            })
+        },
+    );
+    assert!(
+        saw_ref.load(Ordering::Acquire),
+        "long-role-IRI leaf export must refuse under overlap cap {lf_cap}"
+    );
+    match res {
+        Ok(fb) => assert!(!fb.complete && fb.stats.dl_over_budget),
+        Err(Error::Memory { used, .. }) => assert!(used > lf_cap),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn split_round4_split_handoff_keeps_exclusions_live() {
+    use super::admission_test::{MergePhase, SplitAllocSite, with_merge_probe};
+
+    let pad512k = "e".repeat(512 * 1024);
+    let ofn = format!(
+        "Prefix(:=<http://example.org/exsplit#>)\n\
+         Ontology(<http://example.org/exsplit>\n\
+           ClassAssertion(ObjectOneOf(:b :c) :a)\n\
+           IrreflexiveObjectProperty(:irref_{pad512k})\n\
+           ClassAssertion(:P :b)\n\
+           ClassAssertion(:P :c)\n\
+           SubClassOf(:A ObjectOneOf(:a))\n\
+         )"
+    );
+    let doc = crate::ofn_read::parse(&ofn).unwrap();
+    let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+    let lim = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        ..Limits::default()
+    };
+    let stop_prop = Arc::new(AtomicUsize::new(0));
+    let fork_neq_prop = Arc::new(AtomicUsize::new(0));
+    let sp = stop_prop.clone();
+    let fnp = fork_neq_prop.clone();
+    let mut sat_meas = Saturation::new();
+    let out_meas = with_merge_probe(
+        move |p| match p {
+            MergePhase::SplitAlloc {
+                site: SplitAllocSite::StopHandoff,
+                proposed,
+                admitted: true,
+            } => {
+                sp.fetch_max(proposed, Ordering::AcqRel);
+            }
+            MergePhase::SplitAlloc {
+                site: SplitAllocSite::ForkNeq,
+                proposed,
+                admitted: true,
+            } => {
+                fnp.fetch_max(proposed, Ordering::AcqRel);
+            }
+            _ => {}
+        },
+        || {
+            super::with_split_knobs(Some(0), Some(true), Some(4), Some(8), || {
+                sat_meas.classify(&refs, None, &lim).unwrap()
+            })
+        },
+    );
+    assert!(!out_meas.complete);
+    assert_eq!(sat_meas.excluded().len(), 1);
+    assert!(
+        stop_prop.load(Ordering::Acquire) > 512 * 1024,
+        "STOP_SPLIT StopHandoff proposed ({}) must include live 512 KiB self.excluded",
+        stop_prop.load(Ordering::Acquire)
+    );
+    assert!(
+        fork_neq_prop.load(Ordering::Acquire) > 512 * 1024,
+        "STOP_SPLIT ForkNeq proposed ({}) must keep live 512 KiB self.excluded debited",
+        fork_neq_prop.load(Ordering::Acquire)
+    );
+}
+
+#[test]
+fn split_round4_public_split_abort_leaves_empty_interner() {
+    use super::admission_test::{MergePhase, with_merge_probe};
+
+    let input = axioms(
+        "ClassAssertion(ObjectOneOf(:b :c) :a)
+         IrreflexiveObjectProperty(:irref)
+         ClassAssertion(:P :b)
+         ClassAssertion(:P :c)
+         SubClassOf(:A ObjectOneOf(:a))",
+    );
+    let refs: Vec<_> = input.iter().map(|axiom| &axiom.kind).collect();
+    let cancel_at_split = Arc::new(AtomicBool::new(false));
+    let c_cb = cancel_at_split.clone();
+    let c_pr = cancel_at_split.clone();
+    let mut sat_cancel = Saturation::new();
+    let cancel_err = with_merge_probe(
+        move |p| {
+            if matches!(p, MergePhase::SatStop { stop, .. } if stop == super::saturate::STOP_SPLIT)
+            {
+                c_pr.store(true, Ordering::Release);
+            }
+        },
+        || {
+            super::with_split_knobs(Some(0), Some(true), Some(4), Some(8), || {
+                sat_cancel
+                    .classify(
+                        &refs,
+                        None,
+                        &Limits {
+                            cancelled: Some(Arc::new(move || c_cb.load(Ordering::Acquire))),
+                            threads: 1,
+                            rooted: true,
+                            rooted_merge: true,
+                            rooted_eq_split: true,
+                            ..Limits::default()
+                        },
+                    )
+                    .unwrap_err()
+            })
+        },
+    );
+    assert!(
+        matches!(cancel_err, Error::Cancelled),
+        "expected Error::Cancelled on STOP_SPLIT handoff abort, got {cancel_err:?}"
+    );
+    assert_eq!(sat_cancel.excluded().len(), 1);
+    assert_eq!(sat_cancel.excluded()[0].axiom, *refs[1]);
+    assert_eq!(
+        sat_cancel.interner.bytes(),
+        0,
+        "terminal error path must leave interner empty (no eager reset())"
+    );
+}
+
+#[test]
+fn split_round4_merge_handoff_keeps_exclusions_live() {
+    use super::admission_test::{MergePhase, SplitAllocSite, with_merge_probe};
+
+    let pad512k = "m".repeat(512 * 1024);
+    let ofn = format!(
+        "Prefix(:=<http://example.org/exmerge#>)\n\
+         Ontology(<http://example.org/exmerge>\n\
+           SubClassOf(:D ObjectUnionOf(:E :F))\n\
+           SubClassOf(:X ObjectOneOf(:b))\n\
+           ClassAssertion(:X :a)\n\
+           IrreflexiveObjectProperty(:irref_{pad512k})\n\
+           ClassAssertion(:P :b)\n\
+           SubClassOf(:A ObjectOneOf(:a))\n\
+           Declaration(NamedIndividual(:c))\n\
+         )"
+    );
+    let doc = crate::ofn_read::parse(&ofn).unwrap();
+    let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+    let lim = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        ..Limits::default()
+    };
+    let mh_prop = Arc::new(AtomicUsize::new(0));
+    let mc_prop = Arc::new(AtomicUsize::new(0));
+    let mh = mh_prop.clone();
+    let mc = mc_prop.clone();
+    let mut sat = Saturation::new();
+    let out = with_merge_probe(
+        move |p| match p {
+            MergePhase::SplitAlloc {
+                site: SplitAllocSite::MergeHandoff,
+                proposed,
+                admitted: true,
+            } => {
+                mh.fetch_max(proposed, Ordering::AcqRel);
+            }
+            MergePhase::SplitAlloc {
+                site: SplitAllocSite::MergeCanon,
+                proposed,
+                admitted: true,
+            } => {
+                mc.fetch_max(proposed, Ordering::AcqRel);
+            }
+            _ => {}
+        },
+        || sat.classify(&refs, None, &lim).unwrap(),
+    );
+    assert!(!out.complete && out.stats.dl_rooted_restarts >= 1);
+    assert_eq!(sat.excluded().len(), 1);
+    assert!(
+        mh_prop.load(Ordering::Acquire) > 512 * 1024,
+        "STOP_MERGE MergeHandoff proposed ({}) must include live 512 KiB self.excluded",
+        mh_prop.load(Ordering::Acquire)
+    );
+    assert!(
+        mc_prop.load(Ordering::Acquire) > 512 * 1024,
+        "STOP_MERGE MergeCanon proposed ({}) must keep live 512 KiB self.excluded in canon_base",
+        mc_prop.load(Ordering::Acquire)
+    );
+}
+
+#[test]
+fn split_round4_declined_forked_plan_leaves_empty_interner() {
+    use super::admission_test::{MergePhase, PlanKind, with_merge_probe};
+
+    let input = axioms(
+        "HasKey(:K (:r) ())
+         ClassAssertion(ObjectOneOf(:b :c) :a)",
+    );
+    let refs: Vec<_> = input.iter().map(|axiom| &axiom.kind).collect();
+    let mut sat = Saturation::new();
+    assert!(sat.interner.bytes() > 0);
+    // Supply the driver's forked state to inspect the inner error before the driver
+    // performs its own cleanup. The public split-stop cancellation covers that cleanup.
+    sat.split_cfg = Some(SplitBranchCfg {
+        mode: dl_rules::SplitMode::EagerPureThenProbe,
+        probe: 0,
+        epoch: 1,
+        forked: true,
+        orig_individuals: Arc::default(),
+        neq: Vec::new(),
+    });
+    let limits = Limits {
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        threads: 1,
+        max_memory: Some(0),
+        ..Limits::default()
+    };
+    let outcome = Arc::new(parking_lot::Mutex::new(None));
+    let record = outcome.clone();
+    let result = with_merge_probe(
+        move |phase| {
+            if let MergePhase::PlanDone { outcome, .. } = phase {
+                *record.lock() = Some(outcome);
+            }
+        },
+        || {
+            sat.run(
+                &refs,
+                None,
+                0,
+                &limits,
+                &Arc::new(AtomicUsize::new(0)),
+                &mut 0,
+                false,
+            )
+        },
+    );
+    assert_eq!(*outcome.lock(), Some(PlanKind::Declined));
+    assert!(matches!(result, Err(Error::Memory { .. })));
+    assert!(sat.split_ineligible);
+    assert_eq!(sat.interner.bytes(), 0);
+}
+
+#[test]
+fn split_round4_ledger_covers_a_watermark_raising_fork() {
+    use super::admission_test::{LedgerChargeSource, MergePhase, SplitAllocSite, with_merge_probe};
+
+    // At the second fork the sibling's copied disequalities and the equality union
+    // both extend the previous paid peak. Stop after those actual admissions.
+    let suffix = "d".repeat(64 * 1024);
+    let input = axioms(&format!(
+        "SubClassOf(:X0 ObjectUnionOf(:B :X1))
+         SubClassOf(:X1 ObjectUnionOf(:C :X2))
+         SubClassOf(:X2 ObjectUnionOf(:D :X3))
+         SubClassOf(:X3 ObjectUnionOf(:E :F))
+         SubClassOf(:B ObjectOneOf(:b_{suffix}))
+         SubClassOf(:C ObjectOneOf(:c_{suffix}))
+         SubClassOf(:D ObjectOneOf(:d_{suffix}))
+         SubClassOf(:E ObjectOneOf(:e_{suffix}))
+         SubClassOf(:F ObjectOneOf(:f))
+         ClassAssertion(:X0 :a_{suffix})
+         ClassAssertion(:P :b_{suffix})
+         ClassAssertion(:P :c_{suffix})
+         ClassAssertion(:P :d_{suffix})
+         ClassAssertion(:P :e_{suffix})
+         ClassAssertion(:P :f)
+         SubClassOf(:A ObjectOneOf(:a_{suffix}))",
+    ));
+    let refs: Vec<_> = input.iter().map(|axiom| &axiom.kind).collect();
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let record = events.clone();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let stop = cancelled.clone();
+    let mut unions = 0;
+    let result = with_merge_probe(
+        move |phase| {
+            record.lock().push(phase);
+            if matches!(
+                phase,
+                MergePhase::SplitAlloc {
+                    site: SplitAllocSite::ForkEqUnion,
+                    admitted: true,
+                    ..
+                }
+            ) {
+                unions += 1;
+                if unions == 2 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+        },
+        || {
+            super::with_split_knobs(Some(0), Some(true), Some(8), Some(32), || {
+                Saturation::new().classify(
+                    &refs,
+                    None,
+                    &Limits {
+                        threads: 1,
+                        rooted: true,
+                        rooted_merge: true,
+                        rooted_eq_split: true,
+                        dl_work: Some(1_000_000),
+                        charge: Some(Arc::new(|_| true)),
+                        cancelled: Some(Arc::new(move || cancelled.load(Ordering::Relaxed))),
+                        ..Limits::default()
+                    },
+                )
+            })
+        },
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+
+    let events = events.lock();
+    let (delta_paid, before, used, requested) = events
+        .windows(4)
+        .find_map(|events| match events {
+            [
+                MergePhase::LedgerCharge {
+                    source: LedgerChargeSource::Delta,
+                    paid_after,
+                    requested: 1..,
+                    admitted: true,
+                    ..
+                },
+                MergePhase::SplitAlloc {
+                    site: SplitAllocSite::ForkNeq,
+                    admitted: true,
+                    ..
+                },
+                MergePhase::LedgerCharge {
+                    source: LedgerChargeSource::Cover,
+                    paid_before,
+                    used,
+                    requested,
+                    admitted: true,
+                    ..
+                },
+                MergePhase::SplitAlloc {
+                    site: SplitAllocSite::ForkEqUnion,
+                    admitted: true,
+                    ..
+                },
+            ] => Some((*paid_after, *paid_before, *used, *requested)),
+            _ => None,
+        })
+        .expect("a paid ForkNeq addition followed immediately by a ForkEqUnion cover");
+    assert_eq!(before, delta_paid);
+    assert!(requested > 0);
+    assert_eq!(requested, used - before);
+}
+
+#[test]
+fn split_round4_ledger_covers_a_watermark_raising_merge_remap() {
+    use super::admission_test::{LedgerChargeSource, MergePhase, with_merge_probe};
+
+    // A derived union changes the short name in a surviving disequality to a long
+    // representative. The replacement pair overlaps the old one, then the canonical
+    // map takes another copy of the representative. Both phases extend the paid peak.
+    let old = NamedIndividual::new("urn:test:z");
+    let representative = NamedIndividual::new(format!("urn:test:a{}", "r".repeat(64 * 1024)));
+    let mut merge = Merge::default();
+    assert!(
+        merge
+            .union_named(&old, &representative, 0, &mut |_| true)
+            .unwrap()
+    );
+    let mut neq = vec![(old, NamedIndividual::new("urn:test:zz"))];
+    let mut neq_bytes = SplitFrame::neq_owned_bytes(&neq);
+    let initial = merge.uf_bytes() + neq_bytes;
+    let admitted = Arc::new(AtomicUsize::new(initial));
+    let charged = Arc::new(AtomicUsize::new(0));
+    let charge = charged.clone();
+    let limits = Limits {
+        charge: Some(Arc::new(move |more| {
+            charge.fetch_add(more, Ordering::Relaxed);
+            true
+        })),
+        ..Limits::default()
+    };
+    let ledger = SplitLedger {
+        held_base: 0,
+        live: AtomicUsize::new(initial),
+        canon: AtomicUsize::new(0),
+        peak: AtomicUsize::new(initial),
+        admitted: &admitted,
+        limits: &limits,
+        lock: parking_lot::Mutex::new(()),
+    };
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let record = events.clone();
+    let remap_used = with_merge_probe(
+        move |phase| record.lock().push(phase),
+        || {
+            let (collapsed, remap_used) =
+                remap_split_neq(&merge, &mut neq, &mut neq_bytes, &ledger).unwrap();
+            assert!(!collapsed);
+            assert_eq!(neq[0].0, representative);
+            let canon_base = ledger.base_with_canon(merge.uf_bytes()).unwrap();
+            assert!(matches!(
+                merge.build_canon(canon_base, &limits, &mut |used| ledger.cover(used)),
+                Ok(Some(_))
+            ));
+            remap_used.unwrap()
+        },
+    );
+
+    let events = events.lock();
+    let [
+        MergePhase::LedgerCharge {
+            source: LedgerChargeSource::Delta,
+            used,
+            paid_before,
+            paid_after,
+            requested,
+            admitted: true,
+        },
+        MergePhase::LedgerCharge {
+            source: LedgerChargeSource::Cover,
+            used: canon_used,
+            paid_before: canon_before,
+            paid_after: canon_after,
+            requested: canon_requested,
+            admitted: true,
+        },
+    ] = events.as_slice()
+    else {
+        panic!("expected the remap addition and canonical-map cover, got {events:?}");
+    };
+    assert_eq!(
+        (*used, *paid_before, *paid_after),
+        (remap_used, initial, remap_used)
+    );
+    assert_eq!(*requested, remap_used - initial);
+    assert!(*requested > 0);
+    assert_eq!(*canon_before, remap_used);
+    assert_eq!(*canon_after, *canon_used);
+    assert_eq!(*canon_requested, canon_used - canon_before);
+    assert!(*canon_requested > 0);
+    assert_eq!(charged.load(Ordering::Relaxed), canon_after - initial);
+}
+
+#[test]
+fn split_round4_pre_plan_counts_retained_split_metadata() {
+    let input = axioms("SubClassOf(:X ObjectUnionOf(:A :B))");
+    let refs: Vec<_> = input.iter().map(|axiom| &axiom.kind).collect();
+    let mut sat = Saturation::new();
+    let out = sat
+        .classify(
+            &refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert!(out.complete && sat.index.is_some());
+
+    // Rooted runs do not currently keep their DlRun. Seed the metadata on a kept
+    // unrooted index to exercise the estimator independently of the keep policy.
+    let before = sat.pre_plan_live_bytes(0);
+    let run = sat.dl_run.as_mut().expect("retained Tier D state");
+    assert_eq!(run.split_meta_bytes(), 0);
+    run.const_rank = Box::new([0, 1, 2]);
+    run.branch_neq = Box::new([(1, 2)]);
+    let metadata = run.split_meta_bytes();
+    assert_eq!(sat.pre_plan_live_bytes(0), before + metadata);
 }
