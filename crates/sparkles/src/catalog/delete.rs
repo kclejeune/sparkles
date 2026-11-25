@@ -4966,8 +4966,6 @@ mod tests {
 
             let db = std::path::absolute(dir.path()).unwrap().join("databases");
             let keep_dir = db.join("ds").join(KEEP_REPLACED_MARKER);
-            std::fs::create_dir(&keep_dir).unwrap();
-            std::fs::write(keep_dir.join("sentinel.txt"), b"keep-dir-live").unwrap();
 
             let staged = db.join(".restore-ds-11");
             let restored = Store::open(&staged, Default::default()).unwrap();
@@ -4979,7 +4977,16 @@ mod tests {
             .unwrap();
             drop(restored);
 
+            // Inject the `.keep-replaced-v1` directory after rename 1 and swap-marker
+            // publication (bypassing live preflight) so live rollback exercises the
+            // post-rename-1 rollback path.
+            restore::BEFORE_KEEP_MARKER_WRITE.set(Some(Box::new(|replaced| {
+                let staged_keep_dir = replaced.join(KEEP_REPLACED_MARKER);
+                std::fs::create_dir(&staged_keep_dir).unwrap();
+                std::fs::write(staged_keep_dir.join("sentinel.txt"), b"keep-dir-live").unwrap();
+            })));
             let res = swap::replace_in_place(&catalog, "ds", &staged, "11", true);
+            restore::BEFORE_KEEP_MARKER_WRITE.set(None);
             assert!(
                 res.is_err(),
                 "keepReplaced restore must fail when .keep-replaced-v1 is a directory"
