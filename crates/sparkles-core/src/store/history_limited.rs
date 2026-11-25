@@ -177,7 +177,7 @@ impl Store {
         cached: crate::history::Cached,
         limit: &ReadLimit<'_>,
     ) -> Result<()> {
-        let retained = preparation_delta_bytes(&cached.snap.delta);
+        let retained = preparation_delta_bytes(&cached.snap.delta).max(SHARED_SNAPSHOT_BYTES);
         let mut before = 0u64;
         for entry in &history.cache {
             limit.check(retained)?;
@@ -223,6 +223,18 @@ impl Store {
         options: &HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        let (snapshot, resolved, origin, _) =
+            self.snapshot_at_with_branch_limited_charged(store, at, options, max_memory_bytes)?;
+        Ok((snapshot, resolved, origin))
+    }
+
+    pub(crate) fn snapshot_at_with_branch_limited_charged(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         let limit = ReadLimit {
             options,
             memory: Some(max_memory_bytes),
@@ -243,7 +255,7 @@ impl Store {
         at: &At,
         preparation: &crate::access::Preparation,
         memory: u64,
-    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         if self.is_branch()
             || self.owner_dataset_id() != logical.owner_dataset_id()
             || !Arc::ptr_eq(&self.family, &logical.family)
@@ -273,6 +285,18 @@ impl Store {
         options: &HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        let (snapshot, resolved, origin, _) =
+            self.snapshot_of_branch_limited_charged(branch, at, options, max_memory_bytes)?;
+        Ok((snapshot, resolved, origin))
+    }
+
+    pub(crate) fn snapshot_of_branch_limited_charged(
+        &self,
+        branch: uuid::Uuid,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         let limit = ReadLimit {
             options,
             memory: Some(max_memory_bytes),
@@ -306,7 +330,7 @@ impl Store {
         at: &At,
         options: &dyn ReadControl,
         memory: u64,
-    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         self.snapshot_from_limited(
             PinnedSource::Resident(branching::BranchStore::Main(store)),
             at,
@@ -321,7 +345,7 @@ impl Store {
         at: &At,
         options: &dyn ReadControl,
         memory: u64,
-    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         use PinnedSource as Source;
         use branching::readonly::OriginRead;
         let capacity = self
@@ -353,7 +377,9 @@ impl Store {
                     store.branch_id(),
                     store
                         .snapshot_at_inner(requested, options, Some(memory))
-                        .map(|(snapshot, resolved)| OriginRead::View(snapshot, resolved)),
+                        .map(|(snapshot, resolved, charge)| {
+                            OriginRead::View(snapshot, resolved, charge)
+                        }),
                 ),
                 Source::Cold(id) => (
                     *id,
@@ -371,9 +397,9 @@ impl Store {
                 }
             };
             match outcome {
-                OriginRead::View(snapshot, resolved) => {
+                OriginRead::View(snapshot, resolved, charge) => {
                     limit.check(0)?;
-                    return Ok((snapshot, resolved, id));
+                    return Ok((snapshot, resolved, id, charge));
                 }
                 OriginRead::Resident(store) => {
                     selected = Source::Resident(branching::BranchStore::Other(store))
@@ -424,19 +450,40 @@ impl Store {
     }
 }
 
+/// Conservative per-request handle and header charge for retaining a reference to an
+/// already-resident shared live or cached snapshot without copying its delta storage.
+pub(crate) const SHARED_SNAPSHOT_BYTES: u64 = 4096;
+
+/// Retained preparation charge for a snapshot returned by a bounded read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotCharge {
+    /// Delta or shared-handle bytes the caller retains: [`SHARED_SNAPSHOT_BYTES`] for a
+    /// shared live or cached snapshot, or `preparation_delta_bytes(&delta)` (at least
+    /// [`SHARED_SNAPSHOT_BYTES`]) for a freshly materialized private historical snapshot.
+    pub(crate) delta_bytes: u64,
+    /// Non-live sealed generation bytes retained by a cold or sealed historical snapshot
+    /// (`0` when the snapshot shares the store's live generation).
+    pub(crate) generation_bytes: u64,
+}
+
+impl SnapshotCharge {
+    pub(crate) const fn shared() -> Self {
+        Self {
+            delta_bytes: SHARED_SNAPSHOT_BYTES,
+            generation_bytes: 0,
+        }
+    }
+
+    pub(crate) fn total(self) -> u64 {
+        self.delta_bytes.saturating_add(self.generation_bytes)
+    }
+}
+
 // The cache's 448-byte/quad estimate is not an allocation bound: even a one-key
 // KeySet leaf reserves 65 keys. Bounded reads include sparse root capacity and the
 // predicate map as well. Leaves rebalance below 16 keys and branches below eight
 // children; 256 bytes per key plus 8 KiB per tree conservatively covers retained
 // node/vector capacity, Arc headers, and the per-predicate persistent map.
-impl Snapshot {
-    /// The conservative preparation bytes a bounded read charges for this state's
-    /// delta, which a caller that retains the snapshot keeps charged.
-    pub(crate) fn retained_preparation_bytes(&self) -> u64 {
-        preparation_delta_bytes(&self.delta)
-    }
-}
-
 pub(super) fn preparation_delta_bytes(delta: &Delta) -> u64 {
     let quads = delta.inserts().saturating_add(delta.deletes()) as u64;
     if quads == 0 {

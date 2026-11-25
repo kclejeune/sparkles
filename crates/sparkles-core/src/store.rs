@@ -53,6 +53,7 @@ mod group_index_tests;
 #[cfg(test)]
 mod group_model;
 mod history_limited;
+pub(crate) use history_limited::SnapshotCharge;
 mod history_query;
 mod holds;
 #[cfg(test)]
@@ -3146,18 +3147,21 @@ impl Store {
         at: &crate::history::At,
         o: &crate::history::HistoryOptions,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        self.snapshot_at_inner(at, o, None)
+        let (snap, resolved, _) = self.snapshot_at_inner(at, o, None)?;
+        Ok((snap, resolved))
     }
 
     /// Resolve exactly the requested retained state within a per-read memory cap.
-    /// Index mappings remain shared; owned delta and replay buffers consume this cap.
+    /// Index mappings and already-resident shared live or cached deltas remain shared;
+    /// per-request handle overhead and freshly materialized replay buffers consume this cap.
     pub fn snapshot_at_limited(
         &self,
         at: &crate::history::At,
         o: &crate::history::HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        self.snapshot_at_inner(at, o, Some(max_memory_bytes))
+        let (snap, resolved, _) = self.snapshot_at_inner(at, o, Some(max_memory_bytes))?;
+        Ok((snap, resolved))
     }
 
     fn snapshot_at_inner(
@@ -3165,7 +3169,11 @@ impl Store {
         at: &crate::history::At,
         o: &dyn crate::history::ReadControl,
         memory: Option<u64>,
-    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
         let capacity = self
             .opts
             .shared
@@ -3203,7 +3211,11 @@ impl Store {
         &self,
         at: &crate::history::At,
         limit: C,
-    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
         limit.check(0)?;
         let r = if C::ACCOUNTS {
             self.resolve_limited(at, &limit.read_limit())?
@@ -3212,13 +3224,14 @@ impl Store {
         };
         let live = self.snapshot();
         if r.commit.seq == live.commit {
-            limit.check(history_limited::preparation_delta_bytes(&live.delta))?;
+            limit.check(history_limited::SHARED_SNAPSHOT_BYTES)?;
             return Ok((
                 live,
                 crate::history::Resolved {
                     historical: false,
                     ..r
                 },
+                history_limited::SnapshotCharge::shared(),
             ));
         }
         let seq = r.commit.seq;
@@ -3226,9 +3239,9 @@ impl Store {
             let mut m = limit.read_limit().lock(mem)?;
             return match m.get_with(seq, &limit)? {
                 Some(snap) => {
-                    limit.check(history_limited::preparation_delta_bytes(&snap.delta))?;
+                    limit.check(history_limited::SHARED_SNAPSHOT_BYTES)?;
                     m.hits += 1;
-                    Ok((snap, r))
+                    Ok((snap, r, history_limited::SnapshotCharge::shared()))
                 }
                 None => {
                     drop(m);
@@ -3280,7 +3293,7 @@ impl Store {
             }
         }
         if let Some(i) = cached {
-            let retained =
+            let generation_bytes =
                 if C::ACCOUNTS && !Arc::ptr_eq(&h.cache[i].snap.generation, &live.generation) {
                     h.cache[i]
                         .snap
@@ -3289,14 +3302,22 @@ impl Store {
                 } else {
                     0
                 };
-            limit.read_limit().holding(retained)?.check(
-                history_limited::preparation_delta_bytes(&h.cache[i].snap.delta),
-            )?;
+            limit
+                .read_limit()
+                .holding(generation_bytes)?
+                .check(history_limited::SHARED_SNAPSHOT_BYTES)?;
             let e = h.cache.remove(i);
             let snap = e.snap.clone();
             h.cache.insert(0, e);
             h.hits += 1;
-            return Ok((snap, r));
+            return Ok((
+                snap,
+                r,
+                history_limited::SnapshotCharge {
+                    delta_bytes: history_limited::SHARED_SNAPSHOT_BYTES,
+                    generation_bytes,
+                },
+            ));
         }
         h.misses += 1;
         // Snapshot/entry/path metadata remains live beside replay's owned buffers.
@@ -3314,15 +3335,23 @@ impl Store {
         } else {
             self.history_generation(&mut h, owner, current, &live, &entry, seq)?
         };
-        let limit = if C::ACCOUNTS && !Arc::ptr_eq(&generation, &live.generation) {
-            let retained = generation.retained_bytes_limited(&limit.read_limit())?;
-            limit.holding(retained)?
-        } else {
-            limit
-        };
+        let (limit, generation_bytes) =
+            if C::ACCOUNTS && !Arc::ptr_eq(&generation, &live.generation) {
+                let retained = generation.retained_bytes_limited(&limit.read_limit())?;
+                (limit.holding(retained)?, retained)
+            } else {
+                (limit, 0)
+            };
         let t0 = std::time::Instant::now();
         let (delta, end) = self.materialize(&h, owner, &entry, &generation, &live, seq, &limit)?;
-        limit.check(history_limited::preparation_delta_bytes(&delta))?;
+        let delta_charge = if C::ACCOUNTS {
+            let bytes = history_limited::preparation_delta_bytes(&delta)
+                .max(history_limited::SHARED_SNAPSHOT_BYTES);
+            limit.check(bytes)?;
+            bytes
+        } else {
+            0
+        };
         h.materializations += 1;
         h.materialize_nanos += t0.elapsed().as_nanos() as u64;
         let bytes = delta_bytes(&delta);
@@ -3339,6 +3368,10 @@ impl Store {
                 .historical(true)
                 .build(),
         );
+        let charge = history_limited::SnapshotCharge {
+            delta_bytes: delta_charge,
+            generation_bytes,
+        };
         let cached = crate::history::Cached {
             generation: owner,
             seq,
@@ -3348,7 +3381,7 @@ impl Store {
         };
         if C::ACCOUNTS {
             Self::cache_limited_snapshot(&mut h, cached, &limit.read_limit())?;
-            return Ok((snap, r));
+            return Ok((snap, r, charge));
         }
         h.cache.insert(0, cached);
         // evict the least recently used states, warm pins' last
@@ -3373,7 +3406,7 @@ impl Store {
             h.cache.clear();
             h.settle();
         }
-        Ok((snap, r))
+        Ok((snap, r, charge))
     }
 
     /// Materialize the warm pins' states that the history cache does not hold (a
@@ -6750,7 +6783,12 @@ impl WriteTxn<'_> {
             memory: Some(selection.selection_room()),
             held: 0,
         };
-        let delta_bytes = crate::store::history_limited::preparation_delta_bytes(&self.delta);
+        let delta_bytes = if self.is_dirty() {
+            crate::store::history_limited::preparation_delta_bytes(&self.delta)
+                .max(crate::store::history_limited::SHARED_SNAPSHOT_BYTES)
+        } else {
+            crate::store::history_limited::SHARED_SNAPSHOT_BYTES
+        };
         let retained = delta_bytes
             .checked_add(self.base.generation.retained_bytes_limited(&limit)?)
             .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))

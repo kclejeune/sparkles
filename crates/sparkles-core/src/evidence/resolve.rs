@@ -20,7 +20,7 @@ use crate::history::At;
 use crate::id::Id;
 use crate::index::Perm;
 use crate::managed::{ManagedError, ManagedErrorKind, OwnerKind};
-use crate::store::{Snapshot, Store};
+use crate::store::{Snapshot, SnapshotCharge, Store};
 use crate::task::Control;
 use crate::{Error, Result};
 use oxrdf::{NamedNode, Term, Triple};
@@ -323,16 +323,17 @@ impl Resolver {
         };
         let (served_by, index) = self
             .view(view_key, access, |preparation| {
-                let (snapshot, resolved, served_by) = main.snapshot_of_branch_limited(
-                    fact.branch,
-                    &At::Commit(fact.commit),
-                    &preparation.history_options(),
-                    preparation.room(),
-                )?;
+                let (snapshot, resolved, served_by, charge) = main
+                    .snapshot_of_branch_limited_charged(
+                        fact.branch,
+                        &At::Commit(fact.commit),
+                        &preparation.history_options(),
+                        preparation.room(),
+                    )?;
                 if resolved.commit.seq != fact.commit {
                     return Err(Error::NotFound("commit".into()));
                 }
-                Ok((snapshot, served_by))
+                Ok((snapshot, served_by, charge))
             })
             .map_err(|e| classify(key, e))?;
         let cached = &self.views[&view_key][index];
@@ -425,7 +426,7 @@ impl Resolver {
         };
         let (_, index) = self
             .view(view_key, access, |_| {
-                Ok((live.clone(), logical.branch_id()))
+                Ok((live.clone(), logical.branch_id(), SnapshotCharge::shared()))
             })
             .map_err(|e| classify(key, e))?;
         let cached = &self.views[&view_key][index];
@@ -516,7 +517,7 @@ impl Resolver {
         &mut self,
         key: ViewKey,
         access: &Arc<GraphAccess>,
-        read: impl FnOnce(&Preparation) -> Result<(Arc<Snapshot>, Uuid)>,
+        read: impl FnOnce(&Preparation) -> Result<(Arc<Snapshot>, Uuid, SnapshotCharge)>,
     ) -> Result<(Uuid, usize)> {
         if let Some(views) = self.views.get(&key)
             && let Some(index) = views
@@ -525,12 +526,11 @@ impl Resolver {
         {
             return Ok((views[index].served_by, index));
         }
-        let (snapshot, served_by) = read(&self.preparation)?;
-        // The read was checked against the remaining allowance; the snapshot is
-        // retained while the view lives, so its state stays charged.
-        let retained = self
-            .preparation
-            .reserve(snapshot.retained_preparation_bytes())?;
+        let (snapshot, served_by, charge) = read(&self.preparation)?;
+        // The read was checked against the remaining allowance; what the request
+        // retains (a shared handle, or a freshly materialized private delta and any
+        // non-live sealed generation) stays charged while the view lives.
+        let retained = self.preparation.reserve(charge.total())?;
         let view = access.masked_controlled(&snapshot, &self.preparation)?;
         drop(snapshot);
         let views = self.views.entry(key).or_default();

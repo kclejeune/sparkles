@@ -362,16 +362,16 @@ impl super::Store {
         // grant can take the free granules first, so a refused estimate retries
         // once with the room the grant already covers.
         let (allowance, mut held) = selection.reserve_available()?;
-        let snapshot = if inherited {
-            let (snapshot, resolved, _) =
+        let (snapshot, charge) = if inherited {
+            let (snapshot, resolved, _, charge) =
                 self.snapshot_at_prepared(logical, at, &selection, allowance)?;
             drop(resolved);
-            snapshot
+            (snapshot, charge)
         } else {
-            let (snapshot, resolved) =
+            let (snapshot, resolved, charge) =
                 logical.snapshot_at_inner(at, &selection, Some(allowance))?;
             drop(resolved);
-            snapshot
+            (snapshot, charge)
         };
         if snapshot.mask.is_some() {
             return Err(Error::invalid(
@@ -383,8 +383,8 @@ impl super::Store {
             memory: Some(allowance),
             held: 0,
         };
-        let retained = snapshot
-            .retained_preparation_bytes()
+        let retained = charge
+            .delta_bytes
             .checked_add(snapshot.generation.retained_bytes_limited(&limit)?)
             .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))
             .ok_or_else(|| selection.exhausted())?;

@@ -237,3 +237,18 @@ to 0.18 ms, against 0.67 ms and 4.5 ms for the legacy index. Cached calls fell f
 pair repeats and a cold controlled index still takes 25 ms against 5.4 ms for the
 legacy index. Item 409 tracks that per-row cost. These loaded-host diagnostics are not
 published benchmark results.
+
+Bounded history reads and their callers (`snapshot_at_limited`,
+`snapshot_at_with_branch_limited`, `snapshot_of_branch_limited`, `evidence_view`,
+`prepare_read` and clean `WriteTxn::prepare_read_view`) distinguish already-resident
+shared snapshots from freshly materialized private replays. A live snapshot, an
+in-memory retained snapshot or a persistent history-cache hit charges a fixed 4 KiB
+handle cost for its shared delta rather than 2 KiB per delta quad, while still checking
+cancellation, deadlines, the effective shared history capacity and any non-live sealed
+generation's owned dictionary. Freshly materialized WAL replays, unopened cold branch
+replays and dirty transaction views keep full pre-admitted delta accounting before
+allocation. The release diagnostic (`evidence_resolution_delta_charge_diagnostic`) on
+Boat worker `bx_z8s55a5v` confirmed constant 6,400-byte retained preparation for shared
+live and cached stored-fact resolution across 10,000 to 100,000 uncompacted delta
+quads, while uncached private WAL replays refused cleanly with `incomplete-evidence` at
+50,000 and 100,000 quads.
