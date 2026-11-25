@@ -97,12 +97,18 @@
   } | null>(null);
   let statusFilter = $state<'all' | 'new' | 'existing'>('all');
   let searchFilter = $state('');
-  let busy = $state<'preview' | 'dry' | 'apply' | null>(null);
+  let readBusy = $state<'preview' | 'dry' | null>(null);
+  let applying = $state(false);
   let error = $state<unknown>(null);
   let notice = $state<string | null>(null);
 
+  const anyBusy = $derived(applying || readBusy != null);
   const run = new LatestRun();
-  onDestroy(() => run.abortAll());
+  let destroyed = false;
+  onDestroy(() => {
+    destroyed = true;
+    run.abortAll();
+  });
 
   const headers = $derived(parsePreviewHeaders(tableData, format));
   const parsedPrefixes = $derived(parsePrefixLines(prefixText));
@@ -127,9 +133,11 @@
   $effect(() => {
     const sig = inputSignature;
     if (lastInputSignature !== null && lastInputSignature !== sig) {
+      // Abort read-only preview/dry-run requests on authoring edits, but never abort
+      // an in-flight commit so its result and workbench refresh are always reconciled.
       run.claim('preview');
-      run.claim('apply');
-      busy = null;
+      run.claim('dry');
+      readBusy = null;
       preview = null;
       dryPreview = null;
       previewSignature = null;
@@ -142,6 +150,8 @@
   $effect(() => {
     const policy = onError;
     if (lastOnError !== null && lastOnError !== policy) {
+      run.claim('dry');
+      if (readBusy === 'dry') readBusy = null;
       dryPreview = null;
     }
     lastOnError = policy;
@@ -258,7 +268,6 @@
   function insertPlaceholder(col: string) {
     if (mode === 'robot') {
       if (!robotColumns.some((c) => c.column === col)) {
-        headerTemplateRow = false;
         addRobotColumn(col);
       }
       return;
@@ -286,7 +295,7 @@
       previewSignature = null;
       previewPinned = null;
       error = new Error(
-        'The ontology or its import map changed since your preview. Run Preview axioms again to review against the latest commit.',
+        'The ontology, its import map, or dataset prefixes changed since your preview. Run Preview axioms again to review against the latest commit.',
       );
       return true;
     }
@@ -294,22 +303,24 @@
   }
 
   async function runPreview() {
+    if (applying) return;
     const spec = buildSpec();
     if (!spec) return;
     const snapTarget = target;
     const snapSel: Selection = { graph: sel.graph, imports: sel.imports };
     const snapSig = inputSignature;
+    const current = run.claim('preview');
+    run.claim('dry');
+    readBusy = 'preview';
+    error = null;
+    notice = null;
+    dryPreview = null;
     const req: PatternPreviewRequest = {
       table: { data: tableData, format },
       spec,
       declare: declareEntities,
       limit: 500,
     };
-    const current = run.claim('preview');
-    busy = 'preview';
-    error = null;
-    notice = null;
-    dryPreview = null;
     try {
       const res = await previewPatterns(snapTarget, snapSel, req, {
         signal: run.signal('preview'),
@@ -322,16 +333,18 @@
     } catch (e) {
       if (current() && !isAbort(e)) error = e;
     } finally {
-      if (current()) busy = null;
+      if (current() && readBusy === 'preview') readBusy = null;
     }
   }
 
   async function runDryRun() {
-    if (!preview || !previewPinned || previewSignature !== inputSignature) return;
+    if (applying || !preview || !previewPinned || previewSignature !== inputSignature) return;
     const pinned = previewPinned;
     const pinnedEtag = preview.etag ?? etag;
-    const current = run.claim('apply');
-    busy = 'dry';
+    const snapSig = inputSignature;
+    const snapPolicy = onError;
+    const current = run.claim('dry');
+    readBusy = 'dry';
     error = null;
     notice = null;
     try {
@@ -343,24 +356,32 @@
           spec: pinned.req.spec,
           declare: pinned.req.declare,
           message: commitMessage.trim() || 'Generate axioms from pattern',
-          onError,
+          onError: snapPolicy,
         },
-        { etag: pinnedEtag, changes: 50, signal: run.signal('apply') },
+        { etag: pinnedEtag, changes: 50, signal: run.signal('dry') },
       );
-      if (current()) dryPreview = res;
+      if (current() && inputSignature === snapSig && onError === snapPolicy) {
+        dryPreview = res;
+      }
     } catch (e) {
       if (current() && !isAbort(e) && !handlePreconditionError(e)) error = e;
     } finally {
-      if (current()) busy = null;
+      if (current() && readBusy === 'dry') readBusy = null;
     }
   }
 
   async function commitApply() {
-    if (!preview || !previewPinned || previewSignature !== inputSignature) return;
+    if (applying || !preview || !previewPinned || previewSignature !== inputSignature) return;
     const pinned = previewPinned;
     const pinnedEtag = preview.etag ?? etag;
-    const current = run.claim('apply');
-    busy = 'apply';
+    const submittedPolicy = onError;
+    const submittedMessage = commitMessage.trim() || 'Generate axioms from pattern';
+    // Cancel any in-flight read-only preview/dry-run before committing, but keep the
+    // commit itself un-aborted so authoring edits cannot hide its outcome.
+    run.claim('preview');
+    run.claim('dry');
+    readBusy = null;
+    applying = true;
     error = null;
     notice = null;
     try {
@@ -371,12 +392,12 @@
           table: pinned.req.table,
           spec: pinned.req.spec,
           declare: pinned.req.declare,
-          message: commitMessage.trim() || 'Generate axioms from pattern',
-          onError,
+          message: submittedMessage,
+          onError: submittedPolicy,
         },
-        { etag: pinnedEtag, signal: run.signal('apply') },
+        { etag: pinnedEtag },
       );
-      if (!current()) return;
+      if (destroyed) return;
       dryPreview = null;
       notice = res.committed
         ? `Committed ${fmtInt(res.added)} new axiom${res.added === 1 ? '' : 's'} (${fmtInt(res.inserted)} triple${res.inserted === 1 ? '' : 's'}) from ${fmtInt(res.pattern.rowsProcessed)} row${res.pattern.rowsProcessed === 1 ? '' : 's'}.`
@@ -388,15 +409,15 @@
       previewSignature = null;
       previewPinned = null;
     } catch (e) {
-      if (current() && !isAbort(e) && !handlePreconditionError(e)) error = e;
+      if (!destroyed && !handlePreconditionError(e)) error = e;
     } finally {
-      if (current()) busy = null;
+      if (!destroyed) applying = false;
     }
   }
 
   const canApply = $derived(
     !readonly &&
-      busy == null &&
+      !anyBusy &&
       preview != null &&
       previewPinned != null &&
       previewSignature === inputSignature &&
@@ -420,7 +441,11 @@
   </div>
 
   {#if error}<div class="error-box" role="alert">{api.errorMessage(error)}</div>{/if}
-  {#if notice}<div class="notice" role="status">{notice}</div>{/if}
+  {#if applying}
+    <div class="notice" role="status"><span class="spinner"></span> Committing pattern axioms…</div>
+  {:else if notice}
+    <div class="notice" role="status">{notice}</div>
+  {/if}
 
   <div class="grid">
     <section class="card" aria-label="Spreadsheet input">
@@ -656,10 +681,10 @@
         <button
           type="button"
           class="btn primary"
-          disabled={busy != null || !tableData.trim()}
+          disabled={anyBusy || !tableData.trim()}
           onclick={runPreview}
         >
-          {#if busy === 'preview'}<span class="spinner"></span>{/if}
+          {#if readBusy === 'preview'}<span class="spinner"></span>{/if}
           Preview axioms
         </button>
       </div>
@@ -827,11 +852,11 @@
             bind:value={commitMessage}
           />
           <button type="button" class="btn" disabled={!canApply} onclick={runDryRun}>
-            {#if busy === 'dry'}<span class="spinner"></span>{/if}
+            {#if readBusy === 'dry'}<span class="spinner"></span>{/if}
             Check dry-run diff
           </button>
           <button type="button" class="btn primary" disabled={!canApply} onclick={commitApply}>
-            {#if busy === 'apply'}<span class="spinner"></span>{/if}
+            {#if applying}<span class="spinner"></span>{/if}
             Apply as one commit
           </button>
         {/if}
