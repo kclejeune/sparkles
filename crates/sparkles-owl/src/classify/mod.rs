@@ -1397,6 +1397,9 @@ pub struct Saturation {
     /// the clause table of the last run of Tier D whose contexts the next run may keep,
     /// which name its clauses by id
     dl_run: Option<dl_rules::DlRun>,
+    /// the sorted root contexts of the last kept run, used to clear dead roots when
+    /// axioms are removed (roadmap item 753)
+    last_roots: Vec<Ex>,
     /// diagnostic run id for top-level `run_with_all` (non-zero only when adaptive diag is on)
     adaptive_run_id: u64,
     /// number of tracked rooted attempts executed in the current top-level `run_with_all`
@@ -1441,7 +1444,8 @@ struct Kept {
     /// whether the run had axioms outside OWL 2 EL, taken or left out, whose tier the
     /// run decided over the interner as it was then
     outside: bool,
-    /// whether one of them needs case analysis
+    /// whether one of them needs case analysis over non-data constructors (axioms that
+    /// Tier D could take if data, self restrictions or top/bottom properties leave)
     disjunctive: bool,
     /// the interner's expressions and the contexts above the index's after the last
     /// run that started again, which bound what the runs since may keep
@@ -1455,6 +1459,10 @@ struct Kept {
 /// those of the last run that started again. Past the bound a run starts again, which
 /// drops the expressions of removed axioms and the contexts that nothing reaches.
 const KEPT_SLACK: usize = 4096;
+
+/// Contexts or edges visited between cooperative deadline/cancellation polls in
+/// incremental invalidation, shifting, and orphan pruning.
+const POLL_INVALIDATE: usize = 4096;
 
 impl Default for Saturation {
     fn default() -> Saturation {
@@ -1470,16 +1478,20 @@ pub struct Changes<'a> {
 }
 
 /// Whether a change to the axiom needs a run that starts again: one that changes the
-/// role table, which a run builds once, one with data, whose told subsumers the index
-/// derives from every data axiom at once, a key, one with an individual, whose
-/// merges the invalidation does not follow, or one with a self restriction (roadmap
-/// item 1258). A negative self restriction gives its subsumer to every context with a
-/// loop by a subrole, and a loop comes from a self restriction of another role, a
-/// reflexive role or a chain as well as from the restriction itself, so a kept context
-/// can have the loop without holding the changed expression that the invalidation
-/// looks for.
+/// role table or datatype definitions, which a run builds once, a key, one with an
+/// individual, whose merges the invalidation does not follow, one with the top or bottom
+/// data property, or one with a self restriction (roadmap item 1258). A negative self
+/// restriction gives its subsumer to every context with a loop by a subrole, and a loop
+/// comes from a self restriction of another role, a reflexive role or a chain as well as
+/// from the restriction itself, so a kept context can have the loop without holding the
+/// changed expression that the invalidation looks for.
 fn needs_full_run(ax: &AxiomKind) -> bool {
-    if role_axiom(ax) || matches!(ax, AxiomKind::HasKey(..)) {
+    if role_axiom(ax)
+        || matches!(
+            ax,
+            AxiomKind::HasKey(..) | AxiomKind::DatatypeDefinition(..)
+        )
+    {
         return true;
     }
     // an anonymous individual is an individual of the run, though no signature holds it
@@ -1493,12 +1505,74 @@ fn needs_full_run(ax: &AxiomKind) -> bool {
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
     sig.2
-        || sig.0.iter().any(|e| {
-            matches!(
-                e,
-                Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
-            )
+        || sig.0.iter().any(|e| match e {
+            Entity::NamedIndividual(_) => true,
+            Entity::DataProperty(p) => *p == DataProperty::top() || *p == DataProperty::bottom(),
+            _ => false,
         })
+}
+
+/// Whether `ax` is a logical axiom or declaration mentioning any data property or
+/// datatype, so a kept EL run must compare indexes instead of using the EL premise
+/// bitset fast path.
+fn mentions_data(ax: &AxiomKind) -> bool {
+    if !logical(ax) && !matches!(ax, AxiomKind::Declaration(_)) {
+        return false;
+    }
+    let mut sig = crate::model::Signature::default();
+    sig.axiom(ax);
+    sig.0
+        .iter()
+        .any(|e| matches!(e, Entity::DataProperty(_) | Entity::Datatype(_)))
+}
+
+/// Whether an edit of `ax` is compatible with keeping a Horn (or data-bearing EL)
+/// interner when no disjunctive axiom is in play: like [`tier_neutral`], plus class
+/// axioms, data property domains, declarations and `DisjointDataProperties` over
+/// non-top, non-bottom data properties (roadmap item 753).
+fn horn_neutral(ax: &AxiomKind) -> bool {
+    use ClassExpression as C;
+    fn named(p: &ObjectPropertyExpression) -> bool {
+        let p = p.named();
+        *p != ObjectProperty::top() && *p != ObjectProperty::bottom()
+    }
+    fn data_named(p: &DataProperty) -> bool {
+        *p != DataProperty::top() && *p != DataProperty::bottom()
+    }
+    fn plain(c: &ClassExpression) -> bool {
+        match c {
+            C::Class(_) => true,
+            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.iter().all(plain),
+            C::ObjectComplementOf(c) => plain(c),
+            C::ObjectSomeValuesFrom(p, c) | C::ObjectAllValuesFrom(p, c) => named(p) && plain(c),
+            C::ObjectMinCardinality(_, p, c)
+            | C::ObjectMaxCardinality(_, p, c)
+            | C::ObjectExactCardinality(_, p, c) => named(p) && c.as_deref().is_none_or(plain),
+            C::DataSomeValuesFrom(ps, _) | C::DataAllValuesFrom(ps, _) => ps.iter().all(data_named),
+            C::DataHasValue(p, _)
+            | C::DataMinCardinality(_, p, _)
+            | C::DataMaxCardinality(_, p, _)
+            | C::DataExactCardinality(_, p, _) => data_named(p),
+            _ => false,
+        }
+    }
+    match ax {
+        _ if !logical(ax) => true,
+        AxiomKind::Declaration(e) => match e {
+            Entity::ObjectProperty(p) => {
+                *p != ObjectProperty::top() && *p != ObjectProperty::bottom()
+            }
+            Entity::DataProperty(p) => data_named(p),
+            _ => true,
+        },
+        AxiomKind::SubClassOf(a, b) => plain(a) && plain(b),
+        AxiomKind::EquivalentClasses(cs) => cs.iter().all(plain),
+        AxiomKind::DisjointClasses(cs) | AxiomKind::DisjointUnion(_, cs) => cs.iter().all(plain),
+        AxiomKind::ObjectPropertyDomain(p, c) => named(p) && plain(c),
+        AxiomKind::DataPropertyDomain(p, c) => data_named(p) && plain(c),
+        AxiomKind::DisjointDataProperties(ps) => ps.iter().all(data_named),
+        _ => false,
+    }
 }
 
 /// Whether an edit of the axiom leaves alone what decides a run's tier and what its
@@ -2134,7 +2208,7 @@ enum AttemptProvenance {
 /// Why an incremental attempt must start over after building its index.
 #[derive(Debug)]
 enum LateRestart {
-    Incompatible,
+    Incompatible { normalized_peak: usize },
     NamedDomain { normalized_peak: usize },
 }
 
@@ -2175,6 +2249,7 @@ impl Saturation {
             kept: None,
             reused: false,
             dl_run: None,
+            last_roots: Vec::new(),
             adaptive_run_id: 0,
             adaptive_attempts: 0,
         }
@@ -2964,6 +3039,7 @@ impl Saturation {
         self.disjoint = Vec::new();
         self.dynamic = None;
         self.dl_run = None;
+        self.last_roots = Vec::new();
     }
 
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
@@ -3549,8 +3625,8 @@ impl Saturation {
         self.reset();
         let credited;
         let (limits, discarded_peak) = match restart {
-            LateRestart::Incompatible => (limits, 0),
-            LateRestart::NamedDomain { normalized_peak } => match &limits.charge {
+            LateRestart::Incompatible { normalized_peak }
+            | LateRestart::NamedDomain { normalized_peak } => match &limits.charge {
                 Some(charge) => {
                     // The successful build's one numeric budget approved exactly this
                     // much growth at the incoming callback, including inherited credit.
@@ -3646,15 +3722,9 @@ impl Saturation {
                         .iter()
                         .any(|k| !tier_neutral(k) && el_break(k).is_some())
             });
-        // A run with checker components starts again, since what the premises below
-        // intern for a checker property would be the lattice's. Every edit that names a
-        // data property or datatype already satisfies `needs_full_run` inside
-        // `must_restart`, so `!full` guarantees no changed axiom can trigger a checker
-        // component.
         let had_top_chain = self.index.as_ref().is_some_and(|ix| ix.top_chain.is_some());
         let full = self.entangled
             || had_top_chain
-            || self.index.as_ref().is_some_and(|ix| ix.dt.is_some())
             || match (&kept, changes) {
                 (Some(k), Some(c)) => {
                     self.must_restart(k, c)
@@ -3681,13 +3751,18 @@ impl Saturation {
             self.disjoint = Vec::new();
             self.dynamic = None;
             self.dl_run = None;
+            self.last_roots.clear();
         }
-        // a run that keeps the contexts of a run with the Horn rules or Tier D compares
-        // the two indexes, so the last one stays until the new one is built, and counts
-        // against the budget until then, as do the contexts above the index's and Tier
-        // D's clause table
+        // a run that keeps the contexts of a run with the Horn rules, Tier D, datatype
+        // checker components, or data-bearing EL edits compares the two indexes, so the
+        // last one stays until the new one is built, and counts against the budget until
+        // then, as do the contexts above the index's and Tier D's clause table
+        let el_index_diff = kept.as_ref().is_some_and(|k| k.tier == KeptTier::El)
+            && (self.index.as_ref().is_some_and(|ix| ix.dt.is_some())
+                || changes
+                    .is_some_and(|c| c.added.iter().chain(c.removed).any(|k| mentions_data(k))));
         let old_ix = match &kept {
-            Some(k) if k.tier != KeptTier::El => self.index.take(),
+            Some(k) if k.tier != KeptTier::El || el_index_diff => self.index.take(),
             _ => None,
         };
         let old_bytes = old_ix.as_ref().map_or(0, |ix| ix.bytes())
@@ -3695,7 +3770,8 @@ impl Saturation {
             + self
                 .dl_run
                 .as_ref()
-                .map_or(0, |d| d.table.bytes() + d.lits.bytes());
+                .map_or(0, |d| d.table.bytes() + d.lits.bytes())
+            + self.last_roots.capacity() * 4;
         // from here on a stop on the memory budget may be the kept state's, which a run
         // that starts again does not hold, whatever the tier of the kept contexts
         self.reused = kept.is_some();
@@ -3749,6 +3825,10 @@ impl Saturation {
                 normalized_peak,
             }));
         }
+        let non_data_disjunctive = outside.iter().any(|&(i, _)| {
+            let k = axioms[i];
+            !dl::shape(k).horn && !mentions_data(k)
+        });
         drop(outside);
         // the disjointness sets by their numbers in this index, beside those of the
         // last run's, by which the contexts it leaves number the sets they meet; the run
@@ -3773,7 +3853,8 @@ impl Saturation {
             stats.clauses = d.clauses.len();
         }
         // the rules of this run, when a later run may keep its contexts: the EL rules,
-        // the Horn rules without individuals, universal roles, keys or data, whose
+        // the Horn rules without individuals, universal roles or keys (including EL data
+        // lattice, functional data properties and datatype-checker components), whose
         // contexts depend on one another only along their links, or Tier D
         // with the cautious strategy and without a bound on its conclusions, which a
         // run that counts, a rooted run and the run after a passed bound have, and whose
@@ -3782,7 +3863,7 @@ impl Saturation {
             (false, false) => Some(KeptTier::El),
             // also a run whose Horn normalization gave the index no rule that can fire,
             // which the EL rules saturate: its contexts follow from the same entries
-            (true, false) if saturate::plain(&ix) && ix.comparable() => Some(KeptTier::Horn),
+            (true, false) if ix.comparable() => Some(KeptTier::Horn),
             (false, true)
                 if ix.horn.is_none()
                     && ix.dl.as_deref().is_some_and(|d| d.keyed_by_expressions())
@@ -3800,12 +3881,16 @@ impl Saturation {
         {
             // the edit changed the rules the ontology needs, which the run decided over
             // an interner that still holds the expressions of removed axioms
-            return Ok(ControlFlow::Break(LateRestart::Incompatible));
+            return Ok(ControlFlow::Break(LateRestart::Incompatible {
+                normalized_peak,
+            }));
         }
         let reuse = match &old_ix {
             Some(old) => {
                 if !ix.same_tables(old) {
-                    return Ok(ControlFlow::Break(LateRestart::Incompatible));
+                    return Ok(ControlFlow::Break(LateRestart::Incompatible {
+                        normalized_peak,
+                    }));
                 }
                 true
             }
@@ -3838,37 +3923,43 @@ impl Saturation {
             }
         }
         debug_assert!(ix.horn.as_ref().is_none_or(|h| h.base as usize == n));
-        let dynamic = match &ix.horn {
-            _ if reuse => {
-                let mut d = self.dynamic.take().expect(
-                    "the conjunctions of the last run with the Horn rules, or the tests of \
-                     the last run of Tier D",
-                );
-                // the conjunctions' contexts move above the expressions the edit added
-                let from = d.base();
-                let delta = n as Ex - from;
-                if delta > 0 {
-                    for c in self.ctx.iter_mut().filter_map(|c| c.get_mut()) {
-                        c.st.get_mut().shift_contexts(from, delta);
-                    }
-                    for i in 0..d.len() as Ex {
-                        if let Some(c) = d.get_ctx(from + i) {
-                            c.st.lock().shift_contexts(from, delta);
+        let dynamic = if reuse {
+            match self.dynamic.take() {
+                Some(mut d) => {
+                    // the conjunctions' contexts move above the expressions the edit added
+                    let from = d.base();
+                    let delta = n as Ex - from;
+                    if delta > 0 {
+                        for (i, c) in self.ctx.iter_mut().filter_map(|c| c.get_mut()).enumerate() {
+                            if i.is_multiple_of(POLL_INVALIDATE) {
+                                poll(limits)?;
+                            }
+                            c.st.get_mut().shift_contexts(from, delta);
                         }
+                        for i in 0..d.len() as Ex {
+                            if (i as usize).is_multiple_of(POLL_INVALIDATE) {
+                                poll(limits)?;
+                            }
+                            if let Some(c) = d.get_ctx(from + i) {
+                                c.st.lock().shift_contexts(from, delta);
+                            }
+                        }
+                        d.rebase(n as Ex);
                     }
-                    d.rebase(n as Ex);
+                    Some(d)
                 }
-                Some(d)
+                None => None,
             }
-            Some(h) => {
-                debug_assert_eq!(h.base as usize, n);
-                Some(saturate::Dynamic::new(n as Ex))
-            }
+        } else if let Some(h) = &ix.horn {
+            debug_assert_eq!(h.base as usize, n);
+            Some(saturate::Dynamic::new(n as Ex))
+        } else if disj || horn {
             // the test contexts of Tier D get ids above the index's, and a run whose
             // Horn normalization gave no rule has no conjunctions and an empty table,
             // which a run that keeps its contexts expects
-            None if disj || horn => Some(saturate::Dynamic::new(n as Ex)),
-            None => None,
+            Some(saturate::Dynamic::new(n as Ex))
+        } else {
+            None
         };
         if ix.dl.is_some() && dl_rules::tracing() {
             // the trace names each class by the last part of its IRI, once
@@ -3917,22 +4008,37 @@ impl Saturation {
             normalized_peak = budget.peak;
             poll(limits)?;
         }
+        let mut roots: Vec<Ex> = ax.classes.clone();
+        roots.push(TOP);
+        // every individual has an instance, whether an assertion or a class expression
+        // names it
+        roots.extend(ax.individuals.iter().copied());
+        roots.extend(ix.nominals.iter().copied());
+        // a rooted run's root context, where the facts of the individuals meet
+        let rooted = ix.dl.as_deref().and_then(|d| d.root);
+        roots.extend(rooted);
+        roots.sort_unstable();
+        roots.dedup();
         if let Some(old) = old_ix.filter(|_| reuse) {
             stats.incremental = true;
-            let d = dynamic
-                .as_ref()
-                .expect("the contexts above the index's of a run that keeps them");
+            let d_len = dynamic.as_ref().map_or(0, |d| d.len());
+            let d_retained = dynamic.as_ref().map_or(0, |d| d.retained_bytes());
+            let total_slots = self.ctx.len() + d_len;
             // the comparison holds both indexes beside the kept contexts and their
-            // clause table, with its marks and the set and the queue of the
-            // invalidation, which count against the budget as the kept state does; a
-            // run that passes it starts again in full (`run_with`)
-            let scratch = ix.changed_scratch(&old) + (self.ctx.len() + d.len()) * 16;
+            // clause table, with its marks bitset and the queue of the invalidation,
+            // which count against the budget as the kept state does; a run that passes
+            // it starts again in full (`run_with`)
+            let invalidation_scratch =
+                total_slots.div_ceil(64) * 8 + total_slots * std::mem::size_of::<Ex>();
+            let scratch = ix.changed_scratch(&old) + invalidation_scratch;
             let held = self.index_bytes(&ix)
                 + old.bytes()
                 + held_bytes
                 + ax.bytes()
+                + roots.capacity() * 4
+                + self.last_roots.capacity() * 4
                 + self.context_bytes()
-                + d.retained_bytes()
+                + d_retained
                 + dl_run.as_ref().map_or(0, |d| d.bytes())
                 + scratch;
             let more = held.saturating_sub(normalized_peak);
@@ -3951,32 +4057,48 @@ impl Saturation {
             // the stop the comparison saw, which a cancellation polled once does not
             // repeat
             let stopped = std::cell::RefCell::new(None);
-            let changed = ix.changed(&old, &|| {
+            let stop_cmp = || {
                 let r = poll(limits);
                 let stop = r.is_err();
                 if let Err(e) = r {
                     *stopped.borrow_mut() = Some(e);
                 }
                 stop
-            });
+            };
+            let dt_align = match (old.dt.as_deref(), ix.dt.as_deref()) {
+                (Some(old_dt), Some(new_dt)) => {
+                    match new_dt.align(old_dt, old.roles.sup.len(), &stop_cmp) {
+                        dt_sat::DtAlignOutcome::Aligned(a) => Some(a),
+                        dt_sat::DtAlignOutcome::Incompatible => {
+                            return Ok(ControlFlow::Break(LateRestart::Incompatible {
+                                normalized_peak,
+                            }));
+                        }
+                        dt_sat::DtAlignOutcome::Stopped => {
+                            return Err(stopped.into_inner().unwrap_or(Error::Cancelled));
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let changed = ix.changed_with_dt(&old, dt_align.as_ref(), &stop_cmp);
             let Some(changed) = changed else {
                 return Err(stopped.into_inner().unwrap_or(Error::Cancelled));
             };
-            stats.cleared = self.invalidate_changed(&changed, &ix, d);
+            stats.cleared = self.invalidate_changed(
+                &changed,
+                &ix,
+                dynamic.as_ref(),
+                dt_align.as_ref(),
+                &roots,
+                renumbered,
+                limits,
+                held,
+                &mut normalized_peak,
+            )?;
             drop(old);
             poll(limits)?;
         }
-        let mut roots: Vec<Ex> = ax.classes.clone();
-        roots.push(TOP);
-        // every individual has an instance, whether an assertion or a class expression
-        // names it
-        roots.extend(ax.individuals.iter().copied());
-        roots.extend(ix.nominals.iter().copied());
-        // a rooted run's root context, where the facts of the individuals meet
-        let rooted = ix.dl.as_deref().and_then(|d| d.root);
-        roots.extend(rooted);
-        roots.sort_unstable();
-        roots.dedup();
         stats.index = start.elapsed();
         // the index, the caller's copy of the axioms, the normalized axioms and the roots,
         // and the contexts kept from the last run
@@ -4749,7 +4871,7 @@ impl Saturation {
             tier,
             key,
             outside: stats.outside_el.horn + stats.outside_el.disjunctive > 0,
-            disjunctive: stats.outside_el.disjunctive > 0,
+            disjunctive: non_data_disjunctive,
             nodes: kept.map_or(self.interner.len(), |k| k.nodes),
             dynamic: kept.map_or(dynamic.as_ref().map_or(0, |d| d.len()), |k| k.dynamic),
             table: kept.map_or(dl_run.as_ref().map_or(0, |d| d.table.len()), |k| k.table),
@@ -4998,6 +5120,21 @@ impl Saturation {
                 stats.conjunctions = d.len();
             }
         }
+        // Clear any unreachable kept orphan contexts before `dt_sat::collect` reads
+        // every initialized context's last evaluation, so ghost `COVER`/`BOUND`/`UNCOUNTED`
+        // statuses never leak into `excluded` (roadmap item 753).
+        if stats.incremental && ix.dt.is_some() && open.is_none() {
+            self.orphan_prune(
+                &ix,
+                dynamic.as_ref(),
+                &roots,
+                limits,
+                max_memory,
+                charge_fn,
+                world_bytes,
+                &mut totals,
+            )?;
+        }
         // the checker's covers and the answers it could not give, from each kept
         // context's last evaluation of a component and the worst of the others
         if let Some(dt) = ix.dt.as_deref() {
@@ -5049,6 +5186,11 @@ impl Saturation {
         // have stopped so both paths report the same retained-state estimate.
         let root_bytes = roots.capacity() * 4;
         let retained = self.retained_bytes(held_bytes, root_bytes, world_bytes);
+        self.last_roots = if kept_now.is_some() {
+            roots
+        } else {
+            Vec::new()
+        };
         let held = retained + pending * std::mem::size_of::<saturate::Concl>();
         #[cfg(test)]
         if admission_test::observing() {
@@ -5265,14 +5407,26 @@ impl Saturation {
         let outside: Vec<&AxiomKind> = changed()
             .filter(|a| logical(a) && el_break(a).is_some())
             .collect();
+        let disj_in_play = k.disjunctive
+            || outside
+                .iter()
+                .any(|a| !dl::shape(a).horn && !mentions_data(a));
+        if disj_in_play && (self.stale_tier || changed().any(|a| logical(a) && !tier_neutral(a))) {
+            return true;
+        }
         let in_play = k.outside || !outside.is_empty();
-        if in_play && changed().any(|a| logical(a) && !tier_neutral(a)) {
+        if in_play && changed().any(|a| logical(a) && !horn_neutral(a)) {
             return true;
         }
         match k.tier {
-            KeptTier::El => !outside.is_empty(),
+            KeptTier::El => {
+                !outside.is_empty()
+                    || ((self.index.as_ref().is_some_and(|ix| ix.dt.is_some())
+                        || changed().any(mentions_data))
+                        && self.interner.len() > 2 * k.nodes + KEPT_SLACK)
+            }
             KeptTier::Horn => {
-                !outside.is_empty() && (k.disjunctive || outside.iter().any(|a| !dl::shape(a).horn))
+                !outside.is_empty() && disj_in_play
                     || self.interner.len() > 2 * k.nodes + KEPT_SLACK
                     || self.dynamic.as_ref().map_or(0, |d| d.len()) > 2 * k.dynamic + KEPT_SLACK
             }
@@ -5286,99 +5440,153 @@ impl Saturation {
         }
     }
 
-    /// Clears the contexts that hold an expression whose rules `changed` says differ
-    /// from the last run's, and every context with a link to a cleared one, among the
-    /// contexts of the index and those of conjunctions (roadmap item 753). A context's
-    /// subsumers, links and Horn state follow from its conjunction, the rules of the
-    /// expressions it holds and what the contexts it links to send back, so the others
-    /// are as a run that starts again leaves them. They drop what they keep of cleared
-    /// contexts as their predecessors, which register again when they are saturated,
-    /// and number their disjointness sets by the new index. The answer is the number
-    /// cleared.
-    ///
-    /// In a run of Tier D a context holds an expression when a unit, a marker or a
-    /// stored clause names it, the contexts above the index's are the tests, and a
-    /// test that held and is cleared clears its class, whose subsumer it gave. A kept
-    /// context there need not be as a run that starts again leaves it: it keeps the
-    /// markers that cleared predecessors sent, which are tautologies, and the clauses
-    /// they gave. Each kept clause follows from the ontology as it is now, and the
-    /// saturation closes every context under the rules, which is what the
-    /// completeness of the calculus asks (Bate and others, JAIR 2018, Theorem 9, for
-    /// any context structure to which no rule applies, with Theorem 8 for soundness).
+    /// Contexts or edges visited between cooperative stop polls inside
+    /// [`Saturation::invalidate_changed`] and [`Saturation::orphan_prune`].
+    #[allow(clippy::too_many_arguments)]
     fn invalidate_changed(
         &mut self,
         changed: &[bool],
         ix: &Index,
-        dynamic: &saturate::Dynamic,
-    ) -> usize {
-        let base = dynamic.base();
-        let count = dynamic.len() as Ex;
+        dynamic: Option<&saturate::Dynamic>,
+        dt_align: Option<&dt_sat::DtAlign>,
+        new_roots: &[Ex],
+        renumbered: bool,
+        limits: &Limits,
+        held: usize,
+        normalized_peak: &mut usize,
+    ) -> Result<usize, Error> {
+        let base = dynamic.map_or(self.ctx.len() as Ex, |d| d.base());
+        let count = dynamic.map_or(0, |d| d.len() as Ex);
+        let total_slots = self.ctx.len() + count as usize;
         let ctx = &self.ctx;
-        let with = |e: Ex, f: &mut dyn FnMut(&saturate::State)| {
-            let c = if e < base {
+        let get_ctx = |e: Ex| -> Option<&saturate::Ctx> {
+            if e < base {
                 ctx.get(e as usize).and_then(|c| c.get()).map(|c| &**c)
             } else {
-                dynamic.get_ctx(e)
-            };
-            if let Some(c) = c {
-                f(&c.st.lock());
+                dynamic.and_then(|d| d.get_ctx(e))
             }
         };
         let all = (0..ctx.len() as Ex).chain((0..count).map(|i| base + i));
-        let mut affected: FxHashSet<Ex> = FxHashSet::default();
+        let mut affected = Marks::new(total_slots);
+        let mut queue: Vec<Ex> = Vec::new();
+        let mut ticks = 0usize;
         for e in all.clone() {
-            with(e, &mut |st| {
-                if st.init
-                    && (st
-                        .subs
-                        .iter()
-                        .any(|&s| changed.get(s as usize).copied().unwrap_or(true))
-                        || dl_rules::dl(st).is_some_and(|d| d.names_changed(changed)))
-                {
-                    affected.insert(e);
-                }
-            });
+            ticks += 1;
+            if ticks.is_multiple_of(POLL_INVALIDATE) {
+                poll(limits)?;
+            }
+            let Some(c) = get_ctx(e) else { continue };
+            let st = c.st.lock();
+            if st.init
+                && (st
+                    .subs
+                    .iter()
+                    .any(|&s| changed.get(s as usize).copied().unwrap_or(true))
+                    || dl_rules::dl(&st).is_some_and(|d| d.names_changed(changed))
+                    || dt_align.is_some_and(|align| {
+                        st.extra.as_ref().is_some_and(|x| {
+                            x.dt.iter().any(|s| {
+                                align
+                                    .changed_comps
+                                    .get(s.comp as usize)
+                                    .copied()
+                                    .unwrap_or(true)
+                            })
+                        })
+                    }))
+                && affected.insert(e)
+            {
+                queue.push(e);
+            }
+        }
+        // Clear dead roots that disappeared between runs so stale roots never pollute
+        // `dt_sat::collect` or downstream scans.
+        for &r in &self.last_roots {
+            if (r as usize) < total_slots
+                && new_roots.binary_search(&r).is_err()
+                && get_ctx(r).is_some_and(|c| c.st.lock().init)
+                && affected.insert(r)
+            {
+                queue.push(r);
+            }
         }
         // every context with a link into an affected context is affected, as is every
         // context that registered with one as its predecessor, which took its clauses
         // over the predecessor, and the class whose subsumer a test that held gave
         let tests = ix.dl.is_some();
-        let mut queue: Vec<Ex> = affected.iter().copied().collect();
         while let Some(e) = queue.pop() {
-            with(e, &mut |st| {
-                let mut add = |s: Ex| {
-                    if affected.insert(s) {
-                        queue.push(s);
-                    }
-                };
-                for (_, srcs) in &st.back {
-                    for &s in &srcs.list {
-                        add(s);
-                    }
+            ticks += 1;
+            if ticks.is_multiple_of(POLL_INVALIDATE) {
+                poll(limits)?;
+            }
+            let Some(c) = get_ctx(e) else { continue };
+            let st = c.st.lock();
+            let mut add = |s: Ex| {
+                if (s as usize) < total_slots && affected.insert(s) {
+                    queue.push(s);
                 }
-                if let Some(d) = dl_rules::dl(st) {
-                    for &(u, _) in &d.dpreds {
-                        add(u);
-                    }
+            };
+            for (_, srcs) in &st.back {
+                for &s in &srcs.list {
+                    add(s);
                 }
-                if tests
-                    && e >= base
-                    && st.bottom
-                    && let Some(x) = dl_rules::tested_class(dynamic.core(e))
+            }
+            if let Some(d) = dl_rules::dl(&st) {
+                for &(u, _) in &d.dpreds {
+                    add(u);
+                }
+            }
+            if tests
+                && e >= base
+                && st.bottom
+                && let Some(d) = dynamic
+                && let Some(x) = dl_rules::tested_class(d.core(e))
+            {
+                add(x);
+            }
+        }
+        // Pre-admit disjointness map growth on kept contexts before mutating any state.
+        if renumbered {
+            let mut maps = 0usize;
+            for e in all.clone() {
+                ticks += 1;
+                if ticks.is_multiple_of(POLL_INVALIDATE) {
+                    poll(limits)?;
+                }
+                if affected.has(e) {
+                    continue;
+                }
+                let Some(c) = get_ctx(e) else { continue };
+                let st = c.st.lock();
+                if st.init {
+                    maps = maps.saturating_add(st.disjoint_growth(ix));
+                }
+            }
+            if maps > 0 {
+                let total = held.saturating_add(maps);
+                let more = total.saturating_sub(*normalized_peak);
+                if limits.max_memory.is_some_and(|m| total > m)
+                    || limits
+                        .charge
+                        .as_deref()
+                        .is_some_and(|f| more > 0 && !f(more))
                 {
-                    add(x);
+                    return Err(Error::Memory {
+                        limit: limits.max_memory.unwrap_or(total),
+                        used: total,
+                    });
                 }
-            });
+                *normalized_peak = (*normalized_peak).max(total);
+            }
         }
         let mut cleared = 0;
         for e in all {
-            let c = if e < base {
-                ctx.get(e as usize).and_then(|c| c.get()).map(|c| &**c)
-            } else {
-                dynamic.get_ctx(e)
-            };
-            let Some(c) = c else { continue };
-            if affected.contains(&e) {
+            ticks += 1;
+            if ticks.is_multiple_of(POLL_INVALIDATE) {
+                poll(limits)?;
+            }
+            let Some(c) = get_ctx(e) else { continue };
+            if affected.has(e) {
                 if c.st.lock().init {
                     cleared += 1;
                 }
@@ -5386,12 +5594,130 @@ impl Saturation {
             } else {
                 let mut st = c.st.lock();
                 if st.init {
-                    st.drop_predecessors(&affected);
-                    st.reindex_disjoint(ix);
+                    st.drop_predecessors_where(|p| affected.has(p));
+                    if renumbered {
+                        st.reindex_disjoint(ix);
+                    }
+                    if let Some(align) = dt_align {
+                        st.reindex_dt(&align.comp_map);
+                    }
                 }
             }
         }
-        cleared
+        Ok(cleared)
+    }
+
+    /// Clears initialized contexts that are no longer reachable from `roots` after an
+    /// incremental re-saturation, and removes cleared orphans from the predecessor sets
+    /// of kept reachable contexts so a later re-connection replays cleanly.
+    #[allow(clippy::too_many_arguments)]
+    fn orphan_prune(
+        &self,
+        ix: &Index,
+        dynamic: Option<&saturate::Dynamic>,
+        roots: &[Ex],
+        limits: &Limits,
+        max_memory: Option<usize>,
+        charge_fn: Option<&(dyn Fn(usize) -> bool + Sync)>,
+        world_bytes: usize,
+        totals: &mut saturate::Totals,
+    ) -> Result<(), Error> {
+        let base = dynamic.map_or(self.ctx.len() as Ex, |d| d.base());
+        let count = dynamic.map_or(0, |d| d.len() as Ex);
+        let total_slots = self.ctx.len() + count as usize;
+        if total_slots == 0 {
+            return Ok(());
+        }
+        let scratch = total_slots.div_ceil(64) * 8 + total_slots * std::mem::size_of::<Ex>();
+        let used = totals
+            .memory
+            .saturating_add(world_bytes)
+            .saturating_add(scratch);
+        totals.peak = totals.peak.max(used);
+        if !cover_memory(used, max_memory, charge_fn, &mut totals.paid) {
+            return Err(Error::Memory {
+                limit: max_memory.unwrap_or(usize::MAX),
+                used,
+            });
+        }
+        let get_ctx = |e: Ex| -> Option<&saturate::Ctx> {
+            if e < base {
+                self.ctx.get(e as usize).and_then(|c| c.get()).map(|c| &**c)
+            } else {
+                dynamic.and_then(|d| d.get_ctx(e))
+            }
+        };
+        let mut reachable = Marks::new(total_slots);
+        let mut queue: Vec<Ex> = Vec::with_capacity(roots.len().min(total_slots));
+        for &r in roots {
+            if (r as usize) < total_slots && reachable.insert(r) {
+                queue.push(r);
+            }
+        }
+        let mut ticks = 0usize;
+        while let Some(e) = queue.pop() {
+            ticks += 1;
+            if ticks.is_multiple_of(POLL_INVALIDATE) {
+                poll(limits)?;
+            }
+            let Some(c) = get_ctx(e) else { continue };
+            let st = c.st.lock();
+            if !st.init {
+                continue;
+            }
+            for &d in &st.subs {
+                if matches!(ix.head(d).node, Node::Exist(..)) {
+                    let succ = ix.head(d).succ;
+                    if (succ as usize) < total_slots && reachable.insert(succ) {
+                        queue.push(succ);
+                    }
+                }
+            }
+            for &(_, f) in &st.fwd.list {
+                if (f as usize) < total_slots && reachable.insert(f) {
+                    queue.push(f);
+                }
+            }
+            if let Some(x) = &st.extra {
+                for &(_, n) in &x.horn.succ.list {
+                    if (n as usize) < total_slots && reachable.insert(n) {
+                        queue.push(n);
+                    }
+                }
+            }
+        }
+        let all = (0..self.ctx.len() as Ex).chain((0..count).map(|i| base + i));
+        let mut pruned = false;
+        for e in all.clone() {
+            ticks += 1;
+            if ticks.is_multiple_of(POLL_INVALIDATE) {
+                poll(limits)?;
+            }
+            if !reachable.has(e)
+                && let Some(c) = get_ctx(e)
+                && c.st.lock().init
+            {
+                c.clear();
+                pruned = true;
+            }
+        }
+        if pruned {
+            for e in all {
+                ticks += 1;
+                if ticks.is_multiple_of(POLL_INVALIDATE) {
+                    poll(limits)?;
+                }
+                if reachable.has(e)
+                    && let Some(c) = get_ctx(e)
+                {
+                    let mut st = c.st.lock();
+                    if st.init {
+                        st.drop_predecessors_where(|p| !reachable.has(p));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Clears the contexts that the changed axioms can affect: those that derived the

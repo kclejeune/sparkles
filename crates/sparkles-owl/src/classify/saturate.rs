@@ -505,11 +505,6 @@ impl State {
         }
     }
 
-    /// Removes the backward links whose source is in `gone`.
-    pub fn drop_links_from(&mut self, gone: &FxHashSet<Ex>) {
-        self.drop_links_where(|e| gone.contains(&e));
-    }
-
     /// Removes the backward links whose source `gone` answers true for.
     pub fn drop_links_where(&mut self, gone: impl Fn(Ex) -> bool) {
         let mut emptied = false;
@@ -524,26 +519,38 @@ impl State {
         }
     }
 
-    /// Removes what the state keeps of the contexts in `gone` as its predecessors,
-    /// which a run that clears them does before they register again (roadmap item
-    /// 753): their backward links and what the Horn rules were told of them.
-    pub fn drop_predecessors(&mut self, gone: &FxHashSet<Ex>) {
-        self.drop_links_from(gone);
+    /// Removes what the state keeps of every predecessor context for which `gone`
+    /// answers true, which a run that clears them does before they register again
+    /// (roadmap item 753): their backward links and what the Horn and Tier D rules were
+    /// told of them.
+    pub fn drop_predecessors_where(&mut self, gone: impl Fn(Ex) -> bool) {
+        self.drop_links_where(&gone);
         if let Some(x) = self.extra.as_mut() {
             let h = &mut x.horn;
-            if h.pred_in.list.iter().any(|(m, _)| gone.contains(m)) {
-                h.pred_in.retain(|(m, _)| !gone.contains(m));
+            if h.pred_in.list.iter().any(|&(m, _)| gone(m)) {
+                h.pred_in.retain(|&(m, _)| !gone(m));
             }
-            if h.told.list.iter().any(|(m, _)| gone.contains(m)) {
-                h.told.retain(|(m, _)| !gone.contains(m));
+            if h.told.list.iter().any(|&(m, _)| gone(m)) {
+                h.told.retain(|&(m, _)| !gone(m));
             }
             for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
-                if set.list.iter().any(|m| gone.contains(m)) {
-                    set.retain(|m| !gone.contains(m));
+                if set.list.iter().any(|&m| gone(m)) {
+                    set.retain(|&m| !gone(m));
                 }
             }
             if let Some(d) = x.dl.as_deref_mut() {
-                d.drop_predecessors(gone);
+                d.drop_predecessors(&gone);
+            }
+        }
+    }
+
+    /// Remaps each checker component id held by a kept context to its id in the new
+    /// index, preserving its held atoms and last evaluation (roadmap item 753).
+    pub fn reindex_dt(&mut self, comp_map: &[Option<u32>]) {
+        if let Some(x) = self.extra.as_mut() {
+            for s in &mut x.dt {
+                s.comp = comp_map[s.comp as usize]
+                    .expect("kept context holds only unchanged checker components");
             }
         }
     }

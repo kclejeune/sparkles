@@ -86,6 +86,30 @@ pub struct DtSt {
     pub last: u8,
 }
 
+/// Component alignment between an earlier [`DtIx`] and the current one for incremental
+/// maintenance (roadmap item 753).
+pub struct DtAlign {
+    /// For each old component id `0..old.body.len()`, its component id in `self`, or
+    /// `None` if the component changed, split, merged, or disappeared.
+    pub comp_map: Vec<Option<u32>>,
+    /// For each old component id `0..old.body.len()`, whether the component changed
+    /// (`changed_comps[c] == comp_map[c].is_none()`).
+    pub changed_comps: Vec<bool>,
+}
+
+/// Outcome of aligning a new [`DtIx`] against the previous run's [`DtIx`].
+pub enum DtAlignOutcome {
+    Aligned(DtAlign),
+    /// A data property switched between EL-lattice and checker modes, or checker bounds
+    /// changed; the caller must fall back to a fresh full rebuild.
+    Incompatible,
+    /// Cooperative cancellation or deadline stop triggered during alignment.
+    Stopped,
+}
+
+/// Items processed between cooperative stop polls inside [`DtIx::align`].
+const POLL_ALIGN: usize = 4096;
+
 impl DtIx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -265,6 +289,227 @@ impl DtIx {
         } else {
             Atom::AtMost(i, a.n, a.range)
         }
+    }
+
+    /// Components re-evaluated when a context derives `t`.
+    pub fn refire_of(&self, t: Ex) -> Option<&[u32]> {
+        self.refire.get(&t).map(Vec::as_slice)
+    }
+
+    /// Zero-allocation compatibility check: whether checker bounds match and no existing
+    /// data property switched between the EL data lattice and the datatype checker.
+    pub fn modes_compatible(&self, old: &DtIx, old_roles_len: usize) -> bool {
+        if (self.bounds.props, self.bounds.types, self.bounds.nodes)
+            != (old.bounds.props, old.bounds.types, old.bounds.nodes)
+        {
+            return false;
+        }
+        // Any role already interned in `old` that is now a checker role must already have
+        // been a checker role in `old`; otherwise it switched from EL lattice (or was
+        // previously removed and re-entered as a checker role).
+        if self
+            .roles
+            .keys()
+            .any(|&r| (r as usize) < old_roles_len && !old.roles.contains_key(&r))
+        {
+            return false;
+        }
+        // Any data property present in both runs' component maps must keep the same
+        // EL-lattice vs checker assignment.
+        for (d, old_c) in old.comps.iter() {
+            if let Some(new_c) = self.comps.component(d)
+                && old.comps.is_checker(old_c) != self.comps.is_checker(new_c)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Upper-bound scratch bytes allocated by [`DtIx::align`] and `refire` comparison.
+    pub fn align_scratch(&self, old: &DtIx) -> usize {
+        let old_comps = old.body.len();
+        let new_comps = self.body.len();
+        let groups = (old_comps + new_comps)
+            .saturating_mul(std::mem::size_of::<Vec<Role>>())
+            .saturating_add(
+                (old.roles.len() + self.roles.len())
+                    .saturating_mul(std::mem::size_of::<Role>() * 4),
+            );
+        let by_roles = map_buckets_for(new_comps)
+            .saturating_mul(std::mem::size_of::<(&[Role], u32)>() + 1)
+            .saturating_add(32);
+        let disj = (old_comps + new_comps)
+            .saturating_mul(std::mem::size_of::<Vec<(Role, Role)>>())
+            .saturating_add(
+                (old.disjoint.len() + self.disjoint.len())
+                    .saturating_mul(std::mem::size_of::<(Role, Role)>() * 4),
+            );
+        let out = old_comps.saturating_mul(std::mem::size_of::<Option<u32>>() + 1);
+        let max_ranges = old
+            .roles
+            .values()
+            .chain(self.roles.values())
+            .map(|r| r.ranges.len())
+            .max()
+            .unwrap_or(0);
+        let ranges = max_ranges.saturating_mul(std::mem::size_of::<Rid>() * 2);
+        groups
+            .saturating_add(by_roles)
+            .saturating_add(disj)
+            .saturating_add(out)
+            .saturating_add(ranges)
+            .saturating_add(64)
+    }
+
+    /// Aligns components of `old` against `self` for incremental maintenance.
+    ///
+    /// An old checker component `old_c` maps to `Some(new_c)` iff `new_c` has the exact
+    /// same role set, per-role superroles/ranges/functionality, touching disjointness
+    /// pairs, and body atoms (with identical `told` subsumer lists).
+    pub fn align(
+        &self,
+        old: &DtIx,
+        old_roles_len: usize,
+        stop: &dyn Fn() -> bool,
+    ) -> DtAlignOutcome {
+        if !self.modes_compatible(old, old_roles_len) {
+            return DtAlignOutcome::Incompatible;
+        }
+        let mut ticks = 0usize;
+        let mut poll = || -> bool {
+            ticks += 1;
+            ticks.is_multiple_of(POLL_ALIGN) && stop()
+        };
+
+        let mut old_groups: Vec<Vec<Role>> = vec![Vec::new(); old.body.len()];
+        for (&r, ri) in &old.roles {
+            if poll() {
+                return DtAlignOutcome::Stopped;
+            }
+            old_groups[ri.comp as usize].push(r);
+        }
+        for g in &mut old_groups {
+            if poll() {
+                return DtAlignOutcome::Stopped;
+            }
+            g.sort_unstable();
+        }
+
+        let mut new_groups: Vec<Vec<Role>> = vec![Vec::new(); self.body.len()];
+        for (&r, ri) in &self.roles {
+            if poll() {
+                return DtAlignOutcome::Stopped;
+            }
+            new_groups[ri.comp as usize].push(r);
+        }
+        for g in &mut new_groups {
+            if poll() {
+                return DtAlignOutcome::Stopped;
+            }
+            g.sort_unstable();
+        }
+
+        let mut new_by_roles: FxHashMap<&[Role], u32> =
+            FxHashMap::with_capacity_and_hasher(self.body.len(), Default::default());
+        for (c, g) in new_groups.iter().enumerate() {
+            if !g.is_empty() {
+                new_by_roles.insert(g.as_slice(), c as u32);
+            }
+        }
+
+        let mut old_disj: Vec<Vec<(Role, Role)>> = vec![Vec::new(); old.body.len()];
+        for &(a, b) in &old.disjoint {
+            if poll() {
+                return DtAlignOutcome::Stopped;
+            }
+            if let Some(ca) = old.roles.get(&a).map(|r| r.comp) {
+                old_disj[ca as usize].push((a, b));
+                if let Some(cb) = old.roles.get(&b).map(|r| r.comp)
+                    && cb != ca
+                {
+                    old_disj[cb as usize].push((a, b));
+                }
+            }
+        }
+        let mut new_disj: Vec<Vec<(Role, Role)>> = vec![Vec::new(); self.body.len()];
+        for &(a, b) in &self.disjoint {
+            if poll() {
+                return DtAlignOutcome::Stopped;
+            }
+            if let Some(ca) = self.roles.get(&a).map(|r| r.comp) {
+                new_disj[ca as usize].push((a, b));
+                if let Some(cb) = self.roles.get(&b).map(|r| r.comp)
+                    && cb != ca
+                {
+                    new_disj[cb as usize].push((a, b));
+                }
+            }
+        }
+
+        let mut comp_map = vec![None; old.body.len()];
+        let mut changed_comps = vec![true; old.body.len()];
+        let mut ra: Vec<Rid> = Vec::new();
+        let mut rb: Vec<Rid> = Vec::new();
+        for old_c in 0..old.body.len() {
+            if poll() {
+                return DtAlignOutcome::Stopped;
+            }
+            let roles = &old_groups[old_c];
+            if roles.is_empty() {
+                continue;
+            }
+            let Some(&new_c) = new_by_roles.get(roles.as_slice()) else {
+                continue;
+            };
+            if old_disj[old_c] != new_disj[new_c as usize] {
+                continue;
+            }
+            let old_body = &old.body[old_c];
+            let new_body = &self.body[new_c as usize];
+            if old_body.len() != new_body.len()
+                || !old_body
+                    .iter()
+                    .zip(new_body)
+                    .all(|(a, b)| a.e == b.e && a.told == b.told)
+            {
+                continue;
+            }
+            let mut roles_same = true;
+            for &r in roles {
+                let old_ri = &old.roles[&r];
+                let new_ri = &self.roles[&r];
+                if old_ri.functional != new_ri.functional || old_ri.supers != new_ri.supers {
+                    roles_same = false;
+                    break;
+                }
+                if old_ri.ranges != new_ri.ranges {
+                    ra.clear();
+                    ra.extend_from_slice(&old_ri.ranges);
+                    ra.sort_unstable();
+                    ra.dedup();
+                    rb.clear();
+                    rb.extend_from_slice(&new_ri.ranges);
+                    rb.sort_unstable();
+                    rb.dedup();
+                    if ra != rb {
+                        roles_same = false;
+                        break;
+                    }
+                }
+            }
+            if roles_same {
+                comp_map[old_c] = Some(new_c);
+                changed_comps[old_c] = false;
+            }
+        }
+        if stop() {
+            return DtAlignOutcome::Stopped;
+        }
+        DtAlignOutcome::Aligned(DtAlign {
+            comp_map,
+            changed_comps,
+        })
     }
 }
 

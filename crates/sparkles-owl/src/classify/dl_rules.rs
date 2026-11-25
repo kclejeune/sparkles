@@ -1545,10 +1545,11 @@ impl DlSt {
             })
     }
 
-    /// Removes the contexts in `gone` from the predecessors that registered, which
-    /// register again when a run saturates them again (roadmap item 753).
-    pub fn drop_predecessors(&mut self, gone: &FxHashSet<Ex>) {
-        self.dpreds.retain(|(u, _)| !gone.contains(u));
+    /// Removes the contexts for which `gone` answers true from the predecessors that
+    /// registered, which register again when a run saturates them again (roadmap item
+    /// 753).
+    pub fn drop_predecessors(&mut self, gone: impl Fn(Ex) -> bool) {
+        self.dpreds.retain(|&(u, _)| !gone(u));
     }
 
     /// Adds `delta` to every context id from `from` upward that the state names, as

@@ -2537,27 +2537,26 @@ impl Index {
     }
 
     /// Whether a later run may compare this index with its own
-    /// ([`Index::same_tables`]): it has no data, individuals, universal roles or keys,
-    /// with which that comparison always fails. A run over such an index keeps no
-    /// contexts for the next, which then holds no last index beside its own.
+    /// ([`Index::same_tables`]): it has no individuals, universal roles, keys, or top
+    /// data property, with which that comparison fails. Data restrictions (both the EL
+    /// lattice, including functional data properties, and Item 972's datatype checker)
+    /// are comparable across runs (roadmap item 753).
     pub fn comparable(&self) -> bool {
-        self.roles.data_range.iter().all(|r| r.is_none())
-            && self.roles.functional.iter().all(|f| f.is_empty())
-            && self.vals.is_empty()
-            && self.dt.is_none()
-            && self.neg_data.is_empty()
-            && self.universal.is_empty()
+        self.universal.is_empty()
             && self.keys.is_empty()
             && self.nominals.is_empty()
             && !self.nominal_selfs
+            && self.tops[1].is_none()
     }
 
     /// Whether a context that a run over `old` saturated reads the same tables here
     /// when it holds none of the expressions that [`Index::changed`] lists (roadmap
     /// item 753): the tables that no expression keys are equal on the roles of `old`,
-    /// neither index has individuals, universal roles, keys or data, and both have the
-    /// Horn rules or neither, and Tier D or neither, where Tier D's tables are those
-    /// its expressions key ([`DlIx::keyed_by_expressions`](super::dl_rules::DlIx)).
+    /// neither index has individuals, universal roles or keys, both agree on `plain` /
+    /// `dominate` parity and datatype-checker mode assignment for every old data
+    /// property, and both have the Horn rules or neither, and Tier D or neither, where
+    /// Tier D's tables are those its expressions key
+    /// ([`DlIx::keyed_by_expressions`](super::dl_rules::DlIx)).
     /// Roles that `old` lacks may be new here, since a kept context holds no link by
     /// them.
     pub fn same_tables(&self, old: &Index) -> bool {
@@ -2575,6 +2574,24 @@ impl Index {
                 .filter(|(k, _)| (k.0 as usize) < n && (k.1 as usize) < n)
                 .all(|(k, v)| y.get(k) == Some(v))
         };
+        let data_ranges_same = b.data_range.len() >= a.data_range.len()
+            && a.data_range
+                .iter()
+                .zip(&b.data_range)
+                .all(|(va, vb)| match (va, vb) {
+                    (None, None) => true,
+                    (Some(va), Some(vb)) => {
+                        old.vals.get(*va as usize) == self.vals.get(*vb as usize)
+                    }
+                    _ => false,
+                });
+        let functional_same = b.functional.len() >= a.functional.len()
+            && b.functional[..a.functional.len()] == a.functional[..];
+        let dt_same = match (&old.dt, &self.dt) {
+            (None, None) => true,
+            (Some(a_dt), Some(b_dt)) => b_dt.modes_compatible(a_dt, n),
+            _ => false,
+        };
         b.sup.len() >= n
             && b.sup[..n] == a.sup[..]
             && comp_within(&a.comp, &b.comp)
@@ -2584,22 +2601,16 @@ impl Index {
             && a.reflexive == b.reflexive
             && b.range.len() >= a.range.len()
             && b.range[..a.range.len()] == a.range[..]
-            && a.data_range.iter().all(|r| r.is_none())
-            && b.data_range.iter().all(|r| r.is_none())
-            && a.functional.iter().all(|f| f.is_empty())
-            && b.functional.iter().all(|f| f.is_empty())
+            && data_ranges_same
+            && functional_same
+            && super::saturate::plain(old) == super::saturate::plain(self)
             && prefix(&a.empty, &b.empty)
             && prefix(&a.linear, &b.linear)
             && b.inv.len() >= a.inv.len()
             && b.inv[..a.inv.len()] == a.inv[..]
             && a.clash == b.clash
             && sorted(&old.selfs) == sorted(&self.selfs)
-            && old.vals.is_empty()
-            && self.vals.is_empty()
-            && old.dt.is_none()
-            && self.dt.is_none()
-            && old.neg_data.is_empty()
-            && self.neg_data.is_empty()
+            && dt_same
             && old.universal.is_empty()
             && self.universal.is_empty()
             && old.keys.is_empty()
@@ -2609,7 +2620,8 @@ impl Index {
             && !old.nominal_selfs
             && !self.nominal_selfs
             && old.tops == self.tops
-            && old.horn.is_some() == self.horn.is_some()
+            && self.tops[1].is_none()
+            && old.horn.as_ref().map(|h| h.dominate) == self.horn.as_ref().map(|h| h.dominate)
             && match (&old.dl, &self.dl) {
                 (None, None) => true,
                 (Some(a), Some(b)) => a.keyed_by_expressions() && b.keyed_by_expressions(),
@@ -2621,11 +2633,24 @@ impl Index {
     /// here than a run over `old` gave it (roadmap item 753): another successor, told
     /// superexpressions, conjunctions, negative existential restrictions or
     /// disjointness sets, as sets, or other flags of the Horn rules, on the expression
-    /// or, for a universal restriction, on its filler, and in a run of Tier D other
-    /// clauses with the expression in their body or another hypothetical successor.
-    /// `stop` is asked before each [`POLL_CHANGED`] expressions, and the answer is `None`
-    /// once it says to stop.
+    /// or, for a universal restriction, on its filler, changed EL data ranges or
+    /// negative data restrictions, changed datatype-checker components or refire
+    /// triggers, and in a run of Tier D other clauses with the expression in their body
+    /// or another hypothetical successor. `stop` is asked before each [`POLL_CHANGED`]
+    /// expressions, and the answer is `None` once it says to stop.
+    #[allow(dead_code)]
     pub fn changed(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<Vec<bool>> {
+        self.changed_with_dt(old, None, stop)
+    }
+
+    /// [`Index::changed`], incorporating pre-aligned [`DtIx`](super::dt_sat::DtIx)
+    /// component changes when datatype-checker components are active.
+    pub fn changed_with_dt(
+        &self,
+        old: &Index,
+        dt_align: Option<&super::dt_sat::DtAlign>,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<Vec<bool>> {
         let n = old.heads.len();
         debug_assert!(self.heads.len() >= n);
         // the disjointness sets of each index by their members, which name them in both
@@ -2672,6 +2697,41 @@ impl Index {
             b.sort_unstable();
             a == b
         }
+        // Data roles of `old` whose negative data restrictions changed (as sets of
+        // `(DataVal, Ex)` pairs). Any `DataSome(r, _)` with a superrole in this set
+        // must be marked changed so functional data groups re-run `data_matches`.
+        let mut changed_neg_roles: FxHashSet<Role> = FxHashSet::default();
+        if !old.neg_data.is_empty() || !self.neg_data.is_empty() {
+            let old_roles = old.roles.sup.len();
+            let mut neg_a: Vec<(&DataVal, Ex)> = Vec::new();
+            let mut neg_b: Vec<(&DataVal, Ex)> = Vec::new();
+            let mut seen_roles: FxHashSet<Role> = FxHashSet::default();
+            let mut ticks = 0usize;
+            for &r in old.neg_data.keys().chain(self.neg_data.keys()) {
+                if (r as usize) >= old_roles || !seen_roles.insert(r) {
+                    continue;
+                }
+                ticks += 1;
+                if ticks.is_multiple_of(POLL_CHANGED) && stop() {
+                    return None;
+                }
+                neg_a.clear();
+                if let Some(v) = old.neg_data.get(&r) {
+                    neg_a.extend(v.iter().map(|&(w, x)| (&old.vals[w as usize], x)));
+                    neg_a.sort_unstable();
+                    neg_a.dedup();
+                }
+                neg_b.clear();
+                if let Some(v) = self.neg_data.get(&r) {
+                    neg_b.extend(v.iter().map(|&(w, x)| (&self.vals[w as usize], x)));
+                    neg_b.sort_unstable();
+                    neg_b.dedup();
+                }
+                if neg_a != neg_b {
+                    changed_neg_roles.insert(r);
+                }
+            }
+        }
         let mut changed = vec![false; n];
         for (e, changed) in changed.iter_mut().enumerate() {
             if e % POLL_CHANGED == 0 && stop() {
@@ -2692,8 +2752,35 @@ impl Index {
                 Node::Forall(_, f) => flag(old, f as usize) != flag(self, f as usize),
                 _ => false,
             };
+            let succ_changed = match a.node {
+                Node::DataSome(..) => {
+                    a.succ != b.succ
+                        && old.vals.get(a.succ as usize) != self.vals.get(b.succ as usize)
+                }
+                _ => a.succ != b.succ,
+            };
+            let data_changed =
+                match a.node {
+                    Node::DataSome(r, _) => {
+                        !changed_neg_roles.is_empty()
+                            && old.roles.sup.get(r as usize).is_some_and(|sup| {
+                                sup.iter().any(|g| changed_neg_roles.contains(g))
+                            })
+                    }
+                    Node::DtAtom(id) => match (&old.dt, dt_align) {
+                        (Some(old_dt), Some(align)) => old_dt
+                            .keys
+                            .get(id as usize)
+                            .and_then(|k| old_dt.roles.get(&k.role))
+                            .and_then(|ri| align.changed_comps.get(ri.comp as usize).copied())
+                            .unwrap_or(true),
+                        _ => false,
+                    },
+                    _ => false,
+                };
             *changed = a.node != b.node
-                || a.succ != b.succ
+                || succ_changed
+                || data_changed
                 || filler
                 || flag(old, e) != flag(self, e)
                 || !same(old.told_of(a), self.told_of(b))
@@ -2701,6 +2788,35 @@ impl Index {
                 || !same(old.exist_of(a), self.exist_of(b))
                 || (a.disj.len != 0 || b.disj.len != 0)
                     && sets(old, a, &old_sets) != sets(self, b, &new_sets);
+        }
+        if let (Some(old_dt), Some(new_dt), Some(align)) = (&old.dt, &self.dt, dt_align) {
+            for e in 0..n {
+                if e % POLL_CHANGED == 0 && stop() {
+                    return None;
+                }
+                if let Node::DtFire(t) = old.heads[e].node {
+                    let refire_same = match (old_dt.refire_of(t), new_dt.refire_of(t)) {
+                        (None, None) => true,
+                        (Some(old_cs), Some(new_cs)) if old_cs.len() == new_cs.len() => {
+                            old_cs.iter().all(|&oc| {
+                                align
+                                    .comp_map
+                                    .get(oc as usize)
+                                    .copied()
+                                    .flatten()
+                                    .is_some_and(|nc| new_cs.contains(&nc))
+                            })
+                        }
+                        _ => false,
+                    };
+                    if !refire_same {
+                        changed[e] = true;
+                        if (t as usize) < n {
+                            changed[t as usize] = true;
+                        }
+                    }
+                }
+            }
         }
         if stop() {
             return None;
@@ -2711,18 +2827,37 @@ impl Index {
         Some(changed)
     }
 
-    /// The bytes that [`Index::changed`] allocates for the comparison with `old`,
-    /// roughly: a mark for each expression, the members of the disjointness sets of
-    /// both indexes with their lists, their entries in the table that numbers them and
-    /// their numbers, which for sets of two members is 48 bytes a member, and the keys
-    /// of the clauses of Tier D.
+    /// The bytes that [`Index::changed_with_dt`] and [`DtIx::align`](super::dt_sat::DtIx::align)
+    /// allocate for the comparison with `old`, roughly: a mark for each expression, the
+    /// members of the disjointness sets of both indexes with their lists, their entries
+    /// in the table that numbers them and their numbers, which for sets of two members is
+    /// 48 bytes a member, the negative-data role comparison tables, the datatype-checker
+    /// component alignment tables, and the keys of the clauses of Tier D.
     pub fn changed_scratch(&self, old: &Index) -> usize {
-        old.heads.len()
-            + (old.disjoint.len() + self.disjoint.len()) * 48
-            + match (&old.dl, &self.dl) {
+        let neg_roles = old.neg_data.len() + self.neg_data.len();
+        let neg_max = old
+            .neg_data
+            .values()
+            .chain(self.neg_data.values())
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        let neg_scratch = neg_roles
+            .saturating_mul(32)
+            .saturating_add(neg_max.saturating_mul(std::mem::size_of::<(&DataVal, Ex)>() * 2));
+        let dt_scratch = match (&old.dt, &self.dt) {
+            (Some(a), Some(b)) => b.align_scratch(a),
+            _ => 0,
+        };
+        old.heads
+            .len()
+            .saturating_add((old.disjoint.len() + self.disjoint.len()).saturating_mul(48))
+            .saturating_add(neg_scratch)
+            .saturating_add(dt_scratch)
+            .saturating_add(match (&old.dl, &self.dl) {
                 (Some(a), Some(b)) => b.changed_scratch(a),
                 _ => 0,
-            }
+            })
     }
 
     /// The bytes the index takes, roughly, the role table included.
