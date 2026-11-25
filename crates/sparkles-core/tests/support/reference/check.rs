@@ -4,14 +4,11 @@
 //! The comparison passes no answer that the specification forbids, and where it cannot
 //! tell, it says how much it compared instead of passing the answer as compared. A column
 //! whose values the specification leaves open, such as a SAMPLE or a RAND, is compared
-//! only by its place in the rows, which makes the comparison partial. A column that only
-//! computed values bind compares numbers by datatype and value, since the lexical form of
-//! a computed number is the implementation's. Every other term must be the same term,
-//! except that a column bound by both copied terms and computed values, where a number
-//! that differs only in its lexical form may be either, makes the comparison partial, as
-//! does a `STR`, `STRDT`, `STRLANG` or `STRLANGDIR` over an argument that can carry a
-//! computed number when another allowed numeric lexical form keeps the same datatype,
-//! language tag and base direction.
+//! only by its place in the rows, which makes the comparison partial. Computed
+//! numeric bindings compare by datatype and value. Copied bindings compare exactly.
+//! A lexical constructor can carry the spelling of a computed number. Another
+//! spelling in the source datatype's lexical space makes the comparison partial,
+//! with the result's datatype, language tag and base direction still exact.
 //! Where the query orders or slices its answer, the engine's rows must be a slice, at the
 //! query's offset, of an order that ORDER BY allows. Where an ORDER BY condition reads an
 //! open value, the conditions after it can still order the rows that tie before it, so
@@ -19,14 +16,14 @@
 //! answer that the conditions before it forbid. An answer whose rows themselves are open,
 //! because an open value decides which rows there are, is not compared.
 
-use super::{AggregateErrors, Error, Notes, Provenance, Reference, Selected, value};
+use super::{AggregateErrors, Error, Notes, Origin, Reference, Selected, SpellingKey, value};
 
 /// The engine's default reading of the aggregates over errors and non-strings, which the
 /// comparisons take. Roadmap item 1064's setting makes Jena's reading the engine's
 /// default, and the engine runs under it whenever a query chooses no other.
 pub const ENGINE_AGGREGATE_ERRORS: AggregateErrors = AggregateErrors::Jena;
-use oxrdf::{Term, vocab::xsd};
-use std::collections::{BTreeSet, HashMap};
+use oxrdf::Term;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 /// The reference's answer to a query that an engine answered.
 #[derive(Debug, Clone)]
@@ -147,28 +144,26 @@ pub fn check_select(
                 .ok_or_else(|| format!("the engine lacks the column {v}"))
         })
         .collect::<Result<_, _>>()?;
-    let compare = |relax_mixed: bool| -> Result<Outcome, String> {
-        let mask = |row: &[Option<Term>]| -> String {
-            (0..row.len())
-                .map(|c| cell(&row[c], expected.open[c], expected.computed[c], relax_mixed))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let got: Vec<String> = engine_rows
-            .iter()
-            .map(|row| {
-                let ordered: Vec<Option<Term>> = columns.iter().map(|&i| row[i].clone()).collect();
-                mask(&ordered)
-            })
-            .collect();
-        let Some(order) = &expected.order else {
-            let mut a = got;
-            let mut b: Vec<String> = expected.rows.iter().map(|r| mask(r)).collect();
-            a.sort();
-            b.sort();
-            return if a != b {
-                Err(bag_difference(&a, &b))
-            } else if expected.order_unchecked {
+    let got: Vec<Vec<Option<Term>>> = engine_rows
+        .iter()
+        .map(|row| columns.iter().map(|&i| row[i].clone()).collect())
+        .collect();
+    let rows: Vec<_> = match &expected.order {
+        Some(order) => order.items.iter().map(|(row, _)| row.as_slice()).collect(),
+        None => expected.rows.iter().map(Vec::as_slice).collect(),
+    };
+    let compare = |relax_lexical| -> Result<Outcome, String> {
+        let order = expected.order.as_ref();
+        let size = order.map_or(rows.len(), |o| {
+            let available = rows.len().saturating_sub(o.offset);
+            o.limit.map_or(available, |l| l.min(available))
+        });
+        if got.len() != size {
+            return Err(format!("{} rows against the reference's {size}", got.len()));
+        }
+        let matching = match_rows(expected, &rows, &got, relax_lexical)?;
+        let Some(order) = order else {
+            return if expected.order_unchecked {
                 Ok(Outcome::OrderUnchecked(
                     "DISTINCT kept a row whose copies have different sort keys".into(),
                 ))
@@ -176,23 +171,24 @@ pub fn check_select(
                 Ok(Outcome::Compared)
             };
         };
-        let items: Vec<String> = order.items.iter().map(|(r, _)| mask(r)).collect();
-        let outcome = check_order(order, &items, &got)?;
+        let keys = observed_keys(order, &expected.variables, &matching.chosen, &got);
+        let outcome = check_order(order, &keys.terms, &matching)?;
+        let open_conditions = order.open_conditions || keys.incomplete;
         // The keys of an order with an open condition tell which orders are forbidden and
         // not which are allowed, so an answer that breaks no constraint is not passed.
         Ok(match outcome {
             Outcome::Compared | Outcome::OrderUnchecked(_)
-                if order.open_conditions && got.len() < order.items.len() =>
+                if open_conditions && got.len() < order.items.len() =>
             {
                 Outcome::Skipped(
-                    "an ORDER BY condition reads an open value, which can decide the rows of \
+                    "an ORDER BY key is open or uses an unobserved numeric spelling, which can decide the rows of \
                      the slice"
                         .into(),
                 )
             }
-            Outcome::Compared if order.open_conditions => Outcome::OrderUnchecked(
-                "an ORDER BY condition reads an open value, and the conditions after it can \
-                 order rows that tie before it"
+            Outcome::Compared if open_conditions => Outcome::OrderUnchecked(
+                "an ORDER BY key is open or uses an unobserved numeric spelling, and the remaining \
+                 conditions can order rows that tie before it"
                     .into(),
             ),
             // where the slice cuts rows, an order that is not established leaves its rows
@@ -206,21 +202,20 @@ pub fn check_select(
     let outcome = match compare(false) {
         Ok(o) => o,
         Err(e) => {
-            // a number of another lexical form in a column that copies terms and computes
-            // values may be allowed or not
-            let mixed = expected.computed.iter().any(|p| p.is_mixed());
-            if !mixed {
+            if !expected
+                .origins
+                .iter()
+                .flatten()
+                .any(|o| matches!(o, Origin::NumericLexical(_)))
+            {
                 return Err(e);
             }
             return match compare(true) {
                 Ok(Outcome::Compared) => Ok(Outcome::Partial(format!(
-                    "a column copies terms and computes values, and the answer agrees only \
-                     where its numbers are compared by value: {e}"
+                    "the answer agrees only when a computed numeric spelling is compared by value: {e}"
                 ))),
-                // a weaker outcome under the relaxed comparison stays as weak
                 Ok(Outcome::OrderUnchecked(why)) => Ok(Outcome::OrderUnchecked(format!(
-                    "{why}, and a column that copies terms and computes values agrees only \
-                     where its numbers are compared by value"
+                    "{why}, and the answer agrees only when a computed numeric spelling is compared by value"
                 ))),
                 Ok(weaker) => Ok(weaker),
                 Err(_) => Err(e),
@@ -242,77 +237,227 @@ pub fn check_select(
     })
 }
 
-/// One cell of a row as the comparison sees it. Numbers compare by datatype and value in
-/// a computed column, and in a mixed one when `relax_mixed`. In a mixed-lexical column
-/// (where `STR`, `STRDT`, `STRLANG` or `STRLANGDIR` can read a computed number), a
-/// literal's numeric lexical form also compares by numeric value when `relax_mixed`, while
-/// its datatype, language tag and base direction stay exact.
-fn cell(t: &Option<Term>, open: bool, provenance: Provenance, relax_mixed: bool) -> String {
+/// The expected binding supplies the comparison policy for both cells.
+fn cell(t: &Option<Term>, open: bool, origin: Origin) -> String {
     if open {
         return "*".into();
     }
-    let relax_numeric = match provenance {
-        Provenance::Computed => true,
-        Provenance::Mixed | Provenance::MixedLexical => relax_mixed,
-        Provenance::Copied => false,
+    let Some(term) = t else {
+        return "UNDEF".into();
     };
-    let relax_lexical = matches!(provenance, Provenance::MixedLexical) && relax_mixed;
-    match t {
-        None => "UNDEF".into(),
-        Some(Term::Literal(l)) if relax_lexical => {
-            if (l.datatype() == xsd::FLOAT || l.datatype() == xsd::DOUBLE)
-                && let Some(n) = value::numeric(l)
-            {
-                return format!("#{}^^<{}>", n.canonical_lexical(), l.datatype().as_str());
+    if let Term::Literal(l) = term {
+        match origin {
+            Origin::ComputedNumber => {
+                if let Some(n) = value::numeric(l) {
+                    return format!("\"{}\"^^<{}>", n.canonical_lexical(), l.datatype().as_str());
+                }
             }
-            match value::canonical_numeric_lexical(l.value()) {
-                Some(canon) => format!(
-                    "#{canon}^^<{}>@{:?}--{:?}",
-                    l.datatype().as_str(),
-                    l.language(),
-                    l.direction()
-                ),
-                None => l.to_string(),
+            Origin::NumericLexical(kind) => {
+                if let Some(canon) = kind.lexical_key(l.value()) {
+                    return format!(
+                        "#{canon}^^<{}>@{:?}--{:?}",
+                        l.datatype().as_str(),
+                        l.language(),
+                        l.direction()
+                    );
+                }
             }
+            Origin::Exact | Origin::SpellingDependent => {}
         }
-        Some(Term::Literal(l)) if relax_numeric => match value::numeric(l) {
-            Some(n) => format!("\"{}\"^^<{}>", n.canonical_lexical(), l.datatype().as_str()),
-            None => l.to_string(),
-        },
-        Some(t) => t.to_string(),
     }
+    term.to_string()
 }
 
-/// A short description of how two sorted bags differ.
-fn bag_difference(got: &[String], expected: &[String]) -> String {
-    let mut counts: HashMap<&str, i64> = HashMap::new();
-    for r in got {
-        *counts.entry(r).or_default() += 1;
+fn row_key(row: &[Option<Term>], open: &[bool], origins: &[Origin]) -> String {
+    row.iter()
+        .zip(open)
+        .zip(origins)
+        .map(|((term, &open), &origin)| cell(term, open, origin))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Default)]
+struct RowGroup {
+    expected: Vec<usize>,
+    matched: Vec<usize>,
+}
+
+struct Matching {
+    chosen: Vec<usize>,
+    ambiguous: bool,
+}
+
+/// Index expected rows by their cell policies and the keys under those policies.
+/// Groups of identical rows share a capacity. A match can be reassigned if a later
+/// row has fewer choices, as when an engine row can match both a copied term and a
+/// computed spelling but a later row can only match the computed spelling.
+fn match_rows(
+    expected: &Selected,
+    rows: &[&[Option<Term>]],
+    got: &[Vec<Option<Term>>],
+    relax_lexical: bool,
+) -> Result<Matching, String> {
+    let mut by_policy: HashMap<Vec<Origin>, HashMap<String, usize>> = HashMap::new();
+    let mut groups: Vec<RowGroup> = Vec::new();
+    for (i, (row, origins)) in rows.iter().zip(&expected.origins).enumerate() {
+        let policy: Vec<_> = origins
+            .iter()
+            .zip(&expected.open)
+            .map(|(&origin, &open)| match origin {
+                _ if open => Origin::Exact,
+                Origin::SpellingDependent => Origin::Exact,
+                Origin::NumericLexical(_) if !relax_lexical => Origin::Exact,
+                other => other,
+            })
+            .collect();
+        let key = row_key(row, &expected.open, &policy);
+        let group = *by_policy
+            .entry(policy)
+            .or_default()
+            .entry(key)
+            .or_insert_with(|| {
+                groups.push(RowGroup::default());
+                groups.len() - 1
+            });
+        groups[group].expected.push(i);
     }
-    for r in expected {
-        *counts.entry(r).or_default() -= 1;
+
+    let candidates: Vec<Vec<usize>> = got
+        .iter()
+        .map(|row| {
+            let mut ids: Vec<_> = by_policy
+                .iter()
+                .filter_map(|(policy, index)| {
+                    index.get(&row_key(row, &expected.open, policy)).copied()
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        })
+        .collect();
+    for (i, options) in candidates.iter().enumerate() {
+        if let Some(group) = options
+            .iter()
+            .filter(|&&g| groups[g].matched.len() < groups[g].expected.len())
+            .min_by_key(|&&g| groups[g].expected[groups[g].matched.len()])
+        {
+            groups[*group].matched.push(i);
+        } else if !reassign(i, &candidates, &mut groups) {
+            return Err(format!(
+                "row {i} {:?} has no unused match in the reference's answer",
+                got[i]
+            ));
+        }
     }
-    let mut extra: Vec<&str> = counts
+
+    let mut chosen = vec![0; got.len()];
+    for group in &groups {
+        for (&actual, &reference) in group.matched.iter().zip(&group.expected) {
+            chosen[actual] = reference;
+        }
+    }
+    let ambiguous = expected.order.as_ref().is_some_and(|order| {
+        let spread: Vec<_> = groups
+            .iter()
+            .map(|g| {
+                let first = &order.items[g.expected[0]].1;
+                g.expected.iter().any(|&i| &order.items[i].1 != first)
+            })
+            .collect();
+        candidates.iter().enumerate().any(|(i, options)| {
+            let first = &order.items[chosen[i]].1;
+            options
+                .iter()
+                .any(|&g| spread[g] || &order.items[groups[g].expected[0]].1 != first)
+        })
+    });
+    Ok(Matching { chosen, ambiguous })
+}
+
+/// Find a free group by following alternating paths through occupied matches.
+fn reassign(i: usize, candidates: &[Vec<usize>], groups: &mut [RowGroup]) -> bool {
+    if candidates[i].is_empty() {
+        return false;
+    }
+    let mut queue = VecDeque::from([(i, None)]);
+    let mut via = HashMap::new();
+    while let Some((row, parent)) = queue.pop_front() {
+        for &g in &candidates[row] {
+            if via.contains_key(&g) {
+                continue;
+            }
+            via.insert(g, (row, parent));
+            let group = &groups[g];
+            if group.matched.len() < group.expected.len() {
+                groups[g].matched.push(row);
+                let mut step = parent;
+                while let Some((previous, slot)) = step {
+                    let (row, parent) = via[&previous];
+                    groups[previous].matched[slot] = row;
+                    step = parent;
+                }
+                return true;
+            }
+            queue.extend(
+                group
+                    .matched
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &row)| (row, Some((g, slot)))),
+            );
+        }
+    }
+    false
+}
+
+struct ObservedKeys {
+    terms: Vec<Option<Vec<Option<Term>>>>,
+    incomplete: bool,
+}
+
+fn observed_keys(
+    order: &super::TopOrder,
+    variables: &[String],
+    chosen: &[usize],
+    got: &[Vec<Option<Term>>],
+) -> ObservedKeys {
+    let mut observed = vec![None; order.items.len()];
+    for (&i, row) in chosen.iter().zip(got) {
+        observed[i] = Some(row);
+    }
+    let mut incomplete = false;
+    let terms = order
+        .items
         .iter()
-        .filter(|(_, n)| **n > 0)
-        .map(|(r, _)| *r)
+        .zip(observed)
+        .map(|((_, key), row)| {
+            let key = key.as_ref()?;
+            let mut terms = key.terms.clone();
+            for (i, source) in &key.spelling {
+                let cell = |v: &oxrdf::Variable| {
+                    let column = variables.iter().position(|name| name == v.as_str())?;
+                    Some(&row?[column])
+                };
+                let observed = match source {
+                    SpellingKey::Variable(v) => cell(v).cloned(),
+                    SpellingKey::StrOf(v) => {
+                        cell(v).map(|cell| cell.as_ref().and_then(value::lexical_string))
+                    }
+                    SpellingKey::Unobserved => None,
+                };
+                if let Some(observed) = observed {
+                    terms[*i] = observed;
+                } else {
+                    terms.truncate(*i);
+                    incomplete = true;
+                    break;
+                }
+            }
+            Some(terms)
+        })
         .collect();
-    let mut missing: Vec<&str> = counts
-        .iter()
-        .filter(|(_, n)| **n < 0)
-        .map(|(r, _)| *r)
-        .collect();
-    extra.sort();
-    missing.sort();
-    extra.truncate(5);
-    missing.truncate(5);
-    format!(
-        "{} rows against the reference's {}; the engine's rows not in the reference's \
-         answer include {extra:?}, and the reference's rows that the engine lacks include \
-         {missing:?}",
-        got.len(),
-        expected.len()
-    )
+    ObservedKeys { terms, incomplete }
 }
 
 /// Check that `got` is a slice, at the query's offset, of an order of the reference's
@@ -321,7 +466,7 @@ fn bag_difference(got: &[String], expected: &[String]) -> String {
 /// Rows with the same sort key form a block, and the strict order is tested between
 /// every two blocks that the check meets, in both directions, so the check does not rely
 /// on the reference's order extending the specification's. The engine's rows are
-/// matched to the reference's rows, each to the first unused row with the same cells.
+/// matched to the reference's rows, using the match established by the row comparison.
 /// The returned rows must be in an allowed order among themselves. The other rows that
 /// the order puts strictly before a returned row must all be cut by the offset, and those
 /// strictly after one must all follow the slice, so the two sets cannot meet, the first
@@ -332,23 +477,17 @@ fn bag_difference(got: &[String], expected: &[String]) -> String {
 /// unchecked otherwise.
 fn check_order(
     order: &super::TopOrder,
-    items: &[String],
-    got: &[String],
+    row_keys: &[Option<Vec<Option<Term>>>],
+    matching: &Matching,
 ) -> Result<Outcome, String> {
-    let n = items.len();
+    let n = row_keys.len();
     let from = order.offset.min(n);
-    let expected_len = order.limit.map_or(n - from, |l| l.min(n - from));
-    if got.len() != expected_len {
-        return Err(format!(
-            "{} rows against the reference's {expected_len}",
-            got.len()
-        ));
-    }
+    let chosen = &matching.chosen;
     // blocks of equal keys, in the reference's order
     let mut block = Vec::with_capacity(n);
-    let mut keys: Vec<Option<&super::SortKey>> = Vec::new();
-    for (i, (_, k)) in order.items.iter().enumerate() {
-        let same = i > 0 && k.is_some() && order.items[i - 1].1.as_ref() == k.as_ref();
+    let mut keys = Vec::new();
+    for (i, k) in row_keys.iter().enumerate() {
+        let same = i > 0 && k.is_some() && &row_keys[i - 1] == k;
         if !same {
             keys.push(k.as_ref());
         }
@@ -362,35 +501,8 @@ fn check_order(
             _ => false,
         })
     };
-    // match the engine's rows to the reference's
-    let mut by_row: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, r) in items.iter().enumerate().rev() {
-        by_row.entry(r.as_str()).or_default().push(i);
-    }
-    // the rows whose copies fall in different blocks, where the matching chooses
-    let spread: std::collections::HashSet<&str> = by_row
-        .iter()
-        .filter(|(_, is)| is.iter().any(|&k| block[k] != block[is[0]]))
-        .map(|(r, _)| *r)
-        .collect();
-    let mut ambiguous = false;
-    let mut chosen = Vec::with_capacity(got.len());
-    for (j, r) in got.iter().enumerate() {
-        let Some(free) = by_row.get_mut(r.as_str()) else {
-            return Err(format!("row {j} {r} is not in the reference's answer"));
-        };
-        let Some(i) = free.pop() else {
-            return Err(format!(
-                "row {j} {r} occurs more often than in the reference's answer"
-            ));
-        };
-        if spread.contains(r.as_str()) {
-            ambiguous = true;
-        }
-        chosen.push(i);
-    }
     let fail = |message: String| -> Result<Outcome, String> {
-        if ambiguous {
+        if matching.ambiguous {
             Ok(Outcome::OrderUnchecked(format!(
                 "equal rows with different sort keys, and the first matching found {message}"
             )))
@@ -411,19 +523,19 @@ fn check_order(
             match before(b, earlier) {
                 None => return unchecked(),
                 Some(true) => {
-                    return fail(format!("row {j} {} belongs before an earlier row", got[j]));
+                    return fail(format!("row {j} belongs before an earlier row"));
                 }
                 Some(false) => {}
             }
         }
         seen.insert(b);
     }
-    if got.len() == n {
+    if chosen.len() == n {
         return Ok(Outcome::Compared);
     }
     // the rows outside the slice that the order places before or after a returned row
     let mut used = vec![false; n];
-    for &i in &chosen {
+    for &i in chosen {
         used[i] = true;
     }
     let returned: Vec<usize> = seen.iter().copied().collect();
@@ -458,13 +570,13 @@ fn check_order(
         if is_before && is_after {
             return fail(format!(
                 "the reference's row {} belongs both before and after returned rows",
-                items[i]
+                i
             ));
         }
         forced_before += usize::from(is_before);
         forced_after += usize::from(is_after);
     }
-    let rest = n - got.len();
+    let rest = n - chosen.len();
     if forced_before > from {
         return fail(format!(
             "{forced_before} rows belong before the returned rows, more than the offset {from}"
@@ -488,7 +600,7 @@ fn check_order(
     let unused: Vec<usize> = (0..n).filter(|&i| !used[i]).collect();
     let mut sequence: Vec<usize> = unused[..from]
         .iter()
-        .chain(&chosen)
+        .chain(chosen)
         .chain(&unused[from..])
         .map(|&i| block[i])
         .collect();

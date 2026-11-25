@@ -350,26 +350,27 @@ not project. The seeded queries of `tests/query_cursor.rs` compare the eager ans
 the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a compacted base, a
 pending delta, several index blocks and a masked view, and the optimizer, index-join and
 string-filter tests compare `Optimizations::ALL` with it as well as with
-`Optimizations::NONE`. Both go through one comparison, which passes no answer that the specification
-forbids and, where it cannot decide, reports a partial or unordered comparison instead.
+`Optimizations::NONE`. Both use the same comparison of terms, numeric values and ordering.
+It reports when it can check only part of an answer.
 An open column is compared only by its place in the rows, which makes the comparison
-partial. A column that only computed values bind compares numbers by datatype and value,
-and a column that only copied terms bind compares them exactly. Arithmetic, the numeric
-functions, a cast to a number and the COUNT, SUM and AVG aggregates compute values. A
-variable, a constant, IF, COALESCE, STR, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and SAMPLE
-aggregates pass on the terms or lexical forms of copied or constant arguments, and any other operator
-counts as both. When `STR`, `STRDT`, `STRLANG` or `STRLANGDIR` reads an argument that can
-hold a computed number or carry one's lexical form, such as `STR(1.0 + 1.0)` or
-`STRDT(STR(1.0 + 1.0), xsd:decimal)`, it counts as both copied and computed with a
-computed lexical form, so an exact match is compared and another allowed numeric lexical
-form with the same datatype, language tag and base direction makes the comparison partial. A column bound by both,
-such as a COALESCE over a variable and a constant, compares exactly, and a number that
-differs there only in its lexical form makes the comparison partial. An ordered or sliced
-answer must be a slice, at the query's offset, of an order that ORDER BY allows, and an
-answer with open rows is left uncompared. A sort key stops before the first condition
-that reads an open value. The conditions after it can still order the rows that tie
-before it, so the key only finds an answer that the earlier conditions forbid, and
-otherwise the order is unchecked and a slice of it is left uncompared. A slice that passes
+partial. The evaluator records how each binding was produced. Copied terms and constants
+compare exactly. Arithmetic, numeric functions, numeric casts and COUNT, SUM and AVG
+produce numbers that compare by datatype and value. Variables, IF, COALESCE, MIN, MAX
+and SAMPLE retain the provenance of the binding they return.
+
+STR, STRDT, STRLANG and STRLANGDIR can carry the spelling of a computed number. An exact
+match compares fully. A different spelling of the same value in the source number's
+datatype compares partially if the result's datatype, language tag and base direction
+match. An xsd:string cast from a number has a prescribed spelling. A cast that copies a
+string can carry its provenance. String transformations compare exactly. The comparison
+uses the reference's spelling for expressions that select rows or aggregate values.
+
+An ordered or sliced answer must follow an order that ORDER BY allows. The comparison
+uses the engine's spelling for a key it can recover from the returned bindings.
+A key stops before the first open value or spelling it cannot recover. Earlier
+conditions can still rule out an order or slice. Otherwise the order is unchecked
+and a slice of it is left uncompared. An answer with open rows is left uncompared.
+A slice that passes
 the checks against each other row is compared when the reference's other rows, placed
 around it in their own order, complete it to an order that ORDER BY allows. When that
 completion breaks a constraint between two rows, or the order of a slice is otherwise not

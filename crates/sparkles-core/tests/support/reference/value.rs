@@ -93,46 +93,67 @@ pub fn is_float_lexical(lex: &str) -> bool {
     mantissa_ok && exponent_ok
 }
 
-/// A canonical key for a lexical form in the XSD numeric lexical space, grouping allowed
-/// lexical forms of the same exact numeric value (such as `2`, `2.0`, `+2.00` and
-/// `2.0E0`, or `+INF` and `INF`). Returns `None` when `lex` is not a valid XSD numeric
-/// lexical form or its exponent overflows `i128`.
-pub fn canonical_numeric_lexical(lex: &str) -> Option<String> {
-    if !is_float_lexical(lex) {
-        return None;
+/// The datatype that supplied a computed spelling, before a lexical constructor
+/// discarded or replaced the datatype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum NumericKind {
+    Integer,
+    Decimal,
+    Float,
+    Double,
+}
+
+impl NumericKind {
+    pub(super) fn of(t: &Term) -> Option<Self> {
+        let Term::Literal(l) = t else {
+            return None;
+        };
+        Some(match l.datatype() {
+            xsd::INTEGER => Self::Integer,
+            xsd::DECIMAL => Self::Decimal,
+            xsd::FLOAT => Self::Float,
+            xsd::DOUBLE => Self::Double,
+            _ => return None,
+        })
     }
-    match lex {
-        "INF" | "+INF" => return Some("INF".into()),
-        "-INF" => return Some("-INF".into()),
-        "NaN" => return Some("NaN".into()),
-        _ => {}
+
+    pub(super) fn lexical_key(self, lex: &str) -> Option<String> {
+        match self {
+            Self::Integer | Self::Decimal => self.exact_key(lex),
+            Self::Float | Self::Double if !is_float_lexical(lex) => None,
+            Self::Float => Float::from_str(lex)
+                .ok()
+                .map(|f| Num::Flt(f32::from(f)).canonical_lexical()),
+            Self::Double => Double::from_str(lex)
+                .ok()
+                .map(|f| Num::Dbl(f64::from(f)).canonical_lexical()),
+        }
     }
-    let (neg, body) = match lex.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, lex.strip_prefix('+').unwrap_or(lex)),
-    };
-    let (mantissa, exp) = match body.find(['e', 'E']) {
-        Some(i) => (&body[..i], body[i + 1..].parse::<i128>().ok()?),
-        None => (body, 0i128),
-    };
-    let (whole, frac) = match mantissa.find('.') {
-        Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
-        None => (mantissa, ""),
-    };
-    let mut digits = String::with_capacity(whole.len() + frac.len());
-    digits.push_str(whole);
-    digits.push_str(frac);
-    let trimmed_start = digits.trim_start_matches('0');
-    if trimmed_start.is_empty() {
-        return Some("0".into());
+
+    /// Compare an integer or decimal without rounding or bounding the digit count.
+    fn exact_key(self, lex: &str) -> Option<String> {
+        let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+        let (whole, fraction) = match body.split_once('.') {
+            Some(parts) if self == Self::Decimal => parts,
+            _ => (body, ""),
+        };
+        if (whole.is_empty() && fraction.is_empty())
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let whole = whole.trim_start_matches('0');
+        let fraction = fraction.trim_end_matches('0');
+        let sign = if lex.starts_with('-') && !(whole.is_empty() && fraction.is_empty()) {
+            "-"
+        } else {
+            ""
+        };
+        Some(format!("{sign}{whole}.{fraction}"))
     }
-    let trimmed = trimmed_start.trim_end_matches('0');
-    let trailing_zeros = (trimmed_start.len() - trimmed.len()) as i128;
-    let scale = exp
-        .checked_sub(frac.len() as i128)?
-        .checked_add(trailing_zeros)?;
-    let sign = if neg { "-" } else { "" };
-    Some(format!("{sign}{trimmed}e{scale}"))
 }
 
 /// Whether [`numeric`] read an integer or decimal with more than 16 digits since the last
@@ -537,6 +558,15 @@ pub fn bool_term(b: bool) -> Term {
 
 pub fn string_term(s: impl Into<String>) -> Term {
     Term::Literal(Literal::new_simple_literal(s))
+}
+
+/// The simple literal that STR reads from an IRI or literal.
+pub(super) fn lexical_string(term: &Term) -> Option<Term> {
+    match term {
+        Term::NamedNode(n) => Some(string_term(n.as_str())),
+        Term::Literal(l) => Some(string_term(l.value())),
+        _ => None,
+    }
 }
 
 pub fn int_term(i: i128) -> Term {

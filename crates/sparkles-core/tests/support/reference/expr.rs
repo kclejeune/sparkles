@@ -3,7 +3,7 @@
 //! variable or a dropped solution where it says so.
 
 use super::value::*;
-use super::{Cx, Evaluator, Fail, R, Solution, merge, row_variable, unsupported};
+use super::{Binding, Cx, Evaluator, Fail, Origin, R, Solution, merge, row_variable, unsupported};
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{BlankNode, Literal, NamedNode, Term, Triple};
 use oxsdatatypes::{Boolean, DateTime, Decimal, Double, Float};
@@ -100,19 +100,126 @@ impl Evaluator<'_> {
     }
 
     pub(crate) fn expr(&self, e: &Expression, cx: &Cx, s: &Solution) -> R<Term> {
+        Ok(self.binding(e, cx, s)?.term)
+    }
+
+    pub(super) fn binding(&self, e: &Expression, cx: &Cx, s: &Solution) -> R<Binding> {
+        let binding = self.eval_binding(e, cx, s)?;
+        if matches!(
+            binding.origin,
+            Origin::NumericLexical(_) | Origin::SpellingDependent
+        ) {
+            self.read_spelling.set(true);
+        }
+        Ok(binding)
+    }
+
+    fn eval_binding(&self, e: &Expression, cx: &Cx, s: &Solution) -> R<Binding> {
         use Expression as E;
         match e {
-            E::NamedNode(n) => Ok(Term::NamedNode(n.clone())),
-            E::Literal(l) => Ok(Term::Literal(l.clone())),
             E::Variable(v) => {
                 if self.open_vars.borrow().contains(v) {
                     self.read_open.set(true);
                 }
-                s.get(v)
-                    .or_else(|| cx.env.get(v))
-                    .cloned()
-                    .ok_or(Fail::Type)
+                s.binding(v).or_else(|| cx.env.binding(v)).ok_or(Fail::Type)
             }
+            E::If(c, a, b) => {
+                let c = self.expr(c, cx, s)?;
+                if ebv(&c).ok_or(Fail::Type)? {
+                    self.binding(a, cx, s)
+                } else {
+                    self.binding(b, cx, s)
+                }
+            }
+            E::Coalesce(list) => {
+                for item in list {
+                    if let Some(v) = self.soft(self.binding(item, cx, s))? {
+                        return Ok(v);
+                    }
+                }
+                type_error()
+            }
+            E::FunctionCall(f, args) => {
+                // values that another evaluation makes otherwise
+                if matches!(
+                    f,
+                    Function::BNode
+                        | Function::Rand
+                        | Function::Uuid
+                        | Function::StrUuid
+                        | Function::Now
+                ) {
+                    self.read_open.set(true);
+                }
+                if matches!(f, Function::BNode) {
+                    self.scope.set(match s.get(&row_variable()) {
+                        Some(Term::Literal(l)) => l.value().parse().unwrap_or(0),
+                        _ => 0,
+                    });
+                }
+                let mut values = Vec::with_capacity(args.len());
+                let mut first_origin = Origin::Exact;
+                for (i, a) in args.iter().enumerate() {
+                    let b = self.binding(a, cx, s)?;
+                    if i == 0 {
+                        first_origin = b.origin;
+                    }
+                    values.push(b.term);
+                }
+                let term = self.function(f, &values)?;
+                let origin = match f {
+                    Function::Str | Function::StrDt | Function::StrLang | Function::StrLangDir => {
+                        match first_origin {
+                            Origin::ComputedNumber => values
+                                .first()
+                                .and_then(NumericKind::of)
+                                .map(Origin::NumericLexical)
+                                .unwrap_or_default(),
+                            other => other,
+                        }
+                    }
+                    // Casting a number to xsd:string formats it. Casting a string
+                    // copies its existing lexical form.
+                    Function::Custom(n) if n.as_str() == xsd::STRING.as_str() => {
+                        match values.first() {
+                            Some(Term::Literal(l)) if is_string_literal(l) => first_origin,
+                            _ => Origin::Exact,
+                        }
+                    }
+                    Function::Abs
+                    | Function::Ceil
+                    | Function::Floor
+                    | Function::Round
+                    | Function::Rand
+                    | Function::StrLen
+                    | Function::Year
+                    | Function::Month
+                    | Function::Day
+                    | Function::Hours
+                    | Function::Minutes
+                    | Function::Seconds => Origin::ComputedNumber,
+                    Function::Custom(n) if is_numeric_datatype(n.as_str()) => {
+                        Origin::ComputedNumber
+                    }
+                    _ => Origin::Exact,
+                };
+                Ok(Binding { term, origin })
+            }
+            E::Add(..)
+            | E::Subtract(..)
+            | E::Multiply(..)
+            | E::Divide(..)
+            | E::UnaryPlus(_)
+            | E::UnaryMinus(_) => self.term_expr(e, cx, s).map(Binding::number),
+            _ => self.term_expr(e, cx, s).map(Binding::exact),
+        }
+    }
+
+    fn term_expr(&self, e: &Expression, cx: &Cx, s: &Solution) -> R<Term> {
+        use Expression as E;
+        match e {
+            E::NamedNode(n) => Ok(Term::NamedNode(n.clone())),
+            E::Literal(l) => Ok(Term::Literal(l.clone())),
             E::Or(a, b) => {
                 let x = self.soft(self.expr(a, cx, s))?.and_then(|t| ebv(&t));
                 let y = self.soft(self.expr(b, cx, s))?.and_then(|t| ebv(&t));
@@ -205,46 +312,7 @@ impl Evaluator<'_> {
                 }
                 Ok(bool_term(s.contains_key(v) || cx.env.contains_key(v)))
             }
-            E::If(c, a, b) => {
-                let c = self.expr(c, cx, s)?;
-                if ebv(&c).ok_or(Fail::Type)? {
-                    self.expr(a, cx, s)
-                } else {
-                    self.expr(b, cx, s)
-                }
-            }
-            E::Coalesce(list) => {
-                for item in list {
-                    if let Some(v) = self.soft(self.expr(item, cx, s))? {
-                        return Ok(v);
-                    }
-                }
-                type_error()
-            }
-            E::FunctionCall(f, args) => {
-                // values that another evaluation makes otherwise
-                if matches!(
-                    f,
-                    Function::BNode
-                        | Function::Rand
-                        | Function::Uuid
-                        | Function::StrUuid
-                        | Function::Now
-                ) {
-                    self.read_open.set(true);
-                }
-                if matches!(f, Function::BNode) {
-                    self.scope.set(match s.get(&row_variable()) {
-                        Some(Term::Literal(l)) => l.value().parse().unwrap_or(0),
-                        _ => 0,
-                    });
-                }
-                let mut values = Vec::with_capacity(args.len());
-                for a in args {
-                    values.push(self.expr(a, cx, s)?);
-                }
-                self.function(f, &values)
-            }
+            E::Variable(_) | E::If(..) | E::Coalesce(_) | E::FunctionCall(..) => unreachable!(),
         }
     }
 
@@ -280,11 +348,7 @@ impl Evaluator<'_> {
         use Function as F;
         let arg = |i: usize| a.get(i).ok_or(Fail::Type);
         match f {
-            F::Str => match arg(0)? {
-                Term::NamedNode(n) => Ok(string_term(n.as_str())),
-                Term::Literal(l) => Ok(string_term(l.value())),
-                _ => type_error(),
-            },
+            F::Str => lexical_string(arg(0)?).ok_or(Fail::Type),
             F::Lang => Ok(string_term(lit(arg(0)?)?.language().unwrap_or(""))),
             F::LangMatches => {
                 let (tag, range) = (simple_arg(arg(0)?)?, simple_arg(arg(1)?)?);

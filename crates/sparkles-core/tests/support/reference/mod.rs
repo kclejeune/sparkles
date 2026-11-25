@@ -35,8 +35,8 @@ mod path;
 pub mod value;
 
 use oxiri::Iri;
+use oxrdf::Variable;
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
-use oxrdf::{Variable, vocab::xsd};
 use oxsdatatypes::DateTime;
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, Function, GraphPattern, OrderExpression,
@@ -49,8 +49,95 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use value::{ebv, int_term, total_order};
 
-/// A solution mapping.
-pub type Solution = BTreeMap<Variable, Term>;
+/// The comparison policy for a particular binding. Only the lexical constructors can
+/// carry the spelling of a computed number into a term with different RDF metadata.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+enum Origin {
+    #[default]
+    Exact,
+    ComputedNumber,
+    NumericLexical(value::NumericKind),
+    SpellingDependent,
+}
+
+impl Origin {
+    fn shared(self, other: Self) -> Self {
+        if self == other { self } else { Self::Exact }
+    }
+}
+
+#[derive(Clone)]
+struct Binding {
+    term: Term,
+    origin: Origin,
+}
+
+impl Binding {
+    fn exact(term: Term) -> Self {
+        Self {
+            term,
+            origin: Origin::Exact,
+        }
+    }
+
+    fn number(term: Term) -> Self {
+        Self {
+            term,
+            origin: Origin::ComputedNumber,
+        }
+    }
+}
+
+/// A solution mapping with provenance attached to its bindings. RDF equality, joins
+/// and duplicate detection still use the terms themselves.
+#[derive(Clone, Default)]
+pub(crate) struct Solution {
+    terms: BTreeMap<Variable, Term>,
+    origins: BTreeMap<Variable, Origin>,
+}
+
+impl std::ops::Deref for Solution {
+    type Target = BTreeMap<Variable, Term>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.terms
+    }
+}
+
+impl Solution {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn origin(&self, v: &Variable) -> Origin {
+        self.origins.get(v).copied().unwrap_or_default()
+    }
+
+    fn binding(&self, v: &Variable) -> Option<Binding> {
+        Some(Binding {
+            term: self.get(v)?.clone(),
+            origin: self.origin(v),
+        })
+    }
+
+    fn insert(&mut self, v: Variable, term: Term) {
+        self.bind(v, Binding::exact(term));
+    }
+
+    fn bind(&mut self, v: Variable, binding: Binding) {
+        if binding.origin == Origin::Exact {
+            self.origins.remove(&v);
+        } else {
+            self.origins.insert(v.clone(), binding.origin);
+        }
+        self.terms.insert(v, binding.term);
+    }
+
+    fn project(&mut self, variables: &[Variable]) {
+        self.terms.retain(|v, _| variables.contains(v));
+        self.origins.retain(|v, _| variables.contains(v));
+    }
+}
 
 /// Why a query got no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,6 +532,7 @@ pub(crate) struct Evaluator<'a> {
     pub open_vars: RefCell<HashSet<Variable>>,
     /// Whether the expression being evaluated read an open value.
     pub read_open: Cell<bool>,
+    read_spelling: Cell<bool>,
 }
 
 /// The readings of the aggregates where SPARQL, Jena and the engine differ, roadmap item
@@ -513,273 +601,13 @@ pub struct Selected {
     /// For each column, whether its values are open, such as a SAMPLE, a RAND or a new
     /// blank node, so that only their place in the rows can be compared.
     pub open: Vec<bool>,
-    /// For each column, whether the query computes its values, where an implementation
-    /// chooses the lexical form of a number, or copies terms, which keep theirs.
-    pub computed: Vec<Provenance>,
+    /// The sources of the expected cells, including rows outside a top-level slice.
+    origins: Vec<Vec<Origin>>,
     /// The order and slice of the answer, when the query orders or slices it.
     pub order: Option<TopOrder>,
     /// The answer is ordered, and DISTINCT kept a row whose copies have different sort
     /// keys, so the order is not checked.
     pub order_unchecked: bool,
-}
-
-/// Where the values of a column come from, by the patterns and expressions that bind
-/// its variable anywhere in the query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provenance {
-    /// Only terms of the data or the query, copied, which keep their lexical form.
-    Copied,
-    /// Only values that an operator or function computed, whose lexical form is the
-    /// implementation's.
-    Computed,
-    /// Both copied terms and computed values, so a numeric literal's lexical form may be
-    /// fixed or free.
-    Mixed,
-    /// Both copied terms and lexical forms taken from computed numbers through `STR`,
-    /// `STRDT`, `STRLANG` or `STRLANGDIR`, so a literal's numeric lexical form may be
-    /// fixed or free while its datatype, language tag and base direction stay exact.
-    MixedLexical,
-}
-
-impl Provenance {
-    pub(crate) fn is_mixed(self) -> bool {
-        matches!(self, Provenance::Mixed | Provenance::MixedLexical)
-    }
-}
-
-/// The provenance of each variable that `p` binds. A variable is copied where a basic
-/// graph pattern, a path, VALUES or a GRAPH name binds it, or an expression whose
-/// outermost operator passes a term through or keeps the lexical form of a copied or
-/// constant argument: a variable, a constant, COALESCE, IF, STR, STRDT, STRLANG,
-/// STRLANGDIR and the MIN, MAX and SAMPLE aggregates. It is computed where arithmetic,
-/// a numeric function, a cast to a number or the COUNT, SUM and AVG aggregates bind it,
-/// whose numbers take the implementation's lexical form. When `STR`, `STRDT`, `STRLANG`
-/// or `STRLANGDIR` reads an argument that can be a computed number or carry one's lexical
-/// form, the result is both copied and computed with a computed lexical form, so that an
-/// exact match is compared and another allowed numeric lexical form makes the comparison
-/// partial. Any other operator binds it both ways, so that its numbers compare exactly
-/// and a difference only in their lexical form makes the comparison partial.
-fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
-    #[derive(Default)]
-    struct Site {
-        copied: bool,
-        computed: bool,
-        lexical: bool,
-        from: Vec<Variable>,
-        from_lexical: Vec<Variable>,
-    }
-    fn expr_site(e: &Expression, site: &mut Site) {
-        match e {
-            Expression::Variable(v) => site.from.push(v.clone()),
-            Expression::NamedNode(_) | Expression::Literal(_) => site.copied = true,
-            Expression::Coalesce(list) => list.iter().for_each(|x| expr_site(x, site)),
-            Expression::If(_, a, b) => {
-                expr_site(a, site);
-                expr_site(b, site);
-            }
-            Expression::Add(..)
-            | Expression::Subtract(..)
-            | Expression::Multiply(..)
-            | Expression::Divide(..)
-            | Expression::UnaryPlus(_)
-            | Expression::UnaryMinus(_) => site.computed = true,
-            Expression::FunctionCall(f, args) => match f {
-                Function::Abs
-                | Function::Ceil
-                | Function::Floor
-                | Function::Round
-                | Function::Rand
-                | Function::StrLen
-                | Function::Year
-                | Function::Month
-                | Function::Day
-                | Function::Hours
-                | Function::Minutes
-                | Function::Seconds => site.computed = true,
-                Function::Custom(n)
-                    if [xsd::INTEGER, xsd::DECIMAL, xsd::FLOAT, xsd::DOUBLE]
-                        .iter()
-                        .any(|d| d.as_str() == n.as_str()) =>
-                {
-                    site.computed = true
-                }
-                Function::Str | Function::StrDt | Function::StrLang | Function::StrLangDir => {
-                    site.copied = true;
-                    if let Some(arg) = args.first() {
-                        let mut inner = Site::default();
-                        expr_site(arg, &mut inner);
-                        if inner.computed || inner.lexical {
-                            site.computed = true;
-                            site.lexical = true;
-                        }
-                        site.from_lexical.extend(inner.from);
-                        site.from_lexical.extend(inner.from_lexical);
-                    }
-                }
-                _ => {
-                    site.copied = true;
-                    site.computed = true;
-                }
-            },
-            _ => {
-                site.copied = true;
-                site.computed = true;
-            }
-        }
-    }
-    fn term_vars(t: &TermPattern, out: &mut Vec<Variable>) {
-        match t {
-            TermPattern::Variable(v) => out.push(v.clone()),
-            TermPattern::Triple(tr) => {
-                term_vars(&tr.subject, out);
-                if let NamedNodePattern::Variable(v) = &tr.predicate {
-                    out.push(v.clone());
-                }
-                term_vars(&tr.object, out);
-            }
-            _ => {}
-        }
-    }
-    fn walk(p: &GraphPattern, sites: &mut Vec<(Variable, Site)>) {
-        let copied = |v: Variable| {
-            (
-                v,
-                Site {
-                    copied: true,
-                    ..Site::default()
-                },
-            )
-        };
-        match p {
-            GraphPattern::Bgp { patterns } => {
-                let mut vs = Vec::new();
-                for tp in patterns {
-                    term_vars(&tp.subject, &mut vs);
-                    if let NamedNodePattern::Variable(v) = &tp.predicate {
-                        vs.push(v.clone());
-                    }
-                    term_vars(&tp.object, &mut vs);
-                }
-                sites.extend(vs.into_iter().map(copied));
-            }
-            GraphPattern::Path {
-                subject, object, ..
-            } => {
-                let mut vs = Vec::new();
-                term_vars(subject, &mut vs);
-                term_vars(object, &mut vs);
-                sites.extend(vs.into_iter().map(copied));
-            }
-            GraphPattern::Values { variables, .. } => {
-                sites.extend(variables.iter().cloned().map(copied));
-            }
-            GraphPattern::Graph { name, inner } => {
-                if let NamedNodePattern::Variable(v) = name {
-                    sites.push(copied(v.clone()));
-                }
-                walk(inner, sites);
-            }
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => {
-                let mut site = Site::default();
-                expr_site(expression, &mut site);
-                sites.push((variable.clone(), site));
-                walk(inner, sites);
-            }
-            GraphPattern::Group {
-                inner, aggregates, ..
-            } => {
-                for (v, a) in aggregates {
-                    let mut site = Site::default();
-                    match a {
-                        AggregateExpression::FunctionCall {
-                            name:
-                                AggregateFunction::Min
-                                | AggregateFunction::Max
-                                | AggregateFunction::Sample,
-                            expr,
-                            ..
-                        } => expr_site(expr, &mut site),
-                        AggregateExpression::CountSolutions { .. }
-                        | AggregateExpression::FunctionCall {
-                            name:
-                                AggregateFunction::Count
-                                | AggregateFunction::Sum
-                                | AggregateFunction::Avg,
-                            ..
-                        } => site.computed = true,
-                        _ => {
-                            site.copied = true;
-                            site.computed = true;
-                        }
-                    }
-                    sites.push((v.clone(), site));
-                }
-                walk(inner, sites);
-            }
-            GraphPattern::Join { left, right }
-            | GraphPattern::LeftJoin { left, right, .. }
-            | GraphPattern::Lateral { left, right }
-            | GraphPattern::Union { left, right }
-            | GraphPattern::Minus { left, right } => {
-                walk(left, sites);
-                walk(right, sites);
-            }
-            GraphPattern::Filter { inner, .. }
-            | GraphPattern::OrderBy { inner, .. }
-            | GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. } => walk(inner, sites),
-            // the patterns that the evaluator does not evaluate
-            _ => {}
-        }
-    }
-    let mut sites = Vec::new();
-    walk(p, &mut sites);
-    // a variable that copies another takes its provenance, to a fixed point
-    let mut of: HashMap<Variable, (bool, bool, bool)> = HashMap::new();
-    loop {
-        let mut changed = false;
-        for (v, site) in &sites {
-            let mut c = (site.copied, site.computed, site.lexical);
-            for f in &site.from {
-                // a variable that nothing binds is unbound, which copies nothing
-                let (a, b, l) = of.get(f).copied().unwrap_or((false, false, false));
-                c = (c.0 || a, c.1 || b, c.2 || l);
-            }
-            for f in &site.from_lexical {
-                let (_, b, l) = of.get(f).copied().unwrap_or((false, false, false));
-                if b || l {
-                    c.1 = true;
-                    c.2 = true;
-                }
-            }
-            let old = of.entry(v.clone()).or_default();
-            let new = (old.0 || c.0, old.1 || c.1, old.2 || c.2);
-            if new != *old {
-                *old = new;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    of.into_iter()
-        .map(|(v, c)| {
-            let p = match c {
-                (_, false, false) => Provenance::Copied,
-                (false, true, false) => Provenance::Computed,
-                (true, true, false) => Provenance::Mixed,
-                (_, _, true) => Provenance::MixedLexical,
-            };
-            (v, p)
-        })
-        .collect()
 }
 
 /// The rows of an ordered or sliced answer before its slice, in the order of ORDER BY,
@@ -815,7 +643,19 @@ struct Keyed {
 /// The values of the ORDER BY conditions for one solution, unbound where a condition is
 /// an error or unbound. The key ends before the first condition that read an open
 /// value, since that condition and the ones after it do not fix the row's place.
-pub type SortKey = Vec<Option<Term>>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    terms: Vec<Option<Term>>,
+    /// Conditions that read a spelling and how to recover them from the engine's rows.
+    spelling: Vec<(usize, SpellingKey)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpellingKey {
+    Variable(Variable),
+    StrOf(Variable),
+    Unobserved,
+}
 
 /// Whether the specification puts the key `a` strictly before `b`. Two different terms
 /// with equal values, such as `1` and `1.0`, are equal under the specification's text,
@@ -868,7 +708,7 @@ pub(crate) fn compatible(a: &Solution, b: &Solution) -> bool {
 }
 
 /// A solution without the evaluator's own variables.
-fn visible(s: &Solution) -> Solution {
+fn visible(s: &Solution) -> BTreeMap<Variable, Term> {
     s.iter()
         .filter(|(k, _)| !is_hidden(k))
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -922,8 +762,18 @@ impl Candidates {
 
 pub(crate) fn merge(a: &Solution, b: &Solution) -> Solution {
     let mut out = a.clone();
-    for (k, v) in b {
-        out.insert(k.clone(), v.clone());
+    for (k, v) in b.iter() {
+        let mut origin = b.origin(k);
+        if a.get(k) == Some(v) {
+            origin = origin.shared(a.origin(k));
+        }
+        out.bind(
+            k.clone(),
+            Binding {
+                term: v.clone(),
+                origin,
+            },
+        );
     }
     // The merge keeps the number that BNODE reads only where it is the numbered solution
     // itself, the other side binding nothing new. Otherwise it is a new solution, which a
@@ -937,7 +787,7 @@ pub(crate) fn merge(a: &Solution, b: &Solution) -> Solution {
                 .all(|k| is_hidden(k) || numbered.contains_key(k))
     };
     if !(keeps(a, b) || keeps(b, a)) {
-        out.remove(&row);
+        out.terms.remove(&row);
         if let (Some(x), Some(y)) = (a.get(&row), b.get(&row))
             && x == y
         {
@@ -1034,6 +884,7 @@ impl<'a> Evaluator<'a> {
             work: Cell::new(0),
             open_vars: RefCell::new(HashSet::new()),
             read_open: Cell::new(false),
+            read_spelling: Cell::new(false),
         }
     }
 
@@ -1244,14 +1095,23 @@ impl<'a> Evaluator<'a> {
                         let n = self.fresh_id();
                         s.insert(row_variable(), int_term(n as i128));
                     }
-                    let (v, read_open) = self.tracking(|| self.soft(self.expr(expression, cx, &s)));
+                    let ((v, read_open), reads_spelling) = self.tracking_spelling(|| {
+                        self.tracking(|| self.soft(self.binding(expression, cx, &s)))
+                    });
                     open |= read_open;
                     if let Some(v) = v? {
-                        if s.get(variable).is_some_and(|old| *old != v) {
+                        if s.get(variable).is_some_and(|old| *old != v.term) {
                             // a variable already in scope cannot be extended
                             return unsupported("BIND of a variable that is in scope");
                         }
-                        s.insert(variable.clone(), v);
+                        let mut v = v;
+                        if reads_spelling && v.origin == Origin::Exact {
+                            v.origin = Origin::SpellingDependent;
+                        }
+                        if s.contains_key(variable) {
+                            v.origin = v.origin.shared(s.origin(variable));
+                        }
+                        s.bind(variable.clone(), v);
                     }
                     out.push(s);
                 }
@@ -1343,7 +1203,7 @@ impl<'a> Evaluator<'a> {
         to: usize,
     ) {
         let n = solutions.len();
-        let visible_rows: Vec<Solution> = solutions.iter().map(visible).collect();
+        let visible_rows: Vec<_> = solutions.iter().map(visible).collect();
         for cut in [from, to] {
             if cut == 0 || cut == n {
                 continue;
@@ -1352,9 +1212,12 @@ impl<'a> Evaluator<'a> {
                 (cut..n).all(|j| {
                     visible_rows[i] == visible_rows[j]
                         || keys.is_some_and(|(k, d)| match (&k[i], &k[j]) {
-                            (Some(a), Some(b)) => {
-                                strictly_before(a, b, d, !self.data.spec_readings.get())
-                            }
+                            (Some(a), Some(b)) => strictly_before(
+                                &a.terms,
+                                &b.terms,
+                                d,
+                                !self.data.spec_readings.get(),
+                            ),
                             _ => false,
                         })
                 })
@@ -1428,17 +1291,17 @@ impl<'a> Evaluator<'a> {
         };
         let rows = solutions[from..to].iter().map(row_of).collect();
         let open_vars = self.open_vars.borrow();
-        let provenance = provenance(p);
+        let origins = solutions
+            .iter()
+            .map(|s| variables.iter().map(|v| s.origin(v)).collect())
+            .collect();
         Ok(Selected {
             variables: variables.iter().map(|v| v.as_str().to_string()).collect(),
             rows,
             notes: Notes::default(),
             rows_open,
             open: variables.iter().map(|v| open_vars.contains(v)).collect(),
-            computed: variables
-                .iter()
-                .map(|v| provenance.get(v).copied().unwrap_or(Provenance::Copied))
-                .collect(),
+            origins,
             order,
             order_unchecked,
         })
@@ -1490,6 +1353,14 @@ impl<'a> Evaluator<'a> {
         (r, open)
     }
 
+    fn tracking_spelling<T>(&self, f: impl FnOnce() -> T) -> (T, bool) {
+        let outer = self.read_spelling.replace(false);
+        let result = f();
+        let read = self.read_spelling.get();
+        self.read_spelling.set(outer || read);
+        (result, read)
+    }
+
     /// Note that `v` holds open values.
     fn mark_open(&self, v: &Variable) {
         self.open_vars.borrow_mut().insert(v.clone());
@@ -1504,24 +1375,38 @@ impl<'a> Evaluator<'a> {
                 let mut keyed = Vec::new();
                 for s in sols {
                     let mut keys = Vec::new();
+                    let mut spelling = Vec::new();
                     // the conditions from the first that reads an open value on do not fix
                     // the row's place
                     let mut fixed = expression.len();
                     for (i, o) in expression.iter().enumerate() {
                         let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
-                        let (k, open) = self.tracking(|| self.soft(self.expr(e, cx, &s)));
+                        let ((k, open), reads_spelling) = self.tracking_spelling(|| {
+                            self.tracking(|| self.soft(self.expr(e, cx, &s)))
+                        });
+                        if reads_spelling {
+                            let observed = match e {
+                                Expression::Variable(v) => SpellingKey::Variable(v.clone()),
+                                Expression::FunctionCall(Function::Str, args) => match &args[..] {
+                                    [Expression::Variable(v)] => SpellingKey::StrOf(v.clone()),
+                                    _ => SpellingKey::Unobserved,
+                                },
+                                _ => SpellingKey::Unobserved,
+                            };
+                            spelling.push((i, observed));
+                        }
                         keys.push(k?);
                         if open && fixed == expression.len() {
                             fixed = i;
                         }
                     }
-                    keyed.push((keys, fixed, s));
+                    keyed.push((keys, spelling, fixed, s));
                 }
                 let descending: Vec<bool> = expression
                     .iter()
                     .map(|o| matches!(o, OrderExpression::Desc(_)))
                     .collect();
-                keyed.sort_by(|(a, _, _), (b, _, _)| {
+                keyed.sort_by(|(a, _, _, _), (b, _, _, _)| {
                     for (i, desc) in descending.iter().enumerate() {
                         let mut c = total_order(a[i].as_ref(), b[i].as_ref());
                         if *desc {
@@ -1533,12 +1418,15 @@ impl<'a> Evaluator<'a> {
                     }
                     std::cmp::Ordering::Equal
                 });
-                let open_conditions = keyed.iter().any(|(_, fixed, _)| *fixed < expression.len());
+                let open_conditions = keyed
+                    .iter()
+                    .any(|(_, _, fixed, _)| *fixed < expression.len());
                 let (keys, solutions) = keyed
                     .into_iter()
-                    .map(|(mut k, fixed, s)| {
-                        k.truncate(fixed);
-                        (Some(k), s)
+                    .map(|(mut terms, mut spelling, fixed, s)| {
+                        terms.truncate(fixed);
+                        spelling.retain(|(i, _)| *i < fixed);
+                        (Some(SortKey { terms, spelling }), s)
                     })
                     .unzip();
                 Ok(Keyed {
@@ -1551,26 +1439,16 @@ impl<'a> Evaluator<'a> {
             GraphPattern::Project { inner, variables } => {
                 // A sub-SELECT's variables that it does not project are its own, so the
                 // solution that a LATERAL join or EXISTS substitutes stops at them.
-                let env: Solution = cx
-                    .env
-                    .iter()
-                    .filter(|(v, _)| variables.contains(v))
-                    .map(|(v, t)| (v.clone(), t.clone()))
-                    .collect();
+                let mut env = cx.env.clone();
+                env.project(variables);
                 let inner_cx = Cx {
                     graph: cx.graph,
                     env: &env,
                 };
                 let mut k = self.eval_keyed(inner, &inner_cx)?;
-                k.solutions = k
-                    .solutions
-                    .into_iter()
-                    .map(|s| {
-                        s.into_iter()
-                            .filter(|(k, _)| variables.contains(k))
-                            .collect()
-                    })
-                    .collect();
+                for s in &mut k.solutions {
+                    s.project(variables);
+                }
                 Ok(k)
             }
             GraphPattern::Distinct { inner } => {
@@ -1584,19 +1462,25 @@ impl<'a> Evaluator<'a> {
                 if self.binds_open(inner) {
                     self.chose.set(true);
                 }
-                let mut first: HashMap<Solution, usize> = HashMap::new();
+                let mut first: HashMap<BTreeMap<Variable, Term>, usize> = HashMap::new();
                 let mut kept = Vec::new();
+                let mut distinct: Vec<Solution> = Vec::new();
                 let mut unplaced = HashSet::new();
-                for (i, s) in solutions.iter().enumerate() {
-                    match first.get(&visible(s)) {
+                for (i, s) in solutions.into_iter().enumerate() {
+                    match first.get(&visible(&s)) {
                         None => {
-                            first.insert(visible(s), i);
+                            first.insert(visible(&s), kept.len());
                             kept.push(i);
+                            distinct.push(s);
                         }
                         // Which copy DISTINCT keeps is open, and it places the row
                         // differently when the copies have different keys, so the kept
                         // row's key does not fix its place.
-                        Some(&f) => {
+                        Some(&slot) => {
+                            // If an exact term also produced this row, it must still be
+                            // represented even if the computed binding changes spelling.
+                            distinct[slot].origins.retain(|v, o| *o == s.origin(v));
+                            let f = kept[slot];
                             if let Some((k, _)) = &keys
                                 && k[f] != k[i]
                             {
@@ -1608,7 +1492,7 @@ impl<'a> Evaluator<'a> {
                 Ok(Keyed {
                     unplaced: unplaced_any || !unplaced.is_empty(),
                     open_conditions,
-                    solutions: kept.iter().map(|&i| solutions[i].clone()).collect(),
+                    solutions: distinct,
                     keys: keys.map(|(k, d)| {
                         let k = kept
                             .iter()
@@ -1895,7 +1779,8 @@ impl<'a> Evaluator<'a> {
         });
         if numbers {
             for s in &mut sols {
-                s.entry(row_variable())
+                s.terms
+                    .entry(row_variable())
                     .or_insert_with(|| int_term(self.fresh_id() as i128));
             }
         }
@@ -1926,12 +1811,23 @@ impl<'a> Evaluator<'a> {
             let mut row = Solution::new();
             for (v, t) in variables.iter().zip(&key) {
                 if let Some(t) = t {
-                    row.insert(v.clone(), t.clone());
+                    let origin = members
+                        .iter()
+                        .map(|s| s.origin(v))
+                        .reduce(Origin::shared)
+                        .unwrap_or_default();
+                    row.bind(
+                        v.clone(),
+                        Binding {
+                            term: t.clone(),
+                            origin,
+                        },
+                    );
                 }
             }
             for (v, a) in aggregates {
                 if let Some(t) = self.aggregate(v, a, members, inner_open, cx)? {
-                    row.insert(v.clone(), t);
+                    row.bind(v.clone(), t);
                 }
             }
             out.push(row);
@@ -1949,7 +1845,7 @@ impl<'a> Evaluator<'a> {
         members: &[Solution],
         inner_open: bool,
         cx: &Cx,
-    ) -> R<Option<Term>> {
+    ) -> R<Option<Binding>> {
         use value::*;
         let (name, expr, distinct) = match a {
             AggregateExpression::CountSolutions { distinct } => {
@@ -1970,7 +1866,7 @@ impl<'a> Evaluator<'a> {
                 } else {
                     members.len()
                 };
-                return Ok(Some(int_term(n as i128)));
+                return Ok(Some(Binding::number(int_term(n as i128))));
             }
             AggregateExpression::FunctionCall {
                 name,
@@ -1985,15 +1881,15 @@ impl<'a> Evaluator<'a> {
         // ListEval: the value of the expression for each solution, an error as `None`.
         // BNODE(label) gives each solution its own blank node.
         let numbers = reads_bnode(expr);
-        let mut values: Vec<Option<Term>> = Vec::new();
+        let mut values = Vec::new();
         let (r, open) = self.tracking(|| -> R<()> {
             for s in members {
                 let v = if numbers && !s.contains_key(&row_variable()) {
                     let mut s = s.clone();
                     s.insert(row_variable(), int_term(self.fresh_id() as i128));
-                    self.soft(self.expr(expr, cx, &s))?
+                    self.soft(self.binding(expr, cx, &s))?
                 } else {
-                    self.soft(self.expr(expr, cx, s))?
+                    self.soft(self.binding(expr, cx, s))?
                 };
                 values.push(v);
             }
@@ -2005,16 +1901,27 @@ impl<'a> Evaluator<'a> {
         }
         if distinct {
             let mut seen = HashSet::new();
+            // An exact duplicate may also have been produced by a fixed binding.
+            let mut origins = HashMap::new();
+            for b in values.iter().flatten() {
+                origins
+                    .entry(b.term.clone())
+                    .and_modify(|o: &mut Origin| *o = o.shared(b.origin))
+                    .or_insert(b.origin);
+            }
+            for b in values.iter_mut().flatten() {
+                b.origin = origins[&b.term];
+            }
             values.retain(|v| match v {
-                Some(t) => seen.insert(t.clone()),
+                Some(b) => seen.insert(b.term.clone()),
                 None => true,
             });
         }
         let has_error = values.iter().any(Option::is_none);
-        let terms: Vec<Term> = values.iter().flatten().cloned().collect();
+        let terms: Vec<&Term> = values.iter().flatten().map(|b| &b.term).collect();
         Ok(match name {
             // Count removes the errors
-            AggregateFunction::Count => Some(int_term(terms.len() as i128)),
+            AggregateFunction::Count => Some(Binding::number(int_term(terms.len() as i128))),
             AggregateFunction::Sum | AggregateFunction::Avg => {
                 // Avg is zero where Count, which removes the errors, is zero, and Sum
                 // adds every value, so an error makes it an error
@@ -2027,13 +1934,13 @@ impl<'a> Evaluator<'a> {
                             return Ok(None);
                         }
                     }
-                    return Ok(Some(int_term(0)));
+                    return Ok(Some(Binding::number(int_term(0))));
                 }
                 if has_error {
                     return Ok(None);
                 }
                 let mut sum = value::Num::Int(0);
-                for t in &terms {
+                for &t in &terms {
                     let Some(n) = numeric_term(t) else {
                         return Ok(None);
                     };
@@ -2043,10 +1950,10 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 if matches!(name, AggregateFunction::Sum) {
-                    Some(sum.to_term())
+                    Some(Binding::number(sum.to_term()))
                 } else {
                     sum.arith(Arith::Div, value::Num::Int(terms.len() as i128))
-                        .map(Num::to_term)
+                        .map(|n| Binding::number(n.to_term()))
                 }
             }
             AggregateFunction::Min | AggregateFunction::Max => {
@@ -2067,7 +1974,7 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 let mut best: Option<&Term> = None;
-                for t in &terms {
+                for &t in &terms {
                     best = Some(match best {
                         None => t,
                         Some(b) => {
@@ -2090,12 +1997,24 @@ impl<'a> Evaluator<'a> {
                     };
                     if terms
                         .iter()
-                        .any(|t| t != b && value::spec_order(Some(t), Some(b)) != Some(worse))
+                        .any(|&t| t != b && value::spec_order(Some(t), Some(b)) != Some(worse))
                     {
                         self.mark_open(out);
                     }
                 }
-                best.cloned()
+                best.map(|term| {
+                    let origin = values
+                        .iter()
+                        .flatten()
+                        .filter(|b| &b.term == term)
+                        .map(|b| b.origin)
+                        .reduce(Origin::shared)
+                        .unwrap_or_default();
+                    Binding {
+                        term: term.clone(),
+                        origin,
+                    }
+                })
             }
             AggregateFunction::Sample => {
                 // any element of the values, an error among them
@@ -2103,7 +2022,7 @@ impl<'a> Evaluator<'a> {
                 {
                     self.mark_open(out);
                 }
-                terms.first().cloned()
+                values.iter().flatten().next().cloned()
             }
             AggregateFunction::GroupConcat { separator } => {
                 if has_error {
@@ -2113,7 +2032,7 @@ impl<'a> Evaluator<'a> {
                 // reads the lexical form of any value.
                 let sep = separator.clone().unwrap_or_else(|| " ".to_string());
                 let mut parts = Vec::new();
-                for t in &terms {
+                for &t in &terms {
                     let string = matches!(t, Term::Literal(l) if is_string_literal(l));
                     if !string {
                         let mut notes = self.notes.get();
@@ -2135,7 +2054,7 @@ impl<'a> Evaluator<'a> {
                 }
                 // CONCAT with the separator, or with "" for one value, makes a simple
                 // string whatever the languages of the values
-                Some(string_term(parts.join(&sep)))
+                Some(Binding::exact(string_term(parts.join(&sep))))
             }
             AggregateFunction::Custom(_) => unreachable!(),
         })

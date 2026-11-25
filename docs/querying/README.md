@@ -34,6 +34,8 @@ Query evaluation tests for SPARQL, CDTs, property functions, and GeoSPARQL also 
 
 A test-only reference evaluator that interprets the parsed SPARQL algebra directly answers every SPARQL 1.0, 1.1, and 1.2 evaluation test. Seeded differential queries and optimizer tests check both eager and streaming execution against this reference.
 
+The comparison keeps constants and copied terms exact. When STR, STRDT, STRLANG or STRLANGDIR carries a computed number's spelling, another spelling of the same value can compare partially. The source numeric datatype determines which spellings are valid, and the result's datatype, language tag and base direction must match. Ordering uses the engine's spelling when the returned bindings establish the sort key. When a key depends on an unobserved spelling, the comparison checks the preceding constraints and reports the order or slice as unchecked. String transformations and expressions that choose rows or aggregate values are evaluated using the reference's spelling.
+
 ## SPARQL queries and updates
 
 Queries and updates follow the W3C recommendations and selected Apache Jena ARQ extensions.

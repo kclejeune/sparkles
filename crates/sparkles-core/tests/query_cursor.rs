@@ -6566,16 +6566,22 @@ fn reference_evaluator_review_round_3_cases() {
     check(!compared(&o2), format!("2: {o2:?}"));
     let o2b = check_select(&s2, &vars(&["x"]), &col(vec![xsd("16777219.5", "double")]));
     check(compared(&o2b), format!("2 allowed: {o2b:?}"));
-    // a weaker outcome of the comparison by value in a mixed column stays as weak
+    // Open order still permits another spelling of the computed cell.
     let s2c = selected(
         "SELECT ?y WHERE { { VALUES ?y { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } } \
          UNION { BIND(1 + 1 AS ?y) } } ORDER BY ?y RAND()",
     );
-    let o2c = check_select(&s2c, &vars(&["y"]), &col(vec![int(1), int(2)]));
+    let o2c = check_select(
+        &s2c,
+        &vars(&["y"]),
+        &col(vec![xsd("01", "integer"), xsd("+2", "integer")]),
+    );
     check(
         matches!(o2c, Ok(Outcome::OrderUnchecked(_))),
         format!("2 mixed: {o2c:?}"),
     );
+    let o2d = check_select(&s2c, &vars(&["y"]), &col(vec![int(1), int(2)]));
+    check(o2d.is_err(), format!("2 changed copied term: {o2d:?}"));
 
     // 3: STRDT keeps the lexical form of its argument
     let s3 = selected(
@@ -6597,10 +6603,9 @@ fn reference_evaluator_review_round_3_cases() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
-/// Roadmap item 1093: `STR`, `STRDT`, `STRLANG` and `STRLANGDIR` over a non-constant
-/// argument that can carry a computed number are treated as both copied and computed, so
-/// another allowed numeric lexical form resolves as partial rather than failing, while
-/// constant and purely copied arguments keep exact comparison.
+/// An expected cell can carry the spelling of a computed number through `STR`, `STRDT`,
+/// `STRLANG` and `STRLANGDIR`. Another valid spelling gives a partial comparison, while
+/// constant and copied arguments keep exact comparison.
 #[test]
 fn reference_evaluator_str_computed_numbers_1093() {
     use oxrdf::{BaseDirection, Literal, NamedNode};
@@ -6958,6 +6963,272 @@ fn reference_evaluator_str_computed_numbers_1093() {
             &[vec![string("2.0")], vec![string("2.0")]]
         ),
         Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+fn check_str_1093(query: &str, rows: &[&[&str]]) -> Result<reference::check::Outcome, String> {
+    let oracle = reference::Reference::new(Vec::new());
+    let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+    let expected = oracle
+        .run_selected(&query, None)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .unwrap();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|text| Some(text.parse::<Term>().unwrap()))
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    reference::check::check_select(&expected, &expected.variables, &rows)
+}
+
+#[test]
+fn reference_str_1093_tracks_the_selected_cell() {
+    use reference::check::Outcome;
+    for expression in [
+        r#"IF(?i = 0, "02", STR(1 + 1))"#,
+        r#"IF(?i = 0, ?v, STR(1 + 1))"#,
+        r#"COALESCE(?v, STR(1 + 1))"#,
+    ] {
+        let query = format!(
+            "SELECT ?i ({expression} AS ?s) {{ VALUES (?i ?v) {{ (0 \"02\") (1 UNDEF) }} }}"
+        );
+        let fixed = r#""02""#;
+        let computed = r#""+2""#;
+        assert!(matches!(
+            check_str_1093(&query, &[&["1", computed], &["0", fixed]]),
+            Ok(Outcome::Partial(_))
+        ));
+        assert!(check_str_1093(&query, &[&["0", r#""2""#], &["1", computed]]).is_err());
+    }
+
+    // The first got row can match either branch, and the second can only match the computed one.
+    let duplicates = r#"SELECT (IF(?i = 0, STR(1 + 1), "2") AS ?s) { VALUES ?i { 0 1 } }"#;
+    assert!(matches!(
+        check_str_1093(duplicates, &[&[r#""2""#], &[r#""+2""#]]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(duplicates, &[&[r#""+2""#], &[r#""+2""#]]).is_err());
+
+    let distinct = r#"SELECT DISTINCT (IF(?i = 0, STR(1 + 1), "2") AS ?s)
+        { VALUES ?i { 0 1 } }"#;
+    assert_eq!(
+        check_str_1093(distinct, &[&[r#""2""#]]),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_str_1093(distinct, &[&[r#""+2""#]]).is_err());
+}
+
+#[test]
+fn reference_str_1093_keeps_typed_numeric_lexicals_well_formed() {
+    use reference::check::Outcome;
+    let direct = r#"SELECT ?i (IF(?i = 0, STR(1.0 + 1.0), 1 + 1) AS ?s)
+        { VALUES ?i { 0 1 } }"#;
+    assert!(matches!(
+        check_str_1093(
+            direct,
+            &[
+                &["0", r#""2.0""#],
+                &["1", r#""+2"^^<http://www.w3.org/2001/XMLSchema#integer>"#]
+            ]
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(
+        check_str_1093(
+            direct,
+            &[
+                &["0", r#""2.0""#],
+                &["1", r#""2.0"^^<http://www.w3.org/2001/XMLSchema#integer>"#]
+            ]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reference_str_1093_uses_the_source_numeric_type() {
+    use reference::check::Outcome;
+    for (expression, spelling, equivalent) in [
+        ("STR(1 + 1)", r#""+02""#, true),
+        ("STR(1 + 1)", r#""2.0""#, false),
+        ("STR(1 + 1)", r#""2E0""#, false),
+        ("STR(1.0 + 1.0)", r#""2E0""#, false),
+        (
+            "STR(123456789012345.1 + 0)",
+            r#""123456789012345.1000000000000000001""#,
+            false,
+        ),
+        (
+            "STR(123456789012345.1 + 0)",
+            r#""123456789012345.1000000000000000000""#,
+            true,
+        ),
+        ("STR(0e0 / -1e0)", r#""-0.0E0""#, true),
+        ("STR(0e0 / -1e0)", r#""0""#, false),
+        (
+            "STR(0e0 / -1e0)",
+            r#""-1e-9999999999999999999999999999999999999999""#,
+            true,
+        ),
+        (
+            "STR(xsd:float(\"0.1\") + xsd:float(\"0.0\"))",
+            r#""0.10000000009""#,
+            true,
+        ),
+        ("STR(0.1e0 + 0e0)", r#""0.10000000000000001""#, true),
+        ("STR(0e0 / 0e0)", r#""NaN""#, true),
+        ("STR(0e0 / 0e0)", r#""+NaN""#, false),
+        (
+            "STR(1e0 / 0e0)",
+            r#""1e9999999999999999999999999999999999999999""#,
+            true,
+        ),
+        (
+            "STR(1e0 / 0e0)",
+            r#""-1e9999999999999999999999999999999999999999""#,
+            false,
+        ),
+        ("STR(1e0 / 0e0)", r#""1e+""#, false),
+        (
+            "STRDT(STR(16777216 + 0), xsd:float)",
+            r#""+16777216"^^<http://www.w3.org/2001/XMLSchema#float>"#,
+            true,
+        ),
+        (
+            "STRDT(STR(16777216 + 0), xsd:float)",
+            r#""16777217"^^<http://www.w3.org/2001/XMLSchema#float>"#,
+            false,
+        ),
+    ] {
+        let query = format!("SELECT ({expression} AS ?s) {{}}");
+        let result = check_str_1093(&query, &[&[spelling]]);
+        if equivalent {
+            assert!(
+                matches!(result, Ok(Outcome::Compared | Outcome::Partial(_))),
+                "{query} against {spelling}: {result:?}"
+            );
+        } else {
+            assert!(result.is_err(), "{query} against {spelling}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn reference_str_1093_keeps_string_operations_exact() {
+    use reference::check::Outcome;
+    for (query, changed) in [
+        (r#"SELECT (STR(UCASE("01")) AS ?s) {}"#, r#""1""#),
+        (r#"SELECT (STR(xsd:string(1e6)) AS ?s) {}"#, r#""1000000""#),
+        (
+            r#"SELECT (STR(?c) AS ?s) { BIND(xsd:string(1e6) AS ?c) }"#,
+            r#""1000000""#,
+        ),
+        (
+            r#"SELECT (STR(?c) AS ?s) { VALUES ?code { "007x" } BIND(SUBSTR(?code, 1, 3) AS ?c) }"#,
+            r#""7""#,
+        ),
+    ] {
+        assert!(check_str_1093(query, &[&[changed]]).is_err(), "{query}");
+    }
+    assert!(matches!(
+        check_str_1093(
+            "SELECT (STR(xsd:string(STR(1 + 0))) AS ?s) {}",
+            &[&[r#""+01""#]]
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_respects_binding_scopes() {
+    use reference::check::Outcome;
+    for (query, changed) in [
+        (
+            r#"SELECT (STR(?n) AS ?s) { VALUES ?n { "01" }
+            { SELECT ?keep { BIND(1 + 0 AS ?n) BIND(0 AS ?keep) } } }"#,
+            r#""1""#,
+        ),
+        (
+            r#"SELECT (STR(?n) AS ?s) { VALUES ?n { "01" }
+            MINUS { BIND(1 + 0 AS ?n) } }"#,
+            r#""1""#,
+        ),
+        (
+            r#"SELECT (STR(?n) AS ?s) { VALUES ?n { "01" }
+            { SELECT ?k { BIND(1 + 0 AS ?n) BIND(0 AS ?k) } GROUP BY ?k } }"#,
+            r#""1""#,
+        ),
+    ] {
+        assert!(check_str_1093(query, &[&[changed]]).is_err(), "{query}");
+    }
+    for query in [
+        "SELECT (STR(?n) AS ?s) { { SELECT ?n { BIND(1 + 0 AS ?n) } } }",
+        "SELECT (STR(MIN(?n)) AS ?s) { VALUES ?i { 1 2 } BIND(?i + 0 AS ?n) }",
+    ] {
+        assert!(
+            matches!(
+                check_str_1093(query, &[&[r#""+01""#]]),
+                Ok(Outcome::Partial(_))
+            ),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn reference_str_1093_compares_order_using_observed_spellings() {
+    use reference::check::Outcome;
+    let query = "SELECT ?n (STR(?n + 0) AS ?s) { VALUES ?n { 2 10 } }";
+    let two = &["2", r#""02""#][..];
+    let ten = &["10", r#""10""#][..];
+    let lexical = format!("{query} ORDER BY ?s");
+    assert!(matches!(
+        check_str_1093(&lexical, &[two, ten]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(&lexical, &[ten, two]).is_err());
+    let sliced = format!("{lexical} LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&sliced, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert!(check_str_1093(&sliced, &[&["3", r#""03""#]]).is_err());
+
+    let hidden = format!("{query} ORDER BY STR(?n + 0)");
+    assert!(matches!(
+        check_str_1093(&hidden, &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    let numeric = format!("{query} ORDER BY ?n ?s");
+    assert!(matches!(
+        check_str_1093(&numeric, &[two, ten]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(&numeric, &[ten, two]).is_err());
+    assert!(check_str_1093(&format!("{numeric} LIMIT 1"), &[ten]).is_err());
+    let unaffected = format!("{query} ORDER BY ?n LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&unaffected, &[two]),
+        Ok(Outcome::Partial(_))
+    ));
+
+    let raw = r#"SELECT ?n ?number { VALUES ?n { 2 10 } BIND(?n + 0 AS ?number) }
+        ORDER BY STR(?number)"#;
+    let raw_two = &["2", r#""02"^^<http://www.w3.org/2001/XMLSchema#integer>"#][..];
+    let raw_ten = &["10", "10"][..];
+    assert_eq!(
+        check_str_1093(raw, &[raw_two, raw_ten]),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_str_1093(raw, &[raw_ten, raw_two]).is_err());
+
+    let open = format!("{query} ORDER BY RAND() LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&open, &[two]),
+        Ok(Outcome::Skipped(_))
     ));
 }
 
