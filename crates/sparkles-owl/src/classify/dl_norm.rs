@@ -77,6 +77,11 @@ pub struct DlAx {
     /// minimums that entail each other being ordered by their names. It need not hold
     /// every pair of that order.
     pub blockers: FxHashMap<Ex, Vec<Ex>>,
+    /// with the order, when [`number_order`] completed without truncating any eligible
+    /// bundle, the optional generated weakening pairs `G₁ → G₂` that non-unit clause
+    /// processing may skip while unit processing still fires every pair in `ax.subs`
+    /// (item 896, R1b).
+    pub skip_weaken: FxHashMap<Ex, Vec<Ex>>,
 }
 
 impl DlAx {
@@ -104,6 +109,15 @@ impl DlAx {
                 .values()
                 .map(|v| v.capacity() * 4)
                 .sum::<usize>()
+            + super::saturate::table_bytes(
+                self.skip_weaken.capacity(),
+                std::mem::size_of::<(Ex, Vec<Ex>)>(),
+            )
+            + self
+                .skip_weaken
+                .values()
+                .map(|v| v.capacity() * 4)
+                .sum::<usize>()
     }
 
     pub fn logical_bytes(&self) -> usize {
@@ -122,6 +136,15 @@ impl DlAx {
                 std::mem::size_of::<(Ex, Vec<Ex>)>(),
             )
             + self.blockers.values().map(|v| v.len() * 4).sum::<usize>()
+            + super::saturate::table_bytes(
+                self.skip_weaken.len(),
+                std::mem::size_of::<(Ex, Vec<Ex>)>(),
+            )
+            + self
+                .skip_weaken
+                .values()
+                .map(|v| v.len() * 4)
+                .sum::<usize>()
     }
 }
 
@@ -1549,7 +1572,7 @@ fn normalize_within(
         let e = it.node(Node::Forall(r, c));
         ax.subs.push((TOP, e));
     }
-    let (blockers, spared) = if order {
+    let (blockers, spared, skip_weaken) = if order {
         number_order(it, ax, &all.least, &all.atmost, relations, stop)?
     } else {
         Default::default()
@@ -1565,6 +1588,7 @@ fn normalize_within(
         low: all.low,
         order,
         blockers,
+        skip_weaken,
         least: all
             .least
             .iter()
@@ -1631,10 +1655,17 @@ fn number_order(
     atmost: &[(Ex, u32, Role, Ex)],
     bound: usize,
     stop: &dyn Fn() -> bool,
-) -> Result<(FxHashMap<Ex, Vec<Ex>>, FxHashSet<Ex>), Halt> {
+) -> Result<
+    (
+        FxHashMap<Ex, Vec<Ex>>,
+        FxHashSet<Ex>,
+        FxHashMap<Ex, Vec<Ex>>,
+    ),
+    Halt,
+> {
     let mut out: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
     if least.is_empty() {
-        return Ok((out, FxHashSet::default()));
+        return Ok((out, FxHashSet::default(), FxHashMap::default()));
     }
     let mut steps = 0usize;
     let mut poll = |n: usize| -> Result<(), Halt> {
@@ -1648,14 +1679,35 @@ fn number_order(
         Ok(())
     };
     // the told superroles of the minimums' roles and the told subsumers of their fillers,
-    // sorted
+    // certified strictly from the explicitly retained base theory (excluding outgoing
+    // edges of minimum names, such as optional witness inclusions `G ⊑ W`), sorted
+    let least_names: FxHashSet<Ex> = least.iter().map(|l| l.0).collect();
+    let own_witness: FxHashSet<(Ex, Ex)> = least.iter().map(|l| (l.0, l.1)).collect();
     let mut role_edges: FxHashMap<Role, Vec<Role>> = FxHashMap::default();
     for &(x, y) in &ax.role_subs {
         role_edges.entry(x).or_default().push(y);
     }
     let mut told: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+    let mut orig_least_subs: FxHashSet<(Ex, Ex)> = FxHashSet::default();
+    let mut neg_least: FxHashSet<Ex> = FxHashSet::default();
     for &(a, b) in &ax.subs {
+        if least_names.contains(&a) {
+            if least_names.contains(&b) {
+                orig_least_subs.insert((a, b));
+            }
+            if !own_witness.contains(&(a, b)) {
+                neg_least.insert(a);
+            }
+            continue;
+        }
         told.entry(a).or_default().push(b);
+    }
+    for set in &ax.disjoint {
+        for &e in set {
+            if least_names.contains(&e) {
+                neg_least.insert(e);
+            }
+        }
     }
     let mut role_up: FxHashMap<Role, Vec<Role>> = FxHashMap::default();
     let mut up: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
@@ -1708,7 +1760,10 @@ fn number_order(
     let mut stands: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
     let mut reps: Vec<(Role, Ex, u32, Ex)> = Vec::new();
     let mut subs: Vec<(Ex, Ex)> = Vec::new();
+    let mut mandatory: FxHashSet<(Ex, Ex)> = FxHashSet::default();
+    let mut optional: Vec<(Ex, Ex)> = Vec::new();
     let mut relations = 0usize;
+    let mut truncated = false;
     for &(r, f, n, g) in &hs {
         poll(1)?;
         match reps.last() {
@@ -1716,9 +1771,13 @@ fn number_order(
                 if relations + 3 <= bound {
                     relations += 3;
                     subs.push((g, g0));
+                    mandatory.insert((g, g0));
                     subs.push((g0, g));
+                    optional.push((g0, g));
                     out.insert(g, vec![g0]);
                     stands.entry(g0).or_default().push(g);
+                } else {
+                    truncated = true;
                 }
             }
             _ => {
@@ -1748,6 +1807,7 @@ fn number_order(
                     }
                     let blocks = !entails(&(s, g, n, b), a) || a.3 < b;
                     if relations + 1 + usize::from(blocks) > bound {
+                        truncated = true;
                         break 'reps;
                     }
                     relations += 1;
@@ -1755,6 +1815,9 @@ fn number_order(
                     if blocks {
                         relations += 1;
                         out.entry(b).or_default().push(a.3);
+                        optional.push((a.3, b));
+                    } else {
+                        mandatory.insert((a.3, b));
                     }
                 }
                 for &(k, m) in maxs.get(&(s, g)).map_or(&[][..], |v| v.as_slice()) {
@@ -1766,6 +1829,7 @@ fn number_order(
                         .chain(stands.get(&a.3).map_or(&[][..], |v| v.as_slice()))
                     {
                         if relations >= bound {
+                            truncated = true;
                             break 'reps;
                         }
                         relations += 1;
@@ -1790,12 +1854,13 @@ fn number_order(
             "the blockers of the number restrictions have a cycle"
         );
         out.clear();
+        truncated = true;
     }
     // the names told below a blocker, and their inclusions into their own witnesses
-    let told: FxHashSet<(Ex, Ex)> = subs.iter().copied().collect();
+    let told_gen: FxHashSet<(Ex, Ex)> = subs.iter().copied().collect();
     let spared: FxHashSet<Ex> = out
         .iter()
-        .filter(|(g, hs)| hs.iter().any(|&h| told.contains(&(**g, h))))
+        .filter(|(g, hs)| hs.iter().any(|&h| told_gen.contains(&(**g, h))))
         .map(|(&g, _)| g)
         .collect();
     if !spared.is_empty() {
@@ -1806,11 +1871,34 @@ fn number_order(
             .collect();
         ax.subs.retain(|p| !own.contains(p));
     }
+    // R1b: when no eligible bundle was omitted and every spared name keeps a mandatory
+    // witness route to a blocker, optional generated weakening pairs need not fire on
+    // non-unit premises (units still fire every pair in `ax.subs`).
+    let mut skip_weaken: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+    if !truncated
+        && spared.iter().all(|g| {
+            out.get(g)
+                .is_some_and(|hs| hs.iter().any(|&h| mandatory.contains(&(*g, h))))
+        })
+    {
+        for &(x, y) in &optional {
+            if !orig_least_subs.contains(&(x, y))
+                && !mandatory.contains(&(x, y))
+                && !neg_least.contains(&y)
+            {
+                skip_weaken.entry(x).or_default().push(y);
+            }
+        }
+        for v in skip_weaken.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+    }
     ax.subs.extend(subs);
     clash.sort_unstable();
     clash.dedup();
     ax.disjoint.extend(clash);
-    Ok((out, spared))
+    Ok((out, spared, skip_weaken))
 }
 
 /// Whether the relation from each key to its values has no cycle.

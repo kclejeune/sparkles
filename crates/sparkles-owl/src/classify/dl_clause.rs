@@ -2153,6 +2153,65 @@ impl Store {
         }
     }
 
+    /// Whether any live clause `D` in this store contains one of `blockers` in its head
+    /// and subsumes the weakened witness conclusion
+    /// `body → (head \ {resolved}) ∨ witness ∨ ⋁ blockers` (item 896, R1a).
+    ///
+    /// Every inspected entry in `by_lit` (including dead and signature-rejected clauses)
+    /// increments `*reads`, and `keep_going` is invoked every `chunk` reads so the caller
+    /// can charge scan work with remainder carry and respect cancellation or work bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_clause_blocker(
+        &self,
+        body: &[Lit],
+        head: &[Lit],
+        resolved: Lit,
+        witness: Lit,
+        blockers: &[Ex],
+        chunk: usize,
+        reads: &mut usize,
+        mut keep_going: impl FnMut(&mut usize) -> bool,
+    ) -> bool {
+        let mut allowed_sig = witness.sig_bit();
+        for &l in body {
+            allowed_sig |= l.sig_bit();
+        }
+        for &l in head {
+            if l != resolved {
+                allowed_sig |= l.sig_bit();
+            }
+        }
+        for &g in blockers {
+            allowed_sig |= Lit::x(g).sig_bit();
+        }
+        for &g in blockers {
+            let Some(ids) = self.by_lit.get(&Lit::x(g)) else {
+                continue;
+            };
+            for &i in ids {
+                *reads += 1;
+                if *reads >= chunk && !keep_going(reads) {
+                    return false;
+                }
+                let s = &self.clauses[i as usize];
+                if s.dead || (s.sig & !allowed_sig) != 0 {
+                    continue;
+                }
+                if !subset(s.c.body(), body) {
+                    continue;
+                }
+                if s.c.head().iter().all(|&m| {
+                    m == witness
+                        || (m != resolved && head.binary_search(&m).is_ok())
+                        || (m.kind() == X && blockers.binary_search(&m.atom()).is_ok())
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Indexes a processed clause by its maximal literal over a successor term, and adds
     /// what the table and the list grew by to the bytes the run's estimate has not seen,
     /// since a store can hold as many keys as clauses.

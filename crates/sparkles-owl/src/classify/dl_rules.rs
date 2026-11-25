@@ -110,6 +110,9 @@ pub struct DlIx {
     /// for a minimum's name, the names of the minimums that entail it, as
     /// [`super::dl_norm::DlAx::blockers`]
     pub blockers: FxHashMap<Ex, Box<[Ex]>>,
+    /// optional generated weakening targets that non-unit `process()` skips when
+    /// `number_order` was not truncated, as [`super::dl_norm::DlAx::skip_weaken`]
+    skip_weaken: FxHashMap<Ex, Box<[Ex]>>,
     /// for a minimum's name that has witnesses of its own, their conjunction
     pub witnesses: FxHashMap<Ex, Ex>,
     /// by expression, whether it is a minimum's name, for the order of atoms
@@ -251,6 +254,11 @@ impl DlIx {
             .iter()
             .map(|(&h, v)| (h, v.clone().into_boxed_slice()))
             .collect();
+        d.skip_weaken = dl
+            .skip_weaken
+            .iter()
+            .map(|(&h, v)| (h, v.clone().into_boxed_slice()))
+            .collect();
         d.witnesses = dl
             .least
             .iter()
@@ -304,6 +312,7 @@ impl DlIx {
             && self.rdis.is_empty()
             && self.ne_of.is_empty()
             && self.blockers.is_empty()
+            && self.skip_weaken.is_empty()
             && self.witnesses.is_empty()
     }
 
@@ -448,6 +457,12 @@ impl DlIx {
             + self.ne_of.values().map(|v| v.capacity() * 4).sum::<usize>()
             + table_bytes(self.blockers.capacity(), 24)
             + self.blockers.values().map(|v| v.len() * 4).sum::<usize>()
+            + table_bytes(self.skip_weaken.capacity(), 24)
+            + self
+                .skip_weaken
+                .values()
+                .map(|v| v.len() * 4)
+                .sum::<usize>()
             + table_bytes(self.witnesses.capacity(), 8)
             + self.least.capacity()
     }
@@ -483,8 +498,22 @@ impl DlIx {
             + self.ne_of.values().map(|v| v.len() * 4).sum::<usize>()
             + table_bytes(self.blockers.len(), 24)
             + self.blockers.values().map(|v| v.len() * 4).sum::<usize>()
+            + table_bytes(self.skip_weaken.len(), 24)
+            + self
+                .skip_weaken
+                .values()
+                .map(|v| v.len() * 4)
+                .sum::<usize>()
             + table_bytes(self.witnesses.len(), 8)
             + self.least.len()
+    }
+
+    /// Whether the optional generated weakening `d → t` is skipped on non-unit premises.
+    #[inline]
+    fn skips_weaken(&self, d: Ex, t: Ex) -> bool {
+        self.skip_weaken
+            .get(&d)
+            .is_some_and(|vs| vs.binary_search(&t).is_ok())
     }
 
     /// The core of the successor that the EL rules give e.
@@ -1403,6 +1432,9 @@ pub struct DlSt {
     /// exact empty-body unit delivered from the root (`Stored::fact == true`), cleared on
     /// every exit from `process`
     pub given_fact: bool,
+    /// carried remainder `< WORK_READS` of clause-blocker scan reads across calls so
+    /// repeated short scans still accrue global work (item 896, R1a)
+    blocker_reads: u8,
     /// in a rooted run, the heads of the facts a hypothetical successor sent the root
     pub(super) promoted: FxHashSet<Box<[Lit]>>,
     /// the clauses over the predecessor that successors sent, by successor
@@ -2122,6 +2154,60 @@ fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
     dx.blockers
         .get(&d)
         .is_some_and(|hs| hs.iter().any(|h| st.subs.contains(h)))
+}
+
+/// Whether clause `c` with maximal `X` literal `d` (a minimum name with witness `w`)
+/// is blocked from expanding `w`: by a unit blocker, a body blocker (`G₁(x) ∈ Γ`), or
+/// a live stored clause subsuming the weakened conclusion (item 896, R1a).
+fn blocked_clause<S: Sink>(
+    dx: &DlIx,
+    st: &mut State,
+    c: &Clause,
+    d: Ex,
+    w: Ex,
+    out: &mut Guard<'_, S>,
+) -> bool {
+    let Some(bs) = dx.blockers.get(&d) else {
+        return false;
+    };
+    if bs.iter().any(|h| st.subs.contains(h)) {
+        return true;
+    }
+    let body = c.body();
+    if bs.iter().any(|&h| body.binary_search(&Lit::x(h)).is_ok()) {
+        return true;
+    }
+    let Some(x) = st.extra.as_mut().and_then(|e| e.dl.as_deref_mut()) else {
+        return false;
+    };
+    let mut rem = x.blocker_reads as usize;
+    let mut reads = 0usize;
+    let hit = x.store.has_clause_blocker(
+        body,
+        c.head(),
+        Lit::x(d),
+        Lit::x(w),
+        bs,
+        WORK_READS,
+        &mut reads,
+        |r| {
+            let total = rem + *r;
+            let work = total / WORK_READS;
+            rem = total % WORK_READS;
+            *r = 0;
+            if work > 0 {
+                out.worked(work);
+            }
+            !out.stopped()
+        },
+    );
+    let total = rem + reads;
+    let work = total / WORK_READS;
+    x.blocker_reads = (total % WORK_READS) as u8;
+    if work > 0 {
+        out.worked(work);
+    }
+    hit
 }
 
 /// What a run that counts or has the root does when an existential restriction reaches a
@@ -6854,13 +6940,17 @@ fn process<S: Sink>(
                     _ => {}
                 }
                 found.rule = "told";
-                let skip = if blocked(dx, st, d) {
-                    dx.witnesses.get(&d).copied()
-                } else {
-                    None
-                };
+                let skip = dx
+                    .witnesses
+                    .get(&d)
+                    .copied()
+                    .filter(|&w| blocked_clause(dx, st, c, d, w, &mut found_guard));
+                if found_guard.stopped() {
+                    mark_interrupted(st);
+                    return;
+                }
                 for &t in ix.told_of(h) {
-                    if Some(t) != skip {
+                    if Some(t) != skip && !dx.skips_weaken(d, t) {
                         let lit = Lit::x(t);
                         let Some(bytes) = side_parts_bytes(&prem, &[], &[], None, Some(lit)) else {
                             found_guard.data_overflow();
