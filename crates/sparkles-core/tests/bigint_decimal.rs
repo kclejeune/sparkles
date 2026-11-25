@@ -2,7 +2,7 @@
 //! derived integer types, and `xsd:decimal` beyond fixed-width `i64`/`Decimal`.
 
 use oxrdf::vocab::xsd;
-use oxrdf::{Literal, NamedNode, Term};
+use oxrdf::{NamedNode, Term};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::{
     CursorOptions, CursorStatus, FallbackPolicy, QueryOptions, query, select_cursor,
@@ -667,5 +667,251 @@ fn legacy_spkvnum2_file_is_ignored_so_big_integers_are_not_dropped() {
         rows[0][0].as_ref().unwrap(),
         &Term::NamedNode(NamedNode::new_unchecked("http://example.org/a"))
     );
-    let _ = Literal::new_typed_literal("99999999999999999999999", xsd::INTEGER);
+
+    // `Store::add_numeric_column` (`sparkles vocab-index`) must upgrade a stale SPKVNUM2
+    // file to SPKVNUM3 rather than refusing because the stale file exists on disk.
+    let rebuilt = s.add_numeric_column().unwrap();
+    assert!(rebuilt.is_some(), "stale SPKVNUM2 should be rebuilt");
+    drop(s);
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert!(
+        s.snapshot().generation.vocab.numeric().is_some(),
+        "rebuilt SPKVNUM3 vocab.num should load on reopen"
+    );
+    let rows = run_both(&s, "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v > 150000) }");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn knuth_algorithm_d_qhat_base_plus_one_sparql_idiv_and_mod() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rows = run_both(
+        &s,
+        "SELECT ?q ?r WHERE { \
+           BIND(fn:numeric-integer-divide(\"500000000999999998000000000\"^^xsd:integer, \
+                                          \"500000000999999999\"^^xsd:integer) AS ?q) \
+           BIND(fn:numeric-mod(\"500000000999999998000000000\"^^xsd:integer, \
+                               \"500000000999999999\"^^xsd:integer) AS ?r) \
+         }",
+    );
+    assert_eq!(
+        lit_val(&rows[0], 0),
+        Some(("999999999".into(), xsd::INTEGER.as_str().into()))
+    );
+    assert_eq!(
+        lit_val(&rows[0], 1),
+        Some(("499999999999999999".into(), xsd::INTEGER.as_str().into()))
+    );
+}
+
+#[test]
+fn order_by_top_k_is_transitive_with_repeated_mixed_numeric_keys() {
+    let s = Store::in_memory(StoreOptions::default());
+    // Repeated keys in sequence C, A, B, A across deduplicated key column:
+    // A = 10^22 - 1 (integer), B = 10^22.0 (decimal), C = 1e22 (double).
+    let ttl = r#"
+        @prefix ex: <http://example.org/> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        ex:r1 ex:k "1e22"^^xsd:double .
+        ex:r2 ex:k "9999999999999999999999"^^xsd:integer .
+        ex:r3 ex:k "10000000000000000000000.0"^^xsd:decimal .
+        ex:r4 ex:k "9999999999999999999999"^^xsd:integer .
+        ex:r5 ex:k "1e22"^^xsd:double .
+        ex:r6 ex:k "10000000000000000000000.0"^^xsd:decimal .
+    "#;
+    s.load(&[Source::from_bytes(
+        ttl.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+
+    // Ascending LIMIT 1 must pick A (10^22 - 1), matching full sort.
+    let top1 = run_both(
+        &s,
+        "SELECT ?k WHERE { ?s ex:k ?k } ORDER BY ASC(?k) LIMIT 1",
+    );
+    assert_eq!(
+        lit_val(&top1[0], 0),
+        Some((
+            "9999999999999999999999".into(),
+            xsd::INTEGER.as_str().into()
+        ))
+    );
+    let full = run_both(&s, "SELECT ?k WHERE { ?s ex:k ?k } ORDER BY ASC(?k)");
+    assert_eq!(full[0][0], top1[0][0]);
+    assert_eq!(full[1][0], top1[0][0]);
+
+    // FILTER equality still uses XPath numeric promotion (A = C is true).
+    let eq = run_both(
+        &s,
+        "SELECT ?eq WHERE { \
+           BIND((\"9999999999999999999999\"^^xsd:integer = \"1e22\"^^xsd:double) AS ?eq) \
+         }",
+    );
+    assert_eq!(
+        lit_val(&eq[0], 0),
+        Some(("true".into(), xsd::BOOLEAN.as_str().into()))
+    );
+}
+
+#[test]
+fn terminating_and_bounded_extreme_decimal_division_mod_and_idiv() {
+    let s = Store::in_memory(StoreOptions::default());
+    // 1 / 2^100 preserves exact scale 100.
+    let r = run_both(
+        &s,
+        "SELECT ?prod WHERE { \
+           BIND((1 / \"1267650600228229401496703205376\"^^xsd:integer) AS ?q) \
+           BIND((?q * \"1267650600228229401496703205376\"^^xsd:integer) AS ?prod) \
+         }",
+    );
+    assert_eq!(
+        lit_val(&r[0], 0),
+        Some(("1".into(), xsd::DECIMAL.as_str().into()))
+    );
+
+    // Fixed-width i64 operands with terminating quotient beyond 18 fractional digits: 1 / 2^60.
+    let r = run_both(
+        &s,
+        "SELECT ?q ?prod WHERE { \
+           BIND((1 / 1152921504606846976) AS ?q) \
+           BIND((?q * 1152921504606846976) AS ?prod) \
+         }",
+    );
+    assert_ne!(lit_val(&r[0], 0).unwrap().0, "0");
+    assert_eq!(
+        lit_val(&r[0], 1),
+        Some(("1".into(), xsd::DECIMAL.as_str().into()))
+    );
+
+    // 10^-18 / 2 preserves exact 0.0000000000000000005.
+    let r = run_both(
+        &s,
+        "SELECT ?q WHERE { BIND((\"0.000000000000000001\"^^xsd:decimal / 2) AS ?q) }",
+    );
+    assert_eq!(
+        lit_val(&r[0], 0),
+        Some(("0.0000000000000000005".into(), xsd::DECIMAL.as_str().into()))
+    );
+
+    // 10^-4096 / 1 succeeds, 100 / (3 + 10^-4095) succeeds, and 10^4095 mod 10^-4096 == 0,
+    // 10^-4096 idiv 10^4095 == 0.
+    let tiny = format!("0.{}1", "0".repeat(4_095));
+    let big = format!("1{}", "0".repeat(4_095));
+    let div_hi = format!("3.{}1", "0".repeat(4_094));
+    let q = format!(
+        "SELECT ?t ?h ?m ?id WHERE {{ \
+           BIND((\"{tiny}\"^^xsd:decimal / 1) AS ?t) \
+           BIND((100 / \"{div_hi}\"^^xsd:decimal) AS ?h) \
+           BIND(fn:numeric-mod(\"{big}\"^^xsd:decimal, \"{tiny}\"^^xsd:decimal) AS ?m) \
+           BIND(fn:numeric-integer-divide(\"{tiny}\"^^xsd:decimal, \"{big}\"^^xsd:decimal) AS ?id) \
+         }}"
+    );
+    let r = run_both(&s, &q);
+    assert_eq!(
+        lit_val(&r[0], 0),
+        Some((tiny, xsd::DECIMAL.as_str().into()))
+    );
+    assert_eq!(
+        lit_val(&r[0], 1),
+        Some(("33.333333333333333333".into(), xsd::DECIMAL.as_str().into()))
+    );
+    assert_eq!(
+        lit_val(&r[0], 2),
+        Some(("0".into(), xsd::DECIMAL.as_str().into()))
+    );
+    assert_eq!(
+        lit_val(&r[0], 3),
+        Some(("0".into(), xsd::INTEGER.as_str().into()))
+    );
+}
+
+#[test]
+fn sum_and_avg_enforce_cap_after_cancellation_and_averaging() {
+    let s = Store::in_memory(StoreOptions::default());
+    let x = "9".repeat(4_096);
+    let ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+         ex:a1 ex:g ex:cancel1 ; ex:v \"{x}\"^^xsd:integer .\n\
+         ex:a2 ex:g ex:cancel1 ; ex:v \"{x}\"^^xsd:integer .\n\
+         ex:a3 ex:g ex:cancel1 ; ex:v \"-{x}\"^^xsd:integer .\n\
+         ex:b1 ex:g ex:cancel2 ; ex:v \"{x}\"^^xsd:integer .\n\
+         ex:b2 ex:g ex:cancel2 ; ex:v \"-{x}\"^^xsd:integer .\n\
+         ex:b3 ex:g ex:cancel2 ; ex:v \"{x}\"^^xsd:integer .\n\
+         ex:c1 ex:g ex:avg_ok ; ex:v \"{x}\"^^xsd:integer .\n\
+         ex:c2 ex:g ex:avg_ok ; ex:v \"{x}\"^^xsd:integer .\n"
+    );
+    s.load(&[Source::from_bytes(
+        ttl.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+
+    let rows = run_both(
+        &s,
+        "SELECT ?g (SUM(?v) AS ?sum) (AVG(?v) AS ?avg) \
+         WHERE { ?s ex:g ?g ; ex:v ?v } GROUP BY ?g ORDER BY ?g",
+    );
+    assert_eq!(rows.len(), 3);
+    // avg_ok: SUM(X, X) exceeds 4096 digits -> unbound; AVG(X, X) == X!
+    assert!(rows[0][1].is_none(), "SUM(X, X) should exceed cap");
+    assert_eq!(
+        lit_val(&rows[0], 2),
+        Some((x.clone(), xsd::DECIMAL.as_str().into()))
+    );
+    // cancel1 and cancel2: SUM(X, X, -X) == X regardless of row order.
+    assert_eq!(
+        lit_val(&rows[1], 1),
+        Some((x.clone(), xsd::INTEGER.as_str().into()))
+    );
+    assert_eq!(
+        lit_val(&rows[2], 1),
+        Some((x, xsd::INTEGER.as_str().into()))
+    );
+}
+
+#[test]
+fn round_extreme_precision_and_direct_float_to_integer_truncation() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rows = run_both(
+        &s,
+        "SELECT ?r1 ?r2 ?r3 ?c1 ?c2 ?c3 WHERE { \
+           BIND(fn:round-half-to-even(\"99999999999999999999999\"^^xsd:integer, 9223372036854775807) AS ?r1) \
+           BIND(fn:round(\"99999999999999999999999\"^^xsd:integer, -9223372036854775808) AS ?r2) \
+           BIND(fn:round-half-to-even(42, 9223372036854775807) AS ?r3) \
+           BIND(xsd:integer(\"1000000000000000100\"^^xsd:double) AS ?c1) \
+           BIND(xsd:integer(\"-9223372036854775808.0\"^^xsd:double) AS ?c2) \
+           BIND(xsd:integer(\"9223372036854775808.0\"^^xsd:double) AS ?c3) \
+         }",
+    );
+    assert_eq!(
+        lit_val(&rows[0], 0),
+        Some((
+            "99999999999999999999999".into(),
+            xsd::INTEGER.as_str().into()
+        ))
+    );
+    assert_eq!(
+        lit_val(&rows[0], 1),
+        Some(("0".into(), xsd::INTEGER.as_str().into()))
+    );
+    assert_eq!(
+        lit_val(&rows[0], 2),
+        Some(("42".into(), xsd::INTEGER.as_str().into()))
+    );
+    assert_eq!(
+        lit_val(&rows[0], 3),
+        Some(("1000000000000000128".into(), xsd::INTEGER.as_str().into()))
+    );
+    assert_eq!(
+        lit_val(&rows[0], 4),
+        Some(("-9223372036854775808".into(), xsd::INTEGER.as_str().into()))
+    );
+    assert_eq!(
+        lit_val(&rows[0], 5),
+        Some(("9223372036854775808".into(), xsd::INTEGER.as_str().into()))
+    );
 }

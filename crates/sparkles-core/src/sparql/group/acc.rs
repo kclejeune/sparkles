@@ -185,6 +185,13 @@ impl Running {
             AggregateFunction::Min | AggregateFunction::Max
         )
     }
+
+    fn is_sum(&self) -> bool {
+        matches!(
+            self.agg.func,
+            AggregateFunction::Sum | AggregateFunction::Avg
+        )
+    }
 }
 
 impl Accumulator for Running {
@@ -192,7 +199,7 @@ impl Accumulator for Running {
         for _ in 0..groups {
             self.states.push(AggState::new(&self.agg));
         }
-        if self.is_best() {
+        if self.is_best() || (self.track && self.is_sum()) {
             self.payload.resize(self.states.len(), 0);
         }
     }
@@ -217,6 +224,7 @@ impl Accumulator for Running {
             }
             _ => {
                 let best = self.track && self.is_best();
+                let sum = self.track && self.is_sum();
                 for (row, &slot) in slots.iter().enumerate() {
                     if row.is_multiple_of(1024) {
                         ctx.check()?;
@@ -232,6 +240,16 @@ impl Accumulator for Running {
                         }
                     }
                     self.states[slot as usize].add(ctx, agg, id);
+                    if sum {
+                        let held_now = self.states[slot as usize].sum_heap_bytes();
+                        if held_now > 0 {
+                            let held = &mut self.payload[slot as usize];
+                            if held_now > *held {
+                                self.growth += held_now - *held;
+                                *held = held_now;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -258,6 +276,14 @@ impl Accumulator for Running {
                 return Err(crate::error::Error::unsupported(
                     "this aggregate cannot be merged",
                 ));
+            }
+            if self.track && self.is_sum() {
+                let held_now = self.states[to as usize].sum_heap_bytes();
+                let held = &mut self.payload[to as usize];
+                if held_now > *held {
+                    self.growth += held_now - *held;
+                    *held = held_now;
+                }
             }
         }
         if self.is_best() {

@@ -147,6 +147,11 @@ impl SumState {
                 *n += w;
                 if *n == 0 {
                     map.remove(i.as_ref());
+                    if map.is_empty() {
+                        self.big_ints = None;
+                    } else if map.capacity() > 64 && map.len() * 4 < map.capacity() {
+                        map.shrink_to_fit();
+                    }
                 }
             }
             Some(Value::Decimal(d)) => {
@@ -163,6 +168,11 @@ impl SumState {
                 *n += w;
                 if *n == 0 {
                     map.remove(d.as_ref());
+                    if map.is_empty() {
+                        self.big_decs = None;
+                    } else if map.capacity() > 64 && map.len() * 4 < map.capacity() {
+                        map.shrink_to_fit();
+                    }
                 }
             }
             Some(Value::Float(f)) => *self.floats.entry(f32::from(*f).to_bits()).or_insert(0) += w,
@@ -175,33 +185,47 @@ impl SumState {
         self.doubles.retain(|_, n| *n != 0);
     }
 
-    fn sum(&self) -> Option<Value> {
+    fn sum_or_avg(&self, avg: bool) -> Option<Value> {
         if self.errs != 0 {
             return None;
         }
+        if avg && self.rows == 0 {
+            return Some(Value::Integer(0.into()));
+        }
         let has_big_int = self.big_ints.as_ref().is_some_and(|m| !m.is_empty());
         let has_big_dec = self.big_decs.as_ref().is_some_and(|m| !m.is_empty());
-        let mut acc = if has_big_dec || (has_big_int && !self.decs.is_empty()) {
-            use crate::sparql::bignum::{BigDec, BigInt};
+        let has_approx = !self.floats.is_empty() || !self.doubles.is_empty();
+
+        // Accumulate exact subtotals with bounded headroom so cancellation and averaging at
+        // the digit cap are evaluated on the final result rather than intermediate terms.
+        enum ExactAcc {
+            Int(crate::sparql::bignum::BigInt),
+            Dec(crate::sparql::bignum::BigDec),
+            Fixed(Value),
+        }
+
+        let exact = if has_big_dec || (has_big_int && !self.decs.is_empty()) {
+            use crate::sparql::bignum::{AGG_MAX_DEC_DIGITS, BigDec, BigInt};
             let mut total = BigDec::from_bigint(BigInt::from_i128(self.int));
             if let Some(map) = &self.big_ints {
                 for (bi, &n) in map.iter() {
-                    let term = bi.checked_mul(&BigInt::from_i64(n))?;
-                    total = total.checked_add(&BigDec::from_bigint(term))?;
+                    let term = BigDec::from_bigint(bi.clone())
+                        .checked_mul_i64_with_limit(n, AGG_MAX_DEC_DIGITS)?;
+                    total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
                 }
             }
             for (&k, &n) in &self.decs {
                 let d = BigDec::from_oxs_decimal(Decimal::from_be_bytes(k.to_be_bytes()));
-                let term = d.checked_mul(&BigDec::from_i64(n))?;
-                total = total.checked_add(&term)?;
+                let term = d.checked_mul_i64_with_limit(n, AGG_MAX_DEC_DIGITS)?;
+                total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
             }
             if let Some(map) = &self.big_decs {
                 for (bd, &n) in map.iter() {
-                    let term = bd.checked_mul(&BigDec::from_i64(n))?;
-                    total = total.checked_add(&term)?;
+                    let term = bd.checked_mul_i64_with_limit(n, AGG_MAX_DEC_DIGITS)?;
+                    total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
                 }
             }
-            Value::from_bigdec(total)
+            ExactAcc::Dec(total)
         } else if !self.decs.is_empty() {
             // summed exactly in 256 bits, so that values which cancel out do not
             // overflow on the way; the integers join the decimals, as a one-off
@@ -212,28 +236,76 @@ impl SumState {
             }
             acc.add_product(self.int, 1_000_000_000_000_000_000);
             if let Some(raw) = acc.to_i128() {
-                Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes()))
+                ExactAcc::Fixed(Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes())))
             } else {
-                use crate::sparql::bignum::{BigDec, BigInt};
+                use crate::sparql::bignum::{AGG_MAX_DEC_DIGITS, BigDec, BigInt};
                 let mut total = BigDec::from_bigint(BigInt::from_i128(self.int));
                 for (&k, &n) in &self.decs {
                     let d = BigDec::from_oxs_decimal(Decimal::from_be_bytes(k.to_be_bytes()));
-                    total = total.checked_add(&d.checked_mul(&BigDec::from_i64(n))?)?;
+                    let term = d.checked_mul_i64_with_limit(n, AGG_MAX_DEC_DIGITS)?;
+                    total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
                 }
-                Value::from_bigdec(total)
+                ExactAcc::Dec(total)
             }
         } else if has_big_int {
-            use crate::sparql::bignum::BigInt;
+            use crate::sparql::bignum::{AGG_MAX_INT_DIGITS, BigInt};
             let mut total = BigInt::from_i128(self.int);
             if let Some(map) = &self.big_ints {
                 for (bi, &n) in map.iter() {
-                    let term = bi.checked_mul(&BigInt::from_i64(n))?;
-                    total = total.checked_add(&term)?;
+                    let term = bi.checked_mul_i64_with_limit(n, AGG_MAX_INT_DIGITS)?;
+                    total = total.checked_add_with_limit(&term, AGG_MAX_INT_DIGITS)?;
                 }
             }
-            Value::from_bigint(total)
+            ExactAcc::Int(total)
         } else {
-            crate::sparql::value::exact_sum(self.int)
+            ExactAcc::Fixed(crate::sparql::value::exact_sum(self.int))
+        };
+
+        if !has_approx {
+            return match exact {
+                ExactAcc::Fixed(v) => {
+                    if avg {
+                        arith(NumOp::Div, &v, &Value::Integer(self.rows.into())).ok()
+                    } else {
+                        Some(v)
+                    }
+                }
+                ExactAcc::Int(bi) => {
+                    if avg {
+                        crate::sparql::bignum::BigDec::from_bigint(bi)
+                            .checked_div(&crate::sparql::bignum::BigDec::from_i64(self.rows))
+                            .map(Value::from_bigdec)
+                    } else {
+                        bi.fits_limits().then(|| Value::from_bigint(bi))
+                    }
+                }
+                ExactAcc::Dec(bd) => {
+                    if avg {
+                        bd.checked_div(&crate::sparql::bignum::BigDec::from_i64(self.rows))
+                            .map(Value::from_bigdec)
+                    } else {
+                        bd.fits_limits().then(|| Value::from_bigdec(bd))
+                    }
+                }
+            };
+        }
+
+        let mut acc = if !self.doubles.is_empty() {
+            match exact {
+                ExactAcc::Fixed(v) => {
+                    Value::Double(crate::sparql::value::Num::of(&v).ok()?.to_double())
+                }
+                ExactAcc::Int(bi) => Value::Double(Double::from(bi.to_f64())),
+                ExactAcc::Dec(bd) => Value::Double(Double::from(bd.to_f64())),
+            }
+        } else {
+            match exact {
+                ExactAcc::Fixed(v) => {
+                    Value::Float(crate::sparql::value::Num::of(&v).ok()?.to_float())
+                }
+                ExactAcc::Int(bi) => Value::Float(Float::from(bi.to_f32())),
+                ExactAcc::Dec(bd) => Value::Float(Float::from(bd.to_f32())),
+            }
         };
         let mut floats: Vec<(f32, i64)> = self
             .floats
@@ -253,7 +325,11 @@ impl SumState {
         for (d, n) in doubles {
             acc = arith(NumOp::Add, &acc, &Value::Double(Double::from(d * n as f64))).ok()?;
         }
-        Some(acc)
+        if avg {
+            arith(NumOp::Div, &acc, &Value::Integer(self.rows.into())).ok()
+        } else {
+            Some(acc)
+        }
     }
 }
 
@@ -669,18 +745,7 @@ impl Group {
         {
             return p.value_id(&Value::Integer(0.into()));
         }
-        let Some(sum) = s.sum() else {
-            return Id::UNDEF;
-        };
-        let v = if kind == AggKind::Avg {
-            if s.rows == 0 {
-                Some(Value::Integer(0.into()))
-            } else {
-                arith(NumOp::Div, &sum, &Value::Integer(s.rows.into())).ok()
-            }
-        } else {
-            Some(sum)
-        };
+        let v = s.sum_or_avg(kind == AggKind::Avg);
         v.map_or(Id::UNDEF, |v| p.value_id(&v))
     }
 
@@ -847,9 +912,11 @@ impl Group {
                             AState::Values { vals, .. } => vals.len() as u64 * 24 + 96,
                             AState::Sum(s) => {
                                 let big = s.big_ints.as_ref().map_or(0, |m| {
-                                    m.keys().map(|k| k.heap_bytes() + 24).sum::<u64>()
+                                    m.capacity() as u64 * 40
+                                        + m.keys().map(|k| k.heap_bytes()).sum::<u64>()
                                 }) + s.big_decs.as_ref().map_or(0, |m| {
-                                    m.keys().map(|k| k.heap_bytes() + 24).sum::<u64>()
+                                    m.capacity() as u64 * 48
+                                        + m.keys().map(|k| k.heap_bytes()).sum::<u64>()
                                 });
                                 96 + (s.floats.len() + s.doubles.len()) as u64 * 24
                                     + s.decs.len() as u64 * 40
@@ -868,13 +935,6 @@ impl Group {
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {
         fn sum(w: &mut Writer, s: &SumState) -> Result<()> {
-            if s.big_ints.as_ref().is_some_and(|m| !m.is_empty())
-                || s.big_decs.as_ref().is_some_and(|m| !m.is_empty())
-            {
-                return Err(crate::error::Error::unsupported(
-                    "view checkpoints do not encode arbitrary-precision SUM/AVG state",
-                ));
-            }
             w.i64(s.rows);
             w.i64(s.errs);
             w.i64(s.undef);
@@ -893,6 +953,22 @@ impl Group {
             for (b, n) in &s.doubles {
                 w.u64(*b);
                 w.i64(*n);
+            }
+            let big_ints_len = s.big_ints.as_ref().map_or(0, |m| m.len()) as u64;
+            w.u64(big_ints_len);
+            if let Some(m) = &s.big_ints {
+                for (bi, n) in m.iter() {
+                    w.bytes(bi.to_string().as_bytes());
+                    w.i64(*n);
+                }
+            }
+            let big_decs_len = s.big_decs.as_ref().map_or(0, |m| m.len()) as u64;
+            w.u64(big_decs_len);
+            if let Some(m) = &s.big_decs {
+                for (bd, n) in m.iter() {
+                    w.bytes(bd.to_string().as_bytes());
+                    w.i64(*n);
+                }
             }
             Ok(())
         }
@@ -971,6 +1047,42 @@ impl Group {
             for _ in 0..r.u64()? {
                 let b = r.u64()?;
                 s.doubles.insert(b, r.i64()?);
+            }
+            let n_bi = r.u64()?;
+            if n_bi > 0 {
+                let mut map = FxHashMap::default();
+                for _ in 0..n_bi {
+                    let text = std::str::from_utf8(r.bytes()?).map_err(|_| {
+                        crate::error::Error::Corrupt(
+                            "view state holds non-UTF-8 big integer".into(),
+                        )
+                    })?;
+                    let bi = crate::sparql::bignum::BigInt::parse(text).ok_or_else(|| {
+                        crate::error::Error::Corrupt(
+                            "view state holds malformed big integer".into(),
+                        )
+                    })?;
+                    map.insert(bi, r.i64()?);
+                }
+                s.big_ints = Some(Box::new(map));
+            }
+            let n_bd = r.u64()?;
+            if n_bd > 0 {
+                let mut map = FxHashMap::default();
+                for _ in 0..n_bd {
+                    let text = std::str::from_utf8(r.bytes()?).map_err(|_| {
+                        crate::error::Error::Corrupt(
+                            "view state holds non-UTF-8 big decimal".into(),
+                        )
+                    })?;
+                    let bd = crate::sparql::bignum::BigDec::parse(text).ok_or_else(|| {
+                        crate::error::Error::Corrupt(
+                            "view state holds malformed big decimal".into(),
+                        )
+                    })?;
+                    map.insert(bd, r.i64()?);
+                }
+                s.big_decs = Some(Box::new(map));
             }
             Ok(s)
         }

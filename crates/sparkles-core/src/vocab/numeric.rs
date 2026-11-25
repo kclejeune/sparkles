@@ -17,8 +17,9 @@
 //!
 //! * [`NOT_NUMERIC`]: the literal's value is not a number (a string, a date, an
 //!   ill-typed numeric literal…). Comparing it with a number is a type error.
-//! * [`UNKNOWN`]: a number the column does not hold, a decimal with more significant
-//!   digits than fit into 59 bits. Its key is decoded as before.
+//! * [`UNKNOWN`]: a number the column does not hold, such as an integer outside `i64`, a
+//!   decimal outside `oxsdatatypes::Decimal`, or a decimal with more significant digits
+//!   than fit into 59 bits. Its key is decoded as before.
 //! * [`INTEGER`], [`DECIMAL`], [`FLOAT`], [`DOUBLE`] (bit 3 set): the value is the next
 //!   entry of the value array, in id order. An integer is its `i64`, a float the bits of
 //!   its `f32`, a double the bits of its `f64` and a decimal its exact value as a

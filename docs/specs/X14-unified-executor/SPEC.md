@@ -391,8 +391,8 @@ by both copied terms and computed values that differs only in a number's lexical
 the algebra treats as a variable, so a `COUNT(DISTINCT *)` over such a middle is an open
 value. A query whose nested loops pass the evaluator's work limit of 20 million
 intermediate solutions is left uncompared, and so is one that reads a number of more than
-16 digits. The comparison found disagreements, which items 1064, 1065, 1071 and 1077 hold. The
-engine passes over an error in MIN and MAX, where the specification's order makes MIN an
+16 digits. The comparison found disagreements, which items 1064, 1071 and 1077 still hold,
+along with one numeric-range disagreement that item 1065 resolved. The engine passes over an error in MIN and MAX, where the specification's order makes MIN an
 error and Jena makes both an error, and it follows Jena in making AVG over errors only an
 error and in letting GROUP_CONCAT read IRIs and numbers. It did not read an
 `xsd:integer` or `xsd:decimal` beyond the range of its decimal type as a number, which

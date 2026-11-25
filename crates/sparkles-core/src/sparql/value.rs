@@ -6,7 +6,69 @@ use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{Literal, NamedNode, Term};
 use oxsdatatypes::*;
 use std::cmp::Ordering;
+use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
+
+/// Canonical arbitrary-precision integer payload of [`Value::BigInteger`].
+///
+/// Constructible only through [`Value::from_bigint`] (or internal exact-sum helpers) so
+/// every `Value::BigInteger` stays strictly outside the `i64` range and within
+/// [`super::bignum::MAX_DIGITS`].
+#[repr(transparent)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BigIntValue(Arc<BigInt>);
+
+impl Deref for BigIntValue {
+    type Target = BigInt;
+    #[inline]
+    fn deref(&self) -> &BigInt {
+        &self.0
+    }
+}
+
+impl AsRef<BigInt> for BigIntValue {
+    #[inline]
+    fn as_ref(&self) -> &BigInt {
+        &self.0
+    }
+}
+
+impl fmt::Display for BigIntValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Canonical arbitrary-precision decimal payload of [`Value::BigDecimal`].
+///
+/// Constructible only through [`Value::from_bigdec`] so every `Value::BigDecimal` stays
+/// strictly outside `oxsdatatypes::Decimal` and within [`super::bignum::MAX_DIGITS`] and
+/// [`super::bignum::MAX_SCALE`].
+#[repr(transparent)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BigDecValue(Arc<BigDec>);
+
+impl Deref for BigDecValue {
+    type Target = BigDec;
+    #[inline]
+    fn deref(&self) -> &BigDec {
+        &self.0
+    }
+}
+
+impl AsRef<BigDec> for BigDecValue {
+    #[inline]
+    fn as_ref(&self) -> &BigDec {
+        &self.0
+    }
+}
+
+impl fmt::Display for BigDecValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Value {
@@ -23,10 +85,10 @@ pub enum Value {
     Bool(bool),
     Integer(Integer),
     /// `xsd:integer` (or derived integer) outside the `i64` range
-    BigInteger(Arc<BigInt>),
+    BigInteger(BigIntValue),
     Decimal(Decimal),
     /// `xsd:decimal` outside `oxsdatatypes::Decimal`
-    BigDecimal(Arc<BigDec>),
+    BigDecimal(BigDecValue),
     Float(Float),
     Double(Double),
     DateTime(DateTime),
@@ -139,7 +201,11 @@ fn parse_big_decimal_or_other(lex: &str, dt: &str) -> Value {
 #[cold]
 fn numeric_key_big(lex: &str, dt: &str) -> Option<f64> {
     if dt == xsd::DECIMAL.as_str() {
-        return BigDec::parse(lex).map(|d| d.to_f64());
+        return BigDec::parse(lex).map(|d| {
+            d.to_oxs_decimal()
+                .map(decimal_f64)
+                .unwrap_or_else(|| d.to_f64())
+        });
     }
     let bi = BigInt::parse(lex)?;
     integer_in_derived_range(&bi, dt).then(|| bi.to_f64())
@@ -294,14 +360,14 @@ impl Value {
     pub fn from_bigint(i: BigInt) -> Value {
         match i.to_i64() {
             Some(n) => Value::Integer(n.into()),
-            None => Value::BigInteger(Arc::new(i)),
+            None => Value::BigInteger(BigIntValue(Arc::new(i))),
         }
     }
 
     pub fn from_bigdec(d: BigDec) -> Value {
         match d.to_oxs_decimal() {
             Some(dec) => Value::Decimal(dec),
-            None => Value::BigDecimal(Arc::new(d)),
+            None => Value::BigDecimal(BigDecValue(Arc::new(d))),
         }
     }
 
@@ -574,7 +640,11 @@ pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
                         if y == Decimal::from(0) {
                             return Err(TypeError);
                         }
-                        x.checked_div(y)
+                        if decimal_div_needs_big(x, y) {
+                            None
+                        } else {
+                            x.checked_div(y)
+                        }
                     }
                 };
                 if let Some(v) = r {
@@ -607,26 +677,66 @@ pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
 /// The scale of oxsdatatypes' decimals, which hold `value × 10^-18` in an `i128`.
 const DECIMAL_SCALE: i128 = 1_000_000_000_000_000_000;
 
+/// Whether `num / den` (`den > 0`) terminates in base 10.
+#[inline]
+fn u128_terminates_base10(num: u128, mut den: u128) -> bool {
+    den >>= den.trailing_zeros();
+    while den.is_multiple_of(5) {
+        den /= 5;
+    }
+    num.is_multiple_of(den)
+}
+
+/// Whether `x / y` (`y != 0`) is a terminating decimal quotient whose exact fractional
+/// scale exceeds 18 digits (so the fixed-width `Decimal` path would truncate it).
+fn decimal_div_needs_big(x: Decimal, y: Decimal) -> bool {
+    let rx = i128::from_be_bytes(x.to_be_bytes()).unsigned_abs();
+    if rx == 0 {
+        return false;
+    }
+    let ry = i128::from_be_bytes(y.to_be_bytes()).unsigned_abs();
+    let p2_y = ry.trailing_zeros();
+    let mut r = ry >> p2_y;
+    let mut p5_y = 0u32;
+    while r.is_multiple_of(5) {
+        r /= 5;
+        p5_y += 1;
+    }
+    if !rx.is_multiple_of(r) {
+        return false;
+    }
+    let q0 = rx / r;
+    let p2_q = q0.trailing_zeros();
+    let mut q5 = q0 >> p2_q;
+    let mut p5_q = 0u32;
+    while q5.is_multiple_of(5) {
+        q5 /= 5;
+        p5_q += 1;
+    }
+    p2_y.saturating_sub(p2_q).max(p5_y.saturating_sub(p5_q)) > 18
+}
+
 /// An exact integer sum as a value to add further numbers to. It is an `xsd:integer`
 /// (`Value::Integer` when it fits `i64`, `Value::BigInteger` otherwise).
 pub(crate) fn exact_sum(sum: i128) -> Value {
     match i64::try_from(sum) {
         Ok(sum) => Value::Integer(sum.into()),
-        Err(_) => Value::BigInteger(Arc::new(BigInt::from_i128(sum))),
+        Err(_) => Value::BigInteger(BigIntValue(Arc::new(BigInt::from_i128(sum)))),
     }
 }
 
 /// The decimal product or quotient of `a` and `b` in one `i128` operation, for the
 /// operands whose oxsdatatypes result it is known to equal, or `None` to use
-/// oxsdatatypes. The general operations cancel scale factors or strip trailing zeros
-/// with repeated 128-bit division.
+/// oxsdatatypes (or the big-decimal fallback for terminating quotients needing >18
+/// fractional digits). The general operations cancel scale factors or strip trailing
+/// zeros with repeated 128-bit division.
 ///
 /// A product with an integer `j` is the other operand's value times `j`.
 /// oxsdatatypes 0.2.4 cancels the scale's factors before multiplying and returns
 /// zero for a zero operand. The exact product overflows exactly when it does.
 /// The quotient of two integers `i / j` with `j` nonzero is `i × 10^18 / j`
-/// truncated toward zero. oxsdatatypes truncates twice, which gives the same result,
-/// and its shifts stay below 10^39 for 64-bit integers, so it never fails there.
+/// truncated toward zero, except when `i / j` terminates in base 10 with more than 18
+/// fractional digits, in which case `None` delegates to `BigDec::checked_div`.
 fn exact_decimal(op: &NumOp, a: Num<'_>, b: Num<'_>) -> Option<Option<Decimal>> {
     let raw = |d: Decimal| i128::from_be_bytes(d.to_be_bytes());
     let decimal = |v: i128| Decimal::from_be_bytes(v.to_be_bytes());
@@ -635,9 +745,20 @@ fn exact_decimal(op: &NumOp, a: Num<'_>, b: Num<'_>) -> Option<Option<Decimal>> 
         | (NumOp::Mul, Num::Integer(j), Num::Decimal(d)) => {
             Some(raw(d).checked_mul(i128::from(i64::from(j))).map(decimal))
         }
-        (NumOp::Div, Num::Integer(i), Num::Integer(j)) if i64::from(j) != 0 => Some(Some(decimal(
-            i128::from(i64::from(i)) * DECIMAL_SCALE / i128::from(i64::from(j)),
-        ))),
+        (NumOp::Div, Num::Integer(i), Num::Integer(j)) if i64::from(j) != 0 => {
+            let ii = i64::from(i);
+            let jj = i64::from(j);
+            let num = i128::from(ii) * DECIMAL_SCALE;
+            let den = i128::from(jj);
+            let q = num / den;
+            let rem = num % den;
+            if rem != 0
+                && u128_terminates_base10(ii.unsigned_abs() as u128, jj.unsigned_abs() as u128)
+            {
+                return None;
+            }
+            Some(Some(decimal(q)))
+        }
         _ => None,
     }
 }
@@ -892,6 +1013,83 @@ pub fn decimal_f64(d: Decimal) -> f64 {
     if v < 0 { -f } else { f }
 }
 
+/// Compare two exact or floating-point numbers by their exact mathematical value for
+/// `ORDER BY` (transitive across all numeric datatypes; returns `None` if either is `NaN`).
+///
+/// Unlike [`num_cmp`] (which implements XPath numeric promotion for `FILTER` `<` and `=`),
+/// this never rounds an exact integer or decimal to `f64` when comparing against a close
+/// float or double, keeping `ORDER BY` strictly transitive.
+fn order_num_cmp(a: Num<'_>, b: Num<'_>) -> Option<Ordering> {
+    let to_f64_opt = |n: Num<'_>| match n {
+        Num::Float(f) => Some(f64::from(f32::from(f))),
+        Num::Double(d) => Some(f64::from(d)),
+        _ => None,
+    };
+    match (to_f64_opt(a), to_f64_opt(b)) {
+        (None, None) => num_cmp(a, b),
+        (Some(x), Some(y)) => {
+            if x.is_nan() || y.is_nan() {
+                None
+            } else if x < y {
+                Some(Ordering::Less)
+            } else if x > y {
+                Some(Ordering::Greater)
+            } else {
+                Some(Ordering::Equal)
+            }
+        }
+        (None, Some(f)) => exact_vs_f64(a, f),
+        (Some(f), None) => exact_vs_f64(b, f).map(Ordering::reverse),
+    }
+}
+
+fn exact_vs_f64(exact: Num<'_>, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    if f.is_infinite() {
+        return Some(if f.is_sign_positive() {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let approx = match exact {
+        Num::Integer(i) => i64::from(i) as f64,
+        Num::Decimal(d) => decimal_f64(d),
+        Num::BigInteger(i) => i.to_f64(),
+        Num::BigDecimal(d) => d.to_f64(),
+        _ => unreachable!(),
+    };
+    if f == 0.0 {
+        return Some(match exact {
+            Num::Integer(i) => i64::from(i).cmp(&0),
+            Num::Decimal(d) => i128::from_be_bytes(d.to_be_bytes()).cmp(&0),
+            Num::BigInteger(i) => i.cmp(&BigInt::zero()),
+            Num::BigDecimal(d) => d.cmp(&BigDec::zero()),
+            _ => unreachable!(),
+        });
+    }
+    if approx.is_infinite() {
+        return Some(if approx.is_sign_positive() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        });
+    }
+    if (approx - f).abs() > 1e-12 * approx.abs().max(f.abs()) {
+        return Some(if approx < f {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    // Close values: compare exact mathematical values without promotion rounding.
+    let f_exact = BigDec::from_exact_f64(f)?;
+    let exact_dec = exact.to_big_dec()?;
+    Some(exact_dec.cmp(&f_exact))
+}
+
 pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     let (a, b) = match (a, b) {
         (None, None) => return Ordering::Equal,
@@ -941,7 +1139,14 @@ pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
         }
         _ => {}
     }
-    if let Ok(Some(o)) = compare(a, b)
+    if a.is_numeric() && b.is_numeric() {
+        if let (Ok(na), Ok(nb)) = (Num::of(a), Num::of(b))
+            && let Some(o) = order_num_cmp(na, nb)
+            && o != Ordering::Equal
+        {
+            return o;
+        }
+    } else if let Ok(Some(o)) = compare(a, b)
         && o != Ordering::Equal
     {
         return o;
@@ -1091,10 +1296,13 @@ mod tests {
                     assert_eq!(fast, reference(&op, a, b), "{a:?} {b:?}");
                 }
                 let want = reference(&op, a, b);
-                let div_by_zero =
-                    matches!(op, NumOp::Div) && b.to_decimal() == Some(Decimal::from(0));
+                let is_div = matches!(op, NumOp::Div);
+                let div_by_zero = is_div && b.to_decimal() == Some(Decimal::from(0));
                 match (want, arith(op, &a.into_value(), &b.into_value())) {
                     (Some(d), Ok(Value::Decimal(got))) => assert_eq!(got, d, "{a:?} {b:?}"),
+                    // Exact terminating quotients needing >18 fractional digits now preserve
+                    // full precision in BigDecimal instead of truncating to 18 digits.
+                    (Some(_), Ok(Value::BigDecimal(_))) if is_div && !div_by_zero => {}
                     (None, Err(_)) if div_by_zero => {}
                     // Overflows, >18-fractional-digit results, and intermediate i128
                     // overflows (such as Decimal::MIN / -10) fall back to BigDec (item 1065).
@@ -1183,6 +1391,19 @@ mod tests {
         assert!(matches!(v[0], Value::BNode(_)));
         assert!(matches!(v[1], Value::Iri(_)));
     }
+
+    #[test]
+    fn order_cmp_is_transitive_across_big_exact_and_double() {
+        let a = lit("9999999999999999999999", xsd::INTEGER);
+        let b = lit("10000000000000000000000.0", xsd::DECIMAL);
+        let c = lit("1e22", xsd::DOUBLE);
+        assert_eq!(order_cmp(Some(&a), Some(&b)), Ordering::Less);
+        assert_eq!(order_cmp(Some(&b), Some(&c)), Ordering::Less);
+        assert_eq!(order_cmp(Some(&a), Some(&c)), Ordering::Less);
+        // FILTER promotion semantics stay separate from ORDER BY exact ordering.
+        assert!(equals(&a, &c).unwrap());
+        assert_eq!(compare(&a, &c).unwrap(), Some(Ordering::Equal));
+    }
 }
 
 #[cfg(test)]
@@ -1211,6 +1432,7 @@ mod projection_numeric_tests {
                 "NaN",
                 "heavy",
                 "99999999999999999999999999999",
+                "123456789012345678.00000000000000000000",
             ] {
                 let key = crate::id::term_key(&Term::Literal(Literal::new_typed_literal(
                     lex,

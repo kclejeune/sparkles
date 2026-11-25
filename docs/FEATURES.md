@@ -152,7 +152,7 @@ instruction counts, and the limits of attributing them to layout.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [SPARQL Query, Update and Graph Store protocols](querying/README.md#standards-conformance) | Complete | W3C SPARQL 1.0, 1.1 Query, 1.1 Update and 1.2 conformance suites pass, checked against a reference algebra evaluator. Unsupported Jena extensions and Java plugins remain outside scope. |
+| [SPARQL Query, Update and Graph Store protocols](querying/README.md#standards-conformance) | Complete | W3C SPARQL 1.0, 1.1 Query, 1.1 Update and 1.2 conformance suites pass, checked against a reference algebra evaluator, with bounded arbitrary-precision `xsd:integer` and `xsd:decimal` evaluation. Unsupported Jena extensions and Java plugins remain outside scope. |
 | [Durable commits and dataset identity](storage/README.md#storage-and-indexes) | Complete | Transactions produce durable receipts, gap-free commit sequences, change digests, ETags and synchronized acknowledgements. |
 | [Storage, loading and compaction](storage/README.md#storage-and-indexes) | Core complete | Compressed permutations, bulk loading, group commit, online compaction, optional FSST and startup prewarm are available. Adaptive compaction, per-dataset codecs, remaining X16 consolidation and larger-scale measurements remain. |
 | [History, snapshots and branches](storage/README.md#versioning-and-history) | Core complete | Retained commits, time travel, snapshots, diffs, change feeds, branches and conflict-checked merges are available. Historical full-text search, pin rebasing and remote or archive cloning remain. |

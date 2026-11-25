@@ -1770,6 +1770,24 @@ where
     }))
 }
 
+/// Exact binary truncation of a finite `f64` towards zero for XPath float/double-to-integer
+/// casts, avoiding `oxsdatatypes`'s intermediate `10^18` float scaling.
+fn float_to_integer(x: f64) -> EvalResult<Value> {
+    if !x.is_finite() {
+        return Err(TypeError);
+    }
+    let t = x.trunc();
+    // -2^63 is exact in f64 (i64::MIN); +2^63 is strictly above i64::MAX, so every finite
+    // truncated f64 in [-2^63, 2^63) converts losslessly via `as i64`.
+    if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t) {
+        Ok(Value::Integer(Integer::from(t as i64)))
+    } else {
+        Ok(Value::from_bigint(
+            super::bignum::BigInt::from_f64_trunc(t).ok_or(TypeError)?,
+        ))
+    }
+}
+
 /// XSD casts (SPARQL 17.5).
 pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
     let local = dt.as_str().strip_prefix(XSD).ok_or(TypeError)?;
@@ -1818,19 +1836,8 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
                         )
                     }),
                 (_, Some(Num::BigDecimal(d))) => Value::from_bigint(d.trunc_to_bigint()),
-                (_, Some(Num::Float(f))) => match Integer::try_from(f) {
-                    Ok(i) => Value::Integer(i),
-                    Err(_) => Value::from_bigint(
-                        super::bignum::BigInt::from_f64_trunc(f64::from(f32::from(f)))
-                            .ok_or(TypeError)?,
-                    ),
-                },
-                (_, Some(Num::Double(d))) => match Integer::try_from(d) {
-                    Ok(i) => Value::Integer(i),
-                    Err(_) => Value::from_bigint(
-                        super::bignum::BigInt::from_f64_trunc(f64::from(d)).ok_or(TypeError)?,
-                    ),
-                },
+                (_, Some(Num::Float(f))) => float_to_integer(f64::from(f32::from(f)))?,
+                (_, Some(Num::Double(d))) => float_to_integer(f64::from(d))?,
                 _ if from_str => match parsed(xsd::INTEGER)? {
                     Val::V(v) => v,
                     _ => return Err(TypeError),

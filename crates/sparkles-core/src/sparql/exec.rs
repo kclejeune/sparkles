@@ -6539,6 +6539,8 @@ fn key_payload(value: &Option<Value>) -> u64 {
             (s.len() + lang.len()) as u64 + 128
         }
         Some(Value::Other { lex, dt }) => (lex.len() + dt.len()) as u64 + 128,
+        Some(Value::BigInteger(i)) => i.heap_bytes() + 32,
+        Some(Value::BigDecimal(d)) => d.heap_bytes() + 32,
         Some(Value::Triple(triple)) => super::graph_triple_bytes(triple),
         _ => 0,
     }
@@ -6862,6 +6864,169 @@ pub(super) fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::
     }
 }
 
+/// Non-`i128` numeric subtotal of [`AggState::Sum`].
+///
+/// Big-number variants keep bounded headroom ([`super::bignum::AGG_MAX_INT_DIGITS`] /
+/// [`super::bignum::AGG_MAX_DEC_DIGITS`]) so cancellation and averaging at the digit cap
+/// stay independent of row order, while enforcing the final value limits in
+/// [`AggState::finish`].
+pub(super) enum SumGeneric {
+    Decimal(oxsdatatypes::Decimal),
+    Float(oxsdatatypes::Float),
+    Double(oxsdatatypes::Double),
+    BigInt(Box<super::bignum::BigInt>),
+    BigDec(Box<super::bignum::BigDec>),
+}
+
+impl SumGeneric {
+    fn from_int(int: i128) -> Self {
+        Self::BigInt(Box::new(super::bignum::BigInt::from_i128(int)))
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            SumGeneric::BigInt(i) => i.heap_bytes() + 32,
+            SumGeneric::BigDec(d) => d.heap_bytes() + 32,
+            _ => 0,
+        }
+    }
+
+    fn add_value(self, rhs: &Value) -> Option<Self> {
+        use super::bignum::{AGG_MAX_DEC_DIGITS, AGG_MAX_INT_DIGITS, BigDec, BigInt};
+        use super::value::Num;
+        use oxsdatatypes::{Double, Float};
+        let n = Num::of(rhs).ok()?;
+        Some(match (self, n) {
+            (SumGeneric::Decimal(a), Num::Integer(b)) => match a.checked_add(b) {
+                Some(d) => SumGeneric::Decimal(d),
+                None => SumGeneric::BigDec(Box::new(
+                    BigDec::from_oxs_decimal(a)
+                        .checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS)?,
+                )),
+            },
+            (SumGeneric::Decimal(a), Num::Decimal(b)) => match a.checked_add(b) {
+                Some(d) => SumGeneric::Decimal(d),
+                None => SumGeneric::BigDec(Box::new(
+                    BigDec::from_oxs_decimal(a)
+                        .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+                )),
+            },
+            (SumGeneric::Decimal(a), Num::BigInteger(b)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_oxs_decimal(a)
+                    .checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::Decimal(a), Num::BigDecimal(b)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_oxs_decimal(a).checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::Decimal(a), Num::Float(b)) => SumGeneric::Float(Float::from(a) + b),
+            (SumGeneric::Decimal(a), Num::Double(b)) => SumGeneric::Double(Double::from(a) + b),
+            (SumGeneric::BigInt(a), Num::Integer(b)) => SumGeneric::BigInt(Box::new(
+                a.checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS)?,
+            )),
+            (SumGeneric::BigInt(a), Num::BigInteger(b)) => {
+                SumGeneric::BigInt(Box::new(a.checked_add_with_limit(b, AGG_MAX_INT_DIGITS)?))
+            }
+            (SumGeneric::BigInt(a), Num::Decimal(b)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_bigint(*a)
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigInt(a), Num::BigDecimal(b)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_bigint(*a).checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigInt(a), Num::Float(b)) => {
+                SumGeneric::Float(Float::from(a.to_f32()) + b)
+            }
+            (SumGeneric::BigInt(a), Num::Double(b)) => {
+                SumGeneric::Double(Double::from(a.to_f64()) + b)
+            }
+            (SumGeneric::BigDec(a), Num::Integer(b)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigDec(a), Num::BigInteger(b)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigDec(a), Num::Decimal(b)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigDec(a), Num::BigDecimal(b)) => {
+                SumGeneric::BigDec(Box::new(a.checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)?))
+            }
+            (SumGeneric::BigDec(a), Num::Float(b)) => {
+                SumGeneric::Float(Float::from(a.to_f32()) + b)
+            }
+            (SumGeneric::BigDec(a), Num::Double(b)) => {
+                SumGeneric::Double(Double::from(a.to_f64()) + b)
+            }
+            (SumGeneric::Float(a), Num::Double(b)) => SumGeneric::Double(Double::from(a) + b),
+            (SumGeneric::Float(a), other) => SumGeneric::Float(a + other.to_float()),
+            (SumGeneric::Double(a), other) => SumGeneric::Double(a + other.to_double()),
+        })
+    }
+
+    fn merge(self, other: Self) -> Option<Self> {
+        use super::bignum::{AGG_MAX_DEC_DIGITS, AGG_MAX_INT_DIGITS, BigDec};
+        use oxsdatatypes::{Double, Float};
+        Some(match (self, other) {
+            (SumGeneric::Decimal(a), SumGeneric::Decimal(b)) => match a.checked_add(b) {
+                Some(d) => SumGeneric::Decimal(d),
+                None => SumGeneric::BigDec(Box::new(
+                    BigDec::from_oxs_decimal(a)
+                        .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+                )),
+            },
+            (SumGeneric::BigInt(a), SumGeneric::BigInt(b)) => {
+                SumGeneric::BigInt(Box::new(a.checked_add_with_limit(&b, AGG_MAX_INT_DIGITS)?))
+            }
+            (SumGeneric::BigDec(a), SumGeneric::BigDec(b)) => {
+                SumGeneric::BigDec(Box::new(a.checked_add_with_limit(&b, AGG_MAX_DEC_DIGITS)?))
+            }
+            (SumGeneric::BigDec(a), SumGeneric::BigInt(b))
+            | (SumGeneric::BigInt(b), SumGeneric::BigDec(a)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_bigint(*b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigDec(a), SumGeneric::Decimal(b))
+            | (SumGeneric::Decimal(b), SumGeneric::BigDec(a)) => SumGeneric::BigDec(Box::new(
+                a.checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::BigInt(a), SumGeneric::Decimal(b))
+            | (SumGeneric::Decimal(b), SumGeneric::BigInt(a)) => SumGeneric::BigDec(Box::new(
+                BigDec::from_bigint(*a)
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)?,
+            )),
+            (SumGeneric::Float(a), SumGeneric::Float(b)) => SumGeneric::Float(a + b),
+            (SumGeneric::Float(a), SumGeneric::Decimal(b))
+            | (SumGeneric::Decimal(b), SumGeneric::Float(a)) => {
+                SumGeneric::Float(a + Float::from(b))
+            }
+            (SumGeneric::Float(a), SumGeneric::BigInt(b))
+            | (SumGeneric::BigInt(b), SumGeneric::Float(a)) => {
+                SumGeneric::Float(a + Float::from(b.to_f32()))
+            }
+            (SumGeneric::Float(a), SumGeneric::BigDec(b))
+            | (SumGeneric::BigDec(b), SumGeneric::Float(a)) => {
+                SumGeneric::Float(a + Float::from(b.to_f32()))
+            }
+            (SumGeneric::Double(a), SumGeneric::Double(b)) => SumGeneric::Double(a + b),
+            (SumGeneric::Double(a), SumGeneric::Float(b))
+            | (SumGeneric::Float(b), SumGeneric::Double(a)) => {
+                SumGeneric::Double(a + Double::from(b))
+            }
+            (SumGeneric::Double(a), SumGeneric::Decimal(b))
+            | (SumGeneric::Decimal(b), SumGeneric::Double(a)) => {
+                SumGeneric::Double(a + Double::from(b))
+            }
+            (SumGeneric::Double(a), SumGeneric::BigInt(b))
+            | (SumGeneric::BigInt(b), SumGeneric::Double(a)) => {
+                SumGeneric::Double(a + Double::from(b.to_f64()))
+            }
+            (SumGeneric::Double(a), SumGeneric::BigDec(b))
+            | (SumGeneric::BigDec(b), SumGeneric::Double(a)) => {
+                SumGeneric::Double(a + Double::from(b.to_f64()))
+            }
+        })
+    }
+}
+
 /// Running state of one aggregate of one group (same results as [`aggregate`]).
 pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
@@ -6874,7 +7039,7 @@ pub(super) enum AggState {
     /// that are not numbers, for the reading in which AVG over only errors is zero.
     Sum {
         int: i128,
-        generic: Option<Value>,
+        generic: Option<SumGeneric>,
         ok: bool,
         rows: u64,
         errs: u64,
@@ -6904,6 +7069,17 @@ impl AggState {
             AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0),
             AggregateFunction::Sample => AggState::Sample(None),
             _ => AggState::Count(0),
+        }
+    }
+
+    /// Owned heap bytes held by a `SUM`/`AVG` big-number subtotal.
+    #[inline]
+    pub(super) fn sum_heap_bytes(&self) -> u64 {
+        match self {
+            AggState::Sum {
+                generic: Some(g), ..
+            } => g.heap_bytes(),
+            _ => 0,
         }
     }
 
@@ -6941,13 +7117,25 @@ impl AggState {
                     *int = s;
                     return;
                 }
-                let acc = generic
-                    .take()
-                    .unwrap_or_else(|| super::value::exact_sum(*int));
+                let acc = match generic.take() {
+                    Some(g) => g,
+                    None => match &value {
+                        Some(Value::Decimal(d)) => {
+                            if let Ok(i) = oxsdatatypes::Decimal::try_from(*int)
+                                && let Some(s) = i.checked_add(*d)
+                            {
+                                *generic = Some(SumGeneric::Decimal(s));
+                                return;
+                            }
+                            SumGeneric::from_int(*int)
+                        }
+                        _ => SumGeneric::from_int(*int),
+                    },
+                };
                 match value {
-                    Some(v) => match arith(NumOp::Add, &acc, &v) {
-                        Ok(v) => *generic = Some(v),
-                        Err(_) => *ok = false,
+                    Some(v) => match acc.add_value(&v) {
+                        Some(v) => *generic = Some(v),
+                        None => *ok = false,
                     },
                     None => *ok = false,
                 }
@@ -7023,13 +7211,11 @@ impl AggState {
                     *int = s;
                     return true;
                 }
-                let left = generic
-                    .take()
-                    .unwrap_or_else(|| super::value::exact_sum(*int));
-                let right = ogeneric.unwrap_or_else(|| super::value::exact_sum(oint));
-                match arith(NumOp::Add, &left, &right) {
-                    Ok(v) => *generic = Some(v),
-                    Err(_) => *ok = false,
+                let left = generic.take().unwrap_or_else(|| SumGeneric::from_int(*int));
+                let right = ogeneric.unwrap_or_else(|| SumGeneric::from_int(oint));
+                match left.merge(right) {
+                    Some(v) => *generic = Some(v),
+                    None => *ok = false,
                 }
             }
             (AggState::Best(best, best_v, errs), AggState::Best(Some(id), v, oerrs)) => {
@@ -7119,15 +7305,64 @@ impl AggState {
                 if !ok {
                     return Id::UNDEF;
                 }
-                let sum = generic.unwrap_or_else(|| super::value::exact_sum(int));
-                let v = if matches!(agg.func, AggregateFunction::Avg) {
-                    if rows == 0 {
-                        Some(Value::Integer(0.into()))
-                    } else {
-                        arith(NumOp::Div, &sum, &Value::Integer((rows as i64).into())).ok()
+                let is_avg = matches!(agg.func, AggregateFunction::Avg);
+                if is_avg && rows == 0 {
+                    return ctx.intern_value(&Value::Integer(0.into()));
+                }
+                let v = match generic {
+                    None => {
+                        let sum = super::value::exact_sum(int);
+                        if is_avg {
+                            let denom = Value::from_bigint(super::bignum::BigInt::from_u64(rows));
+                            arith(NumOp::Div, &sum, &denom).ok()
+                        } else {
+                            Some(sum)
+                        }
                     }
-                } else {
-                    Some(sum)
+                    Some(SumGeneric::Decimal(d)) => {
+                        let sum = Value::Decimal(d);
+                        if is_avg {
+                            let denom = Value::from_bigint(super::bignum::BigInt::from_u64(rows));
+                            arith(NumOp::Div, &sum, &denom).ok()
+                        } else {
+                            Some(sum)
+                        }
+                    }
+                    Some(SumGeneric::Float(f)) => {
+                        let sum = Value::Float(f);
+                        if is_avg {
+                            let denom = Value::from_bigint(super::bignum::BigInt::from_u64(rows));
+                            arith(NumOp::Div, &sum, &denom).ok()
+                        } else {
+                            Some(sum)
+                        }
+                    }
+                    Some(SumGeneric::Double(d)) => {
+                        let sum = Value::Double(d);
+                        if is_avg {
+                            let denom = Value::from_bigint(super::bignum::BigInt::from_u64(rows));
+                            arith(NumOp::Div, &sum, &denom).ok()
+                        } else {
+                            Some(sum)
+                        }
+                    }
+                    Some(SumGeneric::BigInt(bi)) => {
+                        if is_avg {
+                            super::bignum::BigDec::from_bigint(*bi)
+                                .checked_div(&super::bignum::BigDec::from_u64(rows))
+                                .map(Value::from_bigdec)
+                        } else {
+                            bi.fits_limits().then(|| Value::from_bigint(*bi))
+                        }
+                    }
+                    Some(SumGeneric::BigDec(bd)) => {
+                        if is_avg {
+                            bd.checked_div(&super::bignum::BigDec::from_u64(rows))
+                                .map(Value::from_bigdec)
+                        } else {
+                            bd.fits_limits().then(|| Value::from_bigdec(*bd))
+                        }
+                    }
                 };
                 v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
             }

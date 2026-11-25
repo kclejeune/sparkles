@@ -283,3 +283,37 @@ fn distinct_charges_what_it_passes_on() {
     );
     assert_eq!(results(&ctx, &mut acc, 1), ["1"]);
 }
+
+/// A tracked SUM/AVG running accumulator reports heap growth for big-number subtotals
+/// both during `add_batch` and across `merge`.
+#[test]
+fn running_sum_tracks_big_number_subtotal_growth() {
+    let ctx = ctx();
+    let huge = "9".repeat(4_000);
+    let big_id = ctx.intern_value(&Value::from_typed(
+        &huge,
+        oxrdf::vocab::xsd::INTEGER.as_str(),
+    ));
+    let sum_agg = agg(AggregateFunction::Sum, true, false);
+    let mut acc = Running::new(&sum_agg, true);
+    acc.init(2);
+    fold(&ctx, &mut acc, &[big_id, big_id], &[0, 1]);
+    let growth = acc.take_growth();
+    assert!(
+        growth >= 3_000,
+        "expected big-number SUM growth for two 4000-digit groups, got {growth}"
+    );
+    assert_eq!(acc.take_growth(), 0);
+
+    // Merging a big-number subtotal into an empty group also charges its heap growth.
+    let mut left = Running::new(&sum_agg, true);
+    left.init(1);
+    let mut right = Running::new(&sum_agg, true);
+    right.init(1);
+    fold(&ctx, &mut right, &[big_id], &[0]);
+    left.merge(&ctx, &mut right, &[0]).unwrap();
+    assert!(
+        left.take_growth() >= 1_500,
+        "expected merge growth for big-number SUM"
+    );
+}

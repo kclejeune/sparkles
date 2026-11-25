@@ -37,6 +37,11 @@ const POW10: [u32; 10] = [
 pub const MAX_DIGITS: usize = 4_096;
 /// Maximum fractional decimal scale retained by a [`BigDec`].
 pub const MAX_SCALE: u32 = 4_096;
+/// Bounded intermediate digit headroom for integer `SUM`/`AVG` accumulation so row
+/// order and cancellation before finalization do not fail prematurely.
+pub(crate) const AGG_MAX_INT_DIGITS: usize = MAX_DIGITS + 32;
+/// Bounded intermediate digit headroom for decimal `SUM`/`AVG` accumulation.
+pub(crate) const AGG_MAX_DEC_DIGITS: usize = MAX_DIGITS + MAX_SCALE as usize + 32;
 /// Minimum fractional digits produced by a non-terminating [`BigDec`] division, matching
 /// `oxsdatatypes::Decimal`.
 const MIN_DIV_SCALE: u32 = 18;
@@ -131,6 +136,7 @@ fn sub_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
 }
 
 fn mul_mag_u32(a: &[u32], k: u32) -> Vec<u32> {
+    debug_assert!(k < BASE);
     if a.is_empty() || k == 0 {
         return Vec::new();
     }
@@ -152,7 +158,7 @@ fn mul_mag_u32(a: &[u32], k: u32) -> Vec<u32> {
 }
 
 fn div_rem_mag_u32(a: &[u32], k: u32) -> (Vec<u32>, u32) {
-    debug_assert!(k > 0);
+    debug_assert!(k > 0 && k <= BASE);
     if a.is_empty() {
         return (Vec::new(), 0);
     }
@@ -229,7 +235,7 @@ fn div_rem_mag(u: &[u32], v: &[u32]) -> (Vec<u32>, Vec<u32>) {
         let mut rhat = num % v1;
         if qhat >= BASE_U128 {
             qhat = BASE_U128 - 1;
-            rhat += v1;
+            rhat = num - qhat * v1;
         }
         while rhat < BASE_U128 && qhat * v2 > rhat * BASE_U128 + u128::from(un[j + n - 2]) {
             qhat -= 1;
@@ -267,6 +273,7 @@ fn div_rem_mag(u: &[u32], v: &[u32]) -> (Vec<u32>, Vec<u32>) {
         } else {
             un[j + n] -= borrow as u32;
         }
+        debug_assert_eq!(un[j + n], 0);
         q[j] = qhat as u32;
     }
     trim_limbs(&mut q);
@@ -274,6 +281,7 @@ fn div_rem_mag(u: &[u32], v: &[u32]) -> (Vec<u32>, Vec<u32>) {
     trim_limbs(&mut rem_slice);
     let (r, rem_check) = div_rem_mag_u32(&rem_slice, d);
     debug_assert_eq!(rem_check, 0);
+    debug_assert_eq!(cmp_mag(&r, v), Ordering::Less);
     (q, r)
 }
 
@@ -512,13 +520,17 @@ impl BigInt {
         }
     }
 
-    fn from_parts(neg: bool, mut limbs: Vec<u32>) -> Option<Self> {
+    fn from_parts_limit(neg: bool, mut limbs: Vec<u32>, max_digits: usize) -> Option<Self> {
         trim_limbs(&mut limbs);
-        if limbs_digits(&limbs) > MAX_DIGITS {
+        if limbs_digits(&limbs) > max_digits {
             return None;
         }
         let neg = neg && !limbs.is_empty();
         Some(Self { neg, limbs })
+    }
+
+    fn from_parts(neg: bool, limbs: Vec<u32>) -> Option<Self> {
+        Self::from_parts_limit(neg, limbs, MAX_DIGITS)
     }
 
     fn from_parts_unchecked(neg: bool, mut limbs: Vec<u32>) -> Self {
@@ -632,6 +644,11 @@ impl BigInt {
         limbs_digits(&self.limbs)
     }
 
+    #[inline]
+    pub(crate) fn fits_limits(&self) -> bool {
+        self.decimal_digits() <= MAX_DIGITS
+    }
+
     pub fn heap_bytes(&self) -> u64 {
         (self.limbs.capacity() * std::mem::size_of::<u32>()) as u64 + 32
     }
@@ -680,15 +697,35 @@ impl BigInt {
     }
 
     pub fn checked_add(&self, rhs: &Self) -> Option<Self> {
+        self.checked_add_with_limit(rhs, MAX_DIGITS)
+    }
+
+    pub(crate) fn checked_add_with_limit(&self, rhs: &Self, max_digits: usize) -> Option<Self> {
         if self.neg == rhs.neg {
-            Self::from_parts(self.neg, add_mag(&self.limbs, &rhs.limbs))
+            Self::from_parts_limit(self.neg, add_mag(&self.limbs, &rhs.limbs), max_digits)
         } else {
             match cmp_mag(&self.limbs, &rhs.limbs) {
                 Ordering::Equal => Some(Self::zero()),
-                Ordering::Greater => Self::from_parts(self.neg, sub_mag(&self.limbs, &rhs.limbs)),
-                Ordering::Less => Self::from_parts(rhs.neg, sub_mag(&rhs.limbs, &self.limbs)),
+                Ordering::Greater => {
+                    Self::from_parts_limit(self.neg, sub_mag(&self.limbs, &rhs.limbs), max_digits)
+                }
+                Ordering::Less => {
+                    Self::from_parts_limit(rhs.neg, sub_mag(&rhs.limbs, &self.limbs), max_digits)
+                }
             }
         }
+    }
+
+    pub(crate) fn checked_mul_i64_with_limit(&self, n: i64, max_digits: usize) -> Option<Self> {
+        if self.is_zero() || n == 0 {
+            return Some(Self::zero());
+        }
+        let rhs = Self::from_i64(n);
+        if self.decimal_digits() + rhs.decimal_digits() > max_digits + 1 {
+            return None;
+        }
+        let limbs = mul_mag(&self.limbs, &rhs.limbs);
+        Self::from_parts_limit(self.neg != rhs.neg, limbs, max_digits)
     }
 
     pub fn checked_sub(&self, rhs: &Self) -> Option<Self> {
@@ -765,6 +802,59 @@ impl fmt::Display for BigInt {
     }
 }
 
+/// Factor `limbs` (non-empty) as `r * 10^tz * 2^p2 * 5^p5` with `gcd(r, 10) == 1`.
+fn factor_out_2_5(limbs: &[u32]) -> (Vec<u32>, usize, usize, usize) {
+    let tz = trailing_zeros_mag(limbs);
+    let mut rem = if tz > 0 {
+        div_rem_mag_pow10(limbs, tz).0
+    } else {
+        limbs.to_vec()
+    };
+    let mut p2 = 0usize;
+    let mut p5 = 0usize;
+    // Since trailing zeros were stripped, `rem` is divisible by at most one of 2 or 5.
+    while !rem.is_empty() && rem[0].is_multiple_of(2) {
+        let k = if rem[0] == 0 {
+            9
+        } else {
+            rem[0].trailing_zeros().min(9)
+        };
+        let (q, r) = div_rem_mag_u32(&rem, 1u32 << k);
+        debug_assert_eq!(r, 0);
+        rem = q;
+        p2 += k as usize;
+    }
+    while !rem.is_empty() && rem[0].is_multiple_of(5) {
+        let mut div = 5u32;
+        let mut k = 1usize;
+        while k < 9 && rem[0].is_multiple_of(div * 5) {
+            div *= 5;
+            k += 1;
+        }
+        let (q, r) = div_rem_mag_u32(&rem, div);
+        debug_assert_eq!(r, 0);
+        rem = q;
+        p5 += k;
+    }
+    (rem, tz, p2, p5)
+}
+
+const POW5: [u32; 13] = [
+    1,
+    5,
+    25,
+    125,
+    625,
+    3_125,
+    15_625,
+    78_125,
+    390_625,
+    1_953_125,
+    9_765_625,
+    48_828_125,
+    244_140_625,
+];
+
 impl BigDec {
     pub fn zero() -> Self {
         Self {
@@ -773,7 +863,12 @@ impl BigDec {
         }
     }
 
-    fn normalize(neg: bool, mut limbs: Vec<u32>, mut scale: u32) -> Option<Self> {
+    fn normalize_limit(
+        neg: bool,
+        mut limbs: Vec<u32>,
+        mut scale: u32,
+        max_digits: usize,
+    ) -> Option<Self> {
         trim_limbs(&mut limbs);
         if limbs.is_empty() {
             return Some(Self::zero());
@@ -786,13 +881,17 @@ impl BigDec {
                 scale -= tz as u32;
             }
         }
-        if scale > MAX_SCALE || limbs_digits(&limbs) > MAX_DIGITS {
+        if scale > MAX_SCALE || limbs_digits(&limbs) > max_digits {
             return None;
         }
         Some(Self {
             mantissa: BigInt::from_parts_unchecked(neg, limbs),
             scale,
         })
+    }
+
+    fn normalize(neg: bool, limbs: Vec<u32>, scale: u32) -> Option<Self> {
+        Self::normalize_limit(neg, limbs, scale, MAX_DIGITS)
     }
 
     pub fn from_bigint(i: BigInt) -> Self {
@@ -804,6 +903,59 @@ impl BigDec {
 
     pub fn from_i64(n: i64) -> Self {
         Self::from_bigint(BigInt::from_i64(n))
+    }
+
+    pub fn from_u64(n: u64) -> Self {
+        Self::from_bigint(BigInt::from_u64(n))
+    }
+
+    /// Exact mathematical value of a finite IEEE-754 `f64` (`±mant * 2^exp`), for
+    /// transitive numeric `ORDER BY` comparisons. Unlike [`BigDec::from_f64`], this does
+    /// not shorten the decimal representation.
+    pub(crate) fn from_exact_f64(x: f64) -> Option<Self> {
+        if !x.is_finite() {
+            return None;
+        }
+        if x == 0.0 {
+            return Some(Self::zero());
+        }
+        let bits = x.to_bits();
+        let neg = (bits >> 63) != 0;
+        let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+        let frac = bits & ((1u64 << 52) - 1);
+        let (mut mant, exp) = if exp_bits == 0 {
+            (frac, 1 - 1023 - 52)
+        } else {
+            ((1u64 << 52) | frac, exp_bits - 1023 - 52)
+        };
+        if exp >= 0 {
+            let mut limbs = BigInt::from_u64(mant).limbs;
+            let mut shift = exp as u32;
+            while shift > 0 {
+                let step = shift.min(29);
+                limbs = mul_mag_u32(&limbs, 1u32 << step);
+                shift -= step;
+            }
+            Self::normalize(neg, limbs, 0)
+        } else {
+            let mut k = (-exp) as u32;
+            let tz = mant.trailing_zeros().min(k);
+            mant >>= tz;
+            k -= tz;
+            let mut limbs = BigInt::from_u64(mant).limbs;
+            let mut rem5 = k as usize;
+            while rem5 > 0 {
+                let step = rem5.min(12);
+                limbs = mul_mag_u32(&limbs, POW5[step]);
+                rem5 -= step;
+            }
+            Self::normalize(neg, limbs, k)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn fits_limits(&self) -> bool {
+        self.scale <= MAX_SCALE && self.mantissa.fits_limits()
     }
 
     pub fn from_oxs_decimal(d: Decimal) -> Self {
@@ -970,13 +1122,10 @@ impl BigDec {
         }
     }
 
-    fn align_pair(&self, rhs: &Self) -> Option<(Vec<u32>, Vec<u32>, u32)> {
+    fn align_pair_limit(&self, rhs: &Self, lim: usize) -> Option<(Vec<u32>, Vec<u32>, u32)> {
         let scale = self.scale.max(rhs.scale);
         let shift_a = (scale - self.scale) as usize;
         let shift_b = (scale - rhs.scale) as usize;
-        // Allow up to MAX_DIGITS + 1 during intermediate alignment so cancelling additions
-        // at the boundary stay exact, while still bounding allocation strictly.
-        let lim = MAX_DIGITS + 2;
         if (!self.is_zero() && self.mantissa.decimal_digits() + shift_a > lim)
             || (!rhs.is_zero() && rhs.mantissa.decimal_digits() + shift_b > lim)
         {
@@ -987,23 +1136,59 @@ impl BigDec {
         Some((a, b, scale))
     }
 
+    fn align_pair(&self, rhs: &Self) -> Option<(Vec<u32>, Vec<u32>, u32)> {
+        // Allow up to MAX_DIGITS + 2 during intermediate alignment so cancelling additions
+        // at the boundary stay exact, while still bounding allocation strictly.
+        self.align_pair_limit(rhs, MAX_DIGITS + 2)
+    }
+
     pub fn checked_add(&self, rhs: &Self) -> Option<Self> {
+        self.checked_add_with_limit(rhs, MAX_DIGITS)
+    }
+
+    pub(crate) fn checked_add_with_limit(&self, rhs: &Self, max_digits: usize) -> Option<Self> {
         if self.is_zero() {
-            return Some(rhs.clone());
+            return Self::normalize_limit(
+                rhs.mantissa.neg,
+                rhs.mantissa.limbs.clone(),
+                rhs.scale,
+                max_digits,
+            );
         }
         if rhs.is_zero() {
-            return Some(self.clone());
+            return Self::normalize_limit(
+                self.mantissa.neg,
+                self.mantissa.limbs.clone(),
+                self.scale,
+                max_digits,
+            );
         }
-        let (a, b, scale) = self.align_pair(rhs)?;
+        let (a, b, scale) = self.align_pair_limit(rhs, max_digits + 2)?;
         if self.mantissa.neg == rhs.mantissa.neg {
-            Self::normalize(self.mantissa.neg, add_mag(&a, &b), scale)
+            Self::normalize_limit(self.mantissa.neg, add_mag(&a, &b), scale, max_digits)
         } else {
             match cmp_mag(&a, &b) {
                 Ordering::Equal => Some(Self::zero()),
-                Ordering::Greater => Self::normalize(self.mantissa.neg, sub_mag(&a, &b), scale),
-                Ordering::Less => Self::normalize(rhs.mantissa.neg, sub_mag(&b, &a), scale),
+                Ordering::Greater => {
+                    Self::normalize_limit(self.mantissa.neg, sub_mag(&a, &b), scale, max_digits)
+                }
+                Ordering::Less => {
+                    Self::normalize_limit(rhs.mantissa.neg, sub_mag(&b, &a), scale, max_digits)
+                }
             }
         }
+    }
+
+    pub(crate) fn checked_mul_i64_with_limit(&self, n: i64, max_digits: usize) -> Option<Self> {
+        if self.is_zero() || n == 0 {
+            return Some(Self::zero());
+        }
+        let rhs = BigInt::from_i64(n);
+        if self.mantissa.decimal_digits() + rhs.decimal_digits() > max_digits + 2 {
+            return None;
+        }
+        let limbs = mul_mag(&self.mantissa.limbs, &rhs.limbs);
+        Self::normalize_limit(self.mantissa.neg != rhs.neg, limbs, self.scale, max_digits)
     }
 
     pub fn checked_sub(&self, rhs: &Self) -> Option<Self> {
@@ -1037,9 +1222,100 @@ impl BigDec {
         Self::normalize(self.mantissa.neg != rhs.mantissa.neg, limbs, scale)
     }
 
-    /// Exact decimal division truncated towards zero, retaining at least 18 fractional
-    /// digits (or enough digits for 18 significant digits on tiny quotients), bounded by
-    /// [`MAX_DIGITS`] and [`MAX_SCALE`].
+    /// Attempt an exact terminating decimal quotient within `(MAX_DIGITS, MAX_SCALE)`.
+    /// Returns `Some(q)` iff `self / rhs` terminates in base 10 and fits both caps.
+    fn try_exact_terminating_div(&self, rhs: &Self) -> Option<Self> {
+        let neg = self.mantissa.neg != rhs.mantissa.neg;
+        let (r_b, tz_b, mut p2, mut p5) = factor_out_2_5(&rhs.mantissa.limbs);
+        let mut q0 = if r_b.len() == 1 && r_b[0] == 1 {
+            self.mantissa.limbs.clone()
+        } else {
+            let (q, rem) = div_rem_mag(&self.mantissa.limbs, &r_b);
+            if !rem.is_empty() {
+                return None;
+            }
+            q
+        };
+        // Cancel common factors of 2 or 5 from q0 against p2 / p5.
+        while p2 > 0 && !q0.is_empty() && q0[0].is_multiple_of(2) {
+            let k = if q0[0] == 0 {
+                9usize
+            } else {
+                q0[0].trailing_zeros().min(9) as usize
+            }
+            .min(p2);
+            let (q, rem) = div_rem_mag_u32(&q0, 1u32 << k);
+            debug_assert_eq!(rem, 0);
+            q0 = q;
+            p2 -= k;
+        }
+        while p5 > 0 && !q0.is_empty() && q0[0].is_multiple_of(5) {
+            let mut div = 5u32;
+            let mut k = 1usize;
+            let max_k = p5.min(9);
+            while k < max_k && q0[0].is_multiple_of(div * 5) {
+                div *= 5;
+                k += 1;
+            }
+            let (q, rem) = div_rem_mag_u32(&q0, div);
+            debug_assert_eq!(rem, 0);
+            q0 = q;
+            p5 -= k;
+        }
+        // Strip trailing zeros of q0 before computing net exponent and multiplying by 5^p2 / 2^p5.
+        let tz_q = trailing_zeros_mag(&q0);
+        if tz_q > 0 {
+            q0 = div_rem_mag_pow10(&q0, tz_q).0;
+        }
+        // Note: if p2 > 0, q0 is now odd, so multiplying by 5^p2 produces no trailing zeros.
+        // If p5 > 0, q0 is not divisible by 5, so multiplying by 2^p5 produces no trailing zeros.
+        let exp = i64::from(rhs.scale) - i64::from(self.scale) + tz_q as i64
+            - tz_b as i64
+            - p2 as i64
+            - p5 as i64;
+        if exp < -(i64::from(MAX_SCALE)) {
+            return None;
+        }
+        if p2 > 0 {
+            let mut rem = p2;
+            while rem > 0 {
+                let step = rem.min(12);
+                q0 = mul_mag_u32(&q0, POW5[step]);
+                if limbs_digits(&q0) > MAX_DIGITS {
+                    return None;
+                }
+                rem -= step;
+            }
+        }
+        if p5 > 0 {
+            let mut rem = p5;
+            while rem > 0 {
+                let step = rem.min(29);
+                q0 = mul_mag_u32(&q0, 1u32 << step);
+                if limbs_digits(&q0) > MAX_DIGITS {
+                    return None;
+                }
+                rem -= step;
+            }
+        }
+        if exp >= 0 {
+            let shift = usize::try_from(exp).ok()?;
+            if limbs_digits(&q0) + shift > MAX_DIGITS {
+                return None;
+            }
+            let shifted = shift_mag_pow10(&q0, shift);
+            Self::normalize(neg, shifted, 0)
+        } else {
+            let scale = u32::try_from(-exp).ok()?;
+            Self::normalize(neg, q0, scale)
+        }
+    }
+
+    /// Exact decimal division: preserves terminating quotients whenever they fit within
+    /// [`MAX_DIGITS`] and [`MAX_SCALE`], and truncates non-terminating quotients towards
+    /// zero with at least 18 fractional digits (or 18 significant digits for sub-10^-18
+    /// quotients, and up to the dividend's scale), capped to fit [`MAX_DIGITS`] and
+    /// [`MAX_SCALE`].
     pub fn checked_div(&self, rhs: &Self) -> Option<Self> {
         if rhs.is_zero() {
             return None;
@@ -1047,9 +1323,15 @@ impl BigDec {
         if self.is_zero() {
             return Some(Self::zero());
         }
+        if let Some(exact) = self.try_exact_terminating_div(rhs) {
+            return Some(exact);
+        }
         let mag_a = self.mantissa.decimal_digits() as i64 - i64::from(self.scale);
         let mag_b = rhs.mantissa.decimal_digits() as i64 - i64::from(rhs.scale);
         let q_mag = mag_a - mag_b;
+        if q_mag > MAX_DIGITS as i64 {
+            return None;
+        }
         let min_for_sig = if q_mag < 0 {
             let need = (-q_mag).saturating_add(i64::from(MIN_DIV_SCALE));
             if need > i64::from(MAX_SCALE) {
@@ -1059,9 +1341,18 @@ impl BigDec {
         } else {
             MIN_DIV_SCALE
         };
-        let out_scale = self.scale.max(rhs.scale).max(min_for_sig).min(MAX_SCALE);
+        let max_frac_for_digits = if q_mag >= 0 {
+            MAX_DIGITS.saturating_sub((q_mag + 1) as usize) as u32
+        } else {
+            MAX_SCALE
+        };
+        let out_scale = self
+            .scale
+            .max(min_for_sig)
+            .min(MAX_SCALE)
+            .min(max_frac_for_digits);
         let shift = i64::from(out_scale) + i64::from(rhs.scale) - i64::from(self.scale);
-        let max_work = MAX_DIGITS * 2;
+        let max_work = MAX_DIGITS * 3;
         let (q, _) = if shift >= 0 {
             let shift = usize::try_from(shift).ok()?;
             if self.mantissa.decimal_digits() + shift > max_work {
@@ -1088,7 +1379,17 @@ impl BigDec {
         if self.is_zero() {
             return Some(Self::zero());
         }
-        let (a, b, scale) = self.align_pair(rhs)?;
+        match cmp_mag_scaled(
+            &self.mantissa.limbs,
+            self.scale,
+            &rhs.mantissa.limbs,
+            rhs.scale,
+        ) {
+            Ordering::Less => return Some(self.clone()),
+            Ordering::Equal => return Some(Self::zero()),
+            Ordering::Greater => {}
+        }
+        let (a, b, scale) = self.align_pair_limit(rhs, MAX_DIGITS + MAX_SCALE as usize)?;
         let (_, r) = div_rem_mag(&a, &b);
         Self::normalize(self.mantissa.neg, r, scale)
     }
@@ -1101,9 +1402,25 @@ impl BigDec {
         if self.is_zero() {
             return Some(BigInt::zero());
         }
-        let (a, b, _) = self.align_pair(rhs)?;
+        let neg = self.mantissa.neg != rhs.mantissa.neg;
+        match cmp_mag_scaled(
+            &self.mantissa.limbs,
+            self.scale,
+            &rhs.mantissa.limbs,
+            rhs.scale,
+        ) {
+            Ordering::Less => return Some(BigInt::zero()),
+            Ordering::Equal => return Some(BigInt::from_i64(if neg { -1 } else { 1 })),
+            Ordering::Greater => {}
+        }
+        let mag_a = self.mantissa.decimal_digits() as i64 - i64::from(self.scale);
+        let mag_b = rhs.mantissa.decimal_digits() as i64 - i64::from(rhs.scale);
+        if mag_a - mag_b > MAX_DIGITS as i64 + 1 {
+            return None;
+        }
+        let (a, b, _) = self.align_pair_limit(rhs, MAX_DIGITS + MAX_SCALE as usize)?;
         let (q, _) = div_rem_mag(&a, &b);
-        BigInt::from_parts(self.mantissa.neg != rhs.mantissa.neg, q)
+        BigInt::from_parts(neg, q)
     }
 
     /// Truncate towards zero to a [`BigInt`].
@@ -1419,5 +1736,66 @@ mod tests {
             BigDec::from_f64(1e-25).unwrap().to_string(),
             "0.0000000000000000000000001"
         );
+    }
+
+    #[test]
+    fn knuth_algorithm_d_qhat_base_plus_one_witnesses() {
+        // Sol witness: qhat == BASE + 1 on the second quotient digit.
+        let u1 = BigInt::parse("500000000999999998000000000").unwrap();
+        let v1 = BigInt::parse("500000000999999999").unwrap();
+        let (q1, r1) = u1.checked_div_rem(&v1).unwrap();
+        assert_eq!(q1.to_string(), "999999999");
+        assert_eq!(r1.to_string(), "499999999999999999");
+        assert_eq!(q1.checked_mul(&v1).unwrap().checked_add(&r1).unwrap(), u1);
+
+        // Neon witness: 4-limb by 3-limb qhat == BASE + 1.
+        let u2 = BigInt::parse("500000000999999998000000000000000000").unwrap();
+        let v2 = BigInt::parse("500000000999999999000000000").unwrap();
+        let (q2, r2) = u2.checked_div_rem(&v2).unwrap();
+        assert_eq!(q2.to_string(), "999999999");
+        assert_eq!(r2.to_string(), "499999999999999999000000000");
+        assert_eq!(q2.checked_mul(&v2).unwrap().checked_add(&r2).unwrap(), u2);
+    }
+
+    #[test]
+    fn terminating_and_extreme_scale_division_rem_and_idiv() {
+        // 1 / 2^100 terminates at scale 100 within both caps.
+        let one = BigDec::from_i64(1);
+        let two_pow_100 = BigDec::parse("1267650600228229401496703205376").unwrap();
+        let q = one.checked_div(&two_pow_100).unwrap();
+        assert_eq!(q.scale, 100);
+        assert_eq!(q.checked_mul(&two_pow_100).unwrap(), one);
+
+        // 10^-4096 / 1 succeeds and preserves exact scale 4096.
+        let tiny_cap =
+            BigDec::parse(&format!("0.{}1", "0".repeat(MAX_SCALE as usize - 1))).unwrap();
+        assert_eq!(tiny_cap.checked_div(&one).unwrap(), tiny_cap);
+
+        // High-scale repeating divisor: 100 / (3 + 10^-4095) succeeds.
+        let hundred = BigDec::from_i64(100);
+        let high_scale_div =
+            BigDec::parse(&format!("3.{}1", "0".repeat(MAX_SCALE as usize - 2))).unwrap();
+        let q_high = hundred.checked_div(&high_scale_div).unwrap();
+        assert_eq!(q_high.to_string(), "33.333333333333333333");
+
+        // Large integer divided by repeating divisor clamps scale to fit MAX_DIGITS.
+        let big_int = BigDec::parse(&format!("1{}", "0".repeat(4084))).unwrap();
+        let q_clamp = big_int.checked_div(&BigDec::from_i64(7)).unwrap();
+        assert!(q_clamp.fits_limits());
+        assert!(q_clamp.to_string().starts_with("142857142857"));
+
+        // Bounded operands with 8192-digit scale gap for mod and idiv.
+        let big_pow = BigDec::parse(&format!("1{}", "0".repeat(MAX_DIGITS - 1))).unwrap();
+        assert_eq!(big_pow.checked_rem(&tiny_cap).unwrap(), BigDec::zero());
+        assert_eq!(tiny_cap.checked_idiv(&big_pow).unwrap(), BigInt::zero());
+        assert_eq!(tiny_cap.checked_rem(&big_pow).unwrap(), tiny_cap);
+
+        // Exact binary float conversion for transitive ORDER BY.
+        let d01 = BigDec::from_exact_f64(0.1).unwrap();
+        assert!(d01 > BigDec::parse("0.1").unwrap());
+        let d03 = BigDec::from_exact_f64(0.3).unwrap();
+        assert!(d03 < BigDec::parse("0.3").unwrap());
+        let d1e22 = BigDec::from_exact_f64(1e22).unwrap();
+        assert_eq!(d1e22, BigDec::parse("10000000000000000000000").unwrap());
     }
 }

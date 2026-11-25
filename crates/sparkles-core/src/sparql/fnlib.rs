@@ -67,16 +67,15 @@ fn round_digits(s: &str, precision: i64, half_even: bool) -> String {
         None => (false, s),
     };
     let (int, frac) = body.split_once('.').unwrap_or((body, ""));
-    let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|c| c - b'0').collect();
     let mut point = int.len() as i64;
-    let keep = point + precision;
-    if keep >= digits.len() as i64 {
+    if precision >= frac.len() as i64 {
         return s.to_string();
     }
-    if keep < 0 {
+    if precision < -point {
         return "0".to_string();
     }
-    let keep = keep as usize;
+    let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|c| c - b'0').collect();
+    let keep = (point + precision) as usize;
     let tail = digits.split_off(keep);
     let rest_zero = tail[1..].iter().all(|&d| d == 0);
     let up = match tail[0].cmp(&5) {
@@ -223,7 +222,7 @@ pub fn numeric_integer_divide(a: Num<'_>, b: Num<'_>) -> EvalResult<Value> {
                 return Err(TypeError);
             }
             let q = (x / y).trunc();
-            if q.abs() < 9.2e18 {
+            if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&q) {
                 Value::Integer(Integer::from(q as i64))
             } else {
                 Value::from_bigint(BigInt::from_f64_trunc(q).ok_or(TypeError)?)

@@ -2383,3 +2383,107 @@ fn a_window_cancelled_while_refilling_publishes_nothing() {
     };
     a_failed_window_pass_publishes_nothing(&setup, &change, None, arm, "pass-timeout");
 }
+
+/// Maintained SUM/AVG views with arbitrary-precision values checkpoint and recover across
+/// restarts, enforce caps only after cancellation/averaging, and ignore pre-upgrade
+/// checkpoints built under older numeric semantics.
+#[test]
+fn big_numeric_sum_avg_view_checkpoints_and_invalidates_old_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = persistent(dir.path(), true);
+    let max_int = "9".repeat(4_096);
+    let setup = format!(
+        "INSERT DATA {{ \
+         :a :g :g1 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :b :g :g1 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :c :g :g1 ; :v \"-{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :d :g :g2 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :e :g :g2 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :f :g :g3 ; :v \"99999999999999999999999\"^^<http://www.w3.org/2001/XMLSchema#integer> \
+         }}"
+    );
+    upd(&s, &setup);
+    let sum_q = "SELECT ?g (SUM(?v) AS ?s) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
+    let avg_q = "SELECT ?g (AVG(?v) AS ?a) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
+    {
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "big-sum", ViewDef::table(q(sum_q))).unwrap();
+        rt.put(&s, "big-avg", ViewDef::table(q(avg_q))).unwrap();
+        rt.round(&s);
+        let mut got_sum = read(&rt, &s, "big-sum", None).unwrap();
+        let mut want_sum = oracle(&s, sum_q, None);
+        got_sum.sort();
+        want_sum.sort();
+        assert_eq!(got_sum, want_sum);
+        let mut got_avg = read(&rt, &s, "big-avg", None).unwrap();
+        let mut want_avg = oracle(&s, avg_q, None);
+        got_avg.sort();
+        want_avg.sort();
+        assert_eq!(got_avg, want_avg);
+        rt.close(&s);
+    }
+    // Checkpoints were written for both views holding big-number state.
+    let sum_state_dir = dir.path().join("views/big-sum/main");
+    let sum_files = super::persist::list(&sum_state_dir);
+    assert_eq!(sum_files.len(), 1, "big-number SUM view must checkpoint");
+    assert_eq!(
+        super::persist::list(&dir.path().join("views/big-avg/main")).len(),
+        1,
+        "big-number AVG view must checkpoint"
+    );
+
+    // Reopen from the checkpoint and apply an incremental retraction + insertion.
+    {
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.round(&s);
+        assert!(
+            rt.stats(&s).loaded >= 2,
+            "both big-number views should recover from their checkpoints"
+        );
+        // Retract one copy of max_int from :g2 so SUM(:g2) recovers from unbound to max_int.
+        upd(
+            &s,
+            &format!(
+                "DELETE DATA {{ :e :g :g2 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> }}"
+            ),
+        );
+        rt.round(&s);
+        let mut got_sum = read(&rt, &s, "big-sum", None).unwrap();
+        let mut want_sum = oracle(&s, sum_q, None);
+        got_sum.sort();
+        want_sum.sort();
+        assert_eq!(got_sum, want_sum);
+        rt.close(&s);
+    }
+
+    // Simulate a pre-upgrade checkpoint stamped with an older compiler fingerprint (where
+    // big integers were recorded as `errs = 1`), then reopen, retract the big integer, and
+    // insert a small integer in the same group. Recovery must ignore the stale checkpoint
+    // and rebuild cleanly so the group is not poisoned.
+    let files = super::persist::list(&sum_state_dir);
+    let latest = &files[0].1;
+    let mut bytes = std::fs::read(latest).unwrap();
+    // Flip a bit in the header fingerprint (offset 40..48) to represent an older compiler.
+    bytes[40] ^= 0x5a;
+    std::fs::write(latest, &bytes).unwrap();
+    {
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.round(&s);
+        upd(
+            &s,
+            "DELETE DATA { :f :g :g3 ; :v \"99999999999999999999999\"^^<http://www.w3.org/2001/XMLSchema#integer> } ; \
+             INSERT DATA { :h :g :g3 ; :v 5 }",
+        );
+        rt.round(&s);
+        let mut got_sum = read(&rt, &s, "big-sum", None).unwrap();
+        let mut want_sum = oracle(&s, sum_q, None);
+        got_sum.sort();
+        want_sum.sort();
+        assert_eq!(got_sum, want_sum);
+        assert!(
+            got_sum.iter().any(|r| r.contains("g3") && r.contains("5")),
+            "expected g3 sum to equal 5 after retracting big int and inserting 5, got {got_sum:?}"
+        );
+        rt.close(&s);
+    }
+}

@@ -523,10 +523,19 @@ pub(super) fn cursor_numeric_values(
     };
     let vals = eval(&d.values)?;
     ctx.check()?;
-    let retained = vals.capacity() as u64
-        * std::mem::size_of::<Option<super::value::Value>>() as u64
-        + d.slot.as_ref().map_or(0, |s| s.capacity() as u64 * 4)
-        + 4096;
+    let big_payload: u64 = vals
+        .iter()
+        .map(|v| match v {
+            Some(super::value::Value::BigInteger(i)) => i.heap_bytes() + 32,
+            Some(super::value::Value::BigDecimal(d)) => d.heap_bytes() + 32,
+            _ => 0,
+        })
+        .sum();
+    let retained = (vals.capacity() as u64
+        * std::mem::size_of::<Option<super::value::Value>>() as u64)
+        .saturating_add(big_payload)
+        .saturating_add(d.slot.as_ref().map_or(0, |s| s.capacity() as u64 * 4))
+        .saturating_add(4096);
     if let Some(charge) = &mut charge {
         charge.resize(retained)?;
     }

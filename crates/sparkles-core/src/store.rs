@@ -6380,7 +6380,7 @@ impl Store {
         let Some(dir) = snap.generation.dir.as_ref() else {
             return Ok(None);
         };
-        if dir.join(crate::vocab::numeric::FILE).exists() {
+        if snap.generation.vocab.numeric().is_some() {
             return Ok(None);
         }
         crate::vocab::add_numeric_column(dir).map(Some)

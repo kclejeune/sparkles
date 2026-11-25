@@ -2783,6 +2783,14 @@ pub fn add_numeric_column(dir: &Path) -> Result<u64> {
         return Err(e);
     }
     let n = w.finish(dir, v.len())?;
+    if n == 0 {
+        let stale = dir.join(numeric::FILE);
+        if let Err(e) = std::fs::remove_file(&stale)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e.into());
+        }
+    }
     crate::store::sync_dir(dir)?;
     Ok(n)
 }
