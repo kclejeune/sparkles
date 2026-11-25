@@ -9,11 +9,10 @@ impl Runtime {
         let wait = Instant::now() + self.opts.read().view_wait;
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
-            let mut dropped = Vec::new();
-            let mut retired = Vec::new();
+            let mut deferred = DeferredDrops::default();
             let (cell, access, suspended, error, errors) = {
                 let mut reg = self.reg.lock();
-                self.sync_for_read(&mut reg, &mut dropped, &mut retired);
+                self.sync_for_read(&mut reg, &mut deferred);
                 let errors = reg.aggregate_errors;
                 let e = reg.view(r.name)?;
                 (
@@ -24,8 +23,7 @@ impl Runtime {
                     errors,
                 )
             };
-            drop(dropped);
-            drop(retired);
+            drop(deferred);
             if let Some(why) = suspended {
                 return Err(crate::incr::error(
                     "view-suspended",
@@ -151,8 +149,7 @@ impl Runtime {
         };
         let mut c = st.fresh(st.circuit.inference.clone())?;
         drop(st);
-        let pool = r.memory_pool.cloned().or_else(|| self.pool.clone());
-        let parent = r.memory_parent.clone().or_else(|| self.circuit_parent());
+        let (pool, parent) = self.resolve_fallback_budget(r)?;
         c.set_pool(pool, parent);
         if let Some(limit) = r.max_memory_bytes {
             let effective = c.max_memory_bytes.map_or(limit, |m| m.min(limit));
@@ -163,12 +160,62 @@ impl Runtime {
             ..Control::none()
         };
         c.build(snap, &control)?;
+        let rows = c.rows_budgeted()?;
         Ok(ViewRows {
             columns,
-            rows: c.rows(),
+            rows,
             commit: r.at,
             evaluated_under: None,
         })
+    }
+
+    /// Resolve a coherent `(pool, parent)` pair for fallback evaluation (`read_back` /
+    /// `evaluate_under`) so `parent.domain()` always matches `pool`, unpooled callers
+    /// never bypass `self.pool`, and `Ctx::memory_parent()` is invoked lazily.
+    fn resolve_fallback_budget(
+        &self,
+        r: &ViewRead<'_>,
+    ) -> Result<(Option<Arc<QueryPool>>, Option<ParentHandle>)> {
+        let unpooled_id = sparkles_budget::MemoryDomain::unpooled().id();
+        if let Some(rp) = r.memory_pool {
+            if let Some(get_parent) = r.memory_parent {
+                let parent = get_parent()?;
+                if parent.domain() != rp.domain() {
+                    return Err(Error::invalid(
+                        "view read memory_parent domain does not match memory_pool",
+                    ));
+                }
+                return Ok((Some(rp.clone()), Some(parent)));
+            }
+            return Ok((Some(rp.clone()), Some(rp.work_parent())));
+        }
+        if let Some(sp) = &self.pool {
+            if let Some(get_parent) = r.memory_parent {
+                let parent = get_parent()?;
+                if parent.domain() == sp.domain() {
+                    return Ok((Some(sp.clone()), Some(parent)));
+                }
+                if parent.domain() == unpooled_id {
+                    // An unpooled query reading a pooled dataset's view must still charge
+                    // the dataset's QueryPool during fallback evaluation.
+                    return Ok((Some(sp.clone()), Some(sp.work_parent())));
+                }
+                return Err(Error::invalid(
+                    "view read memory_parent belongs to another QueryPool without matching memory_pool",
+                ));
+            }
+            return Ok((Some(sp.clone()), Some(sp.work_parent())));
+        }
+        if let Some(get_parent) = r.memory_parent {
+            let parent = get_parent()?;
+            if parent.domain() != unpooled_id {
+                return Err(Error::invalid(
+                    "pooled view read memory_parent requires its matching memory_pool",
+                ));
+            }
+            return Ok((None, Some(parent)));
+        }
+        Ok((None, None))
     }
 }
 
@@ -207,8 +254,7 @@ impl Runtime {
         let mut c = st.fresh(st.circuit.inference.clone())?;
         drop(st);
         c.aggregate_errors = Some(m);
-        let pool = r.memory_pool.cloned().or_else(|| self.pool.clone());
-        let parent = r.memory_parent.clone().or_else(|| self.circuit_parent());
+        let (pool, parent) = self.resolve_fallback_budget(r)?;
         c.set_pool(pool, parent);
         if let Some(limit) = r.max_memory_bytes {
             let effective = c.max_memory_bytes.map_or(limit, |m| m.min(limit));
@@ -219,9 +265,10 @@ impl Runtime {
             ..Control::none()
         };
         c.build(snap.clone(), &control)?;
+        let rows = c.rows_budgeted()?;
         Ok(ViewRows {
             columns: c.columns(),
-            rows: c.rows(),
+            rows,
             commit: snap.commit,
             evaluated_under: Some(m),
         })

@@ -68,6 +68,18 @@ use stats::Counters;
 pub use stats::{RuntimeStats, ViewStat};
 pub use worker::WorkerPause;
 
+/// Payloads and retired leases collected while holding runtime/cell locks.
+///
+/// Rust drops struct fields in declaration order, guaranteeing that all circuit and
+/// cell allocations are freed strictly before any detached [`MemoryLease`] returns
+/// credit to the parent pool on normal return, early `?`, and panic unwind.
+#[derive(Default)]
+pub(super) struct DeferredDrops {
+    pub(super) circuits: Vec<Circuit>,
+    pub(super) cells: Vec<Arc<Cell>>,
+    pub(super) retired: Vec<MemoryLease>,
+}
+
 /// The branch whose state Phase 1 keeps.
 const BRANCH: &str = "main";
 /// The most rows a circuit's diff history keeps for resumed live queries.

@@ -34,32 +34,28 @@ impl Runtime {
         }
         let access = host.access(def.principal.as_deref())?;
         compile(&q, whole_reason(access.as_ref()))?;
-        let mut dropped_circuits = Vec::new();
-        let mut retired = Vec::new();
-        let mut detached_cell = None;
+        let mut deferred = DeferredDrops::default();
         let mut need_gc = false;
         let res = {
             let mut reg = self.reg.lock();
             reg.writable()?;
-            self.sync_inference(&mut reg, host.as_ref(), &mut dropped_circuits, &mut retired);
+            self.sync_inference(&mut reg, host.as_ref(), &mut deferred);
             // a new definition is the operator's: it runs, and no longer waits for a check
             if let Some(root) = &self.root {
                 views::write(root, name, &def)?;
             }
             if let Some(c) = reg.views.remove(name).and_then(|old| old.cell) {
-                if c.release_view() == 0 {
+                if c.release_view(name) == 0 {
                     need_gc = true;
                 }
-                detached_cell = Some(c);
+                deferred.cells.push(c);
             }
             reg.views
                 .insert(name.to_string(), ViewEntry::new(name, def, None));
             *self.defs.write() = reg.defs();
-            self.attach(store, &mut reg, name, &mut retired)
+            self.attach(store, &mut reg, name, &mut deferred.retired)
         };
-        drop(dropped_circuits);
-        drop(retired);
-        drop(detached_cell);
+        drop(deferred);
         if need_gc {
             self.gc();
         }
@@ -77,7 +73,7 @@ impl Runtime {
             reg.writable()?;
             let old = reg.views.remove(name).ok_or_else(|| not_found(name))?;
             if let Some(c) = old.cell {
-                if c.release_view() == 0 {
+                if c.release_view(name) == 0 {
                     need_gc = true;
                 }
                 detached = Some(c);
@@ -191,16 +187,14 @@ impl Runtime {
     pub fn get(&self, store: &Store, name: &str) -> Result<ViewInfo> {
         let _operation = Operation::enter();
         let head = store.snapshot().commit;
-        let mut dropped = Vec::new();
-        let mut retired = Vec::new();
+        let mut deferred = DeferredDrops::default();
         let out = {
             let mut reg = self.reg.lock();
-            self.sync_for_read(&mut reg, &mut dropped, &mut retired);
+            self.sync_for_read(&mut reg, &mut deferred);
             let e = reg.view(name)?;
             Ok(self.info(name, e, head))
         };
-        drop(dropped);
-        drop(retired);
+        drop(deferred);
         out
     }
 
@@ -208,18 +202,16 @@ impl Runtime {
     pub fn list(&self, store: &Store) -> Vec<ViewInfo> {
         let _operation = Operation::enter();
         let head = store.snapshot().commit;
-        let mut dropped = Vec::new();
-        let mut retired = Vec::new();
+        let mut deferred = DeferredDrops::default();
         let out = {
             let mut reg = self.reg.lock();
-            self.sync_for_read(&mut reg, &mut dropped, &mut retired);
+            self.sync_for_read(&mut reg, &mut deferred);
             reg.views
                 .iter()
                 .map(|(n, e)| self.info(n, e, head))
                 .collect()
         };
-        drop(dropped);
-        drop(retired);
+        drop(deferred);
         out
     }
 
@@ -238,19 +230,17 @@ impl Runtime {
         let _operation = Operation::enter();
         let until = Instant::now() + timeout;
         loop {
-            let mut dropped = Vec::new();
-            let mut retired = Vec::new();
+            let mut deferred = DeferredDrops::default();
             let (cell, err) = {
                 let mut reg = self.reg.lock();
-                self.sync_for_read(&mut reg, &mut dropped, &mut retired);
+                self.sync_for_read(&mut reg, &mut deferred);
                 let e = reg.view(name)?;
                 (
                     e.cell.clone(),
                     e.suspended.clone().or_else(|| e.error.clone()),
                 )
             };
-            drop(dropped);
-            drop(retired);
+            drop(deferred);
             if err.is_some() {
                 break;
             }

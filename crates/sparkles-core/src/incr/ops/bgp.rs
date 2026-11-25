@@ -10,6 +10,7 @@
 //! slots: they join like variables and are projected away, so a solution's weight
 //! counts its ways of matching.
 
+use super::super::budget::ScratchLease;
 use super::super::pass::{GraphSel, Pass, Which};
 use super::super::prov::AChanges;
 use super::super::zset::{Changes, Row};
@@ -244,9 +245,11 @@ impl Bgp {
         b: &[Id],
         w: i64,
         out: &mut Changes,
+        out_lease: &mut ScratchLease,
     ) -> Result<()> {
         p.tick()?;
         if rest.is_empty() {
+            p.preadmit_changes_push(out, self.out.len(), out_lease)?;
             let row: Row = self.out.iter().map(|&s| b[s]).collect();
             out.push((row, w));
             return Ok(());
@@ -257,17 +260,31 @@ impl Bgp {
             .max_by_key(|(_, j)| rps[**j].bound(b))
             .expect("rest is not empty");
         let j = rest.swap_remove(k);
+        let mut found_lease = p.scratch_lease();
         let mut found: Vec<Vec<Id>> = Vec::new();
+        let row_sz = (b.len() as u64) * 8 + std::mem::size_of::<Vec<Id>>() as u64;
         Self::scan(p, which(j), &rps[j], b, &mut |q| {
             let mut nb = b.to_vec();
             if rps[j].bind(&q, &mut nb) {
+                let next_cap = sparkles_budget::sizes::vec_grown(
+                    found.capacity(),
+                    found.len(),
+                    1,
+                    std::mem::size_of::<Vec<Id>>(),
+                );
+                let need = (next_cap as u64) * std::mem::size_of::<Vec<Id>>() as u64
+                    + (found.len() as u64 + 1).saturating_mul(row_sz);
+                if need > found_lease.bytes() {
+                    found_lease.try_set(need)?;
+                }
                 found.push(nb);
             }
             Ok(())
         })?;
         for nb in found {
-            self.extend(p, rps, which, rest, &nb, w, out)?;
+            self.extend(p, rps, which, rest, &nb, w, out, out_lease)?;
         }
+        drop(found_lease);
         rest.push(j);
         let last = rest.len() - 1;
         rest.swap(k, last);
@@ -342,11 +359,14 @@ impl Bgp {
         sign: i64,
         trail: &mut Vec<[Id; 4]>,
         out: &mut AChanges,
+        out_ann_bytes: &mut u64,
+        out_lease: &mut ScratchLease,
     ) -> Result<()> {
         p.tick()?;
         if rest.is_empty() {
-            let row: Row = self.out.iter().map(|&s| b[s]).collect();
             let a = p.fact_ann(trail).scaled(sign);
+            p.preadmit_achanges_push(out, self.out.len(), out_ann_bytes, a.bytes(), out_lease)?;
+            let row: Row = self.out.iter().map(|&s| b[s]).collect();
             out.push((row, w, a));
             return Ok(());
         }
@@ -364,18 +384,54 @@ impl Bgp {
             })
             .expect("rest is not empty");
         let j = rest.swap_remove(k);
+        let mut found_lease = p.scratch_lease();
         let mut found: Vec<(Vec<Id>, [Id; 4])> = Vec::new();
+        let mut scan_err: Option<crate::error::Error> = None;
+        let row_sz = (b.len() as u64) * 8 + std::mem::size_of::<(Vec<Id>, [Id; 4])>() as u64;
         Self::scan_sources(p, which(j), &rps[j], b, &mut |q, src| {
+            if scan_err.is_some() {
+                return;
+            }
             let mut nb = b.to_vec();
             if rps[j].bind(&q, &mut nb) {
+                let next_cap = sparkles_budget::sizes::vec_grown(
+                    found.capacity(),
+                    found.len(),
+                    1,
+                    std::mem::size_of::<(Vec<Id>, [Id; 4])>(),
+                );
+                let need = (next_cap as u64) * std::mem::size_of::<(Vec<Id>, [Id; 4])>() as u64
+                    + (found.len() as u64 + 1).saturating_mul(row_sz);
+                if need > found_lease.bytes()
+                    && let Err(e) = found_lease.try_set(need)
+                {
+                    scan_err = Some(e);
+                    return;
+                }
                 found.push((nb, src));
             }
         })?;
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
         for (nb, src) in found {
             trail.push(src);
-            self.extend_a(p, rps, which, rest, &nb, w, sign, trail, out)?;
+            self.extend_a(
+                p,
+                rps,
+                which,
+                rest,
+                &nb,
+                w,
+                sign,
+                trail,
+                out,
+                out_ann_bytes,
+                out_lease,
+            )?;
             trail.pop();
         }
+        drop(found_lease);
         rest.push(j);
         let last = rest.len() - 1;
         rest.swap(k, last);
@@ -387,6 +443,8 @@ impl Bgp {
     pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
         let rps = self.resolve(p);
         let mut out = AChanges::new();
+        let mut out_lease = p.scratch_lease();
+        let mut out_ann_bytes = 0u64;
         let mut rest: Vec<usize> = (0..rps.len()).collect();
         let b = vec![Id::UNDEF; self.slots];
         self.extend_a(
@@ -399,7 +457,10 @@ impl Bgp {
             1,
             &mut Vec::new(),
             &mut out,
+            &mut out_ann_bytes,
+            &mut out_lease,
         )?;
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -441,6 +502,8 @@ impl Bgp {
         if p.added.is_empty() && p.removed.is_empty() {
             return Ok(out);
         }
+        let mut out_lease = p.scratch_lease();
+        let mut out_ann_bytes = 0u64;
         let rps = self.resolve(p);
         let n = rps.len();
         let union_seeds = if rps.iter().any(|r| matches!(r.g, RG::Union)) {
@@ -469,10 +532,23 @@ impl Bgp {
                 if rps[i].bind(&q, &mut b) {
                     trail.clear();
                     trail.push(src);
-                    self.extend_a(p, &rps, &which, &mut rest, &b, w, s, &mut trail, &mut out)?;
+                    self.extend_a(
+                        p,
+                        &rps,
+                        &which,
+                        &mut rest,
+                        &b,
+                        w,
+                        s,
+                        &mut trail,
+                        &mut out,
+                        &mut out_ann_bytes,
+                        &mut out_lease,
+                    )?;
                 }
             }
         }
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -484,6 +560,8 @@ impl Bgp {
             b[self.out[pos]] = v;
         }
         let mut out = AChanges::new();
+        let mut out_lease = p.scratch_lease();
+        let mut out_ann_bytes = 0u64;
         let mut rest: Vec<usize> = (0..rps.len()).collect();
         self.extend_a(
             p,
@@ -495,6 +573,8 @@ impl Bgp {
             1,
             &mut Vec::new(),
             &mut out,
+            &mut out_ann_bytes,
+            &mut out_lease,
         )?;
         Ok(out)
     }
@@ -545,6 +625,7 @@ impl Bgp {
         if p.added.is_empty() && p.removed.is_empty() {
             return Ok(out);
         }
+        let mut out_lease = p.scratch_lease();
         let rps = self.resolve(p);
         let n = rps.len();
         let union_changes: Vec<([Id; 3], i64)> = if rps.iter().any(|r| matches!(r.g, RG::Union)) {
@@ -573,10 +654,11 @@ impl Bgp {
             for (q, w) in seeds {
                 let mut b = vec![Id::UNDEF; self.slots];
                 if rps[i].bind(&q, &mut b) {
-                    self.extend(p, &rps, &which, &mut rest, &b, w, &mut out)?;
+                    self.extend(p, &rps, &which, &mut rest, &b, w, &mut out, &mut out_lease)?;
                 }
             }
         }
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -601,8 +683,9 @@ impl Bgp {
             b[self.out[pos]] = v;
         }
         let mut out = Changes::new();
+        let mut out_lease = p.scratch_lease();
         let mut rest: Vec<usize> = (0..rps.len()).collect();
-        self.extend(p, rps, &|_| w, &mut rest, &b, 1, &mut out)?;
+        self.extend(p, rps, &|_| w, &mut rest, &b, 1, &mut out, &mut out_lease)?;
         Ok(out)
     }
 

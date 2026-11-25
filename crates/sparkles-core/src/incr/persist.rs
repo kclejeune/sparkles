@@ -27,8 +27,9 @@
 //! that older releases read. Each circuit reads only its own format: a file of the other
 //! is left for the next checkpoint to remove, and the view is built from the data.
 
+use super::budget::BudgetHandle;
 use super::terms::Terms;
-use super::zset::{Row, ZSet};
+use super::zset::{Row, ZSet, row_bytes};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::store::Snapshot;
@@ -216,6 +217,8 @@ pub struct Reader<'a> {
     body: &'a [u8],
     at: usize,
     ids: Vec<Id>,
+    budget: Option<BudgetHandle>,
+    ids_lease: super::budget::ScratchLease,
 }
 
 fn short() -> Error {
@@ -224,17 +227,64 @@ fn short() -> Error {
 
 impl<'a> Reader<'a> {
     pub fn new(data: &'a [u8], snap: &Snapshot, terms: &mut Terms) -> Result<Reader<'a>> {
+        Self::with_budget(data, snap, terms, None)
+    }
+
+    pub(crate) fn with_budget(
+        data: &'a [u8],
+        snap: &Snapshot,
+        terms: &mut Terms,
+        budget: Option<BudgetHandle>,
+    ) -> Result<Reader<'a>> {
+        let ids_lease = super::budget::ScratchLease::new(budget.clone());
         let mut r = Reader {
             body: data,
             at: 0,
             ids: vec![Id::UNDEF],
+            budget,
+            ids_lease,
         };
         let n = r.u64()?;
+        let mut terms_tracked = terms.bytes();
         for _ in 0..n {
-            let k = r.bytes()?.to_vec();
-            r.ids.push(terms.intern_key(snap, &k));
+            let k = r.bytes()?;
+            // Pre-admit id table growth and potential local-term insertion before allocating.
+            let next_ids_cap = sparkles_budget::sizes::vec_grown(
+                r.ids.capacity(),
+                r.ids.len(),
+                1,
+                std::mem::size_of::<Id>(),
+            );
+            let next_ids_bytes = (next_ids_cap as u64) * std::mem::size_of::<Id>() as u64;
+            if next_ids_bytes > r.ids_lease.bytes() {
+                r.ids_lease.try_set(next_ids_bytes)?;
+            }
+            let k_owned = k.to_vec();
+            let id = terms.intern_key(snap, &k_owned);
+            let now_terms = terms.bytes();
+            if now_terms > terms_tracked {
+                r.charge_state(now_terms - terms_tracked)?;
+                terms_tracked = now_terms;
+            }
+            r.ids.push(id);
         }
         Ok(r)
+    }
+
+    pub(crate) fn budget_handle(&self) -> Option<BudgetHandle> {
+        self.budget.clone()
+    }
+
+    /// Pre-admit decoded persistent state bytes against the circuit's budget during
+    /// checkpoint loading.
+    pub(crate) fn charge_state(&self, delta: u64) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        if let Some(budget) = &self.budget {
+            budget.try_reserve_pass(delta)?;
+        }
+        Ok(())
     }
 
     pub fn u64(&mut self) -> Result<u64> {
@@ -298,9 +348,16 @@ impl<'a> Reader<'a> {
     pub fn zset(&mut self) -> Result<ZSet> {
         let n = self.u64()?;
         let mut z = ZSet::new();
+        let mut charged = 0u64;
         for _ in 0..n {
             let r = self.row()?;
+            let width = r.len();
             let w = self.i64()?;
+            let next = (z.len() as u64 + 1).saturating_mul(row_bytes(width));
+            if next > charged {
+                self.charge_state(next - charged)?;
+                charged = next;
+            }
             z.add(r, w);
         }
         Ok(z)

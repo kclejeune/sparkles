@@ -555,17 +555,28 @@ impl ExistsOp {
 
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         self.rows.clear();
-        let c = consolidate(self.inner.init(p)?);
-        self.apply(p, c, Vec::new())
+        let mark = p.output_lease_mark();
+        let raw = self.inner.init(p)?;
+        let leases = p.take_output_leases_since(mark);
+        let c = consolidate(raw);
+        let out = self.apply(p, c, Vec::new())?;
+        drop(leases);
+        Ok(out)
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
-        let dl = consolidate(self.inner.delta(p)?);
+        let mark = p.output_lease_mark();
+        let raw = self.inner.delta(p)?;
+        let leases = p.take_output_leases_since(mark);
+        let dl = consolidate(raw);
         let affected = self.affected(p)?;
         if dl.is_empty() && affected.is_empty() {
+            drop(leases);
             return Ok(dl);
         }
-        self.apply(p, dl, affected)
+        let out = self.apply(p, dl, affected)?;
+        drop(leases);
+        Ok(out)
     }
 
     /// [`init`](Self::init) with annotations. The engine does not report why the
@@ -625,11 +636,13 @@ impl ExistsOp {
     }
 
     pub fn load(&mut self, r: &mut Reader) -> Result<()> {
-        self.rows.clear();
+        self.rows = FxHashMap::default();
+        let per = row_bytes(self.inner.schema.len()) + 16;
         for _ in 0..r.u64()? {
             let row = r.row()?;
             let n = r.i64()?;
             let h = r.u64()? != 0;
+            r.charge_state(per)?;
             self.rows.insert(row, (n, h));
         }
         self.resolved = None;

@@ -12,7 +12,7 @@ use super::super::pass::{Pass, Which};
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{self, AChanges, Ann, AnnMap, Provenance};
 use super::super::zset::{Changes, Row, consolidate, row_bytes};
-use super::{Arrangement, Merge, Node, absorb_side, side_matches, side_matches_a};
+use super::{Arrangement, Merge, Node, side_matches, side_matches_a};
 use crate::error::Result;
 use crate::id::Id;
 use rustc_hash::FxHashMap;
@@ -157,16 +157,51 @@ impl MatchOp {
     /// [`init`](Self::init) with annotations.
     pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
         let mode = p.prov;
-        let l = prov::consolidate(self.left.init_a(p)?);
-        let r = prov::consolidate(self.right.init_a(p)?);
-        let r = match (&mut self.rarr, &mut self.rann) {
-            (Some(a), Some(m)) => {
-                a.clear();
-                m.clear();
-                absorb_side(a, m, r, mode)
+        let l_mark = p.output_lease_mark();
+        let l_raw = self.left.init_a(p)?;
+        let l_leases = p.take_output_leases_since(l_mark);
+        let l = prov::consolidate(l_raw);
+        let r_mark = p.output_lease_mark();
+        let r_raw = self.right.init_a(p)?;
+        let r_leases = p.take_output_leases_since(r_mark);
+        let r = prov::consolidate(r_raw);
+        let mut tracked = self.bytes();
+        let rw = self.right.schema.len();
+        let r = if let (Some(rarr), Some(rann)) = (&mut self.rarr, &mut self.rann) {
+            let lw = self.left.schema.len();
+            let other = self.lrows as u64 * (row_bytes(lw) + 8)
+                + self.lstate.len() as u64 * row_bytes(self.m.key.len())
+                + [&self.lann, &self.sann]
+                    .into_iter()
+                    .flatten()
+                    .map(|m| prov::map_bytes(m, lw))
+                    .sum::<u64>();
+            rarr.clear();
+            rann.clear();
+            let mut eff = AChanges::with_capacity(r.len());
+            for (idx, (row, w, a)) in r.into_iter().enumerate() {
+                rarr.add(&row, w);
+                let e = prov::absorb_row(rann, &row, a, mode);
+                eff.push((row, w, e));
+                if idx % 1024 == 1023 {
+                    p.tick()?;
+                    p.sync_op_state(
+                        &mut tracked,
+                        other + rarr.bytes() + prov::map_bytes(rann, rw),
+                    )?;
+                }
             }
-            _ => r,
+            p.sync_op_state(
+                &mut tracked,
+                other + rarr.bytes() + prov::map_bytes(rann, rw),
+            )?;
+            eff
+        } else {
+            r
         };
+        let mut rindex_lease = p.scratch_lease();
+        rindex_lease
+            .try_reserve((r.len() as u64).saturating_mul(row_bytes(self.m.key.len()) + 32))?;
         let mut rindex: FxHashMap<Row, Vec<usize>> = FxHashMap::default();
         for (i, (b, _, _)) in r.iter().enumerate() {
             rindex.entry(self.m.key_right(b)).or_default().push(i);
@@ -179,8 +214,15 @@ impl MatchOp {
         if let Some(s) = sann.as_mut() {
             s.clear();
         }
-        let mut tracked = self.bytes();
+        p.sync_op_state(&mut tracked, self.bytes())?;
+        let out_width = if self.mode == MatchMode::LeftJoin {
+            self.m.out.len()
+        } else {
+            self.left.schema.len()
+        };
         let mut out = AChanges::new();
+        let mut out_lease = p.scratch_lease();
+        let mut out_ann_bytes = 0u64;
         for (idx, (a, wa, aa)) in l.into_iter().enumerate() {
             p.tick()?;
             prov::absorb_row(&mut lann, &a, aa, mode);
@@ -205,7 +247,15 @@ impl MatchOp {
                 if k {
                     m += wb;
                     if self.mode == MatchMode::LeftJoin {
-                        out.push((self.m.merge(&a, b), wa * wb, la.mul(ab)));
+                        let merged_ann = la.mul(ab);
+                        p.preadmit_achanges_push(
+                            &out,
+                            out_width,
+                            &mut out_ann_bytes,
+                            merged_ann.bytes(),
+                            &mut out_lease,
+                        )?;
+                        out.push((self.m.merge(&a, b), wa * wb, merged_ann));
                     } else if self.mode == MatchMode::Exists {
                         sum.add_assign(ab);
                     }
@@ -220,16 +270,32 @@ impl MatchOp {
             };
             self.set(&a, (wa, m));
             if idx % 1024 == 1023 {
-                p.sync_op_state(&mut tracked, self.bytes())?;
+                let lw = self.left.schema.len();
+                let ann_b = prov::map_bytes(&lann, lw)
+                    + sann.as_ref().map_or(0, |s| prov::map_bytes(s, lw));
+                p.sync_op_state(&mut tracked, self.bytes() + ann_b)?;
             }
             if self.mode.alone(m) {
                 let ann = self.alone_ann(p, &a, &la, &sa);
+                p.preadmit_achanges_push(
+                    &out,
+                    out_width,
+                    &mut out_ann_bytes,
+                    ann.bytes(),
+                    &mut out_lease,
+                )?;
                 out.push((self.out_row(&a), wa, ann));
             }
         }
         self.lann = Some(lann);
         self.sann = sann;
         p.sync_op_state(&mut tracked, self.bytes())?;
+        drop(rindex);
+        drop(rindex_lease);
+        drop(r);
+        drop(r_leases);
+        drop(l_leases);
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -239,8 +305,15 @@ impl MatchOp {
     /// alone as the difference of their annotations before and after.
     pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
         let mode = p.prov;
-        let dl = prov::consolidate(self.left.delta_a(p)?);
-        let dr = prov::consolidate(self.right.delta_a(p)?);
+        let l_mark = p.output_lease_mark();
+        let dl_raw = self.left.delta_a(p)?;
+        let dl_leases = p.take_output_leases_since(l_mark);
+        let dl = prov::consolidate(dl_raw);
+        let r_mark = p.output_lease_mark();
+        let dr_raw = self.right.delta_a(p)?;
+        let dr_leases = p.take_output_leases_since(r_mark);
+        let dr = prov::consolidate(dr_raw);
+        let mut tracked = self.bytes();
         let lj = self.mode == MatchMode::LeftJoin;
         let ex = self.mode == MatchMode::Exists;
         // the left rows each right change matches, by the counts before the changes
@@ -287,18 +360,58 @@ impl MatchOp {
                 (a, wa, e)
             })
             .collect();
+        let out_width = if lj {
+            self.m.out.len()
+        } else {
+            self.left.schema.len()
+        };
         let mut out = AChanges::new();
+        let mut out_lease = p.scratch_lease();
+        let mut out_ann_bytes = 0u64;
         // the joined part: ΔL ⋈ R_old
         if lj {
             for (a, wa, aa) in &dl {
                 for (b, wb, ab) in self.matching_a(p, Which::Old, a)? {
-                    out.push((self.m.merge(a, &b), wa * wb, aa.mul(&ab)));
+                    let merged_ann = aa.mul(&ab);
+                    p.preadmit_achanges_push(
+                        &out,
+                        out_width,
+                        &mut out_ann_bytes,
+                        merged_ann.bytes(),
+                        &mut out_lease,
+                    )?;
+                    out.push((self.m.merge(a, &b), wa * wb, merged_ann));
                 }
             }
         }
-        let dr = match (&mut self.rarr, &mut self.rann) {
-            (Some(a), Some(m)) => absorb_side(a, m, dr, mode),
-            _ => dr,
+        drop(dl);
+        drop(dl_leases);
+        let lw = self.left.schema.len();
+        let rw = self.right.schema.len();
+        let dr = if let (Some(rarr), Some(rann)) = (&mut self.rarr, &mut self.rann) {
+            let other = self.lrows as u64 * (row_bytes(lw) + 8)
+                + self.lstate.len() as u64 * row_bytes(self.m.key.len())
+                + prov::map_bytes(&lann, lw)
+                + sann.as_ref().map_or(0, |s| prov::map_bytes(s, lw));
+            let mut eff = AChanges::with_capacity(dr.len());
+            for (idx, (row, w, a)) in dr.into_iter().enumerate() {
+                rarr.add(&row, w);
+                let e = prov::absorb_row(rann, &row, a, mode);
+                eff.push((row, w, e));
+                if idx % 1024 == 1023 {
+                    p.sync_op_state(
+                        &mut tracked,
+                        other + rarr.bytes() + prov::map_bytes(rann, rw),
+                    )?;
+                }
+            }
+            p.sync_op_state(
+                &mut tracked,
+                other + rarr.bytes() + prov::map_bytes(rann, rw),
+            )?;
+            eff
+        } else {
+            dr
         };
         let mut dm: FxHashMap<Row, i64> = FxHashMap::default();
         let mut ds: FxHashMap<Row, Ann> = FxHashMap::default();
@@ -341,11 +454,17 @@ impl MatchOp {
             }
             new.push((a, (ow, om), (nw, nm)));
         }
-        let mut tracked = self.bytes();
-        for (a, _, v) in &new {
+        for (idx, (a, _, v)) in new.iter().enumerate() {
             self.set(a, *v);
+            if idx % 1024 == 1023 {
+                let ann_b = prov::map_bytes(&lann, lw)
+                    + sann.as_ref().map_or(0, |s| prov::map_bytes(s, lw));
+                p.sync_op_state(&mut tracked, self.bytes() + ann_b)?;
+            }
         }
-        p.sync_op_state(&mut tracked, self.bytes())?;
+        let ann_b =
+            prov::map_bytes(&lann, lw) + sann.as_ref().map_or(0, |s| prov::map_bytes(s, lw));
+        p.sync_op_state(&mut tracked, self.bytes() + ann_b)?;
         // the joined part: L_new ⋈ ΔR
         if lj {
             for (b, wb, ab) in &dr {
@@ -356,11 +475,21 @@ impl MatchOp {
                 for ((a, (wa, _)), k) in cands.into_iter().zip(keep) {
                     if k {
                         let la = prov::get(&lann, &a, mode);
-                        out.push((self.m.merge(&a, b), wa * wb, la.mul(ab)));
+                        let merged_ann = la.mul(ab);
+                        p.preadmit_achanges_push(
+                            &out,
+                            out_width,
+                            &mut out_ann_bytes,
+                            merged_ann.bytes(),
+                            &mut out_lease,
+                        )?;
+                        out.push((self.m.merge(&a, b), wa * wb, merged_ann));
                     }
                 }
             }
         }
+        drop(dr);
+        drop(dr_leases);
         // rows that move in or out of the part without a match, or whose annotation
         // there changes
         for (a, (ow, om), (nw, nm)) in new {
@@ -386,11 +515,20 @@ impl MatchOp {
             };
             let d = now.sub(&old);
             if before_w != after_w || !d.is_zero() {
+                p.preadmit_achanges_push(
+                    &out,
+                    out_width,
+                    &mut out_ann_bytes,
+                    d.bytes(),
+                    &mut out_lease,
+                )?;
                 out.push((self.out_row(&a), after_w - before_w, d));
             }
         }
         self.lann = Some(lann);
         self.sann = sann;
+        p.sync_op_state(&mut tracked, self.bytes())?;
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -482,21 +620,52 @@ impl MatchOp {
     }
 
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
-        let l = consolidate(self.left.init(p)?);
-        let r = consolidate(self.right.init(p)?);
-        let mut rindex = Arrangement::new(
-            self.m.key.iter().map(|k| k.1).collect(),
-            self.right.schema.len(),
-        );
+        let l_mark = p.output_lease_mark();
+        let l_raw = self.left.init(p)?;
+        let l_leases = p.take_output_leases_since(l_mark);
+        let l = consolidate(l_raw);
+        let r_mark = p.output_lease_mark();
+        let r_raw = self.right.init(p)?;
+        let r_leases = p.take_output_leases_since(r_mark);
+        let r = consolidate(r_raw);
+        let mut tracked = self.bytes();
+        let mut rindex_lease = p.scratch_lease();
+        let rw = self.right.schema.len();
+        rindex_lease.try_reserve(
+            (r.len() as u64).saturating_mul(row_bytes(rw) + row_bytes(self.m.key.len())),
+        )?;
+        let mut rindex = Arrangement::new(self.m.key.iter().map(|k| k.1).collect(), rw);
         rindex.apply(&r);
-        if let Some(a) = &mut self.rarr {
-            a.clear();
-            a.apply(&r);
+        if let Some(rarr) = &mut self.rarr {
+            let lw = self.left.schema.len();
+            let other = self.lrows as u64 * (row_bytes(lw) + 8)
+                + self.lstate.len() as u64 * row_bytes(self.m.key.len())
+                + [&self.lann, &self.sann]
+                    .into_iter()
+                    .flatten()
+                    .map(|m| prov::map_bytes(m, lw))
+                    .sum::<u64>()
+                + self.rann.as_ref().map_or(0, |m| prov::map_bytes(m, rw));
+            rarr.clear();
+            for (idx, (row, w)) in r.iter().enumerate() {
+                rarr.add(row, *w);
+                if idx % 1024 == 1023 {
+                    p.tick()?;
+                    p.sync_op_state(&mut tracked, other + rarr.bytes())?;
+                }
+            }
+            p.sync_op_state(&mut tracked, other + rarr.bytes())?;
         }
         self.lstate.clear();
         self.lrows = 0;
-        let mut tracked = self.bytes();
+        p.sync_op_state(&mut tracked, self.bytes())?;
+        let out_width = if self.mode == MatchMode::LeftJoin {
+            self.m.out.len()
+        } else {
+            self.left.schema.len()
+        };
         let mut out = Changes::new();
+        let mut out_lease = p.scratch_lease();
         for (idx, (a, wa)) in l.iter().enumerate() {
             p.tick()?;
             let cands: Changes = rindex
@@ -511,6 +680,7 @@ impl MatchOp {
                 if k {
                     m += wb;
                     if self.mode == MatchMode::LeftJoin {
+                        p.preadmit_changes_push(&out, out_width, &mut out_lease)?;
                         out.push((self.m.merge(a, b), wa * wb));
                     }
                 }
@@ -520,22 +690,44 @@ impl MatchOp {
                 p.sync_op_state(&mut tracked, self.bytes())?;
             }
             if self.mode.alone(m) {
+                p.preadmit_changes_push(&out, out_width, &mut out_lease)?;
                 out.push((self.out_row(a), *wa));
             }
         }
         p.sync_op_state(&mut tracked, self.bytes())?;
+        drop(rindex);
+        drop(rindex_lease);
+        drop(r);
+        drop(r_leases);
+        drop(l);
+        drop(l_leases);
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
-        let dl = consolidate(self.left.delta(p)?);
-        let dr = consolidate(self.right.delta(p)?);
-        let mut out = Changes::new();
+        let l_mark = p.output_lease_mark();
+        let dl_raw = self.left.delta(p)?;
+        let dl_leases = p.take_output_leases_since(l_mark);
+        let dl = consolidate(dl_raw);
+        let r_mark = p.output_lease_mark();
+        let dr_raw = self.right.delta(p)?;
+        let dr_leases = p.take_output_leases_since(r_mark);
+        let dr = consolidate(dr_raw);
+        let mut tracked = self.bytes();
         let lj = self.mode == MatchMode::LeftJoin;
+        let out_width = if lj {
+            self.m.out.len()
+        } else {
+            self.left.schema.len()
+        };
+        let mut out = Changes::new();
+        let mut out_lease = p.scratch_lease();
         // the joined part: ΔL ⋈ R_old
         if lj {
             for (a, wa) in &dl {
                 for (b, wb) in self.matching(p, Which::Old, a)? {
+                    p.preadmit_changes_push(&out, out_width, &mut out_lease)?;
                     out.push((self.m.merge(a, &b), wa * wb));
                 }
             }
@@ -556,8 +748,25 @@ impl MatchOp {
                 }
             }
         }
-        if let Some(arr) = &mut self.rarr {
-            arr.apply(&dr);
+        if let Some(rarr) = &mut self.rarr {
+            let lw = self.left.schema.len();
+            let rw = self.right.schema.len();
+            let other = self.lrows as u64 * (row_bytes(lw) + 8)
+                + self.lstate.len() as u64 * row_bytes(self.m.key.len())
+                + [&self.lann, &self.sann]
+                    .into_iter()
+                    .flatten()
+                    .map(|m| prov::map_bytes(m, lw))
+                    .sum::<u64>()
+                + self.rann.as_ref().map_or(0, |m| prov::map_bytes(m, rw));
+            for (idx, (row, w)) in dr.iter().enumerate() {
+                rarr.add(row, *w);
+                if idx % 1024 == 1023 {
+                    p.tick()?;
+                    p.sync_op_state(&mut tracked, other + rarr.bytes())?;
+                }
+            }
+            p.sync_op_state(&mut tracked, other + rarr.bytes())?;
         }
         // the left's own changes; a row that appears counts its matches anew
         let mut dw: FxHashMap<Row, i64> = FxHashMap::default();
@@ -568,6 +777,8 @@ impl MatchOp {
                 touched.insert(a.clone(), v);
             }
         }
+        drop(dl);
+        drop(dl_leases);
         #[allow(clippy::type_complexity)]
         let mut new: Vec<(Row, (i64, i64), (i64, i64))> = Vec::with_capacity(touched.len());
         for (a, (ow, om)) in touched {
@@ -584,9 +795,11 @@ impl MatchOp {
             };
             new.push((a, (ow, om), (nw, nm)));
         }
-        let mut tracked = self.bytes();
-        for (a, _, v) in &new {
+        for (idx, (a, _, v)) in new.iter().enumerate() {
             self.set(a, *v);
+            if idx % 1024 == 1023 {
+                p.sync_op_state(&mut tracked, self.bytes())?;
+            }
         }
         p.sync_op_state(&mut tracked, self.bytes())?;
         // the joined part: L_new ⋈ ΔR
@@ -598,11 +811,14 @@ impl MatchOp {
                 let keep = self.conditions(p, &pairs)?;
                 for ((a, (wa, _)), k) in cands.into_iter().zip(keep) {
                     if k {
+                        p.preadmit_changes_push(&out, out_width, &mut out_lease)?;
                         out.push((self.m.merge(&a, b), wa * wb));
                     }
                 }
             }
         }
+        drop(dr);
+        drop(dr_leases);
         // rows that move in or out of the part without a match
         for (a, (ow, om), (nw, nm)) in new {
             let before = if ow != 0 && self.mode.alone(om) {
@@ -616,9 +832,11 @@ impl MatchOp {
                 0
             };
             if before != after {
+                p.preadmit_changes_push(&out, out_width, &mut out_lease)?;
                 out.push((self.out_row(&a), after - before));
             }
         }
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -671,18 +889,21 @@ impl MatchOp {
     }
 
     pub fn load(&mut self, r: &mut Reader) -> Result<()> {
-        self.lstate.clear();
+        self.lstate = FxHashMap::default();
         self.lrows = 0;
         let n = r.u64()?;
+        let lw = self.left.schema.len();
+        let per = row_bytes(lw) + 8 + row_bytes(self.m.key.len());
         for _ in 0..n {
             let a = r.row()?;
-            if a.len() != self.left.schema.len() {
+            if a.len() != lw {
                 return Err(crate::error::Error::Corrupt(
                     "a view's state holds a row of another width".into(),
                 ));
             }
             let w = r.i64()?;
             let m = r.i64()?;
+            r.charge_state(per)?;
             self.set(&a, (w, m));
         }
         if let Some(a) = &mut self.rarr {

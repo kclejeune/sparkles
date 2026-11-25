@@ -16,9 +16,6 @@ impl Runtime {
         let whole = whole_reason(access.as_ref()).map(str::to_string);
         let key = key_of(&q, text, access.as_ref(), whole.as_deref());
         if let Some(c) = reg.cells.get(&key) {
-            if let Some(limit) = max_memory_bytes {
-                c.state.lock().circuit.raise_local_limit(limit);
-            }
             return Ok((c.clone(), false));
         }
         let inference = reg.inference.clone();
@@ -26,9 +23,11 @@ impl Runtime {
             .clone()
             .or_else(|| inference.as_ref().map(|i| i.reason().to_string()));
         let compiled = compile(&q, mode.as_deref())?;
+        let history = Arc::new(Mutex::new(HistoryBuf::default()));
         let mut circuit = Circuit::new(compiled, access);
         circuit.set_pool(self.pool.clone(), self.circuit_parent());
         circuit.set_local_limit(max_memory_bytes);
+        circuit.set_reclaim_external(Some(Slot::history_reclaim_hook(&history)));
         circuit.inference = inference;
         circuit.aggregate_errors = Some(reg.aggregate_errors);
         let info = Info {
@@ -51,11 +50,9 @@ impl Runtime {
                 query: q,
                 whole,
                 vars,
-                history: VecDeque::new(),
-                history_rows: 0,
-                history_bytes: 0,
+                history,
                 subs: Vec::new(),
-                views: 0,
+                view_limits: FxHashMap::default(),
                 rebased: false,
                 circuit,
             }),
@@ -93,6 +90,11 @@ impl Runtime {
         let q = self.parse(host.as_ref(), &text)?;
         let access = host.access(def.principal.as_deref())?;
         let (cell, new) = self.cell_for(reg, q, &text, access.clone(), Some(def.memory_bytes))?;
+        {
+            let mut st = cell.state.lock();
+            st.view_limits.insert(name.to_string(), def.memory_bytes);
+            st.recompute_local_limit();
+        }
         if new {
             self.ensure_subscription(store);
             if let Some(root) = &self.root {
@@ -105,7 +107,6 @@ impl Runtime {
                 );
             }
         }
-        cell.state.lock().views += 1;
         let entry = reg.views.get_mut(name).expect("checked above");
         entry.cell = Some(cell);
         entry.access = access;
@@ -125,7 +126,24 @@ impl Runtime {
         let snap = store.snapshot();
         let kind = persist::view_kind(cell.state.lock().circuit.has_fixpoint());
         for (commit, path) in persist::list(dir) {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let mut file_lease = super::super::budget::ScratchLease::new_pool_only(Some(
+                cell.state.lock().circuit.budget_handle(),
+            ));
+            if let Err(e) = file_lease.try_reserve(meta.len()) {
+                tracing::warn!(
+                    target: "sparkles::incr::runtime",
+                    "view {name}: checkpoint {}: {e}; the view is built again",
+                    path.display()
+                );
+                retired.extend(cell.state.lock().circuit.drain_retired());
+                continue;
+            }
             let Ok(bytes) = std::fs::read(&path) else {
+                drop(file_lease);
+                retired.extend(cell.state.lock().circuit.drain_retired());
                 continue;
             };
             let (h, body) = match persist::decode_as(kind, &bytes) {
@@ -136,44 +154,54 @@ impl Runtime {
                         "view {name}: checkpoint {}: {e}; it is left in place",
                         path.display()
                     );
+                    drop(bytes);
+                    drop(file_lease);
+                    retired.extend(cell.state.lock().circuit.drain_retired());
                     continue;
                 }
             };
-            let mut st = cell.state.lock();
-            if h.dataset != self.dataset
-                || h.fingerprint != st.fingerprint(cell.key)
-                || commit > snap.commit
+            let mut loaded = false;
             {
-                continue;
+                let mut st = cell.state.lock();
+                if h.dataset == self.dataset
+                    && h.fingerprint == st.fingerprint(cell.key)
+                    && commit <= snap.commit
+                {
+                    match st.circuit.decode_with_input_charged(body, &snap) {
+                        Ok(()) => {
+                            st.circuit.applied = h.commit;
+                            self.seen.fetch_max(h.commit, Ordering::AcqRel);
+                            self.counters.loaded.fetch_add(1, Ordering::Relaxed);
+                            let mut info = cell.info.lock();
+                            info.status = Status::Ready;
+                            info.applied = h.commit;
+                            info.rows = st.circuit.result.total().max(0) as u64;
+                            info.bytes = st.circuit.bytes();
+                            tracing::info!(
+                                target: "sparkles::incr::runtime",
+                                "view {name}: loaded its state at commit {}; {} commits to apply",
+                                h.commit,
+                                snap.commit - h.commit
+                            );
+                            loaded = true;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "sparkles::incr::runtime",
+                                "view {name}: checkpoint {}: {e}; the view is built again",
+                                path.display()
+                            );
+                            st.circuit.clear_state();
+                        }
+                    }
+                }
             }
-            match st.circuit.decode(body, &snap) {
-                Ok(()) => {
-                    retired.extend(st.circuit.drain_retired());
-                    st.circuit.applied = h.commit;
-                    self.seen.fetch_max(h.commit, Ordering::AcqRel);
-                    self.counters.loaded.fetch_add(1, Ordering::Relaxed);
-                    let mut info = cell.info.lock();
-                    info.status = Status::Ready;
-                    info.applied = h.commit;
-                    info.rows = st.circuit.result.total().max(0) as u64;
-                    info.bytes = st.circuit.bytes();
-                    tracing::info!(
-                        target: "sparkles::incr::runtime",
-                        "view {name}: loaded its state at commit {}; {} commits to apply",
-                        h.commit,
-                        snap.commit - h.commit
-                    );
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "sparkles::incr::runtime",
-                        "view {name}: checkpoint {}: {e}; the view is built again",
-                        path.display()
-                    );
-                    st.circuit.clear_state();
-                    retired.extend(st.circuit.drain_retired());
-                }
+            // Drop the raw checkpoint buffer strictly before releasing `file_lease`.
+            drop(bytes);
+            drop(file_lease);
+            retired.extend(cell.state.lock().circuit.drain_retired());
+            if loaded {
+                return;
             }
         }
     }
@@ -182,20 +210,18 @@ impl Runtime {
         let Some(host) = self.host.read().clone() else {
             return;
         };
-        let mut dropped_cells: Vec<Arc<Cell>> = Vec::new();
-        let mut dropped_circuits: Vec<Circuit> = Vec::new();
-        let mut retired: Vec<MemoryLease> = Vec::new();
+        let mut deferred = DeferredDrops::default();
         {
             let mut reg = self.reg.lock();
-            self.sync_inference(&mut reg, host.as_ref(), &mut dropped_circuits, &mut retired);
+            self.sync_inference(&mut reg, host.as_ref(), &mut deferred);
             let epoch = host.epoch();
             if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
                 // grants may have changed: resolve every view's principal again
-                for e in reg.views.values_mut() {
+                for (name, e) in reg.views.iter_mut() {
                     e.error = None;
                     if let Some(c) = e.cell.take() {
-                        c.release_view();
-                        dropped_cells.push(c);
+                        c.release_view(name);
+                        deferred.cells.push(c);
                     }
                 }
             }
@@ -206,7 +232,7 @@ impl Runtime {
                 .map(|(n, _)| n.clone())
                 .collect();
             for name in pending {
-                if let Err(e) = self.attach(store, &mut reg, &name, &mut retired) {
+                if let Err(e) = self.attach(store, &mut reg, &name, &mut deferred.retired) {
                     tracing::warn!(target: "sparkles::incr::runtime", "view {name}: {e}");
                     if let Some(entry) = reg.views.get_mut(&name) {
                         entry.error = Some(e.to_string());
@@ -214,9 +240,7 @@ impl Runtime {
                 }
             }
         }
-        drop(dropped_circuits);
-        drop(retired);
-        drop(dropped_cells);
+        drop(deferred);
     }
 
     /// Compile every circuit for the host's inference and reading of errors in
@@ -227,8 +251,7 @@ impl Runtime {
         &self,
         reg: &mut Registry,
         host: &dyn Host,
-        dropped_circuits: &mut Vec<Circuit>,
-        retired: &mut Vec<MemoryLease>,
+        deferred: &mut DeferredDrops,
     ) {
         let now = host.inference();
         let errors = host.aggregate_errors();
@@ -261,7 +284,7 @@ impl Runtime {
                 }
                 Err(e) => {
                     self.fail(cell, &mut st, &e);
-                    retired.extend(st.circuit.drain_retired());
+                    deferred.retired.extend(st.circuit.drain_retired());
                     continue;
                 }
             };
@@ -278,8 +301,8 @@ impl Runtime {
             st.circuit.shrink_budget_state();
             // diffs of the old mode do not lead to rows of the new one
             st.clear_history();
-            retired.extend(st.circuit.drain_retired());
-            dropped_circuits.push(old);
+            deferred.retired.extend(st.circuit.drain_retired());
+            deferred.circuits.push(old);
             st.rebased = true;
             let mut info = cell.info.lock();
             info.plan = st.circuit.plan();
@@ -292,14 +315,9 @@ impl Runtime {
 
     /// [`sync_inference`](Self::sync_inference) for a reader, so that a read after a
     /// change of the setting never sees a circuit of the old mode as current.
-    pub(super) fn sync_for_read(
-        &self,
-        reg: &mut Registry,
-        dropped_circuits: &mut Vec<Circuit>,
-        retired: &mut Vec<MemoryLease>,
-    ) {
+    pub(super) fn sync_for_read(&self, reg: &mut Registry, deferred: &mut DeferredDrops) {
         if let Some(host) = self.host.read().clone() {
-            self.sync_inference(reg, host.as_ref(), dropped_circuits, retired);
+            self.sync_inference(reg, host.as_ref(), deferred);
         }
     }
 }
@@ -347,14 +365,12 @@ mod switch_tests {
             Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
             Vec::new(),
         );
-        let mut dropped = Vec::new();
-        let mut retired = Vec::new();
+        let mut deferred = DeferredDrops::default();
         {
             let mut reg = rt.reg.lock();
-            rt.sync_inference(&mut reg, host.as_ref(), &mut dropped, &mut retired);
+            rt.sync_inference(&mut reg, host.as_ref(), &mut deferred);
         }
-        drop(dropped);
-        drop(retired);
+        drop(deferred);
         assert_eq!(rt.switched.load(Ordering::Acquire), 7);
     }
 

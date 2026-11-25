@@ -754,8 +754,12 @@ impl Group {
 
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         self.groups.clear();
-        let c = consolidate(self.inner.init(p)?);
+        let mark = p.output_lease_mark();
+        let raw = self.inner.init(p)?;
+        let leases = p.take_output_leases_since(mark);
+        let c = consolidate(raw);
         let mut out = self.apply(p, c)?;
+        drop(leases);
         if self.implicit && self.groups.is_empty() {
             let g = self.fresh();
             let mut row = Vec::new();
@@ -770,11 +774,17 @@ impl Group {
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
-        let c = consolidate(self.inner.delta(p)?);
+        let mark = p.output_lease_mark();
+        let raw = self.inner.delta(p)?;
+        let leases = p.take_output_leases_since(mark);
+        let c = consolidate(raw);
         if c.is_empty() {
+            drop(leases);
             return Ok(c);
         }
-        self.apply(p, c)
+        let out = self.apply(p, c)?;
+        drop(leases);
+        Ok(out)
     }
 
     pub fn bytes(&self) -> u64 {
@@ -911,7 +921,10 @@ impl Group {
             }
             Ok(s)
         }
-        self.groups.clear();
+        self.groups = FxHashMap::default();
+        let width = self.keys.len() + self.aggs.len();
+        let per_group = row_bytes(width) * 2;
+        let inner_row = row_bytes(self.inner.schema.len());
         let n = r.u64()?;
         for _ in 0..n {
             let k = r.row()?;
@@ -921,28 +934,43 @@ impl Group {
                 0 => None,
                 _ => Some(r.row()?),
             };
+            r.charge_state(per_group)?;
             for a in g.aggs.iter_mut() {
                 match a {
-                    AState::Count(n) => *n = r.i64()?,
+                    AState::Count(n) => {
+                        *n = r.i64()?;
+                        r.charge_state(8)?;
+                    }
                     AState::Rows(m) => {
                         for _ in 0..r.u64()? {
                             let row = r.row()?;
+                            r.charge_state(inner_row)?;
                             m.insert(row, r.i64()?);
                         }
                     }
                     AState::Values { vals, errs, sum: s } => {
+                        r.charge_state(96)?;
                         for _ in 0..r.u64()? {
                             let v = r.id()?;
+                            r.charge_state(24)?;
                             vals.insert(v, r.i64()?);
                         }
                         *errs = r.i64()?;
                         *s = sum(r)?;
                     }
-                    AState::Sum(s) => *s = sum(r)?,
+                    AState::Sum(s) => {
+                        *s = sum(r)?;
+                        r.charge_state(
+                            96 + (s.floats.len() + s.doubles.len()) as u64 * 24
+                                + s.decs.len() as u64 * 40,
+                        )?;
+                    }
                     AState::Multi(m) => {
+                        r.charge_state(40)?;
                         // the entries were written in their order, which the terms keep
                         for _ in 0..r.u64()? {
                             let v = r.id()?;
+                            r.charge_state(16)?;
                             m.vals.push((v, r.i64()?));
                         }
                         m.errs = r.i64()?;

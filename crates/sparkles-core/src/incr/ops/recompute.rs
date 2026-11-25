@@ -38,9 +38,14 @@ impl Recompute {
 
     pub fn init(&mut self, p: &mut Pass, schema: &[u32]) -> Result<Changes> {
         let mut tracked = self.bytes(schema.len());
+        let mark = p.output_lease_mark();
         let rows = p.evaluate(&self.pattern, schema, self.dataset.as_ref())?;
+        let rows_leases = p.take_output_leases_since(mark);
         self.prev = rows.iter().cloned().collect();
         p.sync_op_state(&mut tracked, self.bytes(schema.len()))?;
+        for lease in rows_leases {
+            p.push_output_lease(lease);
+        }
         Ok(rows)
     }
 
@@ -58,13 +63,19 @@ impl Recompute {
             }
         }
         let mut tracked = self.bytes(schema.len());
-        let now: ZSet = p
-            .evaluate(&self.pattern, schema, self.dataset.as_ref())?
-            .into_iter()
-            .collect();
+        let mark = p.output_lease_mark();
+        let raw = p.evaluate(&self.pattern, schema, self.dataset.as_ref())?;
+        let raw_leases = p.take_output_leases_since(mark);
+        let now: ZSet = raw.into_iter().collect();
         let d = now.minus(&self.prev);
+        let mut out_lease = p.scratch_lease();
+        let out_bytes =
+            (d.len() as u64).saturating_mul(super::super::zset::row_bytes(schema.len()));
+        out_lease.try_set(out_bytes)?;
         self.prev = now;
         p.sync_op_state(&mut tracked, self.bytes(schema.len()))?;
+        drop(raw_leases);
+        p.push_output_lease(out_lease);
         Ok(d)
     }
 

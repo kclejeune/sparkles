@@ -35,6 +35,7 @@ fn dataset_views_share_query_pool_and_return_exact_zero_on_delete() {
     ds.views()
         .wait_built("items", Duration::from_secs(10))
         .unwrap();
+    ds.views().settle(Duration::from_secs(10));
     assert!(
         pool.granted() > 0,
         "Dataset view must reserve from Dataset's QueryPool"
@@ -50,6 +51,8 @@ fn dataset_views_share_query_pool_and_return_exact_zero_on_delete() {
     assert_eq!(pool.granted(), before);
 
     assert!(ds.views().delete("items").unwrap());
+    // Ensure any worker round that held an Arc<Cell> has finished before asserting 0.
+    ds.views().settle(Duration::from_secs(10));
     assert_eq!(
         pool.granted(),
         0,

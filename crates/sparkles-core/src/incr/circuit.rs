@@ -312,6 +312,34 @@ pub struct Circuit {
     budget: ViewBudget,
 }
 
+/// Approximate heap bytes of one decoded term row.
+pub(crate) fn decoded_row_bytes(row: &[Option<Term>]) -> u64 {
+    fn term_bytes(t: &Term) -> u64 {
+        match t {
+            Term::NamedNode(n) => 32 + n.as_str().len() as u64,
+            Term::BlankNode(b) => 32 + b.as_str().len() as u64,
+            Term::Literal(l) => {
+                48 + l.value().len() as u64
+                    + l.language().map_or(0, |s| s.len() as u64)
+                    + l.datatype().as_str().len() as u64
+            }
+            Term::Triple(tr) => {
+                64 + term_bytes(&Term::from(tr.subject.clone()))
+                    + term_bytes(&Term::NamedNode(tr.predicate.clone()))
+                    + term_bytes(&tr.object)
+            }
+        }
+    }
+    let mut total = 32u64;
+    for cell in row {
+        total = total.saturating_add(match cell {
+            Some(t) => term_bytes(t),
+            None => 8,
+        });
+    }
+    total
+}
+
 /// Annotated changes split into the weights' changes, consolidated, and the changes
 /// themselves.
 fn split(c: AChanges) -> (Changes, AChanges) {
@@ -369,14 +397,20 @@ impl Circuit {
         self.budget.set_local_limit(limit);
     }
 
-    /// Raise a shared circuit's local byte limit so all attached consumers can stay
-    /// within the largest consumer's bound (narrower consumers are evicted post-pass).
-    pub(crate) fn raise_local_limit(&mut self, limit: u64) {
-        if let Some(cur) = self.max_memory_bytes {
-            let next = cur.max(limit);
-            self.max_memory_bytes = Some(next);
-            self.budget.raise_local_limit(next);
-        }
+    pub(crate) fn local_limit(&self) -> Option<u64> {
+        self.budget.local_limit()
+    }
+
+    pub(crate) fn budget_handle(&self) -> super::budget::BudgetHandle {
+        self.budget.handle()
+    }
+
+    pub(crate) fn scratch_lease(&self) -> super::budget::ScratchLease {
+        self.budget.scratch_lease()
+    }
+
+    pub(crate) fn set_reclaim_external(&self, hook: Option<super::budget::ReclaimHook>) {
+        self.budget.set_reclaim_external(hook);
     }
 
     /// Drain excess [`MemoryLease`]s split during shrinks so the caller can drop them
@@ -421,6 +455,15 @@ impl Circuit {
     pub(crate) fn try_set_external(&self, bytes: u64) -> Result<()> {
         self.budget.set_local_limit(self.max_memory_bytes);
         self.budget.try_set_external(bytes)
+    }
+
+    pub(crate) fn commit_external_from_scratch(
+        &self,
+        bytes: u64,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<()> {
+        self.budget.set_local_limit(self.max_memory_bytes);
+        self.budget.commit_external_from_scratch(bytes, lease)
     }
 
     pub(crate) fn set_external_best_effort(&self, bytes: u64) {
@@ -693,11 +736,15 @@ impl Circuit {
     /// Evaluate the circuit from scratch at `snap`.
     pub fn build(&mut self, snap: Arc<Snapshot>, control: &Control) -> Result<()> {
         self.clear_moves();
+        self.root.clear();
+        self.result = ZSet::new();
         self.terms = Terms::default();
+        self.ann = AnnMap::default();
+        self.facts.clear();
         // the schema may have changed in changes no pass saw
         self.inferred = InferredFootprint::default();
+        self.budget.shrink_state_to(0);
         let vis = Vis::new(self.access.as_ref(), &snap);
-        self.facts.clear();
         let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
         let res = if p.prov.is_none() {
             root.init(&mut p).map(|out| (out, None))
@@ -708,13 +755,15 @@ impl Circuit {
             })
         };
         let stats = p.stats;
+        let mut out_lease = p.take_output_lease();
         #[cfg(test)]
         let (scanned, estimated) = (p.scanned.get(), p.estimated.get());
         drop(p);
         let (out, ann) = match res {
             Ok(v) => v,
             Err(e) => {
-                self.budget.abort_pass(self.bytes());
+                drop(out_lease);
+                self.clear_state();
                 return Err(e);
             }
         };
@@ -730,7 +779,11 @@ impl Circuit {
         };
         self.ann.clear();
         self.absorb(ann);
-        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+        if let Err(e) = self
+            .budget
+            .commit_pass_with_scratch(self.bytes(), &mut out_lease)
+        {
+            drop(out_lease);
             self.clear_state();
             return Err(e);
         }
@@ -761,11 +814,31 @@ impl Circuit {
     /// Load a state written by [`encode`](Self::encode) into the id space of `snap`.
     pub fn decode(&mut self, body: &[u8], snap: &Arc<Snapshot>) -> Result<()> {
         self.budget.set_local_limit(self.max_memory_bytes);
-        let scratch = body.len() as u64;
-        self.budget.try_reserve_scratch(scratch)?;
+        let mut body_lease = self.budget.scratch_lease();
+        body_lease.try_reserve(body.len() as u64)?;
+        let res = self.decode_with_input_charged(body, snap);
+        drop(body_lease);
+        res
+    }
+
+    /// Like [`decode`](Self::decode), when the caller already holds a [`ScratchLease`]
+    /// covering `body` for its lifetime (such as a pre-admitted checkpoint file buffer).
+    pub(crate) fn decode_with_input_charged(
+        &mut self,
+        body: &[u8],
+        snap: &Arc<Snapshot>,
+    ) -> Result<()> {
+        self.budget.set_local_limit(self.max_memory_bytes);
+        self.root.clear();
+        self.result = ZSet::new();
+        self.terms = Terms::default();
+        self.ann = AnnMap::default();
+        self.facts.clear();
+        self.budget.shrink_state_to(0);
+        let budget_handle = self.budget.handle();
         let decoded = (|| {
             let mut terms = Terms::default();
-            let mut r = Reader::new(body, snap, &mut terms)?;
+            let mut r = Reader::with_budget(body, snap, &mut terms, Some(budget_handle))?;
             self.result = r.zset()?;
             self.root.load(&mut r)?;
             if !self.prov.is_none() {
@@ -779,12 +852,11 @@ impl Circuit {
             self.terms = terms;
             Ok(())
         })();
-        self.budget.release_scratch(scratch);
         if let Err(e) = decoded {
             self.clear_state();
             return Err(e);
         }
-        if let Err(e) = self.budget.try_set_state(self.bytes()) {
+        if let Err(e) = self.budget.commit_pass(self.bytes()) {
             self.clear_state();
             return Err(e);
         }
@@ -809,50 +881,99 @@ impl Circuit {
             self.remap(&prev, &snap)?;
         }
         self.budget.set_local_limit(self.max_memory_bytes);
+        let width = self.root.schema.len();
+        let before_bytes = self.result.bytes(width).saturating_add(self.terms.bytes());
+        // Declare `before_lease` before `before` and `old_terms` so Rust drops payloads
+        // strictly before releasing their scratch credit on every exit path.
+        let before_lease = self.budget.move_state_to_scratch(before_bytes)?;
         let before = std::mem::take(&mut self.result);
-        let old_terms = self.terms.clone();
-        // Keep the old result and terms charged alongside the replacement build until
-        // both are dropped after computing the diff.
-        let before_bytes = before
-            .bytes(self.root.schema.len())
-            .saturating_add(old_terms.bytes());
-        if let Err(e) = self.budget.try_reserve_scratch(before_bytes) {
-            self.result = before;
-            return Err(e);
-        }
-        // Lower persistent state accounting for the moved-out result before `build`
-        // (its bytes are now covered by `before_bytes` in scratch).
-        self.budget.shrink_state_to(self.bytes());
-        if let Err(e) = self.build(snap.clone(), control) {
-            drop(before);
+        let old_terms = std::mem::take(&mut self.terms);
+        self.build(snap.clone(), control)?;
+        let mut diff_lease = self.budget.scratch_lease();
+        let diff = if old_terms.is_empty() {
+            let diff = Self::minus_budgeted(&self.result, &before, width, &mut diff_lease)?;
             drop(old_terms);
-            self.budget.release_scratch(before_bytes);
-            return Err(e);
-        }
-        // local ids of the old result must mean what the new ones mean
-        let mut before_keys: ZSet = ZSet::new();
-        for (r, w) in before.iter() {
-            let row: Row = r
-                .iter()
-                .map(|&i| {
-                    if i.tag() == crate::id::Tag::Local {
-                        old_terms
-                            .term(&snap, i)
-                            .map_or(Id::UNDEF, |t| self.terms.intern(&snap, &t))
-                    } else {
-                        i
-                    }
-                })
-                .collect();
-            before_keys.add(row, w);
-        }
-        let diff = self.result.minus(&before_keys);
-        drop(before_keys);
-        drop(before);
-        drop(old_terms);
-        self.budget.release_scratch(before_bytes);
+            drop(before);
+            drop(before_lease);
+            diff
+        } else {
+            // local ids of the old result must mean what the new ones mean
+            let mut remapped_lease = self.budget.scratch_lease();
+            let mut before_keys = ZSet::new();
+            for (idx, (r, w)) in before.iter().enumerate() {
+                let row: Row = r
+                    .iter()
+                    .map(|&i| {
+                        if i.tag() == crate::id::Tag::Local {
+                            old_terms
+                                .term(&snap, i)
+                                .map_or(Id::UNDEF, |t| self.terms.intern(&snap, &t))
+                        } else {
+                            i
+                        }
+                    })
+                    .collect();
+                let next_bytes =
+                    (before_keys.len() as u64 + 1).saturating_mul(super::zset::row_bytes(width));
+                if next_bytes > remapped_lease.bytes() {
+                    remapped_lease.try_set(next_bytes)?;
+                }
+                before_keys.add(row, w);
+                if idx % 1024 == 1023 {
+                    self.budget.try_set_state(self.bytes())?;
+                }
+            }
+            self.budget.try_set_state(self.bytes())?;
+            drop(old_terms);
+            drop(before);
+            drop(before_lease);
+            let diff = Self::minus_budgeted(&self.result, &before_keys, width, &mut diff_lease)?;
+            drop(before_keys);
+            drop(remapped_lease);
+            diff
+        };
+        drop(diff_lease);
         self.budget.try_set_state(self.bytes())?;
         Ok(diff)
+    }
+
+    fn minus_budgeted(
+        now: &ZSet,
+        before: &ZSet,
+        width: usize,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<Changes> {
+        let mut out = Changes::new();
+        let row_sz = (width as u64) * 8;
+        let slot_sz = std::mem::size_of::<(Row, i64)>() as u64;
+        let mut push = |out: &mut Changes, row: Row, w: i64| -> Result<()> {
+            let next_cap = sparkles_budget::sizes::vec_grown(
+                out.capacity(),
+                out.len(),
+                1,
+                std::mem::size_of::<(Row, i64)>(),
+            );
+            let need = (next_cap as u64)
+                .saturating_mul(slot_sz)
+                .saturating_add((out.len() as u64 + 1).saturating_mul(row_sz));
+            if need > lease.bytes() {
+                lease.try_set(need)?;
+            }
+            out.push((row, w));
+            Ok(())
+        };
+        for (r, w) in now.iter() {
+            let d = w - before.get(r);
+            if d != 0 {
+                push(&mut out, r.clone(), d)?;
+            }
+        }
+        for (r, w) in before.iter() {
+            if now.get(r) == 0 {
+                push(&mut out, r.clone(), -w)?;
+            }
+        }
+        Ok(out)
     }
 
     /// Apply the net changes `d` (whose `after` must be the circuit's commit).
@@ -903,10 +1024,12 @@ impl Circuit {
             p.full = true;
             let res = Self::run_delta(root, &mut p);
             let stats = p.stats;
+            let mut out_lease = p.take_output_lease();
             drop(p);
             let (out, ann) = match res {
                 Ok(v) => v,
                 Err(e) => {
+                    drop(out_lease);
                     self.budget.abort_pass(self.bytes());
                     return Err(e);
                 }
@@ -915,7 +1038,11 @@ impl Circuit {
                 self.result.apply(&out);
             }
             self.absorb(ann);
-            if let Err(e) = self.budget.commit_pass(self.bytes()) {
+            if let Err(e) = self
+                .budget
+                .commit_pass_with_scratch(self.bytes(), &mut out_lease)
+            {
+                drop(out_lease);
                 self.budget.abort_pass(self.bytes());
                 return Err(e);
             }
@@ -957,10 +1084,12 @@ impl Circuit {
         let (mut p, root) = self.pass(snap.clone(), Some(old), &added, &removed, &vis, control);
         let res = Self::run_delta(root, &mut p);
         let stats = p.stats;
+        let mut out_lease = p.take_output_lease();
         drop(p);
         let (out, ann) = match res {
             Ok(v) => v,
             Err(e) => {
+                drop(out_lease);
                 self.budget.abort_pass(self.bytes());
                 return Err(e);
             }
@@ -969,7 +1098,11 @@ impl Circuit {
             self.result.apply(&out);
         }
         self.absorb(ann);
-        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+        if let Err(e) = self
+            .budget
+            .commit_pass_with_scratch(self.bytes(), &mut out_lease)
+        {
+            drop(out_lease);
             self.budget.abort_pass(self.bytes());
             return Err(e);
         }
@@ -977,6 +1110,58 @@ impl Circuit {
         self.snap = Some(snap);
         self.last = stats;
         Ok(Advance::Changed(out))
+    }
+
+    /// Decode `rows` into terms while charging the decoded copy against this circuit's
+    /// budget (for fallback reads where the circuit and decoded rows coexist).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn rows_budgeted(&self) -> Result<Vec<(Vec<Option<Term>>, i64)>> {
+        let mut lease = self.budget.scratch_lease();
+        let rows = if let Some((w, cols)) = self.root.result_window()
+            && w.positions
+        {
+            let raw: Vec<(Row, i64)> = w
+                .rows()
+                .iter()
+                .map(|(r, n)| (Self::window_row(cols, r), *n))
+                .collect();
+            self.decode_rows_charged(&raw, &mut lease)?
+        } else {
+            let Some(snap) = &self.snap else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::with_capacity(self.result.len());
+            let mut bytes = 0u64;
+            for (r, w) in self.result.iter() {
+                let decoded: Vec<Option<Term>> =
+                    r.iter().map(|&i| self.terms.term(snap, i)).collect();
+                bytes = bytes.saturating_add(decoded_row_bytes(&decoded));
+                lease.try_set(bytes)?;
+                out.push((decoded, w));
+            }
+            out
+        };
+        Ok(rows)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn decode_rows_charged(
+        &self,
+        rows: &[(Row, i64)],
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<Vec<(Vec<Option<Term>>, i64)>> {
+        let Some(snap) = &self.snap else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        let mut bytes = 0u64;
+        for (r, w) in rows {
+            let decoded: Vec<Option<Term>> = r.iter().map(|&i| self.terms.term(snap, i)).collect();
+            bytes = bytes.saturating_add(decoded_row_bytes(&decoded));
+            lease.try_set(bytes)?;
+            out.push((decoded, *w));
+        }
+        Ok(out)
     }
 
     /// The terms of rows of the result.

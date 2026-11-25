@@ -12,9 +12,10 @@
 //! reads. Protections that depend on the data never reach a pass: such a circuit is one
 //! `recompute` node over its masked snapshot.
 
-use super::budget::BudgetHandle;
+use super::budget::{BudgetHandle, ScratchLease};
+use super::prov::AChanges;
 use super::terms::Terms;
-use super::zset::{Changes, Row};
+use super::zset::{Changes, Row, row_bytes};
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
 use crate::id::{self, Id, Tag};
@@ -147,6 +148,8 @@ pub struct Pass<'a> {
     pub(crate) pool: Option<Arc<QueryPool>>,
     /// current window scratch bytes reserved on `budget` during this pass
     window_scratch: u64,
+    /// scratch leases for intermediate operator outputs carried across boundaries
+    output_leases: Vec<ScratchLease>,
     /// the query's base IRI
     pub base: Option<oxiri::Iri<String>>,
     /// the dataset's inference, which evaluations read with
@@ -202,6 +205,7 @@ impl<'a> Pass<'a> {
             budget: None,
             pool: None,
             window_scratch: 0,
+            output_leases: Vec::new(),
             base: None,
             inference: None,
             aggregate_errors,
@@ -229,6 +233,85 @@ impl<'a> Pass<'a> {
 
     pub(crate) fn budget_handle(&self) -> Option<BudgetHandle> {
         self.budget.clone()
+    }
+
+    pub(crate) fn scratch_lease(&self) -> ScratchLease {
+        ScratchLease::new(self.budget.clone())
+    }
+
+    pub(crate) fn output_lease_mark(&self) -> usize {
+        self.output_leases.len()
+    }
+
+    pub(crate) fn push_output_lease(&mut self, lease: ScratchLease) {
+        if lease.bytes() > 0 {
+            self.output_leases.push(lease);
+        }
+    }
+
+    pub(crate) fn take_output_leases_since(&mut self, mark: usize) -> Vec<ScratchLease> {
+        self.output_leases.split_off(mark)
+    }
+
+    pub(crate) fn take_output_lease(&mut self) -> ScratchLease {
+        let mut total = 0u64;
+        for mut l in self.output_leases.drain(..) {
+            total = total.saturating_add(l.take_bytes());
+        }
+        ScratchLease::from_reserved(self.budget.clone(), total)
+    }
+
+    /// Pre-admit growth of a [`Changes`] output vector before pushing one row of `width`
+    /// ids, covering both the backing `Vec` slots and the boxed row allocations.
+    pub(crate) fn preadmit_changes_push(
+        &self,
+        out: &Changes,
+        width: usize,
+        lease: &mut ScratchLease,
+    ) -> Result<()> {
+        let next_cap = sparkles_budget::sizes::vec_grown(
+            out.capacity(),
+            out.len(),
+            1,
+            std::mem::size_of::<(Row, i64)>(),
+        );
+        let vec_bytes = (next_cap as u64) * std::mem::size_of::<(Row, i64)>() as u64;
+        let row_payload = (out.len() as u64 + 1).saturating_mul((width as u64) * 8);
+        let need = vec_bytes.saturating_add(row_payload);
+        if need > lease.bytes() {
+            lease.try_set(need)?;
+        }
+        Ok(())
+    }
+
+    /// Pre-admit growth of an [`AChanges`] output vector before pushing one annotated
+    /// row of `width` ids and `ann_bytes` annotation bytes.
+    pub(crate) fn preadmit_achanges_push(
+        &self,
+        out: &AChanges,
+        width: usize,
+        ann_bytes_total: &mut u64,
+        next_ann_bytes: u64,
+        lease: &mut ScratchLease,
+    ) -> Result<()> {
+        let next_cap = sparkles_budget::sizes::vec_grown(
+            out.capacity(),
+            out.len(),
+            1,
+            std::mem::size_of::<(Row, i64, super::prov::Ann)>(),
+        );
+        let vec_bytes =
+            (next_cap as u64) * std::mem::size_of::<(Row, i64, super::prov::Ann)>() as u64;
+        let row_payload = (out.len() as u64 + 1).saturating_mul((width as u64) * 8);
+        let next_ann_total = ann_bytes_total.saturating_add(next_ann_bytes);
+        let need = vec_bytes
+            .saturating_add(row_payload)
+            .saturating_add(next_ann_total);
+        if need > lease.bytes() {
+            lease.try_set(need)?;
+        }
+        *ann_bytes_total = next_ann_total;
+        Ok(())
     }
 
     pub(crate) fn reserve_pass(&mut self, delta: u64) -> Result<()> {
@@ -286,6 +369,21 @@ impl<'a> Pass<'a> {
             let delta = self.window_scratch - extra;
             self.release_pass(delta);
             self.window_scratch = extra;
+        }
+        Ok(())
+    }
+
+    /// Transition window scratch bytes into persistent pass-time state accounting after
+    /// `Window::kept` has been replaced/updated, releasing only the scratch excess while
+    /// keeping the newly retained window state charged for enclosing operators.
+    pub(crate) fn commit_window_state(&mut self, next_state: u64, base_state: u64) -> Result<()> {
+        let kept_growth = next_state.saturating_sub(base_state);
+        let prev_scratch = self.window_scratch;
+        self.window_scratch = 0;
+        if kept_growth > prev_scratch {
+            self.reserve_pass(kept_growth - prev_scratch)?;
+        } else if prev_scratch > kept_growth {
+            self.release_pass(prev_scratch - kept_growth);
         }
         Ok(())
     }
@@ -510,7 +608,7 @@ impl<'a> Pass<'a> {
                 c.mem_limit = m;
             }
             if let Some(budget) = &self.budget
-                && let Some((parent, grant)) = budget.child_parent(self.pool.as_ref())
+                && let Some((parent, grant)) = budget.child_parent(self.pool.as_ref())?
             {
                 c.set_grant(grant);
                 c.set_memory_parent(parent)?;
@@ -689,10 +787,10 @@ impl<'a> Pass<'a> {
             },
             base_iri: self.base.clone(),
         };
-        let child = self
-            .budget
-            .as_ref()
-            .and_then(|b| b.child_parent(self.pool.as_ref()));
+        let child = match &self.budget {
+            Some(b) => b.child_parent(self.pool.as_ref())?,
+            None => None,
+        };
         let (parent, grant) = match child {
             Some((p, g)) => (Some(p), g),
             None => (None, None),
@@ -730,7 +828,8 @@ impl<'a> Pass<'a> {
         let width = r.table().width();
         let mut z = super::zset::ZSet::new();
         let mut decoded: FxHashMap<Id, Id> = FxHashMap::default();
-        let mut z_tracked = 0u64;
+        let mut z_lease = self.scratch_lease();
+        let mut terms_tracked = self.terms.bytes();
         for i in 0..r.table().len() {
             let mut row: Vec<Id> = Vec::with_capacity(width);
             for c in 0..width {
@@ -755,18 +854,26 @@ impl<'a> Pass<'a> {
                 row.push(m);
             }
             let row: Row = row.into();
+            let next_bytes = (z.len() as u64 + 1)
+                .saturating_mul(row_bytes(width))
+                .saturating_add((decoded.len() as u64) * 24);
+            if next_bytes > z_lease.bytes() {
+                z_lease.try_set(next_bytes)?;
+            }
             z.add(row, 1);
             if i % 1024 == 1023 {
-                self.sync_op_state(&mut z_tracked, z.bytes(width))?;
+                let now_terms = self.terms.bytes();
+                self.sync_op_state(&mut terms_tracked, now_terms)?;
             }
             if i % 4096 == 4095 {
                 self.control.check()?;
             }
         }
-        self.sync_op_state(&mut z_tracked, z.bytes(width))?;
+        let now_terms = self.terms.bytes();
+        self.sync_op_state(&mut terms_tracked, now_terms)?;
         let r_width = r.table().width();
+        drop(decoded);
         drop(r);
-        self.release_pass(z_tracked);
         self.stats.recompute += t0.elapsed();
         self.stats.recomputes += 1;
         if r_width != vars.len() {
@@ -774,7 +881,11 @@ impl<'a> Pass<'a> {
                 "a recompute node's evaluation returned other columns".into(),
             ));
         }
-        Ok(z.into_changes())
+        let changes = z.into_changes();
+        let changes_bytes = (changes.len() as u64).saturating_mul(row_bytes(width));
+        z_lease.try_set(changes_bytes)?;
+        self.push_output_lease(z_lease);
+        Ok(changes)
     }
 }
 

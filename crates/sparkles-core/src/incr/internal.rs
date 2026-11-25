@@ -280,31 +280,164 @@ impl Tally {
         n
     }
 
+    /// Release all entries, unknown ranges, keys, and retained backing capacity so
+    /// `self.bytes() == 0` while keeping `key_cols` and `since`.
+    pub(crate) fn clear_storage(&mut self) {
+        self.entries = VecDeque::new();
+        self.unknown = Vec::new();
+        self.keys = Vec::new();
+        self.index = FxHashMap::default();
+        self.key_bytes = 0;
+    }
+
+    /// Release spare backing capacity without dropping any commits' counts.
+    /// Returns whether `self.bytes()` decreased.
+    pub(crate) fn shrink_spare_capacity(&mut self) -> bool {
+        let before = self.bytes();
+        self.entries.shrink_to_fit();
+        self.unknown.shrink_to_fit();
+        self.bytes() < before
+    }
+
     /// Count the change `c` of the circuit's result in `commit`: the absolute weight of
     /// each row, which holds the key and the fact, summed per key. `term` decodes an id
     /// of the change.
+    #[cfg(test)]
     pub(crate) fn add(&mut self, commit: u64, c: &Changes, term: impl Fn(Id) -> Option<Term>) {
+        let mut dirty = false;
+        let _ = self.add_budgeted(commit, c, term, None, &mut dirty);
+    }
+
+    /// Reserve `next_bytes` on `scratch`, evicting oldest tally commits in batches if
+    /// needed to stay within the circuit's budget or parent `QueryPool`. Only returns an
+    /// error when the tally has nothing left to reclaim for `next_bytes`.
+    fn reserve_or_shrink(
+        &mut self,
+        circuit: Option<&super::circuit::Circuit>,
+        dirty: &mut bool,
+        scratch: &mut super::budget::ScratchLease,
+        next_bytes: u64,
+    ) -> Result<()> {
+        while let Err(e) = scratch.try_set(next_bytes) {
+            let Some(circ) = circuit else {
+                return Err(e);
+            };
+            let cur = self.bytes();
+            if cur == 0 {
+                return Err(e);
+            }
+            let target = circ
+                .max_memory_bytes
+                .map(|max| max.saturating_sub(circ.bytes()).saturating_sub(next_bytes))
+                .unwrap_or(cur / 2)
+                .min(cur.saturating_sub(1));
+            if self.shrink_to(target) {
+                *dirty = true;
+            }
+            if self.bytes() == cur && !self.shrink_spare_capacity() {
+                if self.shrink_to(cur / 2) {
+                    *dirty = true;
+                }
+                if self.bytes() == cur {
+                    if let Some(last_commit) = self.entries.back().map(|e| e.0) {
+                        self.discard_through(last_commit);
+                        *dirty = true;
+                    }
+                    if self.bytes() == cur {
+                        return Err(e);
+                    }
+                }
+            }
+            circ.set_external_best_effort(self.bytes());
+        }
+        Ok(())
+    }
+
+    /// Like [`add`](Self::add), pre-admitting transient per-key aggregation scratch and
+    /// key/entry growth against `circuit`'s budget before allocating unboundedly, while
+    /// evicting oldest commits in batches if needed.
+    pub(crate) fn add_budgeted(
+        &mut self,
+        commit: u64,
+        c: &Changes,
+        term: impl Fn(Id) -> Option<Term>,
+        circuit: Option<&super::circuit::Circuit>,
+        dirty: &mut bool,
+    ) -> Result<()> {
+        let mut scratch = super::budget::ScratchLease::new(circuit.map(|c| c.budget_handle()));
         let mut per: FxHashMap<Box<[Id]>, u64> = FxHashMap::default();
+        let key_slot = (self.key_cols.len() as u64) * 8 + 40;
         for (row, w) in c {
             let key: Box<[Id]> = self.key_cols.iter().map(|&i| row[i]).collect();
+            if !per.contains_key(&key) {
+                let next_bytes = (per.len() as u64 + 1).saturating_mul(key_slot);
+                if next_bytes > scratch.bytes() {
+                    self.reserve_or_shrink(circuit, dirty, &mut scratch, next_bytes)?;
+                }
+            }
             *per.entry(key).or_insert(0) += w.unsigned_abs();
         }
-        let mut counted: Vec<(u32, u64)> = per
-            .into_iter()
-            .filter(|(_, n)| *n > 0)
-            .map(|(k, n)| {
-                let key = k.iter().map(|&i| term(i)).collect();
-                (self.intern(key), n)
-            })
-            .collect();
+        let per_bytes = scratch.bytes();
+        // Decode keys and pre-admit both temporary `decoded` storage and any new keys /
+        // entry growth BEFORE mutating `self.keys`/`self.index` so mid-loop eviction
+        // never compacts away freshly interned keys.
+        let mut decoded: Vec<(Vec<Option<Term>>, u64)> = Vec::new();
+        let mut decoded_bytes = 0u64;
+        let mut added_tally = 0u64;
+        for (k, n) in per {
+            if n == 0 {
+                continue;
+            }
+            let key: Vec<Option<Term>> = k.iter().map(|&i| term(i)).collect();
+            let kb = key_bytes(&key);
+            decoded_bytes = decoded_bytes.saturating_add(kb / 2 + 16);
+            if !self.index.contains_key(&key) {
+                added_tally = added_tally.saturating_add(kb);
+            }
+            let need = per_bytes
+                .saturating_add(decoded_bytes)
+                .saturating_add(added_tally)
+                .saturating_add((decoded.len() as u64 + 1) * ENTRY_BYTES);
+            if need > scratch.bytes() {
+                self.reserve_or_shrink(circuit, dirty, &mut scratch, need)?;
+            }
+            decoded.push((key, n));
+        }
+        // Recompute new-key bytes once after any eviction during decoding so `self.intern`
+        // and `self.entries.push_back` are fully pre-admitted.
+        let final_added: u64 = decoded
+            .iter()
+            .filter(|(key, _)| !self.index.contains_key(key))
+            .map(|(key, _)| key_bytes(key))
+            .sum();
+        let entry_next = sparkles_budget::sizes::vec_grown(
+            self.entries.capacity(),
+            self.entries.len(),
+            decoded.len(),
+            ENTRY_BYTES as usize,
+        );
+        let entry_growth =
+            (entry_next.saturating_sub(self.entries.capacity()) as u64) * ENTRY_BYTES;
+        let final_need = decoded_bytes
+            .saturating_add(final_added)
+            .saturating_add(entry_growth);
+        if final_need > scratch.bytes() {
+            self.reserve_or_shrink(circuit, dirty, &mut scratch, final_need)?;
+        }
+        let mut counted: Vec<(u32, u64)> = Vec::with_capacity(decoded.len());
+        for (key, n) in decoded {
+            counted.push((self.intern(key), n));
+        }
         counted.sort_unstable();
         for (k, n) in counted {
             self.entries.push_back((commit, k, n));
         }
+        drop(scratch);
         #[cfg(test)]
         {
             self.peak = self.peak.max(self.bytes());
         }
+        Ok(())
     }
 
     /// Record that the commits `first..=last` were not counted per key.
@@ -524,12 +657,34 @@ impl Tally {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(key_cols: Vec<usize>, d: &mut Dec<'_>) -> Result<Tally> {
+        let mut lease = super::budget::ScratchLease::default();
+        Self::decode_budgeted(key_cols, d, &mut lease)
+    }
+
+    pub(crate) fn decode_budgeted(
+        key_cols: Vec<usize>,
+        d: &mut Dec<'_>,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<Tally> {
         let width = key_cols.len();
         let mut t = Tally::new(key_cols, d.u64()?);
         for _ in 0..d.count()? {
             let a = d.u64()?;
             let b = d.u64()?;
+            let next_cap = sparkles_budget::sizes::vec_grown(
+                t.unknown.capacity(),
+                t.unknown.len(),
+                1,
+                RANGE_BYTES as usize,
+            );
+            let need = (next_cap as u64) * RANGE_BYTES
+                + t.key_bytes
+                + t.entries.capacity() as u64 * ENTRY_BYTES;
+            if need > lease.bytes() {
+                lease.try_set(need)?;
+            }
             t.unknown.push((a, b));
         }
         for _ in 0..d.count()? {
@@ -546,8 +701,13 @@ impl Tally {
                     Some(crate::id::key_to_term(d.raw(len - 1)?))
                 });
             }
+            let kb = key_bytes(&key);
+            let need = t.bytes().saturating_add(kb);
+            if need > lease.bytes() {
+                lease.try_set(need)?;
+            }
             let n = t.keys.len() as u32;
-            t.key_bytes += key_bytes(&key);
+            t.key_bytes += kb;
             t.index.insert(key.clone(), n);
             t.keys.push(key);
         }
@@ -560,8 +720,21 @@ impl Tally {
                 return Err(corrupt("a count out of order or of no key"));
             }
             last = c;
+            let next_cap = sparkles_budget::sizes::vec_grown(
+                t.entries.capacity(),
+                t.entries.len(),
+                1,
+                ENTRY_BYTES as usize,
+            );
+            let need = (next_cap as u64) * ENTRY_BYTES
+                + t.key_bytes
+                + t.unknown.capacity() as u64 * RANGE_BYTES;
+            if need > lease.bytes() {
+                lease.try_set(need)?;
+            }
             t.entries.push_back((c, k as u32, n));
         }
+        lease.try_set(t.bytes())?;
         Ok(t)
     }
 }

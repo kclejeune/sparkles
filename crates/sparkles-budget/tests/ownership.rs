@@ -361,25 +361,36 @@ fn detached_remove_and_trim_defer_parent_release_until_lease_drop() {
     assert!(live.remove_detached(LIVE_SLACK).unwrap().is_none());
     assert_eq!(c.releases.load(Ordering::SeqCst), 0);
 
-    // Past slack: excess is split off without releasing yet.
+    // Past slack: removing LIVE_STEP leaves LIVE_SLACK live (within slack for the next
+    // step) and splits off the excess without releasing yet.
     let detached = live
-        .remove_detached(1)
+        .remove_detached(LIVE_STEP)
         .unwrap()
         .expect("shrink past LIVE_SLACK returns a detached lease");
     assert_eq!(c.releases.load(Ordering::SeqCst), 0);
     assert_eq!(c.reserved.load(Ordering::SeqCst), before_reserved);
-    assert!(detached.bytes() > 0);
+    assert_eq!(detached.bytes(), LIVE_SLACK + LIVE_STEP);
+    assert_eq!(live.live(), LIVE_SLACK);
+    assert_eq!(live.reserved(), LIVE_SLACK);
     drop(detached);
     assert_eq!(c.releases.load(Ordering::SeqCst), 1);
     assert_eq!(c.reserved.load(Ordering::SeqCst), live.reserved());
 
     // Dropping live to 0 within slack keeps credit until trim_detached drops its lease.
     let rem = live.live();
-    let detached_rem = live.remove_detached(rem).unwrap();
+    assert!(
+        live.remove_detached(rem).unwrap().is_none(),
+        "dropping live to 0 within LIVE_SLACK must retain credit until trim_detached"
+    );
     assert_eq!(live.live(), 0);
-    let trimmed = live.trim_detached();
+    assert_eq!(live.reserved(), LIVE_SLACK);
+    assert_eq!(c.reserved.load(Ordering::SeqCst), LIVE_SLACK);
+    let trimmed = live
+        .trim_detached()
+        .expect("trim_detached must split remaining within-slack credit down to 0");
+    assert_eq!(trimmed.bytes(), LIVE_SLACK);
     assert_eq!(live.reserved(), 0);
-    drop(detached_rem);
+    assert_eq!(c.reserved.load(Ordering::SeqCst), LIVE_SLACK);
     drop(trimmed);
     assert_eq!(c.reserved.load(Ordering::SeqCst), 0);
 }

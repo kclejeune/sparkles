@@ -22,8 +22,7 @@ impl Runtime {
         let budget = o
             .max_memory_bytes
             .unwrap_or(self.opts.read().live_memory_bytes);
-        let mut dropped_circuits = Vec::new();
-        let mut retired = Vec::new();
+        let mut deferred_reg = DeferredDrops::default();
         let cell = {
             let mut reg = self.reg.lock();
             if self.is_closed() {
@@ -32,33 +31,48 @@ impl Runtime {
                     "the dataset is closing",
                 ));
             }
-            self.sync_inference(&mut reg, host.as_ref(), &mut dropped_circuits, &mut retired);
+            self.sync_inference(&mut reg, host.as_ref(), &mut deferred_reg);
             let res = self.cell_for(&mut reg, q, query, access, Some(budget));
             if let Ok((cell, _)) = &res {
                 cell.pending.fetch_add(1, Ordering::AcqRel);
             }
             res
         };
-        drop(dropped_circuits);
-        drop(retired);
+        drop(deferred_reg);
         let (cell, _) = cell?;
         let joining = Joining(&cell);
         self.ensure_subscription(store);
         let shared = Arc::new(Shared::default());
-        let mut retired_after_state = Vec::new();
-        let mut temp_circuits = Vec::new();
+        // Declared outside `cell.state.lock()` so any temporary circuit built by `resume`
+        // and any retired leases drop strictly after the state lock releases (even on
+        // panic unwind), with circuits freeing payloads strictly before retired leases.
+        let mut deferred_state = DeferredDrops::default();
         let subscribe_res: Result<()> = (|| {
-            let mut st = cell.state.lock();
+            struct LimitGuard<'a>(parking_lot::MutexGuard<'a, Slot>);
+            impl Drop for LimitGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.recompute_local_limit();
+                }
+            }
+            let mut guard = LimitGuard(cell.state.lock());
+            let st = &mut *guard.0;
             let status = cell.info.lock().status.clone();
-            if status != Status::Ready
-                && let Err(e) = self.evaluate_for_live(store, &cell, &mut st)
-            {
-                retired_after_state.extend(st.circuit.drain_retired());
-                return Err(e);
+            if status != Status::Ready {
+                // Provisionally allow the joining subscriber's budget during the build;
+                // `LimitGuard` restores the exact active-consumer ceiling on exit/unwind.
+                let next_limit = st
+                    .circuit
+                    .local_limit()
+                    .map_or(budget, |cur| cur.max(budget));
+                st.circuit.set_local_limit(Some(next_limit));
+                if let Err(e) = self.evaluate_for_live(store, &cell, st) {
+                    deferred_state.retired.extend(st.circuit.drain_retired());
+                    return Err(e);
+                }
             }
             if st.circuit.bytes() > budget {
                 let bytes = st.circuit.bytes();
-                retired_after_state.extend(st.circuit.drain_retired());
+                deferred_state.retired.extend(st.circuit.drain_retired());
                 return Err(crate::incr::error(
                     "over-budget",
                     format!(
@@ -68,7 +82,7 @@ impl Runtime {
             }
             let first = match o.after {
                 None => Some(st.event(false)),
-                Some(after) => self.resume(store, &st, after, &mut temp_circuits),
+                Some(after) => self.resume(store, st, after, &mut deferred_state.circuits),
             };
             // queued before a pass can see the subscriber, so that no later diff
             // overtakes it
@@ -81,11 +95,11 @@ impl Runtime {
                 budget,
                 last,
             });
-            retired_after_state.extend(st.circuit.drain_retired());
+            st.recompute_local_limit();
+            deferred_state.retired.extend(st.circuit.drain_retired());
             Ok(())
         })();
-        drop(temp_circuits);
-        drop(retired_after_state);
+        drop(deferred_state);
         if let Err(e) = subscribe_res {
             drop(joining);
             self.gc();
@@ -144,8 +158,14 @@ impl Runtime {
     /// other subscribers the new result as a `reset`.
     fn evaluate_for_live(&self, store: &Store, cell: &Cell, st: &mut Slot) -> Result<()> {
         let snap = store.snapshot();
+        let had_snap = st.circuit.snap.is_some();
         let t0 = Instant::now();
-        st.evaluate(snap, &self.control())?;
+        if let Err(e) = st.evaluate(snap, &self.control()) {
+            if !had_snap {
+                st.circuit.clear_state();
+            }
+            return Err(e);
+        }
         cell.info.lock().status = Status::Ready;
         self.note_pass(cell, st, t0.elapsed(), false);
         if std::mem::take(&mut st.rebased) {
@@ -200,8 +220,12 @@ impl Runtime {
             let old = d.old().ok()?;
             let mut c = st.fresh(st.circuit.inference.clone()).ok()?;
             c.set_pool(self.pool.clone(), self.circuit_parent());
+            // Move `c` into caller-owned storage outside `cell.state.lock()` BEFORE
+            // charging/building it so a panic unwind cannot drop `c` under the state lock.
+            temp_circuits.push(c);
+            let c = temp_circuits.last_mut().expect("pushed above");
             let built = c.build(old, &self.control());
-            let out = if built.is_ok() {
+            if built.is_ok() {
                 if ask {
                     let delta = st.circuit.result.total() - c.result.total();
                     Some(vec![(Vec::new(), delta)])
@@ -214,9 +238,7 @@ impl Runtime {
                 }
             } else {
                 None
-            };
-            temp_circuits.push(c);
-            out
+            }
         });
         let Some(change) = change else {
             return Some(st.event(true));
@@ -234,5 +256,89 @@ impl Runtime {
             });
         }
         Some(diff_event(after, applied, change.into_iter()))
+    }
+}
+
+#[cfg(test)]
+mod resume_unwind_tests {
+    use super::*;
+    use crate::store::StoreOptions;
+
+    /// Proves that a charged fallback circuit pushed into caller-owned `DeferredDrops`
+    /// before building/unwinding releases its `QueryPool` credit strictly AFTER
+    /// `cell.state.lock()` unwinds, so a synchronous waker that re-acquires
+    /// `cell.state.lock()` never deadlocks.
+    #[test]
+    fn resume_unwind_drops_charged_circuit_after_cell_state_lock_releases() {
+        let store = Store::in_memory(StoreOptions::default());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> \"1\" . <urn:b> <urn:p> \"2\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let pool = QueryPool::new(16 << 20);
+        let rt = Runtime::open_with_pool(
+            None,
+            store.dataset_id(),
+            RuntimeOptions::default(),
+            Some(pool.clone()),
+        );
+        rt.set_host(Arc::new(OpenHost));
+        let _live = rt
+            .live(
+                &store,
+                "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+                None,
+                &LiveOptions::default(),
+            )
+            .unwrap();
+        let cell = rt.reg.lock().cells.values().next().unwrap().clone();
+        let baseline = pool.granted();
+        assert!(baseline > 0);
+
+        // Fill pool so free room is exact 4 MiB before building the fallback circuit;
+        // once `c.build` charges `c`, entering a 4 MiB waiter queues it, and dropping `c`
+        // during unwind frees exact 4 MiB and wakes the waiter synchronously.
+        let filler = pool
+            .work_parent()
+            .reserve(pool.capacity() - (4 << 20) - baseline)
+            .unwrap();
+        let woke = Arc::new(AtomicUsize::new(0));
+        let woke_cb = woke.clone();
+        let cell_cb = cell.clone();
+        let waiter_slot = Mutex::new(None);
+
+        let snap = store.snapshot();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut deferred_state = DeferredDrops::default();
+            let st = cell.state.lock();
+            let mut c = st.fresh(st.circuit.inference.clone()).unwrap();
+            c.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+            // Same ordering as `Runtime::resume`: push into `deferred_state` BEFORE build.
+            deferred_state.circuits.push(c);
+            let c = deferred_state.circuits.last_mut().unwrap();
+            c.build(snap, &Control::none()).unwrap();
+            *waiter_slot.lock() = Some(pool.enter(
+                4 << 20,
+                Some(Arc::new(move || {
+                    // Would deadlock immediately if the fallback circuit dropped while
+                    // `cell.state.lock()` was still held during unwind.
+                    let _st = cell_cb.state.lock();
+                    woke_cb.fetch_add(1, Ordering::SeqCst);
+                })),
+            ));
+            panic!("simulated panic after charging fallback circuit inside cell.state.lock()");
+        }));
+        assert!(res.is_err());
+        assert!(
+            woke.load(Ordering::SeqCst) >= 1,
+            "waker must have acquired cell.state.lock() cleanly after unwind"
+        );
+        drop(waiter_slot);
+        drop(filler);
+        drop(_live);
+        rt.close(&store);
+        assert_eq!(pool.granted(), 0);
     }
 }

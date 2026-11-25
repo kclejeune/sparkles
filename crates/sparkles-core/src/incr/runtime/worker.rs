@@ -119,44 +119,52 @@ impl Runtime {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.checkpoint(store);
-        let (cells, view_cells, internal) = {
-            let mut reg = self.reg.lock();
-            let internal = std::mem::take(&mut reg.internal);
-            let cells: Vec<Arc<Cell>> = reg.cells.drain().map(|(_, c)| c).collect();
-            let view_cells: Vec<Arc<Cell>> = reg
-                .views
-                .values_mut()
-                .filter_map(|e| e.cell.take())
-                .collect();
-            (cells, view_cells, internal)
-        };
-        let mut retired = Vec::new();
-        for c in &cells {
-            let mut st = c.state.lock();
-            for s in st.subs.drain(..) {
-                if let Some(sh) = s.shared.upgrade() {
-                    sh.close();
+        // Guarantee registry teardown, circuit clearing, and lock-free credit release
+        // even if `checkpoint(store)` unwinds on a failpoint or panic.
+        struct CloseCleanup<'a>(&'a Runtime);
+        impl Drop for CloseCleanup<'_> {
+            fn drop(&mut self) {
+                let mut retired = Vec::new();
+                let (cells, view_cells, internal) = {
+                    let mut reg = self.0.reg.lock();
+                    let internal = std::mem::take(&mut reg.internal);
+                    let cells: Vec<Arc<Cell>> = reg.cells.drain().map(|(_, c)| c).collect();
+                    let view_cells: Vec<Arc<Cell>> = reg
+                        .views
+                        .values_mut()
+                        .filter_map(|e| e.cell.take())
+                        .collect();
+                    (cells, view_cells, internal)
+                };
+                for c in &cells {
+                    let mut st = c.state.lock();
+                    for s in st.subs.drain(..) {
+                        if let Some(sh) = s.shared.upgrade() {
+                            sh.close();
+                        }
+                    }
+                    st.clear_history();
+                    st.circuit.clear_state();
+                    retired.extend(st.circuit.drain_retired());
                 }
+                for c in internal.values() {
+                    let mut st = c.state.lock();
+                    st.tally = None;
+                    st.circuit.set_external_best_effort(0);
+                    st.circuit.clear_state();
+                    retired.extend(st.circuit.drain_retired());
+                }
+                drop(cells);
+                drop(view_cells);
+                drop(internal);
+                drop(retired);
+                *self.0.subscription.lock() = None;
+                self.0.kick();
+                self.0.cv.notify_all();
             }
-            st.clear_history();
-            st.circuit.clear_state();
-            retired.extend(st.circuit.drain_retired());
         }
-        for c in internal.values() {
-            let mut st = c.state.lock();
-            st.tally = None;
-            st.circuit.set_external_best_effort(0);
-            st.circuit.clear_state();
-            retired.extend(st.circuit.drain_retired());
-        }
-        drop(retired);
-        drop(cells);
-        drop(view_cells);
-        drop(internal);
-        *self.subscription.lock() = None;
-        self.kick();
-        self.cv.notify_all();
+        let _cleanup = CloseCleanup(self);
+        self.checkpoint(store);
     }
 
     pub fn is_closed(&self) -> bool {

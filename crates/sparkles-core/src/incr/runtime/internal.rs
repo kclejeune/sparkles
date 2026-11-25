@@ -540,12 +540,21 @@ impl Runtime {
             "internal circuit {} failed ({code}): {message}",
             cell.spec.id
         );
+        // Clear both circuit state and retained tally storage so a failed handle never
+        // pins QueryPool credit while alive (a future rebuild records missed commits as
+        // unknown from `since`).
+        let applied = st.circuit.applied;
+        if let Some(t) = st.tally.as_mut() {
+            t.discard_through(applied);
+            t.clear_storage();
+            st.circuit.set_external_best_effort(0);
+        }
         st.circuit.clear_state();
         st.status = Status::Failed { code, message };
     }
 
     /// Reconcile an accumulator's tally bytes against the circuit's budget and parent
-    /// pool, shrinking the oldest counts when needed.
+    /// pool, shrinking spare capacity first and oldest counts when needed.
     fn charge_tally(
         circuit: &Circuit,
         tally: &mut Tally,
@@ -554,13 +563,19 @@ impl Runtime {
     ) -> Result<()> {
         while let Err(e) = circuit.try_set_external(tally.bytes()) {
             let cur = tally.bytes();
-            let shrunk = if cur > 0 {
+            // First try releasing spare backing capacity without dropping any commits.
+            if cur > 0 && tally.shrink_spare_capacity() {
+                continue;
+            }
+            let dropped = if cur > 0 {
                 tally.shrink_to(cur / 2)
             } else {
                 false
             };
-            if shrunk {
+            if dropped {
                 *dirty = true;
+            }
+            if tally.bytes() < cur {
                 continue;
             }
             if tally.since < applied {
@@ -570,6 +585,9 @@ impl Runtime {
                     return Ok(());
                 }
             }
+            // Release all backing capacity before zeroing external accounting so no
+            // retained capacity survives uncharged.
+            tally.clear_storage();
             circuit.set_external_best_effort(0);
             return Err(e);
         }
@@ -672,6 +690,7 @@ impl Runtime {
             let snap = store.snapshot();
             circuit.reset(&DeltaSet::at(snap.clone()), control)?;
             tally.lose(from + 1, snap.commit);
+            Self::charge_tally(circuit, tally, dirty, snap.commit)?;
             return Ok(());
         };
         while let Some(d) = steps.next() {
@@ -682,7 +701,7 @@ impl Runtime {
                 Advance::Changed(c) => {
                     let snap = d.snapshot.clone();
                     let terms = &circuit.terms;
-                    tally.add(at, &c, |i| terms.term(&snap, i));
+                    tally.add_budgeted(at, &c, |i| terms.term(&snap, i), Some(circuit), dirty)?;
                     // the budget holds after each commit of a run, not only at its end
                     let state = circuit.bytes();
                     if state > max {
@@ -697,7 +716,10 @@ impl Runtime {
                     }
                     Self::charge_tally(circuit, tally, dirty, at)?;
                 }
-                Advance::Reset(_) => tally.lose(d.after + 1, at),
+                Advance::Reset(_) => {
+                    tally.lose(d.after + 1, at);
+                    Self::charge_tally(circuit, tally, dirty, at)?;
+                }
             }
         }
         Ok(())
@@ -769,6 +791,19 @@ impl Runtime {
         let snap = store.snapshot();
         let id = &cell.spec.id;
         for (commit, path) in persist::list(dir) {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let mut file_lease =
+                super::super::budget::ScratchLease::new_pool_only(Some(st.circuit.budget_handle()));
+            if let Err(e) = file_lease.try_reserve(meta.len()) {
+                tracing::warn!(
+                    target: "sparkles::incr::runtime",
+                    "internal circuit {id}: checkpoint {}: {e}; the circuit is built again",
+                    path.display()
+                );
+                continue;
+            }
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
@@ -790,13 +825,19 @@ impl Runtime {
             {
                 continue;
             }
+            let mut tally_lease =
+                super::super::budget::ScratchLease::new_pool_only(Some(st.circuit.budget_handle()));
             let r = (|| {
                 let mut d = Dec { b: body, at: 0 };
                 let n = d.u64()? as usize;
                 let state = d.raw(n)?;
                 let tally = match (d.u64()?, st.key_cols.is_empty()) {
                     (0, true) => None,
-                    (1, false) => Some(Tally::decode(st.key_cols.clone(), &mut d)?),
+                    (1, false) => Some(Tally::decode_budgeted(
+                        st.key_cols.clone(),
+                        &mut d,
+                        &mut tally_lease,
+                    )?),
                     _ => {
                         return Err(Error::Corrupt(
                             "an internal circuit's state has another sink".into(),
@@ -808,11 +849,41 @@ impl Runtime {
                         "an internal circuit's state has trailing bytes".into(),
                     ));
                 }
-                st.circuit.decode(state, &snap)?;
+                st.circuit.decode_with_input_charged(state, &snap)?;
                 Ok(tally)
             })();
+            // Drop raw checkpoint bytes before releasing `file_lease`.
+            drop(bytes);
+            drop(file_lease);
             match r {
-                Ok(tally) => {
+                Ok(mut tally) => {
+                    if let Some(t) = tally.as_mut() {
+                        if let Some(max) = st.circuit.max_memory_bytes {
+                            let avail = max.saturating_sub(st.circuit.bytes());
+                            if t.shrink_to(avail) {
+                                st.dirty = true;
+                            }
+                        }
+                        if let Err(e) = st
+                            .circuit
+                            .commit_external_from_scratch(t.bytes(), &mut tally_lease)
+                        {
+                            drop(tally_lease);
+                            if Self::charge_tally(&st.circuit, t, &mut st.dirty, h.commit).is_err()
+                            {
+                                tracing::warn!(
+                                    target: "sparkles::incr::runtime",
+                                    "internal circuit {id}: checkpoint {}: {e}; the circuit is built again",
+                                    path.display()
+                                );
+                                drop(tally);
+                                st.circuit.clear_state();
+                                continue;
+                            }
+                        }
+                    } else {
+                        drop(tally_lease);
+                    }
                     st.tally = tally;
                     st.circuit.applied = h.commit;
                     st.checkpointed = h.commit;
@@ -833,6 +904,8 @@ impl Runtime {
                         "internal circuit {id}: checkpoint {}: {e}; the circuit is built again",
                         path.display()
                     );
+                    drop(tally_lease);
+                    st.circuit.set_external_best_effort(0);
                     st.circuit.clear_state();
                 }
             }
@@ -873,5 +946,82 @@ impl Runtime {
         }
         drop(dead);
         drop(idle);
+    }
+}
+
+#[cfg(test)]
+mod charge_tally_tests {
+    use super::*;
+    use crate::sparql::parse_query;
+
+    #[test]
+    fn charge_tally_preserves_counts_on_capacity_only_shrink_and_zeroes_on_terminal_refusal() {
+        let q = parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
+        let mut circuit = Circuit::new(compile(&q, None).unwrap(), None);
+        let pool = QueryPool::new(1 << 20);
+        circuit.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+
+        // Populate 50 commits (VecDeque capacity 64), then discard 1..=45, keeping
+        // 46..=50 (5 entries) while retaining spare VecDeque capacity (`64 <= 5 + 1 + 64`).
+        let mut tally = Tally::new(vec![0], 0);
+        let s_id = crate::id::Id::from_i64(1).unwrap();
+        let o_id = crate::id::Id::from_i64(2).unwrap();
+        let row: crate::incr::zset::Row = vec![s_id, o_id].into();
+        for c in 1..=50u64 {
+            tally.add(c, &vec![(row.clone(), 1)], |i| {
+                Some(oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                    format!("k{}", i.0),
+                )))
+            });
+        }
+        tally.discard_through(45);
+        let before_bytes = tally.bytes();
+        // Set local limit just below `before_bytes` so spare-capacity shrink alone suffices.
+        let tight = before_bytes.saturating_sub(1);
+        circuit.set_local_limit(Some(tight));
+        let mut dirty = false;
+        let res = Runtime::charge_tally(&circuit, &mut tally, &mut dirty, 50);
+        assert!(
+            res.is_ok(),
+            "capacity-only shrink must succeed without wiping counts: {res:?}"
+        );
+        assert!(!dirty, "capacity-only shrink must not mark counts dirty");
+        assert!(tally.bytes() <= tight);
+        let counts = tally.counts(45, 50);
+        assert_eq!(
+            counts.unknown, None,
+            "capacity-only shrink must preserve accumulated counts"
+        );
+        assert_eq!(counts.keys.len(), 1);
+        assert_eq!(counts.keys[0].1, 5);
+
+        // Now build circuit state (so `state_bytes > 0`) and lower `local_limit` to 0 to
+        // force terminal refusal: `charge_tally` must release all retained tally storage
+        // so `tally.bytes() == 0` and pool credit returns to 0 on drop.
+        let store = Store::in_memory(crate::store::StoreOptions::default());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> \"1\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        circuit.set_local_limit(None);
+        circuit.build(store.snapshot(), &Control::none()).unwrap();
+        assert!(circuit.bytes() > 0);
+        circuit.set_local_limit(Some(0));
+        tally.add(51, &vec![(row, 1)], |i| {
+            Some(oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                format!("k{}", i.0),
+            )))
+        });
+        let err = Runtime::charge_tally(&circuit, &mut tally, &mut dirty, 51);
+        assert!(err.is_err());
+        assert_eq!(
+            tally.bytes(),
+            0,
+            "terminal refusal in charge_tally must clear retained tally storage"
+        );
+        drop(circuit);
+        assert_eq!(pool.granted(), 0);
     }
 }

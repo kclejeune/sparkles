@@ -228,13 +228,21 @@ impl Template {
 
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         self.counts = ZSet::new();
+        let mark = p.output_lease_mark();
         let c = self.inner.init(p)?;
-        self.apply(p, c)
+        let leases = p.take_output_leases_since(mark);
+        let out = self.apply(p, c)?;
+        drop(leases);
+        Ok(out)
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
+        let mark = p.output_lease_mark();
         let c = self.inner.delta(p)?;
-        self.apply(p, c)
+        let leases = p.take_output_leases_since(mark);
+        let out = self.apply(p, c)?;
+        drop(leases);
+        Ok(out)
     }
 }
 

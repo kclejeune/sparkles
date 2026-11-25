@@ -20,7 +20,7 @@
 //! exists, which is how the query engine evaluates them. Neither needs state: the nodes
 //! and graphs that the changed quads name are checked at both snapshots.
 
-use super::super::budget::BudgetHandle;
+use super::super::budget::{BudgetHandle, ScratchLease};
 use super::super::fixpoint::{
     self, Change, FactStore, FixedPoint, HashStore, NewStore, Program, Sink,
 };
@@ -163,8 +163,9 @@ impl Closure {
         from: Option<Id>,
         to: Option<Id>,
         g: Id,
-    ) -> Result<Vec<Fact>> {
+    ) -> Result<(Vec<Fact>, ScratchLease)> {
         self.ensure(p);
+        let mut out_lease = p.scratch_lease();
         let mut out = Vec::new();
         for (i, s) in self.steps.iter().enumerate() {
             let seed = self.seed(s, from, to, g);
@@ -175,10 +176,20 @@ impl Closure {
                     (r[s.y], r[s.x])
                 };
                 let gg = s.g.map_or(Id::UNDEF, |gp| r[gp]);
+                let next_cap = sparkles_budget::sizes::vec_grown(
+                    out.capacity(),
+                    out.len(),
+                    1,
+                    std::mem::size_of::<Fact>(),
+                );
+                let need = (next_cap as u64) * std::mem::size_of::<Fact>() as u64;
+                if need > out_lease.bytes() {
+                    out_lease.try_set(need)?;
+                }
                 out.push([gg, a, b]);
             }
         }
-        Ok(out)
+        Ok((out, out_lease))
     }
 
     /// The nodes one step from `z` in graph `g` at `w`, walking forward or backward.
@@ -187,20 +198,24 @@ impl Closure {
         if let Some(v) = self.cache.next.get(&key) {
             return Ok(v.clone());
         }
-        let rows = if fwd {
+        let (rows, rows_lease) = if fwd {
             self.rows(p, w, Some(z), None, g)?
         } else {
             self.rows(p, w, None, Some(z), g)?
         };
+        let mut v_lease = p.scratch_lease();
+        v_lease.try_reserve((rows.len() as u64) * std::mem::size_of::<Id>() as u64)?;
         let mut v: Vec<Id> = rows
             .into_iter()
             .map(|r| if fwd { r[2] } else { r[1] })
             .collect();
+        drop(rows_lease);
         v.sort_unstable();
         v.dedup();
-        let v: Arc<[Id]> = v.into();
         let added = memo_bytes(v.len());
         p.reserve_pass(added)?;
+        let v: Arc<[Id]> = v.into();
+        drop(v_lease);
         self.cache.bytes += added;
         self.cache.next.insert(key, v.clone());
         Ok(v)
@@ -291,20 +306,41 @@ impl Closure {
         if let Some(v) = self.cache.reach.get(&key) {
             return Ok(v.clone());
         }
+        let mut walk_lease = p.scratch_lease();
         let mut seen: FxHashSet<Id> = FxHashSet::default();
+        let mut stack: Vec<Id> = Vec::new();
+        let id_sz = std::mem::size_of::<Id>();
+        let preadmit_walk =
+            |seen: &FxHashSet<Id>, stack: &Vec<Id>, lease: &mut ScratchLease| -> Result<()> {
+                let next_seen_cap =
+                    sparkles_budget::sizes::table_grown(seen.capacity(), seen.len(), 1);
+                let next_stack_cap =
+                    sparkles_budget::sizes::vec_grown(stack.capacity(), stack.len(), 1, id_sz);
+                let need = (sparkles_budget::sizes::table_bytes(next_seen_cap, id_sz) as u64)
+                    .saturating_add((next_stack_cap as u64) * id_sz as u64);
+                if need > lease.bytes() {
+                    lease.try_set(need)?;
+                }
+                Ok(())
+            };
+        preadmit_walk(&seen, &stack, &mut walk_lease)?;
         seen.insert(z);
-        let mut stack = vec![z];
+        stack.push(z);
         while let Some(x) = stack.pop() {
             p.tick()?;
             for &y in self.next(p, w, false, g, x)?.iter() {
-                if seen.insert(y) {
+                if !seen.contains(&y) {
+                    preadmit_walk(&seen, &stack, &mut walk_lease)?;
+                    seen.insert(y);
                     stack.push(y);
                 }
             }
         }
-        let v: Arc<[Id]> = seen.into_iter().collect::<Vec<_>>().into();
-        let added = memo_bytes(v.len());
+        let added = memo_bytes(seen.len());
         p.reserve_pass(added)?;
+        let v: Arc<[Id]> = seen.into_iter().collect::<Vec<_>>().into();
+        drop(stack);
+        drop(walk_lease);
         self.cache.bytes += added;
         self.cache.reach.insert(key, v.clone());
         Ok(v)
@@ -388,18 +424,40 @@ impl FactStore<Fact, Id> for PathStore {
 
     #[inline]
     fn insert(&mut self, f: Fact, r: Id) -> Result<bool> {
+        if self.inner.contains(&f) {
+            return Ok(false);
+        }
+        let cap = self.inner.capacity();
+        let len = self.inner.len();
+        if len >= cap {
+            let next_cap = sparkles_budget::sizes::table_grown(cap, len, 1);
+            let predicted = (next_cap as u64).saturating_mul(self.inner.fact_bytes());
+            if predicted > self.tracked {
+                let delta = predicted - self.tracked;
+                if let Some(budget) = &self.budget {
+                    budget.try_reserve_pass(delta)?;
+                }
+                self.tracked = predicted;
+            }
+        }
         let inserted = self.inner.insert(f, r)?;
         if inserted {
-            let now = self.inner.bytes();
-            if now > self.tracked {
-                let delta = now - self.tracked;
+            let actual = self.inner.bytes();
+            if actual > self.tracked {
+                let delta = actual - self.tracked;
                 if let Some(budget) = &self.budget
                     && let Err(e) = budget.try_reserve_pass(delta)
                 {
                     let _ = self.inner.remove(&f);
                     return Err(e);
                 }
-                self.tracked = now;
+                self.tracked = actual;
+            } else if actual < self.tracked {
+                let excess = self.tracked - actual;
+                if let Some(budget) = &self.budget {
+                    budget.release_pass(excess);
+                }
+                self.tracked = actual;
             }
         }
         Ok(inserted)
@@ -463,15 +521,19 @@ impl Program for Closure {
         match self.start {
             Some(_) => {
                 if let Some(s) = self.cache.start {
-                    for f in self.rows(p, Which::New, Some(s), None, Id::UNDEF)? {
+                    let (rows, rows_lease) = self.rows(p, Which::New, Some(s), None, Id::UNDEF)?;
+                    for f in rows {
                         out.push((f, Id::UNDEF))?;
                     }
+                    drop(rows_lease);
                 }
             }
             None => {
                 for i in 0..self.steps.len() {
                     let s = &self.steps[i];
+                    let mark = p.output_lease_mark();
                     let rows = p.evaluate(&s.bgp.source, &s.schema, None)?;
+                    let rows_leases = p.take_output_leases_since(mark);
                     for (r, _) in rows {
                         let (a, b) = if self.forward {
                             (r[s.x], r[s.y])
@@ -484,6 +546,7 @@ impl Program for Closure {
                         let g = s.g.map_or(Id::UNDEF, |gp| r[gp]);
                         out.push(([g, a, b], Id::UNDEF))?;
                     }
+                    drop(rows_leases);
                 }
             }
         }
@@ -740,31 +803,51 @@ impl PathOp {
         }
     }
 
-    fn rows_of(&self, schema: &[u32], ends: &Ends, ch: Vec<Change<Fact>>) -> AChanges {
-        ch.into_iter()
-            .filter_map(|c| {
-                let r = self.fact_row(schema, ends, &c.fact)?;
-                let a = c.ann.unwrap_or(Ann::Count(c.weight));
-                Some((r, c.weight, a))
-            })
-            .collect()
+    fn rows_of(
+        &self,
+        p: &Pass,
+        schema: &[u32],
+        ends: &Ends,
+        ch: Vec<Change<Fact>>,
+        out_lease: &mut ScratchLease,
+    ) -> Result<AChanges> {
+        let mut out = AChanges::new();
+        let mut ann_bytes = 0u64;
+        for c in ch {
+            let Some(r) = self.fact_row(schema, ends, &c.fact) else {
+                continue;
+            };
+            let a = c.ann.unwrap_or(Ann::Count(c.weight));
+            p.preadmit_achanges_push(&out, schema.len(), &mut ann_bytes, a.bytes(), out_lease)?;
+            out.push((r, c.weight, a));
+        }
+        Ok(out)
     }
 
     pub fn init(&mut self, p: &mut Pass, schema: &[u32]) -> Result<Changes> {
-        Ok(self
-            .init_a(p, schema)?
-            .into_iter()
-            .map(|(r, w, _)| (r, w))
-            .collect())
+        let mark = p.output_lease_mark();
+        let raw = self.init_a(p, schema)?;
+        let raw_leases = p.take_output_leases_since(mark);
+        let out: Changes = raw.into_iter().map(|(r, w, _)| (r, w)).collect();
+        for lease in raw_leases {
+            p.push_output_lease(lease);
+        }
+        Ok(out)
     }
 
     pub fn delta(&mut self, p: &mut Pass, schema: &[u32]) -> Result<Changes> {
-        Ok(self
-            .delta_a(p, schema)?
+        let mark = p.output_lease_mark();
+        let raw = self.delta_a(p, schema)?;
+        let raw_leases = p.take_output_leases_since(mark);
+        let out: Changes = raw
             .into_iter()
             .filter(|(_, w, _)| *w != 0)
             .map(|(r, w, _)| (r, w))
-            .collect())
+            .collect();
+        for lease in raw_leases {
+            p.push_output_lease(lease);
+        }
+        Ok(out)
     }
 
     pub fn init_a(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
@@ -782,11 +865,19 @@ impl PathOp {
     fn init_rows(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
         let ends = self.ends(p);
         let max = p.max_memory_bytes;
-        let ch = self.fixed.build(p, max)?;
-        let mut out = self.rows_of(schema, &ends, ch);
+        let (ch, ch_bytes) = self.fixed.build_charged(p, max)?;
+        let ch_lease = ScratchLease::from_reserved(p.budget_handle(), ch_bytes);
+        let mut out_lease = p.scratch_lease();
+        let mut out = self.rows_of(p, schema, &ends, ch, &mut out_lease)?;
+        drop(ch_lease);
         if self.zero {
-            out.extend(self.zero_build(p, schema, &ends)?);
+            let extra = self.zero_build(p, schema, &ends)?;
+            let extra_bytes = (extra.len() as u64)
+                .saturating_mul(super::super::zset::row_bytes(schema.len()) + 32);
+            out_lease.try_reserve(extra_bytes)?;
+            out.extend(extra);
         }
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -807,11 +898,19 @@ impl PathOp {
     fn delta_rows(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
         let ends = self.ends(p);
         let max = p.max_memory_bytes;
-        let ch = self.fixed.advance(p, max)?;
-        let mut out = self.rows_of(schema, &ends, ch);
+        let (ch, ch_bytes) = self.fixed.advance_charged(p, max)?;
+        let ch_lease = ScratchLease::from_reserved(p.budget_handle(), ch_bytes);
+        let mut out_lease = p.scratch_lease();
+        let mut out = self.rows_of(p, schema, &ends, ch, &mut out_lease)?;
+        drop(ch_lease);
         if self.zero {
-            out.extend(self.zero_delta(p, schema, &ends)?);
+            let extra = self.zero_delta(p, schema, &ends)?;
+            let extra_bytes = (extra.len() as u64)
+                .saturating_mul(super::super::zset::row_bytes(schema.len()) + 32);
+            out_lease.try_reserve(extra_bytes)?;
+            out.extend(extra);
         }
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -1104,7 +1203,10 @@ impl PathOp {
     }
 
     pub fn load(&mut self, r: &mut Reader) -> Result<()> {
-        self.fixed.load(r)
+        self.fixed.store_mut().attach_budget(r.budget_handle());
+        let res = self.fixed.load(r);
+        self.fixed.store_mut().detach_budget();
+        res
     }
 
     pub fn describe(&self) -> String {

@@ -590,7 +590,7 @@ impl Arrangement {
 
     /// Remove every row.
     pub fn clear(&mut self) {
-        self.map.clear();
+        self.map = FxHashMap::default();
         self.len = 0;
     }
 
@@ -652,9 +652,10 @@ impl Arrangement {
     }
 
     pub fn load(&mut self, r: &mut Reader) -> Result<()> {
-        self.map.clear();
+        self.map = FxHashMap::default();
         self.len = 0;
         let n = r.u64()?;
+        let mut charged = 0u64;
         for _ in 0..n {
             let row = r.row()?;
             if row.len() != self.width {
@@ -663,6 +664,14 @@ impl Arrangement {
                 ));
             }
             let w = r.i64()?;
+            let next = self
+                .bytes()
+                .saturating_add(row_bytes(self.width))
+                .saturating_add(row_bytes(self.key.len()));
+            if next > charged {
+                r.charge_state(next - charged)?;
+                charged = next;
+            }
             self.add(&row, w);
         }
         Ok(())
@@ -710,23 +719,6 @@ pub fn side_matches_a(
             )),
         },
     }
-}
-
-/// Add annotated changes to an arrangement and its annotations, returning the
-/// effective changes (one per change, in order).
-pub fn absorb_side(
-    arr: &mut Arrangement,
-    ann: &mut AnnMap,
-    c: AChanges,
-    mode: Provenance,
-) -> AChanges {
-    c.into_iter()
-        .map(|(r, w, a)| {
-            arr.add(&r, w);
-            let e = prov::absorb_row(ann, &r, a, mode);
-            (r, w, e)
-        })
-        .collect()
 }
 
 /// The rows of one side of a join that can match a row of the other side: from the

@@ -38,13 +38,21 @@ impl Distinct {
 
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         self.weights = ZSet::new();
+        let mark = p.output_lease_mark();
         let c = self.inner.init(p)?;
-        self.apply(p, c)
+        let c_leases = p.take_output_leases_since(mark);
+        let out = self.apply(p, c)?;
+        drop(c_leases);
+        Ok(out)
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
+        let mark = p.output_lease_mark();
         let c = self.inner.delta(p)?;
-        self.apply(p, c)
+        let c_leases = p.take_output_leases_since(mark);
+        let out = self.apply(p, c)?;
+        drop(c_leases);
+        Ok(out)
     }
 
     /// [`apply`](Self::apply) with annotations: a row's annotation is the sum of its

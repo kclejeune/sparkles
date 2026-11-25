@@ -894,7 +894,10 @@ pub fn load_map(r: &mut Reader, mode: Provenance) -> Result<AnnMap> {
     let mut m = AnnMap::default();
     for _ in 0..n {
         let row = r.row()?;
-        m.insert(row, Ann::load(r, mode)?);
+        let width = row.len();
+        let a = Ann::load(r, mode)?;
+        r.charge_state(super::zset::row_bytes(width).saturating_add(a.bytes()))?;
+        m.insert(row, a);
     }
     Ok(m)
 }
@@ -1003,7 +1006,7 @@ impl FactCache {
     }
 
     pub fn clear(&mut self) {
-        self.map.clear();
+        self.map = FxHashMap::default();
     }
 
     pub fn bytes(&self) -> u64 {

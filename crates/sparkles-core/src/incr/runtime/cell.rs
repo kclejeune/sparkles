@@ -38,6 +38,18 @@ pub(super) struct Hist {
     bytes: u64,
 }
 
+/// Replay diffs kept for resumed live queries and past-commit reads.
+///
+/// Stored behind a leaf [`Mutex`] so [`super::super::budget::ViewBudget`] can evict
+/// oldest diffs first whenever active circuit state or pass work hits a memory cap,
+/// without ever acquiring `Cell::state` or `Runtime::reg`.
+#[derive(Default)]
+pub(super) struct HistoryBuf {
+    pub(super) entries: VecDeque<Hist>,
+    pub(super) rows: usize,
+    pub(super) bytes: u64,
+}
+
 fn term_bytes(t: &Term) -> u64 {
     match t {
         Term::NamedNode(n) => 32 + n.as_str().len() as u64,
@@ -85,12 +97,10 @@ pub(crate) struct Slot {
     /// why the access makes the whole query be evaluated again, when it does
     pub(super) whole: Option<String>,
     pub(super) vars: Arc<[String]>,
-    pub(super) history: VecDeque<Hist>,
-    pub(super) history_rows: usize,
-    pub(super) history_bytes: u64,
+    pub(super) history: Arc<Mutex<HistoryBuf>>,
     pub(super) subs: Vec<Sub>,
-    /// the views attached to the circuit
-    pub(super) views: usize,
+    /// each attached view's local `memoryBytes` ceiling, by view name
+    pub(super) view_limits: FxHashMap<String, u64>,
     /// set by a switch of the inference until the evaluation that follows it: the change
     /// that evaluation publishes leads from one mode to the other, and diffs from before
     /// it must not rewind a view across the switch
@@ -99,6 +109,55 @@ pub(crate) struct Slot {
 }
 
 impl Slot {
+    /// Leaf reclaim hook for `ViewBudget`: drops oldest replay diffs when active state
+    /// needs headroom under the local cap or parent pool.
+    pub(super) fn history_reclaim_hook(
+        history: &Arc<Mutex<HistoryBuf>>,
+    ) -> crate::incr::budget::ReclaimHook {
+        let hist = history.clone();
+        Arc::new(move |needed: u64| {
+            let mut h = hist.lock();
+            let mut freed = 0u64;
+            while freed < needed {
+                let Some(old) = h.entries.pop_front() else {
+                    break;
+                };
+                h.rows = h.rows.saturating_sub(old.rows.len());
+                h.bytes = h.bytes.saturating_sub(old.bytes);
+                freed = freed.saturating_add(old.bytes);
+                drop(old);
+            }
+            if h.entries.is_empty() {
+                h.entries = VecDeque::new();
+                h.rows = 0;
+                h.bytes = 0;
+            }
+            freed
+        })
+    }
+
+    pub(super) fn views_count(&self) -> usize {
+        self.view_limits.len()
+    }
+
+    /// Recompute the shared circuit's local byte limit from its currently attached views
+    /// and live subscribers so detaching a larger consumer lowers the ceiling.
+    pub(super) fn recompute_local_limit(&mut self) {
+        let max_view = self.view_limits.values().copied().max();
+        let max_sub = self
+            .subs
+            .iter()
+            .filter(|s| s.shared.strong_count() > 0)
+            .map(|s| s.budget)
+            .max();
+        let effective = match (max_view, max_sub) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(limit) = effective {
+            self.circuit.set_local_limit(Some(limit));
+        }
+    }
     /// Why the whole query is evaluated again: protections that depend on the data, or
     /// the dataset's inference.
     pub(super) fn whole_reason(&self, inference: Option<&Inference>) -> Option<String> {
@@ -220,18 +279,25 @@ impl Slot {
 
     /// Forget the diffs kept for resumed live queries and reads at past commits.
     pub(super) fn clear_history(&mut self) {
-        self.history.clear();
-        self.history_rows = 0;
-        self.history_bytes = 0;
+        {
+            let mut h = self.history.lock();
+            h.entries = VecDeque::new();
+            h.rows = 0;
+            h.bytes = 0;
+        }
         self.circuit.set_external_best_effort(0);
     }
 
     pub(super) fn alive(&mut self) -> bool {
+        let before = self.subs.len();
         self.subs.retain(|s| s.shared.strong_count() > 0);
-        if self.subs.is_empty() && self.views == 0 {
+        if self.subs.len() != before {
+            self.recompute_local_limit();
+        }
+        if self.subs.is_empty() && self.view_limits.is_empty() {
             self.clear_history();
         }
-        !self.subs.is_empty() || self.views > 0
+        !self.subs.is_empty() || !self.view_limits.is_empty()
     }
 
     pub(super) fn remember(
@@ -242,71 +308,92 @@ impl Slot {
         max: usize,
     ) {
         let max = if self.subs.is_empty() {
-            if self.views == 0 {
+            if self.view_limits.is_empty() {
                 return;
             }
             VIEW_HISTORY_COMMITS
         } else {
             max
         };
-        if rows.is_empty()
-            && let Some(last) = self.history.back_mut()
-            && last.rows.is_empty()
-            && last.to == from
-        {
-            last.to = to;
-            return;
-        }
-        let bytes = hist_bytes(&rows);
-        self.history_rows += rows.len();
-        self.history_bytes = self.history_bytes.saturating_add(bytes);
-        self.history.push_back(Hist {
-            from,
-            to,
-            rows,
-            bytes,
-        });
-        while self.history.len() > max.max(1) || self.history_rows > HISTORY_ROWS {
-            match self.history.pop_front() {
-                Some(h) => {
-                    self.history_rows -= h.rows.len();
-                    self.history_bytes = self.history_bytes.saturating_sub(h.bytes);
-                }
-                None => break,
+        if rows.is_empty() {
+            let mut h = self.history.lock();
+            if let Some(last) = h.entries.back_mut()
+                && last.rows.is_empty()
+                && last.to == from
+            {
+                last.to = to;
+                return;
             }
         }
-        // Admit the retained history against the circuit's budget and parent pool,
-        // dropping the oldest diffs first when memory is tight so history never
-        // escapes the pool or breaks an otherwise healthy view.
-        while self.circuit.try_set_external(self.history_bytes).is_err() {
-            match self.history.pop_front() {
-                Some(h) => {
-                    self.history_rows -= h.rows.len();
-                    self.history_bytes = self.history_bytes.saturating_sub(h.bytes);
+        let bytes = hist_bytes(&rows);
+        let new_rows = rows.len();
+        {
+            let mut h = self.history.lock();
+            while h.entries.len() >= max.max(1) || h.rows.saturating_add(new_rows) > HISTORY_ROWS {
+                match h.entries.pop_front() {
+                    Some(old) => {
+                        h.rows = h.rows.saturating_sub(old.rows.len());
+                        h.bytes = h.bytes.saturating_sub(old.bytes);
+                    }
+                    None => break,
                 }
-                None => {
-                    self.history_rows = 0;
-                    self.history_bytes = 0;
-                    self.circuit.set_external_best_effort(0);
-                    break;
+            }
+        }
+        // Pre-admit the incoming diff before storing it in history, evicting oldest
+        // entries first when memory is tight so replay history never escapes the pool
+        // or breaks an otherwise healthy view.
+        loop {
+            let cur_bytes = self.history.lock().bytes;
+            let next_bytes = cur_bytes.saturating_add(bytes);
+            if self.circuit.try_set_external(next_bytes).is_ok() {
+                let mut h = self.history.lock();
+                h.rows = h.rows.saturating_add(new_rows);
+                h.bytes = h.bytes.saturating_add(bytes);
+                h.entries.push_back(Hist {
+                    from,
+                    to,
+                    rows,
+                    bytes,
+                });
+                return;
+            }
+            let popped = {
+                let mut h = self.history.lock();
+                let popped = h.entries.pop_front();
+                if let Some(ref old) = popped {
+                    h.rows = h.rows.saturating_sub(old.rows.len());
+                    h.bytes = h.bytes.saturating_sub(old.bytes);
                 }
+                if h.entries.is_empty() {
+                    h.entries = VecDeque::new();
+                    h.rows = 0;
+                    h.bytes = 0;
+                }
+                popped
+            };
+            if popped.is_none() {
+                drop(rows);
+                self.circuit.set_external_best_effort(0);
+                return;
             }
         }
     }
 
     /// The net change from commit `after` to the circuit's commit from the history.
     pub(super) fn history_since(&self, after: u64) -> Option<Vec<(Vec<Option<Term>>, i64)>> {
-        let start = self.history.iter().position(|h| {
-            h.from == after || (h.rows.is_empty() && h.from <= after && after < h.to)
+        let h = self.history.lock();
+        let start = h.entries.iter().position(|entry| {
+            entry.from == after
+                || (entry.rows.is_empty() && entry.from <= after && after < entry.to)
         })?;
         let mut at = after;
         let mut parts = Vec::new();
-        for h in self.history.iter().skip(start) {
-            if h.from > at {
+        for entry in h.entries.iter().skip(start) {
+            if entry.from > at {
                 return None;
             }
-            parts.push(&h.rows);
-            at = h.to;
+            parts.push(&entry.rows);
+            at = entry.to;
         }
         if at != self.circuit.applied {
             return None;
@@ -350,11 +437,13 @@ pub(crate) struct Cell {
 }
 
 impl Cell {
-    /// Detach one view from the circuit, which leaves the views still attached.
-    pub(super) fn release_view(&self) -> usize {
+    /// Detach view `name` from the circuit and recompute its effective local limit,
+    /// returning the number of views still attached.
+    pub(super) fn release_view(&self, name: &str) -> usize {
         let mut st = self.state.lock();
-        st.views = st.views.saturating_sub(1);
-        st.views
+        st.view_limits.remove(name);
+        st.recompute_local_limit();
+        st.view_limits.len()
     }
 }
 

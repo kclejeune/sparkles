@@ -227,7 +227,7 @@ impl Runtime {
         // the pass is applied in memory and not yet checkpointed (a test hook; it must
         // not call the runtime, whose locks the pass holds)
         store.failpoint("view-pass-applied");
-        if d.complete && st.circuit.applied > from + 1 && from > 0 && st.views > 0 {
+        if d.complete && st.circuit.applied > from + 1 && from > 0 && st.views_count() > 0 {
             tracing::debug!(
                 target: "sparkles::incr::runtime",
                 "a view circuit applied commits {}..={}",
@@ -242,6 +242,7 @@ impl Runtime {
     /// End the live queries of the circuit whose budget its state passed.
     pub(super) fn live_budgets(&self, st: &mut Slot) {
         let bytes = st.circuit.bytes();
+        let before = st.subs.len();
         st.subs.retain(|s| {
             if bytes <= s.budget {
                 return true;
@@ -257,19 +258,52 @@ impl Runtime {
             }
             false
         });
+        if st.subs.len() != before {
+            st.recompute_local_limit();
+        }
     }
 
     /// Send the change `c` from commit `from` to the circuit's commit to the
     /// subscribers.
     pub(super) fn publish(&self, st: &mut Slot, from: u64, c: Changes, reset: bool) {
+        let before_subs = st.subs.len();
         st.subs.retain(|s| s.shared.strong_count() > 0);
+        if st.subs.len() != before_subs {
+            st.recompute_local_limit();
+        }
         let to = st.circuit.applied;
         if st.subs.is_empty() {
-            if st.views == 0 || (reset && c.len() > self.opts.read().reset_rows) {
+            if st.views_count() == 0 || (reset && c.len() > self.opts.read().reset_rows) {
                 st.clear_history();
             } else {
-                let rows = st.circuit.decode_rows(&c).into();
-                st.remember(from, to, rows, VIEW_HISTORY_COMMITS);
+                // Decode incrementally under a scratch lease so an oversized diff for a
+                // view with no live subscribers is abandoned before unbounded allocation.
+                let mut lease = st.circuit.scratch_lease();
+                let mut decoded = Vec::new();
+                let mut bytes = 0u64;
+                let mut fits = true;
+                if let Some(snap) = &st.circuit.snap {
+                    for (r, w) in &c {
+                        let row: Vec<Option<Term>> =
+                            r.iter().map(|&i| st.circuit.terms.term(snap, i)).collect();
+                        bytes =
+                            bytes.saturating_add(super::super::circuit::decoded_row_bytes(&row));
+                        if lease.try_set(bytes).is_err() {
+                            fits = false;
+                            break;
+                        }
+                        decoded.push((row, *w));
+                    }
+                }
+                if fits {
+                    let rows: Arc<[(Vec<Option<Term>>, i64)]> = decoded.into();
+                    drop(lease);
+                    st.remember(from, to, rows, VIEW_HISTORY_COMMITS);
+                } else {
+                    drop(decoded);
+                    drop(lease);
+                    st.clear_history();
+                }
             }
             return;
         }
@@ -364,7 +398,7 @@ impl Runtime {
                     tracing::warn!(target: "sparkles::incr::runtime", "view {n} suspended: {why}");
                     e.suspended = Some(why);
                     if let Some(c) = e.cell.take() {
-                        if c.release_view() == 0 {
+                        if c.release_view(&n) == 0 {
                             total = total.saturating_sub(*bytes);
                         }
                         detached.push(c);
@@ -377,8 +411,7 @@ impl Runtime {
 
     /// Drop the circuits nobody uses.
     pub(super) fn gc(&self) {
-        let mut dead: Vec<Arc<Cell>> = Vec::new();
-        let mut retired: Vec<MemoryLease> = Vec::new();
+        let mut deferred = DeferredDrops::default();
         {
             let mut reg = self.reg.lock();
             reg.cells.retain(|_, c| {
@@ -388,9 +421,9 @@ impl Runtime {
                 match c.state.try_lock() {
                     Some(mut st) => {
                         let keep = st.alive();
-                        retired.extend(st.circuit.drain_retired());
+                        deferred.retired.extend(st.circuit.drain_retired());
                         if !keep {
-                            dead.push(c.clone());
+                            deferred.cells.push(c.clone());
                         }
                         keep
                     }
@@ -401,8 +434,7 @@ impl Runtime {
                 *self.subscription.lock() = None;
             }
         }
-        drop(retired);
-        drop(dead);
+        drop(deferred);
     }
 
     /// Checkpoint every view whose state moved since its last checkpoint.
