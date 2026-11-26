@@ -56,6 +56,7 @@ DEFERRED = {
     "evidence.find_dependents",
     "evidence.holds",
     "evidence.propose",
+    "evidence.reauthenticate",
     "evidence.release_hold",
     "evidence.resolve",
     "evidence.resolve_entities",

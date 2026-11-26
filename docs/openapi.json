@@ -9813,6 +9813,200 @@
         ],
         "type": "object"
       },
+      "EvidenceReauthenticateRequest": {
+        "additionalProperties": false,
+        "description": "Administered re-authentication request for records of an earlier protection.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "properties": {
+          "branch": {
+            "description": "The target branch name. `main` when absent.",
+            "type": "string"
+          },
+          "dryRun": {
+            "description": "Verify and preview the changes without committing.",
+            "type": "boolean"
+          },
+          "graph": {
+            "description": "The protected evidence record graph to reconcile.",
+            "type": "string"
+          },
+          "idempotencyKey": {
+            "description": "Replays the first reconciliation receipt when repeated with the same payload.",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ifHead": {
+            "description": "Commit only while the target branch head equals this commit.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "description": "Optional commit message.",
+            "type": "string"
+          },
+          "records": {
+            "description": "Specific records to verify and re-authenticate. Omit to reconcile every profile record in `graph`.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "iri": {
+                  "description": "The record IRI to verify and vouch for.",
+                  "type": "string"
+                },
+                "recordDigest": {
+                  "description": "Optional expected `ev:recordDigest` that the record must match.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "iri"
+              ],
+              "type": "object"
+            },
+            "maxItems": 10000,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "graph"
+        ],
+        "type": "object"
+      },
+      "EvidenceReauthenticateResult": {
+        "additionalProperties": false,
+        "description": "Result of an administered evidence re-authentication reconciliation.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "properties": {
+          "branchId": {
+            "description": "The reconciled branch's UUID.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "commit": {
+            "description": "The publishing commit, the first commit on a replay, or the branch head on a dry run or no-op.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "Whether this call published a commit.",
+            "type": "boolean"
+          },
+          "dryRun": {
+            "additionalProperties": false,
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "inserted": {
+                "type": "integer"
+              },
+              "wouldCommit": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wouldCommit",
+              "inserted",
+              "deleted",
+              "error"
+            ],
+            "type": "object"
+          },
+          "graph": {
+            "description": "The reconciled evidence record graph.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "The audit `ev:Operation` IRI in the reconciled graph.",
+            "type": "string"
+          },
+          "records": {
+            "description": "Every verified record of the reconciliation.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "alreadyAuthenticated": {
+                  "description": "Whether the record already carried the graph's current protection nonce.",
+                  "type": "boolean"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "SourceRevision",
+                    "Rendition",
+                    "Passage",
+                    "EvidenceRef",
+                    "Claim",
+                    "EvidenceLink",
+                    "Assessment",
+                    "Note",
+                    "Decision",
+                    "Task",
+                    "ReviewDecision",
+                    "IdentityProposal",
+                    "AcceptanceSupport",
+                    "Withdrawal",
+                    "Projection",
+                    "ResolutionMap"
+                  ],
+                  "type": "string"
+                },
+                "receipt": {
+                  "description": "The record's preserved `ev:availabilityReceipt` operation IRI.",
+                  "type": "string"
+                },
+                "recordDigest": {
+                  "description": "The verified `ev:recordDigest`.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "iri",
+                "kind",
+                "recordDigest",
+                "receipt",
+                "alreadyAuthenticated"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "replayed": {
+            "description": "Whether an earlier idempotent operation's receipt was returned.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation",
+          "graph",
+          "committed",
+          "replayed",
+          "commit",
+          "branchId",
+          "records"
+        ],
+        "type": "object"
+      },
       "EvidenceRecordedStatus": {
         "additionalProperties": false,
         "description": "Recorded evidence settings, protection state and drift status.",
@@ -35554,6 +35748,93 @@
           }
         ],
         "summary": "Release an evidence hold",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/reauthenticate": {
+      "post": {
+        "description": "Needs `admin` on the dataset and target branch. Verifies records written under an earlier protection nonce in a protected evidence record graph against their recorded digests, retained content, passage spans and receipts, and atomically marks the verified records and their receipt operations under the graph's current protection nonce together with an audit operation. Refuses tampered or mismatched records without writing (`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable`, `422 incomplete-evidence`). Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused key with another payload, `409 unsupported-profile` while the graph is detached or the profile is disabled, and `503 authority-changed` when authorization changes before publication.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "operationId": "reauthenticateEvidence",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceReauthenticateRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceReauthenticateResult"
+                }
+              }
+            },
+            "description": "The reconciliation receipt and verified records."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Re-authenticate evidence records under a graph's current protection",
         "tags": [
           "Datasets"
         ],

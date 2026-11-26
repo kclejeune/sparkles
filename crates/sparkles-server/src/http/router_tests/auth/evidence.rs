@@ -837,3 +837,166 @@ async fn evidence_settings_reads_use_admin_middleware() {
         }
     }
 }
+
+#[tokio::test]
+async fn evidence_reauthenticate_requires_admin_and_respects_drift() {
+    let s = proposal_server();
+    let alice = b("alice");
+    let evw = basic("evw", "evw-pw");
+    let bob = b("bob");
+
+    // Propose a claim as writer `evw`.
+    let r = propose(&s, &evw, &revision_and_claim("reauth-auth")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let claim_iri = r.json()["records"][1]["iri"].as_str().unwrap().to_string();
+
+    // Admin detaches and re-protects `urn:ev:claims`.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/detach",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({ "graph": "urn:ev:claims" }).to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/evidence/ev/settings",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({
+            "format": 1,
+            "profile": 1,
+            "enabled": true,
+            "sourceRecords": ["urn:ev:sources"],
+            "proposals": ["urn:ev:claims"]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    let body = serde_json::json!({ "graph": "urn:ev:claims" }).to_string();
+
+    // Anonymous caller -> 401.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/reauthenticate",
+        &[("content-type", "application/json")],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+
+    // Writer `evw` (non-admin) -> 403.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/reauthenticate",
+        &[
+            ("authorization", &evw),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+
+    // Unrelated user `bob` -> 403/404.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/reauthenticate",
+        &[
+            ("authorization", &bob),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert!(
+        matches!(r.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+        "{}: {}",
+        r.status,
+        r.text()
+    );
+
+    // While declared evidence settings drift, even admin gets 409 evidence-settings-drift.
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    std::fs::write(
+        &f,
+        serde_json::json!({
+            "datasets": {
+                "ev": {
+                    "evidence": {
+                        "enabled": true,
+                        "sourceRecords": ["urn:ev:sources", "urn:ev:extra-sources"],
+                        "proposals": ["urn:ev:claims"]
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let drifted = crate::settings::Settings::load(&f, None).unwrap();
+    let orig_declared = s.state.settings.declared();
+    s.state
+        .settings
+        .replace_declared_for_test(drifted.declared());
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/reauthenticate",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "evidence-settings-drift");
+    s.state.settings.replace_declared_for_test(orig_declared);
+
+    // Admin `alice` succeeds once reconciled and restores resolution for `evw`.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/reauthenticate",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["committed"], true);
+
+    let r = call(
+        &s.app,
+        "POST",
+        "/ev/claims/resolve",
+        &[
+            ("authorization", &evw),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({
+            "references": [{ "key": "c", "record": { "iri": claim_iri } }]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    drop(dir);
+}

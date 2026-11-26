@@ -38,6 +38,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(get_settings).put(put_settings),
         )
         .route("/$/evidence/{ds}/detach", post(detach))
+        .route("/$/evidence/{ds}/reauthenticate", post(reauthenticate))
         .route("/$/evidence/{ds}/holds", get(list_holds).post(acquire_hold))
         .route("/$/evidence/{ds}/holds/{id}", delete(release_hold))
         .route("/{ds}/claims/resolve", post(resolve))
@@ -129,6 +130,183 @@ async fn detach(
         body(sparkles::evidence::detach(&ds.dataset, &request.graph)?)
     })
     .await
+}
+
+const MAX_REAUTHENTICATE_BYTES: usize = 4 << 20;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReauthenticateRequest {
+    graph: String,
+    branch: Option<String>,
+    records: Option<Vec<ReauthenticateRecordJson>>,
+    if_head: Option<u64>,
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReauthenticateRecordJson {
+    iri: String,
+    record_digest: Option<String>,
+}
+
+/// `POST /$/evidence/{ds}/reauthenticate`: verify records written under an earlier
+/// protection nonce in a protected evidence record graph against their recorded digests
+/// and mark the vouched records under the graph's current protection nonce.
+async fn reauthenticate(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(bytes): AdminBody,
+) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    if bytes.len() > MAX_REAUTHENTICATE_BYTES {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("a re-authentication request holds at most {MAX_REAUTHENTICATE_BYTES} bytes"),
+        ));
+    }
+    let request: ReauthenticateRequest = serde_json::from_slice(&bytes).map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid re-authentication request: {e}"),
+        )
+    })?;
+    let graph = named("graph", &request.graph)?;
+    let records = match request.records {
+        None => None,
+        Some(list) => {
+            if list.is_empty() {
+                return Err(bad(
+                    "records".into(),
+                    "records must not be empty when supplied; omit records to reconcile every record in the graph",
+                ));
+            }
+            if list.len() > sparkles::evidence::MAX_REAUTHENTICATE_RECORDS {
+                return Err(bad(
+                    "records".into(),
+                    format!(
+                        "at most {} records",
+                        sparkles::evidence::MAX_REAUTHENTICATE_RECORDS
+                    ),
+                ));
+            }
+            let mut parsed = Vec::with_capacity(list.len());
+            for (i, item) in list.into_iter().enumerate() {
+                let at = format!("records[{i}]");
+                let iri = named(&format!("{at}.iri"), &item.iri)?;
+                let expected_digest = item
+                    .record_digest
+                    .as_deref()
+                    .map(|d| claims::digest(&format!("{at}.recordDigest"), d))
+                    .transpose()?;
+                parsed.push(sparkles::evidence::ReauthenticateRecord {
+                    iri,
+                    expected_digest,
+                });
+            }
+            Some(parsed)
+        }
+    };
+    if let Some(k) = &request.idempotency_key
+        && (k.is_empty() || k.len() > 256)
+    {
+        return Err(bad("idempotencyKey".into(), "a key has 1 to 256 bytes"));
+    }
+    let branch = request
+        .branch
+        .unwrap_or_else(|| sparkles::branch::MAIN.to_string());
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    let grant = crate::server_memory::current_grant();
+    let res = blocking(move || -> ApiResult<J> {
+        let _grant = grant;
+        let main = crate::http::main_dataset(&st, &name)?;
+        let here = crate::auth::on_branch(&main.name, &branch);
+        if !p.can(&here, crate::auth::Level::Admin) {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                format!("re-authentication needs admin on {here}"),
+            ));
+        }
+        let logical = if branch == sparkles::branch::MAIN {
+            main.clone()
+        } else {
+            st.branch_dataset(&main, &branch)?
+        };
+        crate::settings::evidence::require_reconciled(&st, &main)?;
+        let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
+        let opts = caller.options_on(
+            &crate::http::Params::empty(),
+            &here,
+            crate::auth::Endpoint::Update,
+        );
+        let control = Control {
+            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
+            ..Control::with_cancel(cancel)
+        };
+        let drift = crate::settings::evidence::DriftFence::capture(&st, &main)?;
+        let fence = Arc::new(claims::CallerFence {
+            st: st.clone(),
+            p: p.clone(),
+            drift,
+        });
+        let mut options = sparkles::evidence::ReauthenticateOptions::new(claims::principal_iri(&p));
+        options.records = records;
+        options.idempotency_key = request.idempotency_key;
+        options.if_head = request.if_head;
+        options.dry_run = request.dry_run;
+        options.message = request.message.map(Arc::from);
+        options.author = crate::http::author(&p);
+        options.write = opts.graphs.clone();
+        options.authority = Some(fence.clone());
+        let outcome = sparkles::evidence::reauthenticate(
+            &main.dataset,
+            &logical.dataset,
+            &graph,
+            &options,
+            &control,
+        )?;
+        let mut out = json!({
+            "operation": outcome.operation.as_str(),
+            "graph": outcome.graph.as_str(),
+            "committed": outcome.committed,
+            "replayed": outcome.replayed,
+            "commit": outcome.commit,
+            "branchId": outcome.branch,
+            "records": outcome.records.iter().map(|r| json!({
+                "iri": r.iri.as_str(),
+                "kind": kind_name(r.kind),
+                "recordDigest": r.digest.to_string(),
+                "receipt": r.receipt.as_str(),
+                "alreadyAuthenticated": r.already_authenticated,
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(preview) = &outcome.preview {
+            let commit = preview.receipt_commit();
+            out["dryRun"] = json!({
+                "wouldCommit": matches!(preview.outcome(), sparkles::preview::Outcome::Commit),
+                "inserted": commit.inserted,
+                "deleted": commit.deleted,
+                "error": preview.error(),
+            });
+        }
+        fence.check_uncommitted(outcome.committed)?;
+        Ok(out)
+    })
+    .await;
+    match res {
+        Ok(value) => Ok(Json(value).into_response()),
+        Err(error) if error.audit_code() == "authority-changed" => {
+            Ok(crate::auth::routes::authority_changed_response())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 // ------------------------------------------------------------------ holds ------

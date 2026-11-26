@@ -3887,6 +3887,20 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(
+            POST,
+            "/$/evidence/{ds}/reauthenticate",
+            "reauthenticateEvidence",
+            "Datasets",
+            "Re-authenticate evidence records under a graph's current protection",
+        )
+        .doc("Needs `admin` on the dataset and target branch. Verifies records written under an earlier protection nonce in a protected evidence record graph against their recorded digests, retained content, passage spans and receipts, and atomically marks the verified records and their receipt operations under the graph's current protection nonce together with an audit operation. Refuses tampered or mismatched records without writing (`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable`, `422 incomplete-evidence`). Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused key with another payload, `409 unsupported-profile` while the graph is detached or the profile is disabled, and `503 authority-changed` when authorization changes before publication.")
+        .see("evidence-settings")
+        .json_body(true, "EvidenceReauthenticateRequest")
+        .json("200", "The reconciliation receipt and verified records.", "EvidenceReauthenticateResult")
+        .errors(&[400, 403, 404, 409, 413, 422, 503]),
+    );
+    p.add(
+        op(
             GET,
             "/$/evidence/{ds}/holds",
             "listEvidenceHolds",

@@ -447,6 +447,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("detachEvidenceGraph", "evidence.detach", |ds| {
             let _ = sparkles::evidence::detach(ds, &any::<String>());
         }),
+        op!("reauthenticateEvidence", "evidence.reauthenticate", |ds| {
+            let _ = sparkles::evidence::reauthenticate(ds, ds, &any(), &any(), &any());
+        }),
         op!("listEvidenceHolds", "evidence.holds", |ds| {
             let _ = sparkles::evidence::holds(ds);
         }),

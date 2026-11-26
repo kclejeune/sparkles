@@ -603,6 +603,81 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
     };
     let commit = |d: &str| with_desc(json!({ "type": "integer", "minimum": 0 }), d);
     put(
+        "EvidenceReauthenticateRequest",
+        doc(
+            closed(
+                &["graph"],
+                json!({
+                    "graph": with_desc(string(), "The protected evidence record graph to reconcile."),
+                    "branch": with_desc(string(), "The target branch name. `main` when absent."),
+                    "records": with_desc(json!({
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 10000,
+                        "items": closed(
+                            &["iri"],
+                            json!({
+                                "iri": with_desc(string(), "The record IRI to verify and vouch for."),
+                                "recordDigest": digest("Optional expected `ev:recordDigest` that the record must match."),
+                            }),
+                        ),
+                    }), "Specific records to verify and re-authenticate. Omit to reconcile every profile record in `graph`."),
+                    "ifHead": commit("Commit only while the target branch head equals this commit."),
+                    "idempotencyKey": with_desc(json!({ "type": "string", "minLength": 1, "maxLength": 256 }), "Replays the first reconciliation receipt when repeated with the same payload."),
+                    "dryRun": with_desc(boolean(), "Verify and preview the changes without committing."),
+                    "message": with_desc(string(), "Optional commit message."),
+                }),
+            ),
+            "Administered re-authentication request for records of an earlier protection.",
+            "evidence-settings",
+        ),
+    );
+    put(
+        "EvidenceReauthenticateResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "graph",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "records",
+                ],
+                json!({
+                    "operation": with_desc(string(), "The audit `ev:Operation` IRI in the reconciled graph."),
+                    "graph": with_desc(string(), "The reconciled evidence record graph."),
+                    "committed": with_desc(boolean(), "Whether this call published a commit."),
+                    "replayed": with_desc(boolean(), "Whether an earlier idempotent operation's receipt was returned."),
+                    "commit": commit("The publishing commit, the first commit on a replay, or the branch head on a dry run or no-op."),
+                    "branchId": uuid("The reconciled branch's UUID."),
+                    "records": with_desc(array(closed(
+                        &["iri", "kind", "recordDigest", "receipt", "alreadyAuthenticated"],
+                        json!({
+                            "iri": string(),
+                            "kind": kinds(),
+                            "recordDigest": digest("The verified `ev:recordDigest`."),
+                            "receipt": with_desc(string(), "The record's preserved `ev:availabilityReceipt` operation IRI."),
+                            "alreadyAuthenticated": with_desc(boolean(), "Whether the record already carried the graph's current protection nonce."),
+                        }),
+                    )), "Every verified record of the reconciliation."),
+                    "dryRun": closed(
+                        &["wouldCommit", "inserted", "deleted", "error"],
+                        json!({
+                            "wouldCommit": boolean(),
+                            "inserted": int(),
+                            "deleted": int(),
+                            "error": or_null(string()),
+                        }),
+                    ),
+                }),
+            ),
+            "Result of an administered evidence re-authentication reconciliation.",
+            "evidence-settings",
+        ),
+    );
+    put(
         "EvidenceResolveRequest",
         doc(
             closed(

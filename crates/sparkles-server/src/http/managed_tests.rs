@@ -1224,3 +1224,239 @@ async fn identities_are_proposed_reviewed_and_resolved_over_http() {
         "/{ds}/claims/dependents"
     );
 }
+
+/// `POST /$/evidence/{ds}/reauthenticate` (spec C25, roadmap item 552): verifies records
+/// written under an earlier protection nonce after a detach + re-protect, refuses
+/// tampered records cleanly, restores resolution and proposals, and matches OpenAPI.
+#[tokio::test]
+async fn evidence_reauthenticate_http_route_and_openapi_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    let post = |uri: &'static str, body: J| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                uri,
+                Some("application/json"),
+                &body.to_string(),
+            )
+            .await
+        }
+    };
+    let settings = json!({
+        "format": 1,
+        "profile": 1,
+        "enabled": true,
+        "sourceRecords": ["urn:ev:sources"],
+        "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "advisories": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "requiredScope": [],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let batch = json!({
+        "revisions": [{
+            "key": "rev",
+            "source": "https://example.org/src",
+            "sourceKey": "src-1",
+            "content": { "text": "hello world" }
+        }],
+        "claims": [{
+            "key": "c1",
+            "occurrenceKey": "c1",
+            "revision": { "key": "rev" },
+            "proposition": "<https://example.org/a> <https://example.org/p> <https://example.org/b>",
+            "kind": "reported",
+            "polarity": "positive",
+            "author": "https://example.org/author"
+        }]
+    });
+    let (status, proposed) = post("/d/claims", batch.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{proposed}");
+    let rev_iri = proposed["records"][0]["iri"].as_str().unwrap().to_string();
+    let claim_iri = proposed["records"][1]["iri"].as_str().unwrap().to_string();
+    let claim_digest = proposed["records"][1]["recordDigest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Detach and re-protect `urn:ev:claims`.
+    let (status, _) = post("/$/evidence/d/detach", json!({ "graph": "urn:ev:claims" })).await;
+    assert_eq!(status, StatusCode::OK);
+    // Refuses while still detached.
+    let (status, j) = post(
+        "/$/evidence/d/reauthenticate",
+        json!({ "graph": "urn:ev:claims" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "unsupported-profile");
+
+    // Re-protect.
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Resolution fails with `origin-not-reproduced`, and re-proposal fails with
+    // `immutable-record-conflict`.
+    let (status, j) = post(
+        "/d/claims/resolve",
+        json!({ "references": [{ "key": "k", "record": { "iri": claim_iri } }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{j}");
+    assert_eq!(j["code"], "origin-not-reproduced");
+    let (status, j) = post("/d/claims", batch.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "immutable-record-conflict");
+
+    // Dry-run preview works without committing.
+    let (status, dry) = post(
+        "/$/evidence/d/reauthenticate",
+        json!({ "graph": "urn:ev:claims", "dryRun": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dry}");
+    assert_eq!(dry["committed"], false);
+    assert_eq!(dry["dryRun"]["wouldCommit"], true);
+
+    // Real reconciliation with idempotency key and pinned recordDigest succeeds.
+    let req_body = json!({
+        "graph": "urn:ev:claims",
+        "idempotencyKey": "http-reauth-1",
+        "records": [{ "iri": claim_iri, "recordDigest": claim_digest }],
+        "message": "re-authenticate claims after maintenance"
+    });
+    let (status, res) = post("/$/evidence/d/reauthenticate", req_body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{res}");
+    assert_eq!(res["committed"], true);
+    assert_eq!(res["replayed"], false);
+    assert_eq!(res["records"][0]["iri"], claim_iri);
+    assert_eq!(res["records"][0]["kind"], "Claim");
+    assert_eq!(res["records"][0]["alreadyAuthenticated"], false);
+
+    // Replay returns the original receipt cleanly.
+    let (status, replay) = post("/$/evidence/d/reauthenticate", req_body).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["committed"], false);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["operation"], res["operation"]);
+    assert_eq!(replay["commit"], res["commit"]);
+
+    // Same key with a different payload returns 409 idempotency-conflict.
+    let (status, conflict) = post(
+        "/$/evidence/d/reauthenticate",
+        json!({ "graph": "urn:ev:claims", "idempotencyKey": "http-reauth-1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["code"], "idempotency-conflict");
+
+    // Resolution and new proposals referencing the records now succeed.
+    let (status, resolved) = post(
+        "/d/claims/resolve",
+        json!({ "references": [{ "key": "k", "record": { "iri": claim_iri } }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resolved}");
+    assert_eq!(resolved["resolved"][0]["record"]["iri"], claim_iri);
+    let (status, followup) = post(
+        "/d/claims",
+        json!({
+            "claims": [{
+                "key": "c2",
+                "occurrenceKey": "c2",
+                "revision": { "iri": rev_iri },
+                "proposition": "<https://example.org/a> <https://example.org/p> <https://example.org/c>",
+                "kind": "observation",
+                "polarity": "positive",
+                "author": "https://example.org/author"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{followup}");
+
+    // Tampering while detached causes 409 immutable-record-conflict over HTTP.
+    let (status, _) = post("/$/evidence/d/detach", json!({ "graph": "urn:ev:claims" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/d/update",
+        Some(UPDATE),
+        &format!("INSERT DATA {{ GRAPH <urn:ev:claims> {{ <{claim_iri}> <https://example.org/bad> \"1\" }} }}"),
+    )
+    .await;
+    assert!(status.is_success());
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, tampered) = post(
+        "/$/evidence/d/reauthenticate",
+        json!({ "graph": "urn:ev:claims" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{tampered}");
+    assert_eq!(tampered["code"], "immutable-record-conflict");
+
+    // Projection graphs and malformed requests are rejected with 400.
+    for bad in [
+        json!({ "graph": "urn:ev:accepted" }),
+        json!({ "graph": "urn:ev:claims", "records": [] }),
+        json!({ "graph": "not an iri" }),
+        json!({ "graph": "urn:ev:claims", "extra": 1 }),
+    ] {
+        let (status, j) = post("/$/evidence/d/reauthenticate", bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+    }
+
+    // Response matches the published OpenAPI schema.
+    let doc = crate::openapi::build("0.0.0");
+    let schema = doc["paths"]["/$/evidence/{ds}/reauthenticate"]["post"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]
+        .clone();
+    assert_eq!(
+        crate::openapi::contract_tests::mismatch(&doc, &schema, &res, "$"),
+        None
+    );
+}
