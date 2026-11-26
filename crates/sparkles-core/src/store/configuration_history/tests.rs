@@ -1307,10 +1307,18 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
     crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
     let src = Store::open(&src_root, StoreOptions::default()).unwrap();
     // Create several configuration generations so DiskClosure retains substantial bytes.
+    // Give the earliest imported WAL generation (`imp-0`) a large settings payload while
+    // keeping later generations small so `imp-0`'s publication decode inside `prove_wal`'s
+    // callback cleanly dominates setup and current-registry verification.
     for i in 0..8 {
+        let source_records = if i == 0 {
+            (0..400).map(|k| format!("urn:r2src:0:{k:04}")).collect()
+        } else {
+            vec![format!("urn:r2src:{i}")]
+        };
         let settings = crate::evidence::Settings {
             enabled: true,
-            source_records: vec![format!("urn:r2src:{i}")],
+            source_records,
             proposals: vec![format!("urn:r2prop:{i}")],
             ..Default::default()
         };
@@ -1368,114 +1376,272 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
     let own_last_seq = dst.head_commit().seq;
     assert!(own_last_seq > own_2_seq);
 
-    // 1. Verify disjoint live memory accounting in `DiskClosure::prove_wal`:
-    //    first observe `entered`, `before_physical`, and `callback` charges on a full
-    //    budget, then find the exact minimum passing limit and verify that just below
-    //    it admission succeeds all the way into `"callback"` (after closure loading,
-    //    base check, vocabulary, annotations, range storage, and physical proof buffer
-    //    reservation) before refusing the combined live allocations with BudgetExceeded.
+    // 1. Verify disjoint live memory accounting in `DiskClosure::prove_wal` across
+    //    BOTH callers (`authenticate_retained_generation` and closed-copy
+    //    `validate_copy_imported`):
+    //    (a) At a fixed full budget, measure every admission boundary and assert that:
+    //        - `actual_commit` stays charged in `budget` during setup and is released
+    //          before `physical::prove_prefix*`,
+    //        - `actual_meta` (`Owned<IndexMeta>`) and `orig` (`DiskOriginalBase`) keep
+    //          their full decoded charges attached inside `setup_prep`,
+    //        - `setup_prep` and `callback_prep` never overlap live `budget` charges
+    //          (`budget_used + sub_limit <= cap`), directly catching any regression
+    //          that passes a pre-proof allowance into the callback.
+    //    (b) At a tight budget derived independently from `DiskClosure::load`'s own peak
+    //        (no binary search over `prove_wal`), verify that BOTH callers reach
+    //        `"callback"` with non-overlapping `sub_limit` and refuse with
+    //        `Error::BudgetExceeded`.
     let opts = HistoryOptions::default();
     let entry = {
         let hist = dst.history.as_ref().unwrap().lock();
         hist.gens.get(&1).expect("gen-0001 retained").clone()
     };
+    let meta_len = std::fs::metadata(entry.dir.join("meta.json"))
+        .unwrap()
+        .len();
+
+    let capture_stages = |run: &mut dyn FnMut() -> Result<()>| -> (Result<()>, Vec<ProveWalStage>) {
+        let observed = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<ProveWalStage>::new()));
+        let observed_clone = observed.clone();
+        PROVE_WAL_STAGE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |stage| {
+                observed_clone.lock().push(stage);
+            }));
+        });
+        let res = run();
+        PROVE_WAL_STAGE_HOOK.with(|hook| hook.borrow_mut().take());
+        let stages = observed.lock().clone();
+        (res, stages)
+    };
+
+    let assert_full_disjoint_stages = |label: &str, stages: &[ProveWalStage], expected_max: u64| {
+        let entered = stages
+            .iter()
+            .find(|s| s.stage == "entered")
+            .unwrap_or_else(|| panic!("{label}: missing entered stage"));
+        let setup_meta = stages
+            .iter()
+            .find(|s| s.stage == "setup_meta")
+            .unwrap_or_else(|| panic!("{label}: missing setup_meta stage"));
+        let setup_source = stages
+            .iter()
+            .find(|s| s.stage == "setup_source")
+            .unwrap_or_else(|| panic!("{label}: missing setup_source stage"));
+        let before_physical = stages
+            .iter()
+            .find(|s| s.stage == "before_physical")
+            .unwrap_or_else(|| panic!("{label}: missing before_physical stage"));
+        let callback = stages
+            .iter()
+            .find(|s| s.stage == "callback")
+            .unwrap_or_else(|| panic!("{label}: missing callback stage"));
+        let cap = entered.budget_used + entered.budget_available;
+        assert!(
+            cap <= expected_max,
+            "{label}: budget cap {cap} exceeds caller limit {expected_max}"
+        );
+        assert!(
+            before_physical.budget_used > entered.budget_used,
+            "{label}: prove_wal must charge range/span storage ({} > {})",
+            before_physical.budget_used,
+            entered.budget_used
+        );
+        assert!(
+            setup_meta.budget_used > before_physical.budget_used,
+            "{label}: destination commit must remain charged in budget during setup and release before physical proof ({} > {})",
+            setup_meta.budget_used,
+            before_physical.budget_used
+        );
+        let meta_min_charge = meta_len * 128 + 1024;
+        assert!(
+            setup_meta.sub_used.unwrap() >= meta_min_charge,
+            "{label}: actual_meta must retain its decoded charge in setup_prep ({} >= {meta_min_charge})",
+            setup_meta.sub_used.unwrap()
+        );
+        assert!(
+            setup_source.sub_used.unwrap() > setup_meta.sub_used.unwrap() + meta_len * 128,
+            "{label}: DiskOriginalBase must retain its decoded charge on top of actual_meta ({} > {} + {})",
+            setup_source.sub_used.unwrap(),
+            setup_meta.sub_used.unwrap(),
+            meta_len * 128
+        );
+        assert!(
+            setup_meta.budget_used + setup_meta.sub_limit.unwrap() <= cap,
+            "{label}: setup_prep limit ({}) must not overlap live budget charge ({}) against cap ({cap})",
+            setup_meta.sub_limit.unwrap(),
+            setup_meta.budget_used
+        );
+        assert!(
+            callback.budget_used > before_physical.budget_used,
+            "{label}: physical proof buffer/state must be charged during callback ({} > {})",
+            callback.budget_used,
+            before_physical.budget_used
+        );
+        assert_eq!(
+            callback.sub_limit.unwrap(),
+            callback.budget_available,
+            "{label}: callback_prep must receive only proof_budget.available()"
+        );
+        assert!(
+            callback.budget_used + callback.sub_limit.unwrap() <= cap,
+            "{label}: callback_prep limit ({}) must not overlap proof_budget charge ({}) against cap ({cap})",
+            callback.sub_limit.unwrap(),
+            callback.budget_used
+        );
+        (
+            cap,
+            before_physical.budget_used,
+            setup_source.sub_used.unwrap(),
+        )
+    };
+
+    let full_budget = 64u64 << 20;
     let full_limit = ReadLimit {
         options: &opts,
-        memory: Some(64 << 20),
+        memory: Some(full_budget),
         held: 0,
     };
-    let observed_stages = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<(String, u64)>::new()));
-    let stages_clone = observed_stages.clone();
-    PROVE_WAL_STAGE_HOOK.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move |stage, used| {
-            stages_clone.lock().push((stage.to_owned(), used));
-        }));
-    });
-    super::branching::readonly::authenticate_retained_generation(
-        &dst,
-        &entry,
-        &full_limit,
-        imported_seq,
-    )
-    .unwrap();
-    PROVE_WAL_STAGE_HOOK.with(|hook| hook.borrow_mut().take());
-    let stages = observed_stages.lock().clone();
-    let entered_used = stages
-        .iter()
-        .find(|(s, _)| s == "entered")
-        .expect("entered stage")
-        .1;
-    let before_physical_used = stages
-        .iter()
-        .find(|(s, _)| s == "before_physical")
-        .expect("before_physical stage")
-        .1;
-    let callback_used = stages
-        .iter()
-        .find(|(s, _)| s == "callback")
-        .expect("callback stage")
-        .1;
-    assert!(
-        before_physical_used > entered_used,
-        "prove_wal must charge range/span storage ({before_physical_used} > {entered_used})"
-    );
-    assert!(
-        callback_used > before_physical_used,
-        "physical proof buffer/state must be charged during callback ({callback_used} > {before_physical_used})"
-    );
-
-    let mut lo = 1u64;
-    let mut hi = 4u64 << 20;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let limit = ReadLimit {
-            options: &opts,
-            memory: Some(mid),
-            held: 0,
-        };
-        if super::branching::readonly::authenticate_retained_generation(
+    let (res, retained_stages) = capture_stages(&mut || {
+        super::branching::readonly::authenticate_retained_generation(
             &dst,
             &entry,
-            &limit,
+            &full_limit,
             imported_seq,
         )
-        .is_ok()
-        {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    let min_pass = lo;
-    let tight_limit_bytes = min_pass.saturating_sub(1);
-    let tight_stages = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<(String, u64)>::new()));
-    let tight_stages_clone = tight_stages.clone();
-    PROVE_WAL_STAGE_HOOK.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move |stage, used| {
-            tight_stages_clone.lock().push((stage.to_owned(), used));
-        }));
     });
+    res.unwrap();
+    let (retained_cap, retained_before_physical, retained_setup_peak) =
+        assert_full_disjoint_stages("retained_cold_read", &retained_stages, full_budget);
+    assert_eq!(retained_cap, full_budget);
+
+    let (res, validate_stages) = capture_stages(&mut || {
+        let prep = Preparation::new(crate::task::Control::none(), full_budget)?;
+        validate_copy_imported(&dst_root, &prep)
+    });
+    res.unwrap();
+    let (validate_cap, validate_before_physical, validate_setup_peak) =
+        assert_full_disjoint_stages("closed_copy_validate", &validate_stages, full_budget);
+    assert!(
+        validate_cap < full_budget,
+        "closed-copy validation must reserve DiskClosure in Preparation before ColdBudget ({validate_cap} < {full_budget})"
+    );
+
+    // Independently measure the exact publication-walk peak on `src_root` via
+    // `managed_history::resolve` (which makes no whole-room loan and never touches
+    // `prove_wal`). Adding a 16 KiB margin above `before_physical + src_pub_peak` clears
+    // `DiskClosure::load`, base/setup verification, and `physical::prove_prefix`
+    // buffering while leaving `callback_prep` short of `imp-0`'s publication walk by
+    // the ~64 KiB physical proof allowance. A future regression that overlaps
+    // `callback_prep` with the pre-proof allowance would therefore succeed here instead
+    // of failing with `BudgetExceeded`.
+    let src_history = primary::recorded_root(&src_root, &preparation())
+        .unwrap()
+        .expect("source history root");
+    let src_pub_peak = {
+        let probe_prep = Preparation::new(crate::task::Control::none(), full_budget).unwrap();
+        let doc = managed_history::resolve(
+            &src_root,
+            src_id,
+            &src_history,
+            src_history.identity(src_id),
+            &probe_prep,
+        )
+        .unwrap();
+        drop(doc);
+        probe_prep.test_peak()
+    };
+    assert!(
+        src_pub_peak < (4 << 20),
+        "src_pub_peak ({src_pub_peak}) must reflect actual decode peak, not a whole-room loan"
+    );
+    let max_setup_peak = retained_setup_peak.max(validate_setup_peak);
+    assert!(
+        src_pub_peak > max_setup_peak + (64 << 10),
+        "independent src_pub_peak ({src_pub_peak}) must exceed setup peak ({max_setup_peak}) + headroom"
+    );
+    let tight_room = src_pub_peak + (16 << 10);
+
+    // Tight-budget refusal through `authenticate_retained_generation`.
+    let tight_retained = retained_before_physical + tight_room;
     let tight_limit = ReadLimit {
         options: &opts,
-        memory: Some(tight_limit_bytes),
+        memory: Some(tight_retained),
         held: 0,
     };
-    let err = super::branching::readonly::authenticate_retained_generation(
-        &dst,
-        &entry,
-        &tight_limit,
-        imported_seq,
-    )
-    .unwrap_err();
-    PROVE_WAL_STAGE_HOOK.with(|hook| hook.borrow_mut().take());
-    let seen = tight_stages.lock().clone();
+    let (res, tight_retained_stages) = capture_stages(&mut || {
+        super::branching::readonly::authenticate_retained_generation(
+            &dst,
+            &entry,
+            &tight_limit,
+            imported_seq,
+        )
+    });
+    let err = res.unwrap_err();
+    let cb = tight_retained_stages
+        .iter()
+        .find(|s| s.stage == "callback")
+        .unwrap_or_else(|| {
+            panic!(
+                "retained tight budget ({tight_retained}) must reach callback before failing; stages={tight_retained_stages:?}, err={err:?}"
+            )
+        });
     assert!(
-        seen.iter().any(|(s, _)| s == "callback"),
-        "tight budget ({tight_limit_bytes}) must pass closure/setup/physical buffer and reach proof callback before failing; stages={seen:?}, err={err:?}"
+        cb.budget_used > retained_before_physical,
+        "retained tight callback must include physical proof charges ({} > {retained_before_physical})",
+        cb.budget_used
+    );
+    assert!(
+        cb.budget_used + cb.sub_limit.unwrap() <= tight_retained,
+        "retained tight callback must not overlap budget ({} + {} <= {tight_retained})",
+        cb.budget_used,
+        cb.sub_limit.unwrap()
+    );
+    assert!(
+        cb.sub_limit.unwrap() < src_pub_peak,
+        "retained tight callback limit ({}) must be below imp-0 publication walk peak ({src_pub_peak})",
+        cb.sub_limit.unwrap()
     );
     assert!(
         matches!(err, Error::BudgetExceeded(_)),
-        "expected BudgetExceeded at proof callback under tight limit ({tight_limit_bytes}), got {err:?}"
+        "expected BudgetExceeded at retained proof callback under independent tight limit ({tight_retained}), got {err:?}"
+    );
+
+    // Tight-budget refusal through closed-copy `validate_copy_imported`.
+    let validate_pre_budget = full_budget - validate_cap;
+    let tight_validate = validate_pre_budget + validate_before_physical + tight_room;
+    let (res, tight_validate_stages) = capture_stages(&mut || {
+        let prep = Preparation::new(crate::task::Control::none(), tight_validate)?;
+        validate_copy_imported(&dst_root, &prep)
+    });
+    let err = res.unwrap_err();
+    let v_cb = tight_validate_stages
+        .iter()
+        .find(|s| s.stage == "callback")
+        .unwrap_or_else(|| {
+            panic!(
+                "closed-copy tight budget ({tight_validate}) must reach callback before failing; stages={tight_validate_stages:?}, err={err:?}"
+            )
+        });
+    assert!(
+        v_cb.budget_used > validate_before_physical,
+        "closed-copy tight callback must include physical proof charges ({} > {validate_before_physical})",
+        v_cb.budget_used
+    );
+    assert!(
+        v_cb.budget_used + v_cb.sub_limit.unwrap() <= tight_validate - validate_pre_budget,
+        "closed-copy tight callback must not overlap budget ({} + {} <= {})",
+        v_cb.budget_used,
+        v_cb.sub_limit.unwrap(),
+        tight_validate - validate_pre_budget
+    );
+    assert!(
+        v_cb.sub_limit.unwrap() < src_pub_peak,
+        "closed-copy tight callback limit ({}) must be below imp-0 publication walk peak ({src_pub_peak})",
+        v_cb.sub_limit.unwrap()
+    );
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded at closed-copy proof callback under independent tight limit ({tight_validate}), got {err:?}"
     );
 
     // 2. Scoped WAL proof: corrupt `own-1` (strictly between `imported_seq` and
@@ -1854,18 +2020,96 @@ fn retained_binding_uses_authoritative_proof_observation() {
 
 #[test]
 fn direct_branch_backup_uses_single_anchored_commit_read() {
+    for (case, write_after_compact) in [("header-only-wal", false), ("nonempty-wal", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let src_root = dir.path().join("src");
+        drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+        crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+        let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+        update(&src, "seed");
+        src.create_branch("single-read-br", &Default::default())
+            .unwrap();
+        let branch = src.branch("single-read-br").unwrap();
+        update(&branch, "br-1");
+        // Compact once to unlink the branch so `backup_capture` takes the direct capture path.
+        // Without a post-compaction write, `wal.log` is header-only and `check_wal_prefix`
+        // must reuse the anchored base sequence instead of rereading `commit.json`.
+        branch.compact().unwrap();
+        if write_after_compact {
+            update(&branch, "br-2");
+        }
+
+        let br_root = branch.root.clone().expect("persistent branch root");
+        let gen_name = std::fs::read_to_string(br_root.join("CURRENT"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let commit_path = br_root.join(&gen_name).join("commit.json");
+        let orig_commit_bytes = std::fs::read(&commit_path).unwrap();
+
+        // Immediately after the single anchored read of `commit.json`, overwrite it on disk
+        // with garbage; any second open (in `build_branch_standalone_provenance` or
+        // `check_wal_prefix`) would fail or emit mismatched source provenance.
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let commit_path_clone = commit_path.clone();
+        branch.set_failpoint(
+            "backup-capture-branch-commit-read",
+            Some(std::sync::Arc::new(move |_| {
+                fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::fs::write(&commit_path_clone, b"{\"mutated\":true}\n").unwrap();
+            })),
+        );
+        let cap = branch
+            .backup_capture(&format!("b-single-read-{case}"))
+            .unwrap_or_else(|err| panic!("{case}: backup_capture must succeed, got {err:?}"));
+        branch.set_failpoint("backup-capture-branch-commit-read", None);
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "{case}: single-read failpoint must have fired"
+        );
+
+        let staged = dir.path().join("staged");
+        cap.write_to(&staged).unwrap();
+        validate_copy_imported(&staged, &preparation()).unwrap_or_else(|err| {
+            panic!("{case}: direct branch backup must authenticate cleanly, got {err:?}")
+        });
+
+        // Verify the source descriptor embedded the exact original commit.json bytes.
+        let imports_dir = staged.join("evidence-history").join("imports");
+        let mut found_source_commit = None;
+        for entry in std::fs::read_dir(&imports_dir).unwrap() {
+            let candidate = entry
+                .unwrap()
+                .path()
+                .join("source")
+                .join(&gen_name)
+                .join("commit.json");
+            if candidate.exists() {
+                found_source_commit = Some(std::fs::read(&candidate).unwrap());
+            }
+        }
+        assert_eq!(
+            found_source_commit.as_deref(),
+            Some(orig_commit_bytes.as_slice()),
+            "{case}: staged source commit.json must match the single anchored read, not the later mutated file"
+        );
+    }
+}
+
+#[test]
+fn direct_branch_backup_rejects_malformed_canonical_timestamp_with_wal_suffix() {
     let dir = tempfile::tempdir().unwrap();
     let src_root = dir.path().join("src");
     drop(Store::open(&src_root, StoreOptions::default()).unwrap());
     crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
     let src = Store::open(&src_root, StoreOptions::default()).unwrap();
     update(&src, "seed");
-    src.create_branch("single-read-br", &Default::default())
-        .unwrap();
-    let branch = src.branch("single-read-br").unwrap();
+    src.create_branch("bad-ts-br", &Default::default()).unwrap();
+    let branch = src.branch("bad-ts-br").unwrap();
     update(&branch, "br-1");
-    // Compact once to unlink the branch so `backup_capture` takes the direct capture path.
     branch.compact().unwrap();
+    // Append a WAL suffix so `check_wal_prefix` checks the WAL tail rather than `commit.json`.
     update(&branch, "br-2");
 
     let br_root = branch.root.clone().expect("persistent branch root");
@@ -1874,51 +2118,30 @@ fn direct_branch_backup_uses_single_anchored_commit_read() {
         .trim()
         .to_string();
     let commit_path = br_root.join(&gen_name).join("commit.json");
-    let orig_commit_bytes = std::fs::read(&commit_path).unwrap();
-
-    // Immediately after the single anchored read of `commit.json`, overwrite it on disk
-    // with garbage; a second open inside `build_branch_standalone_provenance` would fail
-    // or emit mismatched source provenance.
-    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let fired_clone = fired.clone();
-    let commit_path_clone = commit_path.clone();
-    branch.set_failpoint(
-        "backup-capture-branch-commit-read",
-        Some(std::sync::Arc::new(move |_| {
-            fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            std::fs::write(&commit_path_clone, b"{\"mutated\":true}\n").unwrap();
-        })),
+    let orig_text = std::fs::read_to_string(&commit_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&orig_text).unwrap();
+    let orig_ts = parsed["commit"]["timestamp"]
+        .as_str()
+        .expect("timestamp field")
+        .to_owned();
+    let mutated_text = orig_text.replacen(
+        &format!("\"timestamp\": \"{orig_ts}\""),
+        "\"timestamp\": \"not-a-timestamp\"",
+        1,
     );
-    let cap = branch.backup_capture("b-single-read").unwrap();
-    branch.set_failpoint("backup-capture-branch-commit-read", None);
+    assert_ne!(
+        mutated_text, orig_text,
+        "must replace canonical timestamp field"
+    );
+    std::fs::write(&commit_path, mutated_text.as_bytes()).unwrap();
+
+    let err = match branch.backup_capture("b-bad-ts") {
+        Ok(_) => panic!("direct branch capture must reject malformed canonical timestamp"),
+        Err(err) => err,
+    };
     assert!(
-        fired.load(std::sync::atomic::Ordering::SeqCst),
-        "single-read failpoint must have fired"
-    );
-
-    let staged = dir.path().join("staged");
-    cap.write_to(&staged).unwrap();
-    validate_copy_imported(&staged, &preparation())
-        .expect("direct branch backup must authenticate cleanly from single commit.json read");
-
-    // Verify the source descriptor embedded the exact original commit.json bytes.
-    let imports_dir = staged.join("evidence-history").join("imports");
-    let mut found_source_commit = None;
-    for entry in std::fs::read_dir(&imports_dir).unwrap() {
-        let candidate = entry
-            .unwrap()
-            .path()
-            .join("source")
-            .join(&gen_name)
-            .join("commit.json");
-        if candidate.exists() {
-            found_source_commit = Some(std::fs::read(&candidate).unwrap());
-        }
-    }
-    assert_eq!(
-        found_source_commit.as_deref(),
-        Some(orig_commit_bytes.as_slice()),
-        "staged source commit.json must match the single anchored read, not the later mutated file"
+        matches!(err, Error::Corrupt(_)) && err.to_string().contains("timestamp"),
+        "expected Corrupt timestamp refusal, got {err:?}"
     );
 }
 

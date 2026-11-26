@@ -653,6 +653,11 @@ impl Preparation {
         &self.inner.used
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_peak(&self) -> u64 {
+        self.inner.peak.load(Ordering::Relaxed)
+    }
+
     /// Bytes currently reserved in the active budget.
     pub(crate) fn used(&self) -> u64 {
         let (counter, _) = self.active_budget();

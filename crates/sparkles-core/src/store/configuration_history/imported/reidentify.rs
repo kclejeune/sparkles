@@ -33,21 +33,43 @@ pub(super) struct DiskNode {
 }
 
 #[cfg(test)]
-pub(in crate::store) type ProveWalStageHook = Option<Box<dyn FnMut(&str, u64)>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::store) struct ProveWalStage {
+    pub(in crate::store) stage: &'static str,
+    pub(in crate::store) budget_used: u64,
+    pub(in crate::store) budget_available: u64,
+    pub(in crate::store) sub_limit: Option<u64>,
+    pub(in crate::store) sub_used: Option<u64>,
+}
+
+#[cfg(test)]
+pub(in crate::store) type ProveWalStageHook = Option<Box<dyn FnMut(ProveWalStage)>>;
 
 #[cfg(test)]
 thread_local! {
     /// Test-only stage observer for `DiskClosure::prove_wal` that reports
-    /// `(stage, budget.used())` at admission boundaries.
+    /// admission boundaries and sub-arena allowances.
     pub(in crate::store) static PROVE_WAL_STAGE_HOOK: std::cell::RefCell<ProveWalStageHook> =
         const { std::cell::RefCell::new(None) };
 }
 
-fn prove_wal_stage_hook(_stage: &str, _used: u64) {
+fn prove_wal_stage_hook(
+    _stage: &'static str,
+    _budget_used: u64,
+    _budget_available: u64,
+    _sub_limit: Option<u64>,
+    _sub_used: Option<u64>,
+) {
     #[cfg(test)]
     PROVE_WAL_STAGE_HOOK.with(|hook| {
         if let Some(cb) = hook.borrow_mut().as_mut() {
-            cb(_stage, _used);
+            cb(ProveWalStage {
+                stage: _stage,
+                budget_used: _budget_used,
+                budget_available: _budget_available,
+                sub_limit: _sub_limit,
+                sub_used: _sub_used,
+            });
         }
     });
 }
@@ -366,10 +388,10 @@ impl DiskClosure {
                 .original
                 .branch
                 .map_or_else(|| "main".to_owned(), |id| id.to_string());
-            let (orig_commit, orig_meta) =
+            let orig =
                 read_disk_original_base(node, &root_name, &base.original.generation, preparation)?;
             let actual_meta = read_meta_controlled(&gen_dir.join("meta.json"), preparation)?;
-            let retagged = match orig_commit.configuration {
+            let retagged = match orig.physical.configuration {
                 ConfigurationBinding::Known { configuration } => {
                     ConfigurationBinding::ImportedUnbound {
                         source: configuration,
@@ -377,31 +399,32 @@ impl DiskClosure {
                 }
                 other => other,
             };
-            if orig_meta != actual_meta
-                || orig_commit.commit != actual.commit
-                || orig_commit.origin != actual.origin
-                || (actual.configuration != orig_commit.configuration
+            if orig.meta != actual_meta.value
+                || orig.physical.commit != actual.commit
+                || orig.physical.origin != actual.origin
+                || (actual.configuration != orig.physical.configuration
                     && actual.configuration != retagged)
             {
                 return Err(managed_history::unavailable(
                     "imported original physical base differs from copied generation",
                 ));
             }
+            let orig_seq = orig.physical.commit.seq;
+            let orig_config = orig.physical.configuration;
+            drop(actual_meta);
+            drop(orig);
             let mut header = documents::source_header(
                 &node.directory,
                 &node.descriptor.value,
                 &root_name,
                 preparation,
             )?;
-            match orig_commit.configuration {
+            match orig_config {
                 ConfigurationBinding::ImportedUnbound { source } => {
                     self.verify_prior_from(index, source, preparation)?;
                 }
-                binding => header.generation_using(
-                    preparation,
-                    orig_commit.commit.seq,
-                    binding,
-                    &mut |identity| {
+                binding => {
+                    header.generation_using(preparation, orig_seq, binding, &mut |identity| {
                         documents::source_publication(
                             &node.directory,
                             &node.descriptor.value,
@@ -409,8 +432,8 @@ impl DiskClosure {
                             preparation,
                         )
                         .map(|_| ())
-                    },
-                )?,
+                    })?
+                }
             }
             if matches!(actual.configuration, ConfigurationBinding::Known { .. }) {
                 native.generation(
@@ -514,7 +537,7 @@ impl DiskClosure {
     ) -> Result<()> {
         let start = budget.used();
         let result = (|| -> Result<()> {
-            prove_wal_stage_hook("entered", budget.used());
+            prove_wal_stage_hook("entered", budget.used(), budget.available(), None, None);
             let local = Location {
                 branch: None,
                 generation: gen_name.to_owned(),
@@ -528,8 +551,6 @@ impl DiskClosure {
                 .ok_or_else(|| {
                     managed_history::unavailable("copied generation commit is missing")
                 })?;
-            let actual_commit = actual_commit_loaded.value;
-            budget.release(actual_commit_loaded.charge);
 
             let count = self
                 .origin
@@ -552,13 +573,22 @@ impl DiskClosure {
                 .map_err(|_| budget.exhausted())?;
 
             // Setup reads use a temporary Preparation bounded by `budget.available()`
-            // while `budget` is not mutated, then drop it before physical proof starts.
+            // while `budget` retains `actual_commit_loaded` and `range_storage` and is
+            // not mutated. Release setup allocations and `actual_commit_loaded` before
+            // physical proof starts.
             {
                 let setup_prep = budget
                     .owned_limit()?
                     .options
                     .temporary(budget.available())?;
                 let actual_meta = read_meta_controlled(&gen_dir.join("meta.json"), &setup_prep)?;
+                prove_wal_stage_hook(
+                    "setup_meta",
+                    budget.used(),
+                    budget.available(),
+                    Some(setup_prep.limit()),
+                    Some(setup_prep.used()),
+                );
                 for assignment in &self.origin.value.ranges {
                     setup_prep.check()?;
                     if assignment.local != local {
@@ -576,13 +606,20 @@ impl DiskClosure {
                                 "imported range has no declared source interval",
                             )
                         })?;
-                    let (orig_commit, orig_meta) = read_disk_original_base(
+                    let orig = read_disk_original_base(
                         node,
                         &interval.root,
                         &interval.generation,
                         &setup_prep,
                     )?;
-                    let retagged = match orig_commit.configuration {
+                    prove_wal_stage_hook(
+                        "setup_source",
+                        budget.used(),
+                        budget.available(),
+                        Some(setup_prep.limit()),
+                        Some(setup_prep.used()),
+                    );
+                    let retagged = match orig.physical.configuration {
                         ConfigurationBinding::Known { configuration } => {
                             ConfigurationBinding::ImportedUnbound {
                                 source: configuration,
@@ -590,16 +627,17 @@ impl DiskClosure {
                         }
                         other => other,
                     };
-                    if orig_meta != actual_meta
-                        || orig_commit.commit != actual_commit.commit
-                        || orig_commit.origin != actual_commit.origin
-                        || (actual_commit.configuration != orig_commit.configuration
-                            && actual_commit.configuration != retagged)
+                    if orig.meta != actual_meta.value
+                        || orig.physical.commit != actual_commit_loaded.value.commit
+                        || orig.physical.origin != actual_commit_loaded.value.origin
+                        || (actual_commit_loaded.value.configuration != orig.physical.configuration
+                            && actual_commit_loaded.value.configuration != retagged)
                     {
                         return Err(managed_history::unavailable(
                             "imported WAL range base differs from copied generation",
                         ));
                     }
+                    drop(orig);
                     let header = documents::source_header(
                         &node.directory,
                         &node.descriptor.value,
@@ -618,7 +656,11 @@ impl DiskClosure {
                         header,
                     });
                 }
+                drop(actual_meta);
             }
+            let actual_commit_charge = actual_commit_loaded.charge;
+            drop(actual_commit_loaded.value);
+            budget.release(actual_commit_charge);
             ranges.sort_unstable_by_key(|r| r.span.start);
             if ranges.windows(2).any(|p| p[0].span.end > p[1].span.start) {
                 return Err(managed_history::unavailable(
@@ -641,11 +683,16 @@ impl DiskClosure {
                     last_seq: r.span.last_seq,
                 });
             }
-            prove_wal_stage_hook("before_physical", budget.used());
+            prove_wal_stage_hook(
+                "before_physical",
+                budget.used(),
+                budget.available(),
+                None,
+                None,
+            );
             let mut config_error = None;
             let mut visit = |observation: wal::probe::WalCommitObservation,
                              proof_budget: &ColdBudget<'_>| {
-                prove_wal_stage_hook("callback", proof_budget.used());
                 if config_error.is_none() {
                     let matched = ranges.iter_mut().find(|r| {
                         (r.span.start <= observation.start_offset
@@ -658,6 +705,13 @@ impl DiskClosure {
                             .owned_limit()?
                             .options
                             .temporary(proof_budget.available())?;
+                        prove_wal_stage_hook(
+                            "callback",
+                            proof_budget.used(),
+                            proof_budget.available(),
+                            Some(callback_prep.limit()),
+                            Some(callback_prep.used()),
+                        );
                         range.header.observation_using(
                             &callback_prep,
                             observation,
@@ -679,6 +733,13 @@ impl DiskClosure {
                                     .owned_limit()?
                                     .options
                                     .temporary(proof_budget.available())?;
+                                prove_wal_stage_hook(
+                                    "callback",
+                                    proof_budget.used(),
+                                    proof_budget.available(),
+                                    Some(callback_prep.limit()),
+                                    Some(callback_prep.used()),
+                                );
                                 native.observation(family_root, &callback_prep, observation)
                             }
                             Err(error) => Err(error),
@@ -734,12 +795,23 @@ impl DiskClosure {
     }
 }
 
+struct DiskOriginalBase {
+    physical: RetainedGenerationCommit,
+    meta: crate::builder::IndexMeta,
+    _held: Reservation,
+}
+
 fn read_disk_original_base(
     node: &DiskNode,
     root_name: &str,
     generation: &str,
     preparation: &Preparation,
-) -> Result<(RetainedGenerationCommit, crate::builder::IndexMeta)> {
+) -> Result<DiskOriginalBase> {
+    let _paths = preparation.reserve(
+        (root_name.len() as u64)
+            .saturating_mul(4)
+            .saturating_add(4096),
+    )?;
     let prefix = if root_name == "main" {
         String::new()
     } else {
@@ -751,14 +823,14 @@ fn read_disk_original_base(
         &format!("{prefix}{generation}/commit.json"),
         preparation,
     )?;
-    let meta = documents::read_member(
+    let meta_bytes = documents::read_member(
         &node.directory,
         &node.descriptor.value,
         &format!("{prefix}{generation}/meta.json"),
         preparation,
     )?;
     let allowance = preparation.room();
-    let _loan = preparation.reserve(allowance)?;
+    let mut held = preparation.reserve(allowance)?;
     let options = HistoryOptions {
         cancel: Some(preparation.control().cancel.flag()),
         deadline: preparation.control().deadline,
@@ -773,7 +845,8 @@ fn read_disk_original_base(
         &commit.value,
         &mut budget,
     )?;
-    let meta: crate::store::cold::Loaded<crate::builder::IndexMeta> = budget.json(&meta.value)?;
+    let meta: crate::store::cold::Loaded<crate::builder::IndexMeta> =
+        budget.json(&meta_bytes.value)?;
     let logical = node
         .descriptor
         .value
@@ -785,16 +858,24 @@ fn read_disk_original_base(
             "original base belongs to another logical dataset",
         ));
     }
-    Ok((physical.value, meta.value))
+    drop(commit);
+    drop(meta_bytes);
+    held.release_to(budget.used());
+    preparation.check()?;
+    Ok(DiskOriginalBase {
+        physical: physical.value,
+        meta: meta.value,
+        _held: held,
+    })
 }
 
 pub(super) fn read_meta_controlled(
     path: &Path,
     preparation: &Preparation,
-) -> Result<crate::builder::IndexMeta> {
+) -> Result<managed_history::Owned<crate::builder::IndexMeta>> {
     let bytes = managed_history::read_bytes(path, preparation)?;
     let allowance = preparation.room();
-    let _loan = preparation.reserve(allowance)?;
+    let mut held = preparation.reserve(allowance)?;
     let options = HistoryOptions {
         cancel: Some(preparation.control().cancel.flag()),
         deadline: preparation.control().deadline,
@@ -809,7 +890,10 @@ pub(super) fn read_meta_controlled(
             Error::BudgetExceeded(_) | Error::Cancelled | Error::Timeout => e,
             _ => managed_history::unavailable("invalid copied meta.json"),
         })?;
-    Ok(meta.value)
+    drop(bytes);
+    held.release_to(budget.used());
+    preparation.check()?;
+    Ok(managed_history::Owned::new(meta.value, held))
 }
 
 fn check_acyclic(
@@ -2334,7 +2418,7 @@ pub(in crate::store) fn reidentify_activated_dir_with(
             });
         }
     }
-    let physical_base = {
+    let physical_base_seq = {
         let allowance = preparation.room();
         let _loan = preparation.reserve(allowance)?;
         let options = HistoryOptions {
@@ -2352,13 +2436,15 @@ pub(in crate::store) fn reidentify_activated_dir_with(
             &mut budget,
         )?
         .value
+        .commit
+        .seq
     };
     let new_interval = compute_wal_suffix_interval_bounded(
         root,
         &gen_dir,
         &gen_name,
         old_id,
-        physical_base.commit.seq,
+        physical_base_seq,
         prior_end,
         None,
         preparation,

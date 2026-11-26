@@ -253,7 +253,7 @@ impl Retained {
                     managed_history::unavailable("imported range has no declared source interval")
                 })?;
             let original = original_base(node, &interval.root, &interval.generation, preparation)?;
-            if original.meta != actual_meta
+            if original.meta != actual_meta.value
                 || original.physical.commit != actual.commit
                 || original.physical.origin != actual.origin
                 || (actual.configuration != original.physical.configuration
@@ -263,6 +263,7 @@ impl Retained {
                     "imported WAL range base differs from retained generation",
                 ));
             }
+            drop(original);
             let header = documents::source_header(
                 &node.directory,
                 &node.descriptor.value,
@@ -281,6 +282,7 @@ impl Retained {
                 header,
             });
         }
+        drop(actual_meta);
         ranges.sort_unstable_by_key(|range| range.span.start);
         if ranges
             .windows(2)

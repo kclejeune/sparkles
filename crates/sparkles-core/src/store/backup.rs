@@ -2233,7 +2233,7 @@ impl Store {
         if !self.same_managed_state(&managed_state) {
             return Ok(None);
         }
-        let (history_files, branch_retagged_commit) = match history_installed {
+        let (history_files, branch_retagged_commit, branch_base_seq) = match history_installed {
             Some(installed) => {
                 let family_root = self.managed_root().ok_or_else(|| {
                     Error::Corrupt("captured configuration has no family root".into())
@@ -2302,7 +2302,7 @@ impl Store {
                         return Ok(None);
                     }
                     *branch_staging.lock() = Some(staging);
-                    (captured?, Some(retagged.value))
+                    (captured?, Some(retagged.value), Some(base_seq))
                 } else {
                     let captured = super::managed_history::capture::files(
                         &family_root,
@@ -2317,10 +2317,10 @@ impl Store {
                     if !self.same_managed_state(&managed_state) {
                         return Ok(None);
                     }
-                    (captured?, None)
+                    (captured?, None, None)
                 }
             }
-            None => (Vec::new(), None),
+            None => (Vec::new(), None, None),
         };
         let mut files = Vec::with_capacity(gen_files.len() + 8);
         gen_files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2353,7 +2353,7 @@ impl Store {
             });
         }
         let wal = files.iter().find(|f| f.path.ends_with("/wal.log"));
-        check_wal_prefix(wal, &gdir, &head)?;
+        check_wal_prefix(wal, &gdir, &head, branch_base_seq)?;
         let catalog = CapturedFile {
             path: "commits.bin".into(),
             kind: FileKind::Append,
@@ -2509,7 +2509,12 @@ impl Store {
 
 /// The WAL prefix must end with the head's commit record, or be empty when the head is
 /// the generation's base commit.
-fn check_wal_prefix(wal: Option<&CapturedFile>, gdir: &Path, head: &CommitInfo) -> Result<()> {
+fn check_wal_prefix(
+    wal: Option<&CapturedFile>,
+    gdir: &Path,
+    head: &CommitInfo,
+    anchored_base_seq: Option<u64>,
+) -> Result<()> {
     let len = wal.map_or(0, |f| f.len);
     let bad = |m: String| Err(Error::Corrupt(format!("{}: {m}", gdir.display())));
     // a log that holds only its header record has no commits either
@@ -2519,8 +2524,12 @@ fn check_wal_prefix(wal: Option<&CapturedFile>, gdir: &Path, head: &CommitInfo) 
         rec[0] == super::WAL_HEADER
     };
     if len == 0 || header_only {
-        return match crate::commit::read_gen_commit(gdir)? {
-            Some((_, base, _)) if base.seq == head.seq => Ok(()),
+        let base_seq = match anchored_base_seq {
+            Some(seq) => Some(seq),
+            None => crate::commit::read_gen_commit(gdir)?.map(|(_, base, _)| base.seq),
+        };
+        return match base_seq {
+            Some(seq) if seq == head.seq => Ok(()),
             _ => bad(format!(
                 "empty WAL, but the head {} is not its base",
                 head.seq

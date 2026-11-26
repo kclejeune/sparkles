@@ -1255,6 +1255,9 @@ pub(crate) fn reidentified_generation_bytes_with_base(
     check_gen_commit_value(label, &parsed.value)?;
     let mut file: GenCommitFile = budget.value(parsed.value)?;
     check_gen_binding(label, &file, bytes)?;
+    if parse_rfc3339_ms(&file.commit.timestamp).is_none() {
+        return Err(Error::Corrupt(format!("{}: timestamp", label.display())));
+    }
     if file.dataset_id != old {
         return Err(Error::Corrupt(
             "original generation belongs to another physical source".into(),
@@ -2701,6 +2704,13 @@ mod tests {
         let mut noncanonical = raw.clone();
         noncanonical.push(b'\n');
         assert!(reidentified_generation_bytes(&noncanonical, old, new, &preparation).is_err());
+        let mut bad_ts: GenCommitFile = serde_json::from_slice(&raw).unwrap();
+        bad_ts.commit.timestamp = "not-a-timestamp".to_owned();
+        let bad_ts_canonical = serde_json::to_vec_pretty(&bad_ts).unwrap();
+        assert!(matches!(
+            reidentified_generation_bytes_with_base(&bad_ts_canonical, old, new, &preparation),
+            Err(Error::Corrupt(_))
+        ));
         assert_eq!(preparation.room(), room);
         let control = Control::none();
         let cancelled = Preparation::new(control.clone(), 4 << 20).unwrap();

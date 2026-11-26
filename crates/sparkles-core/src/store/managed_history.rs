@@ -179,6 +179,12 @@ pub(crate) struct Owned<T> {
     _held: Reservation,
 }
 
+impl<T> Owned<T> {
+    pub(crate) fn new(value: T, held: Reservation) -> Self {
+        Self { value, _held: held }
+    }
+}
+
 pub(crate) struct Bytes {
     pub(crate) value: Vec<u8>,
     pub(crate) _held: Reservation,

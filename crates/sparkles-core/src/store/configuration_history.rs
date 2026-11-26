@@ -24,7 +24,7 @@ pub(super) use imported::reidentify::{
 };
 #[cfg(test)]
 pub(super) use imported::reidentify::{
-    PROVE_WAL_STAGE_HOOK, WAL_HASH_CHUNK_HOOK, reidentify_activated_dir_with,
+    PROVE_WAL_STAGE_HOOK, ProveWalStage, WAL_HASH_CHUNK_HOOK, reidentify_activated_dir_with,
     write_clone_destination_with_sync,
 };
 pub(super) use imported::{
