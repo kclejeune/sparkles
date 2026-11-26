@@ -3214,10 +3214,10 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
         },
     )));
 
-    let hide_pred = |pred: &str| {
+    let hide_preds = |preds: &[&str]| {
         let protection = Protection {
             name: "hidden".into(),
-            predicates: Some(vec![pred.to_string()]),
+            predicates: Some(preds.iter().map(|p| (*p).to_string()).collect()),
             classes: None,
             subclasses: false,
             graphs: Some(Graphs::Only(GraphRule::new([SOURCES_TWO], &[]))),
@@ -3240,6 +3240,7 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
             rules,
         )))
     };
+    let hide_pred = |pred: &str| hide_preds(&[pred]);
 
     let run_err = |input: &EvidenceInput, target: &NamedNode, access: Option<Arc<GraphAccess>>| {
         let mut o = options();
@@ -3265,9 +3266,10 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
 
     // 1. Same IRI named as both `revision` (SourceRevision) and `rendition` (Rendition)
     //    of a nonempty proposed passage: absent, graph-denied, rdf:type-masked,
-    //    metadata-only, ev:normalizedText-masked, and prov:wasDerivedFrom-masked targets
-    //    all answer identically with `evidence-unavailable` naming the target; a fully
-    //    readable rendition preserves `immutable-record-conflict`.
+    //    metadata-only, ev:normalizedText-masked, prov:wasDerivedFrom-masked, and
+    //    receipt-masked targets all answer identically with `evidence-unavailable`
+    //    naming the target; a fully readable rendition preserves
+    //    `immutable-record-conflict`.
     let same_iri_passage = |target: &NamedNode| EvidenceInput {
         passages: vec![PassageInput {
             version: RecordVersion::V1,
@@ -3317,14 +3319,41 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
         ),
         absent
     );
+    assert_eq!(
+        run_err(
+            &same_iri_passage(&rend2),
+            &rend2,
+            hide_pred("urn:x-sparkles:evidence:availabilityReceipt"),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_passage(&rend2),
+            &rend2,
+            hide_preds(&[
+                "urn:x-sparkles:evidence:availabilityReceipt",
+                "urn:x-sparkles:evidence:normalizedText",
+            ]),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_passage(&rend2),
+            &rend2,
+            hide_pred("urn:x-sparkles:evidence:graphProtection"),
+        ),
+        absent
+    );
     let readable_rend = run_err(&same_iri_passage(&rend2), &rend2, all());
     assert_eq!(readable_rend.0, "immutable-record-conflict");
     assert!(readable_rend.1.contains("another kind"));
 
     // 2. Same IRI named as an earlier `rendition` (Rendition) and a later structured
     //    reference's `revision` (SourceRevision): unavailable parity for absent,
-    //    graph-denied, metadata-only, masked ev:retainedBytes and masked ev:contentDigest;
-    //    `immutable-record-conflict` when the retained SourceRevision is fully readable.
+    //    graph-denied, metadata-only, masked ev:retainedBytes, masked ev:contentDigest,
+    //    and masked receipt predicates; `immutable-record-conflict` when fully readable.
     let same_iri_struct = |target: &NamedNode| EvidenceInput {
         passages: vec![PassageInput {
             version: RecordVersion::V1,
@@ -3381,15 +3410,42 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
         ),
         absent
     );
+    assert_eq!(
+        run_err(
+            &same_iri_struct(&rev1),
+            &rev1,
+            hide_pred("urn:x-sparkles:evidence:availabilityReceipt"),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_struct(&rev1),
+            &rev1,
+            hide_preds(&[
+                "urn:x-sparkles:evidence:availabilityReceipt",
+                "urn:x-sparkles:evidence:retainedBytes",
+            ]),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_struct(&rev1),
+            &rev1,
+            hide_pred("urn:x-sparkles:evidence:graphProtection"),
+        ),
+        absent
+    );
     let readable_rev = run_err(&same_iri_struct(&rev1), &rev1, all());
     assert_eq!(readable_rev.0, "immutable-record-conflict");
     assert!(readable_rev.1.contains("another kind"));
 
     // 3. Same IRI named in all three roles (`revision`, `rendition`, `passage`) of an
     //    existing-passage reference: absent, graph-denied, masked ev:sourceRevision,
-    //    masked rendition ev:normalizedText and masked rendition prov:wasDerivedFrom
-    //    answer identically with `evidence-unavailable`; a fully readable verified
-    //    passage preserves `immutable-record-conflict`.
+    //    masked rendition ev:normalizedText, masked rendition prov:wasDerivedFrom, and
+    //    masked receipt predicates answer identically with `evidence-unavailable`; a
+    //    fully readable verified passage preserves `immutable-record-conflict`.
     let same_iri_pass_ref = |target: &NamedNode| EvidenceInput {
         references: vec![EvidenceRefInput {
             version: RecordVersion::V1,
@@ -3435,7 +3491,60 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
         ),
         absent
     );
+    assert_eq!(
+        run_err(
+            &same_iri_pass_ref(&pass2),
+            &pass2,
+            hide_pred("urn:x-sparkles:evidence:availabilityReceipt"),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_pass_ref(&pass2),
+            &pass2,
+            hide_preds(&[
+                "urn:x-sparkles:evidence:availabilityReceipt",
+                "urn:x-sparkles:evidence:sourceRevision",
+            ]),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_pass_ref(&pass2),
+            &pass2,
+            hide_pred("urn:x-sparkles:evidence:graphProtection"),
+        ),
+        absent
+    );
     let readable_pass = run_err(&same_iri_pass_ref(&pass2), &pass2, all());
     assert_eq!(readable_pass.0, "immutable-record-conflict");
     assert!(readable_pass.1.contains("another kind"));
+
+    // 4. Detaching and re-protecting `SOURCES_TWO` still produces
+    //    `origin-not-reproduced` for an unmasked caller, while masking
+    //    `ev:availabilityReceipt` keeps answering `evidence-unavailable`.
+    evidence::detach(&ds, SOURCES_TWO).unwrap();
+    evidence::configure(&ds, &settings, &Control::none()).unwrap();
+    assert_eq!(
+        run_err(&same_iri_passage(&rend2), &rend2, all()).0,
+        "origin-not-reproduced"
+    );
+    assert_eq!(
+        run_err(&same_iri_struct(&rev1), &rev1, all()).0,
+        "origin-not-reproduced"
+    );
+    assert_eq!(
+        run_err(&same_iri_pass_ref(&pass2), &pass2, all()).0,
+        "origin-not-reproduced"
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_passage(&rend2),
+            &rend2,
+            hide_pred("urn:x-sparkles:evidence:availabilityReceipt"),
+        ),
+        absent
+    );
 }

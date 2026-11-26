@@ -2358,12 +2358,14 @@ fn probe_plus_verify_reads_each_retained_literal_once_on_compacted_store() {
     assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 0);
     assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 0);
 
-    // 4. Incompatible kind constraint on selected target: verifies literal shape once so
-    //    wrong-shape targets answer `evidence-unavailable` while readable targets preserve
-    //    `immutable-record-conflict`.
+    // 4. Incompatible kind constraint on selected target: verifies literal shape once on
+    //    a fresh resolver so wrong-shape targets answer `evidence-unavailable` while
+    //    readable targets preserve `immutable-record-conflict`, and a subsequent fallback
+    //    `verify_selection_literal_shape` reuses the cached outcome with 0 extra reads.
+    let mut r_incompat = resolver();
     SIMPLE_LITERAL_READS.with(|c| c.set(0));
     assert_eq!(
-        code(r.probe_record_with_selection(
+        code(r_incompat.probe_record_with_selection(
             rend_ok.as_str(),
             &s,
             &s,
@@ -2378,14 +2380,43 @@ fn probe_plus_verify_reads_each_retained_literal_once_on_compacted_store() {
         "immutable-record-conflict"
     );
     assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 1);
+    r_incompat
+        .verify_selection_literal_shape(
+            rend_ok.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_ok,
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 1);
     assert_eq!(
-        code(r.probe_record_with_selection(
+        code(r_incompat.probe_record_with_selection(
             rend_bad_shape.as_str(),
             &s,
             &s,
             Some(&all()),
             &rend_bad_shape,
             &[RecordKind::SourceRevision],
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 2);
+    assert_eq!(
+        code(r_incompat.verify_selection_literal_shape(
+            rend_bad_shape.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_bad_shape,
             SelectionRequirements {
                 rendition_content: true,
                 ..Default::default()

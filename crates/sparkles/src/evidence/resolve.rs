@@ -12,9 +12,9 @@
 //! capability.
 
 pub use sparkles_core::evidence::resolve::{
-    MAX_REFERENCES, MEMORY_BYTES, ProposedPassage, ProposedStructured, Receipt, RecordRequest,
-    SelectionProbe, SelectionRequirements, VerifiedFact, VerifiedRecord, VerifiedSpan,
-    check_anchor, kind_iri, unavailable,
+    MAX_REFERENCES, MEMORY_BYTES, Phase2Outcome, ProposedPassage, ProposedStructured, Receipt,
+    RecordRequest, SelectionProbe, SelectionRequirements, VerifiedFact, VerifiedRecord,
+    VerifiedSpan, check_anchor, kind_iri, unavailable,
 };
 pub use sparkles_core::evidence::{BlankAnchor, GraphIdentity, RecordKind, StoredFactRef};
 
@@ -152,7 +152,7 @@ impl Resolution {
     /// reconstructing a compatible retained literal (`ev:normalizedText` or
     /// `ev:retainedBytes`) when a single `Vocab`/`Delta` object ID is present.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn probe_record_with_selection(
+    pub(crate) fn probe_record_with_selection_at(
         &mut self,
         key: &str,
         main: &Dataset,
@@ -161,8 +161,9 @@ impl Resolution {
         iri: &NamedNode,
         kinds: &[RecordKind],
         selection: SelectionRequirements,
+        req_idx: usize,
     ) -> Result<SelectionProbe> {
-        self.resolver.probe_record_with_selection(
+        self.resolver.probe_record_with_selection_at(
             key,
             main.store(),
             logical.store(),
@@ -170,11 +171,29 @@ impl Resolution {
             iri,
             kinds,
             selection,
+            req_idx,
         )
     }
 
+    /// Smallest Phase 1 requirement index among deferred existing passages that have not
+    /// yet been verified or consumed.
+    pub(crate) fn next_pending_passage_req_idx(&self) -> Option<usize> {
+        self.resolver.next_pending_passage_req_idx()
+    }
+
+    /// Verify and consume the earliest deferred existing passage.
+    pub(crate) fn verify_next_pending_passage(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+    ) -> Phase2Outcome {
+        self.resolver
+            .verify_next_pending_passage(main.store(), logical.store(), access.as_ref())
+    }
+
     /// Verify the exact vocabulary literal shape of a selected target whose single
-    /// `Vocab`/`Delta` object ID was deferred by `probe_record_with_selection`.
+    /// `Vocab`/`Delta` object ID was deferred by `probe_record_with_selection_at`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_selection_literal_shape(
         &mut self,
@@ -231,6 +250,27 @@ impl Resolution {
         )
     }
 
+    /// Verify proposed passages and any deferred existing passages targeting `rendition`
+    /// in one `ev:normalizedText` scan, returning Phase 2 fallback context.
+    pub(crate) fn verify_proposed_passages_checked(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        rendition: &NamedNode,
+        passages: &[ProposedPassage<'_>],
+        group_req_idx: usize,
+    ) -> Phase2Outcome {
+        self.resolver.verify_proposed_passages_checked(
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            rendition,
+            passages,
+            group_req_idx,
+        )
+    }
+
     /// Verify that an existing authenticated passage belongs to `expected_revision` and
     /// `expected_rendition`, and that its own selector verifies against its rendition's
     /// retained text.
@@ -267,6 +307,25 @@ impl Resolution {
         references: &[ProposedStructured<'_>],
     ) -> Result<()> {
         self.resolver.verify_structured_references(
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            revision,
+            references,
+        )
+    }
+
+    /// Verify structured JSON Pointer references against `revision`, returning Phase 2
+    /// fallback context.
+    pub(crate) fn verify_structured_references_checked(
+        &mut self,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        revision: &NamedNode,
+        references: &[ProposedStructured<'_>],
+    ) -> Phase2Outcome {
+        self.resolver.verify_structured_references_checked(
             main.store(),
             logical.store(),
             access.as_ref(),

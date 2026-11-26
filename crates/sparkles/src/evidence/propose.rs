@@ -563,14 +563,17 @@ fn check_deferred_literal_shapes(
     structured.sort_unstable_by_key(|(req_idx, _, _)| *req_idx);
     let mut pi = 0usize;
     let mut si = 0usize;
-    while pi < passages.len() || si < structured.len() {
+    loop {
         control.check()?;
         let p_idx = passages.get(pi).map_or(usize::MAX, |(idx, _, _)| *idx);
         let s_idx = structured.get(si).map_or(usize::MAX, |(idx, _, _)| *idx);
-        if p_idx >= limit_req_idx && s_idx >= limit_req_idx {
+        let e_idx = resolution
+            .next_pending_passage_req_idx()
+            .unwrap_or(usize::MAX);
+        if p_idx >= limit_req_idx && s_idx >= limit_req_idx && e_idx >= limit_req_idx {
             break;
         }
-        if p_idx <= s_idx {
+        if p_idx <= s_idx && p_idx <= e_idx {
             let iri = passages[pi].1;
             pi += 1;
             resolution.verify_selection_literal_shape(
@@ -584,7 +587,7 @@ fn check_deferred_literal_shapes(
                     ..Default::default()
                 },
             )?;
-        } else {
+        } else if s_idx <= e_idx {
             let iri = structured[si].1;
             si += 1;
             resolution.verify_selection_literal_shape(
@@ -598,6 +601,10 @@ fn check_deferred_literal_shapes(
                     ..Default::default()
                 },
             )?;
+        } else {
+            resolution
+                .verify_next_pending_passage(main, logical, access.clone())
+                .result?;
         }
     }
     Ok(())
@@ -1038,7 +1045,7 @@ fn verify_requirements_with_memory(
                         access
                     }
                 };
-                resolution.probe_record_with_selection(
+                resolution.probe_record_with_selection_at(
                     iri.as_str(),
                     main,
                     logical,
@@ -1046,6 +1053,7 @@ fn verify_requirements_with_memory(
                     iri,
                     kinds,
                     *selection,
+                    req_idx,
                 )
             }
         };
@@ -1097,18 +1105,30 @@ fn verify_requirements_with_memory(
                 let g = &passage_groups.as_slice()[idx];
                 (g.0, g.1)
             };
-            let res = resolution.verify_proposed_passages(
+            let outcome = resolution.verify_proposed_passages_checked(
                 main,
                 logical,
                 access.clone(),
                 rendition,
                 passage_groups.as_slice()[idx].2.as_slice(),
+                group_req_idx,
             );
-            if let Err(e) = res {
-                let limit = match e.code() {
-                    "invalid" | "span-mismatch" => Some(usize::MAX),
-                    "evidence-unavailable" => Some(group_req_idx),
-                    _ => None,
+            if let Err(e) = outcome.result {
+                let limit = if let Some(failed_req_idx) = outcome.failed_req_idx {
+                    Some(failed_req_idx)
+                } else {
+                    match e.code() {
+                        "invalid" | "span-mismatch" => Some(usize::MAX),
+                        "incomplete-evidence" | "immutable-record-conflict" => {
+                            Some(if outcome.shape_confirmed {
+                                usize::MAX
+                            } else {
+                                group_req_idx
+                            })
+                        }
+                        "evidence-unavailable" => Some(group_req_idx),
+                        _ => None,
+                    }
                 };
                 if let Some(limit) = limit {
                     check_deferred_literal_shapes(
@@ -1127,6 +1147,46 @@ fn verify_requirements_with_memory(
         }
     }
     drop(passage_groups);
+    if resolution.next_pending_passage_req_idx().is_some() {
+        let access = match &record_access {
+            Some(access) => access.clone(),
+            None => {
+                let access = resolution.logical_access(main, logical, read)?;
+                record_access = Some(access.clone());
+                access
+            }
+        };
+        while let Some(pending_req_idx) = resolution.next_pending_passage_req_idx() {
+            control.check()?;
+            let outcome = resolution.verify_next_pending_passage(main, logical, access.clone());
+            if let Err(e) = outcome.result {
+                let limit = match e.code() {
+                    "span-mismatch" | "evidence-unavailable" | "immutable-record-conflict" => {
+                        Some(pending_req_idx)
+                    }
+                    "incomplete-evidence" => Some(if outcome.shape_confirmed {
+                        usize::MAX
+                    } else {
+                        pending_req_idx
+                    }),
+                    _ => None,
+                };
+                if let Some(limit) = limit {
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        structured_groups.as_mut_slice(),
+                        limit,
+                        control,
+                    )?;
+                }
+                return Err(e);
+            }
+        }
+    }
     if !passage_refs.is_empty() {
         let access = match &record_access {
             Some(access) => access.clone(),
@@ -1137,10 +1197,44 @@ fn verify_requirements_with_memory(
             }
         };
         let mut checked_passage_refs: AdmittedSet<(&NamedNode, &NamedNode, &NamedNode)> =
-            AdmittedSet::new(&prep, &admit)?;
+            match AdmittedSet::new(&prep, &admit) {
+                Ok(set) => set,
+                Err(e) => {
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        structured_groups.as_mut_slice(),
+                        usize::MAX,
+                        control,
+                    )?;
+                    return Err(e);
+                }
+            };
         for (ref_key, passage, expected_rev, expected_rend) in passage_refs.as_slice() {
             control.check()?;
-            if checked_passage_refs.insert((*passage, *expected_rev, *expected_rend), &admit)?
+            let inserted = match checked_passage_refs
+                .insert((*passage, *expected_rev, *expected_rend), &admit)
+            {
+                Ok(inserted) => inserted,
+                Err(e) => {
+                    drop(checked_passage_refs);
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        structured_groups.as_mut_slice(),
+                        usize::MAX,
+                        control,
+                    )?;
+                    return Err(e);
+                }
+            };
+            if inserted
                 && let Err(e) = resolution.verify_passage_reference(
                     ref_key,
                     main,
@@ -1151,7 +1245,13 @@ fn verify_requirements_with_memory(
                     expected_rend,
                 )
             {
-                if e.code() == "invalid" {
+                if matches!(
+                    e.code(),
+                    "invalid"
+                        | "span-mismatch"
+                        | "immutable-record-conflict"
+                        | "incomplete-evidence"
+                ) {
                     drop(checked_passage_refs);
                     check_deferred_literal_shapes(
                         &mut resolution,
@@ -1181,16 +1281,23 @@ fn verify_requirements_with_memory(
                 let g = &structured_groups.as_slice()[idx];
                 (g.0, g.1)
             };
-            let res = resolution.verify_structured_references(
+            let outcome = resolution.verify_structured_references_checked(
                 main,
                 logical,
                 access.clone(),
                 revision,
                 structured_groups.as_slice()[idx].2.as_slice(),
             );
-            if let Err(e) = res {
+            if let Err(e) = outcome.result {
                 let limit = match e.code() {
-                    "span-mismatch" | "immutable-record-conflict" => Some(usize::MAX),
+                    "span-mismatch" => Some(usize::MAX),
+                    "immutable-record-conflict" | "incomplete-evidence" => {
+                        Some(if outcome.shape_confirmed {
+                            usize::MAX
+                        } else {
+                            group_req_idx
+                        })
+                    }
                     "evidence-unavailable" => Some(group_req_idx),
                     _ => None,
                 };
@@ -1905,5 +2012,903 @@ mod tests {
         assert_eq!(long_err.code(), "incomplete-evidence");
         assert!(long_err.to_string().contains("not supported by this build"));
         assert_eq!(long_reads.load(Ordering::Relaxed), 0);
+    }
+
+    fn insert_managed_quads(ds: &Dataset, quads: Vec<oxrdf::Quad>) {
+        let store = ds.store();
+        let cap = store
+            .managed_writer(OwnerKind::Evidence, Uuid::new_v4())
+            .unwrap();
+        let mut txn = store
+            .try_write_with(
+                sparkles_core::commit::CommitKind::Transaction,
+                Default::default(),
+            )
+            .unwrap();
+        txn.set_managed(cap).unwrap();
+        let mut labels = std::collections::HashMap::new();
+        for q in &quads {
+            let ids = txn.encode_quad(q, &mut labels).unwrap();
+            txn.insert(ids).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn configure_test_evidence(ds: &Dataset) -> (Settings, Uuid) {
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            ..Default::default()
+        };
+        crate::evidence::configure(ds, &settings, &Control::none()).unwrap();
+        let capability = ds
+            .store()
+            .managed_writer(OwnerKind::Evidence, Uuid::new_v4())
+            .unwrap();
+        let nonce = capability
+            .protection("urn:ev:sources")
+            .expect("sources protection nonce");
+        (settings, nonce)
+    }
+
+    fn run_verify(
+        ds: &Dataset,
+        settings: &Settings,
+        input: &EvidenceInput,
+        memory_bytes: u64,
+    ) -> Result<()> {
+        let principal = iri("urn:agent:r4-test");
+        let opts = ProposalOptions {
+            principal: &principal,
+            idempotency_key: None,
+            source_graph: None,
+            proposal_graph: None,
+            identity_graph: None,
+        };
+        let prepared = prepare_input(input, &Control::none()).unwrap();
+        let plan = write::plan(
+            &prepared,
+            ds.dataset_id(),
+            settings,
+            &opts,
+            &Control::none(),
+        )
+        .unwrap();
+        verify_requirements_with_memory(
+            None,
+            ds,
+            ds,
+            input,
+            &plan,
+            prepared.requirements(),
+            &mut |_, _| Some(Arc::new(GraphAccess::all())),
+            &Control::none(),
+            memory_bytes,
+        )
+    }
+
+    #[test]
+    fn proposal_single_read_for_incompatible_kind_fallback_and_mixed_passages() {
+        use base64::Engine as _;
+        use oxrdf::{Literal, Term};
+        use sparkles_core::evidence::resolve::{
+            kind_iri, literal_read_counts, reset_literal_read_counts,
+        };
+
+        const EV: &str = "urn:x-sparkles:evidence:";
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        const PROV_DERIVED: &str = "http://www.w3.org/ns/prov#wasDerivedFrom";
+        const OA: &str = "http://www.w3.org/ns/oa#";
+        const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+        const XSD_BASE64: &str = "http://www.w3.org/2001/XMLSchema#base64Binary";
+
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let (settings, nonce) = configure_test_evidence(&ds);
+        let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+        let q =
+            |s: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(s.clone(), iri(p), o, sg.clone());
+        let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+        let int_lit =
+            |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+        let op = iri("urn:op:r4-reads");
+        let rev_ok = iri("urn:rev:r4-ok");
+        let rend_ok = iri("urn:rend:r4-ok");
+        let rend_bad_shape = iri("urn:rend:r4-bad-shape");
+        let rend_bad_shape_2 = iri("urn:rend:r4-bad-shape-2");
+        let pass_ok_1 = iri("urn:pass:r4-ok-1");
+        let sel_1 = iri("urn:sel:r4-ok-1");
+        let pass_ok_2 = iri("urn:pass:r4-ok-2");
+        let sel_2 = iri("urn:sel:r4-ok-2");
+
+        let json = r#"{"score":42}"#;
+        let json_digest = Sha256Digest::of_bytes(json.as_bytes(), &Control::none()).unwrap();
+        let val_digest = Sha256Digest::of_bytes(b"42", &Control::none()).unwrap();
+        let json_b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        let text = "single proposal read check";
+        let d_single = Sha256Digest::of_bytes(b"single", &Control::none()).unwrap();
+        let d_proposal = Sha256Digest::of_bytes(b"proposal", &Control::none()).unwrap();
+        let d_read = Sha256Digest::of_bytes(b"read", &Control::none()).unwrap();
+
+        insert_managed_quads(
+            &ds,
+            vec![
+                q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+                q(
+                    &op,
+                    &format!("{EV}datasetId"),
+                    lit(&ds.dataset_id().to_string()),
+                ),
+                q(
+                    &op,
+                    &format!("{EV}branchId"),
+                    lit(&ds.store().branch_id().to_string()),
+                ),
+                q(&op, &format!("{EV}commit"), int_lit(1)),
+                q(
+                    &op,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                // Valid SourceRevision
+                q(
+                    &rev_ok,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::SourceRevision)).into(),
+                ),
+                q(
+                    &rev_ok,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &rev_ok,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(
+                    &rev_ok,
+                    &format!("{EV}contentDigest"),
+                    lit(&json_digest.to_string()),
+                ),
+                q(
+                    &rev_ok,
+                    &format!("{EV}retainedBytes"),
+                    Term::Literal(Literal::new_typed_literal(json_b64, iri(XSD_BASE64))),
+                ),
+                // Valid Rendition
+                q(
+                    &rend_ok,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Rendition)).into(),
+                ),
+                q(
+                    &rend_ok,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &rend_ok,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(&rend_ok, PROV_DERIVED, rev_ok.clone().into()),
+                q(&rend_ok, &format!("{EV}normalizedText"), lit(text)),
+                // Wrong-shape Rendition (Vocab IRI under ev:normalizedText)
+                q(
+                    &rend_bad_shape,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Rendition)).into(),
+                ),
+                q(
+                    &rend_bad_shape,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &rend_bad_shape,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(&rend_bad_shape, PROV_DERIVED, rev_ok.clone().into()),
+                q(
+                    &rend_bad_shape,
+                    &format!("{EV}normalizedText"),
+                    iri("urn:not:simple-literal").into(),
+                ),
+                // Second wrong-shape Rendition (for ordering between compatible & incompatible probes)
+                q(
+                    &rend_bad_shape_2,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Rendition)).into(),
+                ),
+                q(
+                    &rend_bad_shape_2,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &rend_bad_shape_2,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(&rend_bad_shape_2, PROV_DERIVED, rev_ok.clone().into()),
+                q(
+                    &rend_bad_shape_2,
+                    &format!("{EV}normalizedText"),
+                    iri("urn:not:simple-literal-2").into(),
+                ),
+                // Existing passage 1 on rend_ok
+                q(
+                    &pass_ok_1,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Passage)).into(),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{EV}sourceRevision"),
+                    rev_ok.clone().into(),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{OA}hasSource"),
+                    rend_ok.clone().into(),
+                ),
+                q(
+                    &pass_ok_1,
+                    &format!("{OA}hasSelector"),
+                    sel_1.clone().into(),
+                ),
+                q(&sel_1, &format!("{OA}start"), int_lit(0)),
+                q(&sel_1, &format!("{OA}end"), int_lit(6)),
+                q(
+                    &pass_ok_1,
+                    &format!("{EV}textDigest"),
+                    lit(&d_single.to_string()),
+                ),
+                // Existing passage 2 on rend_ok
+                q(
+                    &pass_ok_2,
+                    RDF_TYPE,
+                    iri(kind_iri(RecordKind::Passage)).into(),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{EV}availabilityReceipt"),
+                    op.clone().into(),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{EV}graphProtection"),
+                    lit(&nonce.to_string()),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{EV}sourceRevision"),
+                    rev_ok.clone().into(),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{OA}hasSource"),
+                    rend_ok.clone().into(),
+                ),
+                q(
+                    &pass_ok_2,
+                    &format!("{OA}hasSelector"),
+                    sel_2.clone().into(),
+                ),
+                q(&sel_2, &format!("{OA}start"), int_lit(7)),
+                q(&sel_2, &format!("{OA}end"), int_lit(15)),
+                q(
+                    &pass_ok_2,
+                    &format!("{EV}textDigest"),
+                    lit(&d_proposal.to_string()),
+                ),
+            ],
+        );
+        ds.store().compact().unwrap();
+
+        // 1. Compatible rendition probe (rev_ok, rend_ok) followed by incompatible
+        //    (rend_ok, rend_ok): fallback reuses the exact shape already checked by the
+        //    incompatible probe -> 1 simple literal read total (not 2).
+        let compat_then_incompat = EvidenceInput {
+            passages: vec![
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p1"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_ok.clone()),
+                    occurrence_key: key("p1"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: Some("single".into()),
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p2"),
+                    revision: RecordRef::Existing(rend_ok.clone()),
+                    rendition: RecordRef::Existing(rend_ok.clone()),
+                    occurrence_key: key("p2"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: Some("single".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        let err = run_verify(&ds, &settings, &compat_then_incompat, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "immutable-record-conflict");
+        assert_eq!(literal_read_counts(), (1, 0));
+
+        // 2a. Earlier compatible probe on wrong-shape rendition T, then wrong-shape
+        //     rendition B, then incompatible (T, T): carries forward T's exact
+        //     Unavailable outcome at T's earlier position before B without rereading T
+        //     or reading B.
+        let earlier_bad_shape = EvidenceInput {
+            passages: vec![
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-bad-1"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_bad_shape.clone()),
+                    occurrence_key: key("p-bad-1"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: None,
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-bad-mid"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_bad_shape_2.clone()),
+                    occurrence_key: key("p-bad-mid"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: None,
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-bad-2"),
+                    revision: RecordRef::Existing(rend_bad_shape.clone()),
+                    rendition: RecordRef::Existing(rend_bad_shape.clone()),
+                    occurrence_key: key("p-bad-2"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: None,
+                },
+            ],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        let err = run_verify(&ds, &settings, &earlier_bad_shape, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "evidence-unavailable");
+        assert!(err.to_string().contains(rend_bad_shape.as_str()));
+        assert_eq!(literal_read_counts(), (1, 0));
+
+        // 2b. Earlier compatible probe on valid rendition T, then wrong-shape rendition B,
+        //     then incompatible (T, T): fallback skips rereading T (cached Valid) and
+        //     reports B's earlier `evidence-unavailable` before T's kind conflict
+        //     (2 reads total: 1 for T, 1 for B).
+        let valid_then_bad_then_incompat = EvidenceInput {
+            passages: vec![
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-ok-first"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_ok.clone()),
+                    occurrence_key: key("p-ok-first"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: Some("single".into()),
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-bad-second"),
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    rendition: RecordRef::Existing(rend_bad_shape.clone()),
+                    occurrence_key: key("p-bad-second"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: None,
+                },
+                PassageInput {
+                    version: RecordVersion::V1,
+                    key: key("p-ok-incompat"),
+                    revision: RecordRef::Existing(rend_ok.clone()),
+                    rendition: RecordRef::Existing(rend_ok.clone()),
+                    occurrence_key: key("p-ok-incompat"),
+                    start: 0,
+                    end: 6,
+                    text_digest: d_single,
+                    quote: Some("single".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        let err =
+            run_verify(&ds, &settings, &valid_then_bad_then_incompat, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "evidence-unavailable");
+        assert!(err.to_string().contains(rend_bad_shape.as_str()));
+        assert_eq!(literal_read_counts(), (2, 0));
+
+        // 3. Symmetric structured compatible probe followed by incompatible rendition probe:
+        //    exactly 1 typed literal read total.
+        let struct_then_incompat = EvidenceInput {
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-ok"),
+                occurrence_key: key("s-ok"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(rev_ok.clone()),
+                    pointer: "/score".into(),
+                    method: MethodRef {
+                        method: iri(JSON_LEXICAL_UTF8_V1),
+                        version: key(JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: val_digest,
+                },
+            }],
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-rev-as-rend"),
+                revision: RecordRef::Existing(rev_ok.clone()),
+                rendition: RecordRef::Existing(rev_ok.clone()),
+                occurrence_key: key("p-rev-as-rend"),
+                start: 0,
+                end: 6,
+                text_digest: d_single,
+                quote: None,
+            }],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        let err = run_verify(&ds, &settings, &struct_then_incompat, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "immutable-record-conflict");
+        assert_eq!(literal_read_counts(), (0, 1));
+
+        // 4. Mixed successful proposal creating a new passage from `rend_ok` AND
+        //    referencing two existing passages on `rend_ok`: shares one single
+        //    `ev:normalizedText` read across both selection forms.
+        let mixed_ok = EvidenceInput {
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-new"),
+                revision: RecordRef::Existing(rev_ok.clone()),
+                rendition: RecordRef::Existing(rend_ok.clone()),
+                occurrence_key: key("p-new"),
+                start: 16,
+                end: 20,
+                text_digest: d_read,
+                quote: Some("read".into()),
+            }],
+            references: vec![
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("ref-existing-1"),
+                    occurrence_key: key("ref-existing-1"),
+                    target: EvidenceRefTarget::Passage {
+                        revision: RecordRef::Existing(rev_ok.clone()),
+                        rendition: RecordRef::Existing(rend_ok.clone()),
+                        passage: RecordRef::Existing(pass_ok_1.clone()),
+                    },
+                },
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("ref-existing-2"),
+                    occurrence_key: key("ref-existing-2"),
+                    target: EvidenceRefTarget::Passage {
+                        revision: RecordRef::Existing(rev_ok.clone()),
+                        rendition: RecordRef::Existing(rend_ok.clone()),
+                        passage: RecordRef::Existing(pass_ok_2.clone()),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        reset_literal_read_counts();
+        run_verify(&ds, &settings, &mixed_ok, MEMORY_BYTES).unwrap();
+        assert_eq!(literal_read_counts(), (1, 0));
+    }
+
+    #[test]
+    fn proposal_phase2_budget_and_mixed_batch_wrong_shape_fallback_parity() {
+        use base64::Engine as _;
+        use oxrdf::{Literal, Term};
+        use sparkles_core::evidence::resolve::kind_iri;
+
+        const EV: &str = "urn:x-sparkles:evidence:";
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        const PROV_DERIVED: &str = "http://www.w3.org/ns/prov#wasDerivedFrom";
+        const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+        const XSD_BASE64: &str = "http://www.w3.org/2001/XMLSchema#base64Binary";
+
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let (settings, nonce) = configure_test_evidence(&ds);
+        let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+        let q =
+            |s: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(s.clone(), iri(p), o, sg.clone());
+        let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+        let int_lit =
+            |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+        let op = iri("urn:op:r4-budget");
+        let rev_big = iri("urn:rev:r4-big");
+        let rev_other = iri("urn:rev:r4-other");
+        let rev_bad = iri("urn:rev:r4-wrong-shape");
+        let rev_missing = iri("urn:rev:r4-missing");
+        let rend_ok = iri("urn:rend:r4-budget-ok");
+
+        // 180 KiB JSON -> ~240 KiB base64 literal (< 256 KiB Vec capacity): leaves a
+        // ~52 KiB window where the reconstructed vocab key fits during literal-shape
+        // checking (128 + 256 = 384 KiB peak), while the 180 KiB decoded buffer cannot
+        // fit simultaneously alongside the 256 KiB live key (256 + 180 = 436 KiB).
+        let json = format!(r#"{{"score":1,"pad":"{}"}}"#, "x".repeat(180 * 1024));
+        let json_digest = Sha256Digest::of_bytes(json.as_bytes(), &Control::none()).unwrap();
+        let val_digest = Sha256Digest::of_bytes(b"1", &Control::none()).unwrap();
+        let json_b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        let text = "Release 1.2";
+        let d_text = Sha256Digest::of_bytes(text.as_bytes(), &Control::none()).unwrap();
+
+        let mut quads = vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&ds.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&ds.store().branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_big,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_big,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_big,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_big,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_big,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(json_b64, iri(XSD_BASE64))),
+            ),
+            q(
+                &rev_other,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_other,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_other,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_other,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_bad,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_bad,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_bad,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_bad,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_bad,
+                &format!("{EV}retainedBytes"),
+                iri("urn:not:base64-value").into(),
+            ),
+            q(
+                &rend_ok,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Rendition)).into(),
+            ),
+            q(
+                &rend_ok,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend_ok,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend_ok, PROV_DERIVED, rev_big.clone().into()),
+            q(&rend_ok, &format!("{EV}normalizedText"), lit(text)),
+        ];
+        // Isolate `rev_big`'s large base64 literal into its own front-coded Vocab block
+        // so IRI lookups do not scan past the 240 KiB literal.
+        let pad_sub = iri("urn:pad:vocab-blocks");
+        for i in 0..32u32 {
+            quads.push(q(
+                &pad_sub,
+                &format!("{EV}padBefore"),
+                lit(&format!("a{i:02}")),
+            ));
+            quads.push(q(
+                &pad_sub,
+                &format!("{EV}padAfter"),
+                lit(&format!("z{i:02}")),
+            ));
+        }
+        insert_managed_quads(&ds, quads);
+        ds.store().compact().unwrap();
+
+        let two_struct = |b: &NamedNode| EvidenceInput {
+            references: vec![
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("s-a"),
+                    occurrence_key: key("s-a"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: RecordRef::Existing(rev_big.clone()),
+                        pointer: "/score".into(),
+                        method: MethodRef {
+                            method: iri(JSON_LEXICAL_UTF8_V1),
+                            version: key(JSON_LEXICAL_UTF8_VERSION),
+                        },
+                        value_digest: val_digest,
+                    },
+                },
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("s-b"),
+                    occurrence_key: key("s-b"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: RecordRef::Existing(b.clone()),
+                        pointer: "/score".into(),
+                        method: MethodRef {
+                            method: iri(JSON_LEXICAL_UTF8_V1),
+                            version: key(JSON_LEXICAL_UTF8_VERSION),
+                        },
+                        value_digest: val_digest,
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+
+        let scrub = |e: &Error, target: &NamedNode| {
+            (
+                e.code().to_string(),
+                e.to_string().replace(target.as_str(), "TARGET"),
+            )
+        };
+
+        // Find a budget in [4 KiB, 512 KiB] where:
+        // - `(rev_big, rev_big)` fails in Phase 2 decoding with `incomplete-evidence`
+        //   naming `rev_big`, AND
+        // - `(rev_big, rev_missing)` succeeds at `rev_big`'s literal-shape check and
+        //   returns `evidence-unavailable` naming `rev_missing`.
+        let valid_pair = two_struct(&rev_big);
+        let absent_pair = two_struct(&rev_missing);
+        let wrong_shape_pair = two_struct(&rev_bad);
+
+        let mut decode_refusal_budget = None;
+        let mut key_refusal_budget = None;
+        for kib in (128u64..=768).step_by(8) {
+            let cap = kib * 1024;
+            let absent_res = run_verify(&ds, &settings, &absent_pair, cap);
+            let valid_res = run_verify(&ds, &settings, &valid_pair, cap);
+            if let (Err(a_err), Err(v_err)) = (&absent_res, &valid_res) {
+                if a_err.code() == "incomplete-evidence"
+                    && a_err.to_string().contains(rev_big.as_str())
+                    && key_refusal_budget.is_none()
+                {
+                    key_refusal_budget = Some(cap);
+                }
+                if a_err.code() == "evidence-unavailable"
+                    && a_err.to_string().contains(rev_missing.as_str())
+                    && v_err.code() == "incomplete-evidence"
+                    && v_err.to_string().contains(rev_big.as_str())
+                {
+                    decode_refusal_budget = Some(cap);
+                    break;
+                }
+            }
+        }
+        let decode_budget = decode_refusal_budget
+            .expect("expected a budget admitting A's shape check but refusing A's decode buffer");
+        let key_budget =
+            key_refusal_budget.expect("expected a tighter budget refusing A's vocab key itself");
+
+        // 1. Under `decode_budget`, Phase 2 decode refusal on A must still check B's
+        //    deferred literal shape and match absent B byte for byte.
+        let absent_err = run_verify(&ds, &settings, &absent_pair, decode_budget).unwrap_err();
+        let bad_shape_err =
+            run_verify(&ds, &settings, &wrong_shape_pair, decode_budget).unwrap_err();
+        assert_eq!(absent_err.code(), "evidence-unavailable");
+        assert_eq!(
+            scrub(&bad_shape_err, &rev_bad),
+            scrub(&absent_err, &rev_missing)
+        );
+
+        // 2. Under `key_budget` where A's vocab key itself does not fit, both absent B
+        //    and wrong-shape B return identical `incomplete-evidence` naming A.
+        let absent_key_err = run_verify(&ds, &settings, &absent_pair, key_budget).unwrap_err();
+        let bad_key_err = run_verify(&ds, &settings, &wrong_shape_pair, key_budget).unwrap_err();
+        assert_eq!(absent_key_err.code(), "incomplete-evidence");
+        assert_eq!(bad_key_err.code(), "incomplete-evidence");
+        assert_eq!(bad_key_err.to_string(), absent_key_err.to_string());
+
+        // 3. Mixed-batch Phase 2 fallback dispatch: an earlier proposed passage that
+        //    fails with `span-mismatch` (mismatched quote) or `invalid` (wrong revision)
+        //    still runs `check_deferred_literal_shapes` on a later wrong-shape target B
+        //    and matches absent B byte for byte.
+        let mixed_bad_quote = |b: &NamedNode| EvidenceInput {
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-bad-quote"),
+                revision: RecordRef::Existing(rev_big.clone()),
+                rendition: RecordRef::Existing(rend_ok.clone()),
+                occurrence_key: key("p-bad-quote"),
+                start: 0,
+                end: 11,
+                text_digest: d_text,
+                quote: Some("Wrong quote".into()),
+            }],
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-after-quote"),
+                occurrence_key: key("s-after-quote"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(b.clone()),
+                    pointer: "/score".into(),
+                    method: MethodRef {
+                        method: iri(JSON_LEXICAL_UTF8_V1),
+                        version: key(JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: val_digest,
+                },
+            }],
+            ..Default::default()
+        };
+        let quote_absent =
+            run_verify(&ds, &settings, &mixed_bad_quote(&rev_missing), MEMORY_BYTES).unwrap_err();
+        let quote_bad =
+            run_verify(&ds, &settings, &mixed_bad_quote(&rev_bad), MEMORY_BYTES).unwrap_err();
+        assert_eq!(quote_absent.code(), "evidence-unavailable");
+        assert_eq!(
+            scrub(&quote_bad, &rev_bad),
+            scrub(&quote_absent, &rev_missing)
+        );
+
+        let mixed_bad_rev = |b: &NamedNode| EvidenceInput {
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-bad-rev"),
+                revision: RecordRef::Existing(rev_other.clone()),
+                rendition: RecordRef::Existing(rend_ok.clone()),
+                occurrence_key: key("p-bad-rev"),
+                start: 0,
+                end: 11,
+                text_digest: d_text,
+                quote: Some(text.into()),
+            }],
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-after-rev"),
+                occurrence_key: key("s-after-rev"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(b.clone()),
+                    pointer: "/score".into(),
+                    method: MethodRef {
+                        method: iri(JSON_LEXICAL_UTF8_V1),
+                        version: key(JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: val_digest,
+                },
+            }],
+            ..Default::default()
+        };
+        let rev_absent =
+            run_verify(&ds, &settings, &mixed_bad_rev(&rev_missing), MEMORY_BYTES).unwrap_err();
+        let rev_bad_err =
+            run_verify(&ds, &settings, &mixed_bad_rev(&rev_bad), MEMORY_BYTES).unwrap_err();
+        assert_eq!(rev_absent.code(), "evidence-unavailable");
+        assert_eq!(
+            scrub(&rev_bad_err, &rev_bad),
+            scrub(&rev_absent, &rev_missing)
+        );
+
+        // 4. Phase 1 fallback dispatch: wrong-shape target B before missing target M
+        //    returns `evidence-unavailable` naming B (not M).
+        let bad_before_missing = EvidenceInput {
+            references: vec![
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("s-first-bad"),
+                    occurrence_key: key("s-first-bad"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: RecordRef::Existing(rev_bad.clone()),
+                        pointer: "/score".into(),
+                        method: MethodRef {
+                            method: iri(JSON_LEXICAL_UTF8_V1),
+                            version: key(JSON_LEXICAL_UTF8_VERSION),
+                        },
+                        value_digest: val_digest,
+                    },
+                },
+                EvidenceRefInput {
+                    version: RecordVersion::V1,
+                    key: key("s-second-missing"),
+                    occurrence_key: key("s-second-missing"),
+                    target: EvidenceRefTarget::Structured {
+                        revision: RecordRef::Existing(rev_missing.clone()),
+                        pointer: "/score".into(),
+                        method: MethodRef {
+                            method: iri(JSON_LEXICAL_UTF8_V1),
+                            version: key(JSON_LEXICAL_UTF8_VERSION),
+                        },
+                        value_digest: val_digest,
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let err = run_verify(&ds, &settings, &bad_before_missing, MEMORY_BYTES).unwrap_err();
+        assert_eq!(err.code(), "evidence-unavailable");
+        assert!(err.to_string().contains(rev_bad.as_str()));
     }
 }

@@ -136,6 +136,18 @@ pub enum SelectionProbe {
     DeferredLiteralShape,
 }
 
+/// Outcome of a Phase 2 grouped verification step, carrying enough context for proposal
+/// fallback dispatch to preserve exact Phase 1 error precedence.
+pub struct Phase2Outcome {
+    pub result: Result<()>,
+    /// Whether the target's retained literal shape (`ev:normalizedText` or
+    /// `ev:retainedBytes`) was confirmed before any error occurred.
+    pub shape_confirmed: bool,
+    /// When a deferred Phase 1 item (such as an existing passage sharing the same
+    /// rendition) produced the error, its Phase 1 requirement index.
+    pub failed_req_idx: Option<usize>,
+}
+
 /// An authenticated profile record at the resolving view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedRecord {
@@ -309,6 +321,39 @@ struct CachedPassage {
     span: VerifiedSpan,
 }
 
+/// Exact literal-shape outcome for a selected target in one bound `(ViewKey, view_index)`
+/// view so fallback checks never reread a literal already inspected in the same view.
+#[derive(Clone, Copy)]
+enum CachedLiteralShape {
+    Valid,
+    Unavailable,
+    Conflict(&'static str),
+}
+
+/// Outcome of a deferred existing passage's span check once its rendition's
+/// `ev:normalizedText` has been scanned.
+#[derive(Clone, Copy)]
+enum PendingOutcome {
+    Valid,
+    Unavailable,
+    Conflict(&'static str),
+    Span(&'static str),
+}
+
+/// An existing passage whose metadata and rendition authentication succeeded during
+/// Phase 1 probing, with its `ev:normalizedText` scan deferred so it can share one read
+/// of that rendition with any other existing or proposed passages targeting it.
+struct PendingPassage {
+    key: String,
+    req_idx: usize,
+    passage: NamedNode,
+    graph: NamedNode,
+    rendition_graph: NamedNode,
+    span: VerifiedSpan,
+    passage_lineage: bool,
+    outcome: Option<PendingOutcome>,
+}
+
 /// The record graphs of one dataset, derived from one running managed state. A
 /// management change installs a new state, so a list kept for an earlier one is
 /// rederived.
@@ -322,6 +367,13 @@ struct RecordGraphs {
     /// Verified passage spans keyed by `(view_key, view_index)` and passage IRI.
     /// Invalidated automatically whenever `state` changes and `RecordGraphs` is rebuilt.
     verified_passages: BTreeMap<(ViewKey, usize), BTreeMap<String, CachedPassage>>,
+    /// Exact literal-shape outcomes (`ev:normalizedText` or `ev:retainedBytes`) already
+    /// established in one bound `(view_key, view_index)` view.
+    verified_literal_shapes:
+        BTreeMap<(ViewKey, usize), BTreeMap<String, (RecordKind, CachedLiteralShape)>>,
+    /// Existing passages deferred during Phase 1 probing for one `(view_key, view_index)`,
+    /// stored in ascending Phase-1 `req_idx` order.
+    pending_passages: BTreeMap<(ViewKey, usize), Vec<PendingPassage>>,
     _held: Reservation,
 }
 
@@ -464,6 +516,8 @@ impl Resolver {
                 graphs,
                 protections,
                 verified_passages: BTreeMap::new(),
+                verified_literal_shapes: BTreeMap::new(),
+                pending_passages: BTreeMap::new(),
                 _held: held,
             });
         }
@@ -515,7 +569,7 @@ impl Resolver {
             &request.kinds,
             request.content_digest.as_ref(),
             SelectionRequirements::default(),
-            false,
+            None,
         )?;
         Ok(verified)
     }
@@ -558,7 +612,7 @@ impl Resolver {
     ) -> Result<()> {
         let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
         let _ = self.record_in_view(
-            key, view_key, index, main, iri, kinds, None, selection, false,
+            key, view_key, index, main, iri, kinds, None, selection, None,
         )?;
         Ok(())
     }
@@ -580,11 +634,351 @@ impl Resolver {
         kinds: &[RecordKind],
         selection: SelectionRequirements,
     ) -> Result<SelectionProbe> {
+        self.probe_record_with_selection_at(key, main, logical, access, iri, kinds, selection, 0)
+    }
+
+    /// Like [`probe_record_with_selection`](Self::probe_record_with_selection), recording
+    /// `req_idx` for any deferred existing passage so fallback checks preserve exact
+    /// Phase 1 ordering across proposed passages, existing passages and structured
+    /// references.
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe_record_with_selection_at(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: Option<&Arc<GraphAccess>>,
+        iri: &NamedNode,
+        kinds: &[RecordKind],
+        selection: SelectionRequirements,
+        req_idx: usize,
+    ) -> Result<SelectionProbe> {
         let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
         let (_, probe) = self.record_in_view(
-            key, view_key, index, main, iri, kinds, None, selection, true,
+            key,
+            view_key,
+            index,
+            main,
+            iri,
+            kinds,
+            None,
+            selection,
+            Some(req_idx),
         )?;
         Ok(probe)
+    }
+
+    /// Smallest Phase 1 requirement index among deferred existing passages that have not
+    /// yet been verified or consumed.
+    pub fn next_pending_passage_req_idx(&self) -> Option<usize> {
+        self.record_graphs
+            .as_ref()?
+            .pending_passages
+            .values()
+            .filter_map(|list| list.first().map(|p| p.req_idx))
+            .min()
+    }
+
+    /// Verify and consume the earliest deferred existing passage (smallest Phase 1
+    /// `req_idx`), sharing a single `ev:normalizedText` scan across all pending passages
+    /// that target the same rendition.
+    pub fn verify_next_pending_passage(
+        &mut self,
+        main: &Store,
+        logical: &Store,
+        access: Option<&Arc<GraphAccess>>,
+    ) -> Phase2Outcome {
+        let Some((target_view_key, target_index, front_key, front_passage, front_lineage)) =
+            self.record_graphs.as_ref().and_then(|rg| {
+                rg.pending_passages
+                    .iter()
+                    .filter_map(|(&(vk, idx), list)| {
+                        list.first().map(|p| {
+                            (
+                                p.req_idx,
+                                vk,
+                                idx,
+                                p.key.clone(),
+                                p.passage.clone(),
+                                p.passage_lineage,
+                            )
+                        })
+                    })
+                    .min_by_key(|(req_idx, _, _, _, _, _)| *req_idx)
+                    .map(|(_, vk, idx, k, p, lin)| (vk, idx, k, p, lin))
+            })
+        else {
+            return Phase2Outcome {
+                result: Ok(()),
+                shape_confirmed: true,
+                failed_req_idx: None,
+            };
+        };
+        let state = main.managed_state_shared();
+        let state_current = self.record_graphs.as_ref().is_some_and(|r| {
+            r.dataset == main.dataset_id()
+                && match (&r.state, &state) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+        });
+        if !state_current {
+            // Management state changed since Phase 1 probing; discard stale pending state
+            // and re-verify eagerly under the new state.
+            let res = self.verify_record_with_selection(
+                &front_key,
+                main,
+                logical,
+                access,
+                &front_passage,
+                &[RecordKind::Passage],
+                SelectionRequirements {
+                    passage_lineage: front_lineage,
+                    ..Default::default()
+                },
+            );
+            return Phase2Outcome {
+                result: res,
+                shape_confirmed: false,
+                failed_req_idx: None,
+            };
+        }
+        let (view_key, index) = match self.prepare_record_view(&front_key, main, logical, access) {
+            Ok(v) => v,
+            Err(e) => {
+                return Phase2Outcome {
+                    result: Err(e),
+                    shape_confirmed: false,
+                    failed_req_idx: None,
+                };
+            }
+        };
+        if (view_key, index) != (target_view_key, target_index) {
+            // Snapshot or access changed; remove this pending entry and verify eagerly.
+            if let Some(rg) = self.record_graphs.as_mut()
+                && let Some(list) = rg
+                    .pending_passages
+                    .get_mut(&(target_view_key, target_index))
+                && !list.is_empty()
+            {
+                list.remove(0);
+            }
+            let res = self.verify_record_with_selection(
+                &front_key,
+                main,
+                logical,
+                access,
+                &front_passage,
+                &[RecordKind::Passage],
+                SelectionRequirements {
+                    passage_lineage: front_lineage,
+                    ..Default::default()
+                },
+            );
+            return Phase2Outcome {
+                result: res,
+                shape_confirmed: false,
+                failed_req_idx: None,
+            };
+        }
+        let (already_outcome, rendition, rendition_graph) = {
+            let rg = self.record_graphs.as_ref().expect("prepared");
+            let p = &rg.pending_passages[&(view_key, index)][0];
+            (
+                p.outcome,
+                p.span.rendition.clone(),
+                p.rendition_graph.clone(),
+            )
+        };
+        let mut shape_confirmed = false;
+        if already_outcome.is_none() {
+            let scan_res = self.scan_pending_passages_for_rendition(
+                &front_key,
+                view_key,
+                index,
+                &rendition,
+                &rendition_graph,
+                &mut shape_confirmed,
+            );
+            if let Err(e) = scan_res {
+                return Phase2Outcome {
+                    result: Err(e),
+                    shape_confirmed,
+                    failed_req_idx: None,
+                };
+            }
+        }
+        let consumed = {
+            let rg = self.record_graphs.as_mut().expect("prepared");
+            let list = rg
+                .pending_passages
+                .get_mut(&(view_key, index))
+                .expect("pending list exists");
+            list.remove(0)
+        };
+        match consumed.outcome.expect("outcome populated by scan") {
+            PendingOutcome::Valid => {
+                let cache_res = self.cache_verified_passage(
+                    &consumed.key,
+                    view_key,
+                    index,
+                    &consumed.passage,
+                    &consumed.graph,
+                    &consumed.rendition_graph,
+                    &consumed.span,
+                );
+                Phase2Outcome {
+                    result: cache_res,
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                }
+            }
+            PendingOutcome::Unavailable => Phase2Outcome {
+                result: Err(unavailable(&consumed.key)),
+                shape_confirmed: false,
+                failed_req_idx: None,
+            },
+            PendingOutcome::Conflict(msg) => Phase2Outcome {
+                result: Err(conflict(&consumed.key, msg)),
+                shape_confirmed: false,
+                failed_req_idx: None,
+            },
+            PendingOutcome::Span(why) => Phase2Outcome {
+                result: Err(span(&consumed.key, why)),
+                shape_confirmed: true,
+                failed_req_idx: None,
+            },
+        }
+    }
+
+    /// Scan `rendition`'s `ev:normalizedText` once to populate `outcome` for every
+    /// unresolved `PendingPassage` targeting `rendition` in `(view_key, index)`.
+    fn scan_pending_passages_for_rendition(
+        &mut self,
+        key: &str,
+        view_key: ViewKey,
+        index: usize,
+        rendition: &NamedNode,
+        rendition_graph: &NamedNode,
+        shape_confirmed: &mut bool,
+    ) -> Result<()> {
+        let cached_shape = self
+            .record_graphs
+            .as_ref()
+            .and_then(|rg| rg.verified_literal_shapes.get(&(view_key, index)))
+            .and_then(|m| m.get(rendition.as_str()))
+            .copied();
+        if let Some((RecordKind::Rendition, CachedLiteralShape::Unavailable)) = cached_shape {
+            self.set_pending_outcomes_for_rendition(
+                view_key,
+                index,
+                rendition,
+                PendingOutcome::Unavailable,
+            );
+            return Ok(());
+        }
+        if let Some((RecordKind::Rendition, CachedLiteralShape::Conflict(msg))) = cached_shape {
+            self.set_pending_outcomes_for_rendition(
+                view_key,
+                index,
+                rendition,
+                PendingOutcome::Conflict(msg),
+            );
+            return Ok(());
+        }
+        let outcome = {
+            let cached = &self.views[&view_key][index];
+            let rg = self.record_graphs.as_ref().expect("prepared");
+            let list = rg
+                .pending_passages
+                .get(&(view_key, index))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut lookups = Lookups::new(&self.preparation, &cached.view);
+            let preparation = &self.preparation;
+            lookups
+                .one_text(
+                    rendition.as_str(),
+                    &format!("{EV}normalizedText"),
+                    rendition_graph,
+                    |text| {
+                        *shape_confirmed = true;
+                        verify_pending_spans_in_text(text, list, rendition, preparation)
+                    },
+                )
+                .map_err(|e| classify(key, e))?
+        };
+        match outcome {
+            Text::Some(outcomes) => {
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    rendition,
+                    RecordKind::Rendition,
+                    CachedLiteralShape::Valid,
+                );
+                if let Some(rg) = self.record_graphs.as_mut()
+                    && let Some(list) = rg.pending_passages.get_mut(&(view_key, index))
+                {
+                    for (slot, out) in outcomes {
+                        if let Some(entry) = list.get_mut(slot) {
+                            entry.outcome = Some(out);
+                        }
+                    }
+                }
+            }
+            Text::Many => {
+                let msg = "the rendition has more than one normalized text";
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    rendition,
+                    RecordKind::Rendition,
+                    CachedLiteralShape::Conflict(msg),
+                );
+                self.set_pending_outcomes_for_rendition(
+                    view_key,
+                    index,
+                    rendition,
+                    PendingOutcome::Conflict(msg),
+                );
+            }
+            Text::None => {
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    rendition,
+                    RecordKind::Rendition,
+                    CachedLiteralShape::Unavailable,
+                );
+                self.set_pending_outcomes_for_rendition(
+                    view_key,
+                    index,
+                    rendition,
+                    PendingOutcome::Unavailable,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn set_pending_outcomes_for_rendition(
+        &mut self,
+        view_key: ViewKey,
+        index: usize,
+        rendition: &NamedNode,
+        outcome: PendingOutcome,
+    ) {
+        if let Some(rg) = self.record_graphs.as_mut()
+            && let Some(list) = rg.pending_passages.get_mut(&(view_key, index))
+        {
+            for p in list.iter_mut() {
+                if p.span.rendition == *rendition && p.outcome.is_none() {
+                    p.outcome = Some(outcome);
+                }
+            }
+        }
     }
 
     /// Verify the exact vocabulary literal shape of a selected target whose single
@@ -600,51 +994,138 @@ impl Resolver {
         selection: SelectionRequirements,
     ) -> Result<()> {
         let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
-        let cached = &self.views[&view_key][index];
-        let rg = self.record_graphs.as_ref().expect("prepared");
-        let (graphs, _filtered) =
-            readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, key)?;
-        let mut lookups = Lookups::new(&self.preparation, &cached.view);
-        let Some((graph, kind)) = find_record(&mut lookups, &graphs, iri, key)? else {
-            return Err(unavailable(key));
-        };
-        if kind == RecordKind::Rendition && selection.rendition_content {
-            match lookups
-                .one_text(iri.as_str(), &format!("{EV}normalizedText"), &graph, |_| {
-                    Ok(())
-                })
-                .map_err(|e| classify(key, e))?
-            {
-                Text::Some(()) => {}
-                Text::Many => {
-                    return Err(conflict(
-                        key,
-                        "the rendition has more than one normalized text",
-                    ));
-                }
-                Text::None => return Err(unavailable(key)),
+        if let Some((cached_kind, cached_shape)) = self
+            .record_graphs
+            .as_ref()
+            .and_then(|rg| rg.verified_literal_shapes.get(&(view_key, index)))
+            .and_then(|m| m.get(iri.as_str()))
+            .copied()
+        {
+            let applies = (cached_kind == RecordKind::Rendition && selection.rendition_content)
+                || (cached_kind == RecordKind::SourceRevision && selection.structured_content);
+            if applies {
+                return match cached_shape {
+                    CachedLiteralShape::Valid => Ok(()),
+                    CachedLiteralShape::Unavailable => Err(unavailable(key)),
+                    CachedLiteralShape::Conflict(msg) => Err(conflict(key, msg)),
+                };
             }
         }
-        if kind == RecordKind::SourceRevision && selection.structured_content {
-            match lookups
-                .one_typed_literal(
-                    iri.as_str(),
-                    &format!("{EV}retainedBytes"),
-                    XSD_BASE64_BINARY,
-                    &graph,
-                    |_| Ok(()),
-                )
-                .map_err(|e| classify(key, e))?
-            {
-                Text::Some(()) => {}
-                Text::Many => {
-                    return Err(conflict(
-                        key,
-                        "the revision has more than one retained bytes value",
-                    ));
+        let (cache_entry, pending_outcomes) = {
+            let cached = &self.views[&view_key][index];
+            let rg = self.record_graphs.as_ref().expect("prepared");
+            let (graphs, _filtered) =
+                readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, key)?;
+            let mut lookups = Lookups::new(&self.preparation, &cached.view);
+            let Some((graph, kind)) = find_record(&mut lookups, &graphs, iri, key)? else {
+                return Err(unavailable(key));
+            };
+            let mut cache_entry: Option<(RecordKind, CachedLiteralShape)> = None;
+            let mut pending_outcomes: Option<Vec<(usize, PendingOutcome)>> = None;
+            if kind == RecordKind::Rendition && selection.rendition_content {
+                let pending_list = rg
+                    .pending_passages
+                    .get(&(view_key, index))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let has_pending = pending_list
+                    .iter()
+                    .any(|p| p.span.rendition == *iri && p.outcome.is_none());
+                let preparation = &self.preparation;
+                match lookups
+                    .one_text(
+                        iri.as_str(),
+                        &format!("{EV}normalizedText"),
+                        &graph,
+                        |text| {
+                            if has_pending {
+                                verify_pending_spans_in_text(text, pending_list, iri, preparation)
+                                    .map(Some)
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                    )
+                    .map_err(|e| classify(key, e))?
+                {
+                    Text::Some(outcomes) => {
+                        cache_entry = Some((RecordKind::Rendition, CachedLiteralShape::Valid));
+                        pending_outcomes = outcomes;
+                    }
+                    Text::Many => {
+                        let msg = "the rendition has more than one normalized text";
+                        cache_entry =
+                            Some((RecordKind::Rendition, CachedLiteralShape::Conflict(msg)));
+                    }
+                    Text::None => {
+                        cache_entry =
+                            Some((RecordKind::Rendition, CachedLiteralShape::Unavailable));
+                    }
                 }
-                Text::None => return Err(unavailable(key)),
             }
+            if kind == RecordKind::SourceRevision && selection.structured_content {
+                match lookups
+                    .one_typed_literal(
+                        iri.as_str(),
+                        &format!("{EV}retainedBytes"),
+                        XSD_BASE64_BINARY,
+                        &graph,
+                        |_| Ok(()),
+                    )
+                    .map_err(|e| classify(key, e))?
+                {
+                    Text::Some(()) => {
+                        cache_entry = Some((RecordKind::SourceRevision, CachedLiteralShape::Valid));
+                    }
+                    Text::Many => {
+                        let msg = "the revision has more than one retained bytes value";
+                        cache_entry = Some((
+                            RecordKind::SourceRevision,
+                            CachedLiteralShape::Conflict(msg),
+                        ));
+                    }
+                    Text::None => {
+                        cache_entry =
+                            Some((RecordKind::SourceRevision, CachedLiteralShape::Unavailable));
+                    }
+                }
+            }
+            (cache_entry, pending_outcomes)
+        };
+        if let Some(outcomes) = pending_outcomes
+            && let Some(rg) = self.record_graphs.as_mut()
+            && let Some(list) = rg.pending_passages.get_mut(&(view_key, index))
+        {
+            for (slot, out) in outcomes {
+                if let Some(entry) = list.get_mut(slot) {
+                    entry.outcome = Some(out);
+                }
+            }
+        }
+        if let Some((kind, shape)) = cache_entry {
+            self.cache_literal_shape(view_key, index, iri, kind, shape);
+            if kind == RecordKind::Rendition {
+                match shape {
+                    CachedLiteralShape::Unavailable => self.set_pending_outcomes_for_rendition(
+                        view_key,
+                        index,
+                        iri,
+                        PendingOutcome::Unavailable,
+                    ),
+                    CachedLiteralShape::Conflict(msg) => self.set_pending_outcomes_for_rendition(
+                        view_key,
+                        index,
+                        iri,
+                        PendingOutcome::Conflict(msg),
+                    ),
+                    CachedLiteralShape::Valid => {}
+                }
+            }
+            return match shape {
+                CachedLiteralShape::Valid => Ok(()),
+                CachedLiteralShape::Unavailable => Err(unavailable(key)),
+                CachedLiteralShape::Conflict(msg) => Err(conflict(key, msg)),
+            };
         }
         Ok(())
     }
@@ -660,9 +1141,24 @@ impl Resolver {
         kinds: &[RecordKind],
         expected_content_digest: Option<&Sha256Digest>,
         selection: SelectionRequirements,
-        defer_literal_shape: bool,
+        defer_req_idx: Option<usize>,
     ) -> Result<(VerifiedRecord, SelectionProbe)> {
-        let (auth, cached_span, probe) = {
+        enum DeferredWork {
+            None,
+            CachePassage(NamedNode, VerifiedSpan),
+            EnqueuePending(PendingPassage),
+            MarkPendingOutcome(NamedNode, PendingOutcome),
+        }
+        struct InViewState {
+            auth: AuthenticatedRecord,
+            span: Option<VerifiedSpan>,
+            probe: SelectionProbe,
+            deferred: DeferredWork,
+            shape_to_cache: Option<(NamedNode, RecordKind, CachedLiteralShape)>,
+            pending_outcomes: Option<Vec<(usize, PendingOutcome)>>,
+            err: Option<Error>,
+        }
+        let state = {
             let cached = &self.views[&view_key][index];
             let rg = self.record_graphs.as_ref().expect("prepared");
             let (graphs, _filtered) =
@@ -697,13 +1193,26 @@ impl Resolver {
             if let Some(expected) = expected_content_digest
                 && auth.content_digest.as_ref() != Some(expected)
             {
+                if auth.content_digest.is_none()
+                    && lookups
+                        .has_hidden_spg(iri.as_str(), &format!("{EV}contentDigest"), &auth.graph)
+                        .map_err(|e| classify(key, e))?
+                {
+                    return Err(unavailable(key));
+                }
                 return Err(conflict(
                     key,
                     "the record's content digest differs from the expected digest",
                 ));
             }
             let mut probe = SelectionProbe::Complete;
-            let cached_span = if auth.kind == RecordKind::Passage {
+            let mut deferred = DeferredWork::None;
+            let mut shape_to_cache: Option<(NamedNode, RecordKind, CachedLiteralShape)> = None;
+            let mut pending_outcomes: Option<Vec<(usize, PendingOutcome)>> = None;
+            let mut span: Option<VerifiedSpan> = None;
+            let mut err: Option<Error> = None;
+
+            if auth.kind == RecordKind::Passage {
                 if selection.passage_lineage {
                     match lookups
                         .one(iri.as_str(), &format!("{EV}sourceRevision"), &auth.graph)
@@ -743,9 +1252,86 @@ impl Resolver {
                             One::None | One::Some(_) => return Err(unavailable(key)),
                         }
                     }
-                    Some((None, hit.span.clone()))
+                    span = Some(hit.span.clone());
+                } else if let Some(req_idx) = defer_req_idx
+                    && !wrong_kind
+                {
+                    let existing_pending = rg
+                        .pending_passages
+                        .get(&(view_key, index))
+                        .and_then(|list| list.iter().find(|p| p.passage == *iri));
+                    if let Some(pending) = existing_pending {
+                        if selection.passage_lineage {
+                            match lookups
+                                .one(
+                                    pending.span.rendition.as_str(),
+                                    PROV_WAS_DERIVED_FROM,
+                                    &pending.rendition_graph,
+                                )
+                                .map_err(|e| classify(key, e))?
+                            {
+                                One::Some(Term::NamedNode(_)) => {}
+                                One::Many => {
+                                    return Err(conflict(
+                                        key,
+                                        "the rendition names more than one source revision",
+                                    ));
+                                }
+                                One::None | One::Some(_) => return Err(unavailable(key)),
+                            }
+                        }
+                        span = Some(pending.span.clone());
+                        probe = SelectionProbe::DeferredLiteralShape;
+                    } else {
+                        let meta = prepare_passage_metadata(
+                            &mut lookups,
+                            &graphs,
+                            &rg.protections,
+                            &auth.graph,
+                            iri,
+                            main,
+                            key,
+                            selection.passage_lineage,
+                        )?;
+                        match lookups
+                            .one_vocab_object_id(
+                                meta.span.rendition.as_str(),
+                                &format!("{EV}normalizedText"),
+                                &meta.rendition_graph,
+                            )
+                            .map_err(|e| classify(key, e))?
+                        {
+                            Text::Some(()) => {
+                                if meta.span.end < meta.span.start {
+                                    return Err(super::resolve::span(
+                                        key,
+                                        "the passage selector ends before it starts",
+                                    ));
+                                }
+                                span = Some(meta.span.clone());
+                                deferred = DeferredWork::EnqueuePending(PendingPassage {
+                                    key: key.to_string(),
+                                    req_idx,
+                                    passage: iri.clone(),
+                                    graph: auth.graph.clone(),
+                                    rendition_graph: meta.rendition_graph,
+                                    span: meta.span,
+                                    passage_lineage: selection.passage_lineage,
+                                    outcome: None,
+                                });
+                                probe = SelectionProbe::DeferredLiteralShape;
+                            }
+                            Text::Many => {
+                                return Err(conflict(
+                                    key,
+                                    "the rendition has more than one normalized text",
+                                ));
+                            }
+                            Text::None => return Err(unavailable(key)),
+                        }
+                    }
                 } else {
-                    let (rendition_graph, span) = verify_passage(
+                    match verify_passage(
                         &mut lookups,
                         &graphs,
                         &rg.protections,
@@ -754,8 +1340,58 @@ impl Resolver {
                         main,
                         key,
                         selection.passage_lineage,
-                    )?;
-                    Some((Some(rendition_graph), span))
+                    ) {
+                        Ok((rendition_graph, verified_span)) => {
+                            if defer_req_idx.is_some() {
+                                shape_to_cache = Some((
+                                    verified_span.rendition.clone(),
+                                    RecordKind::Rendition,
+                                    CachedLiteralShape::Valid,
+                                ));
+                            }
+                            if wrong_kind {
+                                deferred = DeferredWork::MarkPendingOutcome(
+                                    iri.clone(),
+                                    PendingOutcome::Valid,
+                                );
+                            } else {
+                                deferred = DeferredWork::CachePassage(
+                                    rendition_graph,
+                                    verified_span.clone(),
+                                );
+                            }
+                            span = Some(verified_span);
+                        }
+                        Err(e) => {
+                            if wrong_kind && defer_req_idx.is_some() {
+                                let outcome = match e.code() {
+                                    "evidence-unavailable" => Some(PendingOutcome::Unavailable),
+                                    "immutable-record-conflict" => Some(PendingOutcome::Conflict(
+                                        "the rendition has more than one normalized text",
+                                    )),
+                                    "span-mismatch" => {
+                                        let text = e.to_string();
+                                        let why = if text.contains("ends before it starts") {
+                                            "the passage selector ends before it starts"
+                                        } else if text
+                                            .contains("exceeds the rendition's normalized text")
+                                        {
+                                            "the passage selector exceeds the rendition's normalized text"
+                                        } else {
+                                            "the passage's text digest does not match the selected text"
+                                        };
+                                        Some(PendingOutcome::Span(why))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(outcome) = outcome {
+                                    deferred =
+                                        DeferredWork::MarkPendingOutcome(iri.clone(), outcome);
+                                }
+                            }
+                            err = Some(e);
+                        }
+                    }
                 }
             } else {
                 if auth.kind == RecordKind::Rendition && selection.rendition_content {
@@ -772,7 +1408,18 @@ impl Resolver {
                         }
                         One::None | One::Some(_) => return Err(unavailable(key)),
                     }
-                    if defer_literal_shape && !wrong_kind {
+                    let cached_shape = rg
+                        .verified_literal_shapes
+                        .get(&(view_key, index))
+                        .and_then(|m| m.get(iri.as_str()))
+                        .copied();
+                    if let Some((RecordKind::Rendition, shape)) = cached_shape {
+                        match shape {
+                            CachedLiteralShape::Valid => {}
+                            CachedLiteralShape::Unavailable => err = Some(unavailable(key)),
+                            CachedLiteralShape::Conflict(msg) => err = Some(conflict(key, msg)),
+                        }
+                    } else if defer_req_idx.is_some() && !wrong_kind {
                         match lookups
                             .one_vocab_object_id(
                                 iri.as_str(),
@@ -791,31 +1438,89 @@ impl Resolver {
                             Text::None => return Err(unavailable(key)),
                         }
                     } else {
+                        let pending_list = rg
+                            .pending_passages
+                            .get(&(view_key, index))
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
+                        let has_pending = pending_list
+                            .iter()
+                            .any(|p| p.span.rendition == *iri && p.outcome.is_none());
+                        let preparation = &self.preparation;
                         match lookups
                             .one_text(
                                 iri.as_str(),
                                 &format!("{EV}normalizedText"),
                                 &auth.graph,
-                                |_| Ok(()),
+                                |text| {
+                                    if has_pending {
+                                        verify_pending_spans_in_text(
+                                            text,
+                                            pending_list,
+                                            iri,
+                                            preparation,
+                                        )
+                                        .map(Some)
+                                    } else {
+                                        Ok(None)
+                                    }
+                                },
                             )
                             .map_err(|e| classify(key, e))?
                         {
-                            Text::Some(()) => {}
-                            Text::Many => {
-                                return Err(conflict(
-                                    key,
-                                    "the rendition has more than one normalized text",
-                                ));
+                            Text::Some(outcomes) => {
+                                pending_outcomes = outcomes;
+                                if defer_req_idx.is_some() {
+                                    shape_to_cache = Some((
+                                        iri.clone(),
+                                        RecordKind::Rendition,
+                                        CachedLiteralShape::Valid,
+                                    ));
+                                }
                             }
-                            Text::None => return Err(unavailable(key)),
+                            Text::Many => {
+                                let msg = "the rendition has more than one normalized text";
+                                if defer_req_idx.is_some() {
+                                    shape_to_cache = Some((
+                                        iri.clone(),
+                                        RecordKind::Rendition,
+                                        CachedLiteralShape::Conflict(msg),
+                                    ));
+                                }
+                                err = Some(conflict(key, msg));
+                            }
+                            Text::None => {
+                                if defer_req_idx.is_some() {
+                                    shape_to_cache = Some((
+                                        iri.clone(),
+                                        RecordKind::Rendition,
+                                        CachedLiteralShape::Unavailable,
+                                    ));
+                                }
+                                err = Some(unavailable(key));
+                            }
                         }
                     }
                 }
-                if auth.kind == RecordKind::SourceRevision && selection.structured_content {
+                if err.is_none()
+                    && auth.kind == RecordKind::SourceRevision
+                    && selection.structured_content
+                {
                     if auth.content_digest.is_none() {
                         return Err(unavailable(key));
                     }
-                    if defer_literal_shape && !wrong_kind {
+                    let cached_shape = rg
+                        .verified_literal_shapes
+                        .get(&(view_key, index))
+                        .and_then(|m| m.get(iri.as_str()))
+                        .copied();
+                    if let Some((RecordKind::SourceRevision, shape)) = cached_shape {
+                        match shape {
+                            CachedLiteralShape::Valid => {}
+                            CachedLiteralShape::Unavailable => err = Some(unavailable(key)),
+                            CachedLiteralShape::Conflict(msg) => err = Some(conflict(key, msg)),
+                        }
+                    } else if defer_req_idx.is_some() && !wrong_kind {
                         match lookups
                             .one_vocab_object_id(
                                 iri.as_str(),
@@ -844,55 +1549,175 @@ impl Resolver {
                             )
                             .map_err(|e| classify(key, e))?
                         {
-                            Text::Some(()) => {}
-                            Text::Many => {
-                                return Err(conflict(
-                                    key,
-                                    "the revision has more than one retained bytes value",
-                                ));
+                            Text::Some(()) => {
+                                if defer_req_idx.is_some() {
+                                    shape_to_cache = Some((
+                                        iri.clone(),
+                                        RecordKind::SourceRevision,
+                                        CachedLiteralShape::Valid,
+                                    ));
+                                }
                             }
-                            Text::None => return Err(unavailable(key)),
+                            Text::Many => {
+                                let msg = "the revision has more than one retained bytes value";
+                                if defer_req_idx.is_some() {
+                                    shape_to_cache = Some((
+                                        iri.clone(),
+                                        RecordKind::SourceRevision,
+                                        CachedLiteralShape::Conflict(msg),
+                                    ));
+                                }
+                                err = Some(conflict(key, msg));
+                            }
+                            Text::None => {
+                                if defer_req_idx.is_some() {
+                                    shape_to_cache = Some((
+                                        iri.clone(),
+                                        RecordKind::SourceRevision,
+                                        CachedLiteralShape::Unavailable,
+                                    ));
+                                }
+                                err = Some(unavailable(key));
+                            }
                         }
                     }
                 }
-                None
-            };
-            if wrong_kind {
-                return Err(conflict(
+            }
+            if err.is_none() && wrong_kind {
+                err = Some(conflict(
                     key,
                     "the record exists with another kind than the reference expects",
                 ));
             }
-            (auth, cached_span, probe)
+            InViewState {
+                auth,
+                span,
+                probe,
+                deferred,
+                shape_to_cache,
+                pending_outcomes,
+                err,
+            }
         };
-        let span = match cached_span {
-            Some((Some(rendition_graph), span)) => {
+
+        if let Some(outcomes) = state.pending_outcomes
+            && let Some(rg) = self.record_graphs.as_mut()
+            && let Some(list) = rg.pending_passages.get_mut(&(view_key, index))
+        {
+            for (slot, out) in outcomes {
+                if let Some(entry) = list.get_mut(slot) {
+                    entry.outcome = Some(out);
+                }
+            }
+        }
+        if let Some((target_iri, target_kind, shape)) = state.shape_to_cache {
+            self.cache_literal_shape(view_key, index, &target_iri, target_kind, shape);
+            if target_kind == RecordKind::Rendition {
+                match shape {
+                    CachedLiteralShape::Unavailable => self.set_pending_outcomes_for_rendition(
+                        view_key,
+                        index,
+                        &target_iri,
+                        PendingOutcome::Unavailable,
+                    ),
+                    CachedLiteralShape::Conflict(msg) => self.set_pending_outcomes_for_rendition(
+                        view_key,
+                        index,
+                        &target_iri,
+                        PendingOutcome::Conflict(msg),
+                    ),
+                    CachedLiteralShape::Valid => {}
+                }
+            }
+        }
+        match state.deferred {
+            DeferredWork::None => {}
+            DeferredWork::CachePassage(rendition_graph, verified_span) => {
                 self.cache_verified_passage(
                     key,
                     view_key,
                     index,
                     iri,
-                    &auth.graph,
+                    &state.auth.graph,
                     &rendition_graph,
-                    &span,
+                    &verified_span,
                 )?;
-                Some(span)
             }
-            Some((None, span)) => Some(span),
-            None => None,
-        };
+            DeferredWork::EnqueuePending(pending) => {
+                self.enqueue_pending_passage(key, view_key, index, pending)?;
+            }
+            DeferredWork::MarkPendingOutcome(passage_iri, outcome) => {
+                if let Some(rg) = self.record_graphs.as_mut()
+                    && let Some(list) = rg.pending_passages.get_mut(&(view_key, index))
+                    && let Some(entry) = list.iter_mut().find(|p| p.passage == passage_iri)
+                {
+                    entry.outcome = Some(outcome);
+                }
+            }
+        }
+        if let Some(e) = state.err {
+            return Err(e);
+        }
         Ok((
             VerifiedRecord {
                 iri: iri.clone(),
-                kind: auth.kind,
-                graph: auth.graph,
-                receipt: auth.receipt,
-                content_digest: auth.content_digest,
-                record_digest: auth.record_digest,
-                span,
+                kind: state.auth.kind,
+                graph: state.auth.graph,
+                receipt: state.auth.receipt,
+                content_digest: state.auth.content_digest,
+                record_digest: state.auth.record_digest,
+                span: state.span,
             },
-            probe,
+            state.probe,
         ))
+    }
+
+    fn cache_literal_shape(
+        &mut self,
+        view_key: ViewKey,
+        index: usize,
+        iri: &NamedNode,
+        kind: RecordKind,
+        shape: CachedLiteralShape,
+    ) {
+        let Some(rg) = self.record_graphs.as_mut() else {
+            return;
+        };
+        let map = rg
+            .verified_literal_shapes
+            .entry((view_key, index))
+            .or_default();
+        if let Some(slot) = map.get_mut(iri.as_str()) {
+            *slot = (kind, shape);
+            return;
+        }
+        let charge = (iri.as_str().len() as u64).saturating_add(96);
+        if rg._held.grow_by(charge).is_ok() {
+            map.insert(iri.as_str().to_string(), (kind, shape));
+        }
+    }
+
+    fn enqueue_pending_passage(
+        &mut self,
+        key: &str,
+        view_key: ViewKey,
+        index: usize,
+        pending: PendingPassage,
+    ) -> Result<()> {
+        let rg = self.record_graphs.as_mut().expect("prepared");
+        let list = rg.pending_passages.entry((view_key, index)).or_default();
+        if list.iter().any(|p| p.passage == pending.passage) {
+            return Ok(());
+        }
+        let charge = (pending.key.len() as u64)
+            .saturating_add(pending.passage.as_str().len() as u64)
+            .saturating_add(pending.graph.as_str().len() as u64)
+            .saturating_add(pending.rendition_graph.as_str().len() as u64)
+            .saturating_add(pending.span.rendition.as_str().len() as u64)
+            .saturating_add(256);
+        rg._held.grow_by(charge).map_err(|e| classify(key, e))?;
+        list.push(pending);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -938,164 +1763,560 @@ impl Resolver {
         rendition: &NamedNode,
         passages: &[ProposedPassage<'_>],
     ) -> Result<()> {
+        self.verify_proposed_passages_checked(
+            main,
+            logical,
+            access,
+            rendition,
+            passages,
+            usize::MAX,
+        )
+        .result
+    }
+
+    /// Like [`verify_proposed_passages`](Self::verify_proposed_passages), sharing the
+    /// single `ev:normalizedText` scan with any deferred existing passages targeting
+    /// `rendition` and reporting whether the literal shape was confirmed before any error.
+    pub fn verify_proposed_passages_checked(
+        &mut self,
+        main: &Store,
+        logical: &Store,
+        access: Option<&Arc<GraphAccess>>,
+        rendition: &NamedNode,
+        passages: &[ProposedPassage<'_>],
+        group_req_idx: usize,
+    ) -> Phase2Outcome {
         if passages.is_empty() {
-            return Ok(());
+            return Phase2Outcome {
+                result: Ok(()),
+                shape_confirmed: true,
+                failed_req_idx: None,
+            };
         }
         // Validate caller-input-only span bounds before touching the store so malformed
         // input answers identically whether or not the rendition exists.
         for p in passages {
-            self.preparation.check()?;
+            if let Err(e) = self.preparation.check() {
+                return Phase2Outcome {
+                    result: Err(e),
+                    shape_confirmed: false,
+                    failed_req_idx: None,
+                };
+            }
             if p.start >= p.end {
-                return Err(span(p.key, "passage must be nonempty"));
+                return Phase2Outcome {
+                    result: Err(span(p.key, "passage must be nonempty")),
+                    shape_confirmed: false,
+                    failed_req_idx: None,
+                };
             }
         }
         let target_key = rendition.as_str();
-        let (view_key, index) = self.prepare_record_view(target_key, main, logical, access)?;
-        let cached = &self.views[&view_key][index];
-        let rg = self.record_graphs.as_ref().expect("prepared");
-        let (graphs, _filtered) =
-            readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, target_key)?;
-        let protections = &rg.protections;
-        let mut lookups = Lookups::new(&self.preparation, &cached.view);
-        let auth = authenticate_record(
-            &mut lookups,
-            &graphs,
-            protections,
-            rendition,
-            &[RecordKind::Rendition],
-            "the passage's source is not a rendition",
-            main,
-            target_key,
-        )?;
-        let rendition_graph = auth.graph;
-        let actual_rev = match lookups
-            .one(rendition.as_str(), PROV_WAS_DERIVED_FROM, &rendition_graph)
-            .map_err(|e| classify(target_key, e))?
-        {
-            One::Some(Term::NamedNode(actual_rev)) => actual_rev,
-            One::Many => {
-                return Err(conflict(
-                    target_key,
-                    "the rendition names more than one source revision",
-                ));
+        let (view_key, index) = match self.prepare_record_view(target_key, main, logical, access) {
+            Ok(v) => v,
+            Err(e) => {
+                return Phase2Outcome {
+                    result: Err(e),
+                    shape_confirmed: false,
+                    failed_req_idx: None,
+                };
             }
-            One::None | One::Some(_) => return Err(unavailable(target_key)),
         };
         enum PassageOutcome<'a> {
-            Ok,
-            Invalid(&'a str),
-            Span(&'a str, &'static str),
+            Ok(Vec<(usize, PendingOutcome)>),
+            PendingFailed(Vec<(usize, PendingOutcome)>, usize, String, &'static str),
+            Invalid(Vec<(usize, PendingOutcome)>, &'a str),
+            Span(Vec<(usize, PendingOutcome)>, &'a str, &'static str),
         }
-        // Establish that `ev:normalizedText` is present and caller-visible before
-        // comparing `actual_rev` against each passage's revision, so a masked or
-        // metadata-only rendition answers `evidence-unavailable` identically to an
-        // absent rendition even when the supplied revision differs.
-        let preparation = &self.preparation;
-        let checked = lookups
-            .one_text(
-                rendition.as_str(),
-                &format!("{EV}normalizedText"),
-                &rendition_graph,
-                |text| {
-                    let control = preparation.control();
-                    for p in passages {
-                        control.check()?;
-                        if p.revision != &actual_rev {
-                            return Ok(PassageOutcome::Invalid(p.key));
+        let mut shape_confirmed = false;
+        let checked = {
+            let cached = &self.views[&view_key][index];
+            let rg = self.record_graphs.as_ref().expect("prepared");
+            let (graphs, _filtered) = match readable_record_graphs(
+                &self.preparation,
+                &cached.view,
+                &rg.graphs,
+                target_key,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Phase2Outcome {
+                        result: Err(e),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    };
+                }
+            };
+            let protections = &rg.protections;
+            let mut lookups = Lookups::new(&self.preparation, &cached.view);
+            let auth = match authenticate_record(
+                &mut lookups,
+                &graphs,
+                protections,
+                rendition,
+                &[RecordKind::Rendition],
+                "the passage's source is not a rendition",
+                main,
+                target_key,
+            ) {
+                Ok(a) => a,
+                Err(e) => {
+                    return Phase2Outcome {
+                        result: Err(e),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    };
+                }
+            };
+            let rendition_graph = auth.graph;
+            let actual_rev = match lookups
+                .one(rendition.as_str(), PROV_WAS_DERIVED_FROM, &rendition_graph)
+                .map_err(|e| classify(target_key, e))
+            {
+                Ok(One::Some(Term::NamedNode(actual_rev))) => actual_rev,
+                Ok(One::Many) => {
+                    return Phase2Outcome {
+                        result: Err(conflict(
+                            target_key,
+                            "the rendition names more than one source revision",
+                        )),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    };
+                }
+                Ok(One::None | One::Some(_)) => {
+                    return Phase2Outcome {
+                        result: Err(unavailable(target_key)),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    };
+                }
+                Err(e) => {
+                    return Phase2Outcome {
+                        result: Err(e),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    };
+                }
+            };
+            let pending_list = rg
+                .pending_passages
+                .get(&(view_key, index))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            // Establish that `ev:normalizedText` is present and caller-visible before
+            // comparing `actual_rev` against each passage's revision, so a masked or
+            // metadata-only rendition answers `evidence-unavailable` identically to an
+            // absent rendition even when the supplied revision differs.
+            let preparation = &self.preparation;
+            match lookups
+                .one_text(
+                    rendition.as_str(),
+                    &format!("{EV}normalizedText"),
+                    &rendition_graph,
+                    |text| {
+                        shape_confirmed = true;
+                        let control = preparation.control();
+                        let mut pending_count = 0usize;
+                        for p in pending_list {
+                            if p.span.rendition == *rendition && p.outcome.is_none() {
+                                pending_count += 1;
+                            }
                         }
-                    }
-                    let mut offsets: Vec<u64> = Vec::new();
-                    let offset_cap = passages.len().saturating_mul(2);
-                    let _offsets_hold = preparation.reserve(
-                        (offset_cap as u64).saturating_mul(std::mem::size_of::<u64>() as u64),
-                    )?;
-                    offsets
-                        .try_reserve_exact(offset_cap)
-                        .map_err(|_| preparation.exhausted())?;
-                    for p in passages {
-                        offsets.push(p.start);
-                        offsets.push(p.end);
-                    }
-                    offsets.sort_unstable();
-                    offsets.dedup();
-                    let mut positions: Vec<usize> = Vec::new();
-                    let _pos_hold = preparation.reserve(
-                        (offsets.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
-                    )?;
-                    positions
-                        .try_reserve_exact(offsets.len())
-                        .map_err(|_| preparation.exhausted())?;
-                    let mut count = 0u64;
-                    for (byte, _) in text.char_indices() {
-                        if count.is_multiple_of(16_384) {
-                            control.check()?;
+                        if pending_count == 0 {
+                            for p in passages {
+                                control.check()?;
+                                if p.revision != &actual_rev {
+                                    return Ok(PassageOutcome::Invalid(Vec::new(), p.key));
+                                }
+                            }
+                        }
+                        let mut invalid_proposed: Option<&str> = None;
+                        if pending_count > 0 {
+                            for p in passages {
+                                control.check()?;
+                                if p.revision != &actual_rev {
+                                    invalid_proposed = Some(p.key);
+                                    break;
+                                }
+                            }
+                        }
+                        let include_proposed = invalid_proposed.is_none();
+                        let proposed_count = if include_proposed { passages.len() } else { 0 };
+                        let offset_cap = pending_count
+                            .saturating_add(proposed_count)
+                            .saturating_mul(2);
+                        let mut offsets: Vec<u64> = Vec::new();
+                        let _offsets_hold = preparation.reserve(
+                            (offset_cap as u64).saturating_mul(std::mem::size_of::<u64>() as u64),
+                        )?;
+                        offsets
+                            .try_reserve_exact(offset_cap)
+                            .map_err(|_| preparation.exhausted())?;
+                        for p in pending_list {
+                            if p.span.rendition == *rendition && p.outcome.is_none() {
+                                offsets.push(p.span.start);
+                                offsets.push(p.span.end);
+                            }
+                        }
+                        if include_proposed {
+                            for p in passages {
+                                offsets.push(p.start);
+                                offsets.push(p.end);
+                            }
+                        }
+                        offsets.sort_unstable();
+                        offsets.dedup();
+                        let mut positions: Vec<usize> = Vec::new();
+                        let _pos_hold = preparation.reserve(
+                            (offsets.len() as u64)
+                                .saturating_mul(std::mem::size_of::<usize>() as u64),
+                        )?;
+                        positions
+                            .try_reserve_exact(offsets.len())
+                            .map_err(|_| preparation.exhausted())?;
+                        let mut count = 0u64;
+                        for (byte, _) in text.char_indices() {
+                            if count.is_multiple_of(16_384) {
+                                control.check()?;
+                            }
+                            if offsets.get(positions.len()) == Some(&count) {
+                                positions.push(byte);
+                                if positions.len() == offsets.len() {
+                                    break;
+                                }
+                            }
+                            count += 1;
                         }
                         if offsets.get(positions.len()) == Some(&count) {
-                            positions.push(byte);
-                            if positions.len() == offsets.len() {
-                                break;
-                            }
+                            positions.push(text.len());
                         }
-                        count += 1;
-                    }
-                    if offsets.get(positions.len()) == Some(&count) {
-                        positions.push(text.len());
-                    }
-                    control.check()?;
-                    let mut digests: BTreeMap<(usize, usize), Sha256Digest> = BTreeMap::new();
-                    let mut digest_hold = preparation.reserve(0)?;
-                    for p in passages {
                         control.check()?;
-                        let start_idx = offsets
-                            .binary_search(&p.start)
-                            .expect("start offset was grouped");
-                        let end_idx = offsets
-                            .binary_search(&p.end)
-                            .expect("end offset was grouped");
-                        let (Some(&start), Some(&end)) =
-                            (positions.get(start_idx), positions.get(end_idx))
-                        else {
-                            return Ok(PassageOutcome::Span(
-                                p.key,
-                                "the passage selector exceeds the rendition's normalized text",
-                            ));
-                        };
-                        let selected = &text[start..end];
-                        if p.quote.is_some_and(|quote| quote != selected) {
-                            return Ok(PassageOutcome::Span(
-                                p.key,
-                                "the passage's quote does not match the rendition's normalized text",
-                            ));
-                        }
-                        let digest = match digests.entry((start, end)) {
-                            std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
-                            std::collections::btree_map::Entry::Vacant(entry) => {
-                                digest_hold.grow_by(128)?;
-                                *entry.insert(Sha256Digest::of_bytes(selected.as_bytes(), control)?)
+                        let mut digests: BTreeMap<(usize, usize), Sha256Digest> = BTreeMap::new();
+                        let mut digest_hold = preparation.reserve(0)?;
+                        let mut pending_outcomes: Vec<(usize, PendingOutcome)> = Vec::new();
+                        if pending_count > 0 {
+                            let _pending_hold = preparation.reserve(
+                                (pending_count as u64).saturating_mul(
+                                    std::mem::size_of::<(usize, PendingOutcome)>() as u64,
+                                ),
+                            )?;
+                            pending_outcomes
+                                .try_reserve_exact(pending_count)
+                                .map_err(|_| preparation.exhausted())?;
+                            let mut first_pending_err: Option<(usize, String, &'static str)> = None;
+                            for (slot, p) in pending_list.iter().enumerate() {
+                                if p.span.rendition != *rendition || p.outcome.is_some() {
+                                    continue;
+                                }
+                                control.check()?;
+                                let out = if p.span.end < p.span.start {
+                                    PendingOutcome::Span(
+                                        "the passage selector ends before it starts",
+                                    )
+                                } else {
+                                    let start_idx = offsets
+                                        .binary_search(&p.span.start)
+                                        .expect("start offset was grouped");
+                                    let end_idx = offsets
+                                        .binary_search(&p.span.end)
+                                        .expect("end offset was grouped");
+                                    match (positions.get(start_idx), positions.get(end_idx)) {
+                                        (Some(&start), Some(&end)) => {
+                                            let selected = &text[start..end];
+                                            let digest = match digests.entry((start, end)) {
+                                                std::collections::btree_map::Entry::Occupied(e) => {
+                                                    *e.get()
+                                                }
+                                                std::collections::btree_map::Entry::Vacant(e) => {
+                                                    digest_hold.grow_by(128)?;
+                                                    *e.insert(Sha256Digest::of_bytes(
+                                                        selected.as_bytes(),
+                                                        control,
+                                                    )?)
+                                                }
+                                            };
+                                            if digest == p.span.text_digest {
+                                                PendingOutcome::Valid
+                                            } else {
+                                                PendingOutcome::Span(
+                                                    "the passage's text digest does not match the selected text",
+                                                )
+                                            }
+                                        }
+                                        _ => PendingOutcome::Span(
+                                            "the passage selector exceeds the rendition's normalized text",
+                                        ),
+                                    }
+                                };
+                                if let PendingOutcome::Span(why) = out
+                                    && first_pending_err.is_none()
+                                {
+                                    first_pending_err = Some((p.req_idx, p.key.clone(), why));
+                                }
+                                pending_outcomes.push((slot, out));
                             }
-                        };
-                        if digest != p.text_digest {
-                            return Ok(PassageOutcome::Span(
-                                p.key,
-                                "the passage's text digest does not match the selected text",
+                            if let Some((req_idx, key, why)) = first_pending_err {
+                                return Ok(PassageOutcome::PendingFailed(
+                                    pending_outcomes,
+                                    req_idx,
+                                    key,
+                                    why,
+                                ));
+                            }
+                        }
+                        if let Some(k) = invalid_proposed {
+                            return Ok(PassageOutcome::Invalid(pending_outcomes, k));
+                        }
+                        for p in passages {
+                            control.check()?;
+                            let start_idx = offsets
+                                .binary_search(&p.start)
+                                .expect("start offset was grouped");
+                            let end_idx = offsets
+                                .binary_search(&p.end)
+                                .expect("end offset was grouped");
+                            let (Some(&start), Some(&end)) =
+                                (positions.get(start_idx), positions.get(end_idx))
+                            else {
+                                return Ok(PassageOutcome::Span(
+                                    pending_outcomes,
+                                    p.key,
+                                    "the passage selector exceeds the rendition's normalized text",
+                                ));
+                            };
+                            let selected = &text[start..end];
+                            if p.quote.is_some_and(|quote| quote != selected) {
+                                return Ok(PassageOutcome::Span(
+                                    pending_outcomes,
+                                    p.key,
+                                    "the passage's quote does not match the rendition's normalized text",
+                                ));
+                            }
+                            let digest = match digests.entry((start, end)) {
+                                std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                                std::collections::btree_map::Entry::Vacant(entry) => {
+                                    digest_hold.grow_by(128)?;
+                                    *entry.insert(Sha256Digest::of_bytes(
+                                        selected.as_bytes(),
+                                        control,
+                                    )?)
+                                }
+                            };
+                            if digest != p.text_digest {
+                                return Ok(PassageOutcome::Span(
+                                    pending_outcomes,
+                                    p.key,
+                                    "the passage's text digest does not match the selected text",
+                                ));
+                            }
+                        }
+                        Ok(PassageOutcome::Ok(pending_outcomes))
+                    },
+                )
+                .map_err(|e| classify(target_key, e))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return Phase2Outcome {
+                        result: Err(e),
+                        shape_confirmed,
+                        failed_req_idx: None,
+                    };
+                }
+            }
+        };
+        let promote_pending = |resolver: &mut Self,
+                               outcomes: Vec<(usize, PendingOutcome)>,
+                               remove_valid: bool|
+         -> Result<()> {
+            if outcomes.is_empty() {
+                return Ok(());
+            }
+            let mut to_cache: Vec<(String, NamedNode, NamedNode, NamedNode, VerifiedSpan)> =
+                Vec::new();
+            if let Some(rg) = resolver.record_graphs.as_mut()
+                && let Some(list) = rg.pending_passages.get_mut(&(view_key, index))
+            {
+                for (slot, out) in &outcomes {
+                    if let Some(entry) = list.get_mut(*slot) {
+                        entry.outcome = Some(*out);
+                        if matches!(out, PendingOutcome::Valid) {
+                            to_cache.push((
+                                entry.key.clone(),
+                                entry.passage.clone(),
+                                entry.graph.clone(),
+                                entry.rendition_graph.clone(),
+                                entry.span.clone(),
                             ));
                         }
                     }
-                    Ok(PassageOutcome::Ok)
-                },
-            )
-            .map_err(|e| classify(target_key, e))?;
+                }
+                if remove_valid {
+                    list.retain(|entry| {
+                        !(entry.span.rendition == *rendition
+                            && matches!(entry.outcome, Some(PendingOutcome::Valid)))
+                    });
+                }
+            }
+            for (k, passage, graph, rendition_graph, span) in to_cache {
+                resolver.cache_verified_passage(
+                    &k,
+                    view_key,
+                    index,
+                    &passage,
+                    &graph,
+                    &rendition_graph,
+                    &span,
+                )?;
+            }
+            Ok(())
+        };
         match checked {
-            Text::Some(PassageOutcome::Ok) => Ok(()),
-            Text::Some(PassageOutcome::Invalid(k)) => Err(Error::invalid(format!(
-                "{k}: the passage and its rendition name different revisions"
-            ))),
-            Text::Some(PassageOutcome::Span(k, why)) => Err(span(k, why)),
-            Text::Many => Err(conflict(
-                target_key,
-                "the rendition has more than one normalized text",
-            )),
-            Text::None => Err(unavailable(target_key)),
+            Text::Some(PassageOutcome::Ok(outcomes)) => {
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    rendition,
+                    RecordKind::Rendition,
+                    CachedLiteralShape::Valid,
+                );
+                let res = promote_pending(self, outcomes, true);
+                Phase2Outcome {
+                    result: res,
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                }
+            }
+            Text::Some(PassageOutcome::PendingFailed(outcomes, req_idx, key, why)) => {
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    rendition,
+                    RecordKind::Rendition,
+                    CachedLiteralShape::Valid,
+                );
+                let _ = promote_pending(self, outcomes, true);
+                if let Some(rg) = self.record_graphs.as_mut()
+                    && let Some(list) = rg.pending_passages.get_mut(&(view_key, index))
+                {
+                    list.retain(|entry| {
+                        !(entry.span.rendition == *rendition && entry.req_idx == req_idx)
+                    });
+                }
+                Phase2Outcome {
+                    result: Err(span(&key, why)),
+                    shape_confirmed: false,
+                    failed_req_idx: Some(req_idx),
+                }
+            }
+            Text::Some(PassageOutcome::Invalid(outcomes, k)) => {
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    rendition,
+                    RecordKind::Rendition,
+                    CachedLiteralShape::Valid,
+                );
+                let _ = promote_pending(self, outcomes, true);
+                Phase2Outcome {
+                    result: Err(Error::invalid(format!(
+                        "{k}: the passage and its rendition name different revisions"
+                    ))),
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                }
+            }
+            Text::Some(PassageOutcome::Span(outcomes, k, why)) => {
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    rendition,
+                    RecordKind::Rendition,
+                    CachedLiteralShape::Valid,
+                );
+                let _ = promote_pending(self, outcomes, true);
+                Phase2Outcome {
+                    result: Err(span(k, why)),
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                }
+            }
+            Text::Many => {
+                let msg = "the rendition has more than one normalized text";
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    rendition,
+                    RecordKind::Rendition,
+                    CachedLiteralShape::Conflict(msg),
+                );
+                self.set_pending_outcomes_for_rendition(
+                    view_key,
+                    index,
+                    rendition,
+                    PendingOutcome::Conflict(msg),
+                );
+                let earlier_pending = self
+                    .record_graphs
+                    .as_ref()
+                    .and_then(|rg| rg.pending_passages.get(&(view_key, index)))
+                    .and_then(|list| {
+                        list.iter()
+                            .find(|p| p.span.rendition == *rendition && p.req_idx < group_req_idx)
+                            .map(|p| (p.req_idx, p.key.clone()))
+                    });
+                if let Some((req_idx, key)) = earlier_pending {
+                    Phase2Outcome {
+                        result: Err(conflict(&key, msg)),
+                        shape_confirmed: false,
+                        failed_req_idx: Some(req_idx),
+                    }
+                } else {
+                    Phase2Outcome {
+                        result: Err(conflict(target_key, msg)),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    }
+                }
+            }
+            Text::None => {
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    rendition,
+                    RecordKind::Rendition,
+                    CachedLiteralShape::Unavailable,
+                );
+                self.set_pending_outcomes_for_rendition(
+                    view_key,
+                    index,
+                    rendition,
+                    PendingOutcome::Unavailable,
+                );
+                let earlier_pending = self
+                    .record_graphs
+                    .as_ref()
+                    .and_then(|rg| rg.pending_passages.get(&(view_key, index)))
+                    .and_then(|list| {
+                        list.iter()
+                            .find(|p| p.span.rendition == *rendition && p.req_idx < group_req_idx)
+                            .map(|p| (p.req_idx, p.key.clone()))
+                    });
+                if let Some((req_idx, key)) = earlier_pending {
+                    Phase2Outcome {
+                        result: Err(unavailable(&key)),
+                        shape_confirmed: false,
+                        failed_req_idx: Some(req_idx),
+                    }
+                } else {
+                    Phase2Outcome {
+                        result: Err(unavailable(target_key)),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    }
+                }
+            }
         }
     }
 
@@ -1243,25 +2464,75 @@ impl Resolver {
         revision: &NamedNode,
         references: &[ProposedStructured<'_>],
     ) -> Result<()> {
+        self.verify_structured_references_checked(main, logical, access, revision, references)
+            .result
+    }
+
+    /// Like [`verify_structured_references`](Self::verify_structured_references), reporting
+    /// whether the revision's `ev:retainedBytes` (`xsd:base64Binary`) literal shape was
+    /// confirmed before any error occurred.
+    pub fn verify_structured_references_checked(
+        &mut self,
+        main: &Store,
+        logical: &Store,
+        access: Option<&Arc<GraphAccess>>,
+        revision: &NamedNode,
+        references: &[ProposedStructured<'_>],
+    ) -> Phase2Outcome {
         let Some(first) = references.first() else {
-            return Ok(());
+            return Phase2Outcome {
+                result: Ok(()),
+                shape_confirmed: true,
+                failed_req_idx: None,
+            };
         };
         // Validate RFC 6901 pointer syntax from caller input before reading the store
         // so malformed pointers always answer Invalid (400) rather than span-mismatch.
         for reference in references {
-            super::structured::validate_pointer(reference.pointer, self.preparation.control())?;
+            if let Err(e) =
+                super::structured::validate_pointer(reference.pointer, self.preparation.control())
+            {
+                return Phase2Outcome {
+                    result: Err(e),
+                    shape_confirmed: false,
+                    failed_req_idx: None,
+                };
+            }
         }
         let target_key = revision.as_str();
         let first_key = first.key;
-        let (view_key, index) = self.prepare_record_view(target_key, main, logical, access)?;
-        let (expected_digest, bytes, _decoded_hold) = {
+        let (view_key, index) = match self.prepare_record_view(target_key, main, logical, access) {
+            Ok(v) => v,
+            Err(e) => {
+                return Phase2Outcome {
+                    result: Err(e),
+                    shape_confirmed: false,
+                    failed_req_idx: None,
+                };
+            }
+        };
+        let mut shape_confirmed = false;
+        let decoded_step = {
             let cached = &self.views[&view_key][index];
             let rg = self.record_graphs.as_ref().expect("prepared");
-            let (graphs, _filtered) =
-                readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, target_key)?;
+            let (graphs, _filtered) = match readable_record_graphs(
+                &self.preparation,
+                &cached.view,
+                &rg.graphs,
+                target_key,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Phase2Outcome {
+                        result: Err(e),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    };
+                }
+            };
             let protections = &rg.protections;
             let mut lookups = Lookups::new(&self.preparation, &cached.view);
-            let auth = authenticate_record(
+            let auth = match authenticate_record(
                 &mut lookups,
                 &graphs,
                 protections,
@@ -1270,10 +2541,23 @@ impl Resolver {
                 "the structured reference's source is not a source revision",
                 main,
                 target_key,
-            )?;
+            ) {
+                Ok(a) => a,
+                Err(e) => {
+                    return Phase2Outcome {
+                        result: Err(e),
+                        shape_confirmed: false,
+                        failed_req_idx: None,
+                    };
+                }
+            };
             let rev_graph = auth.graph;
             let Some(expected_digest) = auth.content_digest else {
-                return Err(unavailable(target_key));
+                return Phase2Outcome {
+                    result: Err(unavailable(target_key)),
+                    shape_confirmed: false,
+                    failed_req_idx: None,
+                };
             };
             enum DecodedBytes {
                 Ok(Vec<u8>, Reservation),
@@ -1283,13 +2567,14 @@ impl Resolver {
             // workspace and any `dvocab` read lock are released before SHA-256 hashing
             // and JSON validation/traversal run.
             let preparation = &self.preparation;
-            let decoded = lookups
+            let decoded = match lookups
                 .one_typed_literal(
                     revision.as_str(),
                     &format!("{EV}retainedBytes"),
                     XSD_BASE64_BINARY,
                     &rev_graph,
                     |b64| {
+                        shape_confirmed = true;
                         let control = preparation.control();
                         control.check()?;
                         let max_b64 = super::RecordKey::MAX_BYTES.div_ceil(3).saturating_mul(4);
@@ -1316,46 +2601,120 @@ impl Resolver {
                         Ok(DecodedBytes::Ok(bytes, decoded_hold))
                     },
                 )
-                .map_err(|e| classify(target_key, e))?;
-            let (bytes, decoded_hold) = match decoded {
-                Text::Some(DecodedBytes::Ok(bytes, hold)) => (bytes, hold),
-                Text::Some(DecodedBytes::InvalidBase64) => {
-                    return Err(conflict(
+                .map_err(|e| classify(target_key, e))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return Phase2Outcome {
+                        result: Err(e),
+                        shape_confirmed,
+                        failed_req_idx: None,
+                    };
+                }
+            };
+            match decoded {
+                Text::Some(DecodedBytes::Ok(bytes, hold)) => Ok((expected_digest, bytes, hold)),
+                Text::Some(DecodedBytes::InvalidBase64) => Err((
+                    Some(CachedLiteralShape::Valid),
+                    conflict(
                         target_key,
                         "the revision's retained bytes are not valid base64",
-                    ));
-                }
+                    ),
+                )),
                 Text::Many => {
-                    return Err(conflict(
-                        target_key,
-                        "the revision has more than one retained bytes value",
-                    ));
+                    let msg = "the revision has more than one retained bytes value";
+                    Err((
+                        Some(CachedLiteralShape::Conflict(msg)),
+                        conflict(target_key, msg),
+                    ))
                 }
-                Text::None => return Err(unavailable(target_key)),
-            };
-            (expected_digest, bytes, decoded_hold)
+                Text::None => Err((
+                    Some(CachedLiteralShape::Unavailable),
+                    unavailable(target_key),
+                )),
+            }
+        };
+        let (expected_digest, bytes, _decoded_hold) = match decoded_step {
+            Ok(v) => {
+                self.cache_literal_shape(
+                    view_key,
+                    index,
+                    revision,
+                    RecordKind::SourceRevision,
+                    CachedLiteralShape::Valid,
+                );
+                v
+            }
+            Err((shape, err)) => {
+                if let Some(shape) = shape {
+                    self.cache_literal_shape(
+                        view_key,
+                        index,
+                        revision,
+                        RecordKind::SourceRevision,
+                        shape,
+                    );
+                }
+                return Phase2Outcome {
+                    result: Err(err),
+                    shape_confirmed,
+                    failed_req_idx: None,
+                };
+            }
         };
         let control = self.preparation.control();
-        if Sha256Digest::of_bytes(&bytes, control)? != expected_digest {
-            return Err(span(
-                first_key,
-                "the revision's retained bytes do not match its content digest",
-            ));
+        let digest_res = match Sha256Digest::of_bytes(&bytes, control) {
+            Ok(d) => d,
+            Err(e) => {
+                return Phase2Outcome {
+                    result: Err(e),
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                };
+            }
+        };
+        if digest_res != expected_digest {
+            return Phase2Outcome {
+                result: Err(span(
+                    first_key,
+                    "the revision's retained bytes do not match its content digest",
+                )),
+                shape_confirmed: true,
+                failed_req_idx: None,
+            };
         }
         let Ok(json) = std::str::from_utf8(&bytes) else {
-            return Err(span(
-                first_key,
-                "the revision's retained bytes are not valid UTF-8 JSON",
-            ));
+            return Phase2Outcome {
+                result: Err(span(
+                    first_key,
+                    "the revision's retained bytes are not valid UTF-8 JSON",
+                )),
+                shape_confirmed: true,
+                failed_req_idx: None,
+            };
         };
         let mut pointers: Vec<&str> = Vec::new();
-        let _ptrs_hold = self
+        let _ptrs_hold = match self
             .preparation
             .reserve((references.len() as u64).saturating_mul(std::mem::size_of::<&str>() as u64))
-            .map_err(|e| classify(target_key, e))?;
-        pointers
-            .try_reserve_exact(references.len())
-            .map_err(|_| classify(target_key, self.preparation.exhausted()))?;
+            .map_err(|e| classify(target_key, e))
+        {
+            Ok(h) => h,
+            Err(e) => {
+                return Phase2Outcome {
+                    result: Err(e),
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                };
+            }
+        };
+        if pointers.try_reserve_exact(references.len()).is_err() {
+            return Phase2Outcome {
+                result: Err(classify(target_key, self.preparation.exhausted())),
+                shape_confirmed: true,
+                failed_req_idx: None,
+            };
+        }
         pointers.extend(references.iter().map(|r| r.pointer));
         // `bytes` is already charged in `_decoded_hold`, so add `json.len()` back when
         // deriving the cap for `select_json_lexical_utf8_batch_optional`, which starts
@@ -1370,29 +2729,59 @@ impl Resolver {
         ) {
             Ok(selected) => selected,
             Err(Error::Invalid(msg)) => {
-                if let Some(why) = msg.strip_prefix("span-mismatch: ") {
-                    return Err(span(first_key, why));
-                }
-                return Err(Error::Invalid(msg));
+                let err = if let Some(why) = msg.strip_prefix("span-mismatch: ") {
+                    span(first_key, why)
+                } else {
+                    Error::Invalid(msg)
+                };
+                return Phase2Outcome {
+                    result: Err(err),
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                };
             }
-            Err(e) => return Err(classify(target_key, e)),
+            Err(e) => {
+                return Phase2Outcome {
+                    result: Err(classify(target_key, e)),
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                };
+            }
         };
         for (reference, value) in references.iter().zip(selected) {
-            control.check()?;
+            if let Err(e) = control.check() {
+                return Phase2Outcome {
+                    result: Err(e),
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                };
+            }
             let Some(value) = value else {
-                return Err(span(
-                    reference.key,
-                    "JSON Pointer does not select a retained value",
-                ));
+                return Phase2Outcome {
+                    result: Err(span(
+                        reference.key,
+                        "JSON Pointer does not select a retained value",
+                    )),
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                };
             };
             if value.digest != reference.value_digest {
-                return Err(span(
-                    reference.key,
-                    "the selected JSON value's digest does not match valueDigest",
-                ));
+                return Phase2Outcome {
+                    result: Err(span(
+                        reference.key,
+                        "the selected JSON value's digest does not match valueDigest",
+                    )),
+                    shape_confirmed: true,
+                    failed_req_idx: None,
+                };
             }
         }
-        Ok(())
+        Phase2Outcome {
+            result: Ok(()),
+            shape_confirmed: true,
+            failed_req_idx: None,
+        }
     }
 
     /// Prepare, or reuse, the controlled view of `key` under `access`, and return the
@@ -1719,9 +3108,29 @@ fn readable_record_graphs<'a>(
 #[cfg(test)]
 std::thread_local! {
     static PASSAGE_TEXT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CANCEL_BASE64_AT_CHUNK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+std::thread_local! {
     static SIMPLE_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TYPED_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static CANCEL_BASE64_AT_CHUNK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+#[doc(hidden)]
+pub fn reset_literal_read_counts() {
+    SIMPLE_LITERAL_READS.with(|c| c.set(0));
+    TYPED_LITERAL_READS.with(|c| c.set(0));
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+#[doc(hidden)]
+pub fn literal_read_counts() -> (usize, usize) {
+    (
+        SIMPLE_LITERAL_READS.with(std::cell::Cell::get),
+        TYPED_LITERAL_READS.with(std::cell::Cell::get),
+    )
 }
 
 /// Decode standard base64 in 64 KiB chunks under `preparation` controls into a
@@ -1811,6 +3220,52 @@ impl<'a> Lookups<'a> {
         self.snap().contains(&[s, p, o, g])
     }
 
+    /// Whether the view's triple mask hid at least one quad matching `(s, p, ?, graph)`.
+    fn has_hidden_spg(&mut self, s: &str, p: &str, graph: &NamedNode) -> Result<bool> {
+        if self.snap().mask.is_none() || !self.readable(graph) {
+            return Ok(false);
+        }
+        let (Some(s), Some(p), Some(g)) = (self.iri(s)?, self.iri(p)?, self.iri(graph.as_str())?)
+        else {
+            return Ok(false);
+        };
+        let mask = self.snap().mask.as_deref().expect("checked mask");
+        let start = mask.hidden.partition_point(|k| (k[0], k[1]) < (s.0, p.0));
+        for (i, quad) in mask.hidden[start..].iter().enumerate() {
+            if i.is_multiple_of(4096) {
+                self.preparation.check()?;
+            }
+            if quad[0] != s.0 || quad[1] != p.0 {
+                break;
+            }
+            if quad[3] == g.0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the view's triple mask hid the exact quad `(s, p, o, graph)`.
+    fn has_hidden_spog(&mut self, s: &str, p: &str, o: &str, graph: &NamedNode) -> Result<bool> {
+        if self.snap().mask.is_none() || !self.readable(graph) {
+            return Ok(false);
+        }
+        let (Some(s), Some(p), Some(o), Some(g)) = (
+            self.iri(s)?,
+            self.iri(p)?,
+            self.iri(o)?,
+            self.iri(graph.as_str())?,
+        ) else {
+            return Ok(false);
+        };
+        Ok(self
+            .snap()
+            .mask
+            .as_deref()
+            .expect("checked mask")
+            .hides(&[s.0, p.0, o.0, g.0]))
+    }
+
     /// Up to two objects of `s p ?o` in `graph`, decoded.
     /// Up to two object ids of `s p ?o` in graph `g`.
     fn object_ids(&self, s: Id, p: Id, g: Id) -> Result<Vec<Id>> {
@@ -1864,7 +3319,7 @@ impl<'a> Lookups<'a> {
         match self.object_ids(s, p, g)?.as_slice() {
             [] => Ok(Text::None),
             [id] => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "failpoints"))]
                 SIMPLE_LITERAL_READS.with(|count| count.set(count.get() + 1));
                 self.preparation
                     .with_simple_literal(self.snap(), *id, |text| match text {
@@ -1896,7 +3351,7 @@ impl<'a> Lookups<'a> {
         match self.object_ids(s, p, g)?.as_slice() {
             [] => Ok(Text::None),
             [id] => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "failpoints"))]
                 TYPED_LITERAL_READS.with(|count| count.set(count.get() + 1));
                 self.preparation
                     .with_typed_literal(self.snap(), *id, datatype, |text| match text {
@@ -1993,65 +3448,146 @@ fn receipt(
     key: &str,
     nonce: Option<Uuid>,
 ) -> Result<Receipt> {
+    enum Field<T> {
+        Some(T),
+        Masked,
+        Invalid,
+    }
     let receipt = match lookups
         .one(iri.as_str(), &format!("{EV}availabilityReceipt"), graph)
         .map_err(|e| classify(key, e))?
     {
         One::Some(Term::NamedNode(r)) => r,
+        One::None
+            if lookups
+                .has_hidden_spg(iri.as_str(), &format!("{EV}availabilityReceipt"), graph)
+                .map_err(|e| classify(key, e))? =>
+        {
+            return Err(unavailable(key));
+        }
         _ => return Err(origin(key)),
     };
-    let mut uuid_of = |p: &str| -> Result<Option<Uuid>> {
+    let mut uuid_of = |p: &str| -> Result<Field<Uuid>> {
+        let pred = format!("{EV}{p}");
         Ok(
             match lookups
-                .one(receipt.as_str(), &format!("{EV}{p}"), graph)
+                .one(receipt.as_str(), &pred, graph)
                 .map_err(|e| classify(key, e))?
             {
                 One::Some(Term::Literal(l))
                     if l.datatype().as_str() == "http://www.w3.org/2001/XMLSchema#string" =>
                 {
-                    Uuid::parse_str(l.value()).ok()
+                    match Uuid::parse_str(l.value()) {
+                        Ok(u) => Field::Some(u),
+                        Err(_) => Field::Invalid,
+                    }
                 }
-                _ => None,
+                One::None
+                    if lookups
+                        .has_hidden_spg(receipt.as_str(), &pred, graph)
+                        .map_err(|e| classify(key, e))? =>
+                {
+                    Field::Masked
+                }
+                _ => Field::Invalid,
             },
         )
     };
-    let (Some(dataset), Some(branch)) = (uuid_of("datasetId")?, uuid_of("branchId")?) else {
-        return Err(origin(key));
-    };
-    let commit = match lookups
-        .one(receipt.as_str(), &format!("{EV}commit"), graph)
-        .map_err(|e| classify(key, e))?
-    {
-        One::Some(Term::Literal(l)) => integer(&l),
-        _ => None,
-    };
-    let Some(commit) = commit else {
-        return Err(origin(key));
+    let dataset = uuid_of("datasetId")?;
+    let branch = uuid_of("branchId")?;
+    let commit = {
+        let pred = format!("{EV}commit");
+        match lookups
+            .one(receipt.as_str(), &pred, graph)
+            .map_err(|e| classify(key, e))?
+        {
+            One::Some(Term::Literal(l)) => match integer(&l) {
+                Some(c) => Field::Some(c),
+                None => Field::Invalid,
+            },
+            One::None
+                if lookups
+                    .has_hidden_spg(receipt.as_str(), &pred, graph)
+                    .map_err(|e| classify(key, e))? =>
+            {
+                Field::Masked
+            }
+            _ => Field::Invalid,
+        }
     };
     // The operation marker of decision 1 of the resolution step.
-    let Some(nonce) = nonce else {
-        return Err(origin(key));
-    };
-    if !lookups
+    let is_operation = if lookups
         .has(receipt.as_str(), RDF_TYPE, &format!("{EV}Operation"), graph)
         .map_err(|e| classify(key, e))?
     {
-        return Err(origin(key));
-    }
+        Field::Some(())
+    } else if lookups
+        .has_hidden_spog(receipt.as_str(), RDF_TYPE, &format!("{EV}Operation"), graph)
+        .map_err(|e| classify(key, e))?
+    {
+        Field::Masked
+    } else {
+        Field::Invalid
+    };
     // The record and its operation both carry the nonce. A record planted while the
     // graph was detached cannot, even when it names an operation that a later typed
     // write records with the current nonce.
-    for subject in [receipt.as_str(), iri.as_str()] {
+    let mut protection_of = |subject: &str| -> Result<Field<Uuid>> {
+        let pred = format!("{EV}graphProtection");
         match lookups
-            .one(subject, &format!("{EV}graphProtection"), graph)
+            .one(subject, &pred, graph)
             .map_err(|e| classify(key, e))?
         {
             One::Some(Term::Literal(l))
-                if l.datatype().as_str() == "http://www.w3.org/2001/XMLSchema#string"
-                    && Uuid::parse_str(l.value()).ok() == Some(nonce) => {}
-            _ => return Err(origin(key)),
+                if l.datatype().as_str() == "http://www.w3.org/2001/XMLSchema#string" =>
+            {
+                match Uuid::parse_str(l.value()) {
+                    Ok(u) if Some(u) == nonce => Ok(Field::Some(u)),
+                    _ => Ok(Field::Invalid),
+                }
+            }
+            One::None
+                if lookups
+                    .has_hidden_spg(subject, &pred, graph)
+                    .map_err(|e| classify(key, e))? =>
+            {
+                Ok(Field::Masked)
+            }
+            _ => Ok(Field::Invalid),
         }
+    };
+    let receipt_prot = protection_of(receipt.as_str())?;
+    let record_prot = protection_of(iri.as_str())?;
+    // If any required receipt triple was hidden by the caller's triple mask, report
+    // `evidence-unavailable` before `origin-not-reproduced` so masked records remain
+    // indistinguishable from absent or graph-denied records.
+    if matches!(dataset, Field::Masked)
+        || matches!(branch, Field::Masked)
+        || matches!(commit, Field::Masked)
+        || matches!(is_operation, Field::Masked)
+        || matches!(receipt_prot, Field::Masked)
+        || matches!(record_prot, Field::Masked)
+    {
+        return Err(unavailable(key));
     }
+    let (
+        Field::Some(dataset),
+        Field::Some(branch),
+        Field::Some(commit),
+        Field::Some(()),
+        Field::Some(_),
+        Field::Some(_),
+    ) = (
+        dataset,
+        branch,
+        commit,
+        is_operation,
+        receipt_prot,
+        record_prot,
+    )
+    else {
+        return Err(origin(key));
+    };
     Ok(Receipt {
         iri: receipt,
         dataset,
@@ -2158,9 +3694,17 @@ fn single_digest(
     }
 }
 
-/// Verify a passage's selector and text digest against its rendition's retained text.
+/// Authenticated passage selector and rendition metadata checked before reading the
+/// rendition's `ev:normalizedText`.
+struct PreparedPassageMeta {
+    rendition_graph: NamedNode,
+    span: VerifiedSpan,
+}
+
+/// Validate an existing passage's selector, text digest, and authenticated rendition
+/// metadata without reading the rendition's `ev:normalizedText`.
 #[allow(clippy::too_many_arguments)]
-fn verify_passage(
+fn prepare_passage_metadata(
     lookups: &mut Lookups<'_>,
     graphs: &[&NamedNode],
     protections: &BTreeMap<String, Uuid>,
@@ -2169,7 +3713,7 @@ fn verify_passage(
     main: &Store,
     key: &str,
     require_rendition_revision: bool,
-) -> Result<(NamedNode, VerifiedSpan)> {
+) -> Result<PreparedPassageMeta> {
     let rendition = match lookups
         .one(iri.as_str(), &format!("{OA}hasSource"), graph)
         .map_err(|e| classify(key, e))?
@@ -2190,33 +3734,6 @@ fn verify_passage(
         One::None => return Err(unavailable(key)),
         One::Some(_) => return Err(span(key, "the passage has no selector")),
     };
-    verify_with_selector(
-        lookups,
-        graphs,
-        protections,
-        graph,
-        iri,
-        &rendition,
-        selector,
-        main,
-        key,
-        require_rendition_revision,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn verify_with_selector(
-    lookups: &mut Lookups<'_>,
-    graphs: &[&NamedNode],
-    protections: &BTreeMap<String, Uuid>,
-    graph: &NamedNode,
-    iri: &NamedNode,
-    rendition: &NamedNode,
-    selector: Term,
-    main: &Store,
-    key: &str,
-    require_rendition_revision: bool,
-) -> Result<(NamedNode, VerifiedSpan)> {
     enum Position {
         None,
         Some(u64),
@@ -2274,7 +3791,7 @@ fn verify_with_selector(
         return Err(unavailable(key));
     };
     // The rendition is itself an authenticated record of one of the record graphs.
-    let Some((rendition_graph, kind)) = find_record(lookups, graphs, rendition, key)? else {
+    let Some((rendition_graph, kind)) = find_record(lookups, graphs, &rendition, key)? else {
         return Err(unavailable(key));
     };
     if kind != RecordKind::Rendition {
@@ -2283,7 +3800,7 @@ fn verify_with_selector(
     let receipt = receipt(
         lookups,
         &rendition_graph,
-        rendition,
+        &rendition,
         key,
         protections.get(rendition_graph.as_str()).copied(),
     )?;
@@ -2309,12 +3826,156 @@ fn verify_with_selector(
             One::None | One::Some(_) => return Err(unavailable(key)),
         }
     }
+    Ok(PreparedPassageMeta {
+        rendition_graph,
+        span: VerifiedSpan {
+            rendition,
+            start,
+            end,
+            text_digest,
+        },
+    })
+}
+
+/// Verify all unresolved `pending` passages targeting `rendition` in a single scan of
+/// `text`, returning `(slot_index, PendingOutcome)` for each matching entry.
+fn verify_pending_spans_in_text(
+    text: &str,
+    pending: &[PendingPassage],
+    rendition: &NamedNode,
+    preparation: &Preparation,
+) -> Result<Vec<(usize, PendingOutcome)>> {
+    let control = preparation.control();
+    let pending_count = pending
+        .iter()
+        .filter(|p| p.span.rendition == *rendition && p.outcome.is_none())
+        .count();
+    if pending_count == 0 {
+        return Ok(Vec::new());
+    }
+    let offset_cap = pending_count.saturating_mul(2);
+    let mut offsets: Vec<u64> = Vec::new();
+    let _offsets_hold = preparation
+        .reserve((offset_cap as u64).saturating_mul(std::mem::size_of::<u64>() as u64))?;
+    offsets
+        .try_reserve_exact(offset_cap)
+        .map_err(|_| preparation.exhausted())?;
+    for p in pending {
+        if p.span.rendition == *rendition && p.outcome.is_none() {
+            offsets.push(p.span.start);
+            offsets.push(p.span.end);
+        }
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut positions: Vec<usize> = Vec::new();
+    let _pos_hold = preparation
+        .reserve((offsets.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64))?;
+    positions
+        .try_reserve_exact(offsets.len())
+        .map_err(|_| preparation.exhausted())?;
+    #[cfg(test)]
+    PASSAGE_TEXT_SCANS.with(|count| count.set(count.get() + 1));
+    let mut count = 0u64;
+    for (byte, _) in text.char_indices() {
+        if count.is_multiple_of(16_384) {
+            control.check()?;
+        }
+        if offsets.get(positions.len()) == Some(&count) {
+            positions.push(byte);
+            if positions.len() == offsets.len() {
+                break;
+            }
+        }
+        count += 1;
+    }
+    if offsets.get(positions.len()) == Some(&count) {
+        positions.push(text.len());
+    }
+    control.check()?;
+    let mut digests: BTreeMap<(usize, usize), Sha256Digest> = BTreeMap::new();
+    let mut digest_hold = preparation.reserve(0)?;
+    let mut outcomes: Vec<(usize, PendingOutcome)> = Vec::new();
+    let _out_hold = preparation.reserve(
+        (pending_count as u64)
+            .saturating_mul(std::mem::size_of::<(usize, PendingOutcome)>() as u64),
+    )?;
+    outcomes
+        .try_reserve_exact(pending_count)
+        .map_err(|_| preparation.exhausted())?;
+    for (slot, p) in pending.iter().enumerate() {
+        if p.span.rendition != *rendition || p.outcome.is_some() {
+            continue;
+        }
+        control.check()?;
+        let out = if p.span.end < p.span.start {
+            PendingOutcome::Span("the passage selector ends before it starts")
+        } else {
+            let start_idx = offsets
+                .binary_search(&p.span.start)
+                .expect("start offset was grouped");
+            let end_idx = offsets
+                .binary_search(&p.span.end)
+                .expect("end offset was grouped");
+            match (positions.get(start_idx), positions.get(end_idx)) {
+                (Some(&start), Some(&end)) => {
+                    let selected = &text[start..end];
+                    let digest = match digests.entry((start, end)) {
+                        std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            digest_hold.grow_by(128)?;
+                            *entry.insert(Sha256Digest::of_bytes(selected.as_bytes(), control)?)
+                        }
+                    };
+                    if digest == p.span.text_digest {
+                        PendingOutcome::Valid
+                    } else {
+                        PendingOutcome::Span(
+                            "the passage's text digest does not match the selected text",
+                        )
+                    }
+                }
+                _ => PendingOutcome::Span(
+                    "the passage selector exceeds the rendition's normalized text",
+                ),
+            }
+        };
+        outcomes.push((slot, out));
+    }
+    Ok(outcomes)
+}
+
+/// Verify a passage's selector and text digest against its rendition's retained text.
+#[allow(clippy::too_many_arguments)]
+fn verify_passage(
+    lookups: &mut Lookups<'_>,
+    graphs: &[&NamedNode],
+    protections: &BTreeMap<String, Uuid>,
+    graph: &NamedNode,
+    iri: &NamedNode,
+    main: &Store,
+    key: &str,
+    require_rendition_revision: bool,
+) -> Result<(NamedNode, VerifiedSpan)> {
+    let meta = prepare_passage_metadata(
+        lookups,
+        graphs,
+        protections,
+        graph,
+        iri,
+        main,
+        key,
+        require_rendition_revision,
+    )?;
+    let start = meta.span.start;
+    let end = meta.span.end;
+    let text_digest = meta.span.text_digest;
     let control = lookups.preparation.control();
     let checked = lookups
         .one_text(
-            rendition.as_str(),
+            meta.span.rendition.as_str(),
             &format!("{EV}normalizedText"),
-            &rendition_graph,
+            &meta.rendition_graph,
             |text| {
                 if end < start {
                     return Ok(Err("the passage selector ends before it starts"));
@@ -2356,15 +4017,7 @@ fn verify_with_selector(
         }
         Text::None => return Err(unavailable(key)),
     }
-    Ok((
-        rendition_graph,
-        VerifiedSpan {
-            rendition: rendition.clone(),
-            start,
-            end,
-            text_digest,
-        },
-    ))
+    Ok((meta.rendition_graph, meta.span))
 }
 
 #[cfg(test)]
