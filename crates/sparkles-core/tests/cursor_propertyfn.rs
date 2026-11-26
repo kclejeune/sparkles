@@ -458,3 +458,68 @@ fn leaf_bnode_unbound_subject_errors_and_delimiter_only_split_polls_controls() {
         "expected between-pull mid-stream cancellation before deleted-tail refill, got {err:?}"
     );
 }
+
+#[test]
+fn strict_cursor_bound_str_split_and_split_iri_parity_and_budgets() {
+    let s = Store::in_memory(StoreOptions::default());
+    let snap = s.snapshot();
+
+    // Long (>128 KiB) uncached bound token in `apf:strSplit`: verify strict-cursor parity
+    // on both match and mismatch and refusal when the memory budget cannot hold the scan
+    // buffer and bound token decode simultaneously.
+    let long_tok = "k".repeat(160 << 10);
+    let prefix = "x,".repeat(2_048);
+    let q_match =
+        format!("{P}SELECT * {{ \"{long_tok}\" apf:strSplit (\"{prefix}{long_tok}\" \",\") }}");
+    let q_miss =
+        format!("{P}SELECT * {{ \"{long_tok}y\" apf:strSplit (\"{prefix}{long_tok}\" \",\") }}");
+    assert_strict_parity(&snap, &q_match[P.len()..], true);
+    assert_strict_parity(&snap, &q_miss[P.len()..], false);
+
+    let tight_opts = QueryOptions {
+        max_memory_bytes: Some(256 << 10),
+        no_cache: true,
+        ..Default::default()
+    };
+    let strict_opts = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let err = match select_cursor(snap.clone(), &q_match, &tight_opts, &strict_opts) {
+        Err(e) => Some(e),
+        Ok(mut c) => c.next_batch().err(),
+    };
+    assert!(
+        matches!(err, Some(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "expected BudgetKind::Memory for tight bound strSplit, got {err:?}"
+    );
+
+    // Bound namespace IRI, bound namespace literal, and bound local-name literal in
+    // `apf:splitIRI`: verify exact strict-cursor parity on match and mismatch.
+    let long_ns = format!("http://example.org/{}/", "n".repeat(4_096));
+    let long_local = "l".repeat(4_096);
+    let full_iri = format!("{long_ns}{long_local}");
+    for (body, expect_non_empty) in [
+        (
+            format!("SELECT * {{ <{full_iri}> apf:splitIRI (<{long_ns}> \"{long_local}\") }}"),
+            true,
+        ),
+        (
+            format!("SELECT * {{ <{full_iri}> apf:splitIRI (\"{long_ns}\" \"{long_local}\") }}"),
+            true,
+        ),
+        (
+            format!(
+                "SELECT * {{ <{full_iri}> apf:splitIRI (<http://example.org/other/> \"{long_local}\") }}"
+            ),
+            false,
+        ),
+        (
+            format!("SELECT * {{ <{full_iri}> apf:splitIRI (<{long_ns}> \"other\") }}"),
+            false,
+        ),
+    ] {
+        assert_strict_parity(&snap, &body, expect_non_empty);
+    }
+}

@@ -1217,16 +1217,7 @@ are evaluated once per batch through `compute_column`, which reuses one value pe
 distinct input in both modes. An eager grouping of a query that may spill charges its
 groups, and when they do not fit, it runs again as the cursor's grouping over its input
 table and its plan notes `[groups did not fit: partitioned to disk]`. An eager grouping
-of a query that cannot spill charges nothing, as before. The `incremental_group` switch
-stays as a diagnostic that sends every aggregate through `Rows`, so the optimization
-tests keep an independent check of the running states until item 512's reference
-evaluator replaces it, and the merge phase retires it. The parallel split of a grouping
-over Rayon with `merge`, which the plan names, is not built, since the eager grouping
-was sequential before and the sequential operator measured faster than its base with one
-thread. The 12-thread cells of the forge matrix decide its value. Roadmap
-item 1066 holds the split, together with the cases in which a merged SUM or AVG differs
-from one pass. A DISTINCT accumulator charges the slots and values it passes to the
-aggregate underneath while that aggregate reads them.
+of a query that cannot spill charges nothing, as before. The `incremental_group` switch stays as a diagnostic that sends every aggregate through `Rows`, so the optimization tests keep an independent check of the running states until item 512's reference evaluator replaces it, and the merge phase retires it. Eager hashable groupings above `PAR_GROUP_THRESHOLD` rows on multi-threaded pools now dispatch to `par::whole_parallel`, except ungrouped pure-count plans that take the constant-time row-count shortcut. `whole_parallel` runs contiguous range-split folding with `Accumulator::merge` for ungrouped and low-cardinality mergeable groupings and key-hash partitioning for higher-cardinality or non-mergeable running aggregates. `AggState::can_merge` and `Running::merge` check exactness against single-pass semantics for `SUM`, `AVG`, `MIN` and `MAX`, re-folding only refused aggregates sequentially over the built global group index, and falling back to key-hash partitioning on high cardinality or to sequential execution under tight memory pressure without latching sticky memory failures. The 12-thread benchmark cells on `forge` remain open under roadmap item 1066 to decide where parallel dispatch stays enabled. A DISTINCT accumulator charges the slots and values it passes to the aggregate underneath while that aggregate reads them.
 
 Tests compare mixed aggregates with HAVING between eager execution and the cursor at
 batches of one row and 4,096 rows, with and without the memory to hold the groups, and

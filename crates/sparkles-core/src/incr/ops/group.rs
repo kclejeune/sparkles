@@ -488,6 +488,7 @@ impl Group {
                 neg_weights.push(w);
             }
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         let pos_table = if pos_idx.is_empty() {
             Table::new(Vec::new())
         } else {
@@ -498,6 +499,23 @@ impl Group {
         } else {
             self.build_table(&c, &neg_idx)
         };
+        let pass_budget = p.budget_handle();
+        let sync_pass = |tracked: &mut u64, current: u64| -> Result<()> {
+            if current > *tracked {
+                let delta = current - *tracked;
+                if let Some(b) = &pass_budget {
+                    b.try_reserve_pass(delta)?;
+                }
+                *tracked = current;
+            } else if current < *tracked {
+                let delta = *tracked - current;
+                if let Some(b) = &pass_budget {
+                    b.release_pass(delta);
+                }
+                *tracked = current;
+            }
+            Ok(())
+        };
         let mut out = Changes::new();
         let aggs = &self.aggs;
         let accs = &mut self.accs;
@@ -505,54 +523,86 @@ impl Group {
         let slots = &mut self.slots;
         let implicit = self.implicit;
         let mut removed_any = false;
+        const FOLD_CHUNK: usize = 1024;
         p.with_agg_ctx(|ctx| {
-            // Fold positive weights first, then retract negative weights, so intermediate
-            // multiplicities stay non-negative and SAMPLE stays stable on replacements.
+            // Fold positive weights first, then retract negative weights, in bounded
+            // chunks with live accumulator retention and per-chunk reconciliation so an
+            // update cannot allocate an unbounded delta or hide an add-then-retract peak.
+            let mut chunk_col: Vec<Id> = Vec::new();
             for (ai, acc) in accs.iter_mut().enumerate() {
-                if !pos_slots.is_empty() {
-                    let pos_col: Vec<Id> = match &args[ai] {
-                        Some(col) => pos_idx.iter().map(|&i| col[i]).collect(),
-                        None => Vec::new(),
-                    };
+                let other_bytes = tracked.saturating_sub(acc.retained_bytes());
+                let mut start = 0;
+                while start < pos_slots.len() {
+                    ctx.check()?;
+                    let end = (start + FOLD_CHUNK).min(pos_slots.len());
                     let arg = match (&aggs[ai].expr, aggs[ai].column) {
                         (None, _) => Arg::Star,
                         (_, Some(None)) => Arg::Unbound,
-                        _ => Arg::Column(&pos_col),
+                        _ => {
+                            chunk_col.clear();
+                            if let Some(col) = &args[ai] {
+                                chunk_col.extend(pos_idx[start..end].iter().map(|&i| col[i]));
+                            }
+                            Arg::Column(&chunk_col)
+                        }
                     };
                     let batch = Batch {
                         table: &pos_table,
                         arg,
                         rows: None,
-                        weights: Some(&pos_weights),
-                        base: 0,
+                        weights: Some(&pos_weights[start..end]),
+                        base: start,
                     };
-                    let mut noop = |_| Ok(());
-                    let mut budget = BatchBudget::Retain(&mut noop);
-                    acc.add_batch(ctx, &batch, &pos_slots, &mut budget)?;
+                    let mut retain = |delta: u64| {
+                        if delta > 0 {
+                            if let Some(b) = &pass_budget {
+                                b.try_reserve_pass(delta)?;
+                            }
+                            tracked = tracked.saturating_add(delta);
+                        }
+                        Ok(())
+                    };
+                    let mut budget = BatchBudget::Retain(&mut retain);
+                    acc.add_batch(ctx, &batch, &pos_slots[start..end], &mut budget)?;
+                    sync_pass(
+                        &mut tracked,
+                        other_bytes.saturating_add(acc.retained_bytes()),
+                    )?;
+                    start = end;
                 }
-                if !neg_slots.is_empty() {
-                    let neg_col: Vec<Id> = match &args[ai] {
-                        Some(col) => neg_idx.iter().map(|&i| col[i]).collect(),
-                        None => Vec::new(),
-                    };
+                let mut start = 0;
+                while start < neg_slots.len() {
+                    ctx.check()?;
+                    let end = (start + FOLD_CHUNK).min(neg_slots.len());
                     let arg = match (&aggs[ai].expr, aggs[ai].column) {
                         (None, _) => Arg::Star,
                         (_, Some(None)) => Arg::Unbound,
-                        _ => Arg::Column(&neg_col),
+                        _ => {
+                            chunk_col.clear();
+                            if let Some(col) = &args[ai] {
+                                chunk_col.extend(neg_idx[start..end].iter().map(|&i| col[i]));
+                            }
+                            Arg::Column(&chunk_col)
+                        }
                     };
                     let batch = Batch {
                         table: &neg_table,
                         arg,
                         rows: None,
-                        weights: Some(&neg_weights),
-                        base: 0,
+                        weights: Some(&neg_weights[start..end]),
+                        base: start,
                     };
                     debug_assert!(acc.retractable());
-                    if !acc.retract(ctx, &batch, &neg_slots)? {
+                    if !acc.retract(ctx, &batch, &neg_slots[start..end])? {
                         return Err(Error::Corrupt(
                             "incremental view accumulator refused retraction".into(),
                         ));
                     }
+                    sync_pass(
+                        &mut tracked,
+                        other_bytes.saturating_add(acc.retained_bytes()),
+                    )?;
+                    start = end;
                 }
             }
             for (ti, key) in touched.into_iter().enumerate() {
@@ -818,5 +868,186 @@ mod tests {
             ret_checks >= 5,
             "expected weighted COUNT(*) retract to poll ctx.check(), got {ret_checks}"
         );
+    }
+
+    /// Regression test: a large delta adding many distinct decimals to a single existing
+    /// group (including a delta that adds and then retracts those decimals in one `apply`)
+    /// must admit accumulator growth during the fold under a tight circuit budget backed
+    /// by a parent pool ledger, failing before allocating the full map.
+    #[test]
+    fn group_apply_admits_accumulator_growth_mid_fold_under_parent_budget() {
+        use crate::incr::budget::ViewBudget;
+        use crate::sparql::pool::QueryPool;
+        use oxrdf::vocab::xsd;
+        use oxrdf::{Literal, Term};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let parsed = sparql::parse_query(
+            "PREFIX : <http://ex/> SELECT ?g (SUM(?v) AS ?s) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g",
+            None,
+            &[],
+        )
+        .unwrap();
+        let vis = Vis::new(None, &snap);
+        let ctl = Control::none();
+        let g_key = Id::from_i64(42).unwrap();
+
+        let make_decimal_id = |terms: &mut Terms, i: i64| -> Id {
+            let lit = Literal::new_typed_literal(format!("{i}.1"), xsd::DECIMAL);
+            terms.intern(&snap, &Term::Literal(lit))
+        };
+
+        // Helper: compile plan and seed one existing group (?g = 42, ?v = 1.1).
+        let seed_plan = |terms: &mut Terms| {
+            let mut plan = compile(&parsed, None).unwrap();
+            let (width, g_col, v_col) = {
+                let group = find_group_mut(&mut plan.root).expect("Group operator");
+                (
+                    group.inner.schema.len(),
+                    group.keys[0].expect("group key column"),
+                    group.aggs[0].column.flatten().expect("sum arg column"),
+                )
+            };
+            let mut seed_row = vec![Id::from_i64(1).unwrap(); width];
+            seed_row[g_col] = g_key;
+            seed_row[v_col] = make_decimal_id(terms, 1);
+            let mut seed_pass = Pass::new(
+                snap.clone(),
+                None,
+                &[],
+                &[],
+                terms,
+                &vis,
+                None,
+                &ctl,
+                &plan.vars,
+            );
+            find_group_mut(&mut plan.root)
+                .expect("Group operator")
+                .apply(&mut seed_pass, vec![(seed_row.into_boxed_slice(), 1)])
+                .unwrap();
+            plan
+        };
+
+        let limit = 16 << 10;
+
+        // 1. Positive-only delta of 4,000 distinct decimals to the single existing group.
+        // Without mid-fold accumulator admission, `RetractableSum` allocates the whole >130 KiB
+        // hash table before the final `sync_op_state`.
+        {
+            let mut terms = Terms::default();
+            let mut plan = seed_plan(&mut terms);
+            let plan_vars = plan.vars.clone();
+            let group = find_group_mut(&mut plan.root).expect("Group operator");
+            let g_col = group.keys[0].expect("group key column");
+            let v_col = group.aggs[0].column.flatten().expect("sum arg column");
+            let delta: Changes = (10..4_010i64)
+                .map(|i| {
+                    let mut r = vec![Id::from_i64(i).unwrap(); group.inner.schema.len()];
+                    r[g_col] = g_key;
+                    r[v_col] = make_decimal_id(&mut terms, i);
+                    (r.into_boxed_slice(), 1)
+                })
+                .collect();
+
+            let pool = QueryPool::new(limit);
+            let budget = ViewBudget::new(Some(limit), Some(pool.work_parent()));
+            let initial_bytes = group.bytes();
+            budget.try_set_state(initial_bytes).unwrap();
+
+            let mut pass = Pass::new(
+                snap.clone(),
+                None,
+                &[],
+                &[],
+                &mut terms,
+                &vis,
+                None,
+                &ctl,
+                &plan_vars,
+            );
+            pass.budget = Some(budget.handle());
+            pass.pool = Some(pool.clone());
+            pass.max_memory_bytes = Some(limit);
+
+            let err = group
+                .apply(&mut pass, delta)
+                .expect_err("expected tight parent-backed budget refusal mid-fold");
+            assert!(
+                matches!(
+                    err,
+                    Error::BudgetExceeded(b)
+                        if matches!(b.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
+                ),
+                "expected Memory/ServerMemory budget error, got {err:?}"
+            );
+            assert!(
+                group.bytes() <= limit,
+                "accumulator allocated {} bytes past {limit}-byte budget before refusal",
+                group.bytes()
+            );
+        }
+
+        // 2. Add-then-retract delta in one `apply` call: adds 4,000 distinct decimals (+1)
+        // and retracts 3,995 of them (-1). Final state would fit under 1 KiB, so only
+        // mid-fold admission / per-chunk reconciliation catches the intermediate peak.
+        {
+            let mut terms = Terms::default();
+            let mut plan = seed_plan(&mut terms);
+            let plan_vars = plan.vars.clone();
+            let group = find_group_mut(&mut plan.root).expect("Group operator");
+            let g_col = group.keys[0].expect("group key column");
+            let v_col = group.aggs[0].column.flatten().expect("sum arg column");
+            let mut delta: Changes = Vec::with_capacity(7_995);
+            for i in 10..4_010i64 {
+                let mut r = vec![Id::from_i64(i).unwrap(); group.inner.schema.len()];
+                r[g_col] = g_key;
+                r[v_col] = make_decimal_id(&mut terms, i);
+                delta.push((r.into_boxed_slice(), 1));
+            }
+            for i in 15..4_010i64 {
+                let mut r = vec![Id::from_i64(i).unwrap(); group.inner.schema.len()];
+                r[g_col] = g_key;
+                r[v_col] = make_decimal_id(&mut terms, i);
+                delta.push((r.into_boxed_slice(), -1));
+            }
+
+            let pool = QueryPool::new(limit);
+            let budget = ViewBudget::new(Some(limit), Some(pool.work_parent()));
+            budget.try_set_state(group.bytes()).unwrap();
+
+            let mut pass = Pass::new(
+                snap.clone(),
+                None,
+                &[],
+                &[],
+                &mut terms,
+                &vis,
+                None,
+                &ctl,
+                &plan_vars,
+            );
+            pass.budget = Some(budget.handle());
+            pass.pool = Some(pool.clone());
+            pass.max_memory_bytes = Some(limit);
+
+            let err = group
+                .apply(&mut pass, delta)
+                .expect_err("expected add-then-retract peak to refuse during positive fold");
+            assert!(
+                matches!(
+                    err,
+                    Error::BudgetExceeded(b)
+                        if matches!(b.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
+                ),
+                "expected Memory/ServerMemory budget error, got {err:?}"
+            );
+            assert!(
+                group.bytes() <= limit,
+                "add-then-retract accumulator allocated {} bytes past {limit}-byte budget",
+                group.bytes()
+            );
+        }
     }
 }

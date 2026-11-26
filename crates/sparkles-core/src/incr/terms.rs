@@ -158,7 +158,15 @@ impl Terms {
         self.index.get(key).copied()
     }
 
-    pub(crate) fn push_local_key(&mut self, key: Vec<u8>) -> Id {
+    pub(crate) fn key_retained_bytes(key_len: usize) -> Option<u64> {
+        u64::try_from(key_len).ok()?.checked_mul(2)?.checked_add(48)
+    }
+
+    pub(crate) fn insert_peak_bytes(&self, key_len: usize) -> Option<u64> {
+        self.bytes.checked_add(Self::key_retained_bytes(key_len)?)
+    }
+
+    pub(crate) fn push_local_key(&mut self, key: &[u8]) -> Id {
         self.local(key)
     }
 
@@ -261,9 +269,10 @@ impl Terms {
         if let Some(&n) = self.index.get(encoded.as_slice()) {
             return Ok(Id::local(n));
         }
-        let added = encoded.len() as u64 * 2 + 48;
+        let added = Self::key_retained_bytes(encoded.len())
+            .ok_or_else(|| super::budget::budget_error(sparkles_budget::ParentRefused::Overflow))?;
         reserve(added)?;
-        Ok(self.local(encoded))
+        Ok(self.local(&encoded))
     }
 
     /// The id of `t`: the store's when `snap` holds it, else a local one.
@@ -282,16 +291,16 @@ impl Terms {
         {
             return i;
         }
-        self.local(key)
+        self.local(&key)
     }
 
-    fn local(&mut self, key: Vec<u8>) -> Id {
-        if let Some(&n) = self.index.get(key.as_slice()) {
+    fn local(&mut self, key: &[u8]) -> Id {
+        if let Some(&n) = self.index.get(key) {
             return Id::local(n);
         }
         let n = self.keys.len() as u64;
-        let added = key.len() as u64 * 2 + 48;
-        let bytes: Arc<[u8]> = key.into();
+        let added = Self::key_retained_bytes(key.len()).unwrap_or(u64::MAX);
+        let bytes: Arc<[u8]> = Arc::from(key);
         self.keys.push(Arc::new(Key {
             bytes: bytes.clone(),
             published: Mutex::new(Weak::new()),

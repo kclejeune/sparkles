@@ -4224,3 +4224,166 @@ fn non_inline_double_finalization_admission_and_fallible_interning() {
         .check()
         .expect("range-split finalization refusal must not latch sticky memory_failure");
 }
+
+#[test]
+fn integer_subtotal_i64_promotion_admits_before_allocating_in_fold_and_merge() {
+    use super::exec::{AggState, DECIMAL_SUM_BYTES, INT128_SUM_BYTES, ScratchAdmit, SumAdmit};
+
+    assert_eq!(std::mem::size_of::<AggState>(), 80);
+    let sum_agg = agg(AggregateFunction::Sum, true, false);
+    let c = ctx();
+
+    // 1. Sequential fold across the i64 boundary: refusal returns Ok(false) before
+    // allocating Box<Int128Sum>, preserving the admitted i64 prefix for deferred replay.
+    struct RefuseOnce {
+        seen: Option<(u64, u64)>,
+        allow: bool,
+    }
+    impl ScratchAdmit for RefuseOnce {
+        fn charge_scratch<'a>(
+            &mut self,
+            _ctx: &'a Ctx,
+            _bytes: u64,
+        ) -> crate::error::Result<super::ctx::Charge<'a>> {
+            panic!("fixed-size Int128/Decimal promotion should admit before scratch allocation");
+        }
+    }
+    impl SumAdmit for RefuseOnce {
+        fn admit(&mut self, old: u64, new: u64) -> crate::error::Result<bool> {
+            self.seen = Some((old, new));
+            Ok(self.allow)
+        }
+    }
+
+    let mut state = AggState::new(&sum_agg);
+    let mut admit = RefuseOnce {
+        seen: None,
+        allow: false,
+    };
+    assert!(
+        state
+            .add_admitted(&c, &sum_agg, Some(int(&c, i64::MAX)), &mut admit)
+            .unwrap()
+    );
+    assert_eq!(admit.seen, None);
+    assert_eq!(state.sum_heap_bytes(), 0);
+
+    // Crossing i64::MAX + 1 requests INT128_SUM_BYTES; refusing preserves the prefix.
+    assert!(
+        !state
+            .add_admitted(&c, &sum_agg, Some(int(&c, 1)), &mut admit)
+            .unwrap()
+    );
+    assert_eq!(admit.seen, Some((0, INT128_SUM_BYTES)));
+    assert_eq!(state.sum_heap_bytes(), 0);
+    let prefix_id = state.read(&c, &sum_agg).unwrap();
+    assert_eq!(
+        c.term(prefix_id),
+        Some(oxrdf::Term::Literal(oxrdf::Literal::from(i64::MAX))),
+        "refused i64->i128 transition must preserve admitted prefix"
+    );
+
+    // Fixed-width decimal promotion from i64 also admits DECIMAL_SUM_BYTES before allocating.
+    admit.seen = None;
+    let dec_one = c.intern_value(&Value::Decimal(oxsdatatypes::Decimal::from(1)));
+    assert!(
+        !state
+            .add_admitted(&c, &sum_agg, Some(dec_one), &mut admit)
+            .unwrap()
+    );
+    assert_eq!(admit.seen, Some((0, DECIMAL_SUM_BYTES)));
+    assert_eq!(state.sum_heap_bytes(), 0);
+
+    // Deferred replay of the refused `1` with admission allowed finishes to i64::MAX + 1.
+    let expected_term = oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+        "9223372036854775808",
+        oxrdf::vocab::xsd::INTEGER,
+    ));
+    admit.seen = None;
+    admit.allow = true;
+    assert!(
+        state
+            .add_admitted(&c, &sum_agg, Some(int(&c, 1)), &mut admit)
+            .unwrap()
+    );
+    assert_eq!(admit.seen, Some((0, INT128_SUM_BYTES)));
+    assert_eq!(state.sum_heap_bytes(), INT128_SUM_BYTES);
+    let done = state.finish(&c, &sum_agg).unwrap();
+    assert_eq!(c.term(done), Some(expected_term.clone()));
+
+    // 2. Parallel range merge of two inline SumAcc::Int subtotals whose sum exceeds i64:
+    // `Running::merge` must invoke `retain(INT128_SUM_BYTES)` BEFORE mutating either
+    // accumulator or allocating `Box<Int128Sum>`.
+    let mut left = Running::new(&sum_agg, true);
+    let mut right = Running::new(&sum_agg, true);
+    left.init(1);
+    right.init(1);
+    fold(&c, &mut left, &[int(&c, i64::MAX)], &[0]);
+    fold(&c, &mut right, &[int(&c, 1)], &[0]);
+
+    let mut requested = Vec::new();
+    let mut refuse_retain = |delta: u64| {
+        requested.push(delta);
+        Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
+            kind: crate::BudgetKind::Memory,
+            limit: 0,
+            requested: delta,
+        }))
+    };
+    let err = left
+        .merge(&c, &mut right, &[0], &mut refuse_retain)
+        .expect_err("merge must fail before allocating Box<Int128Sum>");
+    assert!(matches!(
+        err,
+        crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+    ));
+    assert_eq!(requested, vec![INT128_SUM_BYTES]);
+    // Both accumulators remain intact after refusal.
+    assert_eq!(
+        c.term(left.read(&c, 0).unwrap()),
+        Some(oxrdf::Term::Literal(oxrdf::Literal::from(i64::MAX)))
+    );
+    assert_eq!(
+        c.term(right.read(&c, 0).unwrap()),
+        Some(oxrdf::Term::Literal(oxrdf::Literal::from(1i64)))
+    );
+
+    // 3. End-to-end parallel range-split over two i64-fitting partitions whose combined sum
+    // exceeds i64::MAX: succeeds both in parallel and under tight memory fallback.
+    let n = 16_384usize;
+    let half = n / 2;
+    let mut table = Table::new(vec![0]);
+    for i in 0..n {
+        let v = if i == 0 {
+            i64::MAX
+        } else if i == half {
+            1
+        } else {
+            0
+        };
+        table.push_row(&[int(&c, v)]);
+    }
+    let aggs = vec![(10, sum_agg.clone())];
+    let (par_out, _) = run_whole_in_pool(2, &c, &table, &[], &aggs, true).unwrap();
+    assert_eq!(c.term(par_out.cols[0][0]), Some(expected_term.clone()));
+
+    let mut tight = ctx();
+    tight.mem_limit = 150_000;
+    let tight = tight.into_shared();
+    let mut tight_table = Table::new(vec![0]);
+    for i in 0..n {
+        let v = if i == 0 {
+            i64::MAX
+        } else if i == half {
+            1
+        } else {
+            0
+        };
+        tight_table.push_row(&[int(&tight, v)]);
+    }
+    let (fb_out, _) = run_whole_in_pool(2, &tight, &tight_table, &[], &aggs, true).unwrap();
+    tight
+        .check()
+        .expect("range-split merge fallback must not latch memory_failure");
+    assert_eq!(tight.term(fb_out.cols[0][0]), Some(expected_term));
+}

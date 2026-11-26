@@ -2778,34 +2778,40 @@ impl LeafReader {
                         s,
                         re: re_arg,
                     },
-                    Some(x) => match ctx.value_checked(x)? {
-                        Some(Value::Str(v)) => {
-                            let mut matched = false;
-                            let mut checked = 0usize;
-                            while let Some(tok) = iter.next_token(ctx)? {
-                                checked += 1;
-                                if checked.is_multiple_of(1024) {
-                                    ctx.check()?;
+                    Some(x) => {
+                        let tok_decode = ctx.charge(0)?;
+                        let tok_val = ctx.value_checked_into(x, &tok_decode)?;
+                        let matched = match tok_val {
+                            Some(Value::Str(v)) => {
+                                let mut matched = false;
+                                let mut checked = 0usize;
+                                while let Some(tok) = iter.next_token(ctx)? {
+                                    checked += 1;
+                                    if checked.is_multiple_of(1024) {
+                                        ctx.check()?;
+                                    }
+                                    if *tok == *v {
+                                        matched = true;
+                                        break;
+                                    }
                                 }
-                                if *tok == *v {
-                                    matched = true;
-                                    break;
-                                }
+                                drop(v);
+                                matched
                             }
-                            drop(iter);
-                            charge.resize(open_base)?;
-                            if matched {
-                                ReaderMode::Single(Some(Solution::triple(x, s, re_arg)))
-                            } else {
-                                ReaderMode::Done
+                            other => {
+                                drop(other);
+                                false
                             }
-                        }
-                        _ => {
-                            drop(iter);
-                            charge.resize(open_base)?;
+                        };
+                        drop(tok_decode);
+                        drop(iter);
+                        charge.resize(open_base)?;
+                        if matched {
+                            ReaderMode::Single(Some(Solution::triple(x, s, re_arg)))
+                        } else {
                             ReaderMode::Done
                         }
-                    },
+                    }
                 }
             }
             PfKind::Concat => {
@@ -2953,16 +2959,20 @@ impl LeafReader {
                     None => ctx.intern_iri_checked(ns)?,
                     Some(x) => {
                         let arg_decode = ctx.charge(0)?;
-                        let text = match ctx.term_checked_into(x, &arg_decode)? {
-                            Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
-                            Some(Term::Literal(_)) => {
-                                arg_decode.resize(0)?;
-                                string_literal(ctx, x, &arg_decode)?
+                        let ok = {
+                            let term = ctx.term_checked_into(x, &arg_decode)?;
+                            match &term {
+                                Some(Term::NamedNode(n)) => n.as_str() == ns,
+                                Some(Term::Literal(l))
+                                    if l.datatype() == xsd::STRING || l.language().is_some() =>
+                                {
+                                    l.value() == ns
+                                }
+                                _ => false,
                             }
-                            _ => None,
                         };
                         drop(arg_decode);
-                        if text.as_deref() != Some(ns) {
+                        if !ok {
                             drop(iri);
                             drop(decode);
                             drop(args);
@@ -2981,7 +2991,15 @@ impl LeafReader {
                     None => string(local)?,
                     Some(x) => {
                         let arg_decode = ctx.charge(0)?;
-                        let ok = string_literal(ctx, x, &arg_decode)?.as_deref() == Some(local);
+                        let ok = {
+                            let term = ctx.term_checked_into(x, &arg_decode)?;
+                            matches!(
+                                &term,
+                                Some(Term::Literal(l))
+                                    if (l.datatype() == xsd::STRING || l.language().is_some())
+                                        && l.value() == local
+                            )
+                        };
                         drop(arg_decode);
                         if !ok {
                             drop(iri);
@@ -4668,6 +4686,84 @@ mod tests {
         assert!(
             checks >= 2_000,
             "expected >= 2,000 inner deletion polls during LeafReader::next, got {checks}"
+        );
+    }
+
+    /// Bound-token `apf:strSplit` must keep the uncached bound token's checked-decode
+    /// charge live across the entire token scan rather than releasing it before the scan.
+    #[test]
+    fn bound_str_split_keeps_decode_credit_live_during_token_scan() {
+        use sparkles_budget::MemoryDomain;
+        use std::sync::Mutex;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let events: Arc<Mutex<Vec<(bool, u64, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev_res = events.clone();
+        let ev_rel = events.clone();
+        let parent = MemoryDomain::unpooled().parent(
+            move |delta| {
+                let c = super::super::ctx::CHECKS.with(|n| n.get());
+                ev_res.lock().unwrap().push((true, delta, c));
+                Ok(())
+            },
+            move |delta| {
+                let c = super::super::ctx::CHECKS.with(|n| n.get());
+                ev_rel.lock().unwrap().push((false, delta, c));
+            },
+        );
+
+        let mut raw = Ctx::new(store.snapshot());
+        raw.mem_limit = 4 << 20;
+        raw.set_memory_parent(parent).unwrap();
+        raw.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(raw);
+        ctx.attach_owner();
+
+        // 256 KiB bound token exceeds the 4 MiB ValueCache shard share (64 KiB), so
+        // `value_checked_into` leaves it uncached and its live credit comes solely from
+        // `tok_decode`.
+        let long_tok = "z".repeat(256 << 10);
+        let text = format!("{}{long_tok}", "a,".repeat(20_000));
+        let tok_id = ctx.intern_value(&Value::Str(long_tok.into()));
+        let text_id = ctx.intern_value(&Value::Str(text.into()));
+        let pat_id = ctx.intern_value(&Value::Str(",".into()));
+
+        events.lock().unwrap().clear();
+        super::super::ctx::CHECKS.with(|n| n.set(0));
+
+        let spec = PfSpec {
+            kind: PfKind::StrSplit,
+            slots: vec![
+                PathEnd::Const(tok_id),
+                PathEnd::Const(text_id),
+                PathEnd::Const(pat_id),
+            ],
+            inputs: Default::default(),
+            graph: GraphFilter::Default,
+        };
+        let mut reader = LeafReader::open(&ctx, &spec, &[]).unwrap();
+        let mut out = Table::new(Vec::new());
+        assert!(reader.next(&ctx, &mut out, 1).unwrap());
+        assert_eq!(out.len(), 1, "bound long token must match");
+
+        let log = events.lock().unwrap();
+        // Find the large (>= 192 KiB) reserve for `tok_decode` after `StrSplitIter` setup
+        // and the corresponding large release. Under `value_checked_into`, the release must
+        // happen only after the 20,000-token scan advances `CHECKS` by at least 15 polls.
+        let tok_res = log
+            .iter()
+            .rev()
+            .find(|&&(is_res, delta, _)| is_res && delta >= (192 << 10))
+            .copied()
+            .expect("expected >= 192 KiB parent reserve for uncached bound token");
+        let tok_rel = log
+            .iter()
+            .find(|&&(is_res, delta, check)| !is_res && delta >= (192 << 10) && check >= tok_res.2)
+            .copied()
+            .expect("expected >= 192 KiB parent release for uncached bound token");
+        assert!(
+            tok_rel.2 >= tok_res.2 + 15,
+            "bound-token decode credit dropped before scan completed: reserve={tok_res:?}, release={tok_rel:?}, log={log:?}"
         );
     }
 }

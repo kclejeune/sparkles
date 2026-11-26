@@ -1178,7 +1178,7 @@ impl LocalVocab {
             Self::Owned(v) => v.insert(key),
             Self::Circuit(t) => {
                 let before = t.key_count();
-                let id = t.push_local_key(key.to_vec());
+                let id = t.push_local_key(key);
                 (id.payload(), t.key_count() > before)
             }
         }
@@ -1216,10 +1216,7 @@ impl LocalVocab {
     fn insert_peak_bytes(&self, key_len: usize) -> Option<u64> {
         match self {
             Self::Owned(v) => v.insert_peak_bytes(key_len),
-            Self::Circuit(t) => t
-                .bytes()
-                .checked_add(u64::try_from(key_len).ok()?)?
-                .checked_add(96),
+            Self::Circuit(t) => t.insert_peak_bytes(key_len),
         }
     }
 }
@@ -8001,6 +7998,60 @@ mod charge_tests {
                 ctx.live_bytes(),
                 ctx.mem_limit
             );
+        }
+    }
+
+    #[test]
+    fn circuit_vocab_checked_insert_covers_long_keys_and_refuses_before_mutation() {
+        let store = Store::in_memory(StoreOptions::default());
+        let long_key = format!("\"{}\x00", "a".repeat(256));
+        let expected_retained =
+            crate::incr::terms::Terms::key_retained_bytes(long_key.len()).unwrap();
+        assert!(expected_retained > long_key.len() as u64 + 96);
+
+        // 1. Direct checked insertion into an attached empty circuit term table with a key
+        // longer than 48 bytes must cover `Terms::bytes()` without tripping `rem == 0`.
+        {
+            let ctx = Ctx::new(store.snapshot());
+            ctx.swap_circuit_terms(crate::incr::terms::Terms::default());
+            let id = ctx
+                .intern_key_checked(long_key.as_bytes())
+                .expect("long key insertion must fit");
+            assert_eq!(id.tag(), Tag::Local);
+            assert_eq!(
+                ctx.local_retained.load(Ordering::Acquire),
+                expected_retained
+            );
+            let terms = ctx.take_circuit_terms();
+            assert_eq!(terms.key_count(), 1);
+            assert_eq!(terms.bytes(), expected_retained);
+        }
+
+        // 2. Budget strictly between `key_len + 96` and `2 * key_len + 48` must refuse
+        // BEFORE mutating the attached circuit term table.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = long_key.len() as u64 + 96 + 16;
+            assert!(ctx.mem_limit < expected_retained);
+            ctx.swap_circuit_terms(crate::incr::terms::Terms::default());
+            let err = ctx
+                .intern_key_checked(long_key.as_bytes())
+                .expect_err("long key insertion must refuse before mutating terms");
+            assert!(
+                matches!(
+                    err,
+                    crate::error::Error::BudgetExceeded(b)
+                        if b.kind == crate::BudgetKind::Memory
+                ),
+                "expected BudgetKind::Memory, got {err:?}"
+            );
+            let terms = ctx.take_circuit_terms();
+            assert_eq!(
+                terms.key_count(),
+                0,
+                "refused checked insertion must not mutate attached circuit terms"
+            );
+            assert_eq!(terms.bytes(), 0);
         }
     }
 }

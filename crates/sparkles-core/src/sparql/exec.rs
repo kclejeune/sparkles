@@ -8263,7 +8263,8 @@ pub(super) fn double_intern_bytes(x: f64) -> u64 {
 
 /// Heap bytes owned by a `SumAcc::Decimal(Box<DecimalSum>)` allocation.
 pub(super) const DECIMAL_SUM_BYTES: u64 = size_of::<DecimalSum>() as u64;
-const INT128_SUM_BYTES: u64 = size_of::<Int128Sum>() as u64;
+/// Heap bytes owned by a `SumAcc::Int128(Box<Int128Sum>)` allocation.
+pub(super) const INT128_SUM_BYTES: u64 = size_of::<Int128Sum>() as u64;
 
 /// Value-space hazard flags tracked on `AggState::Best` so `can_merge` only combines
 /// slice winners when `order_cmp` is guaranteed to be a transitive total preorder
@@ -8436,13 +8437,14 @@ impl SumAcc {
                 let s = i128::from(*sum) + i128::from(i64::from(b));
                 let lo = i128::from(*min).min(s);
                 let hi = i128::from(*max).max(s);
+                let scratch = admit.charge_scratch(ctx, INT128_SUM_BYTES)?;
                 (
                     SumAcc::Int128(Box::new(Int128Sum {
                         sum: s,
                         min: lo,
                         max: hi,
                     })),
-                    None,
+                    Some(scratch),
                 )
             }
             (SumAcc::Int { .. } | SumAcc::Int128(_), Num::Decimal(b)) => {
@@ -8451,6 +8453,7 @@ impl SumAcc {
                     .checked_mul(super::value::DECIMAL_SCALE)
                     .and_then(|s| s.checked_add(super::value::decimal_raw(b)))
                 {
+                    let scratch = admit.charge_scratch(ctx, DECIMAL_SUM_BYTES)?;
                     return Ok((
                         SumAcc::Decimal(Box::new(DecimalSum {
                             val: v,
@@ -8461,7 +8464,7 @@ impl SumAcc {
                             int_max,
                             exact_int_prefix: true,
                         })),
-                        None,
+                        Some(scratch),
                     ));
                 }
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
@@ -8476,6 +8479,7 @@ impl SumAcc {
                     .checked_mul(super::value::DECIMAL_SCALE)
                     .and_then(|s| s.checked_add(super::value::decimal_raw(b)))
                 {
+                    let scratch = admit.charge_scratch(ctx, DECIMAL_SUM_BYTES)?;
                     return Ok((
                         SumAcc::Decimal(Box::new(DecimalSum {
                             val: v,
@@ -8486,7 +8490,7 @@ impl SumAcc {
                             int_max: 0,
                             exact_int_prefix: false,
                         })),
-                        None,
+                        Some(scratch),
                     ));
                 }
                 let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
@@ -8947,6 +8951,43 @@ impl AggState {
             return Ok(true);
         }
         match (&mut *acc, id.tag()) {
+            (SumAcc::Int { sum, min, max }, crate::id::Tag::Int) => {
+                let x = id.as_i64();
+                if let Some(s) = sum.checked_add(x) {
+                    *sum = s;
+                    if x >= 0 {
+                        if s > *max {
+                            *max = s;
+                        }
+                    } else if s < *min {
+                        *min = s;
+                    }
+                    return Ok(true);
+                }
+                let s = i128::from(*sum) + i128::from(x);
+                let lo = i128::from(*min).min(s);
+                let hi = i128::from(*max).max(s);
+                match admit.admit(0, INT128_SUM_BYTES) {
+                    Ok(true) => {
+                        *acc = SumAcc::Int128(Box::new(Int128Sum {
+                            sum: s,
+                            min: lo,
+                            max: hi,
+                        }));
+                        return Ok(true);
+                    }
+                    Ok(false) => {
+                        *rows -= 1;
+                        *errs -= err;
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        *rows -= 1;
+                        *errs -= err;
+                        return Err(error);
+                    }
+                }
+            }
             (SumAcc::Int128(b), crate::id::Tag::Int) => {
                 let x = id.as_i64();
                 if let Some(s) = b.sum.checked_add(x.into()) {
@@ -9012,7 +9053,9 @@ impl AggState {
             *acc = SumAcc::HardError;
             return Ok(true);
         };
-        // Fast in-place updates that never change heap ownership or need big-number scratch.
+        // Fast in-place updates that never change heap ownership or need big-number scratch,
+        // plus fixed-size boxed transitions admitted strictly before allocation so spilling
+        // refusal preserves the admitted prefix without allocating.
         match (&mut *acc, &value) {
             (SumAcc::Int { sum, min, max }, Value::Integer(i)) => {
                 let x = i64::from(*i);
@@ -9026,6 +9069,73 @@ impl AggState {
                         *min = s;
                     }
                     return Ok(true);
+                }
+                let s = i128::from(*sum) + i128::from(x);
+                let lo = i128::from(*min).min(s);
+                let hi = i128::from(*max).max(s);
+                match admit.admit(0, INT128_SUM_BYTES) {
+                    Ok(true) => {
+                        *acc = SumAcc::Int128(Box::new(Int128Sum {
+                            sum: s,
+                            min: lo,
+                            max: hi,
+                        }));
+                        return Ok(true);
+                    }
+                    Ok(false) => {
+                        *rows -= 1;
+                        *errs -= err;
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        *rows -= 1;
+                        *errs -= err;
+                        return Err(error);
+                    }
+                }
+            }
+            (
+                SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_),
+                Value::Decimal(d),
+            ) => {
+                let (int_before, int_min, int_max, exact_int_prefix) = match &*acc {
+                    SumAcc::Int { sum, min, max } => {
+                        (i128::from(*sum), i128::from(*min), i128::from(*max), true)
+                    }
+                    SumAcc::Int128(b) => (b.sum, b.min, b.max, true),
+                    SumAcc::IntRetracted(sum) => (*sum, 0, 0, false),
+                    _ => unreachable!(),
+                };
+                if let Some(v) = int_before
+                    .checked_mul(super::value::DECIMAL_SCALE)
+                    .and_then(|s| s.checked_add(super::value::decimal_raw(*d)))
+                {
+                    let old_bytes = acc.heap_bytes();
+                    match admit.admit(old_bytes, DECIMAL_SUM_BYTES) {
+                        Ok(true) => {
+                            *acc = SumAcc::HardError;
+                            *acc = SumAcc::Decimal(Box::new(DecimalSum {
+                                val: v,
+                                min: v,
+                                max: v,
+                                int_before,
+                                int_min,
+                                int_max,
+                                exact_int_prefix,
+                            }));
+                            return Ok(true);
+                        }
+                        Ok(false) => {
+                            *rows -= 1;
+                            *errs -= err;
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            *rows -= 1;
+                            *errs -= err;
+                            return Err(error);
+                        }
+                    }
                 }
             }
             (SumAcc::Int128(b), Value::Integer(i)) => {
@@ -9259,6 +9369,59 @@ impl AggState {
         }
     }
 
+    /// Exact heap bytes that `self` will own after [`AggState::merge`] folds `other` into
+    /// `self`, assuming `self.can_merge(other)` is true. Allocates nothing.
+    pub(super) fn merged_sum_heap_bytes(&self, other: &AggState) -> u64 {
+        let (
+            AggState::Sum {
+                acc: la, rows: lr, ..
+            },
+            AggState::Sum {
+                acc: ra,
+                rows: rr,
+                errs: re,
+                ..
+            },
+        ) = (self, other)
+        else {
+            return 0;
+        };
+        if *rr == 0 {
+            return la.heap_bytes();
+        }
+        if *lr == 0 {
+            return ra.heap_bytes();
+        }
+        if matches!(la, SumAcc::HardError | SumAcc::Overflow) {
+            return la.heap_bytes();
+        }
+        if matches!(ra, SumAcc::HardError) || (matches!(ra, SumAcc::Overflow) && *re > 0) {
+            return 0;
+        }
+        match (la, ra) {
+            (l, r) if l.int_bounds().is_some() && r.int_bounds().is_some() => {
+                let (base, lmin, lmax) = l.int_bounds().expect("checked above");
+                let (osum, omin, omax) = r.int_bounds().expect("checked above");
+                let new_sum = base + osum;
+                let new_min = lmin.min(base + omin);
+                let new_max = lmax.max(base + omax);
+                if i64::try_from(new_sum).is_ok()
+                    && i64::try_from(new_min).is_ok()
+                    && i64::try_from(new_max).is_ok()
+                {
+                    0
+                } else {
+                    INT128_SUM_BYTES
+                }
+            }
+            (l, r) if l.int_sum().is_some() && r.int_sum().is_some() => 0,
+            (SumAcc::Decimal(_), r) if r.int_bounds().is_some() => DECIMAL_SUM_BYTES,
+            (l, SumAcc::Decimal(_)) if l.int_bounds().is_some() => DECIMAL_SUM_BYTES,
+            (SumAcc::Decimal(_), SumAcc::Decimal(_)) => DECIMAL_SUM_BYTES,
+            _ => 0,
+        }
+    }
+
     /// Fold `other`, the state of the same aggregate over rows that come after this
     /// state's rows, into this one, so that the result is what one state over all the
     /// rows in that order gives. `false`, with this state unchanged, for a state that
@@ -9324,6 +9487,11 @@ impl AggState {
                             b.sum = new_sum;
                             b.min = new_min;
                             b.max = new_max;
+                        } else if let SumAcc::Int128(mut b) = r {
+                            b.sum = new_sum;
+                            b.min = new_min;
+                            b.max = new_max;
+                            *l = SumAcc::Int128(b);
                         } else {
                             *l = SumAcc::Int128(Box::new(Int128Sum {
                                 sum: new_sum,
