@@ -665,10 +665,11 @@ fn resources(p: &mut Paths) {
     );
     p.add(
         op(GET, "/$/resources/{id}/recipes", "getVocabularyRecipes", tag, "Export PURL or w3id redirection recipes")
-            .doc("Generates Apache `.htaccess` rules (for `w3id.org` or a self-hosted domain) or PURL redirection recipes for a vocabulary resource's hosted namespaces and version IRIs. Returns `text/plain` by default or JSON on `Accept: application/json` or `format=json`. Needs server `admin`.")
+            .doc("Generates Apache `.htaccess` rules (for `w3id.org` or a self-hosted domain) or PURL redirection recipes for a vocabulary resource's hosted namespaces and version IRIs. Representation negotiation is delegated to Sparkles. Returns `text/plain` by default or JSON on `Accept: application/json` or `format=json`. Needs server `admin`.")
             .see("linked-data-publishing")
             .query("kind", str_enum(&["w3id", "htaccess", "purl"]), "Recipe target (`w3id` by default).")
             .query("base", s(), "Public `http(s)` base URL of this Sparkles server.")
+            .query("mount", s(), "Optional `.htaccess` directory mount to strip from `RewriteRule` patterns (defaults to the shared first path segment for `w3id`, or site root for `htaccess`).")
             .query("format", str_enum(&["text", "json"]), "Response format (`text` by default).")
             .resp_h("200", "The generated recipe.", Some(json!({
                 "text/plain": text(),
@@ -697,8 +698,12 @@ fn resources(p: &mut Paths) {
     };
     let ld_headers = json!({
         "Vary": { "description": "`Accept`.", "schema": s() },
-        "Link": { "description": "Alternate representation links.", "schema": s() },
-        "Sparkles-Describe-Truncated": { "description": "`true` when the bounded DESCRIBE reached its triple limit.", "schema": s() },
+        "Link": { "description": "Alternate representation links (and `rel=\"original\"` for historical snapshots of live IRIs).", "schema": s() },
+        "Sparkles-Describe-Truncated": { "description": "`true` when the bounded DESCRIBE reached its triple or term limit.", "schema": s() },
+        "Sparkles-At": { "description": "Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state.", "schema": s() },
+        "Sparkles-Head": { "description": "Current head commit sequence of the resolved dataset when reading a historical state.", "schema": s() },
+        "Memento-Datetime": { "description": "HTTP-date timestamp of the resolved historical commit (RFC 7089).", "schema": s() },
+        "Content-Security-Policy": { "description": "Script-free Content Security Policy sent on `text/html` responses.", "schema": s() },
     });
     let ld_redirect_headers = json!({
         "Location": { "description": "The document URL for the negotiated representation.", "schema": s() },
@@ -706,6 +711,9 @@ fn resources(p: &mut Paths) {
     });
     let ld_format = str_enum(&["html", "turtle", "jsonld", "rdfxml", "ntriples"]);
     let ld_not_acceptable = json!({ "application/json": { "schema": sref("Error") } });
+    let ld_vary_header = json!({
+        "Vary": { "description": "`Accept`.", "schema": s() },
+    });
     let ld_common = |o: Op| {
         o.see("linked-data-publishing")
             .query("format", ld_format.clone(), "Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`).")
@@ -717,8 +725,8 @@ fn resources(p: &mut Paths) {
             .param("describeMaxTriples")
             .param("describeMaxDepth")
             .resp_h("200", "The negotiated HTML or bounded DESCRIBE RDF representation.", Some(ld_content()), ld_headers.clone())
-            .resp("406", "No supported representation matches `Accept`.", Some(ld_not_acceptable.clone()))
-            .errors(&[400, 404, 410, 503])
+            .resp_h("406", "No supported representation matches `Accept`.", Some(ld_not_acceptable.clone()), ld_vary_header.clone())
+            .errors(&[400, 404, 408, 410, 503, 507])
     };
     p.add(
         ld_common(

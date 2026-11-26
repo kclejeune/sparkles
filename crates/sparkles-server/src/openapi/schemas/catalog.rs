@@ -288,6 +288,7 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
                     "resource": string(),
                     "kind": string_enum(&["w3id", "htaccess", "purl"]),
                     "baseUrl": string(),
+                    "mount": with_desc(string(), "Relative `.htaccess` directory mount stripped from `RewriteRule` patterns, when set."),
                     "namespaces": array(obj(&["prefix", "iri", "style", "targetUrl"], json!({
                         "prefix": string(),
                         "iri": string(),

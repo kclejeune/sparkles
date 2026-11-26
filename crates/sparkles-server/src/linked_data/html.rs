@@ -3,10 +3,12 @@
 //! All dynamic text, IRIs, language tags, datatypes and attribute values are strictly
 //! HTML-escaped. Only `http://`, `https://` and relative `/$/ld...` URLs are rendered
 //! as clickable `href` links; any other IRI scheme (such as `javascript:` or `data:`)
-//! is rendered as plain escaped text.
+//! is rendered as plain escaped text. Output is bounded against `max_result_bytes` as
+//! chunks are written so oversized pages abort without allocating past the limit.
 
 use super::{Description, Format};
 use oxrdf::{NamedOrBlankNode, Term, Triple};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -17,22 +19,6 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// Strict CSP for linked-data HTML pages: no scripts, no external subresources, no framing.
 pub const HTML_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-
-/// Escape `&`, `<`, `>`, `"`, and `'` for safe HTML text and quoted attribute contexts.
-pub fn escape_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
 
 /// Whether `iri` may be placed in an HTML `href` attribute directly.
 /// Only absolute `http://` and `https://` URLs without whitespace or control chars pass.
@@ -78,8 +64,11 @@ pub fn doc_url(
     url
 }
 
-fn compact_iri(iri: &str, prefixes: &BTreeMap<String, String>) -> Option<String> {
-    let mut best: Option<(&str, &str)> = None;
+fn compact_iri<'a>(
+    iri: &'a str,
+    prefixes: &'a BTreeMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
+    let mut best: Option<(&'a str, &'a str)> = None;
     for (prefix, ns) in prefixes {
         if let Some(local) = iri.strip_prefix(ns.as_str())
             && !local.is_empty()
@@ -89,85 +78,266 @@ fn compact_iri(iri: &str, prefixes: &BTreeMap<String, String>) -> Option<String>
             best = Some((prefix.as_str(), ns.as_str()));
         }
     }
-    best.map(|(p, ns)| format!("{p}:{}", &iri[ns.len()..]))
+    best.map(|(p, ns)| (p, &iri[ns.len()..]))
 }
 
-fn is_readable_hosted(iri: &str, readable_namespaces: &[String]) -> bool {
-    readable_namespaces.iter().any(|ns| {
+fn is_in_namespaces(iri: &str, namespaces: &[String]) -> bool {
+    namespaces.iter().any(|ns| {
         iri == ns.as_str()
             || ((ns.ends_with('/') || ns.ends_with('#') || ns.ends_with(':'))
                 && iri.starts_with(ns.as_str()))
     })
 }
 
-fn render_iri(
-    iri: &str,
-    prefixes: &BTreeMap<String, String>,
-    readable_namespaces: &[String],
-    version: Option<&str>,
-    at: Option<&str>,
-) -> String {
-    let display = compact_iri(iri, prefixes).unwrap_or_else(|| iri.to_string());
-    let escaped_display = escape_html(&display);
-    let escaped_full = escape_html(iri);
-    if is_readable_hosted(iri, readable_namespaces) {
-        let mut href = format!("/$/ld?iri={}", percent_encode_param(iri));
-        if let Some(v) = version {
-            let _ = write!(href, "&version={}", percent_encode_param(v));
-        }
-        if let Some(a) = at {
-            let _ = write!(href, "&at={}", percent_encode_param(a));
-        }
-        format!(
-            "<a href=\"{}\" title=\"{escaped_full}\">{escaped_display}</a>",
-            escape_html(&href)
-        )
-    } else if safe_external_href(iri) {
-        format!(
-            "<a href=\"{escaped_full}\" rel=\"noopener noreferrer\" title=\"{escaped_full}\">{escaped_display}</a>"
-        )
-    } else {
-        format!("<code title=\"{escaped_full}\">{escaped_display}</code>")
-    }
+/// Bounded HTML writer enforcing `max_result_bytes` before every append.
+struct HtmlWriter {
+    buf: String,
+    limit: Option<u64>,
 }
 
-fn render_term(
-    term: &Term,
-    prefixes: &BTreeMap<String, String>,
-    readable_namespaces: &[String],
-    version: Option<&str>,
-    at: Option<&str>,
-) -> String {
-    match term {
-        Term::NamedNode(n) => render_iri(n.as_str(), prefixes, readable_namespaces, version, at),
-        Term::BlankNode(b) => format!("<code>_:{}</code>", escape_html(b.as_str())),
-        Term::Literal(l) => {
-            let val = escape_html(l.value());
-            if let Some(lang) = l.language() {
-                format!(
-                    "<span class=\"lit\">{val}</span> <span class=\"tag\">@{}</span>",
-                    escape_html(lang)
-                )
-            } else {
-                let dt = l.datatype().as_str();
-                if dt == "http://www.w3.org/2001/XMLSchema#string" {
-                    format!("<span class=\"lit\">{val}</span>")
-                } else {
-                    let dt_disp = compact_iri(dt, prefixes).unwrap_or_else(|| dt.to_string());
-                    format!(
-                        "<span class=\"lit\">{val}</span> <span class=\"tag\">^^{}</span>",
-                        escape_html(&dt_disp)
-                    )
-                }
+impl HtmlWriter {
+    fn new(limit: Option<u64>) -> Self {
+        let cap = limit.map_or(4096, |l| l.min(4096) as usize);
+        Self {
+            buf: String::with_capacity(cap),
+            limit,
+        }
+    }
+
+    #[inline]
+    fn check(&self, add: usize) -> sparkles::Result<()> {
+        if let Some(limit) = self.limit {
+            let requested = (self.buf.len() as u64).saturating_add(add as u64);
+            if requested > limit {
+                return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                    kind: sparkles::BudgetKind::ResultBytes,
+                    limit,
+                    requested,
+                }));
             }
         }
-        #[allow(unreachable_patterns)]
-        other => format!("<code>{}</code>", escape_html(&other.to_string())),
+        Ok(())
+    }
+
+    fn push_str(&mut self, s: &str) -> sparkles::Result<()> {
+        self.check(s.len())?;
+        self.buf.push_str(s);
+        Ok(())
+    }
+
+    fn push_u64(&mut self, n: u64) -> sparkles::Result<()> {
+        let s = n.to_string();
+        self.push_str(&s)
+    }
+
+    /// Write `s` with HTML escaping directly into `self.buf`, checking `limit` as slices
+    /// are emitted so oversized literals abort immediately.
+    fn push_escaped(&mut self, s: &str) -> sparkles::Result<()> {
+        let mut last = 0usize;
+        for (i, c) in s.char_indices() {
+            let repl = match c {
+                '&' => "&amp;",
+                '<' => "&lt;",
+                '>' => "&gt;",
+                '"' => "&quot;",
+                '\'' => "&#39;",
+                _ => continue,
+            };
+            if i > last {
+                self.push_str(&s[last..i])?;
+            }
+            self.push_str(repl)?;
+            last = i + c.len_utf8();
+        }
+        if last < s.len() {
+            self.push_str(&s[last..])?;
+        }
+        Ok(())
+    }
+
+    fn into_string(self) -> String {
+        self.buf
     }
 }
 
-fn preferred_label(iri: &str, triples: &[Triple]) -> String {
-    let mut best: Option<(u8, String)> = None;
+fn write_compact_or_iri(
+    w: &mut HtmlWriter,
+    iri: &str,
+    prefixes: &BTreeMap<String, String>,
+) -> sparkles::Result<()> {
+    match compact_iri(iri, prefixes) {
+        Some((p, local)) => {
+            w.push_escaped(p)?;
+            w.push_str(":")?;
+            w.push_escaped(local)
+        }
+        None => w.push_escaped(iri),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_iri(
+    w: &mut HtmlWriter,
+    iri: &str,
+    prefixes: &BTreeMap<String, String>,
+    own_namespaces: &[String],
+    readable_namespaces: &[String],
+    version: Option<&str>,
+    at: Option<&str>,
+) -> sparkles::Result<()> {
+    if is_in_namespaces(iri, readable_namespaces) {
+        let same_resource = is_in_namespaces(iri, own_namespaces);
+        let mut href = format!("/$/ld?iri={}", percent_encode_param(iri));
+        if same_resource {
+            if let Some(v) = version {
+                let _ = write!(href, "&version={}", percent_encode_param(v));
+            }
+            if let Some(a) = at {
+                let _ = write!(href, "&at={}", percent_encode_param(a));
+            }
+        }
+        w.push_str("<a href=\"")?;
+        w.push_escaped(&href)?;
+        w.push_str("\" title=\"")?;
+        w.push_escaped(iri)?;
+        w.push_str("\">")?;
+        write_compact_or_iri(w, iri, prefixes)?;
+        w.push_str("</a>")
+    } else if safe_external_href(iri) {
+        w.push_str("<a href=\"")?;
+        w.push_escaped(iri)?;
+        w.push_str("\" rel=\"noopener noreferrer\" title=\"")?;
+        w.push_escaped(iri)?;
+        w.push_str("\">")?;
+        write_compact_or_iri(w, iri, prefixes)?;
+        w.push_str("</a>")
+    } else {
+        w.push_str("<code title=\"")?;
+        w.push_escaped(iri)?;
+        w.push_str("\">")?;
+        write_compact_or_iri(w, iri, prefixes)?;
+        w.push_str("</code>")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_subject(
+    w: &mut HtmlWriter,
+    subj: &NamedOrBlankNode,
+    prefixes: &BTreeMap<String, String>,
+    own_namespaces: &[String],
+    readable_namespaces: &[String],
+    version: Option<&str>,
+    at: Option<&str>,
+) -> sparkles::Result<()> {
+    match subj {
+        NamedOrBlankNode::NamedNode(n) => write_iri(
+            w,
+            n.as_str(),
+            prefixes,
+            own_namespaces,
+            readable_namespaces,
+            version,
+            at,
+        ),
+        NamedOrBlankNode::BlankNode(b) => {
+            w.push_str("<code>_:")?;
+            w.push_escaped(b.as_str())?;
+            w.push_str("</code>")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_term(
+    w: &mut HtmlWriter,
+    term: &Term,
+    prefixes: &BTreeMap<String, String>,
+    own_namespaces: &[String],
+    readable_namespaces: &[String],
+    version: Option<&str>,
+    at: Option<&str>,
+) -> sparkles::Result<()> {
+    match term {
+        Term::NamedNode(n) => write_iri(
+            w,
+            n.as_str(),
+            prefixes,
+            own_namespaces,
+            readable_namespaces,
+            version,
+            at,
+        ),
+        Term::BlankNode(b) => {
+            w.push_str("<code>_:")?;
+            w.push_escaped(b.as_str())?;
+            w.push_str("</code>")
+        }
+        Term::Literal(l) => {
+            w.push_str("<span class=\"lit\">")?;
+            w.push_escaped(l.value())?;
+            w.push_str("</span>")?;
+            if let Some(lang) = l.language() {
+                w.push_str(" <span class=\"tag\">@")?;
+                w.push_escaped(lang)?;
+                w.push_str("</span>")?;
+            } else {
+                let dt = l.datatype().as_str();
+                if dt != "http://www.w3.org/2001/XMLSchema#string" {
+                    w.push_str(" <span class=\"tag\">^^")?;
+                    write_compact_or_iri(w, dt, prefixes)?;
+                    w.push_str("</span>")?;
+                }
+            }
+            Ok(())
+        }
+        #[allow(unreachable_patterns)]
+        other => {
+            w.push_str("<code>")?;
+            w.push_escaped(&other.to_string())?;
+            w.push_str("</code>")
+        }
+    }
+}
+
+fn cmp_named_or_blank(a: &NamedOrBlankNode, b: &NamedOrBlankNode) -> Ordering {
+    match (a, b) {
+        (NamedOrBlankNode::NamedNode(x), NamedOrBlankNode::NamedNode(y)) => {
+            x.as_str().cmp(y.as_str())
+        }
+        (NamedOrBlankNode::BlankNode(x), NamedOrBlankNode::BlankNode(y)) => {
+            x.as_str().cmp(y.as_str())
+        }
+        (NamedOrBlankNode::NamedNode(_), NamedOrBlankNode::BlankNode(_)) => Ordering::Less,
+        (NamedOrBlankNode::BlankNode(_), NamedOrBlankNode::NamedNode(_)) => Ordering::Greater,
+    }
+}
+
+fn cmp_term(a: &Term, b: &Term) -> Ordering {
+    match (a, b) {
+        (Term::NamedNode(x), Term::NamedNode(y)) => x.as_str().cmp(y.as_str()),
+        (Term::BlankNode(x), Term::BlankNode(y)) => x.as_str().cmp(y.as_str()),
+        (Term::Literal(x), Term::Literal(y)) => (
+            x.value(),
+            x.language().unwrap_or(""),
+            x.datatype().as_str(),
+        )
+            .cmp(&(y.value(), y.language().unwrap_or(""), y.datatype().as_str())),
+        _ => {
+            let tag = |t: &Term| match t {
+                Term::NamedNode(_) => 0u8,
+                Term::BlankNode(_) => 1u8,
+                Term::Literal(_) => 2u8,
+                #[allow(unreachable_patterns)]
+                _ => 3u8,
+            };
+            tag(a).cmp(&tag(b))
+        }
+    }
+}
+
+fn preferred_label<'a>(iri: &'a str, triples: &'a [Triple]) -> &'a str {
+    let mut best: Option<(u8, &'a str)> = None;
     for t in triples {
         let NamedOrBlankNode::NamedNode(s) = &t.subject else {
             continue;
@@ -191,8 +361,8 @@ fn preferred_label(iri: &str, triples: &[Triple]) -> String {
             Some(_) => 2u8,
         };
         let rank = pred_rank * 4 + lang_rank;
-        if best.as_ref().is_none_or(|(b, _)| rank < *b) {
-            best = Some((rank, lit.value().to_string()));
+        if best.is_none_or(|(b, _)| rank < b) {
+            best = Some((rank, lit.value()));
         }
     }
     if let Some((_, label)) = best {
@@ -204,16 +374,17 @@ fn preferred_label(iri: &str, triples: &[Triple]) -> String {
         .map(|(_, local)| local)
         .filter(|s| !s.is_empty())
         .unwrap_or(iri)
-        .to_string()
 }
 
-/// Render a self-contained, escaped HTML5 page for `desc`.
+/// Render a self-contained, escaped HTML5 page for `desc`, enforcing `max_result_bytes`
+/// during construction.
 pub fn render(
     desc: &Description,
     version_param: Option<&str>,
     at_param: Option<&str>,
     extra_describe: &[(String, String)],
-) -> String {
+    max_result_bytes: Option<u64>,
+) -> sparkles::Result<String> {
     let title = preferred_label(&desc.iri, &desc.triples);
     let mut outgoing: Vec<&Triple> = Vec::new();
     let mut incoming: Vec<&Triple> = Vec::new();
@@ -231,66 +402,55 @@ pub fn render(
             related.push(t);
         }
     }
-    // Sort deterministically: rdf:type first, then predicate, then object.
+    // Sort deterministically without allocating temporary strings: rdf:type first, then
+    // predicate, then object.
     outgoing.sort_by(|a, b| {
         let ra = a.predicate.as_str() != RDF_TYPE;
         let rb = b.predicate.as_str() != RDF_TYPE;
-        (ra, a.predicate.as_str(), a.object.to_string()).cmp(&(
-            rb,
-            b.predicate.as_str(),
-            b.object.to_string(),
-        ))
+        ra.cmp(&rb)
+            .then_with(|| a.predicate.as_str().cmp(b.predicate.as_str()))
+            .then_with(|| cmp_term(&a.object, &b.object))
     });
     incoming.sort_by(|a, b| {
-        (a.predicate.as_str(), a.subject.to_string())
-            .cmp(&(b.predicate.as_str(), b.subject.to_string()))
+        a.predicate
+            .as_str()
+            .cmp(b.predicate.as_str())
+            .then_with(|| cmp_named_or_blank(&a.subject, &b.subject))
     });
     related.sort_by(|a, b| {
-        (
-            a.subject.to_string(),
-            a.predicate.as_str(),
-            a.object.to_string(),
-        )
-            .cmp(&(
-                b.subject.to_string(),
-                b.predicate.as_str(),
-                b.object.to_string(),
-            ))
+        cmp_named_or_blank(&a.subject, &b.subject)
+            .then_with(|| a.predicate.as_str().cmp(b.predicate.as_str()))
+            .then_with(|| cmp_term(&a.object, &b.object))
     });
 
-    let mut out = String::with_capacity(4096);
-    let escaped_title = escape_html(&title);
-    let escaped_iri = escape_html(&desc.iri);
-    let _ = write!(
-        out,
+    let mut w = HtmlWriter::new(max_result_bytes);
+    w.push_str(
         "<!DOCTYPE html>\n\
          <html lang=\"en\">\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{escaped_title}</title>\n"
-    );
+         <title>",
+    )?;
+    w.push_escaped(title)?;
+    w.push_str("</title>\n")?;
+
     for fmt in [
         Format::Turtle,
         Format::JsonLd,
         Format::RdfXml,
         Format::NTriples,
     ] {
-        let href = escape_html(&doc_url(
-            &desc.iri,
-            fmt,
-            version_param,
-            at_param,
-            extra_describe,
-        ));
-        let _ = writeln!(
-            out,
-            "<link rel=\"alternate\" type=\"{}\" href=\"{href}\" title=\"{}\">",
-            fmt.essence(),
-            fmt.label()
-        );
+        let href = doc_url(&desc.iri, fmt, version_param, at_param, extra_describe);
+        w.push_str("<link rel=\"alternate\" type=\"")?;
+        w.push_str(fmt.essence())?;
+        w.push_str("\" href=\"")?;
+        w.push_escaped(&href)?;
+        w.push_str("\" title=\"")?;
+        w.push_str(fmt.label())?;
+        w.push_str("\">\n")?;
     }
-    out.push_str(
+    w.push_str(
         "<style>\n\
          body{font-family:system-ui,-apple-system,sans-serif;max-width:60rem;margin:2rem auto;padding:0 1rem;line-height:1.5;color:#1f2937;background:#fff}\n\
          h1{margin:0 0 .25rem;font-size:1.6rem}\n\
@@ -308,160 +468,158 @@ pub fn render(
          a{color:#1d4ed8}\n\
          </style>\n\
          </head>\n\
-         <body>\n",
-    );
-    let _ = writeln!(out, "<h1>{escaped_title}</h1>");
-    let _ = writeln!(out, "<div class=\"iri\"><code>{escaped_iri}</code></div>");
+         <body>\n<h1>",
+    )?;
+    w.push_escaped(title)?;
+    w.push_str("</h1>\n<div class=\"iri\"><code>")?;
+    w.push_escaped(&desc.iri)?;
+    w.push_str("</code></div>\n")?;
 
     // Metadata bar
-    out.push_str("<div class=\"meta\">");
-    let _ = write!(
-        out,
-        "<span><strong>Resource:</strong> {}</span>",
-        escape_html(&desc.resource_title)
-    );
+    w.push_str("<div class=\"meta\"><span><strong>Resource:</strong> ")?;
+    w.push_escaped(&desc.resource_title)?;
+    w.push_str("</span>")?;
     if let Some(p) = &desc.namespace_prefix {
-        let _ = write!(
-            out,
-            "<span><strong>Prefix:</strong> <code>{}</code></span>",
-            escape_html(p)
-        );
+        w.push_str("<span><strong>Prefix:</strong> <code>")?;
+        w.push_escaped(p)?;
+        w.push_str("</code></span>")?;
     }
     if let Some(v) = &desc.version_name {
-        let _ = write!(
-            out,
-            "<span><strong>Version:</strong> <code>{}</code></span>",
-            escape_html(v)
-        );
+        w.push_str("<span><strong>Version:</strong> <code>")?;
+        w.push_escaped(v)?;
+        w.push_str("</code></span>")?;
     }
     if let Some(h) = &desc.resolved_history {
-        let _ = write!(
-            out,
-            "<span><strong>Snapshot:</strong> <code>{}</code> (commit {})</span>",
-            escape_html(&h.at.to_string()),
-            h.commit.seq
-        );
+        w.push_str("<span><strong>Snapshot:</strong> <code>")?;
+        w.push_escaped(&h.at.to_string())?;
+        w.push_str("</code> (commit ")?;
+        w.push_u64(h.commit.seq)?;
+        w.push_str(")</span>")?;
     }
     if let Some(lic) = &desc.license {
-        let _ = write!(
-            out,
-            "<span><strong>Licence:</strong> <code>{}</code></span>",
-            escape_html(lic)
-        );
+        w.push_str("<span><strong>Licence:</strong> <code>")?;
+        w.push_escaped(lic)?;
+        w.push_str("</code></span>")?;
     }
-    out.push_str("</div>\n");
+    w.push_str("</div>\n")?;
 
     // Alternate RDF format links
-    out.push_str("<nav class=\"formats\" aria-label=\"Alternate formats\">");
+    w.push_str("<nav class=\"formats\" aria-label=\"Alternate formats\">")?;
     for fmt in [
         Format::Turtle,
         Format::JsonLd,
         Format::RdfXml,
         Format::NTriples,
     ] {
-        let href = escape_html(&doc_url(
-            &desc.iri,
-            fmt,
-            version_param,
-            at_param,
-            extra_describe,
-        ));
-        let _ = write!(out, "<a href=\"{href}\">{}</a>", fmt.label());
+        let href = doc_url(&desc.iri, fmt, version_param, at_param, extra_describe);
+        w.push_str("<a href=\"")?;
+        w.push_escaped(&href)?;
+        w.push_str("\">")?;
+        w.push_str(fmt.label())?;
+        w.push_str("</a>")?;
     }
-    out.push_str("</nav>\n");
+    w.push_str("</nav>\n")?;
 
     if desc.truncated {
-        out.push_str(
+        w.push_str(
             "<div class=\"notice\">This description was truncated at the server's DESCRIBE triple limit.</div>\n",
-        );
+        )?;
     }
 
     if !outgoing.is_empty() {
-        out.push_str("<h2>Properties</h2>\n<table><tbody>\n");
+        w.push_str("<h2>Properties</h2>\n<table><tbody>\n")?;
         for t in outgoing {
-            let p_html = render_iri(
+            w.push_str("<tr><th>")?;
+            write_iri(
+                &mut w,
                 t.predicate.as_str(),
                 &desc.prefixes,
+                &desc.own_namespaces,
                 &desc.readable_namespaces,
                 version_param,
                 at_param,
-            );
-            let o_html = render_term(
+            )?;
+            w.push_str("</th><td>")?;
+            write_term(
+                &mut w,
                 &t.object,
                 &desc.prefixes,
+                &desc.own_namespaces,
                 &desc.readable_namespaces,
                 version_param,
                 at_param,
-            );
-            let _ = writeln!(out, "<tr><th>{p_html}</th><td>{o_html}</td></tr>");
+            )?;
+            w.push_str("</td></tr>\n")?;
         }
-        out.push_str("</tbody></table>\n");
+        w.push_str("</tbody></table>\n")?;
     }
 
     if !incoming.is_empty() {
-        out.push_str("<h2>Referenced by</h2>\n<table><tbody>\n");
+        w.push_str("<h2>Referenced by</h2>\n<table><tbody>\n")?;
         for t in incoming {
-            let s_html = match &t.subject {
-                NamedOrBlankNode::NamedNode(n) => render_iri(
-                    n.as_str(),
-                    &desc.prefixes,
-                    &desc.readable_namespaces,
-                    version_param,
-                    at_param,
-                ),
-                NamedOrBlankNode::BlankNode(b) => {
-                    format!("<code>_:{}</code>", escape_html(b.as_str()))
-                }
-            };
-            let p_html = render_iri(
+            w.push_str("<tr><th>")?;
+            write_iri(
+                &mut w,
                 t.predicate.as_str(),
                 &desc.prefixes,
+                &desc.own_namespaces,
                 &desc.readable_namespaces,
                 version_param,
                 at_param,
-            );
-            let _ = writeln!(out, "<tr><th>{p_html}</th><td>{s_html}</td></tr>");
+            )?;
+            w.push_str("</th><td>")?;
+            write_subject(
+                &mut w,
+                &t.subject,
+                &desc.prefixes,
+                &desc.own_namespaces,
+                &desc.readable_namespaces,
+                version_param,
+                at_param,
+            )?;
+            w.push_str("</td></tr>\n")?;
         }
-        out.push_str("</tbody></table>\n");
+        w.push_str("</tbody></table>\n")?;
     }
 
     if !related.is_empty() {
-        out.push_str("<h2>Related statements</h2>\n<table><thead><tr><th>Subject</th><th>Predicate</th><th>Object</th></tr></thead><tbody>\n");
+        w.push_str("<h2>Related statements</h2>\n<table><thead><tr><th>Subject</th><th>Predicate</th><th>Object</th></tr></thead><tbody>\n")?;
         for t in related {
-            let s_html = match &t.subject {
-                NamedOrBlankNode::NamedNode(n) => render_iri(
-                    n.as_str(),
-                    &desc.prefixes,
-                    &desc.readable_namespaces,
-                    version_param,
-                    at_param,
-                ),
-                NamedOrBlankNode::BlankNode(b) => {
-                    format!("<code>_:{}</code>", escape_html(b.as_str()))
-                }
-            };
-            let p_html = render_iri(
+            w.push_str("<tr><td>")?;
+            write_subject(
+                &mut w,
+                &t.subject,
+                &desc.prefixes,
+                &desc.own_namespaces,
+                &desc.readable_namespaces,
+                version_param,
+                at_param,
+            )?;
+            w.push_str("</td><td>")?;
+            write_iri(
+                &mut w,
                 t.predicate.as_str(),
                 &desc.prefixes,
+                &desc.own_namespaces,
                 &desc.readable_namespaces,
                 version_param,
                 at_param,
-            );
-            let o_html = render_term(
+            )?;
+            w.push_str("</td><td>")?;
+            write_term(
+                &mut w,
                 &t.object,
                 &desc.prefixes,
+                &desc.own_namespaces,
                 &desc.readable_namespaces,
                 version_param,
                 at_param,
-            );
-            let _ = writeln!(
-                out,
-                "<tr><td>{s_html}</td><td>{p_html}</td><td>{o_html}</td></tr>"
-            );
+            )?;
+            w.push_str("</td></tr>\n")?;
         }
-        out.push_str("</tbody></table>\n");
+        w.push_str("</tbody></table>\n")?;
     }
 
-    out.push_str("</body>\n</html>\n");
-    out
+    w.push_str("</body>\n</html>\n")?;
+    Ok(w.into_string())
 }

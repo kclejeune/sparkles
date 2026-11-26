@@ -760,6 +760,26 @@ fn check_match(r: &Resource, if_match: Option<&str>) -> Result<()> {
 
 // --------------------------------------------------------------------- store ------
 
+/// Whether a raw JSON catalog object contains any format-2 version members (`versionIri`
+/// or `snapshot`), including explicit `null` values.
+fn raw_has_format_2_members(v: &serde_json::Value) -> bool {
+    v.get("resources")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|resources| {
+            resources.iter().any(|r| {
+                r.get("versions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|versions| {
+                        versions.iter().any(|ver| {
+                            ver.as_object().is_some_and(|o| {
+                                o.contains_key("versionIri") || o.contains_key("snapshot")
+                            })
+                        })
+                    })
+            })
+        })
+}
+
 /// Whether any record in `c` uses fields introduced in `resources.json` format 2
 /// (`versionIri` or `snapshot` on a version).
 fn uses_format_2(c: &CatalogFile) -> bool {
@@ -811,9 +831,21 @@ impl Resources {
                 path.display()
             )));
         }
-        let (c, found): (CatalogFile, u32) =
-            sparkles::formats::settings_from_slice_with_format(FILE, &bytes)
-                .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
+        let mut raw: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
+        let found = sparkles::formats::check_settings(FILE, &raw)
+            .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
+        if found == 1 && raw_has_format_2_members(&raw) {
+            return Err(Error::Unreadable(format!(
+                "{}: versionIri and snapshot require format 2",
+                path.display()
+            )));
+        }
+        if let Some(o) = raw.as_object_mut() {
+            o.remove("format");
+        }
+        let c: CatalogFile = serde_json::from_value(raw)
+            .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
         if found == 1 && uses_format_2(&c) {
             return Err(Error::Unreadable(format!(
                 "{}: versionIri and snapshot require format 2",

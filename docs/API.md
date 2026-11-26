@@ -6072,8 +6072,10 @@ readable triples match the IRI, the server answers `404 Not Found` without issui
 redirect.
 
 `GET /$/resources/{id}/recipes` needs server `admin` and accepts `kind=w3id` (the default),
-`kind=htaccess` or `kind=purl`, an optional `base=` public URL and `format=text` or
-`format=json`.
+`kind=htaccess` or `kind=purl`, an optional `base=` public URL, an optional `mount=`
+directory path stripped from `.htaccess` patterns (defaulting to the shared first path
+segment for `w3id` and the site root for `htaccess`) and `format=text` or `format=json`.
+Generated Apache rules delegate `Accept` content negotiation to Sparkles.
 
 ## Backup repositories
 

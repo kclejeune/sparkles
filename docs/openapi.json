@@ -23259,6 +23259,10 @@
             ],
             "type": "string"
           },
+          "mount": {
+            "description": "Relative `.htaccess` directory mount stripped from `RewriteRule` patterns, when set.",
+            "type": "string"
+          },
           "namespaces": {
             "items": {
               "properties": {
@@ -40262,14 +40266,38 @@
             },
             "description": "The negotiated HTML or bounded DESCRIBE RDF representation.",
             "headers": {
+              "Content-Security-Policy": {
+                "description": "Script-free Content Security Policy sent on `text/html` responses.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Link": {
-                "description": "Alternate representation links.",
+                "description": "Alternate representation links (and `rel=\"original\"` for historical snapshots of live IRIs).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Memento-Datetime": {
+                "description": "HTTP-date timestamp of the resolved historical commit (RFC 7089).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-At": {
+                "description": "Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state.",
                 "schema": {
                   "type": "string"
                 }
               },
               "Sparkles-Describe-Truncated": {
-                "description": "`true` when the bounded DESCRIBE reached its triple limit.",
+                "description": "`true` when the bounded DESCRIBE reached its triple or term limit.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Head": {
+                "description": "Current head commit sequence of the resolved dataset when reading a historical state.",
                 "schema": {
                   "type": "string"
                 }
@@ -40319,13 +40347,27 @@
                 }
               }
             },
-            "description": "No supported representation matches `Accept`."
+            "description": "No supported representation matches `Accept`.",
+            "headers": {
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
           },
           "410": {
             "$ref": "#/components/responses/Gone"
           },
           "503": {
             "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -40446,14 +40488,38 @@
             },
             "description": "The negotiated HTML or bounded DESCRIBE RDF representation.",
             "headers": {
+              "Content-Security-Policy": {
+                "description": "Script-free Content Security Policy sent on `text/html` responses.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Link": {
-                "description": "Alternate representation links.",
+                "description": "Alternate representation links (and `rel=\"original\"` for historical snapshots of live IRIs).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Memento-Datetime": {
+                "description": "HTTP-date timestamp of the resolved historical commit (RFC 7089).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-At": {
+                "description": "Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state.",
                 "schema": {
                   "type": "string"
                 }
               },
               "Sparkles-Describe-Truncated": {
-                "description": "`true` when the bounded DESCRIBE reached its triple limit.",
+                "description": "`true` when the bounded DESCRIBE reached its triple or term limit.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Head": {
+                "description": "Current head commit sequence of the resolved dataset when reading a historical state.",
                 "schema": {
                   "type": "string"
                 }
@@ -40486,13 +40552,27 @@
                 }
               }
             },
-            "description": "No supported representation matches `Accept`."
+            "description": "No supported representation matches `Accept`.",
+            "headers": {
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
           },
           "410": {
             "$ref": "#/components/responses/Gone"
           },
           "503": {
             "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -40607,14 +40687,38 @@
             },
             "description": "The negotiated HTML or bounded DESCRIBE RDF representation.",
             "headers": {
+              "Content-Security-Policy": {
+                "description": "Script-free Content Security Policy sent on `text/html` responses.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Link": {
-                "description": "Alternate representation links.",
+                "description": "Alternate representation links (and `rel=\"original\"` for historical snapshots of live IRIs).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Memento-Datetime": {
+                "description": "HTTP-date timestamp of the resolved historical commit (RFC 7089).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-At": {
+                "description": "Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state.",
                 "schema": {
                   "type": "string"
                 }
               },
               "Sparkles-Describe-Truncated": {
-                "description": "`true` when the bounded DESCRIBE reached its triple limit.",
+                "description": "`true` when the bounded DESCRIBE reached its triple or term limit.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Head": {
+                "description": "Current head commit sequence of the resolved dataset when reading a historical state.",
                 "schema": {
                   "type": "string"
                 }
@@ -40664,13 +40768,27 @@
                 }
               }
             },
-            "description": "No supported representation matches `Accept`."
+            "description": "No supported representation matches `Accept`.",
+            "headers": {
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
           },
           "410": {
             "$ref": "#/components/responses/Gone"
           },
           "503": {
             "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -40788,14 +40906,38 @@
             },
             "description": "The negotiated HTML or bounded DESCRIBE RDF representation.",
             "headers": {
+              "Content-Security-Policy": {
+                "description": "Script-free Content Security Policy sent on `text/html` responses.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Link": {
-                "description": "Alternate representation links.",
+                "description": "Alternate representation links (and `rel=\"original\"` for historical snapshots of live IRIs).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Memento-Datetime": {
+                "description": "HTTP-date timestamp of the resolved historical commit (RFC 7089).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-At": {
+                "description": "Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state.",
                 "schema": {
                   "type": "string"
                 }
               },
               "Sparkles-Describe-Truncated": {
-                "description": "`true` when the bounded DESCRIBE reached its triple limit.",
+                "description": "`true` when the bounded DESCRIBE reached its triple or term limit.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Head": {
+                "description": "Current head commit sequence of the resolved dataset when reading a historical state.",
                 "schema": {
                   "type": "string"
                 }
@@ -40845,13 +40987,27 @@
                 }
               }
             },
-            "description": "No supported representation matches `Accept`."
+            "description": "No supported representation matches `Accept`.",
+            "headers": {
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
           },
           "410": {
             "$ref": "#/components/responses/Gone"
           },
           "503": {
             "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -51056,7 +51212,7 @@
     },
     "/$/resources/{id}/recipes": {
       "get": {
-        "description": "Generates Apache `.htaccess` rules (for `w3id.org` or a self-hosted domain) or PURL redirection recipes for a vocabulary resource's hosted namespaces and version IRIs. Returns `text/plain` by default or JSON on `Accept: application/json` or `format=json`. Needs server `admin`.",
+        "description": "Generates Apache `.htaccess` rules (for `w3id.org` or a self-hosted domain) or PURL redirection recipes for a vocabulary resource's hosted namespaces and version IRIs. Representation negotiation is delegated to Sparkles. Returns `text/plain` by default or JSON on `Accept: application/json` or `format=json`. Needs server `admin`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
         },
@@ -51082,6 +51238,14 @@
             "description": "Public `http(s)` base URL of this Sparkles server.",
             "in": "query",
             "name": "base",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional `.htaccess` directory mount to strip from `RewriteRule` patterns (defaults to the shared first path segment for `w3id`, or site root for `htaccess`).",
+            "in": "query",
+            "name": "mount",
             "schema": {
               "type": "string"
             }

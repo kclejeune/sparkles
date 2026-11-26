@@ -11,8 +11,8 @@
 //!   of PURL / w3id Apache `.htaccess` redirection recipes.
 
 use super::{
-    Description, Format, describe_authorized, html, negotiate_format, not_found, recipes,
-    resolve_prefix, serialize_rdf,
+    Format, LookupOutcome, LookupTarget, html, negotiate_format, recipes, resolve_and_describe,
+    serialize_rdf, valid_local_part, valid_lookup_iri,
 };
 use crate::auth::Principal;
 use crate::http::{ApiError, ApiResult, Params, blocking, err_code};
@@ -22,6 +22,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
+use sparkles::history::Resolved;
 use std::sync::Arc;
 
 type St = State<Arc<AppState>>;
@@ -51,6 +52,18 @@ fn describe_extra(params: &Params) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Combine all `Accept` header fields per RFC 9110 §5.3.
+fn combined_accept(headers: &HeaderMap) -> Option<String> {
+    let vals: Vec<&str> = headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!vals.is_empty()).then(|| vals.join(", "))
+}
+
 fn pick_format(params: &Params, headers: &HeaderMap) -> Result<Format, Box<Response>> {
     if let Some(f) = params.get("format") {
         return Format::from_param(f).ok_or_else(|| {
@@ -66,8 +79,8 @@ fn pick_format(params: &Params, headers: &HeaderMap) -> Result<Format, Box<Respo
             )
         });
     }
-    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
-    negotiate_format(accept).ok_or_else(|| {
+    let accept = combined_accept(headers);
+    negotiate_format(accept.as_deref()).ok_or_else(|| {
         let mut resp = err_code(
             StatusCode::NOT_ACCEPTABLE,
             "not-acceptable",
@@ -109,41 +122,70 @@ fn link_header(
         .join(", ")
 }
 
-fn render_response(
-    desc: &Description,
+/// Live original URI for a historical linked-data response, stripping both `at` and
+/// `version`. Returns `None` when the request targets a pinned version IRI directly or
+/// when stripping `at`/`version` would leave the URI unchanged.
+fn live_original_uri(uri: &Uri, is_exact_version_iri: bool) -> Option<String> {
+    if is_exact_version_iri {
+        return None;
+    }
+    let query_raw = uri.query().unwrap_or("");
+    let filtered: Vec<&str> = query_raw
+        .split('&')
+        .filter(|kv| {
+            !kv.is_empty() && !matches!(kv.split('=').next(), Some("at") | Some("version"))
+        })
+        .collect();
+    let original = if filtered.is_empty() {
+        uri.path().to_string()
+    } else {
+        format!("{}?{}", uri.path(), filtered.join("&"))
+    };
+    let current = match uri.query() {
+        Some(q) if !q.is_empty() => format!("{}?{q}", uri.path()),
+        _ => uri.path().to_string(),
+    };
+    (original != current).then_some(original)
+}
+
+enum RenderedBody {
+    Rdf(Vec<u8>),
+    Html(String),
+}
+
+struct RenderedDocument {
+    iri: String,
+    body: RenderedBody,
+    truncated: bool,
+    resolved_history: Option<Resolved>,
+    is_exact_version_iri: bool,
+}
+
+enum RenderedOutcome {
+    Redirect { iri: String },
+    Document(RenderedDocument),
+}
+
+fn build_document_response(
+    doc: RenderedDocument,
     format: Format,
     uri: &Uri,
     version_param: Option<&str>,
     at_param: Option<&str>,
     extra: &[(String, String)],
-    max_result_bytes: Option<u64>,
-) -> ApiResult<Response> {
-    let mut resp = match format.rdf_format() {
-        Some(rdf_fmt) => {
-            let bytes = serialize_rdf(desc, rdf_fmt, max_result_bytes)?;
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, format.media_type())],
-                bytes,
-            )
-                .into_response()
-        }
-        None => {
-            let body = html::render(desc, version_param, at_param, extra);
-            if let Some(limit) = max_result_bytes
-                && (body.len() as u64) > limit
-            {
-                return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
-                    kind: sparkles::BudgetKind::ResultBytes,
-                    limit,
-                    requested: body.len() as u64,
-                })
-                .into());
-            }
+) -> Response {
+    let mut resp = match doc.body {
+        RenderedBody::Rdf(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, format.media_type())],
+            bytes,
+        )
+            .into_response(),
+        RenderedBody::Html(html_body) => {
             let mut r = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, format.media_type())],
-                body,
+                html_body,
             )
                 .into_response();
             let h = r.headers_mut();
@@ -159,47 +201,38 @@ fn render_response(
         }
     };
 
-    {
-        let h = resp.headers_mut();
-        h.insert(header::VARY, HeaderValue::from_static("Accept"));
-        let links = link_header(&desc.iri, version_param, at_param, extra);
-        if let Ok(v) = HeaderValue::from_str(&links) {
-            h.insert(header::LINK, v);
-        }
-        if desc.truncated {
-            h.insert(
-                crate::http::describe::SPARKLES_DESCRIBE_TRUNCATED,
-                HeaderValue::from_static("true"),
-            );
-        }
+    let h = resp.headers_mut();
+    h.insert(header::VARY, HeaderValue::from_static("Accept"));
+    let mut links = link_header(&doc.iri, version_param, at_param, extra);
+    if doc.truncated {
+        h.insert(
+            crate::http::describe::SPARKLES_DESCRIBE_TRUNCATED,
+            HeaderValue::from_static("true"),
+        );
     }
 
-    // Apply history/Memento headers when resolved to a pinned snapshot or commit.
-    // Note: `history_headers` sets `Link: <original>; rel="original"`; preserve our
-    // alternate links by appending when both exist.
-    if let Some(resolved) = &desc.resolved_history {
-        let existing_link = resp
-            .headers()
-            .get(header::LINK)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        resp = crate::http::history::history_headers(resp, Some(resolved), uri);
-        if let Some(alt) = existing_link {
-            let combined = match resp
-                .headers()
-                .get(header::LINK)
-                .and_then(|v| v.to_str().ok())
-            {
-                Some(orig) if orig != alt => format!("{alt}, {orig}"),
-                _ => alt,
-            };
-            if let Ok(v) = HeaderValue::from_str(&combined) {
-                resp.headers_mut().insert(header::LINK, v);
+    if let Some(resolved) = &doc.resolved_history {
+        if let Ok(v) = HeaderValue::from_str(&resolved.at.to_string()) {
+            h.insert("sparkles-at", v);
+        }
+        h.insert("sparkles-head", resolved.head.into());
+        if resolved.historical {
+            let t = std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(resolved.commit.timestamp_ms.max(0) as u64);
+            if let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(t)) {
+                h.insert("memento-datetime", v);
+            }
+            if let Some(orig) = live_original_uri(uri, doc.is_exact_version_iri) {
+                links.push_str(&format!(", <{orig}>; rel=\"original\""));
             }
         }
     }
 
-    Ok(resp)
+    if let Ok(v) = HeaderValue::from_str(&links) {
+        h.insert(header::LINK, v);
+    }
+
+    resp
 }
 
 async fn handle_lookup(
@@ -207,67 +240,132 @@ async fn handle_lookup(
     principal: Principal,
     uri: Uri,
     headers: HeaderMap,
-    iri: String,
+    target: LookupTarget,
     redirect_slash: bool,
 ) -> ApiResult<Response> {
+    // Validate every target-independent request parameter BEFORE reading the catalog so
+    // private prefixes and absent prefixes answer identically.
     let params = Params::from_query(&uri);
     let format = match pick_format(&params, &headers) {
         Ok(f) => f,
         Err(resp) => return Ok(*resp),
     };
     let at = parse_at(&params)?;
+    crate::http::describe::validate_params(&params)?;
+    match &target {
+        LookupTarget::Iri(iri) if !valid_lookup_iri(iri) => {
+            return Err(err_code(
+                StatusCode::BAD_REQUEST,
+                "invalid-iri",
+                "iri must be a valid absolute IRI",
+            ));
+        }
+        LookupTarget::Namespace {
+            local: Some(loc), ..
+        } if !loc.is_empty() && !valid_local_part(loc) => {
+            return Err(err_code(
+                StatusCode::BAD_REQUEST,
+                "invalid-iri",
+                "iri must be a valid absolute IRI",
+            ));
+        }
+        _ => {}
+    }
+
     let version_param = params.get("version").map(str::to_string);
     let at_param = params.get("at").map(str::to_string);
     let extra = describe_extra(&params);
     let max_result_bytes = st.limits.max_result_bytes;
 
-    let (st_c, p_c, iri_c, ver_c, params_c) = (
+    // Capture the admitted query memory pool grant on the async request task before
+    // crossing into `spawn_blocking`, where Tokio task-locals are absent.
+    let grant = crate::server_memory::current_grant();
+
+    let (st_c, p_c, ver_c, at_str_c, extra_c, params_c) = (
         st.clone(),
         principal,
-        iri.clone(),
         version_param.clone(),
+        at_param.clone(),
+        extra.clone(),
         params.clone(),
     );
-    let desc = blocking(move || {
-        let catalog = st_c.resources.read().map_err(ApiError::from)?;
-        describe_authorized(
+    let rendered = blocking(move || {
+        let catalog = st_c.resources.read().map_err(|e| {
+            tracing::warn!("linked-data catalog read failed: {e:?}");
+            err_code(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "catalog-unreadable",
+                "resource catalog is temporarily unavailable",
+            )
+        })?;
+        match resolve_and_describe(
             &st_c,
             &p_c,
             &catalog,
-            &iri_c,
+            target,
             ver_c.as_deref(),
             at,
             &params_c,
-        )
+            grant,
+            redirect_slash,
+        )? {
+            LookupOutcome::Redirect { iri } => Ok(RenderedOutcome::Redirect { iri }),
+            LookupOutcome::Document(desc) => {
+                // Serialize RDF or render HTML on the blocking thread while `desc`
+                // still holds its memory charge against the request budget and pool.
+                let body = match format.rdf_format() {
+                    Some(rdf_fmt) => {
+                        RenderedBody::Rdf(serialize_rdf(&desc, rdf_fmt, max_result_bytes)?)
+                    }
+                    None => RenderedBody::Html(
+                        html::render(
+                            &desc,
+                            ver_c.as_deref(),
+                            at_str_c.as_deref(),
+                            &extra_c,
+                            max_result_bytes,
+                        )
+                        .map_err(ApiError::from)?,
+                    ),
+                };
+                Ok(RenderedOutcome::Document(RenderedDocument {
+                    iri: desc.iri,
+                    body,
+                    truncated: desc.truncated,
+                    resolved_history: desc.resolved_history,
+                    is_exact_version_iri: desc.is_exact_version_iri,
+                }))
+            }
+        }
     })
     .await?;
 
-    if redirect_slash && !desc.is_hash {
-        let location = html::doc_url(
-            &desc.iri,
+    match rendered {
+        RenderedOutcome::Redirect { iri } => {
+            let location = html::doc_url(
+                &iri,
+                format,
+                version_param.as_deref(),
+                at_param.as_deref(),
+                &extra,
+            );
+            let mut resp = StatusCode::SEE_OTHER.into_response();
+            let h = resp.headers_mut();
+            if let Ok(v) = HeaderValue::from_str(&location) {
+                h.insert(header::LOCATION, v);
+            }
+            h.insert(header::VARY, HeaderValue::from_static("Accept"));
+            Ok(resp)
+        }
+        RenderedOutcome::Document(doc) => Ok(build_document_response(
+            doc,
             format,
+            &uri,
             version_param.as_deref(),
             at_param.as_deref(),
             &extra,
-        );
-        let mut resp = StatusCode::SEE_OTHER.into_response();
-        let h = resp.headers_mut();
-        if let Ok(v) = HeaderValue::from_str(&location) {
-            h.insert(header::LOCATION, v);
-        }
-        h.insert(header::VARY, HeaderValue::from_static("Accept"));
-        return Ok(resp);
+        )),
     }
-
-    render_response(
-        &desc,
-        format,
-        &uri,
-        version_param.as_deref(),
-        at_param.as_deref(),
-        &extra,
-        max_result_bytes,
-    )
 }
 
 /// `GET /$/ld?iri=...`: content-negotiated IRI lookup with 303 for slash IRIs.
@@ -285,7 +383,7 @@ async fn resolve_query(
             "query parameter 'iri' is required",
         ));
     };
-    handle_lookup(st, p, uri, headers, iri, true).await
+    handle_lookup(st, p, uri, headers, LookupTarget::Iri(iri), true).await
 }
 
 /// `GET /$/ld/doc?iri=...`: direct representation endpoint (200 OK, never 303).
@@ -303,7 +401,7 @@ async fn document(
             "query parameter 'iri' is required",
         ));
     };
-    handle_lookup(st, p, uri, headers, iri, false).await
+    handle_lookup(st, p, uri, headers, LookupTarget::Iri(iri), false).await
 }
 
 /// `GET /$/ld/ns/{prefix}`: resolve the namespace root for hosted `prefix`.
@@ -314,13 +412,18 @@ async fn resolve_ns_root(
     uri: Uri,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let st_c = st.clone();
-    let iri = blocking(move || {
-        let catalog = st_c.resources.read().map_err(ApiError::from)?;
-        resolve_prefix(&catalog, &prefix, None).ok_or_else(not_found)
-    })
-    .await?;
-    handle_lookup(st, p, uri, headers, iri, true).await
+    handle_lookup(
+        st,
+        p,
+        uri,
+        headers,
+        LookupTarget::Namespace {
+            prefix,
+            local: None,
+        },
+        true,
+    )
+    .await
 }
 
 /// `GET /$/ld/ns/{prefix}/{*local}`: resolve `<namespace_iri><local>` for hosted `prefix`.
@@ -331,13 +434,18 @@ async fn resolve_ns_local(
     uri: Uri,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let st_c = st.clone();
-    let iri = blocking(move || {
-        let catalog = st_c.resources.read().map_err(ApiError::from)?;
-        resolve_prefix(&catalog, &prefix, Some(&local)).ok_or_else(not_found)
-    })
-    .await?;
-    handle_lookup(st, p, uri, headers, iri, true).await
+    handle_lookup(
+        st,
+        p,
+        uri,
+        headers,
+        LookupTarget::Namespace {
+            prefix,
+            local: Some(local),
+        },
+        true,
+    )
+    .await
 }
 
 fn default_base_url(st: &AppState, headers: &HeaderMap) -> String {
@@ -389,12 +497,10 @@ pub async fn recipes(
             ));
         }
         None => {
-            let accept = headers
-                .get(header::ACCEPT)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("text/plain");
+            let accept = combined_accept(&headers);
+            let accept_str = accept.as_deref().unwrap_or("text/plain");
             matches!(
-                crate::http::negotiate(accept, &["text/plain", "application/json"]),
+                crate::http::negotiate(accept_str, &["text/plain", "application/json"]),
                 Some(1)
             )
         }
@@ -405,6 +511,13 @@ pub async fn recipes(
         .unwrap_or_else(|| default_base_url(&st, &headers));
     let base = recipes::validate_base_url(&base)
         .map_err(|m| err_code(StatusCode::BAD_REQUEST, "bad-base-url", m))?;
+    let mount = match params.get("mount") {
+        Some(m) => Some(
+            recipes::validate_mount(m)
+                .map_err(|e| err_code(StatusCode::BAD_REQUEST, "bad-mount", e))?,
+        ),
+        None => None,
+    };
 
     blocking(move || {
         let c = st.resources.read().map_err(ApiError::from)?;
@@ -419,7 +532,7 @@ pub async fn recipes(
                 ),
             ));
         }
-        let export = recipes::generate(r, kind, &base)
+        let export = recipes::generate(r, kind, &base, mount.as_deref())
             .map_err(|m| err_code(StatusCode::BAD_REQUEST, "bad-recipe", m))?;
         let mut resp = if wants_json {
             Json(export).into_response()

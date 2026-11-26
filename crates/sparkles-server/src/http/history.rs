@@ -56,6 +56,17 @@ pub(crate) fn snapshot_for(
     at: Option<&At>,
     opts: &QueryOptions,
 ) -> sparkles::Result<(Arc<Snapshot>, Option<Resolved>)> {
+    snapshot_for_limited(ds, at, opts, None)
+}
+
+/// Like [`snapshot_for`], bounding historical replay memory to `max_memory_bytes` when
+/// given.
+pub(crate) fn snapshot_for_limited(
+    ds: &Dataset,
+    at: Option<&At>,
+    opts: &QueryOptions,
+    max_memory_bytes: Option<u64>,
+) -> sparkles::Result<(Arc<Snapshot>, Option<Resolved>)> {
     let Some(at) = at else {
         return Ok((ds.store.snapshot(), None));
     };
@@ -63,7 +74,11 @@ pub(crate) fn snapshot_for(
         cancel: opts.cancel.clone(),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
     };
-    let (snap, r) = match ds.store.snapshot_at(at, &o) {
+    let res = match max_memory_bytes {
+        Some(cap) => ds.store.snapshot_at_limited(at, &o, cap),
+        None => ds.store.snapshot_at(at, &o),
+    };
+    let (snap, r) = match res {
         // a commit a branch shares with its upstream is read there
         Err(e) if sparkles::branch::inherited_commit(&e).is_some() => match ds.main() {
             Some(main) => main.store.branch_snapshot_at(&ds.branch_name(), at, &o)?,

@@ -30,9 +30,12 @@ use axum::http::StatusCode;
 use oxrdf::{BlankNode, NamedNode, NamedOrBlankNode, Term, Triple};
 use oxrdfio::{JsonLdProfileSet, RdfFormat, RdfSerializer};
 use sparkles::history::{At, Resolved};
+use sparkles::sparql::describe::DescribeOptions;
+use sparkles::sparql::pool::PoolGrant;
 use sparkles::sparql::results::LimitedWriter;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Default upper bound on triples returned by a linked-data `DESCRIBE`.
 pub const DEFAULT_MAX_TRIPLES: u64 = 10_000;
@@ -60,11 +63,11 @@ impl Format {
         Format::NTriples,
     ];
 
-    /// Parse a `format=` query parameter or media type name.
+    /// Parse a `format=` query parameter or emitted media type name.
     pub fn from_param(s: &str) -> Option<Format> {
         let base = s.split(';').next()?.trim().to_ascii_lowercase();
         match base.as_str() {
-            "html" | "text/html" | "xhtml" | "application/xhtml+xml" => Some(Format::Html),
+            "html" | "text/html" => Some(Format::Html),
             "turtle" | "ttl" | "text/turtle" => Some(Format::Turtle),
             "jsonld" | "json-ld" | "application/ld+json" => Some(Format::JsonLd),
             "rdfxml" | "rdf" | "xml" | "application/rdf+xml" => Some(Format::RdfXml),
@@ -128,61 +131,145 @@ impl Format {
     }
 }
 
-/// Negotiate an output [`Format`] from an HTTP `Accept` header following RFC 9110:
-/// exact media type > `type/*` > `*/*`, honoring explicit `q=0` exclusions.
+/// Split `s` on `sep`, ignoring separators inside double-quoted strings.
+fn split_outside_quotes(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_quotes = false;
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == sep {
+            parts.push(&s[start..i]);
+            start = i + sep.len_utf8();
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+fn unquote_param(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if let Some(inner) = s.strip_prefix('"') {
+        let inner = inner.strip_suffix('"')?;
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                out.push(chars.next()?);
+            } else {
+                out.push(c);
+            }
+        }
+        Some(out)
+    } else if !s.is_empty() {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Negotiate an output [`Format`] from a combined HTTP `Accept` header following
+/// RFC 9110 §12.5.1: exact media type (with matching media parameters) > `type/*` > `*/*`,
+/// honoring explicit `q=0` exclusions and advertising only the media types emitted.
 /// An absent or empty `Accept` header defaults to [`Format::Turtle`].
 pub fn negotiate_format(accept: Option<&str>) -> Option<Format> {
     let Some(raw) = accept.map(str::trim).filter(|s| !s.is_empty()) else {
         return Some(Format::Turtle);
     };
 
-    const OFFERS: [(&str, Format); 6] = [
-        ("text/turtle", Format::Turtle),
-        ("application/ld+json", Format::JsonLd),
-        ("application/rdf+xml", Format::RdfXml),
-        ("application/n-triples", Format::NTriples),
-        ("text/html", Format::Html),
-        ("application/xhtml+xml", Format::Html),
+    type Offer = (
+        &'static str,
+        Format,
+        &'static [(&'static str, &'static str)],
+    );
+    const OFFERS: [Offer; 5] = [
+        ("text/turtle", Format::Turtle, &[("charset", "utf-8")]),
+        ("application/ld+json", Format::JsonLd, &[]),
+        ("application/rdf+xml", Format::RdfXml, &[]),
+        ("application/n-triples", Format::NTriples, &[]),
+        ("text/html", Format::Html, &[("charset", "utf-8")]),
     ];
 
-    let mut ranges: Vec<(String, f32)> = Vec::new();
-    for part in raw.split(',') {
-        let mut it = part.split(';');
-        let mt = it.next().unwrap_or("").trim().to_ascii_lowercase();
-        if mt.is_empty() || !mt.contains('/') {
+    struct MediaRange {
+        mt: String,
+        params: Vec<(String, String)>,
+        q: f32,
+    }
+
+    let mut ranges: Vec<MediaRange> = Vec::new();
+    for part in split_outside_quotes(raw, ',') {
+        let pieces = split_outside_quotes(part, ';');
+        let mt = pieces
+            .first()
+            .copied()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let Some((r_type, r_sub)) = mt.split_once('/') else {
+            continue;
+        };
+        if r_type.is_empty() || r_sub.is_empty() || r_sub.contains('/') {
             continue;
         }
+        let mut params = Vec::new();
         let mut q = 1.0f32;
-        let mut bad_q = false;
-        for param in it {
+        let mut seen_q = false;
+        let mut bad = false;
+        for param in pieces.iter().skip(1) {
             let param = param.trim();
-            if let Some(v) = param
-                .strip_prefix("q=")
-                .or_else(|| param.strip_prefix("Q="))
-            {
+            if param.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = param.split_once('=') else {
+                bad = true;
+                break;
+            };
+            let key = k.trim().to_ascii_lowercase();
+            if key == "q" {
+                seen_q = true;
                 match v.trim().parse::<f32>() {
                     Ok(n) if n.is_finite() && (0.0..=1.0).contains(&n) => q = n,
-                    _ => bad_q = true,
+                    _ => {
+                        bad = true;
+                        break;
+                    }
                 }
+            } else if !seen_q {
+                let Some(val) = unquote_param(v) else {
+                    bad = true;
+                    break;
+                };
+                params.push((key, val));
             }
+            // Parameters after `q` are accept-ext and do not participate in media matching.
         }
-        if !bad_q {
-            ranges.push((mt, q));
+        if !bad {
+            ranges.push(MediaRange { mt, params, q });
         }
     }
     if ranges.is_empty() {
         return None;
     }
 
-    let mut best: Option<(f32, u8, usize, Format)> = None;
-    for (idx, (offer_mt, fmt)) in OFFERS.iter().enumerate() {
+    let mut best: Option<(f32, (u8, usize), usize, Format)> = None;
+    for (idx, (offer_mt, fmt, offer_params)) in OFFERS.iter().enumerate() {
         let offer_type = offer_mt.split('/').next().unwrap_or("");
         // RFC 9110 §12.5.1: the most specific matching media range determines q for this offer.
-        let mut matched: Option<(u8, f32)> = None;
-        for (range_mt, q) in &ranges {
-            let spec = if range_mt == offer_mt {
+        let mut matched: Option<((u8, usize), f32)> = None;
+        for range in &ranges {
+            let type_spec = if range.mt == *offer_mt {
                 3u8
-            } else if let Some(prefix) = range_mt.strip_suffix("/*") {
+            } else if let Some(prefix) = range.mt.strip_suffix("/*") {
                 if prefix == "*" {
                     1u8
                 } else if prefix == offer_type {
@@ -193,10 +280,21 @@ pub fn negotiate_format(accept: Option<&str>) -> Option<Format> {
             } else {
                 continue;
             };
+            let params_match = range.params.iter().all(|(k, v)| {
+                offer_params
+                    .iter()
+                    .any(|(ok, ov)| ok == k && ov.eq_ignore_ascii_case(v))
+            });
+            if !params_match {
+                continue;
+            }
+            let spec = (type_spec, range.params.len());
             match matched {
-                None => matched = Some((spec, *q)),
-                Some((cur_spec, cur_q)) if spec > cur_spec || (spec == cur_spec && *q > cur_q) => {
-                    matched = Some((spec, *q));
+                None => matched = Some((spec, range.q)),
+                Some((cur_spec, cur_q))
+                    if spec > cur_spec || (spec == cur_spec && range.q > cur_q) =>
+                {
+                    matched = Some((spec, range.q));
                 }
                 _ => {}
             }
@@ -220,14 +318,34 @@ pub fn negotiate_format(accept: Option<&str>) -> Option<Format> {
     best.map(|(_, _, _, fmt)| fmt)
 }
 
+/// Whether `s` contains only characters valid in an IRI / local path segment.
+fn has_forbidden_iri_char(s: &str) -> bool {
+    s.chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | '{' | '}' | '"' | '`' | '\\' | ' '))
+}
+
+/// Validate a local path suffix on `/$/ld/ns/{prefix}/{*local}` before catalog lookup
+/// so malformed paths return `400 invalid-iri` independent of prefix existence.
+pub fn valid_local_part(local: &str) -> bool {
+    !local.is_empty() && local.len() <= 4096 && !has_forbidden_iri_char(local)
+}
+
 /// Validate an IRI before embedding it in a SPARQL query or resolving it.
 pub fn valid_lookup_iri(iri: &str) -> bool {
     !iri.is_empty()
         && iri.len() <= 4096
-        && !iri
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '<' | '>' | '{' | '}' | '"' | '`' | '\\' | ' '))
+        && !has_forbidden_iri_char(iri)
         && NamedNode::new(iri).is_ok()
+}
+
+/// What a linked-data HTTP request resolves: either a direct IRI or a hosted prefix path.
+#[derive(Clone, Debug)]
+pub enum LookupTarget {
+    Iri(String),
+    Namespace {
+        prefix: String,
+        local: Option<String>,
+    },
 }
 
 /// Result of matching a requested IRI against the resource catalog.
@@ -449,8 +567,8 @@ fn permitted_locations(
         };
         let view = principal.view(&ds.name, Endpoint::Query);
         if candidate_graphs.is_empty() {
-            // Dataset resource without per-version graph list: only permitted if the
-            // caller's view is not completely empty (QueryOptions enforces graph & triple ACLs).
+            // Dataset resource without per-version graph list: QueryOptions enforces
+            // graph and triple ACLs.
             out.push((ds, Vec::new()));
             continue;
         }
@@ -481,33 +599,92 @@ fn escape_sparql_string(s: &str) -> String {
     out
 }
 
+fn hash_doc_term_pattern(iri: &str, target: &ResolvedTarget<'_>) -> (String, String, String) {
+    let base = if target.is_exact_version_iri {
+        target
+            .version
+            .and_then(|v| v.input.version_iri.as_deref())
+            .filter(|vi| valid_lookup_iri(vi))
+            .unwrap_or(iri)
+    } else {
+        iri
+    };
+    let with_hash = if base.ends_with('#') {
+        base.to_string()
+    } else {
+        format!("{base}#")
+    };
+    let without_hash = with_hash.trim_end_matches('#').to_string();
+    let prefix = escape_sparql_string(&with_hash);
+    let ns_clause = target
+        .namespace
+        .filter(|n| n.iri.ends_with('#') && n.iri != with_hash)
+        .map(|n| {
+            let p = escape_sparql_string(&n.iri);
+            format!(
+                " UNION {{ ?term ?p2 ?o2 . FILTER(ISIRI(?term) && STRSTARTS(STR(?term), \"{p}\")) }}"
+            )
+        })
+        .unwrap_or_default();
+    let pattern = format!(
+        "{{ ?term a <http://www.w3.org/2002/07/owl#Ontology> }} \
+         UNION {{ ?term a <http://www.w3.org/2004/02/skos/core#ConceptScheme> }} \
+         UNION {{ ?term ?p ?o . FILTER(ISIRI(?term) && STRSTARTS(STR(?term), \"{prefix}\")) }}{ns_clause}"
+    );
+    (with_hash, without_hash, pattern)
+}
+
 fn describe_sparql(iri: &str, target: &ResolvedTarget<'_>) -> String {
-    if target.is_exact_version_iri {
+    if target.is_exact_version_iri && target.is_hash_document {
+        let (with_hash, without_hash, pattern) = hash_doc_term_pattern(iri, target);
         format!(
-            "DESCRIBE <{iri}> ?ont WHERE {{ OPTIONAL {{ ?ont <http://www.w3.org/2002/07/owl#versionIRI> <{iri}> }} }}"
+            "DESCRIBE <{with_hash}> <{without_hash}> ?ont ?term WHERE {{ \
+             OPTIONAL {{ \
+               {{ ?ont <http://www.w3.org/2002/07/owl#versionIRI> <{with_hash}> }} \
+               UNION {{ ?ont <http://www.w3.org/2002/07/owl#versionIRI> <{without_hash}> }} \
+             }} \
+             OPTIONAL {{ \
+               {{ SELECT DISTINCT ?term WHERE {{ {pattern} }} ORDER BY ?term LIMIT {HASH_NS_TERM_LIMIT} }} \
+             }} \
+           }}"
         )
-    } else if target.is_hash_document {
-        let with_hash = if iri.ends_with('#') {
-            iri.to_string()
+    } else if target.is_exact_version_iri {
+        let configured_vi = target
+            .version
+            .and_then(|v| v.input.version_iri.as_deref())
+            .filter(|vi| valid_lookup_iri(vi))
+            .unwrap_or(iri);
+        if configured_vi == iri {
+            format!(
+                "DESCRIBE <{iri}> ?ont WHERE {{ OPTIONAL {{ ?ont <http://www.w3.org/2002/07/owl#versionIRI> <{iri}> }} }}"
+            )
         } else {
-            format!("{iri}#")
-        };
-        let without_hash = iri.trim_end_matches('#');
-        let prefix = escape_sparql_string(&with_hash);
+            format!(
+                "DESCRIBE <{iri}> <{configured_vi}> ?ont WHERE {{ OPTIONAL {{ \
+                 {{ ?ont <http://www.w3.org/2002/07/owl#versionIRI> <{configured_vi}> }} \
+                 UNION {{ ?ont <http://www.w3.org/2002/07/owl#versionIRI> <{iri}> }} \
+               }} }}"
+            )
+        }
+    } else if target.is_hash_document {
+        let (with_hash, without_hash, pattern) = hash_doc_term_pattern(iri, target);
         format!(
             "DESCRIBE <{with_hash}> <{without_hash}> ?term WHERE {{ \
              OPTIONAL {{ \
-               {{ SELECT DISTINCT ?term WHERE {{ \
-                 {{ ?term a <http://www.w3.org/2002/07/owl#Ontology> }} \
-                 UNION {{ ?term a <http://www.w3.org/2004/02/skos/core#ConceptScheme> }} \
-                 UNION {{ ?term ?p ?o . FILTER(ISIRI(?term) && STRSTARTS(STR(?term), \"{prefix}\")) }} \
-               }} ORDER BY ?term LIMIT {HASH_NS_TERM_LIMIT} }} \
+               {{ SELECT DISTINCT ?term WHERE {{ {pattern} }} ORDER BY ?term LIMIT {HASH_NS_TERM_LIMIT} }} \
              }} \
            }}"
         )
     } else {
         format!("DESCRIBE <{iri}>")
     }
+}
+
+fn hash_doc_overflow_sparql(iri: &str, target: &ResolvedTarget<'_>) -> String {
+    let (_, _, pattern) = hash_doc_term_pattern(iri, target);
+    format!(
+        "SELECT DISTINCT ?term WHERE {{ {pattern} }} ORDER BY ?term OFFSET {HASH_NS_TERM_LIMIT} LIMIT 1"
+    )
 }
 
 fn scope_bnode(t: Triple, prefix: &str) -> Triple {
@@ -526,6 +703,135 @@ fn scope_bnode(t: Triple, prefix: &str) -> Triple {
     Triple::new(map_nb(t.subject), t.predicate, map_term(t.object))
 }
 
+fn term_bytes(term: &Term) -> u64 {
+    match term {
+        Term::NamedNode(n) => 24 + n.as_str().len() as u64,
+        Term::BlankNode(b) => 24 + b.as_str().len() as u64,
+        Term::Literal(l) => {
+            64 + l.value().len() as u64
+                + l.language().map_or(0, |s| s.len() as u64)
+                + l.datatype().as_str().len() as u64
+        }
+        #[allow(unreachable_patterns)]
+        other => 64 + other.to_string().len() as u64,
+    }
+}
+
+fn triple_bytes(t: &Triple) -> u64 {
+    let s = match &t.subject {
+        NamedOrBlankNode::NamedNode(n) => 24 + n.as_str().len() as u64,
+        NamedOrBlankNode::BlankNode(b) => 24 + b.as_str().len() as u64,
+    };
+    let p = 24 + t.predicate.as_str().len() as u64;
+    let o = term_bytes(&t.object);
+    64 + s + p + o
+}
+
+/// Request-wide memory charge against both `--query-memory-mb` and the admitted
+/// [`PoolGrant`], keeping retained merged triples accounted until response serialization
+/// finishes.
+pub(crate) struct MemoryCharge {
+    grant: Option<Arc<PoolGrant>>,
+    limit: Option<u64>,
+    held: u64,
+}
+
+impl MemoryCharge {
+    pub(crate) fn new(grant: Option<Arc<PoolGrant>>, limit: Option<u64>) -> Self {
+        Self {
+            grant,
+            limit,
+            held: 0,
+        }
+    }
+
+    pub(crate) fn charge(&mut self, n: u64) -> sparkles::Result<()> {
+        let total = self.held.saturating_add(n);
+        if let Some(limit) = self.limit
+            && total > limit
+        {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::Memory,
+                limit,
+                requested: total,
+            }));
+        }
+        if let Some(g) = &self.grant {
+            g.charge(n)?;
+        }
+        self.held = total;
+        Ok(())
+    }
+
+    pub(crate) fn release(&mut self, n: u64) {
+        let n = n.min(self.held);
+        if let Some(g) = &self.grant {
+            g.release(n);
+        }
+        self.held -= n;
+    }
+
+    /// Remaining per-query memory budget for the next engine invocation.
+    pub(crate) fn engine_budget(&self) -> sparkles::Result<Option<u64>> {
+        let Some(limit) = self.limit else {
+            return Ok(None);
+        };
+        if self.held >= limit {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::Memory,
+                limit,
+                requested: self.held,
+            }));
+        }
+        Ok(Some(limit - self.held))
+    }
+
+    /// Memory cap for historical WAL replay: lower of remaining per-query budget and pool
+    /// capacity.
+    pub(crate) fn replay_budget(&self) -> sparkles::Result<Option<u64>> {
+        let query_rem = self.engine_budget()?;
+        let pool_rem = self
+            .grant
+            .as_ref()
+            .map(|g| g.pool().capacity().saturating_sub(self.held));
+        match (query_rem, pool_rem) {
+            (Some(a), Some(b)) => Ok(Some(a.min(b))),
+            (Some(a), None) => Ok(Some(a)),
+            (None, Some(b)) => Ok(Some(b)),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+impl Drop for MemoryCharge {
+    fn drop(&mut self) {
+        self.release(self.held);
+    }
+}
+
+struct Deadline {
+    at: Option<Instant>,
+}
+
+impl Deadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            at: (!timeout.is_zero()).then(|| Instant::now() + timeout),
+        }
+    }
+
+    fn left(&self) -> sparkles::Result<Option<Duration>> {
+        let Some(at) = self.at else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        if now >= at {
+            return Err(sparkles::Error::Timeout);
+        }
+        Ok(Some(at.saturating_duration_since(now)))
+    }
+}
+
 /// Authorized, bounded description of an IRI.
 pub struct Description {
     pub iri: String,
@@ -537,9 +843,20 @@ pub struct Description {
     pub version_name: Option<String>,
     pub namespace_prefix: Option<String>,
     pub license: Option<String>,
-    pub is_hash: bool,
+    pub is_exact_version_iri: bool,
+    /// Hosted namespace IRIs owned by the matched resource itself.
+    pub own_namespaces: Vec<String>,
     /// Hosted namespace IRIs that the caller is permitted to read (for safe internal links).
     pub readable_namespaces: Vec<String>,
+    pub(crate) _memory_charge: MemoryCharge,
+}
+
+/// Outcome of resolving and authorizing a linked-data lookup.
+pub enum LookupOutcome {
+    /// Slash IRI with at least one readable triple: answer `303 See Other`.
+    Redirect { iri: String },
+    /// Direct `200 OK` representation (hash IRI, hash namespace document, or `/$/ld/doc`).
+    Document(Box<Description>),
 }
 
 /// Generic 404 used whenever a resource, namespace, or term is absent or not readable.
@@ -548,6 +865,14 @@ pub fn not_found() -> ApiError {
         StatusCode::NOT_FOUND,
         "linked-data-not-found",
         "resource not found",
+    )
+}
+
+fn history_gone() -> ApiError {
+    err_code(
+        StatusCode::GONE,
+        "history-gone",
+        "requested historical state is no longer retained",
     )
 }
 
@@ -578,42 +903,196 @@ fn readable_namespaces(st: &AppState, principal: &Principal, catalog: &CatalogFi
     out
 }
 
-/// Resolve and run a bounded, authorized `DESCRIBE` for `iri`.
-pub fn describe_authorized(
+struct DatasetPlan {
+    ds: Arc<Dataset>,
+    allowed_graphs: Vec<String>,
+    describe: DescribeOptions,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_one_dataset(
+    st: &AppState,
+    principal: &Principal,
+    plan: &DatasetPlan,
+    sparql: &str,
+    at: Option<&At>,
+    grant: &Option<Arc<PoolGrant>>,
+    charge: &MemoryCharge,
+    deadline: &Deadline,
+) -> ApiResult<ProbeResult> {
+    let mut opts = CallerContext::for_caller(st, &plan.ds, principal).read_options();
+    opts.grant = grant.clone();
+    opts.timeout = deadline.left().map_err(ApiError::from)?;
+    opts.max_memory_bytes = charge.engine_budget().map_err(ApiError::from)?;
+    let mut desc = plan.describe.clone();
+    desc.max_triples = Some(1);
+    opts.describe = desc;
+    if !plan.allowed_graphs.is_empty() {
+        opts.default_graph_uris = plan.allowed_graphs.clone();
+        opts.default_graph_extra.clear();
+    }
+    let replay_cap = charge.replay_budget().map_err(ApiError::from)?;
+    let (snap, _) =
+        match crate::http::history::snapshot_for_limited(&plan.ds, at, &opts, replay_cap) {
+            Ok(pair) => pair,
+            Err(sparkles::Error::NotFound(_)) => return Ok(ProbeResult::Empty),
+            Err(sparkles::Error::HistoryGone(_)) => return Ok(ProbeResult::HistoryGone),
+            Err(e) => return Err(ApiError::from(e)),
+        };
+    let res = sparkles::sparql::query(snap, sparql, &opts).map_err(ApiError::from)?;
+    if res.triples().is_empty() {
+        Ok(ProbeResult::Empty)
+    } else {
+        Ok(ProbeResult::Readable)
+    }
+}
+
+enum ProbeResult {
+    Readable,
+    Empty,
+    HistoryGone,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_any_readable(
+    st: &AppState,
+    principal: &Principal,
+    plans: &[DatasetPlan],
+    sparql: &str,
+    at: Option<&At>,
+    grant: &Option<Arc<PoolGrant>>,
+    charge: &MemoryCharge,
+    deadline: &Deadline,
+) -> ApiResult<ProbeResult> {
+    let mut saw_gone = false;
+    for plan in plans {
+        match probe_one_dataset(st, principal, plan, sparql, at, grant, charge, deadline)? {
+            ProbeResult::Readable => return Ok(ProbeResult::Readable),
+            ProbeResult::Empty => {}
+            ProbeResult::HistoryGone => {
+                // Only report 410 if the caller can read at least one triple on the live
+                // snapshot; otherwise hidden terms stay 404.
+                if matches!(
+                    probe_one_dataset(st, principal, plan, sparql, None, grant, charge, deadline)?,
+                    ProbeResult::Readable
+                ) {
+                    saw_gone = true;
+                }
+            }
+        }
+    }
+    if saw_gone {
+        Ok(ProbeResult::HistoryGone)
+    } else {
+        Ok(ProbeResult::Empty)
+    }
+}
+
+/// Resolve and run a bounded, authorized linked-data lookup for `target`.
+///
+/// When `redirect_slash` is true and the matched target is a slash IRI, executes a
+/// 1-triple existence probe under the caller's ACLs and returns [`LookupOutcome::Redirect`]
+/// instead of materializing a full description.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_and_describe(
     st: &AppState,
     principal: &Principal,
     catalog: &CatalogFile,
-    iri: &str,
+    target: LookupTarget,
     requested_version: Option<&str>,
     at_override: Option<At>,
     describe_params: &Params,
-) -> ApiResult<Description> {
-    if !valid_lookup_iri(iri) {
-        return Err(err_code(
-            StatusCode::BAD_REQUEST,
-            "invalid-iri",
-            "iri must be a valid absolute IRI",
-        ));
-    }
-    let Some(target) = resolve_iri(catalog, iri, requested_version) else {
+    grant: Option<Arc<PoolGrant>>,
+    redirect_slash: bool,
+) -> ApiResult<LookupOutcome> {
+    let iri = match target {
+        LookupTarget::Iri(iri) => {
+            if !valid_lookup_iri(&iri) {
+                return Err(err_code(
+                    StatusCode::BAD_REQUEST,
+                    "invalid-iri",
+                    "iri must be a valid absolute IRI",
+                ));
+            }
+            iri
+        }
+        LookupTarget::Namespace { prefix, local } => {
+            if let Some(loc) = local.as_deref().filter(|s| !s.is_empty())
+                && !valid_local_part(loc)
+            {
+                return Err(err_code(
+                    StatusCode::BAD_REQUEST,
+                    "invalid-iri",
+                    "iri must be a valid absolute IRI",
+                ));
+            }
+            let expanded =
+                resolve_prefix(catalog, &prefix, local.as_deref()).ok_or_else(not_found)?;
+            if !valid_lookup_iri(&expanded) {
+                return Err(not_found());
+            }
+            expanded
+        }
+    };
+
+    let Some(resolved_target) = resolve_iri(catalog, &iri, requested_version) else {
         return Err(not_found());
     };
-    let permitted = permitted_locations(st, principal, &target);
+    let permitted = permitted_locations(st, principal, &resolved_target);
     if permitted.is_empty() {
         return Err(not_found());
     }
-    if target.version_conflict {
-        return Err(err_code(
-            StatusCode::BAD_REQUEST,
-            "version-conflict",
-            "version parameter conflicts with the requested version IRI",
-        ));
-    }
-    if target.version_missing {
+    if resolved_target.version_missing {
         return Err(not_found());
     }
 
-    let effective_at = match (target.pinned_snapshot(), at_override) {
+    // Precompute every permitted dataset's DESCRIBE options and the minimum global cap
+    // before running any query so a later dataset can never lower the cap retroactively.
+    let mut plans = Vec::with_capacity(permitted.len());
+    let mut global_cap = DEFAULT_MAX_TRIPLES as usize;
+    for (ds, allowed_graphs) in permitted {
+        let desc = crate::http::describe::request_options(&ds, describe_params)?
+            .lowered(Some(DEFAULT_MAX_TRIPLES), Some(DEFAULT_MAX_DEPTH));
+        if let Some(limit) = desc.max_triples {
+            global_cap = global_cap.min(limit as usize);
+        }
+        plans.push(DatasetPlan {
+            ds,
+            allowed_graphs,
+            describe: desc,
+        });
+    }
+
+    let deadline = Deadline::new(st.default_timeout);
+    let mut charge = MemoryCharge::new(grant.clone(), st.limits.query_memory_bytes);
+    let sparql = describe_sparql(&iri, &resolved_target);
+
+    if resolved_target.version_conflict {
+        let pin_at = resolved_target
+            .pinned_snapshot()
+            .and_then(|s| s.parse::<At>().ok());
+        match probe_any_readable(
+            st,
+            principal,
+            &plans,
+            &sparql,
+            pin_at.as_ref(),
+            &grant,
+            &charge,
+            &deadline,
+        )? {
+            ProbeResult::Readable => {
+                return Err(err_code(
+                    StatusCode::BAD_REQUEST,
+                    "version-conflict",
+                    "version parameter conflicts with the requested version IRI",
+                ));
+            }
+            ProbeResult::Empty | ProbeResult::HistoryGone => return Err(not_found()),
+        }
+    }
+
+    let effective_at = match (resolved_target.pinned_snapshot(), at_override) {
         (Some(pin_str), Some(req_at)) => {
             let pin_at: At = pin_str.parse().map_err(|e: sparkles::Error| {
                 err_code(
@@ -623,11 +1102,25 @@ pub fn describe_authorized(
                 )
             })?;
             if pin_at != req_at {
-                return Err(err_code(
-                    StatusCode::BAD_REQUEST,
-                    "snapshot-conflict",
-                    "at parameter conflicts with the version's pinned snapshot",
-                ));
+                match probe_any_readable(
+                    st,
+                    principal,
+                    &plans,
+                    &sparql,
+                    Some(&pin_at),
+                    &grant,
+                    &charge,
+                    &deadline,
+                )? {
+                    ProbeResult::Readable => {
+                        return Err(err_code(
+                            StatusCode::BAD_REQUEST,
+                            "snapshot-conflict",
+                            "at parameter conflicts with the version's pinned snapshot",
+                        ));
+                    }
+                    ProbeResult::Empty | ProbeResult::HistoryGone => return Err(not_found()),
+                }
             }
             Some(pin_at)
         }
@@ -641,13 +1134,34 @@ pub fn describe_authorized(
         (None, req_at) => req_at,
     };
 
-    let sparql = describe_sparql(iri, &target);
-    let multi = permitted.len() > 1;
+    // For slash IRIs on redirecting endpoints (/$/ld, /$/ld/ns/...), verify at least one
+    // readable triple exists via a 1-triple probe rather than running a full DESCRIBE.
+    if redirect_slash && !resolved_target.is_hash {
+        return match probe_any_readable(
+            st,
+            principal,
+            &plans,
+            &sparql,
+            effective_at.as_ref(),
+            &grant,
+            &charge,
+            &deadline,
+        )? {
+            ProbeResult::Readable => Ok(LookupOutcome::Redirect { iri }),
+            ProbeResult::HistoryGone => Err(history_gone()),
+            ProbeResult::Empty => Err(not_found()),
+        };
+    }
+
+    let multi = plans.len() > 1;
     let mut merged: Vec<Triple> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seen: Option<HashSet<Triple>> = multi.then(HashSet::new);
+    let mut seen_bytes: u64 = 0;
     let mut truncated = false;
     let mut prefixes: BTreeMap<String, String> = BTreeMap::new();
-    let mut resolved_history: Option<Resolved> = None;
+    let mut contributing_datasets: usize = 0;
+    let mut single_history: Option<Resolved> = None;
+    let mut saw_history_gone = false;
 
     // Seed common semantic-web prefixes plus the matched resource's own namespaces.
     for (p, ns) in [
@@ -660,52 +1174,109 @@ pub fn describe_authorized(
     ] {
         prefixes.insert(p.to_string(), ns.to_string());
     }
-    for ns in &target.resource.input.namespaces {
+    for ns in &resolved_target.resource.input.namespaces {
         prefixes.insert(ns.prefix.clone(), ns.iri.clone());
     }
 
-    let mut global_cap = DEFAULT_MAX_TRIPLES as usize;
-    for (idx, (ds, allowed_graphs)) in permitted.into_iter().enumerate() {
-        let mut opts = CallerContext::for_caller(st, &ds, principal).read_options();
-        let desc = crate::http::describe::request_options(&ds, describe_params)?
-            .lowered(Some(DEFAULT_MAX_TRIPLES), Some(DEFAULT_MAX_DEPTH));
-        if let Some(limit) = desc.max_triples {
-            global_cap = global_cap.min(limit as usize);
-        }
+    for (idx, plan) in plans.iter().enumerate() {
+        let mut opts = CallerContext::for_caller(st, &plan.ds, principal).read_options();
+        opts.grant = grant.clone();
+        opts.timeout = deadline.left().map_err(ApiError::from)?;
+        opts.max_memory_bytes = charge.engine_budget().map_err(ApiError::from)?;
+        let mut desc = plan.describe.clone();
+        desc.max_triples = Some(global_cap as u64);
         opts.describe = desc;
-        if !allowed_graphs.is_empty() {
-            opts.default_graph_uris = allowed_graphs;
+        if !plan.allowed_graphs.is_empty() {
+            opts.default_graph_uris = plan.allowed_graphs.clone();
             // Prevent materialized inferences from unrelated graphs leaking into this
             // vocabulary's linked-data view.
             opts.default_graph_extra.clear();
         }
-        let (snap, resolved) =
-            crate::http::history::snapshot_for(&ds, effective_at.as_ref(), &opts)
-                .map_err(ApiError::from)?;
-        if resolved_history.is_none() {
-            resolved_history = resolved;
-        }
-        let res = sparkles::sparql::query(snap, &sparql, &opts).map_err(ApiError::from)?;
+        let replay_cap = charge.replay_budget().map_err(ApiError::from)?;
+        let (snap, resolved) = match crate::http::history::snapshot_for_limited(
+            &plan.ds,
+            effective_at.as_ref(),
+            &opts,
+            replay_cap,
+        ) {
+            Ok(pair) => pair,
+            Err(sparkles::Error::NotFound(_)) => continue,
+            Err(sparkles::Error::HistoryGone(_)) => {
+                if matches!(
+                    probe_one_dataset(
+                        st, principal, plan, &sparql, None, &grant, &charge, &deadline
+                    )?,
+                    ProbeResult::Readable
+                ) {
+                    saw_history_gone = true;
+                }
+                continue;
+            }
+            Err(e) => return Err(ApiError::from(e)),
+        };
+        let res = sparkles::sparql::query(snap.clone(), &sparql, &opts).map_err(ApiError::from)?;
         if res.describe_truncated {
             truncated = true;
         }
-        for (p, ns) in ds.dataset.prefixes() {
-            prefixes.entry(p).or_insert(ns);
+        // Detect hash-document term-limit truncation when the query returned enough
+        // triples that more than HASH_NS_TERM_LIMIT terms may exist.
+        if resolved_target.is_hash_document
+            && !truncated
+            && res.triples().len() >= HASH_NS_TERM_LIMIT
+        {
+            let mut check_opts = opts.clone();
+            check_opts.timeout = deadline.left().map_err(ApiError::from)?;
+            check_opts.max_memory_bytes = charge.engine_budget().map_err(ApiError::from)?;
+            let overflow_q = hash_doc_overflow_sparql(&iri, &resolved_target);
+            let overflow =
+                sparkles::sparql::query(snap, &overflow_q, &check_opts).map_err(ApiError::from)?;
+            if !overflow.is_empty() {
+                truncated = true;
+            }
         }
         let bnode_prefix = format!("d{idx}");
+        let mut contributed = false;
         for t in res.triples() {
             let triple = if multi {
                 scope_bnode(t.clone(), &bnode_prefix)
             } else {
                 t.clone()
             };
-            let key = triple.to_string();
-            if seen.insert(key) {
+            let is_new = match &mut seen {
+                Some(set) => {
+                    if set.contains(&triple) {
+                        false
+                    } else {
+                        let bytes = triple_bytes(&triple);
+                        charge.charge(bytes).map_err(ApiError::from)?;
+                        seen_bytes = seen_bytes.saturating_add(bytes);
+                        set.insert(triple.clone());
+                        true
+                    }
+                }
+                None => true,
+            };
+            if is_new {
                 if merged.len() >= global_cap {
                     truncated = true;
                     break;
                 }
+                charge
+                    .charge(triple_bytes(&triple))
+                    .map_err(ApiError::from)?;
                 merged.push(triple);
+                contributed = true;
+            }
+        }
+        if contributed {
+            contributing_datasets += 1;
+            if contributing_datasets == 1 {
+                single_history = resolved;
+            } else {
+                single_history = None;
+            }
+            for (p, ns) in plan.ds.dataset.prefixes() {
+                prefixes.entry(p).or_insert(ns);
             }
         }
         if merged.len() >= global_cap && truncated {
@@ -713,29 +1284,44 @@ pub fn describe_authorized(
         }
     }
 
+    drop(seen);
+    charge.release(seen_bytes);
+
     if merged.is_empty() {
+        if saw_history_gone {
+            return Err(history_gone());
+        }
         return Err(not_found());
     }
 
-    let licence = target
+    let licence = resolved_target
         .resource
-        .licence_of(target.version)
+        .licence_of(resolved_target.version)
         .expression
         .map(str::to_string);
+    let own_namespaces = resolved_target
+        .resource
+        .input
+        .namespaces
+        .iter()
+        .map(|n| n.iri.clone())
+        .collect();
 
-    Ok(Description {
-        iri: iri.to_string(),
+    Ok(LookupOutcome::Document(Box::new(Description {
+        iri,
         triples: merged,
         truncated,
         prefixes,
-        resolved_history,
-        resource_title: target.resource.input.title.clone(),
-        version_name: target.version.map(|v| v.input.version.clone()),
-        namespace_prefix: target.namespace.map(|n| n.prefix.clone()),
+        resolved_history: single_history,
+        resource_title: resolved_target.resource.input.title.clone(),
+        version_name: resolved_target.version.map(|v| v.input.version.clone()),
+        namespace_prefix: resolved_target.namespace.map(|n| n.prefix.clone()),
         license: licence,
-        is_hash: target.is_hash,
+        is_exact_version_iri: resolved_target.is_exact_version_iri,
+        own_namespaces,
         readable_namespaces: readable_namespaces(st, principal, catalog),
-    })
+        _memory_charge: charge,
+    })))
 }
 
 /// Serialize `desc` into the requested RDF syntax, respecting `max_bytes`.

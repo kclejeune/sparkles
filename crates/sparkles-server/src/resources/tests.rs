@@ -360,11 +360,33 @@ fn a_file_of_an_unknown_format_is_refused_and_kept() {
             .as_deref(),
         Some("http://ex/s/1.0")
     );
-    // format 1 carrying format 2 fields is rejected
+    // format 1 carrying format 2 fields (populated or explicit null) is rejected
     let mut downgraded = v.clone();
     downgraded["format"] = json!(1);
     std::fs::write(&f, serde_json::to_vec(&downgraded).unwrap()).unwrap();
     assert!(matches!(r.read(), Err(Error::Unreadable(m)) if m.contains("format 2")));
+    for field in ["versionIri", "snapshot"] {
+        let mut with_null = json!({
+            "format": 1,
+            "resources": [{
+                "id": "s",
+                "kind": "source",
+                "title": "S",
+                "versions": [{
+                    "version": "1.0",
+                    "added": {"by": "a", "at": "2026-01-01T00:00:00Z"}
+                }],
+                "created": {"by": "a", "at": "2026-01-01T00:00:00Z"},
+                "modified": {"by": "a", "at": "2026-01-01T00:00:00Z"}
+            }]
+        });
+        with_null["resources"][0]["versions"][0][field] = J::Null;
+        std::fs::write(&f, serde_json::to_vec(&with_null).unwrap()).unwrap();
+        assert!(
+            matches!(r.read(), Err(Error::Unreadable(m)) if m.contains("format 2")),
+            "format 1 must reject explicit null {field}"
+        );
+    }
     // a newer unknown format is refused and left untouched
     let newer = br#"{"format": 3, "resources": []}"#;
     std::fs::write(&f, newer).unwrap();

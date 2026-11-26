@@ -2,7 +2,9 @@
 //!
 //! Generates Apache `.htaccess` rules (for `w3id.org` pull requests or self-hosted
 //! reverse proxies) and PURL redirection recipes that forward canonical vocabulary IRIs
-//! and version IRIs to Sparkles's `/$/ld` linked-data front end with content negotiation.
+//! and version IRIs to Sparkles's `/$/ld` linked-data front end. Representation
+//! negotiation (`Accept`, `q`-values, `Vary: Accept`) is delegated to Sparkles rather
+//! than approximated with `RewriteCond` regexes.
 
 use crate::resources::{Kind, Resource};
 use serde::Serialize;
@@ -63,21 +65,27 @@ pub struct RecipeExport {
     pub resource: String,
     pub kind: &'static str,
     pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount: Option<String>,
     pub namespaces: Vec<NamespaceRecipe>,
     pub versions: Vec<VersionRecipe>,
     pub content: String,
 }
 
-/// Validate a public server base URL (`http://` or `https://`, no whitespace or control
-/// characters, no query or fragment) and return it without a trailing slash.
+fn has_rewrite_meta(s: &str) -> bool {
+    s.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(c, '"' | '\'' | '\\' | '$' | '%' | '{' | '}' | '[' | ']')
+    })
+}
+
+/// Validate a public server base URL (`http://` or `https://`, no whitespace, control
+/// characters, credentials, query, fragment or Apache `mod_rewrite` metacharacters) and
+/// return its normalized form without a trailing slash.
 pub fn validate_base_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.len() > 1024
-        || trimmed
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '\\'))
-    {
+    if trimmed.is_empty() || trimmed.len() > 1024 || has_rewrite_meta(trimmed) {
         return Err(format!("base: {raw:?} is not a valid http(s) URL"));
     }
     let u = url::Url::parse(trimmed)
@@ -93,7 +101,26 @@ pub fn validate_base_url(raw: &str) -> Result<String, String> {
             "base: {raw:?} must be an absolute http(s) URL without credentials, query or fragment"
         ));
     }
-    Ok(trimmed.trim_end_matches('/').to_string())
+    let normalized = u.as_str().trim_end_matches('/').to_string();
+    if has_rewrite_meta(&normalized) {
+        return Err(format!("base: {raw:?} is not a valid http(s) URL"));
+    }
+    Ok(normalized)
+}
+
+/// Validate an explicit `.htaccess` directory mount (relative path without leading or
+/// trailing slashes; empty string means site root `/`).
+pub fn validate_mount(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.len() > 512
+        || has_rewrite_meta(trimmed)
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.split('/').any(|seg| seg == "..")
+    {
+        return Err(format!("mount: {raw:?} is not a valid directory path"));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn escape_regex(s: &str) -> String {
@@ -103,6 +130,20 @@ fn escape_regex(s: &str) -> String {
             c,
             '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
         ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Escape literal characters in an Apache `mod_rewrite` `RewriteRule` substitution
+/// string so `%N` (such as `%3A`, `%2F`), `$N` and `\` are emitted literally rather than
+/// expanded as backreferences.
+pub fn escape_rewrite_subst(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '$') {
             out.push('\\');
         }
         out.push(c);
@@ -121,8 +162,55 @@ fn percent_encode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-/// Generate PURL / w3id redirection recipes for vocabulary resource `r`.
-pub fn generate(r: &Resource, kind: RecipeKind, base_url: &str) -> Result<RecipeExport, String> {
+/// Derive the shared top-level w3id directory mount (e.g. `myorg` for
+/// `https://w3id.org/myorg/mv/` and `https://w3id.org/myorg/mvh#`) when all namespace
+/// and version IRIs share the same first path segment.
+fn derive_w3id_mount(namespaces: &[NamespaceRecipe], versions: &[VersionRecipe]) -> Option<String> {
+    let mut shared: Option<String> = None;
+    for iri in namespaces
+        .iter()
+        .map(|n| n.iri.as_str())
+        .chain(versions.iter().map(|v| v.version_iri.as_str()))
+    {
+        let path = relative_path(iri);
+        let first = path
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .filter(|s| !s.is_empty())?;
+        match &shared {
+            None => shared = Some(first.to_string()),
+            Some(prev) if prev == first => {}
+            Some(_) => return None,
+        }
+    }
+    shared
+}
+
+/// Strip `mount` directory prefix from a URL's root-relative path so `.htaccess`
+/// `RewriteRule` patterns match Apache's per-directory relative path.
+fn strip_mount(path: &str, mount: Option<&str>) -> String {
+    let p = path.trim_start_matches('/');
+    let Some(m) = mount.filter(|s| !s.is_empty()) else {
+        return p.to_string();
+    };
+    if p == m {
+        String::new()
+    } else if let Some(rest) = p.strip_prefix(m).and_then(|r| r.strip_prefix('/')) {
+        rest.to_string()
+    } else {
+        p.to_string()
+    }
+}
+
+/// Generate PURL / w3id redirection recipes for vocabulary resource `r`, using `mount`
+/// when provided or deriving the default mount for `kind`.
+pub fn generate(
+    r: &Resource,
+    kind: RecipeKind,
+    base_url: &str,
+    explicit_mount: Option<&str>,
+) -> Result<RecipeExport, String> {
     if r.input.kind != Kind::Vocabulary {
         return Err(format!(
             "{} is a {}; only a vocabulary has hosted namespaces for recipes",
@@ -160,9 +248,27 @@ pub fn generate(r: &Resource, kind: RecipeKind, base_url: &str) -> Result<Recipe
         }
     }
 
+    let mount = match kind {
+        RecipeKind::Purl => None,
+        RecipeKind::W3id => match explicit_mount {
+            Some(m) => {
+                let v = validate_mount(m)?;
+                (!v.is_empty()).then_some(v)
+            }
+            None => derive_w3id_mount(&namespaces, &versions),
+        },
+        RecipeKind::Htaccess => match explicit_mount {
+            Some(m) => {
+                let v = validate_mount(m)?;
+                (!v.is_empty()).then_some(v)
+            }
+            None => None,
+        },
+    };
+
     let content = match kind {
         RecipeKind::W3id | RecipeKind::Htaccess => {
-            render_htaccess(r, kind, &base, &namespaces, &versions)
+            render_htaccess(r, kind, &base, mount.as_deref(), &namespaces, &versions)
         }
         RecipeKind::Purl => render_purl(r, &base, &namespaces, &versions),
     };
@@ -171,16 +277,34 @@ pub fn generate(r: &Resource, kind: RecipeKind, base_url: &str) -> Result<Recipe
         resource: r.id.clone(),
         kind: kind.as_str(),
         base_url: base,
+        mount,
         namespaces,
         versions,
         content,
     })
 }
 
+fn exact_pattern(pat: &str) -> String {
+    if pat.is_empty() {
+        "^$".to_string()
+    } else {
+        format!("^{pat}/?$")
+    }
+}
+
+fn subterm_pattern(pat: &str) -> String {
+    if pat.is_empty() {
+        "^(.+)$".to_string()
+    } else {
+        format!("^{pat}/(.+)$")
+    }
+}
+
 fn render_htaccess(
     r: &Resource,
     kind: RecipeKind,
     base: &str,
+    mount: Option<&str>,
     namespaces: &[NamespaceRecipe],
     versions: &[VersionRecipe],
 ) -> String {
@@ -193,17 +317,50 @@ fn render_htaccess(
     let _ = writeln!(out, "# {header_kind} recipe for vocabulary '{}'", r.id);
     let _ = writeln!(out, "# Generated by Sparkles linked-data front end");
     let _ = writeln!(out, "# Target server: {base}");
+    match (kind, mount) {
+        (RecipeKind::W3id, Some(m)) => {
+            let _ = writeln!(
+                out,
+                "# Mount directory: /{m}/ (place this file at ids/{m}/.htaccess)"
+            );
+        }
+        (RecipeKind::W3id, None) => {
+            let _ = writeln!(
+                out,
+                "# Mount directory: / (site root; pass ?mount=<dir> for a per-identifier directory)"
+            );
+        }
+        (RecipeKind::Htaccess, Some(m)) => {
+            let _ = writeln!(
+                out,
+                "# Mount directory: /{m}/ (place this file at {m}/.htaccess)"
+            );
+        }
+        (RecipeKind::Htaccess, None) => {
+            let _ = writeln!(
+                out,
+                "# Mount directory: / (document root .htaccess; pass ?mount=<dir> for a subdirectory)"
+            );
+        }
+        (RecipeKind::Purl, _) => unreachable!(),
+    }
+    let _ = writeln!(
+        out,
+        "# Content negotiation (Accept, q-values, Vary: Accept) is handled by Sparkles"
+    );
     let _ = writeln!(out, "Options +FollowSymLinks");
     let _ = writeln!(out, "RewriteEngine on");
     let _ = writeln!(out);
+
+    let subst_base = escape_rewrite_subst(base);
 
     // Version IRI rules come before general namespace rules so specific version IRIs match first.
     if !versions.is_empty() {
         let _ = writeln!(out, "# Versioned IRI rules");
         for v in versions {
-            let path = relative_path(&v.version_iri);
+            let path = strip_mount(&relative_path(&v.version_iri), mount);
             let pat = escape_regex(path.trim_end_matches('/'));
-            let enc_vi = percent_encode(&v.version_iri);
+            let subst_vi = escape_rewrite_subst(&percent_encode(&v.version_iri));
             let _ = writeln!(
                 out,
                 "# Version {} ({}){}",
@@ -214,27 +371,16 @@ fn render_htaccess(
                     .map(|s| format!(" -> {s}"))
                     .unwrap_or_default()
             );
-            for (accept, fmt) in [
-                ("text/html", "html"),
-                ("text/turtle", "turtle"),
-                ("application/ld\\+json", "jsonld"),
-                ("application/rdf\\+xml", "rdfxml"),
-                ("application/n-triples", "ntriples"),
-            ] {
-                let _ = writeln!(out, "RewriteCond %{{HTTP_ACCEPT}} {accept} [NC]");
-                let _ = writeln!(
-                    out,
-                    "RewriteRule ^{pat}/?$ {base}/$/ld/doc?iri={enc_vi}&format={fmt} [R=303,L]"
-                );
-            }
+            let exact_rule = exact_pattern(&pat);
             let _ = writeln!(
                 out,
-                "RewriteRule ^{pat}/?$ {base}/$/ld/doc?iri={enc_vi}&format=turtle [R=303,L]"
+                "RewriteRule {exact_rule} {subst_base}/$/ld/doc?iri={subst_vi} [R=303,L,NE]"
             );
             if v.version_iri.ends_with('/') {
+                let term_rule = subterm_pattern(&pat);
                 let _ = writeln!(
                     out,
-                    "RewriteRule ^{pat}/(.+)$ {base}/$/ld?iri={enc_vi}$1 [R=303,L,NE]"
+                    "RewriteRule {term_rule} {subst_base}/$/ld/doc?iri={subst_vi}$1 [B,R=303,L,NE]"
                 );
             }
             let _ = writeln!(out);
@@ -242,64 +388,30 @@ fn render_htaccess(
     }
 
     for ns in namespaces {
-        let path = relative_path(&ns.iri);
+        let path = strip_mount(&relative_path(&ns.iri), mount);
         let pat = escape_regex(path.trim_end_matches('/'));
-        let enc_prefix = percent_encode(&ns.prefix);
-        let enc_ns = percent_encode(&ns.iri);
+        let subst_prefix = escape_rewrite_subst(&percent_encode(&ns.prefix));
+        let subst_ns = escape_rewrite_subst(&percent_encode(&ns.iri));
         let _ = writeln!(
             out,
             "# Namespace '{}' ({}, {} IRI)",
             ns.prefix, ns.iri, ns.style
         );
+        let root_rule = exact_pattern(&pat);
         if ns.style == "hash" {
-            for (accept, fmt) in [
-                ("text/html", "html"),
-                ("text/turtle", "turtle"),
-                ("application/ld\\+json", "jsonld"),
-                ("application/rdf\\+xml", "rdfxml"),
-                ("application/n-triples", "ntriples"),
-            ] {
-                let _ = writeln!(out, "RewriteCond %{{HTTP_ACCEPT}} {accept} [NC]");
-                let _ = writeln!(
-                    out,
-                    "RewriteRule ^{pat}/?$ {base}/$/ld/doc?iri={enc_ns}&format={fmt} [R=303,L]"
-                );
-            }
             let _ = writeln!(
                 out,
-                "RewriteRule ^{pat}/?$ {base}/$/ld/ns/{enc_prefix} [R=303,L]"
+                "RewriteRule {root_rule} {subst_base}/$/ld/ns/{subst_prefix} [R=303,L,NE]"
             );
         } else {
-            let root_rule = if pat.is_empty() {
-                "^$".to_string()
-            } else {
-                format!("^{pat}/?$")
-            };
-            let term_rule = if pat.is_empty() {
-                "^(.+)$".to_string()
-            } else {
-                format!("^{pat}/(.+)$")
-            };
-            for (accept, fmt) in [
-                ("text/html", "html"),
-                ("text/turtle", "turtle"),
-                ("application/ld\\+json", "jsonld"),
-                ("application/rdf\\+xml", "rdfxml"),
-                ("application/n-triples", "ntriples"),
-            ] {
-                let _ = writeln!(out, "RewriteCond %{{HTTP_ACCEPT}} {accept} [NC]");
-                let _ = writeln!(
-                    out,
-                    "RewriteRule {term_rule} {base}/$/ld/doc?iri={enc_ns}$1&format={fmt} [R=303,L,NE]"
-                );
-            }
+            let term_rule = subterm_pattern(&pat);
             let _ = writeln!(
                 out,
-                "RewriteRule {term_rule} {base}/$/ld/ns/{enc_prefix}/$1 [R=303,L,NE]"
+                "RewriteRule {term_rule} {subst_base}/$/ld/doc?iri={subst_ns}$1 [B,R=303,L,NE]"
             );
             let _ = writeln!(
                 out,
-                "RewriteRule {root_rule} {base}/$/ld/ns/{enc_prefix} [R=303,L]"
+                "RewriteRule {root_rule} {subst_base}/$/ld/doc?iri={subst_ns} [R=303,L,NE]"
             );
         }
         let _ = writeln!(out);
@@ -342,7 +454,7 @@ fn render_purl(
         } else {
             let _ = writeln!(
                 out,
-                "303 partial {} -> {}/ # slash namespace '{}'",
+                "partial {} -> {}/ # slash namespace '{}' (PURL partial sends 302; Sparkles applies 303 See Other to /$/ld/doc)",
                 ns.iri, ns.target_url, ns.prefix
             );
         }
