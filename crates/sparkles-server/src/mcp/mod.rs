@@ -775,5 +775,7 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
             None,
         );
     }
-    rt.block_on(adapter::serve_stdio(server))
+    let res = rt.block_on(adapter::serve_stdio(server));
+    rt.shutdown_timeout(Duration::from_millis(200));
+    res
 }

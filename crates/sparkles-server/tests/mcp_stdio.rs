@@ -456,3 +456,107 @@ fn stdio_rapid_sequential_id_reuse() {
     let status = child.wait().unwrap();
     assert!(status.success(), "{status}");
 }
+
+/// Regression: `sparkles mcp` must exit cleanly after stdin EOF even when its stdout pipe
+/// is completely full and stalled (never drained by the reader until after exit).
+#[cfg(unix)]
+#[test]
+fn stdio_cli_exits_after_eof_with_stalled_stdout() {
+    use std::os::fd::AsRawFd;
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("fixture.ttl");
+    std::fs::write(&data, FIXTURE).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+        .args(["mcp", "--data"])
+        .arg(&data)
+        .args(["--name", "t"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Confirm the CLI process is up and serving before stalling stdout.
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "stalled-eof", "version": "1"}
+        }
+    });
+    writeln!(stdin, "{init}").unwrap();
+    stdin.flush().unwrap();
+    let mut first = String::new();
+    stdout.read_line(&mut first).unwrap();
+    let v: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(v["id"], 1);
+    assert!(v.get("result").is_some(), "{v}");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    // Stop reading stdout while keeping the read end open so the pipe fills and stalls.
+    let stdout_pipe = stdout.into_inner();
+    #[cfg(target_os = "linux")]
+    {
+        let _ = unsafe { libc::fcntl(stdout_pipe.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+    }
+
+    // Enqueue enough `tools/list` responses (~200 KiB) to exceed Linux and macOS pipe buffers.
+    for id in 2..=41u64 {
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"})
+        )
+        .unwrap();
+    }
+    stdin.flush().unwrap();
+
+    // Wait until stdout carries buffered response bytes so the server is actively stalled.
+    let fill_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut readable: libc::c_int = 0;
+        let rc = unsafe { libc::ioctl(stdout_pipe.as_raw_fd(), libc::FIONREAD, &mut readable) };
+        if rc == 0 && readable >= 4096 {
+            break;
+        }
+        assert!(
+            Instant::now() < fill_deadline,
+            "stdout pipe did not fill before EOF test (readable={readable})"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Close stdin while keeping `stdout_pipe` open and unread; `sparkles mcp` must hit its
+    // bounded EOF drain timeout and exit cleanly without hanging on runtime shutdown.
+    drop(stdin);
+    let exit_deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("sparkles mcp failed to exit after stdin EOF while stdout stayed stalled");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(status.success(), "{status}");
+
+    // Release the stalled stdout read end only after verifying process exit.
+    drop(stdout_pipe);
+}
