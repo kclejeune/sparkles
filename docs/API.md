@@ -14278,6 +14278,8 @@ a term the caller cannot read.
 | `query` | A query to check, run and summarize without a draft, for a query that the caller edited. |
 | `thread` | The `threadId` of an earlier ask, for a follow-up in the same thread: 1 to 64 letters, digits, `_` or `-`. Without it the ask starts a thread under its own id. |
 | `about` | The resource the question is about, `{iri, kind?, label?}`, such as the class on the page it was asked from. The pipeline reads the question with ` (about <iri>)` after it, and the [history](#ask-history) keeps the question as written with `about` beside it. `iri` is an absolute IRI, `kind` holds at most 32 characters and `label` at most 200. |
+| `reviewPolicy` | A review policy of the dataset's evidence settings. In local answers, the summary reads and may cite claim occurrences about linked entities under that policy. In global answers, only community reports built under that policy are selected. Requires activated configuration history and read grants on the policy's graphs. |
+| `matchingPolicy` | A matching policy of the dataset's evidence settings. In local answers, it resolves linked entities for claims grounding. In global answers, it resolves the entity identities referenced by the selected community reports' findings and returns the map revision and mapped entities in `resolution` and per-report `identities`. |
 
 The answer is a stream of server-sent events. Each event's data is one JSON object.
 
@@ -14294,7 +14296,7 @@ The answer is a stream of server-sent events. Each event's data is one JSON obje
 | `summary` | `{text, citations, rowsSent, provider, model}`. Each `[n]` marker of `text` names a row of `results`, counted from 1. In a global answer each marker names a point, and `uncitedSentences` lists the sentences without one. |
 | `scope` | `{scope: "global", provider, model}` when the draft classified the question as global. |
 | `reports` | `{level, ranking, reports: [{iri, title, level, status, rating}]}`, the community reports a global answer reads. |
-| `global` | `{points: [{n, text, score, reports, findings}], reports: [{iri, title, level, status, rating, findings: [{iri, text, cites}]}], global: {level, ranking, reportsGraph, selected, batches}}`, sent before the summary of a global answer. |
+| `global` | `{points: [{n, text, score, reports, findings}], reports: [{iri, title, level, status, rating, findings: [{iri, text, cites}]}], global: {level, ranking, reportsGraph, selected, batches}}`, sent before the summary of a global answer. With `reviewPolicy`, `global` also includes `reviewPolicy` and each report carries its `reviewPolicy` and finding `claims` and `decisions`. With `matchingPolicy`, the event also carries `resolution` and each report carries `identities` and finding `about`. |
 | `error` | `{code, message}`, such as `no-model`, `provider-unavailable`, `budget-exceeded` or `timeout`. A draft that says the data cannot answer ends with `unanswerable`, and a draft that still fails after its repairs ends with `no-valid-query` or the error of its last run. These two carry the last draft in `result`. |
 | `usage` | The last event. It holds the `outcome` of the ask, `askId`, `threadId`, the tokens, the estimated cost, the `complexity`, every model step with its pair, outcome and `signal`, the `escalations`, the `answeredBy` pair and `tryHarder`, which is `true` when the draft role has a later pair. |
 
@@ -14331,7 +14333,7 @@ answers plus one per batch. When the reports are off, missing, not readable by t
 caller, or more than half stale, or when the ask reads another branch or an earlier
 state, the ask answers with a query and says why in `notes`. A caller whose access the
 guard does not prove always gets the note that the summaries are unavailable to it.
-The history keeps the reports a global answer used, and `GET /$/asks/{ds}` lists them
+When `reviewPolicy` is supplied, global answers select only community reports whose stored `gr:reviewPolicy` matches that policy, excluding reports built under other policies or without a policy, while enforcing the reports graph's disclosure footprint and the policy's read grants. When `matchingPolicy` is supplied, the server resolves entity identities referenced by the selected reports' findings through that matching policy's resolution map, supplies the mapped cluster links to the map step as data without rewriting source IRIs, and returns `resolution` and per-report `identities`. Unknown, wrong-kind or unauthorized policies are refused with `400` before reading reports or calling a model, inactive configuration history answers `409`, and a change to caller authority, selected reports or the resolution map before publication withholds the answer with `403`. The history keeps the reports a global answer used, and `GET /$/asks/{ds}` lists them
 only while the caller may read their graph.
 
 A local question's grounding also holds the titles and summaries of the communities of

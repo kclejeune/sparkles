@@ -1851,7 +1851,7 @@
             "type": "boolean"
           },
           "matchingPolicy": {
-            "description": "A matching policy of the dataset's evidence settings, which resolves the linked entities for the claims the summary reads. Not with `mode` `global`.",
+            "description": "A matching policy of the dataset's evidence settings. In local answers, it resolves the linked entities for the claims the summary reads. In global answers, it resolves the entity identities referenced by the selected community reports.",
             "type": "string"
           },
           "maxRows": {
@@ -1879,7 +1879,7 @@
             "type": "boolean"
           },
           "reviewPolicy": {
-            "description": "A review policy of the dataset's evidence settings. The summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. Not with `mode` `global`.",
+            "description": "A review policy of the dataset's evidence settings. In local answers, the summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. In global answers, only community reports built under that policy are selected.",
             "type": "string"
           },
           "reviewedOnly": {
@@ -1932,7 +1932,7 @@
           },
           "claims": {
             "additionalProperties": true,
-            "description": "With `reviewPolicy`, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`.",
+            "description": "With `reviewPolicy` in a local answer, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`.",
             "type": "object"
           },
           "clarify": {
@@ -1960,7 +1960,7 @@
           },
           "global": {
             "additionalProperties": true,
-            "description": "In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports and the map `batches`.",
+            "description": "In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports, the map `batches` and, with `reviewPolicy`, the requested `reviewPolicy`.",
             "type": "object"
           },
           "mode": {
@@ -2034,14 +2034,14 @@
             "description": "In a global answer, the reports it used.",
             "items": {
               "additionalProperties": true,
-              "description": "A report with `iri`, `title`, `level`, `status`, `rating` and the `findings` the answer uses, each with its `cites`.",
+              "description": "A report with `iri`, `title`, `level`, `status`, `rating` and the `findings` the answer uses, each with its `cites` (and `claims`, `decisions`, `about` and report `reviewPolicy` or `identities` when present).",
               "type": "object"
             },
             "type": "array"
           },
           "resolution": {
             "additionalProperties": true,
-            "description": "With `matchingPolicy`, the map revision read, in the `resolution` form of `recall`.",
+            "description": "With `matchingPolicy`, the map revision read (`policy`, `version`, `revision` and `number`), plus `entities` for mapped identities referenced by the returned reports in a global answer.",
             "type": "object"
           },
           "result": {

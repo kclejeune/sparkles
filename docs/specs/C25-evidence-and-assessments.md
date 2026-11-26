@@ -2230,12 +2230,28 @@ them, so existing responses are unchanged. Every path reads the report through t
 guard of C22 §6, so the lists reach only readers for whom the reports graph is proven.
 `sparkles graphrag reports` lists titles and statuses and does not change.
 
-A global answer still refuses `reviewPolicy`, because recall's argument names the policy
-whose claims an answer reads, not the policy its reports were built under. Roadmap item
-811 lets a global answer name a policy and use only reports read under it, and adds
-identity resolution through a matching policy to reports. Roadmap item 810 adds a search
-for the reports whose activity used a changed record, as `claims/dependents` does for
-assessments, for F22's maintained analyses.
+Roadmap item 811 extends `community_reports` and global answers in `POST /{ds}/ask` with
+`reviewPolicy` and `matchingPolicy`. Both arguments require activated configuration
+history and read on the Head `BoundEvidenceView`, refusing inactive configuration history
+with `409 configuration-history-inactive`, unavailable projections or maps with `503
+projection-unavailable`, and unknown, wrong-kind or unauthorized policies with `400
+bad-argument` before reading reports or calling a model. With `reviewPolicy`, report
+counting, level selection and retrieval admit only reports whose `gr:reviewPolicy` matches
+the requested policy's IRI, excluding reports built under other policies or no policy,
+while the C22 disclosure guard continues to enforce the reports graph's build footprint.
+With `matchingPolicy`, `community_reports` resolves the distinct entity IRIs referenced by
+the returned findings' `gr:about` and `gr:cites` triple terms through
+`sparkles::evidence::resolve_entities_at` in bounded chunks under the caller's access
+view, refusing selections that reference more than 10,000 distinct entities as
+`422 incomplete-evidence`. Each finding keeps its source IRIs in `about`, each report
+records mapped `identities`, and the response carries `resolution` with the policy name,
+version, map revision IRI, map revision number and mapped `entities`. Global Ask passes
+both arguments to `community_reports`, includes mapped identity links in the map prompt
+within the data block without rewriting source IRIs, fences map and reduce calls with
+`AuthorityFence`, and re-verifies the caller's authority and report selection before
+publishing the answer, withholding it as `403 forbidden` if either changed in flight.
+Roadmap item 810 adds a search for the reports whose activity used a changed record, as
+`claims/dependents` does for assessments, for F22's maintained analyses.
 
 #### Acceptance
 

@@ -5506,9 +5506,7 @@ opposite. `sparkles ask --mode global` and `"mode": "global"` in `POST /{ds}/ask
 same from the command line and the API. A caller who may not read the reports gets an
 answer from the data and a note that the summaries are unavailable.
 
-Agents read the reports with the MCP tool `community_reports`, and `recall` with
-`"communities": true` adds the report of each seed's community after its facts. A
-project brief lists the best rated reports of the coarsest level.
+Agents read the reports with the MCP tool `community_reports`, which also accepts `reviewPolicy` to restrict selection to reports built under that policy and `matchingPolicy` to resolve identities referenced by their findings. Global `POST /{ds}/ask` accepts the same two options. `recall` with `"communities": true` adds the report of each seed's community after its facts. A project brief lists the best rated reports of the coarsest level.
 
 ## Embedding the library
 

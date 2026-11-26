@@ -265,6 +265,10 @@ export type AskRequest = {
   thread?: string;
   /** The resource on the page the question is asked from. */
   about?: AskAbout;
+  /** Review policy for local claim citations or policy-filtered global reports (C25). */
+  reviewPolicy?: string;
+  /** Matching policy for local entity resolution or global report identity resolution (C25). */
+  matchingPolicy?: string;
 };
 
 /** The resource a question is about, which the server renders into the question. */
@@ -272,8 +276,23 @@ export type AskAbout = { iri: string; kind?: string; label?: string };
 
 export type AskMode = 'auto' | 'local' | 'global';
 
+/** A mapped identity referenced by a community report under a matching policy. */
+export type AskResolvedIdentity = {
+  entity: string;
+  representative: string;
+  members: string[];
+  membersComplete: boolean;
+};
+
 /** A finding of a community report, with the facts it cites as N-Triples terms. */
-export type AskFinding = { iri: string; text: string; cites: string[] };
+export type AskFinding = {
+  iri: string;
+  text: string;
+  cites: string[];
+  about?: string[];
+  claims?: string[];
+  decisions?: string[];
+};
 
 /** A report a global answer used (C22 §7.2). */
 export type AskReport = {
@@ -282,6 +301,8 @@ export type AskReport = {
   level: number;
   status: string;
   rating?: number | null;
+  reviewPolicy?: { iri: string; version?: number | null; configuration?: string | null };
+  identities?: AskResolvedIdentity[];
   findings: AskFinding[];
 };
 
@@ -304,6 +325,14 @@ export type AskGlobal = {
     reportsGraph?: string;
     selected?: number;
     batches?: number;
+    reviewPolicy?: { name: string; iri: string; version: number };
+  };
+  resolution?: {
+    policy: string;
+    version: number;
+    revision: string | null;
+    number: number;
+    entities: AskResolvedIdentity[];
   };
 };
 
