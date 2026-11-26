@@ -1550,6 +1550,11 @@ impl PyDataset {
     }
 
     #[getter]
+    fn evidence(slf: Py<Self>) -> crate::evidence::PyEvidence {
+        crate::evidence::PyEvidence { owner: slf }
+    }
+
+    #[getter]
     fn queries(slf: Py<Self>) -> crate::queries::PyStoredQueries {
         crate::queries::PyStoredQueries { owner: slf }
     }
