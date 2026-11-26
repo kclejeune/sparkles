@@ -678,9 +678,9 @@ fn provider_count(
     name: &str,
     p: &ProviderConfig,
     req: &ChatRequest,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<u64, CallError> {
-    if timeout.is_zero() {
+    if Instant::now() >= deadline {
         return Err(CallError::Unavailable(format!(
             "provider {name}: no time is left to count tokens"
         )));
@@ -694,7 +694,7 @@ fn provider_count(
     let hrefs: Vec<(&str, &str)> = hs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let bytes = body_bytes(&body);
     let key = t.key.as_deref();
-    let posted = sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes, timeout)
+    let posted = sparkles::outbound::post_json_until(t.outbound, &url, &hrefs, bytes, deadline)
         .map_err(|f| CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)))?;
     if !(200..300).contains(&posted.status.as_u16()) {
         return Err(CallError::Unavailable(scrub(
@@ -715,6 +715,10 @@ fn provider_count(
 fn is_cancelled(cancel: Option<&Arc<AtomicBool>>) -> bool {
     cancel.is_some_and(|c| c.load(Ordering::Relaxed))
 }
+
+/// Callback invoked when an HTTP request that was abandoned on cancellation or deadline
+/// finishes later and reports token usage.
+pub type AbandonedUsageFn = Arc<dyn Fn(Usage) + Send + Sync>;
 
 /// Sleep until `until` or `deadline`, waking periodically to observe `cancel`.
 pub(super) fn sleep_until(
@@ -740,87 +744,230 @@ pub(super) fn sleep_until(
     }
 }
 
+enum Handoff {
+    Pending,
+    Abandoned,
+    NotSent(bool),
+    Finished(
+        Result<sparkles::outbound::Posted, sparkles::outbound::Failure>,
+        Option<super::admission::Ticket>,
+        Option<super::SlotGuard>,
+    ),
+}
+
+enum PostOutcome {
+    Posted(
+        sparkles::outbound::Posted,
+        Option<super::admission::Ticket>,
+        Option<super::SlotGuard>,
+    ),
+    Failed(sparkles::outbound::Failure, Option<super::SlotGuard>),
+    Cancelled(Option<super::SlotGuard>),
+    TimedOut(Option<super::SlotGuard>),
+}
+
+#[allow(clippy::too_many_arguments)]
 fn post_json_cancellable(
     outbound: &sparkles::outbound::OutboundPolicy,
     url: &str,
     headers: &[(String, String)],
     bytes: Vec<u8>,
-    timeout: Duration,
+    deadline: Instant,
     cancel: Option<&Arc<AtomicBool>>,
-) -> Result<sparkles::outbound::Posted, Result<sparkles::outbound::Failure, ()>> {
+    ticket: Option<super::admission::Ticket>,
+    slot: Option<super::SlotGuard>,
+    kind: Kind,
+    ttl: Option<CacheTtl>,
+    on_abandoned: Option<&AbandonedUsageFn>,
+) -> PostOutcome {
     let Some(flag) = cancel else {
+        if Instant::now() >= deadline {
+            if let Some(tk) = ticket {
+                tk.not_sent();
+            }
+            return PostOutcome::TimedOut(slot);
+        }
         let hrefs: Vec<(&str, &str)> = headers
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        return sparkles::outbound::post_json(outbound, url, &hrefs, bytes, timeout).map_err(Ok);
+        return match sparkles::outbound::post_json_until(outbound, url, &hrefs, bytes, deadline) {
+            Ok(posted) => PostOutcome::Posted(posted, ticket, slot),
+            Err(f) => {
+                drop(ticket);
+                PostOutcome::Failed(f, slot)
+            }
+        };
     };
     if flag.load(Ordering::Relaxed) {
-        return Err(Err(()));
+        if let Some(tk) = ticket {
+            tk.not_sent();
+        }
+        return PostOutcome::Cancelled(slot);
+    }
+    if Instant::now() >= deadline {
+        if let Some(tk) = ticket {
+            tk.not_sent();
+        }
+        return PostOutcome::TimedOut(slot);
     }
     let outbound = outbound.clone();
     let url = url.to_string();
     let headers = headers.to_vec();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _ = std::thread::Builder::new()
+    let flag_worker = flag.clone();
+    let on_abandoned = on_abandoned.cloned();
+    let handoff = Arc::new((
+        parking_lot::Mutex::new(Handoff::Pending),
+        parking_lot::Condvar::new(),
+    ));
+    let handoff_worker = handoff.clone();
+    let payload = Arc::new(parking_lot::Mutex::new(Some((ticket, slot))));
+    let payload_worker = payload.clone();
+    let spawned = std::thread::Builder::new()
         .name("model-http".into())
         .spawn(move || {
+            let Some((ticket, slot)) = payload_worker.lock().take() else {
+                return;
+            };
+            // Re-check cancellation, abandonment, and absolute deadline after thread
+            // scheduling so a delayed worker never starts a POST past the deadline or
+            // after cancellation.
+            let cancelled = flag_worker.load(Ordering::Relaxed);
+            let abandoned = matches!(*handoff_worker.0.lock(), Handoff::Abandoned);
+            if cancelled || abandoned || Instant::now() >= deadline {
+                if let Some(tk) = ticket {
+                    tk.not_sent();
+                }
+                let mut g = handoff_worker.0.lock();
+                if matches!(*g, Handoff::Pending) {
+                    *g = Handoff::NotSent(cancelled);
+                    handoff_worker.1.notify_one();
+                }
+                drop(g);
+                drop(slot);
+                return;
+            }
             let hrefs: Vec<(&str, &str)> = headers
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            let res = sparkles::outbound::post_json(&outbound, &url, &hrefs, bytes, timeout);
-            let _ = tx.send(res);
+            let res = sparkles::outbound::post_json_until(&outbound, &url, &hrefs, bytes, deadline);
+            let mut g = handoff_worker.0.lock();
+            if matches!(*g, Handoff::Pending) {
+                *g = Handoff::Finished(res, ticket, slot);
+                handoff_worker.1.notify_one();
+                return;
+            }
+            drop(g);
+            // Caller already abandoned (cancelled or timed out): settle admission and
+            // record any provider-reported usage BEFORE releasing the provider slot.
+            if let Ok(posted) = res {
+                let body_usage = serde_json::from_slice::<Value>(&posted.body)
+                    .ok()
+                    .map(|v| read_usage(kind, &v, ttl).0)
+                    .unwrap_or_default();
+                if let Some(tk) = ticket {
+                    tk.settle(usage_of(kind, &posted.body, ttl));
+                }
+                if body_usage != Usage::default()
+                    && let Some(cb) = on_abandoned
+                {
+                    cb(body_usage);
+                }
+            } else {
+                drop(ticket);
+            }
+            drop(slot);
         });
-    loop {
-        if flag.load(Ordering::Relaxed) {
-            return Err(Err(()));
+    if let Err(e) = spawned {
+        let (ticket, slot) = payload.lock().take().unwrap_or((None, None));
+        if let Some(tk) = ticket {
+            tk.not_sent();
         }
-        match rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(Ok(posted)) => return Ok(posted),
-            Ok(Err(f)) => return Err(Ok(f)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(Ok(sparkles::outbound::Failure::Failed(
-                    "HTTP worker terminated unexpectedly".into(),
-                )));
+        return PostOutcome::Failed(
+            sparkles::outbound::Failure::Failed(format!("failed to start HTTP worker: {e}")),
+            slot,
+        );
+    }
+    let mut g = handoff.0.lock();
+    loop {
+        match std::mem::replace(&mut *g, Handoff::Pending) {
+            Handoff::Finished(Ok(posted), tk, s) => return PostOutcome::Posted(posted, tk, s),
+            Handoff::Finished(Err(f), tk, s) => {
+                drop(tk);
+                return PostOutcome::Failed(f, s);
+            }
+            Handoff::NotSent(true) => return PostOutcome::Cancelled(None),
+            Handoff::NotSent(false) => return PostOutcome::TimedOut(None),
+            Handoff::Pending => {}
+            Handoff::Abandoned => {
+                *g = Handoff::Abandoned;
+                return if flag.load(Ordering::Relaxed) {
+                    PostOutcome::Cancelled(None)
+                } else {
+                    PostOutcome::TimedOut(None)
+                };
             }
         }
+        if flag.load(Ordering::Relaxed) {
+            *g = Handoff::Abandoned;
+            return PostOutcome::Cancelled(None);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            *g = Handoff::Abandoned;
+            return PostOutcome::TimedOut(None);
+        }
+        let wake = deadline.min(now + Duration::from_millis(20));
+        handoff.1.wait_until(&mut g, wake);
     }
 }
 
-/// Send one call, retrying a `429` or `5xx` twice within its timeout (with the
+/// Send one call, retrying a `429` or `5xx` twice within its absolute `deadline` (with the
 /// provider's `Retry-After` when it is shorter than the time left). With an
 /// `admission`, every HTTP attempt, retries included, is admitted before it is sent,
 /// and each admitted attempt is settled with the usage its answer reported.
 /// On error, returns any provider-reported token usage from failed or unparseable answers.
+/// When cancelled or timed out mid-flight, the worker retains `slot` and settles any
+/// late usage via `on_abandoned` before releasing `slot`.
+#[allow(clippy::too_many_arguments)]
 pub fn send_admitted_cancellable(
     t: &Transport<'_>,
     name: &str,
     p: &ProviderConfig,
     req: &ChatRequest,
+    deadline: Instant,
     admission: Option<&dyn super::admission::Admission>,
     cancel: Option<&Arc<AtomicBool>>,
+    mut slot: Option<super::SlotGuard>,
+    on_abandoned: Option<AbandonedUsageFn>,
 ) -> Result<ChatResponse, (CallError, Usage)> {
+    let started = Instant::now();
+    // Per-step timeout may only tighten the caller's absolute deadline, never widen it.
+    let deadline = deadline.min(started + req.timeout);
+    let timed_out = || {
+        CallError::Unavailable(format!(
+            "provider {name} did not answer within {:.0} s",
+            req.timeout.as_secs_f64()
+        ))
+    };
+    if is_cancelled(cancel) {
+        return Err((CallError::Cancelled, Usage::default()));
+    }
+    if Instant::now() >= deadline {
+        return Err((timed_out(), Usage::default()));
+    }
     let (url, body) = build(p, req);
     let ttl = cache_ttl(p, req);
     let hs = headers(p, t.key.as_deref());
     let bytes = body_bytes(&body);
-    let started = Instant::now();
-    let deadline = started + req.timeout;
     let key = t.key.as_deref();
-    // counting spends the request's own time
+    // counting spends the request's own time up to the absolute deadline
     let counter = || {
         if is_cancelled(cancel) {
             return Err(CallError::Cancelled);
         }
-        provider_count(
-            t,
-            name,
-            p,
-            req,
-            req.timeout.saturating_sub(started.elapsed()),
-        )
+        provider_count(t, name, p, req, deadline)
     };
     let has_counter = count_request(p, req).is_some();
     // an admission that must see every send gets no redirects, each of which would
@@ -841,13 +988,7 @@ pub fn send_admitted_cancellable(
         if is_cancelled(cancel) {
             return Err((CallError::Cancelled, failed_usage));
         }
-        let timed_out = || {
-            CallError::Unavailable(format!(
-                "provider {name} did not answer within {:.0} s",
-                req.timeout.as_secs_f64()
-            ))
-        };
-        if req.timeout.saturating_sub(started.elapsed()).is_zero() {
+        if Instant::now() >= deadline {
             return Err((timed_out(), failed_usage));
         }
         let ticket = match admission {
@@ -879,24 +1020,39 @@ pub fn send_admitted_cancellable(
             return Err((CallError::Cancelled, failed_usage));
         }
         // admission may have spent time counting
-        let left = req.timeout.saturating_sub(started.elapsed());
-        if left.is_zero() {
+        if Instant::now() >= deadline {
             if let Some(tk) = ticket {
                 tk.not_sent();
             }
             return Err((timed_out(), failed_usage));
         }
-        // a ticket dropped on any path below leaves its usage unknown
-        let posted = match post_json_cancellable(outbound, &url, &hs, bytes.clone(), left, cancel) {
-            Ok(posted) => posted,
-            Err(Err(())) => {
-                drop(ticket);
+        let (posted, ticket) = match post_json_cancellable(
+            outbound,
+            &url,
+            &hs,
+            bytes.clone(),
+            deadline,
+            cancel,
+            ticket,
+            slot.take(),
+            p.kind,
+            ttl,
+            on_abandoned.as_ref(),
+        ) {
+            PostOutcome::Posted(posted, tk, s) => {
+                slot = s;
+                (posted, tk)
+            }
+            PostOutcome::Cancelled(s) => {
+                drop(s);
                 return Err((CallError::Cancelled, failed_usage));
             }
-            Err(Ok(sparkles::outbound::Failure::Refused(m))) => {
-                // a refusal can come from a redirect after the request was sent, so
-                // the reservation stays counted
-                drop(ticket);
+            PostOutcome::TimedOut(s) => {
+                drop(s);
+                return Err((timed_out(), failed_usage));
+            }
+            PostOutcome::Failed(sparkles::outbound::Failure::Refused(m), s) => {
+                drop(s);
                 return Err((
                     CallError::Refused(scrub(
                         format!("provider {name}: the outbound policy refuses {m}"),
@@ -905,7 +1061,8 @@ pub fn send_admitted_cancellable(
                     failed_usage,
                 ));
             }
-            Err(Ok(f)) => {
+            PostOutcome::Failed(f, s) => {
+                drop(s);
                 return Err((
                     CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)),
                     failed_usage,
@@ -919,6 +1076,10 @@ pub fn send_admitted_cancellable(
             .unwrap_or_default();
         if let Some(tk) = ticket {
             tk.settle(usage_of(p.kind, &posted.body, ttl));
+        }
+        if is_cancelled(cancel) {
+            failed_usage = failed_usage.plus(body_usage);
+            return Err((CallError::Cancelled, failed_usage));
         }
         let status = posted.status.as_u16();
         if (200..300).contains(&status) {
@@ -959,7 +1120,7 @@ pub fn send_admitted_cancellable(
                     .as_deref()
                     .and_then(|v| v.trim().parse::<u64>().ok())
                     .map_or(Duration::from_millis(250 << attempt), Duration::from_secs);
-                if wait >= req.timeout.saturating_sub(started.elapsed()) {
+                if wait >= deadline.saturating_duration_since(Instant::now()) {
                     return Err((CallError::Unavailable(m), failed_usage));
                 }
                 tracing::info!(target: "sparkles::models", "retrying in {wait:?}: {m}");

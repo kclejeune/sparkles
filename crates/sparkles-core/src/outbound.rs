@@ -624,6 +624,19 @@ impl OutboundPolicy {
             .map_err(SendFailure::into_failure)
     }
 
+    /// Like [`send`](Self::send), bounded by an absolute `deadline` rather than a
+    /// relative duration.
+    pub(crate) fn send_until(
+        &self,
+        budget: &Arc<RequestBudget>,
+        url: &str,
+        deadline: Instant,
+        build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<Response, Failure> {
+        self.send_classified_until(budget, url, deadline, build)
+            .map_err(SendFailure::into_failure)
+    }
+
     /// [`send`](Self::send) preserving whether a failure was an outbound timeout or
     /// over-limit `Content-Length` rather than a general fetch error.
     pub(crate) fn send_classified(
@@ -633,14 +646,35 @@ impl OutboundPolicy {
         timeout: Duration,
         build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
     ) -> Result<Response, SendFailure> {
+        let own = timeout.min(self.timeout);
+        self.send_classified_until(budget, url, Instant::now() + own, build)
+    }
+
+    /// [`send_classified`](Self::send_classified) bounded by an absolute `deadline` that
+    /// is checked before URL validation, immediately before sending, and during response
+    /// reads so setup or scheduling delays never extend it.
+    pub(crate) fn send_classified_until(
+        &self,
+        budget: &Arc<RequestBudget>,
+        url: &str,
+        deadline: Instant,
+        build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<Response, SendFailure> {
         #[cfg(any(test, feature = "failpoints"))]
         if probe::intercept(url) {
             return Err(SendFailure::Failed(
                 "owned test refused outbound send".into(),
             ));
         }
+        let own = deadline
+            .saturating_duration_since(Instant::now())
+            .min(self.timeout);
+        if own.is_zero() {
+            return Err(SendFailure::Limit(LimitError::Timeout(timed_out(
+                Duration::ZERO,
+            ))));
+        }
         let u = self.check_url(url)?;
-        let own = timeout.min(self.timeout);
         let left = budget.remaining_time();
         if left.is_zero() {
             return Err(SendFailure::Limit(LimitError::Timeout(out_of_time(
@@ -667,7 +701,14 @@ impl OutboundPolicy {
                 ))
             })?;
         let start = Instant::now();
-        let resp = apply(build(&client, u)).timeout(timeout).send();
+        let remaining_now = deadline
+            .saturating_duration_since(start)
+            .min(self.timeout)
+            .min(budget.remaining_time());
+        if remaining_now.is_zero() {
+            return Err(SendFailure::Limit(LimitError::Timeout(late)));
+        }
+        let resp = apply(build(&client, u)).timeout(remaining_now).send();
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
@@ -676,7 +717,8 @@ impl OutboundPolicy {
                 if let Some(f) = failed.lock().take() {
                     return Err(f.into());
                 }
-                if e.is_timeout() || start.elapsed() >= timeout {
+                if e.is_timeout() || start.elapsed() >= remaining_now || Instant::now() >= deadline
+                {
                     return Err(SendFailure::Limit(LimitError::Timeout(late)));
                 }
                 // redirect errors are the policy's own words (hops, schemes)
@@ -701,7 +743,7 @@ impl OutboundPolicy {
             budget: Some(budget.clone()),
             spent: budget.clone(),
             start,
-            deadline: start + timeout,
+            deadline: (start + remaining_now).min(deadline),
             late,
         };
         if let Some(n) = body.resp.content_length() {
@@ -1008,8 +1050,20 @@ pub fn post_json(
     body: Vec<u8>,
     timeout: Duration,
 ) -> Result<Posted, Failure> {
+    let deadline = Instant::now() + timeout.min(policy.timeout);
+    post_json_until(policy, url, headers, body, deadline)
+}
+
+/// Like [`post_json`], bounded by an absolute `deadline` rather than a relative duration.
+pub fn post_json_until(
+    policy: &OutboundPolicy,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+    deadline: Instant,
+) -> Result<Posted, Failure> {
     let budget = RequestBudget::new(policy);
-    let resp = policy.send(&budget, url, timeout, |client, u| {
+    let resp = policy.send_until(&budget, url, deadline, |client, u| {
         let mut rb = client
             .post(u)
             .header("Content-Type", "application/json")

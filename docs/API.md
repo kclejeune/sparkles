@@ -15214,10 +15214,14 @@ own id becomes the thread's `threadId`, which the `usage` event and the JSON ans
 `POST /{ds}/ask` carry. A follow-up sends it back as `thread`. An entry kept before
 threads is the thread of its own id.
 
-`asks.json` is format 2, and format 1 still reads. The list and delete routes refuse a
-file of a newer format, or one this server cannot parse, with `409`
-(`unsupported-format` or `unreadable-history`). An ask still answers and feedback on a
-recent ask still counts, but neither they nor the hourly prune write over such a file.
+`asks.json` is format 3, and formats 1 and 2 still read. Format 3 records both the Query
+view and the grounding Info view (or an explicit absence of Info access) so that answers
+and generated queries are withheld whenever either view narrows, and legacy format-1 and
+format-2 records require unrestricted Info access when their grounding footprint is
+unknown. The list and delete routes refuse a file of a newer format, or one this server
+cannot parse, with `409` (`unsupported-format` or `unreadable-history`). An ask still
+answers and feedback on a recent ask still counts, but neither they nor the hourly prune
+write over such a file.
 
 | Method and path | Needs | Effect |
 |---|---|---|

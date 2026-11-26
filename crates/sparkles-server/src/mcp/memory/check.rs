@@ -433,7 +433,7 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let r = self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?;
         let mut terms = Terms::new(&prefixes, 500);
         let mut issues: Vec<Issue> = Vec::new();

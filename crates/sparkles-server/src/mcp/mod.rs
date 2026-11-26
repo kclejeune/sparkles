@@ -304,6 +304,8 @@ pub struct Shared {
     pub tasks: tasks::Tasks,
     /// one permit per open `subscriptions/listen` stream or legacy session watcher
     pub subscriptions: Arc<Semaphore>,
+    /// optional absolute deadline cap inherited by derived child tool calls (never widened)
+    deadline: Option<Instant>,
 }
 
 /// The transport-neutral MCP server.
@@ -353,11 +355,14 @@ pub struct Call {
 impl McpServer {
     fn call_control(&self, call: &Call) -> sparkles::Result<sparkles::task::Control> {
         let mut control = sparkles::task::Control::with_cancel(call.cancel.clone());
-        control.deadline = Some(
-            call.arrived
-                .checked_add(self.cfg().max_timeout)
-                .ok_or_else(|| sparkles::Error::invalid("MCP call deadline overflow"))?,
-        );
+        let mut deadline = call
+            .arrived
+            .checked_add(self.cfg().max_timeout)
+            .ok_or_else(|| sparkles::Error::invalid("MCP call deadline overflow"))?;
+        if let Some(cap) = self.shared.deadline {
+            deadline = deadline.min(cap);
+        }
+        control.deadline = Some(deadline);
         control.check()?;
         Ok(control)
     }
@@ -417,10 +422,15 @@ impl McpServer {
     }
 
     pub fn new(state: Arc<AppState>, cfg: McpConfig) -> McpServer {
-        Self::new_with_pins(state, cfg, Arc::new(pins::Pins::default()))
+        Self::new_with_pins_and_deadline(state, cfg, Arc::new(pins::Pins::default()), None)
     }
 
-    fn new_with_pins(state: Arc<AppState>, cfg: McpConfig, pins: Arc<pins::Pins>) -> McpServer {
+    fn new_with_pins_and_deadline(
+        state: Arc<AppState>,
+        cfg: McpConfig,
+        pins: Arc<pins::Pins>,
+        deadline: Option<Instant>,
+    ) -> McpServer {
         let read_only = state.read_only;
         let tools = schemas::tools(&cfg)
             .into_iter()
@@ -441,22 +451,40 @@ impl McpServer {
                 tasks: tasks::Tasks::default(),
                 subscriptions: Arc::new(Semaphore::new(notify::MAX_SUBSCRIPTIONS)),
                 cfg,
+                deadline,
             }),
         }
     }
 
-    /// Build a derived MCP server with `cfg` that shares this server's snapshot pin table.
+    /// Build a derived MCP server with `cfg` that shares this server's snapshot pin table
+    /// and preserves any existing absolute deadline cap.
     pub(super) fn with_config_shared_pins(&self, cfg: McpConfig) -> McpServer {
-        Self::new_with_pins(self.state.clone(), cfg, self.shared.pins.clone())
+        Self::new_with_pins_and_deadline(
+            self.state.clone(),
+            cfg,
+            self.shared.pins.clone(),
+            self.shared.deadline,
+        )
     }
 
-    /// Build a derived MCP server whose `max_timeout` is capped to `max_timeout`, sharing
-    /// this server's snapshot pin table.
-    pub(crate) fn with_max_timeout(&self, max_timeout: Duration) -> McpServer {
-        let mut cfg = self.cfg().clone();
-        cfg.max_timeout = cfg.max_timeout.min(max_timeout);
-        cfg.default_timeout = cfg.default_timeout.min(cfg.max_timeout);
-        Self::new_with_pins(self.state.clone(), cfg, self.shared.pins.clone())
+    /// Build a derived MCP server whose calls cannot run past `deadline`, sharing this
+    /// server's snapshot pin table. An existing deadline is only tightened, never widened.
+    pub(crate) fn with_deadline(&self, deadline: Instant) -> McpServer {
+        let deadline = match self.shared.deadline {
+            Some(prev) => prev.min(deadline),
+            None => deadline,
+        };
+        Self::new_with_pins_and_deadline(
+            self.state.clone(),
+            self.cfg().clone(),
+            self.shared.pins.clone(),
+            Some(deadline),
+        )
+    }
+
+    /// The absolute deadline cap imposed on calls through this server, if any.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.shared.deadline
     }
 
     pub fn cfg(&self) -> &McpConfig {

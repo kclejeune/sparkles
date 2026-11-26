@@ -310,8 +310,8 @@ pub(super) fn tool_def(cfg: &McpConfig) -> ToolDef {
 /// Build the internal MCP server the Ask pipeline uses to invoke grounding, checking
 /// and query sub-tools. It keeps the caller-visible dataset patterns, resource limits
 /// and snapshot pin table while enabling all read-only internal tools regardless of the
-/// outer tool profile.
-fn internal_server(outer: &McpServer, max_timeout: Duration) -> McpServer {
+/// outer tool profile, capped by the Ask's absolute `deadline`.
+fn internal_server(outer: &McpServer, deadline: Instant) -> McpServer {
     let mut cfg = outer.cfg().clone();
     cfg.disabled.clear();
     cfg.profiles.clear();
@@ -319,9 +319,7 @@ fn internal_server(outer: &McpServer, max_timeout: Duration) -> McpServer {
     cfg.allow_update = false;
     cfg.allow_service = false;
     cfg.stored_queries = false;
-    cfg.max_timeout = cfg.max_timeout.min(max_timeout);
-    cfg.default_timeout = cfg.default_timeout.min(cfg.max_timeout);
-    outer.with_config_shared_pins(cfg)
+    outer.with_config_shared_pins(cfg).with_deadline(deadline)
 }
 
 impl Tools<'_> {
@@ -671,10 +669,7 @@ impl Tools<'_> {
         };
         let start = pinned_to_head.then_some(start);
 
-        let inner = internal_server(
-            self.server,
-            remaining(deadline_at).unwrap_or(Duration::ZERO),
-        );
+        let inner = internal_server(self.server, deadline_at);
         let mut ground = Value::Null;
         let mut on = |event: &str, data: &Value| {
             if event == "ground" {
@@ -691,35 +686,19 @@ impl Tools<'_> {
             assistant::recent_of(&main_ds.name, &me, &out),
             &out["usage"],
         );
-        let view_name = match branch.as_deref() {
-            Some(b) => format!("{}@{b}", main_ds.name),
-            None => main_ds.name.clone(),
-        };
         let read = start.filter(|s| {
             target_ds.store.snapshot().commit == s.commit
                 && out["result"]["commit"]
                     .as_u64()
                     .is_none_or(|c| c == s.commit)
         });
-        let mut access = assistant::answer_access(
+        let access = assistant::ask_access(
             read.as_ref(),
-            ask_principal.view(&view_name, Endpoint::Query).as_ref(),
-            &ask_principal.caller(),
+            &ask_principal,
             &main_ds.name,
             branch.as_deref(),
             &me,
         );
-        if ask_principal.can_at(&view_name, Endpoint::Info, Level::Read) {
-            access.info = Some(Box::new(assistant::answer_access_for(
-                read.as_ref(),
-                ask_principal.view(&view_name, Endpoint::Info).as_ref(),
-                &ask_principal.caller(),
-                &main_ds.name,
-                branch.as_deref(),
-                &me,
-                "info",
-            )));
-        }
         let rec = assistant::record_of(&id, &me, &out).with_answer(
             &id,
             &written,

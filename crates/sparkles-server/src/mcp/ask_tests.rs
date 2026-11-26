@@ -1602,11 +1602,252 @@ GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing 
         None,
         false,
     );
-    let hist_no_info = read_history(no_info).await;
+    let hist_no_info = read_history(no_info.clone()).await;
     let rec_no_info = &hist_no_info["asks"][0];
     assert_eq!(rec_no_info["answerWithheld"], true, "{rec_no_info}");
     assert!(rec_no_info.get("answer").is_none(), "{rec_no_info}");
     assert!(rec_no_info.get("query").is_none(), "{rec_no_info}");
+
+    // Format 3 is written on disk.
+    let raw_after = crate::assist::read_file(&st, &ds, crate::assistant::ASKS_FILE)
+        .unwrap()
+        .unwrap();
+    assert_eq!(raw_after["format"], 3, "{raw_after}");
+
+    // A fresh format-3 ask by a Query-only asker (no Info grant) records explicit absence
+    // of Info access (`infoAccess: "none"`), so the same Query-only reader can read it.
+    let m2 = scripted(vec![draft_json(TEAMS_QUERY)]);
+    let st_qonly = make_state(Some(make_models(
+        &m2.url(),
+        &m2.url(),
+        json!({ "draft": [{ "provider": "cheap", "model": "m" }] }),
+    )));
+    let ds_qonly = st_qonly.get("org").unwrap();
+    ds_qonly
+        .store
+        .load(&[Source::from_bytes(
+            br#"@prefix ex: <http://example.org/ontology#> .
+GRAPH <http://example.org/g/public> { <http://example.org/r/p> a ex:PublicThing . }
+GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing . }
+"#
+            .to_vec(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    put_assistant(
+        &st_qonly,
+        "org",
+        json!({ "enabled": true, "send": "schema", "historyDays": 30 }),
+    )
+    .await;
+    let srv_qonly = McpServer::new(st_qonly.clone(), McpConfig::default());
+    let Outcome::Structured(qonly_out) = srv_qonly
+        .call(
+            "ask",
+            args_map(json!({ "dataset": "org", "question": "List teams" })),
+            call_for(no_info.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected structured ask output");
+    };
+    assert_eq!(qonly_out["outcome"], "answered", "{qonly_out}");
+    let app_qonly = crate::assistant::routes()
+        .layer(axum::Extension(no_info.clone()))
+        .with_state(st_qonly.clone());
+    let res_qonly = app_qonly
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/$/asks/org")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_qonly.status(), StatusCode::OK);
+    let hist_qonly: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_qonly.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        hist_qonly["asks"][0].get("answer").is_some(),
+        "{hist_qonly}"
+    );
+    assert!(hist_qonly["asks"][0].get("query").is_some(), "{hist_qonly}");
+    assert!(
+        hist_qonly["asks"][0].get("answerWithheld").is_none(),
+        "{hist_qonly}"
+    );
+
+    // Pre-fix format-2 record (Query footprint only, no `infoAccess`) must be withheld
+    // under narrowed Info grants BOTH before and after a format-3 history rewrite, while
+    // remaining visible to an unrestricted Info reader.
+    let snap = ds.store.snapshot();
+    let legacy_query_access = crate::assistant::answer_access(
+        Some(&snap),
+        no_info.view("org", Endpoint::Query).as_ref(),
+        &no_info.caller(),
+        "org",
+        None,
+        &no_info.id(),
+    );
+    let legacy_file = json!({
+        "format": 2,
+        "asks": [{
+            "id": "legacy2",
+            "principal": no_info.id(),
+            "at": chrono::Utc::now().to_rfc3339(),
+            "question": "Legacy question",
+            "query": TEAMS_QUERY,
+            "commit": snap.commit,
+            "result": "answered",
+            "outcome": "none",
+            "routing": { "steps": [] },
+            "thread": "legacy2",
+            "answer": { "explanation": "Derived from secret Info schema" },
+            "access": legacy_query_access
+        }]
+    });
+    crate::assist::write_file(&st, &ds, crate::assistant::ASKS_FILE, &legacy_file).unwrap();
+
+    let narrowed_info_again = Access::of(Grants {
+        restricted: vec![
+            Restricted {
+                dataset: "org".into(),
+                level: Level::Read,
+                graphs: Some(vec!["default".into(), "http://example.org/g/public".into()]),
+                endpoints: Some(vec![Endpoint::Query]),
+                lifts: Vec::new(),
+                branches: None,
+                server_models: false,
+            },
+            Restricted {
+                dataset: "org".into(),
+                level: Level::Read,
+                graphs: Some(vec!["default".into(), "http://example.org/g/public".into()]),
+                endpoints: Some(vec![Endpoint::Info]),
+                lifts: Vec::new(),
+                branches: None,
+                server_models: false,
+            },
+        ],
+        ..Default::default()
+    });
+    let narrowed_reader = Principal::new(Kind::User, "alice", Scheme::Basic, narrowed_info_again);
+    let hist_legacy_narrow = read_history(narrowed_reader.clone()).await;
+    let rec_legacy = &hist_legacy_narrow["asks"][0];
+    assert_eq!(rec_legacy["id"], "legacy2");
+    assert_eq!(rec_legacy["answerWithheld"], true, "{rec_legacy}");
+    assert!(rec_legacy.get("answer").is_none(), "{rec_legacy}");
+    assert!(rec_legacy.get("query").is_none(), "{rec_legacy}");
+
+    // Rewrite the history file from format 2 to format 3 (via feedback on legacy2).
+    assert!(crate::assistant::feedback(
+        &st,
+        &ds,
+        &no_info.id(),
+        "legacy2",
+        "accepted",
+        None
+    ));
+    let rewritten = crate::assist::read_file(&st, &ds, crate::assistant::ASKS_FILE)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rewritten["format"], 3, "{rewritten}");
+
+    // Even after the format-3 rewrite, the legacy record still has unknown Info access
+    // and remains withheld from the narrowed Info reader.
+    let hist_after_rewrite = read_history(narrowed_reader).await;
+    let rec_after_rewrite = &hist_after_rewrite["asks"][0];
+    assert_eq!(rec_after_rewrite["id"], "legacy2");
+    assert_eq!(
+        rec_after_rewrite["answerWithheld"], true,
+        "{rec_after_rewrite}"
+    );
+    assert!(
+        rec_after_rewrite.get("answer").is_none(),
+        "{rec_after_rewrite}"
+    );
+    assert!(
+        rec_after_rewrite.get("query").is_none(),
+        "{rec_after_rewrite}"
+    );
+
+    // An unrestricted Info reader (with covering Query access) can still see the legacy record.
+    let unrestricted_info_reader = Principal::new(
+        Kind::User,
+        "alice",
+        Scheme::Basic,
+        Access::of(Grants {
+            restricted: vec![
+                Restricted {
+                    dataset: "org".into(),
+                    level: Level::Read,
+                    graphs: Some(vec!["default".into(), "http://example.org/g/public".into()]),
+                    endpoints: Some(vec![Endpoint::Query]),
+                    lifts: Vec::new(),
+                    branches: None,
+                    server_models: false,
+                },
+                Restricted {
+                    dataset: "org".into(),
+                    level: Level::Read,
+                    graphs: None,
+                    endpoints: Some(vec![Endpoint::Info]),
+                    lifts: Vec::new(),
+                    branches: None,
+                    server_models: false,
+                },
+            ],
+            ..Default::default()
+        }),
+    );
+    let hist_unrestricted = read_history(unrestricted_info_reader).await;
+    let rec_unrestricted = &hist_unrestricted["asks"][0];
+    assert_eq!(rec_unrestricted["id"], "legacy2");
+    assert!(
+        rec_unrestricted.get("answer").is_some(),
+        "{rec_unrestricted}"
+    );
+    assert!(
+        rec_unrestricted.get("query").is_some(),
+        "{rec_unrestricted}"
+    );
+    assert!(
+        rec_unrestricted.get("answerWithheld").is_none(),
+        "{rec_unrestricted}"
+    );
+
+    // Format 4 is cleanly refused with 409 unsupported-format and never overwritten.
+    let future_file = json!({ "format": 4, "asks": [{ "id": "future" }] });
+    crate::assist::write_file(&st, &ds, crate::assistant::ASKS_FILE, &future_file).unwrap();
+    let app_future = crate::assistant::routes()
+        .layer(axum::Extension(Principal::local()))
+        .with_state(st.clone());
+    let res_future = app_future
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/$/asks/org")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_future.status(), StatusCode::CONFLICT);
+    let body_future: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_future.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body_future["code"], "unsupported-format", "{body_future}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1718,28 +1959,34 @@ async fn ask_global_preview_and_schema_only_override() {
     let server = McpServer::new(st.clone(), McpConfig::default());
     let reqs_after_build = f.mock.requests().len();
 
-    // 1. Explicit `mode: "global"` with `run: false` is refused before any model call.
-    let err = server
-        .call(
-            "ask",
-            args_map(json!({
-                "dataset": "org",
-                "question": "What are the main themes?",
-                "mode": "global",
-                "run": false
-            })),
-            call_for(Principal::local()),
-        )
-        .await
-        .unwrap()
-        .err()
-        .expect("global preview should fail");
-    assert_eq!(err.code.as_ref(), "bad-argument", "{err:?}");
-    assert_eq!(
-        f.mock.requests().len(),
-        reqs_after_build,
-        "global preview must make zero model calls"
-    );
+    // 1. Explicit `mode: "global"` with `run: false` is refused before any model call,
+    //    both with and without a caller-supplied `query`.
+    for extra in [
+        json!({}),
+        json!({ "query": "SELECT ?s WHERE { ?s ?p ?o } LIMIT 3" }),
+    ] {
+        let mut req = json!({
+            "dataset": "org",
+            "question": "What are the main themes?",
+            "mode": "global",
+            "run": false
+        });
+        if let Some(q) = extra.get("query") {
+            req["query"] = q.clone();
+        }
+        let err = server
+            .call("ask", args_map(req), call_for(Principal::local()))
+            .await
+            .unwrap()
+            .err()
+            .expect("global preview should fail");
+        assert_eq!(err.code.as_ref(), "bad-argument", "{err:?}");
+        assert_eq!(
+            f.mock.requests().len(),
+            reqs_after_build,
+            "global preview must make zero model calls"
+        );
+    }
 
     // 2. `mode: "auto"` with `run: false` stays in local check mode and never calls global map/reduce.
     let Outcome::Structured(auto_preview) = server
@@ -1953,40 +2200,147 @@ async fn ask_charges_usage_on_refusal_invalid_and_runtime_max_tokens() {
         1,
         "repair step must not run once draft crossed maxTokens"
     );
+
+    // 4. Two-pair draft role: a refusal on pair 1 that exhausts `maxTokens` must return
+    //    `budget-exceeded` with first-step usage retained and zero requests to pair 2.
+    let refusal_pair1 = MockModel::start(|_, _| {
+        (
+            200,
+            json!({
+                "choices": [{
+                    "message": { "refusal": "cannot comply" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+            }),
+        )
+    });
+    let fallback_pair2 = scripted(vec![draft_json(TEAMS_QUERY)]);
+    let st3 = make_state(Some(make_models(
+        &refusal_pair1.url(),
+        &fallback_pair2.url(),
+        json!({
+            "draft": [
+                { "provider": "cheap", "model": "m" },
+                { "provider": "top", "model": "m" }
+            ]
+        }),
+    )));
+    put_assistant(&st3, "org", json!({ "enabled": true, "send": "schema" })).await;
+    let server3 = McpServer::new(st3, McpConfig::default());
+    let err_fallback = server3
+        .call(
+            "ask",
+            args_map(json!({
+                "dataset": "org",
+                "question": "List teams",
+                "maxTokens": 50
+            })),
+            call_for(Principal::local()),
+        )
+        .await
+        .unwrap()
+        .err()
+        .expect("refusal exhausting maxTokens must stop before fallback pair");
+    assert_eq!(
+        err_fallback.code.as_ref(),
+        "budget-exceeded",
+        "{err_fallback:?}"
+    );
+    let fallback_usage = err_fallback.data.as_ref().unwrap()["usage"].clone();
+    assert_eq!(fallback_usage["inputTokens"], 45, "{fallback_usage}");
+    assert_eq!(fallback_usage["outputTokens"], 15, "{fallback_usage}");
+    assert_eq!(refusal_pair1.requests().len(), 1);
+    assert_eq!(
+        fallback_pair2.requests().len(),
+        0,
+        "second provider must receive zero requests after refusal exhausted maxTokens"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ask_cancellation_and_slot_rpm_deadlines() {
-    // 1. Mid-flight cancellation after admission stops promptly without waiting for slow HTTP.
-    let slow = MockModel::start(|_, _| {
-        std::thread::sleep(Duration::from_millis(800));
-        (200, mock::openai(&draft_json(TEAMS_QUERY)))
+    // 1. Mid-flight cancellation synchronized on mock arrival returns promptly while
+    //    retaining the provider concurrency slot until the in-flight HTTP call finishes,
+    //    and records late reported usage for both provider and Ask budgets.
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+    let slow = {
+        let gate = gate.clone();
+        let arrived_tx = parking_lot::Mutex::new(Some(arrived_tx));
+        MockModel::start(move |_, _| {
+            if let Some(tx) = arrived_tx.lock().take() {
+                let _ = tx.send(());
+                let mut open = gate.0.lock();
+                while !*open {
+                    gate.1.wait(&mut open);
+                }
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": draft_json(TEAMS_QUERY) },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+                }),
+            )
+        })
+    };
+    let cancel_cfg = json!({
+        "providers": {
+            "cheap": {
+                "kind": "openai",
+                "endpoint": slow.url(),
+                "concurrency": 1,
+                "requestTimeoutSecs": 5,
+                "budget": { "tokensPerDay": 500 },
+                "allowedModels": ["m"]
+            }
+        },
+        "roles": { "draft": [{ "provider": "cheap", "model": "m" }] }
     });
-    let st_cancel = make_state(Some(make_models(
-        &slow.url(),
-        &slow.url(),
-        json!({ "draft": [{ "provider": "cheap", "model": "m" }] }),
-    )));
+    let cancel_models = Models::new(
+        ModelsConfig::parse(&cancel_cfg.to_string()).unwrap(),
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+    );
+    let st_cancel = make_state(Some(cancel_models));
     put_assistant(
         &st_cancel,
         "org",
         json!({ "enabled": true, "send": "schema" }),
     )
     .await;
-    let srv_cancel = McpServer::new(st_cancel, McpConfig::default());
-    let call = call_for(Principal::local());
+    let srv_cancel = McpServer::new(st_cancel.clone(), McpConfig::default());
+    let alice = restricted_principal("alice", "org", Level::Read, None, None, None, false);
+    let call = call_for(alice.clone());
     let flag = call.cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
+    let first_handle = {
+        let srv = srv_cancel.clone();
+        tokio::spawn(async move {
+            srv.call(
+                "ask",
+                args_map(
+                    json!({ "dataset": "org", "question": "List teams", "timeoutSeconds": 5 }),
+                ),
+                call,
+            )
+            .await
+            .unwrap()
+        })
+    };
+    // Synchronize cancellation with the mock's actual receipt of the first request.
+    arrived_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("first request should arrive at mock provider");
     let t0 = Instant::now();
-    let err = srv_cancel
-        .call(
-            "ask",
-            args_map(json!({ "dataset": "org", "question": "List teams", "timeoutSeconds": 5 })),
-            call,
-        )
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let err = first_handle
         .await
         .unwrap()
         .err()
@@ -1994,9 +2348,70 @@ async fn ask_cancellation_and_slot_rpm_deadlines() {
     assert_eq!(err.code.as_ref(), "cancelled", "{err:?}");
     assert!(
         t0.elapsed() < Duration::from_millis(500),
-        "cancellation should return before the 800ms provider sleep finishes (took {:?})",
+        "cancellation should return promptly while the in-flight HTTP worker finishes (took {:?})",
         t0.elapsed()
     );
+
+    // While the cancelled HTTP request is still in flight, concurrency: 1 must block a
+    // second Ask so it times out without reaching the provider.
+    let blocked_err = srv_cancel
+        .call(
+            "ask",
+            args_map(json!({ "dataset": "org", "question": "List teams", "timeoutSeconds": 0.15 })),
+            call_for(Principal::local()),
+        )
+        .await
+        .unwrap()
+        .err()
+        .expect("second ask must be blocked while cancelled HTTP request is in flight");
+    assert_eq!(blocked_err.code.as_ref(), "timeout", "{blocked_err:?}");
+    assert_eq!(
+        slow.requests().len(),
+        1,
+        "second ask must not bypass concurrency: 1 while cancelled request is in flight"
+    );
+
+    // Release the in-flight HTTP response and verify late usage settlement + slot release.
+    {
+        let mut open = gate.0.lock();
+        *open = true;
+        gate.1.notify_all();
+    }
+    let settle_wait = Instant::now();
+    while st_cancel.asks.tokens_today("org", Some(&alice.id())) < 60
+        && settle_wait.elapsed() < Duration::from_secs(3)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        st_cancel.asks.tokens_today("org", Some(&alice.id())),
+        60,
+        "late usage from cancelled HTTP response must be recorded for principal daily budget"
+    );
+    assert_eq!(
+        st_cancel.asks.tokens_today("org", None),
+        60,
+        "late usage from cancelled HTTP response must be recorded for dataset daily budget"
+    );
+    let desc = st_cancel.models().unwrap().describe();
+    assert_eq!(
+        desc["providers"][0]["budget"]["usedToday"], 60,
+        "late usage from cancelled HTTP response must be recorded for provider daily budget: {desc}"
+    );
+    let Outcome::Structured(after_release) = srv_cancel
+        .call(
+            "ask",
+            args_map(json!({ "dataset": "org", "question": "List teams", "timeoutSeconds": 5 })),
+            call_for(Principal::local()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected structured ask output after slot release");
+    };
+    assert_eq!(after_release["outcome"], "answered", "{after_release}");
+    assert_eq!(slow.requests().len(), 2);
 
     // 2. Deadline expiry while waiting for a provider concurrency slot sends 0 requests for caller 2.
     let slot_mock = MockModel::start(|_, _| {
@@ -2220,4 +2635,59 @@ async fn ask_over_http_mcp_endpoint() {
     let sc = &call_resp["result"]["structuredContent"];
     assert_eq!(sc["outcome"], "answered", "{sc}");
     assert_eq!(sc["summary"]["citations"], json!([1, 2]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_predicate_use_grounding_preserved_under_short_timeout() {
+    // Regression: when the Ask's remaining time falls between 0.5 s and 5 s, predicate-use
+    // grounding (`usage_query`) must NOT be rejected by `Tools::timeout` as over `max_timeout`.
+    let m = scripted(vec![draft_json(TEAMS_QUERY)]);
+    let cfg = json!({
+        "providers": {
+            "cheap": {
+                "kind": "openai",
+                "endpoint": m.url(),
+                "contextTokens": 32768,
+                "requestTimeoutSecs": 5,
+                "allowedModels": ["m"]
+            }
+        },
+        "roles": { "draft": [{ "provider": "cheap", "model": "m" }] }
+    });
+    let models = Models::new(
+        ModelsConfig::parse(&cfg.to_string()).unwrap(),
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+    );
+    let st = make_state(Some(models));
+    put_assistant(&st, "org", json!({ "enabled": true, "send": "schema" })).await;
+    let server = McpServer::new(st, McpConfig::default());
+
+    let Outcome::Structured(out) = server
+        .call(
+            "ask",
+            args_map(json!({
+                "dataset": "org",
+                "question": "Which person is in the Payments team?",
+                "timeoutSeconds": 2.0
+            })),
+            call_for(Principal::local()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected structured ask output");
+    };
+    assert_eq!(out["outcome"], "answered", "{out}");
+    let reqs = m.requests();
+    assert_eq!(reqs.len(), 1);
+    let body = reqs[0].body.to_string();
+    assert!(
+        body.contains("Predicates that these entities"),
+        "predicate-use grounding must reach the draft prompt when remaining time is in (0.5s, 5s): {body}"
+    );
 }

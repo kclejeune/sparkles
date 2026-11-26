@@ -906,3 +906,180 @@ fn provider_tls_options() {
     let e = call(&closed, "p").unwrap_err();
     assert_eq!(e.error.code(), "outbound-refused", "{:?}", e.error);
 }
+
+#[test]
+fn delayed_send_past_absolute_deadline_does_not_post() {
+    use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
+
+    struct RecordSettle(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Settle for RecordSettle {
+        fn reported(self: Box<Self>, usage: Usage) {
+            self.0.lock().push(Some(usage));
+        }
+        fn unknown(self: Box<Self>) {
+            self.0.lock().push(None);
+        }
+    }
+    struct SlowAdmit {
+        delay: Duration,
+        settled: Arc<Mutex<Vec<Option<Usage>>>>,
+    }
+    impl Admission for SlowAdmit {
+        fn admit(&self, _: &Attempt<'_>) -> Result<Ticket, CallError> {
+            std::thread::sleep(self.delay);
+            Ok(Ticket::new(Box::new(RecordSettle(self.settled.clone()))))
+        }
+    }
+
+    let mock = MockModel::start(|_, _| (200, mock::openai(r#"{"query":"ASK {}"}"#)));
+    let m = models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 5 } }),
+        &[],
+    );
+    let settled = Arc::new(Mutex::new(Vec::new()));
+    let admit = SlowAdmit {
+        delay: Duration::from_millis(80),
+        settled: settled.clone(),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let err = m
+        .call_prompt_with_cancel(
+            Some(Role::Draft),
+            &Pair::new("p", "m1"),
+            &Prompt::plain("system text", "user text"),
+            &draft_schema(),
+            Instant::now() + Duration::from_millis(30),
+            Some(&admit),
+            Some(&cancel),
+        )
+        .unwrap_err();
+    assert_eq!(err.error.code(), "deadline", "{:?}", err.error);
+    assert_eq!(
+        mock.requests().len(),
+        0,
+        "provider send delayed past absolute deadline must never POST"
+    );
+    assert_eq!(
+        *settled.lock(),
+        vec![Some(Usage::default())],
+        "unsent ticket must settle as not_sent (0 usage)"
+    );
+}
+
+#[test]
+fn cancelled_http_holds_slot_and_settles_admission_ticket() {
+    use super::admission::{Admission, Attempt, Settle, Ticket, Usage};
+
+    struct RecordSettle(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Settle for RecordSettle {
+        fn reported(self: Box<Self>, usage: Usage) {
+            self.0.lock().push(Some(usage));
+        }
+        fn unknown(self: Box<Self>) {
+            self.0.lock().push(None);
+        }
+    }
+    struct TrackAdmit(Arc<Mutex<Vec<Option<Usage>>>>);
+    impl Admission for TrackAdmit {
+        fn admit(&self, _: &Attempt<'_>) -> Result<Ticket, CallError> {
+            Ok(Ticket::new(Box::new(RecordSettle(self.0.clone()))))
+        }
+    }
+
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let mock = {
+        let gate = gate.clone();
+        let arrived_tx = Mutex::new(Some(arrived_tx));
+        MockModel::start(move |_, _| {
+            if let Some(tx) = arrived_tx.lock().take() {
+                let _ = tx.send(());
+                let mut open = gate.0.lock();
+                while !*open {
+                    gate.1.wait(&mut open);
+                }
+            }
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "message": { "content": r#"{"query":"ASK {}"}"# },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 45, "completion_tokens": 15 }
+                }),
+            )
+        })
+    };
+    let m = Arc::new(models(
+        json!({ "p": { "kind": "openai", "endpoint": mock.url(), "concurrency": 1, "requestTimeoutSecs": 5, "budget": { "tokensPerDay": 500 } } }),
+        &[],
+    ));
+    let settled = Arc::new(Mutex::new(Vec::new()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let h = {
+        let m = m.clone();
+        let settled = settled.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let admit = TrackAdmit(settled);
+            m.call_prompt_with_cancel(
+                Some(Role::Draft),
+                &Pair::new("p", "m1"),
+                &Prompt::plain("system text", "user text"),
+                &draft_schema(),
+                Instant::now() + Duration::from_secs(5),
+                Some(&admit),
+                Some(&cancel),
+            )
+        })
+    };
+    arrived_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("request should reach mock");
+    cancel.store(true, Ordering::Relaxed);
+    let err = h.join().unwrap().unwrap_err();
+    assert_eq!(err.error.code(), "cancelled", "{:?}", err.error);
+    assert!(
+        settled.lock().is_empty(),
+        "ticket must remain unsettled while HTTP response is still in flight"
+    );
+
+    // Second call must block on concurrency: 1 and time out without reaching mock.
+    let err2 = m
+        .call_prompt(
+            Some(Role::Draft),
+            &Pair::new("p", "m1"),
+            &Prompt::plain("system text", "user text"),
+            &draft_schema(),
+            Instant::now() + Duration::from_millis(120),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err2.error.code(), "deadline", "{:?}", err2.error);
+    assert_eq!(mock.requests().len(), 1);
+
+    // Release the mock response and verify late ticket settlement and provider budget accounting.
+    {
+        let mut open = gate.0.lock();
+        *open = true;
+        gate.1.notify_all();
+    }
+    let start = Instant::now();
+    while settled.lock().is_empty() && start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        *settled.lock(),
+        vec![Some(Usage {
+            input: 45,
+            output: 15,
+            ..Default::default()
+        })],
+        "abandoned HTTP response must settle admission ticket with reported usage"
+    );
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 60);
+    // Slot is now free for a subsequent call.
+    call(&m, "p").unwrap();
+    assert_eq!(mock.requests().len(), 2);
+}

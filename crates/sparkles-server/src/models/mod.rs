@@ -330,15 +330,15 @@ impl StepError {
 }
 
 /// Counting slots with a deadline and optional cancellation.
-struct Slots {
+pub(super) struct Slots {
     max: usize,
     used: Mutex<usize>,
     cv: Condvar,
 }
 
-struct SlotGuard<'a>(&'a Slots);
+pub(super) struct SlotGuard(Arc<Slots>);
 
-impl Drop for SlotGuard<'_> {
+impl Drop for SlotGuard {
     fn drop(&mut self) {
         *self.0.used.lock() -= 1;
         self.0.cv.notify_one();
@@ -349,10 +349,10 @@ impl Slots {
     /// Wait until a slot is free, returning `Err(true)` on cancellation or `Err(false)`
     /// on deadline expiry.
     fn acquire(
-        &self,
+        self: &Arc<Self>,
         deadline: Instant,
         cancel: Option<&Arc<AtomicBool>>,
-    ) -> Result<SlotGuard<'_>, bool> {
+    ) -> Result<SlotGuard, bool> {
         let mut used = self.used.lock();
         while *used >= self.max {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -373,13 +373,13 @@ impl Slots {
             return Err(true);
         }
         *used += 1;
-        Ok(SlotGuard(self))
+        Ok(SlotGuard(Arc::clone(self)))
     }
 }
 
 /// The state of one provider.
 struct Runtime {
-    slots: Slots,
+    slots: Arc<Slots>,
     /// the earliest time of the next request (`requestsPerMinute`)
     next: Mutex<Instant>,
     /// (day number, tokens counted that day), shared with the configurations that
@@ -439,11 +439,11 @@ impl Models {
                 (
                     n.clone(),
                     Runtime {
-                        slots: Slots {
+                        slots: Arc::new(Slots {
                             max: p.concurrency.unwrap_or(config::DEFAULT_CONCURRENCY),
                             used: Mutex::new(0),
                             cv: Condvar::new(),
-                        },
+                        }),
                         next: Mutex::new(Instant::now()),
                         tokens: Arc::new(Mutex::new((today(), 0))),
                     },
@@ -765,6 +765,26 @@ impl Models {
         admission: Option<&dyn admission::Admission>,
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Answer, Failure> {
+        self.call_prompt_with_cancel_and_abandoned(
+            role, pair, prompt, out, deadline, admission, cancel, None,
+        )
+    }
+
+    /// [`Models::call_prompt_with_cancel`] with an optional callback that receives late
+    /// provider-reported usage and estimated cost if an in-flight HTTP request completes
+    /// after cancellation or deadline expiry.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn call_prompt_with_cancel_and_abandoned(
+        &self,
+        role: Option<Role>,
+        pair: &Pair,
+        prompt: &Prompt,
+        out: &OutputSchema,
+        deadline: Instant,
+        admission: Option<&dyn admission::Admission>,
+        cancel: Option<&Arc<AtomicBool>>,
+        on_abandoned: Option<Arc<dyn Fn(admission::Usage, Option<f64>) + Send + Sync>>,
+    ) -> Result<Answer, Failure> {
         let mut rec = StepRecord {
             role,
             provider: pair.provider.clone(),
@@ -894,7 +914,7 @@ impl Models {
                     rec.latency = started.elapsed();
                     return fail(StepError::Deadline, rec);
                 }
-                let _slot = match rt.slots.acquire(deadline, cancel) {
+                let slot = match rt.slots.acquire(deadline, cancel) {
                     Ok(slot) => slot,
                     Err(true) => {
                         rec.latency = started.elapsed();
@@ -933,13 +953,16 @@ impl Models {
                     rec.latency = started.elapsed();
                     return fail(StepError::Cancelled, rec);
                 }
-                // Recompute the HTTP timeout after waiting on slots and rate limits so
-                // the request never overshoots the call deadline.
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
+                // Recompute the per-step deadline against the caller's absolute deadline
+                // after waiting on slots and rate limits so the request never overshoots it.
+                let now = Instant::now();
+                if now >= deadline {
                     rec.latency = started.elapsed();
                     return fail(StepError::Deadline, rec);
                 }
+                let step_timeout = Duration::from_secs_f64(timeout);
+                let call_deadline = (now + step_timeout).min(deadline);
+                let left = call_deadline.saturating_duration_since(now);
                 let req = ChatRequest {
                     model: pair.model.clone(),
                     system: prompt.system.clone(),
@@ -950,7 +973,7 @@ impl Models {
                     temperature: m.temperature,
                     reasoning_effort: m.reasoning_effort,
                     num_ctx: m.num_ctx,
-                    timeout: Duration::from_secs_f64(timeout).min(left),
+                    timeout: step_timeout.min(left),
                 };
                 rec.requests += 1;
                 rec.level = Some(level);
@@ -958,15 +981,37 @@ impl Models {
                     outbound: &outbound,
                     key: key.clone(),
                 };
+                let abandoned_cb: client::AbandonedUsageFn = {
+                    let rt_tokens = rt.tokens.clone();
+                    let extra = on_abandoned.clone();
+                    Arc::new(move |usage: admission::Usage| {
+                        if usage == admission::Usage::default() {
+                            return;
+                        }
+                        let budget = usage.budget();
+                        {
+                            let mut t = rt_tokens.lock();
+                            if t.0 != today() {
+                                *t = (today(), 0);
+                            }
+                            t.1 = t.1.saturating_add(budget);
+                        }
+                        if let Some(cb) = &extra {
+                            cb(usage, pricing.map(|pr| usage.cost(&pr)));
+                        }
+                    })
+                };
                 let resp = client::send_admitted_cancellable(
                     &t,
                     &pair.provider,
                     p,
                     &req,
+                    call_deadline,
                     admission,
                     cancel,
+                    Some(slot),
+                    Some(abandoned_cb),
                 );
-                drop(_slot);
                 let resp = match resp {
                     Ok(r) => r,
                     Err((e, usage)) => {
@@ -975,6 +1020,10 @@ impl Models {
                             CallError::Cancelled => {
                                 rec.latency = started.elapsed();
                                 return fail(StepError::Cancelled, rec);
+                            }
+                            CallError::Unavailable(_) if Instant::now() >= deadline => {
+                                rec.latency = started.elapsed();
+                                return fail(StepError::Deadline, rec);
                             }
                             e if has_next && structured::unsupported(&e) => {
                                 tracing::info!(target: "sparkles::models", "{}: level {} refused, trying the next: {e}", pair.label(), level.as_str());

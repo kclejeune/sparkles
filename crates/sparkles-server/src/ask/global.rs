@@ -471,6 +471,7 @@ impl Asking<'_, '_> {
             };
             let deadline = self.deadline;
             let models = self.models;
+            let on_abandoned = self.abandoned_usage_cb(&pair);
             let results: Vec<_> = std::thread::scope(|s| {
                 let hs: Vec<_> = chunk
                     .iter()
@@ -479,10 +480,11 @@ impl Asking<'_, '_> {
                         let pair = pair.clone();
                         let schema = &schema;
                         let cancel = &self.cancel;
+                        let on_abandoned = on_abandoned.clone();
                         s.spawn(move || {
                             (
                                 gi,
-                                models.call_prompt_with_cancel(
+                                models.call_prompt_with_cancel_and_abandoned(
                                     Some(Role::Summarize),
                                     &pair,
                                     &Prompt::plain(MAP_SYSTEM, &user),
@@ -490,6 +492,7 @@ impl Asking<'_, '_> {
                                     deadline,
                                     None,
                                     Some(cancel),
+                                    Some(on_abandoned),
                                 ),
                             )
                         })
@@ -539,12 +542,18 @@ impl Asking<'_, '_> {
             // batches of a chunk run at once on one pair, so a chunk fails once.
             if chunk_failed {
                 self.failed_calls += 1;
-            }
-            if chunk_failed
-                && (self.failed_calls >= super::MAX_FAILED_CALLS
-                    || !self.escalate(Role::Summarize, "provider-failure"))
-            {
-                return self.error("provider-unavailable", last);
+                if self.failed_calls >= super::MAX_FAILED_CALLS
+                    || !self.can_escalate(Role::Summarize)
+                {
+                    return self.error("provider-unavailable", last);
+                }
+                if self.tokens() >= self.o.max_tokens {
+                    return self.error(
+                        "budget-exceeded",
+                        format!("the ask used its {} tokens", self.o.max_tokens),
+                    );
+                }
+                self.escalate(Role::Summarize, "provider-failure");
             }
         }
         // a failed batch runs again on the pair the role moved to

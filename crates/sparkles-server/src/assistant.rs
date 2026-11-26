@@ -472,6 +472,40 @@ impl Runtime {
             .or_default() += tokens;
     }
 
+    /// Record late token usage reported by an in-flight provider HTTP request that
+    /// finished after its ask was cancelled or timed out.
+    pub fn charge_abandoned(
+        &self,
+        dataset: &str,
+        principal: &str,
+        provider: &str,
+        model: &str,
+        usage: crate::models::admission::Usage,
+        estimated_cost: Option<f64>,
+    ) {
+        let tokens = usage.budget();
+        if tokens == 0 && usage == crate::models::admission::Usage::default() {
+            return;
+        }
+        self.add_tokens(dataset, principal, tokens);
+        let add = |c: &mut Counts| {
+            let t = c
+                .tokens
+                .entry((provider.to_string(), model.to_string()))
+                .or_default();
+            t.0 = t.0.plus(usage);
+            t.1 += estimated_cost.unwrap_or(0.0);
+            t.2 += tokens;
+        };
+        {
+            let mut u = self.usage.lock();
+            let d = today();
+            u.retain(|k, _| k.0 + USAGE_DAYS > d);
+            add(u.entry((d, dataset.to_string())).or_default());
+        }
+        add(self.totals.lock().entry(dataset.to_string()).or_default());
+    }
+
     /// Count the model calls of a step outside an ask, such as an explanation (C18
     /// §6.6): its tokens against the dataset and `principal`, and its answer and tokens
     /// in the usage counts under `role`. It is not counted as an ask.
@@ -888,6 +922,29 @@ impl AskAbout {
 /// graphs keeps no footprint, and only unrestricted readers see that answer again.
 pub const MAX_ACCESS_GRAPHS: usize = 512;
 
+/// What grounding (`Endpoint::Info`) could read when an ask ran (format 3).
+///
+/// Legacy format-1 and format-2 records omit this field and deserialize as `Unknown`,
+/// which survives format-3 history rewrites and requires unrestricted `Endpoint::Info`
+/// access to reveal derived content.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InfoAccess {
+    /// Legacy record whose Info view was not recorded.
+    #[default]
+    Unknown,
+    /// Asker had no `Endpoint::Info` read grant when asking.
+    None,
+    /// Asker had `Endpoint::Info` read access with this footprint.
+    Footprint(Box<AnswerAccess>),
+}
+
+impl InfoAccess {
+    fn is_unknown(&self) -> bool {
+        matches!(self, InfoAccess::Unknown)
+    }
+}
+
 /// What an ask could read, so that its stored answer is shown again only to a reader
 /// who can read all of it under the same protections (C18 §6.4). The footprint is the
 /// disclosure guard's (C22 §6.2) over every graph the asker's view read; the guarded
@@ -906,9 +963,54 @@ pub struct AnswerAccess {
     /// the branch the ask read, `main` when absent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    /// what the grounding (`Endpoint::Info`) could read, when the asker could read `info`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub info: Option<Box<AnswerAccess>>,
+    /// what the grounding (`Endpoint::Info`) could read (format 3); absent in legacy
+    /// format-1 and format-2 records (`Unknown`)
+    #[serde(default, skip_serializing_if = "InfoAccess::is_unknown")]
+    pub info_access: InfoAccess,
+}
+
+/// The Query and Info access record of an ask by `principal` over `snap`.
+pub fn ask_access(
+    snap: Option<&Arc<sparkles::store::Snapshot>>,
+    principal: &Principal,
+    dataset: &str,
+    branch: Option<&str>,
+    me: &str,
+) -> AnswerAccess {
+    let view_name = match branch.filter(|b| *b != sparkles::branch::MAIN) {
+        Some(b) => format!("{dataset}@{b}"),
+        None => dataset.to_string(),
+    };
+    let mut access = answer_access(
+        snap,
+        principal
+            .view(&view_name, crate::auth::Endpoint::Query)
+            .as_ref(),
+        &principal.caller(),
+        dataset,
+        branch,
+        me,
+    );
+    access.info_access = if principal.can_at(
+        &view_name,
+        crate::auth::Endpoint::Info,
+        crate::auth::Level::Read,
+    ) {
+        InfoAccess::Footprint(Box::new(answer_access_for(
+            snap,
+            principal
+                .view(&view_name, crate::auth::Endpoint::Info)
+                .as_ref(),
+            &principal.caller(),
+            dataset,
+            branch,
+            me,
+            "info",
+        )))
+    } else {
+        InfoAccess::None
+    };
+    access
 }
 
 /// The access record of an ask over `snap`, the state its answer read (`None` when
@@ -943,7 +1045,7 @@ pub fn answer_access_for(
             guarded: Vec::new(),
             guarded_footprint: None,
             branch: branch.map(str::to_string),
-            info: None,
+            info_access: InfoAccess::Unknown,
         };
     };
     let bound = view.map(|v| v.bound(snap));
@@ -1006,7 +1108,7 @@ pub fn answer_access_for(
         guarded: if fits { guarded } else { Vec::new() },
         guarded_footprint,
         branch: branch.map(str::to_string),
-        info: None,
+        info_access: InfoAccess::Unknown,
     }
 }
 
@@ -1271,8 +1373,8 @@ pub(crate) fn store_history(st: &AppState, ds: &Dataset, list: &[AskRecord]) -> 
     )
 }
 
-/// The format of `asks.json` this release writes; it reads 1 and 2.
-pub const HISTORY_FORMAT: u32 = 2;
+/// The format of `asks.json` this release writes; it reads 1, 2 and 3.
+pub const HISTORY_FORMAT: u32 = 3;
 
 /// Entries older than `days` days.
 fn expired(r: &AskRecord, days: u32) -> bool {
@@ -1648,9 +1750,9 @@ async fn list_asks(
                     .is_some_and(|(view, snap)| {
                         answer_visible(r.access.as_ref(), view.as_ref(), &snap)
                     });
-                    let info_visible = match r.access.as_ref().and_then(|a| a.info.as_deref()) {
-                        None => true,
-                        Some(info_access) => reader_view_at(
+                    let info_visible = match r.access.as_ref().map(|a| &a.info_access) {
+                        Some(InfoAccess::None) => true,
+                        Some(InfoAccess::Footprint(info_access)) => reader_view_at(
                             &st,
                             &ds,
                             &p,
@@ -1662,6 +1764,16 @@ async fn list_asks(
                         .is_some_and(|(view, snap)| {
                             answer_visible(Some(info_access), view.as_ref(), &snap)
                         }),
+                        None | Some(InfoAccess::Unknown) => reader_view_at(
+                            &st,
+                            &ds,
+                            &p,
+                            &opts,
+                            &snap,
+                            r.access.as_ref(),
+                            crate::auth::Endpoint::Info,
+                        )
+                        .is_some_and(|(view, snap)| answer_visible(None, view.as_ref(), &snap)),
                     };
                     let visible = !reports_hidden && query_visible && info_visible;
                     if !visible {
