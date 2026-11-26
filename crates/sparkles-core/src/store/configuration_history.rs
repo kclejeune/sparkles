@@ -13,10 +13,16 @@ pub(super) mod primary;
 mod validation;
 
 pub(super) use imported::Identities as OriginalIdentities;
+pub(super) use imported::context::Pending as ImportedOpening;
+pub(crate) use imported::reidentify::reidentify_activated_dir;
+pub(super) use imported::reidentify::{
+    PriorImportFiles, capture_import_files, read_prior_imports_for_clone,
+    resolve_imported_wal_binding, verify_imported_identity, write_clone_destination,
+};
 pub(super) use imported::{
     MAX_MEMBERS as SOURCE_MEMBER_LIMIT, SourceFile as SourceFilePin, SourceManifest,
     Sources as OriginalSources, encode_first_destination_origin, encode_native_descriptor,
-    opening_origin_selection, original_branch_table_document, original_history_document,
+    opening_origin_info, original_branch_table_document, original_history_document,
     source_member as source_metadata_member, verify_staged_native_source,
 };
 
@@ -308,7 +314,27 @@ impl Store {
                         ));
                     }
                     if found == seq {
-                        break match cursor.configuration() {
+                        let wal_offset = cursor.position().offset;
+                        let wal_config = cursor.configuration();
+                        let gen_name = entry.name.clone();
+                        drop(cursor);
+                        drop(physical);
+                        drop(history);
+                        drop(_held);
+                        if !self.is_branch()
+                            && let Some(family_root) = self.managed_root()
+                            && let Some(imported) = resolve_imported_wal_binding(
+                                &family_root,
+                                &gen_name,
+                                wal_offset,
+                                seq,
+                                wal_config,
+                                preparation,
+                            )?
+                        {
+                            break imported;
+                        }
+                        break match wal_config {
                             Some(generation) => {
                                 let history = installed
                                     .and_then(|i| i.configuration_history.as_ref())
@@ -397,6 +423,8 @@ impl Store {
                     identity,
                     preparation,
                 )?;
+            } else if let ConfigurationBinding::ImportedUnbound { source } = binding {
+                verify_imported_identity(&root, source, preparation)?;
             }
         } else {
             let memory = installed

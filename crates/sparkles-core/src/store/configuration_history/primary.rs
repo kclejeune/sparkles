@@ -37,6 +37,10 @@ fn root_result(
 }
 
 impl Header {
+    pub(super) fn is_pre_cutoff(&self, seq: u64) -> bool {
+        self.cutoff.is_some_and(|cutoff| seq < cutoff)
+    }
+
     /// Fixed original facts can be retained, but a prior operation's successful
     /// publication lookup must not hide a missing reference on the next read.
     pub(crate) fn fresh(&self) -> Self {

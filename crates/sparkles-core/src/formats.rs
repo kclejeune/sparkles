@@ -186,7 +186,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 2, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[5, 6, 7, 8, 9],
+    reads: &[5, 6, 7, 8, 9, 10],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
@@ -339,10 +339,10 @@ pub const CONFIGURATION_COVERAGE: FileKind = FileKind {
 pub const CONFIGURATION_ORIGIN: FileKind = FileKind {
     id: "configuration-origin",
     files: "evidence-history/origin.json",
-    marker: "format 1 and the exact imported source prefix/identity closure",
+    marker: "format 1 (metadata-only) or 2 (destination publication and imported source prefix/identity closure)",
     class: Class::Primary,
-    writes: 1,
-    reads: &[1],
+    writes: 2,
+    reads: &[1, 2],
 };
 
 /// The commit catalog.
@@ -549,6 +549,7 @@ pub const BACKUP_DEFINITION: FileKind = FileKind {
 pub const BACKUP_MANIFEST_FEATURES: &[&str] = &[
     "definitions",
     "evidence-configuration-history/1",
+    "evidence-configuration-history/2",
     "control/1",
 ];
 

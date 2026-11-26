@@ -196,6 +196,14 @@ pub(in crate::store) fn files(
             src: FileSource::File(file),
         });
     }
+    let imported_files =
+        crate::store::configuration_history::capture_import_files(root, &preparation, control)?;
+    if files.len().saturating_add(imported_files.len()) >= MAX_FILES {
+        return Err(unavailable(
+            "configuration closure exceeds backup manifest limits",
+        ));
+    }
+    files.extend(imported_files);
     control.check()?;
     Ok(files)
 }

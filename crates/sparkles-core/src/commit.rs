@@ -439,17 +439,17 @@ pub const DATASET_FORMAT: u32 = 2;
 /// record, see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
 /// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`], 8:
 /// configuration history, see [`crate::store::managed_history`], 9: the durable job
-/// ledger, see [`crate::jobs`]). Readers 1 to 4 named the pre-release forms, a dataset
-/// without branches, relinked generations, framed delta vocabularies or log headers, and
-/// [`OLDEST_DATASET_READER`] is the first one this build reads.
-/// [`crate::formats::DATASET`] lists them.
-pub const DATASET_READER: u32 = 9;
+/// ledger, see [`crate::jobs`], 10: imported configuration history origins,
+/// `evidence-history/origin.json` format 2, see [`crate::store::configuration_history`]).
+/// Readers 1 to 4 named the pre-release forms, a dataset without branches, relinked
+/// generations, framed delta vocabularies or log headers, and [`OLDEST_DATASET_READER`]
+/// is the first one this build reads. [`crate::formats::DATASET`] lists them.
+pub const DATASET_READER: u32 = 10;
 
-/// The reader an imported destination of the private import transport
-/// ([`reidentified_dataset_bytes`]) requires: one above what this build reads, so that
-/// no build accepts an imported destination before the lane that wires the import
-/// (roadmap item 61) raises [`DATASET_READER`] and the registry together.
-pub(crate) const IMPORTED_DESTINATION_READER: u32 = DATASET_READER + 1;
+/// The reader an imported destination (clones and new-identity restores of stores with
+/// activated configuration history) requires: reader 10, so releases before format 2
+/// origin descriptors refuse the dataset before opening it.
+pub(crate) const IMPORTED_DESTINATION_READER: u32 = 10;
 
 /// The oldest dataset reader this build reads: every store of the first release writes
 /// a log with a header record, so a `format` 2 dataset requires at least this reader.
@@ -788,6 +788,25 @@ pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> R
     ds.forked_from = Some(forked_from);
     write_dataset(root, &ds)?;
     crate::store::sync_dir(root)
+}
+
+/// Reidentify a closed, already-validated database directory whose configuration
+/// history is activated: preserve the source's provenance under
+/// `evidence-history/imports/`, establish a new destination configuration-history
+/// root and format 2 `evidence-history/origin.json`, and rewrite its primary
+/// identity files under `new_id`.
+pub fn reidentify_configuration_history(
+    root: &Path,
+    new_id: uuid::Uuid,
+    forked_from: ForkedFrom,
+    control: &crate::task::Control,
+) -> Result<()> {
+    crate::store::configuration_history::reidentify_activated_dir(
+        root,
+        new_id,
+        forked_from,
+        control,
+    )
 }
 
 /// Preserve the blank-node ordinal space of a standalone branch restore.
@@ -2695,16 +2714,13 @@ mod tests {
             let output =
                 reidentified_dataset_bytes(&raw, old, destination, 42, 2000, &preparation).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&output.value).unwrap();
-            // this build never accepts an imported destination it cannot read
-            const { assert!(IMPORTED_DESTINATION_READER > DATASET_READER) };
+            // releases before reader 10 refuse an imported destination; this build accepts it
+            const { assert!(IMPORTED_DESTINATION_READER == DATASET_READER) };
             assert!(matches!(
-                check_dataset_value_as(&value, DATASET_READER),
+                check_dataset_value_as(&value, IMPORTED_DESTINATION_READER - 1),
                 Err(Error::Unsupported(_))
             ));
-            assert!(matches!(
-                parse_dataset(&output.value),
-                Err(Error::Unsupported(_))
-            ));
+            parse_dataset(&output.value).unwrap();
             check_dataset_value_as(&value, IMPORTED_DESTINATION_READER).unwrap();
             let found: DatasetFile = serde_json::from_slice(&output.value).unwrap();
             assert_eq!(found.id, destination);

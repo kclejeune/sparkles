@@ -147,6 +147,19 @@ struct Capture {
     definitions: Vec<super::DefinitionFile>,
     /// the managed-graph registry's files (see [`crate::managed`]) at that time
     managed: Vec<(&'static str, Vec<u8>)>,
+    /// captured configuration-history state and source provenance, when activated
+    activated: Option<ActivatedCapture>,
+}
+
+struct ActivatedCapture {
+    managed_state: Arc<crate::managed::ManagedState>,
+    src_family: uuid::Uuid,
+    src_logical: uuid::Uuid,
+    src_head: u64,
+    src_generation: String,
+    source_files: Vec<(String, Vec<u8>)>,
+    prior_imports: Vec<super::configuration_history::PriorImportFiles>,
+    prior_direct_sources: Vec<crate::evidence::Sha256Digest>,
 }
 
 /// A clone's generation, built or shared.
@@ -217,16 +230,61 @@ impl Store {
             id: self.dataset_id,
             seq: snap.commit,
         };
-        write_synced(
-            &gdir.join("commit.json"),
-            &commit::gen_commit_bytes(id, "clone", &root),
+        let dataset_bytes = if cap.activated.is_some() {
+            commit::with_reader(
+                &commit::clone_dataset_file_bytes(id, now, forked_from),
+                commit::IMPORTED_DESTINATION_READER,
+            )?
+        } else {
+            commit::clone_dataset_file_bytes(id, now, forked_from)
+        };
+        write_atomic(&dir.join("dataset.json"), &dataset_bytes)?;
+        let commit_bytes = if let Some(activated) = &cap.activated {
+            let prep = clone_preparation(opts)?;
+            let installed = match activated.managed_state.as_ref() {
+                crate::managed::ManagedState::Installed(i) => i,
+                crate::managed::ManagedState::Unavailable { reason, .. } => {
+                    return Err(crate::managed::ManagedError::error(
+                        crate::managed::ManagedErrorKind::Unavailable,
+                        reason.clone(),
+                    ));
+                }
+            };
+            let genesis_id = super::configuration_history::write_clone_destination(
+                dir,
+                id,
+                &root,
+                installed,
+                activated.src_family,
+                activated.src_logical,
+                activated.src_head,
+                &activated.src_generation,
+                activated.source_files.clone(),
+                &activated.prior_imports,
+                activated.prior_direct_sources.clone(),
+                &prep,
+            )?;
+            commit::gen_commit_bytes_with_binding(
+                id,
+                "clone",
+                &root,
+                crate::history::ConfigurationBinding::Known {
+                    configuration: genesis_id,
+                },
+            )
+        } else {
+            commit::gen_commit_bytes(id, "clone", &root)
+        };
+        write_synced(&gdir.join("commit.json"), &commit_bytes)?;
+        super::wal::create(
+            &gdir.join("wal.log"),
+            if cap.activated.is_some() {
+                super::wal::version_with(true, self.control_enabled())
+            } else {
+                super::wal::PLAIN_VERSION
+            },
         )?;
-        super::wal::create(&gdir.join("wal.log"), super::wal::PLAIN_VERSION)?;
         sync_dir(&gdir)?;
-        write_atomic(
-            &dir.join("dataset.json"),
-            &commit::clone_dataset_file_bytes(id, now, forked_from),
-        )?;
         Catalog::create(&dir.join("commits.bin"), id, root)?;
         if !cap.prefixes.is_empty() {
             write_atomic(
@@ -371,7 +429,71 @@ impl Store {
         if self.control_enabled() {
             store.enable_control()?;
         }
-        store.install_managed_files(&cap.managed);
+        if let Some(activated) = &cap.activated {
+            let prep = clone_preparation(opts)?;
+            let installed = match activated.managed_state.as_ref() {
+                crate::managed::ManagedState::Installed(i) => i,
+                crate::managed::ManagedState::Unavailable { reason, .. } => {
+                    return Err(crate::managed::ManagedError::error(
+                        crate::managed::ManagedErrorKind::Unavailable,
+                        reason.clone(),
+                    ));
+                }
+            };
+            let mut dest_installed = crate::managed::Installed::new(
+                installed.graphs.clone(),
+                installed.settings.clone(),
+            )?;
+            let genesis = super::managed_history::prepare(
+                id,
+                uuid::Uuid::new_v4(),
+                1,
+                None,
+                &dest_installed,
+                &prep,
+            )?;
+            let coverage = super::managed_history::Coverage {
+                format: super::managed_history::FORMAT,
+                dataset_id: id,
+                lineage_id: genesis.identity.lineage_id,
+                activation_generation: genesis.identity.generation,
+                branches: BTreeMap::from([(
+                    id,
+                    super::managed_history::BranchCoverage {
+                        activation_head: 0,
+                        first_bound_own: 1,
+                    },
+                )]),
+            };
+            let (memory, hist_root) =
+                super::managed_history::MemoryHistory::initial(genesis, coverage, &prep)?;
+            let s = store.snapshot();
+            store.check_memory(
+                s.generation
+                    .disk_bytes()
+                    .saturating_add(super::delta_bytes(&s.delta))
+                    .saturating_add(s.generation.dvocab.with(|v| v.bytes()) as u64)
+                    .saturating_add(memory.retained()),
+            )?;
+            dest_installed.configuration_history = Some(hist_root.clone());
+            dest_installed.history_memory = Some(memory);
+            store
+                .family
+                .managed
+                .store(Some(Arc::new(crate::managed::ManagedState::Installed(
+                    dest_installed,
+                ))));
+            if let Some(mem_hist) = &store.mem_history {
+                mem_hist.lock().configurations.insert(
+                    0,
+                    crate::history::ConfigurationBinding::Known {
+                        configuration: hist_root.identity(id),
+                    },
+                );
+            }
+        } else {
+            store.install_managed_files(&cap.managed);
+        }
         report(opts, 0.95, "configuring indexes");
         self.configure_indexes(&store)?;
         report(opts, 1.0, "done");
@@ -407,29 +529,103 @@ impl Store {
     }
 
     fn clone_capture(&self, opts: &CloneOptions) -> Result<Capture> {
+        for _ in 0..2 {
+            if let Some(cap) = self.clone_capture_once(opts)? {
+                return Ok(cap);
+            }
+        }
+        Err(Error::Conflict(
+            "configuration changed twice during clone capture; retry".into(),
+        ))
+    }
+
+    fn clone_capture_once(&self, opts: &CloneOptions) -> Result<Option<Capture>> {
         self.failpoint("clone-admitting");
         let share = opts.mode != CloneMode::Rebuild && opts.at.is_none();
-        let (snap, next_bnode, lease, definitions, managed) = {
-            let w = self.lock_writer(&crate::guard::WriteOptions {
-                cancel: opts.cancel.clone(),
-                deadline: opts.deadline,
-                no_wait: opts.no_wait,
-                ..Default::default()
-            })?;
-            // A clone copies the registry, whose history root names an
-            // evidence-history closure and native generations of this identity that
-            // a clone does not carry (roadmap item 764). The writer's family permit
-            // excludes activation, so the state checked here is the one captured.
-            // Refuse before anything is captured or written.
-            if self.configuration_activated() {
-                return Err(activated_clone_refused());
-            }
+        let write_opts = crate::guard::WriteOptions {
+            cancel: opts.cancel.clone(),
+            deadline: opts.deadline,
+            no_wait: opts.no_wait,
+            ..Default::default()
+        };
+        let prep = clone_preparation(opts)?;
+        struct LockedActivated {
+            managed_state: Arc<crate::managed::ManagedState>,
+            identities: super::configuration_history::OriginalIdentities,
+            src_head: u64,
+            src_generation: String,
+            local_dataset: Option<Vec<u8>>,
+            local_current: Option<Vec<u8>>,
+            local_commit: Option<Vec<u8>>,
+            local_meta: Option<Vec<u8>>,
+        }
+        let (snap, next_bnode, lease, definitions, managed, locked_activated) = {
+            let w = self.lock_writer(&write_opts)?;
             let snap = self.snapshot();
             // under the same lock as the snapshot: a definition changed after it is
             // not the clone's. Read before the lease is taken, so that a failure
             // leaves no lease behind.
             let definitions = self.capture_definitions()?;
-            let managed = self.managed_files()?;
+            let (managed, locked_activated) = if self.configuration_activated() {
+                let state = self.managed_state_shared();
+                let is_installed = matches!(
+                    state.as_deref(),
+                    Some(crate::managed::ManagedState::Installed(i))
+                        if i.configuration_history.is_some()
+                );
+                if !is_installed {
+                    let reason = match state.as_deref() {
+                        Some(crate::managed::ManagedState::Unavailable { reason, .. }) => {
+                            reason.clone()
+                        }
+                        _ => "activated configuration history is unavailable".into(),
+                    };
+                    return Err(crate::managed::ManagedError::error(
+                        crate::managed::ManagedErrorKind::Unavailable,
+                        format!("cannot clone dataset: {reason}"),
+                    ));
+                }
+                let identities = super::configuration_history::OriginalIdentities::capture(
+                    self, &w, &state, &prep,
+                )?;
+                let src_generation = if self.root.is_some() {
+                    snap.generation.name.clone()
+                } else {
+                    "gen-0001".to_owned()
+                };
+                let (local_dataset, local_current, local_commit, local_meta) =
+                    if let Some(root) = &self.root {
+                        let ds = std::fs::read(root.join("dataset.json"))?;
+                        let cur = std::fs::read(root.join("CURRENT"))?;
+                        let gdir = root.join(&src_generation);
+                        let (cj, mj) = if snap.generation.link.is_none() {
+                            (
+                                std::fs::read(gdir.join("commit.json")).ok(),
+                                std::fs::read(gdir.join("meta.json")).ok(),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        (Some(ds), Some(cur), cj, mj)
+                    } else {
+                        (None, None, None, None)
+                    };
+                (
+                    Vec::new(),
+                    Some(LockedActivated {
+                        managed_state: state.expect("checked installed"),
+                        identities,
+                        src_head: w.head.seq,
+                        src_generation,
+                        local_dataset,
+                        local_current,
+                        local_commit,
+                        local_meta,
+                    }),
+                )
+            } else {
+                (self.managed_files()?, None)
+            };
             let lease = match (&self.root, &self.history) {
                 // a linked generation's base files are its upstream's: rebuilt
                 (Some(root), Some(h))
@@ -446,7 +642,14 @@ impl Store {
                 }
                 _ => None,
             };
-            (snap, w.next_bnode, lease, definitions, managed)
+            (
+                snap,
+                w.next_bnode,
+                lease,
+                definitions,
+                managed,
+                locked_activated,
+            )
         };
         // from here on, dropping the guard releases the lease
         let files = lease.map(|(dir, no, label, id)| {
@@ -462,6 +665,107 @@ impl Store {
             };
             (dir, guard)
         });
+        let activated = if let Some(locked) = locked_activated {
+            let installed = match locked.managed_state.as_ref() {
+                crate::managed::ManagedState::Installed(i) => i,
+                _ => unreachable!("checked installed"),
+            };
+            let mut source_files: Vec<(String, Vec<u8>)> = Vec::new();
+            source_files.push((
+                "family-dataset.json".into(),
+                locked.identities.family_document().to_vec(),
+            ));
+            let ds_bytes = match locked.local_dataset {
+                Some(b) => b,
+                None if locked.identities.family() == locked.identities.logical() => {
+                    locked.identities.family_document().to_vec()
+                }
+                None => commit::with_reader(
+                    &commit::dataset_file_bytes(
+                        locked.identities.logical(),
+                        "memory-capture",
+                        self.now_ms(),
+                    ),
+                    super::managed_history::READER,
+                )?,
+            };
+            source_files.push(("dataset.json".into(), ds_bytes));
+            let cur_bytes = locked
+                .local_current
+                .unwrap_or_else(|| format!("{}\n", locked.src_generation).into_bytes());
+            source_files.push(("CURRENT".into(), cur_bytes));
+            if let Some(branch_bytes) = locked.identities.branch_document() {
+                source_files.push(("branch.json".into(), branch_bytes.to_vec()));
+            }
+            if let Some(cj) = locked.local_commit {
+                source_files.push((format!("{}/commit.json", locked.src_generation), cj));
+            }
+            if let Some(mj) = locked.local_meta {
+                source_files.push((format!("{}/meta.json", locked.src_generation), mj));
+            }
+            let (prior_imports, prior_direct_sources) = if let Some(family_root) =
+                self.managed_root()
+            {
+                let captured = super::managed_history::capture::files(
+                    &family_root,
+                    self.owner_dataset_id(),
+                    installed,
+                    &write_opts,
+                );
+                if !self.same_managed_state(&Some(locked.managed_state.clone())) {
+                    return Ok(None);
+                }
+                for cf in captured? {
+                    if cf.path.starts_with("evidence-history/imports/") {
+                        continue;
+                    }
+                    let mut buf = vec![0u8; usize::try_from(cf.len).map_err(|_| prep.exhausted())?];
+                    if !buf.is_empty() {
+                        cf.read_exact_at(0, &mut buf)?;
+                    }
+                    source_files.push((cf.path, buf));
+                }
+                super::configuration_history::read_prior_imports_for_clone(&family_root, &prep)?
+            } else {
+                let memory = installed.history_memory.as_ref().ok_or_else(|| {
+                    super::managed_history::unavailable("in-memory configuration history missing")
+                })?;
+                source_files.push((crate::managed::FILE.into(), installed.file_bytes()));
+                for (owner, bytes) in &installed.settings {
+                    source_files.push((owner.settings_file().into(), bytes.to_vec()));
+                }
+                let lineage = memory.coverage.value.lineage_id;
+                let cov_bytes = super::managed_history::encode(&memory.coverage.value, &prep)?;
+                source_files.push((
+                    format!("evidence-history/{lineage}/coverage.json"),
+                    cov_bytes.value,
+                ));
+                let mut node = Some(memory.as_ref());
+                while let Some(cur) = node {
+                    prep.check()?;
+                    let hex = cur.prepared.identity.generation.to_string();
+                    let hex = hex.strip_prefix("sha256:").expect("canonical digest");
+                    source_files.push((
+                        format!("evidence-history/{lineage}/generations/{hex}.json"),
+                        cur.prepared.bytes.value.clone(),
+                    ));
+                    node = cur.previous.as_deref();
+                }
+                (Vec::new(), Vec::new())
+            };
+            Some(ActivatedCapture {
+                managed_state: locked.managed_state,
+                src_family: locked.identities.family(),
+                src_logical: locked.identities.logical(),
+                src_head: locked.src_head,
+                src_generation: locked.src_generation,
+                source_files,
+                prior_imports,
+                prior_direct_sources,
+            })
+        } else {
+            None
+        };
         self.failpoint("clone-captured");
         // a past state: its blank nodes are older than the counter, which never decreases
         let snap = match &opts.at {
@@ -474,14 +778,15 @@ impl Store {
             }
             None => snap,
         };
-        Ok(Capture {
+        Ok(Some(Capture {
             snap,
             next_bnode,
             prefixes: self.prefixes(),
             files,
             definitions,
             managed,
-        })
+            activated,
+        }))
     }
 
     /// Make the clone's generation in `gdir`: share the captured generation's files when
@@ -799,12 +1104,14 @@ impl Drop for CleanDir<'_> {
 #[path = "clone_tests.rs"]
 mod tests;
 
-/// The refusal of a clone whose source family has activated configuration history.
-fn activated_clone_refused() -> Error {
-    Error::Unsupported(
-        "cloning a store whose configuration history is activated is not supported: the \
-         clone would keep the registry's history root without its evidence-history closure. \
-         Back the store up and restore it with its identity kept instead"
-            .into(),
-    )
+fn clone_preparation(opts: &CloneOptions) -> Result<crate::access::Preparation> {
+    super::managed_history::administrative_preparation_with(crate::task::Control {
+        cancel: opts
+            .cancel
+            .clone()
+            .map(crate::task::Cancel::from_flag)
+            .unwrap_or_default(),
+        deadline: opts.deadline,
+        ..Default::default()
+    })
 }

@@ -2107,6 +2107,12 @@ impl Store {
             dataset
         } else if history_files.is_empty() {
             crate::commit::with_reader(&dataset, crate::managed::READER)?
+        } else if history_files
+            .iter()
+            .any(|file| file.path == "evidence-history/origin.json")
+        {
+            // an imported destination needs the imported-origin reader
+            crate::commit::with_reader(&dataset, crate::commit::IMPORTED_DESTINATION_READER)?
         } else {
             // an activated store's files need the configuration-history reader
             crate::commit::with_reader(&dataset, super::managed_history::READER)?

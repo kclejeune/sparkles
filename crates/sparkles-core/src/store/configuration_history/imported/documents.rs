@@ -333,6 +333,37 @@ pub(super) fn source_header(
                 Ok(())
             },
         )?;
+    } else if root_name == "main" && descriptor.files.contains_key(ROOT_FILE) {
+        let origin_bytes = read_member(directory, descriptor, ROOT_FILE, preparation)?;
+        let decoded = Origin::decode(&origin_bytes.value, preparation)?;
+        if decoded.value.format == 2
+            && let Some(publication) = &decoded.value.destination
+            && publication.creation_commit.is_some()
+        {
+            let commit_path = format!("{}/commit.json", root.generation);
+            if descriptor.files.contains_key(&commit_path) {
+                let commit_bytes = read_member(directory, descriptor, &commit_path, preparation)?;
+                let allowance = preparation.room();
+                let _loan = preparation.reserve(allowance)?;
+                let options = crate::history::HistoryOptions {
+                    cancel: Some(preparation.control().cancel.flag()),
+                    deadline: preparation.control().deadline,
+                };
+                let mut budget = crate::store::cold::ColdBudget::new(crate::history::ReadLimit {
+                    options: &options,
+                    memory: Some(allowance),
+                    held: 0,
+                })?;
+                let physical = crate::commit::decode_gen_commit_bytes_controlled(
+                    Path::new("original-primary/commit.json"),
+                    &commit_bytes.value,
+                    &mut budget,
+                )?;
+                let actual = physical.value;
+                drop(_loan);
+                origin = publication.creation_origin(&actual, preparation)?;
+            }
+        }
     }
     let header = primary::Header::from_coverage(
         descriptor.family_id,

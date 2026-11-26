@@ -928,7 +928,7 @@ fn retained_original_header_reauthenticates_its_target_in_each_operation() {
 }
 
 #[test]
-fn a_clone_racing_memory_activation_refuses_under_the_writer() {
+fn a_clone_racing_memory_activation_establishes_an_independent_destination_root() {
     let store = Store::in_memory(StoreOptions::default());
     update(&store, "before");
     store.set_failpoint(
@@ -940,18 +940,27 @@ fn a_clone_racing_memory_activation_refuses_under_the_writer() {
     );
     let temporary = tempfile::tempdir().unwrap();
     let destination = temporary.path().join("clone");
-    let error = store
+    let report = store
         .clone_to(&destination, &Default::default())
-        .expect_err("a clone admitted after activation must refuse");
-    assert_eq!(error.code(), "unsupported", "{error}");
-    assert!(!destination.exists());
+        .expect("a clone admitted after activation establishes a destination root");
+    assert!(destination.join("evidence-history/origin.json").is_file());
+    let cloned = Store::open(&destination, StoreOptions::default()).unwrap();
+    assert_eq!(cloned.dataset_id(), report.dataset_id);
+    assert_ne!(cloned.dataset_id(), store.dataset_id());
+    let src_head = store.evidence_view(&At::Head, &preparation()).unwrap();
+    let dst_head = cloned.evidence_view(&At::Head, &preparation()).unwrap();
+    assert_eq!(dst_head.configuration().dataset_id(), cloned.dataset_id());
+    assert_ne!(dst_head.configuration(), src_head.configuration());
+    drop(cloned);
     store.set_failpoint("clone-admitting", None);
-    let error = store
+    let (memory, mem_report) = store
         .clone_to_memory(&Default::default(), StoreOptions::default())
-        .err()
-        .expect("an activated in-memory store must not clone");
-    assert_eq!(error.code(), "unsupported", "{error}");
+        .expect("an activated in-memory store clones into memory");
+    let mem_head = memory.evidence_view(&At::Head, &preparation()).unwrap();
+    assert_eq!(mem_head.configuration().dataset_id(), mem_report.dataset_id);
+    assert_ne!(mem_head.configuration(), src_head.configuration());
     update(&store, "after");
+    update(&memory, "clone-after");
 }
 
 /// `sparkles check` runs this validation on a live root. Commits that land while it

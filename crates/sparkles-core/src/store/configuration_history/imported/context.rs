@@ -99,7 +99,7 @@ struct Range {
 
 /// This remains pending until the whole same-byte prefix, interval digests and
 /// real transaction/durability framing have finished. It exposes no observations.
-pub(super) struct Pending {
+pub(in crate::store) struct Pending {
     sources: Sources,
     ranges: Vec<Range>,
     native: primary::Header,
@@ -115,8 +115,8 @@ pub(super) struct Pending {
 
 /// The complete result keeps the real source payload before its final credit.
 /// It is not Clone and has no constructor outside the completed physical proof.
-pub(super) struct Completed {
-    pub(super) replay: crate::store::Replay,
+pub(in crate::store) struct Completed {
+    pub(in crate::store) replay: crate::store::Replay,
     pub(super) imports: Retained,
 }
 
@@ -203,7 +203,7 @@ impl Retained {
 impl Pending {
     /// Only the main opening path may use this entry. Linked/retained/capture
     /// actors must keep their own physical owner and are wired separately.
-    pub(super) fn opening(
+    pub(in crate::store) fn opening(
         root: &Path,
         family: &Arc<crate::store::family::Family>,
         lock: &Arc<crate::store::ProcessLock>,
@@ -302,6 +302,16 @@ impl Pending {
             if matches!(actual.configuration, ConfigurationBinding::Known { .. }) {
                 native.generation(root, preparation, actual.commit.seq, actual.configuration)?;
             }
+        } else if let ConfigurationBinding::ImportedUnbound { source } = actual.configuration {
+            // A compaction of an imported destination before its first own commit
+            // writes a fresh generation whose base sequence is still below the
+            // destination's own cutoff and retains the authenticated source binding.
+            if !native.is_pre_cutoff(actual.commit.seq) {
+                return Err(managed_history::unavailable(
+                    "covered destination generation cannot hold an imported configuration binding",
+                ));
+            }
+            resolve_any_source(&sources, source, preparation)?;
         } else {
             native.generation(root, preparation, actual.commit.seq, actual.configuration)?;
             if matches!(actual.configuration, ConfigurationBinding::LegacyUnbound) {
@@ -403,10 +413,21 @@ impl Pending {
         }
     }
 
+    /// Verify that an opening without a WAL file declares no imported WAL
+    /// intervals for the opened generation.
+    pub(in crate::store) fn verify_no_wal(self) -> Result<()> {
+        if !self.ranges.is_empty() {
+            return Err(managed_history::unavailable(
+                "imported WAL is missing its declared source intervals",
+            ));
+        }
+        Ok(())
+    }
+
     /// The caller lends the one immutable buffer already read by the genuine
     /// opening. Both proof and replay consume that exact slice. No path reopen,
     /// cursor assumption, data cache entry or truncation occurs in this method.
-    pub(super) fn replay(
+    pub(in crate::store) fn replay(
         mut self,
         from: &crate::store::ReplayFrom<'_>,
         bytes: &[u8],
@@ -639,6 +660,43 @@ fn resolve_prior(
     }
     Err(managed_history::unavailable(
         "imported base publication is not in its reachable original sources",
+    ))
+}
+
+/// Authenticate an `ImportedUnbound` identity against any declared source in
+/// `sources` (used for compacted pre-cutoff bases and branches of an imported
+/// destination).
+pub(super) fn resolve_any_source(
+    sources: &Sources,
+    identity: ConfigurationIdentity,
+    preparation: &Preparation,
+) -> Result<()> {
+    for node in &sources.nodes {
+        preparation.check()?;
+        if node.descriptor.value.family_id == identity.dataset_id {
+            let _paths = preparation.reserve(1024)?;
+            let path = format!(
+                "evidence-history/{}/generations/{}.json",
+                identity.lineage_id,
+                identity
+                    .generation
+                    .to_string()
+                    .strip_prefix("sha256:")
+                    .expect("canonical digest")
+            );
+            if node.descriptor.value.files.contains_key(&path) {
+                drop(documents::source_publication(
+                    &node.directory,
+                    &node.descriptor.value,
+                    identity,
+                    preparation,
+                )?);
+                return preparation.check();
+            }
+        }
+    }
+    Err(managed_history::unavailable(
+        "imported configuration identity is not in any declared original source",
     ))
 }
 

@@ -2,10 +2,11 @@
 //! never permission to replay a foreign seal. Physical/source proofs are separate.
 
 mod closure;
-mod context;
-mod destination;
+pub(in crate::store) mod context;
+pub(in crate::store) mod destination;
 mod documents;
 mod identities;
+pub(in crate::store) mod reidentify;
 
 /// Only the fixed original history member is exposed to the genuine capture.
 /// Opened retains the established anchored, no-follow component semantics.
@@ -61,6 +62,15 @@ pub(in crate::store) fn opening_origin_selection(
     root: &Path,
     preparation: &Preparation,
 ) -> Result<Option<Sha256Digest>> {
+    Ok(opening_origin_info(root, preparation)?.map(|(digest, _)| digest))
+}
+
+/// Select the small origin root and its format version (`1` or `2`). Format 2
+/// requires [`crate::commit::IMPORTED_DESTINATION_READER`] in `dataset.json`.
+pub(in crate::store) fn opening_origin_info(
+    root: &Path,
+    preparation: &Preparation,
+) -> Result<Option<(Sha256Digest, u32)>> {
     preparation.check()?;
     let _paths = preparation.reserve(
         (root.as_os_str().len() as u64)
@@ -106,14 +116,6 @@ pub(in crate::store) fn opening_origin_selection(
         .child("origin.json", false, preparation)?
         .bytes(None, preparation)?;
     let origin = Origin::decode(&encoded.value, preparation)?;
-    if origin.value.format != FORMAT {
-        // The v2 codec is still private source work. Keep the real opening gate
-        // closed until its producer and every physical consumer are wired and
-        // the required dataset/backup reader boundary is enabled together.
-        return Err(Error::Unsupported(
-            "destination import publication is not enabled by this reader".into(),
-        ));
-    }
     let identity = family
         .child("dataset.json", false, preparation)?
         .bytes(None, preparation)?;
@@ -122,9 +124,19 @@ pub(in crate::store) fn opening_origin_selection(
             "opening origin belongs to another family",
         ));
     }
+    if origin.value.format == 2 {
+        let versions = crate::commit::read_dataset_versions(root)?;
+        let reader = versions.map_or(0, |v| v.minimum_reader);
+        if reader < crate::commit::IMPORTED_DESTINATION_READER {
+            return Err(Error::Unsupported(format!(
+                "evidence-history/origin.json has format 2, which requires dataset reader {}; this dataset records reader {reader}",
+                crate::commit::IMPORTED_DESTINATION_READER
+            )));
+        }
+    }
     let digest = Sha256Digest::of_bytes(&encoded.value, preparation.control())?;
     preparation.check()?;
-    Ok(Some(digest))
+    Ok(Some((digest, origin.value.format)))
 }
 
 /// Physical storage is independent of the family's mutable identity. Main stays
@@ -399,7 +411,7 @@ pub(in crate::store) fn source_member(path: &str) -> bool {
         || lineage_file(path)
 }
 
-fn imported_path(path: &str) -> bool {
+pub(in crate::store) fn imported_path(path: &str) -> bool {
     if path == ROOT_FILE {
         return true;
     }
