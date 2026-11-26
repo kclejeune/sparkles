@@ -619,6 +619,53 @@ fn predicates(
     Ok(Some(ids))
 }
 
+fn allows_blank_nodes(graphs: &Graphs) -> bool {
+    match graphs {
+        Graphs::All => true,
+        Graphs::Only(rule) => rule.blank_nodes,
+    }
+}
+
+fn is_empty_graphs(graphs: &Graphs) -> bool {
+    match graphs {
+        Graphs::All => false,
+        Graphs::Only(rule) => {
+            !rule.default_graph
+                && !rule.blank_nodes
+                && rule.iris.is_empty()
+                && rule.patterns.is_empty()
+        }
+    }
+}
+
+fn exact_named_graph_ids(
+    graphs: &Graphs,
+    snap: &Snapshot,
+    preparation: &Preparation,
+) -> Result<Option<Map<u64, ()>>> {
+    let Graphs::Only(rule) = graphs else {
+        return Ok(None);
+    };
+    if !rule.patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut ids = Map::new(preparation)?;
+    if rule.default_graph
+        && let Some(id) = preparation.lookup_iri(snap, crate::sparql::ctx::DEFAULT_GRAPH_IRI)?
+    {
+        ids.insert(id.0, ())?;
+    }
+    for iri in &rule.iris {
+        preparation.check()?;
+        if preparation.allows_named_graph_iri(graphs, iri)?
+            && let Some(id) = preparation.lookup_iri(snap, iri)?
+        {
+            ids.insert(id.0, ())?;
+        }
+    }
+    Ok(Some(ids))
+}
+
 fn hidden(
     access: &GraphAccess,
     rules: &TripleRules,
@@ -627,6 +674,7 @@ fn hidden(
 ) -> Result<Buffer<Key>> {
     let mut hidden = Buffer::new(preparation)?;
     let mut read = Map::new(preparation)?;
+    let exact_readable = exact_named_graph_ids(&access.read, snap, preparation)?;
     for rule in &rules.rules {
         preparation.check()?;
         if rule.read.is_all() {
@@ -657,6 +705,12 @@ fn hidden(
             )?),
             None => None,
         };
+        let exact_protected = match &protection.graphs {
+            Some(graphs) => exact_named_graph_ids(graphs, snap, preparation)?,
+            None => None,
+        };
+        let covers_all_named = protection.graphs.as_ref().is_none_or(Graphs::is_all);
+        let rule_allows_none = is_empty_graphs(&rule.read);
         let mut by_graph = Map::new(preparation)?;
         let mut visit = |quad: [Id; 4]| -> Result<bool> {
             preparation.check()?;
@@ -664,31 +718,87 @@ fn hidden(
             let hide = if let Some(&hide) = by_graph.get(&graph.0) {
                 hide
             } else {
-                let readable = if let Some(&readable) = read.get(&graph.0) {
+                let hide = if graph == Id::DEFAULT_GRAPH {
+                    let readable = if let Some(&readable) = read.get(&graph.0) {
+                        readable
+                    } else {
+                        let readable = access.read.default_graph();
+                        read.insert(graph.0, readable)?;
+                        readable
+                    };
                     readable
+                        && preparation.covers_graph(protection, None)?
+                        && !preparation.allows(&rule.read, None)?
+                } else if graph.tag() == crate::id::Tag::BNode {
+                    let readable = if let Some(&readable) = read.get(&graph.0) {
+                        readable
+                    } else {
+                        let readable = allows_blank_nodes(&access.read);
+                        read.insert(graph.0, readable)?;
+                        readable
+                    };
+                    readable
+                        && protection.graphs.as_ref().is_none_or(allows_blank_nodes)
+                        && !allows_blank_nodes(&rule.read)
+                } else if exact_protected
+                    .as_ref()
+                    .is_some_and(|exact| !exact.contains_key(&graph.0))
+                {
+                    false
                 } else {
-                    let readable = if graph == Id::DEFAULT_GRAPH {
-                        access.read.default_graph()
-                    } else {
-                        preparation.with_term(snap, graph, |term| match term {
-                            Some(term) => preparation.allows(&access.read, Some(term)),
-                            None => Ok(false),
-                        })?
+                    let eval_hide_iri = |iri: Option<&str>| -> Result<bool> {
+                        match iri {
+                            Some(iri) => Ok(preparation.covers_named_graph_iri(protection, iri)?
+                                && !preparation.allows_named_graph_iri(&rule.read, iri)?),
+                            None => Ok(covers_all_named),
+                        }
                     };
-                    read.insert(graph.0, readable)?;
-                    readable
+                    if let Some(&readable) = read.get(&graph.0) {
+                        if !readable {
+                            false
+                        } else if covers_all_named && rule_allows_none {
+                            true
+                        } else {
+                            preparation.with_iri(snap, graph, eval_hide_iri)?
+                        }
+                    } else if let Some(exact) = &exact_readable {
+                        let readable = exact.contains_key(&graph.0);
+                        read.insert(graph.0, readable)?;
+                        if !readable {
+                            false
+                        } else if covers_all_named && rule_allows_none {
+                            true
+                        } else {
+                            preparation.with_iri(snap, graph, eval_hide_iri)?
+                        }
+                    } else if access.read.is_all() {
+                        read.insert(graph.0, true)?;
+                        if covers_all_named && rule_allows_none {
+                            true
+                        } else {
+                            preparation.with_iri(snap, graph, eval_hide_iri)?
+                        }
+                    } else {
+                        let (readable, hide) = preparation.with_iri(snap, graph, |iri| {
+                            let readable = match iri {
+                                Some(iri) => {
+                                    preparation.allows_named_graph_iri(&access.read, iri)?
+                                }
+                                None => false,
+                            };
+                            let hide = if !readable {
+                                false
+                            } else if covers_all_named && rule_allows_none {
+                                true
+                            } else {
+                                eval_hide_iri(iri)?
+                            };
+                            Ok((readable, hide))
+                        })?;
+                        read.insert(graph.0, readable)?;
+                        hide
+                    }
                 };
-                let hide = readable
-                    && if graph == Id::DEFAULT_GRAPH {
-                        preparation.covers_graph(protection, None)?
-                            && !preparation.allows(&rule.read, None)?
-                    } else {
-                        preparation.with_term(snap, graph, |term| match term {
-                            Some(term) => Ok(preparation.covers_graph(protection, Some(term))?
-                                && !preparation.allows(&rule.read, Some(term))?),
-                            None => Ok(false),
-                        })?
-                    };
                 by_graph.insert(graph.0, hide)?;
                 hide
             };
@@ -893,9 +1003,8 @@ fn passes(
     snap.for_each_graph_id_checked(
         || preparation.check(),
         |graph| {
-            preparation.with_term(snap, graph, |term| {
-                if let Some(Term::NamedNode(node)) = term {
-                    let iri = node.as_str();
+            preparation.with_iri(snap, graph, |iri| {
+                if let Some(iri) = iri {
                     names_held.merge(preparation.reserve(iri.len() as u64)?);
                     let mut name = String::new();
                     name.try_reserve_exact(iri.len())

@@ -920,6 +920,34 @@ impl Preparation {
         Ok(false)
     }
 
+    pub(crate) fn allows_named_graph_iri(&self, graphs: &Graphs, iri: &str) -> Result<bool> {
+        self.check()?;
+        let Graphs::Only(rule) = graphs else {
+            return Ok(true);
+        };
+        if iri == crate::sparql::ctx::DEFAULT_GRAPH_IRI {
+            Ok(rule.default_graph)
+        } else if iri == crate::sparql::ctx::UNION_GRAPH_IRI {
+            Ok(false)
+        } else {
+            self.named_rule(rule, iri)
+        }
+    }
+
+    pub(crate) fn covers_named_graph_iri(
+        &self,
+        protection: &Protection,
+        iri: &str,
+    ) -> Result<bool> {
+        match &protection.graphs {
+            Some(graphs) => self.allows_named_graph_iri(graphs, iri),
+            None => {
+                self.check()?;
+                Ok(true)
+            }
+        }
+    }
+
     pub(crate) fn covers_graph(
         &self,
         protection: &Protection,
@@ -975,6 +1003,12 @@ impl Preparation {
         each: impl FnMut([Id; 4]) -> Result<bool>,
     ) -> Result<()> {
         snap.scan_prepared(perm, prefix, self, each)
+    }
+
+    /// Check whether `quad` is present in `snap` under this preparation's controls
+    /// and memory budget.
+    pub fn contains(&self, snap: &Snapshot, quad: &[Id; 4]) -> Result<bool> {
+        snap.contains_prepared(quad, self)
     }
 
     /// Resolve an IRI with controlled reconstruction and delta-vocabulary waiting.
@@ -1117,7 +1151,8 @@ impl Preparation {
     /// The IRI text of a stored named node, borrowed for `each` without full term
     /// decoding. Only the key's own bytes and the reconstruction workspace are
     /// charged, so a long rejected IRI does not pay the general term-decoder
-    /// multiplier. `None` for any non-IRI term.
+    /// multiplier. `None` for any non-IRI term. Vocabulary locks are released
+    /// before the callback.
     pub fn with_iri<R>(
         &self,
         snap: &Snapshot,
@@ -1152,12 +1187,37 @@ impl Preparation {
                     )?
                 }
             }
-            Tag::Delta => snap.generation.dvocab.with_prepared(self, |vocab| {
-                if id.payload() >= snap.dvocab_len {
-                    return Ok(None);
+            Tag::Delta => {
+                // Copy the delta IRI into a budgeted temporary buffer so the delta
+                // vocabulary read lock is released before invoking `each`.
+                let copied: Option<(String, Reservation)> =
+                    snap.generation.dvocab.with_prepared(self, |vocab| {
+                        if id.payload() >= snap.dvocab_len {
+                            return Ok(None);
+                        }
+                        let Some(key) = vocab.get(id.payload()) else {
+                            return Ok(None);
+                        };
+                        let Some(text) = key.strip_prefix(b"<") else {
+                            return Ok(None);
+                        };
+                        let Ok(text) = std::str::from_utf8(text) else {
+                            return Ok(None);
+                        };
+                        let mut held = self.reserve(0)?;
+                        let owned = self.copy_string(text, &mut held)?;
+                        Ok(Some((owned, held)))
+                    })?;
+                let out = (each.take().expect("called once"))(
+                    copied.as_ref().map(|(text, _)| text.as_str()),
+                )?;
+                if let Some((owned, held)) = copied {
+                    drop(owned);
+                    drop(held);
                 }
-                Ok(vocab.get(id.payload()).map(&mut call))
-            })?,
+                self.check()?;
+                return Ok(out);
+            }
             _ => None,
         };
         let result = match result {

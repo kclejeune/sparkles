@@ -14,6 +14,38 @@ impl Snapshot {
         self.scan_prepared_inner::<E, false>(perm, prefix, preparation, each)
     }
 
+    /// Check whether `quad` exists in this snapshot under `preparation`'s controls
+    /// and memory budget, using controlled base-index reads when the delta does not
+    /// decide membership.
+    pub(crate) fn contains_prepared(
+        &self,
+        quad: &[Id; 4],
+        preparation: &Preparation,
+    ) -> Result<bool> {
+        preparation.check()?;
+        let k = Perm::Spo.to_key(quad);
+        let pi = Perm::Spo.index();
+        if self.delta.ins[pi].contains(&k) {
+            return Ok(true);
+        }
+        if self.delta.del[pi].contains(&k) {
+            return Ok(false);
+        }
+        let mut found = false;
+        self.perm(Perm::Spo).for_each_prepared::<Error, false>(
+            &self.cache,
+            &k,
+            &k,
+            preparation,
+            |_| false,
+            |_, _, _| {
+                found = true;
+                Ok(false)
+            },
+        )?;
+        Ok(found)
+    }
+
     /// Check one physical graph without scanning past its first surviving quad.
     pub(crate) fn graph_exists_prepared(&self, id: Id, preparation: &Preparation) -> Result<bool> {
         let mut exists = false;

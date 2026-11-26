@@ -2269,3 +2269,219 @@ fn historical_dependents_bind_guard_and_mask_to_selected_snapshot() {
     .unwrap();
     assert!(head_masked.reports.is_empty());
 }
+
+/// Combined graph restrictions and triple masks at `find_dependents` and
+/// `find_dependents_at` must not decode unreadable 140 KiB report graph IRIs into a
+/// `BudgetExceeded(Memory)` refusal during mask preparation, while still masking hidden
+/// triples in both readable proposal graphs and admitted report graphs.
+#[test]
+fn combined_graph_restriction_and_triple_mask_skip_oversized_unreadable_graph() {
+    use sparkles::access::{Decider, triples};
+
+    let ds = Dataset::memory();
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    evidence::configure(&ds, &settings(), &Control::none()).unwrap();
+
+    let c = claim(&ds, "advisory");
+    let a_ok = assess_in(&ds, CLAIMS, "a-visible", &c.0, &[]);
+    let a_secret = assess(&ds, "a-secret", &c.0, &[]);
+    add_report(
+        &ds,
+        REPORTS,
+        "urn:report:ok",
+        Some("urn:comm:1"),
+        &[c.0.as_str()],
+    );
+    add_report(
+        &ds,
+        REPORTS,
+        "urn:report:secret",
+        Some("urn:comm:2"),
+        &[c.0.as_str()],
+    );
+
+    let huge_unreadable = format!("urn:x-sparkles:graphrag:hidden-{}", "x".repeat(140 * 1024));
+    ds.update(&format!(
+        "INSERT DATA {{ \
+            GRAPH <{REPORTS}> {{ \
+                <urn:report:secret> <urn:secret:tag> \"hidden\" . \
+            }} \
+            GRAPH <{huge_unreadable}> {{ \
+                <{c_iri}> <{RDF_TYPE}> <{GR}Report> . \
+                <urn:hidden:rep> <{RDF_TYPE}> <{GR}Report> ; \
+                    <urn:x-sparkles:evidence:conclusion> \"hidden\" ; \
+                    <urn:secret:tag> \"hidden\" . \
+                <urn:hidden:act> <{RDF_TYPE}> <{PROV_ACTIVITY}> ; <{PROV_USED}> <{c_iri}> . \
+            }} \
+        }}",
+        c_iri = c.0.as_str(),
+    ))
+    .unwrap();
+
+    let seq = ds.store().head_commit().seq;
+    let view = ds
+        .store()
+        .evidence_view(&sparkles::history::At::Commit(seq), &prep)
+        .unwrap();
+
+    let combined_mask_rules = || triples::TripleRules {
+        rules: vec![
+            triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "hide-analyses-conclusion".into(),
+                    predicates: Some(vec!["urn:x-sparkles:evidence:conclusion".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::Only(GraphRule::new([CLAIMS], &[])),
+                write: Graphs::none(),
+            },
+            triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "hide-secret-tag".into(),
+                    predicates: Some(vec!["urn:secret:tag".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            },
+        ],
+        caller: triples::Caller::default(),
+        limits: triples::Limits::default(),
+    };
+
+    // 1. Exact graph allowlist + triple mask covering predicates present in
+    //    `huge_unreadable` and `ANALYSES`. Both head and historical lookups succeed,
+    //    hide `a_secret` in the readable proposal graph, and ignore `huge_unreadable`.
+    let narrow_masked = Arc::new(GraphAccess::with_triples(
+        Graphs::Only(GraphRule::new([CLAIMS, ANALYSES], &[])),
+        Graphs::none(),
+        combined_mask_rules(),
+    ));
+    for res in [
+        evidence::find_dependents(
+            &ds,
+            &ds,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(narrow_masked.clone()),
+            &Control::none(),
+        )
+        .unwrap(),
+        evidence::find_dependents_at(
+            &view,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(narrow_masked),
+            &Control::none(),
+        )
+        .unwrap(),
+    ] {
+        assert_eq!(res.dependents.len(), 1);
+        assert_eq!(res.dependents[0].assessment, a_ok);
+        assert!(res.reports.is_empty());
+    }
+
+    // 2. Guarded wildcard policy + triple mask: both readable proposal graphs and
+    //    admitted report graphs stay masked, and `huge_unreadable` does not trigger a
+    //    memory refusal during mask preparation.
+    let guarded_masked = Arc::new(GraphAccess::with_triples(
+        Graphs::All.guarded_by(
+            "urn:x-sparkles:graphrag:*",
+            Decider(Arc::new(FixedGuard(vec![REPORTS.into()]))),
+        ),
+        Graphs::none(),
+        combined_mask_rules(),
+    ));
+    for res in [
+        evidence::find_dependents(
+            &ds,
+            &ds,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(guarded_masked.clone()),
+            &Control::none(),
+        )
+        .unwrap(),
+        evidence::find_dependents_at(
+            &view,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(guarded_masked),
+            &Control::none(),
+        )
+        .unwrap(),
+    ] {
+        assert_eq!(res.dependents.len(), 1);
+        assert_eq!(res.dependents[0].assessment, a_ok);
+        assert_eq!(res.reports.len(), 1);
+        assert_eq!(res.reports[0].report.as_str(), "urn:report:ok");
+        assert_eq!(res.reports[0].graph.as_str(), REPORTS);
+    }
+
+    // 3. Class-based triple mask on `gr:Report` (present in `huge_unreadable`) combined
+    //    with the narrow allowlist also succeeds at both head and historical entry points.
+    let report_class_masked = Arc::new(GraphAccess::with_triples(
+        Graphs::Only(GraphRule::new([CLAIMS, ANALYSES], &[])),
+        Graphs::none(),
+        triples::TripleRules {
+            rules: vec![triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "hide-reports".into(),
+                    predicates: None,
+                    classes: Some(vec![format!("{GR}Report")]),
+                    subclasses: false,
+                    graphs: None,
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: triples::Caller::default(),
+            limits: triples::Limits::default(),
+        },
+    ));
+    for res in [
+        evidence::find_dependents(
+            &ds,
+            &ds,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(report_class_masked.clone()),
+            &Control::none(),
+        )
+        .unwrap(),
+        evidence::find_dependents_at(
+            &view,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(report_class_masked),
+            &Control::none(),
+        )
+        .unwrap(),
+    ] {
+        let found: Vec<_> = res
+            .dependents
+            .iter()
+            .map(|d| d.assessment.clone())
+            .collect();
+        assert!(found.contains(&a_ok));
+        assert!(found.contains(&a_secret));
+        assert_eq!(res.dependents.len(), 2);
+        assert!(res.reports.is_empty());
+    }
+}

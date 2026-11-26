@@ -739,3 +739,343 @@ fn admitted_graph_ids_skip_oversized_unreadable_graphs_and_check_object_type() {
     assert_eq!(scan.items[0].0.as_str(), "urn:edit:visible");
     assert_eq!(scan.items[0].1.as_str(), g_ok);
 }
+
+/// Mask preparation admits graphs before full term decoding: an exact allowlist rejects
+/// a 256 KiB unreadable graph by ID under a 200 KiB budget (smaller than the IRI itself),
+/// and a guarded wildcard rule checks it with `with_iri` instead of `decode_term`'s 128x
+/// multiplier.
+#[test]
+fn mask_preparation_admits_graphs_before_full_decoding() {
+    use crate::access::{
+        Decider, Exemptions, GraphAccess, GraphRule, Graphs, GuardDecision, GuardSnapshot, triples,
+    };
+    use crate::store::{Store, StoreOptions};
+    use std::sync::Arc;
+
+    struct FixedGuard(Vec<String>);
+    impl GuardDecision for FixedGuard {
+        fn exempt(&self, _snap: &Arc<crate::store::Snapshot>) -> Vec<String> {
+            self.0.clone()
+        }
+        fn exempt_controlled(
+            &self,
+            _snap: &GuardSnapshot<'_>,
+            preparation: &Preparation,
+        ) -> Result<Exemptions> {
+            let mut out = Exemptions::new(preparation)?;
+            for g in &self.0 {
+                out.push(g)?;
+            }
+            Ok(out)
+        }
+    }
+
+    let s = Store::in_memory(StoreOptions::default());
+    let g_ok = "urn:x-sparkles:graphrag:ok";
+    let g_huge_unreadable = format!("urn:x-sparkles:graphrag:secret-{}", "z".repeat(256 * 1024));
+    let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let report_cls = "urn:x-sparkles:graphrag#Report";
+    let secret_pred = "urn:secret:tag";
+
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ \
+                GRAPH <{g_huge_unreadable}> {{ \
+                    <urn:hidden:r> <{rdf_type}> <{report_cls}> ; <{secret_pred}> \"x\" . \
+                }} \
+                GRAPH <{g_ok}> {{ \
+                    <urn:visible:r> <{rdf_type}> <{report_cls}> . \
+                    <urn:masked:r> <{rdf_type}> <{report_cls}> ; <{secret_pred}> \"x\" . \
+                }} \
+            }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+
+    let snap = s.snapshot();
+    let rules = || triples::TripleRules {
+        rules: vec![triples::Rule {
+            protection: Arc::new(triples::Protection {
+                name: "hide-secret".into(),
+                predicates: Some(vec![secret_pred.into()]),
+                classes: None,
+                subclasses: false,
+                graphs: None,
+                pattern: None,
+                prefixes: Default::default(),
+                hide_inferences: false,
+            }),
+            read: Graphs::none(),
+            write: Graphs::none(),
+        }],
+        caller: triples::Caller::default(),
+        limits: triples::Limits::default(),
+    };
+
+    // 1. Exact allowlist rejects the 256 KiB unreadable graph by ID under a 200 KiB cap
+    //    (smaller than the unreadable graph IRI itself).
+    let exact_prep = Preparation::new(crate::task::Control::none(), 200 << 10).unwrap();
+    let exact_access = GraphAccess::with_triples(
+        Graphs::Only(GraphRule::new([g_ok], &[])),
+        Graphs::none(),
+        rules(),
+    );
+    let exact_view = exact_access
+        .masked_controlled_read_only(&snap, &exact_prep)
+        .unwrap();
+    let mut exact_reads = Reads::from_prepared(&exact_prep, &exact_view);
+    assert!(
+        exact_reads
+            .hides_subject_in_graph("urn:masked:r", g_ok)
+            .unwrap()
+    );
+    assert!(
+        !exact_reads
+            .hides_subject_in_graph("urn:visible:r", g_ok)
+            .unwrap()
+    );
+
+    // 2. Guarded wildcard rule checks the 256 KiB unreadable graph via `with_iri`
+    //    instead of `with_term` (128x charge = ~32 MiB), succeeding under 1 MiB.
+    let guard_prep = Preparation::new(crate::task::Control::none(), 1 << 20).unwrap();
+    let guard_access = GraphAccess::with_triples(
+        Graphs::All.guarded_by(
+            "urn:x-sparkles:graphrag:*",
+            Decider(Arc::new(FixedGuard(vec![g_ok.into()]))),
+        ),
+        Graphs::none(),
+        rules(),
+    );
+    let guard_view = guard_access
+        .masked_controlled_read_only(&snap, &guard_prep)
+        .unwrap();
+    let mut guard_reads = Reads::from_prepared(&guard_prep, &guard_view);
+    assert!(
+        guard_reads
+            .hides_subject_in_graph("urn:masked:r", g_ok)
+            .unwrap()
+    );
+    assert!(
+        !guard_reads
+            .hides_subject_in_graph("urn:visible:r", g_ok)
+            .unwrap()
+    );
+}
+
+/// The predecessor `rdf:type` probe inside `subjects_for_typed_object_in_graphs_up_to`
+/// uses controlled base-index reads charged to the same `Preparation` while the outer
+/// POS scan workspace is live.
+#[test]
+fn typed_object_predecessor_probe_uses_controlled_base_index_reads() {
+    use crate::store::{Store, StoreOptions};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let g_ok = "urn:x-sparkles:graphrag:compacted-probe";
+    let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let report_cls = "urn:x-sparkles:graphrag#Report";
+    let edit_of = "urn:x-sparkles:graphrag#editOf";
+    let target_iri = "urn:report:base";
+    let target = Term::NamedNode(NamedNode::new_unchecked(target_iri));
+
+    {
+        let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let mut trig = format!(
+            "GRAPH <{g_ok}> {{\n\
+                <{target_iri}> <{rdf_type}> <{report_cls}> .\n\
+                <urn:edit:1> <{edit_of}> <{target_iri}> .\n"
+        );
+        for i in 0..2000 {
+            trig.push_str(&format!(
+                "<urn:filler:{i:04}> <urn:filler:p> <urn:filler:o> .\n"
+            ));
+        }
+        trig.push_str("}\n");
+        crate::sparql::update::update(
+            &s,
+            &format!("INSERT DATA {{ {trig} }}"),
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        s.compact().unwrap();
+    }
+
+    // Reopen to ensure a cold BlockCache over the compacted base indexes.
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let snap = s.snapshot();
+    assert!(
+        snap.delta.is_empty(),
+        "expected compacted base-only snapshot"
+    );
+
+    let run_with_headroom = |headroom: u64, check_type: bool| -> Result<usize> {
+        let prep = Preparation::new(crate::task::Control::none(), 8 << 20)?;
+        let mut reads = Reads::new(&prep, &snap);
+        let g_id = reads.iri_id(g_ok)?.unwrap();
+        let mut admitted = BTreeMap::new();
+        admitted.insert(g_id, Arc::new(NamedNode::new_unchecked(g_ok)));
+        // Pre-warm all lookup IDs so the remaining headroom measures only scan + probe workspaces.
+        assert!(reads.iri_id(edit_of)?.is_some());
+        assert!(reads.iri_id(target_iri)?.is_some());
+        assert!(reads.iri_id(rdf_type)?.is_some());
+        assert!(reads.iri_id(report_cls)?.is_some());
+        let avail = prep.available_bytes();
+        let _fill = prep.reserve(avail.saturating_sub(headroom))?;
+        let scan = if check_type {
+            reads.subjects_for_typed_object_in_graphs_up_to(
+                edit_of,
+                &target,
+                rdf_type,
+                report_cls,
+                10,
+                false,
+                Some(&admitted),
+                |_| true,
+            )?
+        } else {
+            reads.subjects_in_admitted_graphs_up_to(
+                edit_of,
+                &target,
+                10,
+                false,
+                Some(&admitted),
+                |_| true,
+            )?
+        };
+        Ok(scan.items.len())
+    };
+
+    // Normal budget succeeds against the cold compacted base.
+    assert_eq!(run_with_headroom(4 << 20, true).unwrap(), 1);
+
+    // Binary-search the tightest passing headroom for POS-only vs POS + nested SPO probe.
+    let min_headroom = |check_type: bool| -> u64 {
+        let mut lo = 0u64;
+        let mut hi = 4 << 20;
+        while lo + 256 < hi {
+            let mid = lo + (hi - lo) / 2;
+            match run_with_headroom(mid, check_type) {
+                Ok(n) => {
+                    assert_eq!(n, 1);
+                    hi = mid;
+                }
+                Err(crate::Error::BudgetExceeded(crate::error::Budget {
+                    kind: crate::error::BudgetKind::Memory,
+                    ..
+                })) => lo = mid,
+                Err(err) => panic!("unexpected error probing headroom {mid}: {err:?}"),
+            }
+        }
+        hi
+    };
+
+    let pos_only_min = min_headroom(false);
+    let nested_spo_min = min_headroom(true);
+    assert!(
+        nested_spo_min > pos_only_min + 4096,
+        "expected nested SPO base probe to reserve workspace above live POS scan \
+         (pos_only_min={pos_only_min}, nested_spo_min={nested_spo_min})"
+    );
+
+    // Reopen again for a cold-cache verification at a headroom strictly between the two.
+    drop(snap);
+    drop(s);
+    let cold = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let cold_snap = cold.snapshot();
+    let between = pos_only_min + (nested_spo_min - pos_only_min) / 2;
+    let prep = Preparation::new(crate::task::Control::none(), 8 << 20).unwrap();
+    let mut reads = Reads::new(&prep, &cold_snap);
+    let g_id = reads.iri_id(g_ok).unwrap().unwrap();
+    let mut admitted = BTreeMap::new();
+    admitted.insert(g_id, Arc::new(NamedNode::new_unchecked(g_ok)));
+    assert!(reads.iri_id(edit_of).unwrap().is_some());
+    assert!(reads.iri_id(target_iri).unwrap().is_some());
+    assert!(reads.iri_id(rdf_type).unwrap().is_some());
+    assert!(reads.iri_id(report_cls).unwrap().is_some());
+    let avail = prep.available_bytes();
+    let _fill = prep.reserve(avail - between).unwrap();
+    let err = match reads.subjects_for_typed_object_in_graphs_up_to(
+        edit_of,
+        &target,
+        rdf_type,
+        report_cls,
+        10,
+        false,
+        Some(&admitted),
+        |_| true,
+    ) {
+        Ok(_) => {
+            panic!("expected Memory BudgetExceeded for nested SPO base read at headroom {between}")
+        }
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                ..
+            })
+        ),
+        "expected Memory BudgetExceeded, got {err:?}"
+    );
+}
+
+/// `Reads::subjects_in_graphs_up_to` invokes its `keep_graph` callback after releasing
+/// the delta vocabulary read lock, so callbacks that resolve other delta terms on the
+/// same snapshot cannot deadlock against a queued vocabulary writer.
+#[test]
+fn subjects_in_graphs_predicate_runs_outside_delta_vocab_lock() {
+    use crate::store::{Store, StoreOptions};
+
+    let s = Store::in_memory(StoreOptions::default());
+    let g_delta = "urn:x-sparkles:graphrag:delta-lock-check";
+    let other_delta = "urn:other:delta-term";
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ \
+                GRAPH <{g_delta}> {{ \
+                    <urn:s:1> <urn:p:1> <urn:o:1> . \
+                    <{other_delta}> <urn:p:2> <urn:o:2> . \
+                }} \
+            }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let snap = s.snapshot();
+    let prep = Preparation::new(crate::task::Control::none(), 4 << 20).unwrap();
+    let mut reads = Reads::new(&prep, &snap);
+    let target = Term::NamedNode(NamedNode::new_unchecked("urn:o:1"));
+
+    let mut invoked = false;
+    let scan = reads
+        .subjects_in_graphs_up_to("urn:p:1", &target, 10, false, |graph_iri| {
+            invoked = true;
+            assert_eq!(graph_iri, g_delta);
+            // If `with_iri` still held the delta vocabulary read guard, `try_write`
+            // on the same thread would fail (returning `None`).
+            let write_guard = snap
+                .generation
+                .dvocab
+                .try_write_guard_for_test()
+                .expect("keep_graph must run outside the delta vocabulary read lock");
+            drop(write_guard);
+            assert!(
+                prep.lookup_iri(&snap, other_delta).unwrap().is_some(),
+                "callback should be able to resolve another delta term safely"
+            );
+            true
+        })
+        .unwrap();
+
+    assert!(invoked, "expected keep_graph predicate to run");
+    assert!(!scan.more);
+    assert_eq!(scan.items.len(), 1);
+    assert_eq!(scan.items[0].0.as_str(), "urn:s:1");
+    assert_eq!(scan.items[0].1.as_str(), g_delta);
+}

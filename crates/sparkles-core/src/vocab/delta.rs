@@ -835,6 +835,13 @@ impl DeltaVocab {
         self.inner.write()
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_write_guard_for_test(
+        &self,
+    ) -> Option<parking_lot::RwLockWriteGuard<'_, AppendVocab>> {
+        self.inner.try_write()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

@@ -1614,7 +1614,7 @@ impl<'a> Reads<'a> {
                 if let std::collections::btree_map::Entry::Vacant(e) = accepted.entry(g) {
                     if let Some((tp, cls)) = object_type_ids
                         && ((skip_masked && self.hides_subject_id_in_graph(o, g)?)
-                            || !self.snap.contains(&[o, tp, cls, g])?)
+                            || !self.preparation.contains(self.snap, &[o, tp, cls, g])?)
                     {
                         skipped[slot] = Some(g);
                         return Ok(true);
@@ -1764,7 +1764,7 @@ impl<'a> Reads<'a> {
         let Some(o) = o else {
             return Ok(false);
         };
-        self.snap.contains(&[s, p, o, g])
+        self.preparation.contains(self.snap, &[s, p, o, g])
     }
 
     /// Whether `s` is a typed operation's authenticated record in `g`: its single
@@ -1822,7 +1822,7 @@ impl<'a> Reads<'a> {
         ) else {
             return Ok(false);
         };
-        self.snap.contains(&[s, p, o, g])
+        self.preparation.contains(self.snap, &[s, p, o, g])
     }
 
     /// The single protection nonce that `s` carries in `g`.
