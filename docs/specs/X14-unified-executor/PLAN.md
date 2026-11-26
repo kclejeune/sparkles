@@ -255,8 +255,9 @@ pre-decode. Floors cached per batch measured 24.8% and 33.4% slower than the dir
 comparison on streaming `str-pair-lt` and `str-pair-names` on atlas, so item 1069 gave
 the context a charged floor cache that lasts the query and serves both modes. Cursor
 batches now compare through the floors, the exclusion in `string_order_mask` is gone and
-the bound is seven. The [Outcome](SPEC.md#outcome) records the forge measurements, and
-items 1088, 1089 and 1140 hold the costs that remain.
+the bound is seven. The [Outcome](SPEC.md#outcome) records the forge and atlas measurements. Item 1140 has
+shipped sample-sized initial floor tables and direct entry migration on growth, and items
+1088 and 1089 hold the costs that remain.
 
 ## Stage 5: shared kernels
 
