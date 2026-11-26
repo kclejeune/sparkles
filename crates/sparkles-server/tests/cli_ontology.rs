@@ -1382,11 +1382,59 @@ fn ontology_writers_atomic_error_omn_gz_chained_classify_and_header_loss_cli() {
         &["ontology", "relax", "-i", "bad.ofn", "-o", "existing.owx"],
     );
     assert_ne!(o.status.code(), Some(0), "NUL in OWL/XML must fail");
+    let owx_err = err(&o);
+    assert!(
+        owx_err.contains("OWL/XML") && owx_err.contains("U+0000"),
+        "expected OWL/XML U+0000 serialization diagnostic, got: {owx_err}"
+    );
     assert_eq!(
         std::fs::read_to_string(&existing).unwrap(),
         "SENTINEL_KEEP_ME",
         "writer error must not truncate or corrupt existing destination file"
     );
+
+    // 4b. Atomic success preserves permissions on existing regular file and updates symlink target
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let shared = dir.join("shared.owx");
+        std::fs::write(&shared, "OLD").unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let target = dir.join("target.owx");
+        std::fs::write(&target, "STALE").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.join("link.owx");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let o = sparkles(
+            dir,
+            &[
+                "ontology",
+                "relax",
+                "-i",
+                "demo.ofn",
+                "-o",
+                "shared.owx",
+                "-o",
+                "link.owx",
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(sparkles::owl::owx::parse(&std::fs::read_to_string(&target).unwrap()).is_ok());
+    }
 
     // 5. Header-only loss logs stderr warning on lossy format
     let hdr_loss_ofn = "Prefix(:=<http://ex.org/>)\nPrefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)\nOntology(<http://ex.org/hdr>\nAnnotation(rdfs:label \"bonjour\"@fr)\nDeclaration(Class(:A))\n)\n";
@@ -1414,4 +1462,118 @@ fn ontology_writers_atomic_error_omn_gz_chained_classify_and_header_loss_cli() {
         stderr.contains("hdr_loss.obo") && stderr.contains("header annotations"),
         "expected header-loss warning for .obo: {stderr}"
     );
+}
+
+#[test]
+fn ontology_writers_remote_server_stdout_formats() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("demo.ofn"), WRITER_ONTO).unwrap();
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut server = Kill(
+        Command::new(BIN)
+            .current_dir(dir)
+            .args([
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--data",
+                "data",
+            ])
+            .env_remove("SPARKLES_AUTH_CONFIG")
+            .env_remove("SPARKLES_BACKUP_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let start = Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(server.0.try_wait().unwrap().is_none(), "server exited");
+        assert!(start.elapsed() < Duration::from_secs(30), "server timeout");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let url = format!("http://127.0.0.1:{port}");
+    // Wait until /$/ping responds 200
+    loop {
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            use std::io::{Read as _, Write as _};
+            let _ = stream
+                .write_all(b"GET /$/ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let mut resp = String::new();
+            let _ = stream.read_to_string(&mut resp);
+            if resp.starts_with("HTTP/1.1 200") {
+                break;
+            }
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "server not ready"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let o = sparkles(dir, &["dataset", "create", "onto", "--server", &url]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &["ontology", "relax", "-i", "demo.ofn", "-o", "demo.ttl"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &["load", "--server", &url, "--dataset", "onto", "demo.ttl"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+
+    for cmd in ["axioms", "classify"] {
+        for fmt in ["owx", "omn", "obo", "obographs"] {
+            let o = sparkles(
+                dir,
+                &[
+                    "ontology",
+                    cmd,
+                    "--server",
+                    &url,
+                    "--dataset",
+                    "onto",
+                    "--format",
+                    fmt,
+                ],
+            );
+            assert_eq!(o.status.code(), Some(0), "{cmd} {fmt}: {}", err(&o));
+            let body = out(&o);
+            match fmt {
+                "owx" => assert!(sparkles::owl::owx::parse(&body).is_ok(), "{cmd}: {body}"),
+                "omn" => assert!(
+                    sparkles::owl::manchester::parse_document(&body).is_ok(),
+                    "{cmd}: {body}"
+                ),
+                "obo" => assert!(sparkles::owl::obo::parse(&body).is_ok(), "{cmd}: {body}"),
+                "obographs" => assert!(
+                    sparkles::owl::obographs::parse(&body).is_ok(),
+                    "{cmd}: {body}"
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
 }

@@ -292,6 +292,35 @@ pub fn write_axioms<'a>(
     Ok(())
 }
 
+/// Resolve `path` to the final target path for atomic replacement: follows existing
+/// symlinks (including dangling symlink chains, bounded to 40 hops) so an output symlink
+/// stays intact and points at the atomically replaced target, matching `File::create`.
+fn resolve_atomic_target(path: &Path) -> std::path::PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut cur = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(meta) = std::fs::symlink_metadata(&cur) else {
+            break;
+        };
+        if !meta.file_type().is_symlink() {
+            break;
+        }
+        let Ok(link) = std::fs::read_link(&cur) else {
+            break;
+        };
+        cur = if link.is_absolute() {
+            link
+        } else {
+            cur.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| link.clone(), |p| p.join(&link))
+        };
+    }
+    cur
+}
+
 /// Write a header and axioms to `path` in `format`, returning the writer's report of
 /// written and any skipped axioms.
 pub fn write_axioms_reported<'a>(
@@ -306,14 +335,28 @@ pub fn write_axioms_reported<'a>(
     let werr = |e: sparkles_owl::WriteError| {
         Error::invalid(format!("cannot write {}: {e}", path.display()))
     };
-    let parent = path
+    let target = resolve_atomic_target(path);
+    let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io)?;
-    // Stage output beside the destination so a writer or gzip error never truncates or
-    // overwrites an existing file. Each layer is finished and flushed by hand so an error
-    // writing the gzip trailer or final buffer fails the command.
+    let existing_perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".sparkles-owl-").suffix(".tmp");
+    // New files get the standard 0o666 mode masked by the process umask (matching
+    // File::create); existing files keep their own mode after staging.
+    #[cfg(unix)]
+    if existing_perms.is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut tmp = builder.tempfile_in(parent).map_err(io)?;
+    if let Some(perms) = existing_perms {
+        tmp.as_file().set_permissions(perms).map_err(io)?;
+    }
+    // Stage output beside the resolved destination so a writer or gzip error never
+    // truncates or overwrites an existing file. Each layer is finished and flushed by
+    // hand so an error writing the gzip trailer or final buffer fails the command.
     let report = {
         let mut buf = std::io::BufWriter::with_capacity(1 << 20, tmp.as_file_mut());
         if gz {
@@ -329,7 +372,11 @@ pub fn write_axioms_reported<'a>(
         }
     };
     tmp.as_file().sync_all().map_err(io)?;
-    tmp.persist(path).map_err(|e| io(e.error))?;
+    tmp.persist(&target).map_err(|e| io(e.error))?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(report)
 }
 
@@ -651,5 +698,73 @@ EquivalentClasses(:D ObjectIntersectionOf(:C ObjectSomeValuesFrom(:p :B)))
             .into_counted_document(&QueryOptions::default())
             .unwrap();
         assert_eq!(unmapped, w.unmapped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_staging_preserves_mode_respects_umask_and_follows_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir().unwrap();
+        let input = d.path().join("in.ofn");
+        std::fs::write(&input, ONTO).unwrap();
+        let w = read(&input);
+
+        // 1. New output file gets the same umask-masked mode as File::create.
+        let probe = d.path().join("probe.txt");
+        std::fs::File::create(&probe).unwrap();
+        let expected_new_mode = std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+        let fresh = d.path().join("fresh.owx");
+        w.write(&fresh).unwrap();
+        let actual_new_mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(actual_new_mode, expected_new_mode);
+
+        // 2. Overwriting an existing readable file preserves its explicit mode (e.g. 0o644 / 0o640).
+        let existing = d.path().join("shared.owx");
+        std::fs::write(&existing, "old").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        w.write(&existing).unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let body = std::fs::read_to_string(&existing).unwrap();
+        assert!(sparkles_owl::owx::parse(&body).is_ok());
+
+        // 3. Writing through an existing symlink preserves the symlink and atomically updates its target.
+        let target = d.path().join("real_target.owx");
+        std::fs::write(&target, "stale").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = d.path().join("link.owx");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        w.write(&link).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let updated = std::fs::read_to_string(&target).unwrap();
+        assert!(sparkles_owl::owx::parse(&updated).is_ok());
+
+        // 4. Writing through a dangling symlink creates the target and keeps the symlink intact.
+        let dangling_target = d.path().join("created_via_link.owx");
+        let dangling = d.path().join("dangling.owx");
+        std::os::unix::fs::symlink(&dangling_target, &dangling).unwrap();
+        w.write(&dangling).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(dangling_target.exists());
+        assert!(
+            sparkles_owl::owx::parse(&std::fs::read_to_string(&dangling_target).unwrap()).is_ok()
+        );
     }
 }
