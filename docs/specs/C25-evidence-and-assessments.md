@@ -2362,8 +2362,12 @@ fence (`503 authority-changed`).
 At the branch head (checked against optional `ifHead` and again under the writer), the
 operation collects every live `ev:AcceptanceSupport` of the policy in its supports graph
 that authenticates under the current protections, whose accepted `ev:ReviewDecision`
-authenticates in the decisions graph and is not superseded, and whose claim has no
-authenticated `ev:Withdrawal` in any configured proposal graph. It scans the output
+authenticates in the decisions graph and is not superseded, and whose claim authenticates
+in a configured proposal graph under its current protection and has no authenticated
+`ev:Withdrawal` in any configured proposal graph. If a proposal graph is detached and
+protected again, prior claims and withdrawals there no longer authenticate, so
+reconciliation cannot establish that those claims were never withdrawn and drops their
+supports rather than reviving withdrawn claims. It scans the output
 graph under the shared 64 MiB memory allowance and 1,000,000-triple bound, removes every
 quad not owned by a vouched support (deleting by physical quad ID so blank nodes
 inserted while detached are removed), and inserts every missing vouched triple. When

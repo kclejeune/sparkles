@@ -7453,13 +7453,13 @@ export interface components {
             };
             /** @description The reconciliation operation, which is the availability receipt of any fresh projection record it publishes. */
             operation: string;
-            /** @description The policy's output graph. */
+            /** @description The output graph recorded in the projection record. */
             output: string;
             /** @description The reconciled review policy. */
             policy: string;
             /** @description The policy version recorded in the projection record. */
             policyVersion: number;
-            /** @description The active projection record carrying the current protections. */
+            /** @description The active projection record carrying the current protections, or the projection record selected by the original operation on a replay. */
             projection: string;
             /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
             replayed: boolean;

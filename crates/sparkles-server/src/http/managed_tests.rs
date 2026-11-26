@@ -1537,3 +1537,101 @@ async fn projection_reconciliation_over_http() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{j}");
 }
+
+/// `POST /$/evidence/{ds}/projections/reconcile` participates in query memory pool
+/// admission: saturating the pool returns `503` with `Retry-After`, normal execution
+/// charges its `Preparation::with_grant` against the pool, and pool usage returns to
+/// zero when the request finishes.
+#[tokio::test]
+async fn projection_reconciliation_participates_in_query_memory_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(64 << 20),
+    )
+    .unwrap();
+    state.admission.wait = Duration::from_millis(25);
+    let state = Arc::new(state);
+    state.attach("d", DbType::Memory, None).unwrap();
+    let ds = state.get("d").unwrap();
+    let app = router(state.clone());
+
+    let ev_settings = json!({
+        "format": 1,
+        "profile": 1,
+        "enabled": true,
+        "sourceRecords": ["urn:ev:sources"],
+        "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "main": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let pool = state.catalog.pool().expect("pool configured");
+    assert_eq!(pool.granted(), 0);
+
+    // Saturate the pool so admission times out with 503 + Retry-After.
+    let hog = pool.try_grant(pool.capacity()).expect("saturate pool");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(res.headers().contains_key("retry-after"));
+    drop(hog);
+    assert_eq!(pool.granted(), 0);
+
+    // Release the hog: reconciliation acquires a grant, actively charges the pool
+    // during execution, and releases all pool credit before returning.
+    let observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed_hook = observed.clone();
+    let pool_hook = pool.clone();
+    ds.store.set_failpoint(
+        "evidence-reconcile-before-publish",
+        Some(Arc::new(move |_| {
+            observed_hook.store(pool_hook.granted(), std::sync::atomic::Ordering::SeqCst);
+        })),
+    );
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/$/evidence/d/projections/reconcile",
+        Some("application/json"),
+        &json!({"policy": "main"}).to_string(),
+    )
+    .await;
+    ds.store
+        .set_failpoint("evidence-reconcile-before-publish", None);
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["committed"], true);
+    assert!(
+        observed.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "expected reconciliation to hold pool grant during execution"
+    );
+    assert_eq!(pool.granted(), 0);
+}

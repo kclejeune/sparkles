@@ -8740,7 +8740,7 @@
             "type": "string"
           },
           "output": {
-            "description": "The policy's output graph.",
+            "description": "The output graph recorded in the projection record.",
             "type": "string"
           },
           "policy": {
@@ -8753,7 +8753,7 @@
             "type": "integer"
           },
           "projection": {
-            "description": "The active projection record carrying the current protections.",
+            "description": "The active projection record carrying the current protections, or the projection record selected by the original operation on a replay.",
             "type": "string"
           },
           "replayed": {

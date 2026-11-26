@@ -574,7 +574,8 @@ struct ReconcileProjectionRequest {
 /// `POST /$/evidence/{ds}/projections/reconcile`: administered reconciliation of a
 /// review policy's accepted projection after a changed protection. Rebuilds the output
 /// graph from the live authenticated supports it vouches for (or empties it when none
-/// vouch) and records the current protections in a fresh `ev:Projection` record. Needs
+/// vouch) and records the current protections in a fresh `ev:Projection` record, or
+/// reuses the active projection record when protections and output already match. Needs
 /// `admin` on the dataset (or selected branch).
 pub(super) async fn reconcile_projection(
     State(st): St,
@@ -582,18 +583,24 @@ pub(super) async fn reconcile_projection(
     Extension(p): Extension<Principal>,
     AdminBody(bytes): AdminBody,
 ) -> ApiResult {
+    let request: ReconcileProjectionRequest = body_of(&st, &bytes, "projection reconciliation")?;
     let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    let grant = crate::server_memory::acquire(&st).await?.map(Arc::new);
     let execution = super::Execution {
         branch: crate::http::branches::current()
             .unwrap_or_else(|| sparkles::branch::MAIN.to_string()),
         cancel,
         deadline: None,
-        grant: crate::server_memory::current_grant(),
+        grant,
     };
-    match crate::http::blocking(move || reconcile_projection_now(st, name, p, bytes, execution))
+    match crate::http::blocking(move || reconcile_projection_now(st, name, p, request, execution))
         .await
     {
-        Ok(out) => Ok(axum::Json(out).into_response()),
+        Ok(body) => Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()),
         Err(error) if error.audit_code() == "authority-changed" => {
             Ok(crate::auth::routes::authority_changed_response())
         }
@@ -601,15 +608,89 @@ pub(super) async fn reconcile_projection(
     }
 }
 
+struct NamedNodesRef<'a>(&'a [oxrdf::NamedNode]);
+impl serde::Serialize for NamedNodesRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for n in self.0 {
+            seq.serialize_element(n.as_str())?;
+        }
+        seq.end()
+    }
+}
+
+struct TripleDisplay<'a>(&'a oxrdf::Triple);
+impl serde::Serialize for TripleDisplay<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self.0)
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ProjectionChangeRef<'a> {
+    output: &'a str,
+    triple: TripleDisplay<'a>,
+}
+
+struct ProjectionChangesRef<'a>(&'a [sparkles::evidence::ProjectionChange]);
+impl serde::Serialize for ProjectionChangesRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for c in self.0 {
+            seq.serialize_element(&ProjectionChangeRef {
+                output: c.output.as_str(),
+                triple: TripleDisplay(&c.triple),
+            })?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangedRef<'a> {
+    supports_added: NamedNodesRef<'a>,
+    supports_ended: NamedNodesRef<'a>,
+    inserted: ProjectionChangesRef<'a>,
+    removed: ProjectionChangesRef<'a>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DryRunRef {
+    would_commit: bool,
+    inserted: u64,
+    deleted: u64,
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileProjectionResponse<'a> {
+    operation: &'a str,
+    committed: bool,
+    replayed: bool,
+    commit: u64,
+    branch_id: uuid::Uuid,
+    policy: &'a str,
+    policy_version: u32,
+    output: &'a str,
+    projection: &'a str,
+    vouched_supports: NamedNodesRef<'a>,
+    changed: ChangedRef<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_run: Option<DryRunRef>,
+}
+
 fn reconcile_projection_now(
     st: Arc<AppState>,
     name: String,
     p: Principal,
-    bytes: axum::body::Bytes,
+    r: ReconcileProjectionRequest,
     execution: super::Execution,
-) -> ApiResult<J> {
-    let _grant = execution.grant.clone();
-    let r: ReconcileProjectionRequest = body_of(&st, &bytes, "projection reconciliation")?;
+) -> ApiResult<Vec<u8>> {
     let branch = execution.branch.clone();
     let main = crate::http::main_dataset(&st, &name)?;
     crate::settings::evidence::require_reconciled(&st, &main)?;
@@ -628,31 +709,61 @@ fn reconcile_projection_now(
     let here = on_branch(&prepared.main.name, &branch);
     let read_opts = crate::http::caller::CallerContext::for_caller(&st, &prepared.logical, &p)
         .options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
-    let reconciled = sparkles::evidence::reconcile_projection(
+    let preparation = match execution.grant {
+        Some(grant) => sparkles::access::Preparation::with_grant(
+            prepared.control.clone(),
+            sparkles::evidence::resolve::MEMORY_BYTES,
+            grant,
+        ),
+        None => sparkles::access::Preparation::new(
+            prepared.control.clone(),
+            sparkles::evidence::resolve::MEMORY_BYTES,
+        ),
+    }?;
+    let (reconciled, _response_held) = sparkles::evidence::reconcile_projection_prepared(
         &prepared.main.dataset,
         &prepared.logical.dataset,
         &r.policy,
         r.policy_version,
         &prepared.options,
         read_opts.graphs.clone(),
+        &preparation,
         &prepared.control,
     )?;
-    let mut out = json!({
-        "operation": reconciled.operation.as_str(),
-        "committed": reconciled.committed,
-        "replayed": reconciled.replayed,
-        "commit": reconciled.commit,
-        "branchId": reconciled.branch,
-        "policy": reconciled.policy.as_str(),
-        "policyVersion": reconciled.policy_version,
-        "output": reconciled.output.as_str(),
-        "projection": reconciled.projection.as_str(),
-        "vouchedSupports": reconciled.vouched_supports.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        "changed": changed_json(&reconciled.changed),
-    });
-    preview_json(&mut out, reconciled.preview.as_deref());
     prepared.fence.check_uncommitted(reconciled.committed)?;
-    Ok(out)
+    let dry_run = reconciled.preview.as_deref().map(|preview| {
+        let commit = preview.receipt_commit();
+        DryRunRef {
+            would_commit: matches!(preview.outcome(), sparkles::preview::Outcome::Commit),
+            inserted: commit.inserted,
+            deleted: commit.deleted,
+            error: preview.error(),
+        }
+    });
+    let response = ReconcileProjectionResponse {
+        operation: reconciled.operation.as_str(),
+        committed: reconciled.committed,
+        replayed: reconciled.replayed,
+        commit: reconciled.commit,
+        branch_id: reconciled.branch,
+        policy: reconciled.policy.as_str(),
+        policy_version: reconciled.policy_version,
+        output: reconciled.output.as_str(),
+        projection: reconciled.projection.as_str(),
+        vouched_supports: NamedNodesRef(&reconciled.vouched_supports),
+        changed: ChangedRef {
+            supports_added: NamedNodesRef(&reconciled.changed.supports_added),
+            supports_ended: NamedNodesRef(&reconciled.changed.supports_ended),
+            inserted: ProjectionChangesRef(&reconciled.changed.inserted),
+            removed: ProjectionChangesRef(&reconciled.changed.removed),
+        },
+        dry_run,
+    };
+    let body = serde_json::to_vec(&response)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    drop(_response_held);
+    drop(preparation);
+    Ok(body)
 }
 
 type Policy = Option<Arc<sparkles::access::GraphAccess>>;
