@@ -50,6 +50,14 @@ const HASH_PART_CHUNK_ROWS: usize = 4_096;
 const MIN_HASH_PARTS: usize = 4;
 const MAX_HASH_PARTS: usize = 64;
 
+#[cfg(test)]
+static RANGE_MERGE_MEMORY_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn range_merge_memory_fallbacks() -> usize {
+    RANGE_MERGE_MEMORY_FALLBACKS.load(Ordering::Relaxed)
+}
+
 #[inline]
 fn is_memory_budget_error(err: &Error) -> bool {
     matches!(
@@ -853,6 +861,8 @@ fn run_range_split(
                     *is_refused = true;
                 }
                 Err(e) if is_memory_budget_error(&e) => {
+                    #[cfg(test)]
+                    RANGE_MERGE_MEMORY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                     return Ok(RangeOutcome::MemoryFallback);
                 }
                 Err(e) => return Err(e),

@@ -13,7 +13,7 @@
 use super::super::pass::Pass;
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{self, AChanges, Ann, AnnMap, Provenance};
-use super::super::zset::{Changes, Row, consolidate, row_bytes};
+use super::super::zset::{Changes, Row, consolidate};
 use super::Node;
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -742,8 +742,9 @@ impl Group {
             )));
         }
         self.clear_state();
-        let width = self.keys.len() + self.aggs.len();
-        let per_group = row_bytes(width) * 2;
+        let key_row_bytes = self.keys.len() as u64 * 8;
+        let out_row_bytes = (self.keys.len() + self.aggs.len()) as u64 * 8;
+        let live_per_group = key_row_bytes * 2 + out_row_bytes;
         let n = r.u64()?;
         for _ in 0..n {
             let key = r.row()?;
@@ -752,8 +753,26 @@ impl Group {
                 0 => None,
                 _ => Some(r.row()?),
             };
-            r.charge_state(per_group)?;
+            let slots_delta = acc::vec_insert_growth(&self.slots);
+            let index_est = if self.index.contains_key(&key) {
+                0
+            } else {
+                acc::hbmap_insert_growth(&self.index, 0)
+            };
+            let accs_delta: u64 = self.accs.iter().map(|a| a.init_growth(1)).sum();
+            let est = live_per_group
+                .saturating_add(slots_delta)
+                .saturating_add(index_est)
+                .saturating_add(accs_delta);
+            r.charge_state(est)?;
+            let index_before = self.index.allocation_size() as u64;
             let slot = self.push_group(key) as usize;
+            let index_actual = (self.index.allocation_size() as u64).saturating_sub(index_before);
+            if index_est > index_actual {
+                r.release_state(index_est - index_actual);
+            } else if index_actual > index_est {
+                r.charge_state(index_actual - index_est)?;
+            }
             self.slots[slot].rows = rows;
             self.slots[slot].out = out;
             for acc in &mut self.accs {

@@ -4349,7 +4349,8 @@ fn integer_subtotal_i64_promotion_admits_before_allocating_in_fold_and_merge() {
     );
 
     // 3. End-to-end parallel range-split over two i64-fitting partitions whose combined sum
-    // exceeds i64::MAX: succeeds both in parallel and under tight memory fallback.
+    // exceeds i64::MAX: succeeds both in parallel and under a tight budget that forces
+    // `acc.merge` itself to refuse and route through `RangeOutcome::MemoryFallback`.
     let n = 16_384usize;
     let half = n / 2;
     let mut table = Table::new(vec![0]);
@@ -4367,23 +4368,59 @@ fn integer_subtotal_i64_promotion_admits_before_allocating_in_fold_and_merge() {
     let (par_out, _) = run_whole_in_pool(2, &c, &table, &[], &aggs, true).unwrap();
     assert_eq!(c.term(par_out.cols[0][0]), Some(expected_term.clone()));
 
+    // 64 groups (within `RANGE_SPLIT_SAMPLE_DISTINCT`) x 80 `SUM` aggregates: each
+    // `(group, agg)` promotes from inline i64 to `Box<Int128Sum>` during merge
+    // (64 * 80 * 48 = 245,760 B). Both workers complete with full `RETAIN_STEP` slack
+    // and slot charges under ~2,057 KiB, while the merge needs ~2,126 KiB after slot
+    // charges drop, so a 2,090,000 B budget refuses specifically inside `acc.merge`
+    // and routes through `RangeOutcome::MemoryFallback` to sequential execution.
+    let groups = 64usize;
+    let num_aggs = 80usize;
+    let sum_agg_v1 = Agg {
+        func: AggregateFunction::Sum,
+        expr: Some(super::expr::Expr::Var(1)),
+        distinct: false,
+        fold: None,
+        registered: None,
+    };
+    let multi_aggs: Vec<(VarId, Agg)> = (0..num_aggs)
+        .map(|a| (10 + a as VarId, sum_agg_v1.clone()))
+        .collect();
     let mut tight = ctx();
-    tight.mem_limit = 150_000;
+    tight.mem_limit = 2_090_000;
     let tight = tight.into_shared();
-    let mut tight_table = Table::new(vec![0]);
+    let mut tight_table = Table::new(vec![0, 1]);
     for i in 0..n {
-        let v = if i == 0 {
+        let g = (i % groups) as i64;
+        let v = if i < groups {
             i64::MAX
-        } else if i == half {
+        } else if i >= half && i < half + groups {
             1
         } else {
             0
         };
-        tight_table.push_row(&[int(&tight, v)]);
+        tight_table.push_row(&[int(&tight, g), int(&tight, v)]);
     }
-    let (fb_out, _) = run_whole_in_pool(2, &tight, &tight_table, &[], &aggs, true).unwrap();
+    let before_fallbacks = super::group::par::range_merge_memory_fallbacks();
+    let (fb_out, _) = run_whole_in_pool(2, &tight, &tight_table, &[0], &multi_aggs, true).unwrap();
+    let after_fallbacks = super::group::par::range_merge_memory_fallbacks();
+    assert!(
+        after_fallbacks > before_fallbacks,
+        "expected tight budget to refuse inside acc.merge and trigger RangeOutcome::MemoryFallback \
+         (before={before_fallbacks}, after={after_fallbacks}, mem_peak={})",
+        tight.mem_peak()
+    );
     tight
         .check()
         .expect("range-split merge fallback must not latch memory_failure");
-    assert_eq!(tight.term(fb_out.cols[0][0]), Some(expected_term));
+    assert_eq!(fb_out.len, groups);
+    for row in 0..groups {
+        for a in 0..num_aggs {
+            assert_eq!(
+                tight.term(fb_out.cols[1 + a][row]),
+                Some(expected_term.clone()),
+                "mismatch at group {row}, agg {a}"
+            );
+        }
+    }
 }

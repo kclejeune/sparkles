@@ -152,15 +152,92 @@ fn shrink_map<K: Eq + std::hash::Hash, V>(m: &mut HbMap<K, V>) {
 }
 
 #[inline]
-fn hbmap_insert_growth<K: Eq + std::hash::Hash, V>(map: &HbMap<K, V>, key_extra: u64) -> u64 {
+fn bucket_capacity(buckets: usize) -> usize {
+    if buckets == 0 {
+        0
+    } else if buckets < 8 {
+        buckets - 1
+    } else {
+        buckets / 8 * 7
+    }
+}
+
+#[inline]
+pub(crate) fn hbmap_insert_growth<K: Eq + std::hash::Hash, V>(
+    map: &HbMap<K, V>,
+    key_extra: u64,
+) -> u64 {
     let table_delta = if map.len() < map.capacity() {
         0
     } else {
-        let next_cap = sparkles_budget::sizes::table_grown(map.capacity(), map.len(), 1);
-        let next_bytes = sparkles_budget::sizes::table_bytes(next_cap, size_of::<(K, V)>()) as u64;
-        next_bytes.saturating_sub(map.allocation_size() as u64)
+        let elem = size_of::<(K, V)>();
+        let alloc = map.allocation_size();
+        if alloc == 0 {
+            let first_cap = sparkles_budget::sizes::table_grown(0, 0, 1);
+            sparkles_budget::sizes::table_bytes(first_cap, elem) as u64
+        } else {
+            // `HashMap::capacity()` is `items + growth_left`, so tombstones can exhaust
+            // `growth_left` while `len() < full_capacity`. Derive the current bucket count
+            // from the live allocation so tombstone-triggered resizes are admitted before
+            // hashbrown doubles the table.
+            let mut buckets = sparkles_budget::sizes::buckets(map.capacity()).max(4);
+            while sparkles_budget::sizes::table_bytes(bucket_capacity(buckets), elem) < alloc {
+                let Some(doubled) = buckets.checked_mul(2) else {
+                    break;
+                };
+                buckets = doubled;
+            }
+            let full_cap = bucket_capacity(buckets);
+            if map.len().saturating_add(1) <= full_cap / 2 {
+                0
+            } else {
+                let next_buckets = buckets.saturating_mul(2);
+                let next_bytes =
+                    sparkles_budget::sizes::table_bytes(bucket_capacity(next_buckets), elem) as u64;
+                next_bytes.saturating_sub(alloc as u64)
+            }
+        }
     };
     table_delta.saturating_add(key_extra)
+}
+
+#[inline]
+fn admit_with_headroom(
+    delta: u64,
+    headroom: &mut u64,
+    admit: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    if delta > *headroom {
+        admit(delta - *headroom)?;
+        *headroom = delta;
+    }
+    Ok(())
+}
+
+fn hbmap_load_insert<K: Eq + std::hash::Hash, V>(
+    r: &Reader,
+    map: &mut HbMap<K, V>,
+    key: K,
+    val: V,
+    key_extra: u64,
+) -> Result<()> {
+    if map.contains_key(&key) {
+        map.insert(key, val);
+        return Ok(());
+    }
+    let before = map.allocation_size() as u64;
+    let est = hbmap_insert_growth(map, key_extra);
+    r.charge_state(est)?;
+    map.insert(key, val);
+    let actual = (map.allocation_size() as u64)
+        .saturating_sub(before)
+        .saturating_add(key_extra);
+    if est > actual {
+        r.release_state(est - actual);
+    } else if actual > est {
+        r.charge_state(actual - est)?;
+    }
+    Ok(())
 }
 
 #[inline]
@@ -173,13 +250,19 @@ fn boxed_hbmap_init_growth<K, V>(key_extra: u64) -> u64 {
 }
 
 #[inline]
-fn vec_insert_growth<T>(v: &Vec<T>) -> u64 {
-    if v.len() < v.capacity() {
+pub(crate) fn vec_growth<T>(v: &Vec<T>, add: usize) -> u64 {
+    if add == 0 || v.len().saturating_add(add) <= v.capacity() {
         0
     } else {
-        let next_cap = sparkles_budget::sizes::vec_grown(v.capacity(), v.len(), 1, size_of::<T>());
+        let next_cap =
+            sparkles_budget::sizes::vec_grown(v.capacity(), v.len(), add, size_of::<T>());
         (next_cap.saturating_sub(v.capacity()) as u64).saturating_mul(size_of::<T>() as u64)
     }
+}
+
+#[inline]
+pub(crate) fn vec_insert_growth<T>(v: &Vec<T>) -> u64 {
+    vec_growth(v, 1)
 }
 
 /// Shared finalization for `SUM` and `AVG` over a pre-evaluated result value, keeping
@@ -385,6 +468,12 @@ pub(crate) trait Accumulator: Send {
     /// Approximate bytes retained across all live groups and backing allocations, for
     /// view memory budgeting.
     fn retained_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Backing-vector growth in bytes that [`Accumulator::init`] will allocate for
+    /// `groups` new slots, used to pre-admit checkpoint loads before pushing groups.
+    fn init_growth(&self, _groups: usize) -> u64 {
         0
     }
 
@@ -898,6 +987,15 @@ impl Accumulator for Running {
             + self.payload.capacity() as u64 * size_of::<u64>() as u64
     }
 
+    fn init_growth(&self, groups: usize) -> u64 {
+        let payload = if self.is_best() {
+            vec_growth(&self.payload, groups)
+        } else {
+            0
+        };
+        vec_growth(&self.states, groups).saturating_add(payload)
+    }
+
     fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
         match &self.states[group] {
             AggState::Count(n) => {
@@ -914,7 +1012,6 @@ impl Accumulator for Running {
         match &mut self.states[group] {
             AggState::Count(n) => {
                 *n = r.u64()?;
-                r.charge_state(8)?;
                 Ok(())
             }
             _ => Err(Error::unsupported(
@@ -980,7 +1077,7 @@ impl Wide {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct SumState {
     rows: i64,
     /// Arguments that were errors or not numbers, which make the sum unbound
@@ -993,10 +1090,38 @@ struct SumState {
     /// Arbitrary-precision integers and decimals as counts, allocated only when seen
     big_ints: Option<Box<HbMap<crate::sparql::bignum::BigInt, i64>>>,
     big_decs: Option<Box<HbMap<crate::sparql::bignum::BigDec, i64>>>,
+    /// Running sum of `heap_bytes()` across retained keys in `big_ints` and `big_decs`
+    /// so `map_bytes()` stays O(1) without scanning big-number maps.
+    big_key_bytes: u64,
     /// The decimal values as counts by their 128-bit encoding
     decs: HbMap<i128, i64>,
     floats: HbMap<u32, i64>,
     doubles: HbMap<u64, i64>,
+}
+
+impl Clone for SumState {
+    fn clone(&self) -> Self {
+        let big_ints = self.big_ints.clone();
+        let big_decs = self.big_decs.clone();
+        let big_key_bytes = big_ints
+            .as_ref()
+            .map_or(0, |m| m.keys().map(|k| k.heap_bytes()).sum::<u64>())
+            + big_decs
+                .as_ref()
+                .map_or(0, |m| m.keys().map(|k| k.heap_bytes()).sum::<u64>());
+        Self {
+            rows: self.rows,
+            errs: self.errs,
+            undef: self.undef,
+            int: self.int,
+            big_ints,
+            big_decs,
+            big_key_bytes,
+            decs: self.decs.clone(),
+            floats: self.floats.clone(),
+            doubles: self.doubles.clone(),
+        }
+    }
 }
 
 impl SumState {
@@ -1007,6 +1132,7 @@ impl SumState {
         &mut self,
         v: Option<&Value>,
         w: i64,
+        headroom: &mut u64,
         admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<()> {
         match v {
@@ -1021,7 +1147,10 @@ impl SumState {
                 {
                     *n += w;
                     if *n == 0 {
-                        map.remove(i.as_ref());
+                        if let Some((removed, _)) = map.remove_entry(i.as_ref()) {
+                            self.big_key_bytes =
+                                self.big_key_bytes.saturating_sub(removed.heap_bytes());
+                        }
                         if map.is_empty() {
                             self.big_ints = None;
                         } else {
@@ -1029,17 +1158,27 @@ impl SumState {
                         }
                     }
                 } else {
+                    let est_key_bytes = i.heap_bytes();
                     let delta = match self.big_ints.as_ref() {
-                        Some(map) => hbmap_insert_growth(map, i.heap_bytes()),
+                        Some(map) => hbmap_insert_growth(map, est_key_bytes),
                         None => boxed_hbmap_init_growth::<crate::sparql::bignum::BigInt, i64>(
-                            i.heap_bytes(),
+                            est_key_bytes,
                         ),
                     };
-                    if delta > 0 {
-                        admit(delta)?;
-                    }
+                    admit_with_headroom(delta, headroom, admit)?;
+                    let before = self.big_ints.as_ref().map_or(0, |m| {
+                        size_of::<HbMap<crate::sparql::bignum::BigInt, i64>>() as u64
+                            + m.allocation_size() as u64
+                    });
+                    let key = (**i).clone();
+                    let key_bytes = key.heap_bytes();
                     let map = self.big_ints.get_or_insert_with(Default::default);
-                    map.insert((**i).clone(), w);
+                    map.insert(key, w);
+                    self.big_key_bytes = self.big_key_bytes.saturating_add(key_bytes);
+                    let after = size_of::<HbMap<crate::sparql::bignum::BigInt, i64>>() as u64
+                        + map.allocation_size() as u64;
+                    let actual = after.saturating_sub(before).saturating_add(key_bytes);
+                    *headroom = headroom.saturating_sub(actual);
                 }
             }
             Some(Value::Decimal(d)) => {
@@ -1052,10 +1191,11 @@ impl SumState {
                     }
                 } else {
                     let delta = hbmap_insert_growth(&self.decs, 0);
-                    if delta > 0 {
-                        admit(delta)?;
-                    }
+                    admit_with_headroom(delta, headroom, admit)?;
+                    let before = self.decs.allocation_size() as u64;
                     self.decs.insert(k, w);
+                    let actual = (self.decs.allocation_size() as u64).saturating_sub(before);
+                    *headroom = headroom.saturating_sub(actual);
                 }
             }
             Some(Value::BigDecimal(d)) => {
@@ -1064,7 +1204,10 @@ impl SumState {
                 {
                     *n += w;
                     if *n == 0 {
-                        map.remove(d.as_ref());
+                        if let Some((removed, _)) = map.remove_entry(d.as_ref()) {
+                            self.big_key_bytes =
+                                self.big_key_bytes.saturating_sub(removed.heap_bytes());
+                        }
                         if map.is_empty() {
                             self.big_decs = None;
                         } else {
@@ -1072,17 +1215,27 @@ impl SumState {
                         }
                     }
                 } else {
+                    let est_key_bytes = d.heap_bytes();
                     let delta = match self.big_decs.as_ref() {
-                        Some(map) => hbmap_insert_growth(map, d.heap_bytes()),
+                        Some(map) => hbmap_insert_growth(map, est_key_bytes),
                         None => boxed_hbmap_init_growth::<crate::sparql::bignum::BigDec, i64>(
-                            d.heap_bytes(),
+                            est_key_bytes,
                         ),
                     };
-                    if delta > 0 {
-                        admit(delta)?;
-                    }
+                    admit_with_headroom(delta, headroom, admit)?;
+                    let before = self.big_decs.as_ref().map_or(0, |m| {
+                        size_of::<HbMap<crate::sparql::bignum::BigDec, i64>>() as u64
+                            + m.allocation_size() as u64
+                    });
+                    let key = (**d).clone();
+                    let key_bytes = key.heap_bytes();
                     let map = self.big_decs.get_or_insert_with(Default::default);
-                    map.insert((**d).clone(), w);
+                    map.insert(key, w);
+                    self.big_key_bytes = self.big_key_bytes.saturating_add(key_bytes);
+                    let after = size_of::<HbMap<crate::sparql::bignum::BigDec, i64>>() as u64
+                        + map.allocation_size() as u64;
+                    let actual = after.saturating_sub(before).saturating_add(key_bytes);
+                    *headroom = headroom.saturating_sub(actual);
                 }
             }
             Some(Value::Float(f)) => {
@@ -1095,10 +1248,11 @@ impl SumState {
                     }
                 } else {
                     let delta = hbmap_insert_growth(&self.floats, 0);
-                    if delta > 0 {
-                        admit(delta)?;
-                    }
+                    admit_with_headroom(delta, headroom, admit)?;
+                    let before = self.floats.allocation_size() as u64;
                     self.floats.insert(b, w);
+                    let actual = (self.floats.allocation_size() as u64).saturating_sub(before);
+                    *headroom = headroom.saturating_sub(actual);
                 }
             }
             Some(Value::Double(d)) => {
@@ -1111,10 +1265,11 @@ impl SumState {
                     }
                 } else {
                     let delta = hbmap_insert_growth(&self.doubles, 0);
-                    if delta > 0 {
-                        admit(delta)?;
-                    }
+                    admit_with_headroom(delta, headroom, admit)?;
+                    let before = self.doubles.allocation_size() as u64;
                     self.doubles.insert(b, w);
+                    let actual = (self.doubles.allocation_size() as u64).saturating_sub(before);
+                    *headroom = headroom.saturating_sub(actual);
                 }
             }
             _ => self.errs += w,
@@ -1265,6 +1420,21 @@ impl SumState {
         let big = self.big_ints.as_ref().map_or(0, |m| {
             size_of::<HbMap<crate::sparql::bignum::BigInt, i64>>() as u64
                 + m.allocation_size() as u64
+        }) + self.big_decs.as_ref().map_or(0, |m| {
+            size_of::<HbMap<crate::sparql::bignum::BigDec, i64>>() as u64
+                + m.allocation_size() as u64
+        }) + self.big_key_bytes;
+        (self.floats.allocation_size()
+            + self.doubles.allocation_size()
+            + self.decs.allocation_size()) as u64
+            + big
+    }
+
+    #[cfg(test)]
+    fn exact_map_bytes(&self) -> u64 {
+        let big = self.big_ints.as_ref().map_or(0, |m| {
+            size_of::<HbMap<crate::sparql::bignum::BigInt, i64>>() as u64
+                + m.allocation_size() as u64
                 + m.keys().map(|k| k.heap_bytes()).sum::<u64>()
         }) + self.big_decs.as_ref().map_or(0, |m| {
             size_of::<HbMap<crate::sparql::bignum::BigDec, i64>>() as u64
@@ -1316,7 +1486,6 @@ impl SumState {
     }
 
     fn load(r: &mut Reader) -> Result<Self> {
-        r.charge_state(size_of::<Self>() as u64)?;
         let mut s = Self {
             rows: r.i64()?,
             errs: r.i64()?,
@@ -1327,23 +1496,21 @@ impl SumState {
         for _ in 0..r.u64()? {
             let k = r.i128()?;
             let c = r.i64()?;
-            r.charge_state(40)?;
-            s.decs.insert(k, c);
+            hbmap_load_insert(r, &mut s.decs, k, c, 0)?;
         }
         for _ in 0..r.u64()? {
             let b = r.u64()? as u32;
             let c = r.i64()?;
-            r.charge_state(24)?;
-            s.floats.insert(b, c);
+            hbmap_load_insert(r, &mut s.floats, b, c, 0)?;
         }
         for _ in 0..r.u64()? {
             let b = r.u64()?;
             let c = r.i64()?;
-            r.charge_state(24)?;
-            s.doubles.insert(b, c);
+            hbmap_load_insert(r, &mut s.doubles, b, c, 0)?;
         }
         let n_bi = r.u64()?;
         if n_bi > 0 {
+            r.charge_state(size_of::<HbMap<crate::sparql::bignum::BigInt, i64>>() as u64)?;
             let mut map = HbMap::default();
             for _ in 0..n_bi {
                 let text = std::str::from_utf8(r.bytes()?)
@@ -1352,13 +1519,18 @@ impl SumState {
                     Error::Corrupt("view state holds malformed big integer".into())
                 })?;
                 let c = r.i64()?;
-                r.charge_state(40 + bi.heap_bytes())?;
-                map.insert(bi, c);
+                let key_bytes = bi.heap_bytes();
+                let is_new = !map.contains_key(&bi);
+                hbmap_load_insert(r, &mut map, bi, c, key_bytes)?;
+                if is_new {
+                    s.big_key_bytes = s.big_key_bytes.saturating_add(key_bytes);
+                }
             }
             s.big_ints = Some(Box::new(map));
         }
         let n_bd = r.u64()?;
         if n_bd > 0 {
+            r.charge_state(size_of::<HbMap<crate::sparql::bignum::BigDec, i64>>() as u64)?;
             let mut map = HbMap::default();
             for _ in 0..n_bd {
                 let text = std::str::from_utf8(r.bytes()?)
@@ -1367,8 +1539,12 @@ impl SumState {
                     Error::Corrupt("view state holds malformed big decimal".into())
                 })?;
                 let c = r.i64()?;
-                r.charge_state(48 + bd.heap_bytes())?;
-                map.insert(bd, c);
+                let key_bytes = bd.heap_bytes();
+                let is_new = !map.contains_key(&bd);
+                hbmap_load_insert(r, &mut map, bd, c, key_bytes)?;
+                if is_new {
+                    s.big_key_bytes = s.big_key_bytes.saturating_add(key_bytes);
+                }
             }
             s.big_decs = Some(Box::new(map));
         }
@@ -1378,10 +1554,22 @@ impl SumState {
 
 /// Retractable `SUM` and `AVG` accumulator with exact integer and decimal tracking and
 /// refcounted float, double and error states.
-#[derive(Clone)]
 pub(crate) struct RetractableSum {
     is_avg: bool,
     groups: Vec<SumState>,
+    maps_bytes: u64,
+}
+
+impl Clone for RetractableSum {
+    fn clone(&self) -> Self {
+        let groups = self.groups.clone();
+        let maps_bytes = groups.iter().map(SumState::map_bytes).sum();
+        Self {
+            is_avg: self.is_avg,
+            groups,
+            maps_bytes,
+        }
+    }
 }
 
 impl RetractableSum {
@@ -1389,6 +1577,7 @@ impl RetractableSum {
         Self {
             is_avg: matches!(agg.func, AggregateFunction::Avg),
             groups: Vec::new(),
+            maps_bytes: 0,
         }
     }
 
@@ -1401,6 +1590,7 @@ impl RetractableSum {
         mut budget: Option<&mut BatchBudget<'_>>,
     ) -> Result<()> {
         let decode = ctx.charge(0)?;
+        let mut headroom = 0u64;
         for (row, &slot) in slots.iter().enumerate() {
             if row.is_multiple_of(1024) {
                 ctx.check()?;
@@ -1417,7 +1607,7 @@ impl RetractableSum {
             let s = &mut self.groups[slot as usize];
             let id = batch.value(row).unwrap_or(Id::UNDEF);
             if id.is_undef() {
-                s.add_admitted(None, w, &mut |_| Ok(()))?;
+                s.add_admitted(None, w, &mut headroom, &mut |_| Ok(()))?;
                 s.undef += w;
             } else if id.tag() == Tag::Int {
                 s.rows += w;
@@ -1430,7 +1620,13 @@ impl RetractableSum {
                     Some(b) => b.retain(delta),
                     None => Ok(()),
                 };
-                let res = s.add_admitted(v.as_ref(), w, &mut admit);
+                let before_map = s.map_bytes();
+                let res = s.add_admitted(v.as_ref(), w, &mut headroom, &mut admit);
+                let after_map = s.map_bytes();
+                self.maps_bytes = self
+                    .maps_bytes
+                    .saturating_sub(before_map)
+                    .saturating_add(after_map);
                 drop(v);
                 decode.resize(0)?;
                 res?;
@@ -1459,6 +1655,8 @@ impl Accumulator for RetractableSum {
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         let id = self.read(ctx, group)?;
+        let old = self.groups[group].map_bytes();
+        self.maps_bytes = self.maps_bytes.saturating_sub(old);
         self.groups[group] = SumState::default();
         Ok(id)
     }
@@ -1488,12 +1686,15 @@ impl Accumulator for RetractableSum {
 
     fn clear(&mut self) {
         self.groups = Vec::new();
+        self.maps_bytes = 0;
     }
 
     fn swap_remove(&mut self, group: usize) {
-        self.groups.swap_remove(group);
+        let removed = self.groups.swap_remove(group);
+        self.maps_bytes = self.maps_bytes.saturating_sub(removed.map_bytes());
         if self.groups.is_empty() {
             self.groups = Vec::new();
+            self.maps_bytes = 0;
         }
     }
 
@@ -1502,8 +1703,11 @@ impl Accumulator for RetractableSum {
     }
 
     fn retained_bytes(&self) -> u64 {
-        self.groups.capacity() as u64 * size_of::<SumState>() as u64
-            + self.groups.iter().map(SumState::map_bytes).sum::<u64>()
+        self.groups.capacity() as u64 * size_of::<SumState>() as u64 + self.maps_bytes
+    }
+
+    fn init_growth(&self, groups: usize) -> u64 {
+        vec_growth(&self.groups, groups)
     }
 
     fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
@@ -1512,7 +1716,11 @@ impl Accumulator for RetractableSum {
     }
 
     fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
-        self.groups[group] = SumState::load(r)?;
+        let old = self.groups[group].map_bytes();
+        let loaded = SumState::load(r)?;
+        let new = loaded.map_bytes();
+        self.maps_bytes = self.maps_bytes.saturating_sub(old).saturating_add(new);
+        self.groups[group] = loaded;
         Ok(())
     }
 
@@ -1642,10 +1850,25 @@ enum OrderedKind {
 
 /// Retractable accumulator for `MIN`, `MAX`, `SAMPLE` and `GROUP_CONCAT` (with or
 /// without `DISTINCT`), backed by an ordered [`Multiset`] per group.
-#[derive(Clone)]
 pub(crate) struct Ordered {
     kind: OrderedKind,
     groups: Vec<Multiset>,
+    vals_bytes: u64,
+}
+
+impl Clone for Ordered {
+    fn clone(&self) -> Self {
+        let groups = self.groups.clone();
+        let vals_bytes = groups
+            .iter()
+            .map(|m| m.vals.capacity() as u64 * size_of::<(Id, i64)>() as u64)
+            .sum();
+        Self {
+            kind: self.kind.clone(),
+            groups,
+            vals_bytes,
+        }
+    }
 }
 
 impl Ordered {
@@ -1663,6 +1886,7 @@ impl Ordered {
         Self {
             kind,
             groups: Vec::new(),
+            vals_bytes: 0,
         }
     }
 
@@ -1697,7 +1921,11 @@ impl Ordered {
                     Some(b) => b.retain(delta),
                     None => Ok(()),
                 };
-                m.add_admitted(ctx, id, w, &decode, &mut admit)?;
+                let before = m.vals.capacity() as u64 * size_of::<(Id, i64)>() as u64;
+                let res = m.add_admitted(ctx, id, w, &decode, &mut admit);
+                let after = m.vals.capacity() as u64 * size_of::<(Id, i64)>() as u64;
+                self.vals_bytes = self.vals_bytes.saturating_sub(before).saturating_add(after);
+                res?;
             }
         }
         drop(decode);
@@ -1723,6 +1951,8 @@ impl Accumulator for Ordered {
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         let id = self.read(ctx, group)?;
+        let old = self.groups[group].vals.capacity() as u64 * size_of::<(Id, i64)>() as u64;
+        self.vals_bytes = self.vals_bytes.saturating_sub(old);
         self.groups[group] = Multiset::default();
         Ok(id)
     }
@@ -1888,12 +2118,16 @@ impl Accumulator for Ordered {
 
     fn clear(&mut self) {
         self.groups = Vec::new();
+        self.vals_bytes = 0;
     }
 
     fn swap_remove(&mut self, group: usize) {
-        self.groups.swap_remove(group);
+        let removed = self.groups.swap_remove(group);
+        let old = removed.vals.capacity() as u64 * size_of::<(Id, i64)>() as u64;
+        self.vals_bytes = self.vals_bytes.saturating_sub(old);
         if self.groups.is_empty() {
             self.groups = Vec::new();
+            self.vals_bytes = 0;
         }
     }
 
@@ -1902,12 +2136,11 @@ impl Accumulator for Ordered {
     }
 
     fn retained_bytes(&self) -> u64 {
-        self.groups.capacity() as u64 * size_of::<Multiset>() as u64
-            + self
-                .groups
-                .iter()
-                .map(|m| m.vals.capacity() as u64 * size_of::<(Id, i64)>() as u64)
-                .sum::<u64>()
+        self.groups.capacity() as u64 * size_of::<Multiset>() as u64 + self.vals_bytes
+    }
+
+    fn init_growth(&self, groups: usize) -> u64 {
+        vec_growth(&self.groups, groups)
     }
 
     fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
@@ -1929,13 +2162,13 @@ impl Accumulator for Ordered {
     }
 
     fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
-        r.charge_state(40)?;
+        let old = self.groups[group].vals.capacity() as u64 * size_of::<(Id, i64)>() as u64;
         let mut m = Multiset::default();
         // The entries were written in their order, which the terms keep.
         for _ in 0..r.u64()? {
             let v = r.id()?;
             let c = r.i64()?;
-            r.charge_state(16)?;
+            r.charge_state(vec_insert_growth(&m.vals))?;
             m.vals.push((v, c));
         }
         m.errs = r.i64()?;
@@ -1943,6 +2176,8 @@ impl Accumulator for Ordered {
             0 => None,
             _ => Some(r.id()?),
         };
+        let new = m.vals.capacity() as u64 * size_of::<(Id, i64)>() as u64;
+        self.vals_bytes = self.vals_bytes.saturating_sub(old).saturating_add(new);
         self.groups[group] = m;
         Ok(())
     }
@@ -1966,6 +2201,16 @@ enum DistinctGroup {
     Rows(HbMap<Box<[Id]>, i64>),
 }
 
+#[inline]
+fn distinct_group_bytes(group: &DistinctGroup, row_width: usize) -> u64 {
+    match group {
+        DistinctGroup::Rows(m) => {
+            m.len() as u64 * (row_width as u64 * 8) + m.allocation_size() as u64
+        }
+        DistinctGroup::Values(m) => m.allocation_size() as u64,
+    }
+}
+
 /// Retractable `DISTINCT` wrapper over any retractable accumulator. Each group counts
 /// occurrences of each distinct value (or full row for `COUNT(DISTINCT *)`), forwarding
 /// transitions across zero to `inner` and passing errors (`Id::UNDEF`) through
@@ -1973,6 +2218,7 @@ enum DistinctGroup {
 pub(crate) struct RetractableDistinct {
     inner: Box<dyn Accumulator>,
     groups: Vec<DistinctGroup>,
+    groups_own_bytes: u64,
     star: bool,
     row_width: usize,
 }
@@ -1982,6 +2228,7 @@ impl RetractableDistinct {
         Self {
             inner,
             groups: Vec::new(),
+            groups_own_bytes: 0,
             star,
             row_width,
         }
@@ -1998,9 +2245,14 @@ impl RetractableDistinct {
 
 impl Accumulator for RetractableDistinct {
     fn init(&mut self, groups: usize) {
-        for _ in 0..groups {
-            self.groups.push(self.empty_group());
-        }
+        let star = self.star;
+        self.groups.resize_with(self.groups.len() + groups, || {
+            if star {
+                DistinctGroup::Rows(HbMap::default())
+            } else {
+                DistinctGroup::Values(HbMap::default())
+            }
+        });
         self.inner.init(groups);
     }
 
@@ -2015,6 +2267,7 @@ impl Accumulator for RetractableDistinct {
         let mut keep_vals: Vec<Id> = Vec::new();
         let mut keep_weights: Vec<i64> = Vec::new();
         let mut row_buf: Vec<Id> = Vec::new();
+        let mut headroom = 0u64;
         for (row, &slot) in slots.iter().enumerate() {
             if row.is_multiple_of(1024) {
                 ctx.check()?;
@@ -2023,11 +2276,13 @@ impl Accumulator for RetractableDistinct {
             if w == 0 {
                 continue;
             }
-            match &mut self.groups[slot as usize] {
+            let before_own = distinct_group_bytes(&self.groups[slot as usize], self.row_width);
+            let mut admit = |delta: u64| budget.retain(delta);
+            let step_res: Result<()> = match &mut self.groups[slot as usize] {
                 DistinctGroup::Rows(m) => {
                     row_buf.clear();
                     row_buf.extend(batch.table.cols.iter().map(|c| c[batch.base + row]));
-                    let (before, after) = if let Some(e) = m.get_mut(row_buf.as_slice()) {
+                    let res = if let Some(e) = m.get_mut(row_buf.as_slice()) {
                         let before = *e;
                         *e += w;
                         let after = *e;
@@ -2035,21 +2290,27 @@ impl Accumulator for RetractableDistinct {
                             m.remove(row_buf.as_slice());
                             shrink_map(m);
                         }
-                        (before, after)
+                        Ok((before, after))
                     } else {
                         let key_extra = (row_buf.len() * size_of::<Id>()) as u64;
                         let delta = hbmap_insert_growth(m, key_extra);
-                        if delta > 0 {
-                            budget.retain(delta)?;
-                        }
-                        let key: Box<[Id]> = row_buf.as_slice().into();
-                        m.insert(key, w);
-                        (0, w)
+                        admit_with_headroom(delta, &mut headroom, &mut admit).map(|()| {
+                            let before_alloc = m.allocation_size() as u64;
+                            let key: Box<[Id]> = row_buf.as_slice().into();
+                            m.insert(key, w);
+                            let actual = (m.allocation_size() as u64)
+                                .saturating_sub(before_alloc)
+                                .saturating_add(key_extra);
+                            headroom = headroom.saturating_sub(actual);
+                            (0, w)
+                        })
                     };
-                    if before <= 0 && after > 0 {
-                        keep_slots.push(slot);
-                        keep_weights.push(1);
-                    }
+                    res.map(|(before, after)| {
+                        if before <= 0 && after > 0 {
+                            keep_slots.push(slot);
+                            keep_weights.push(1);
+                        }
+                    })
                 }
                 DistinctGroup::Values(m) => {
                     let id = batch.value(row).unwrap_or(Id::UNDEF);
@@ -2058,8 +2319,9 @@ impl Accumulator for RetractableDistinct {
                         keep_slots.push(slot);
                         keep_vals.push(Id::UNDEF);
                         keep_weights.push(w);
+                        Ok(())
                     } else {
-                        let (before, after) = if let Some(e) = m.get_mut(&id) {
+                        let res = if let Some(e) = m.get_mut(&id) {
                             let before = *e;
                             *e += w;
                             let after = *e;
@@ -2067,23 +2329,34 @@ impl Accumulator for RetractableDistinct {
                                 m.remove(&id);
                                 shrink_map(m);
                             }
-                            (before, after)
+                            Ok((before, after))
                         } else {
                             let delta = hbmap_insert_growth(m, 0);
-                            if delta > 0 {
-                                budget.retain(delta)?;
-                            }
-                            m.insert(id, w);
-                            (0, w)
+                            admit_with_headroom(delta, &mut headroom, &mut admit).map(|()| {
+                                let before_alloc = m.allocation_size() as u64;
+                                m.insert(id, w);
+                                let actual =
+                                    (m.allocation_size() as u64).saturating_sub(before_alloc);
+                                headroom = headroom.saturating_sub(actual);
+                                (0, w)
+                            })
                         };
-                        if before <= 0 && after > 0 {
-                            keep_slots.push(slot);
-                            keep_vals.push(id);
-                            keep_weights.push(1);
-                        }
+                        res.map(|(before, after)| {
+                            if before <= 0 && after > 0 {
+                                keep_slots.push(slot);
+                                keep_vals.push(id);
+                                keep_weights.push(1);
+                            }
+                        })
                     }
                 }
-            }
+            };
+            let after_own = distinct_group_bytes(&self.groups[slot as usize], self.row_width);
+            self.groups_own_bytes = self
+                .groups_own_bytes
+                .saturating_sub(before_own)
+                .saturating_add(after_own);
+            step_res?;
         }
         if keep_slots.is_empty() {
             return Ok(());
@@ -2105,6 +2378,8 @@ impl Accumulator for RetractableDistinct {
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         let id = self.inner.finish(ctx, group)?;
+        let old = distinct_group_bytes(&self.groups[group], self.row_width);
+        self.groups_own_bytes = self.groups_own_bytes.saturating_sub(old);
         self.groups[group] = self.empty_group();
         Ok(id)
     }
@@ -2132,6 +2407,7 @@ impl Accumulator for RetractableDistinct {
             if w == 0 {
                 continue;
             }
+            let before_own = distinct_group_bytes(&self.groups[slot as usize], self.row_width);
             match &mut self.groups[slot as usize] {
                 DistinctGroup::Rows(m) => {
                     let key: Box<[Id]> = batch
@@ -2176,6 +2452,11 @@ impl Accumulator for RetractableDistinct {
                     }
                 }
             }
+            let after_own = distinct_group_bytes(&self.groups[slot as usize], self.row_width);
+            self.groups_own_bytes = self
+                .groups_own_bytes
+                .saturating_sub(before_own)
+                .saturating_add(after_own);
         }
         if drop_slots.is_empty() {
             return Ok(true);
@@ -2197,13 +2478,17 @@ impl Accumulator for RetractableDistinct {
 
     fn clear(&mut self) {
         self.groups = Vec::new();
+        self.groups_own_bytes = 0;
         self.inner.clear();
     }
 
     fn swap_remove(&mut self, group: usize) {
-        self.groups.swap_remove(group);
+        let removed = self.groups.swap_remove(group);
+        let old = distinct_group_bytes(&removed, self.row_width);
+        self.groups_own_bytes = self.groups_own_bytes.saturating_sub(old);
         if self.groups.is_empty() {
             self.groups = Vec::new();
+            self.groups_own_bytes = 0;
         }
         self.inner.swap_remove(group);
     }
@@ -2215,17 +2500,11 @@ impl Accumulator for RetractableDistinct {
 
     fn retained_bytes(&self) -> u64 {
         let outer = self.groups.capacity() as u64 * size_of::<DistinctGroup>() as u64;
-        let own: u64 = self
-            .groups
-            .iter()
-            .map(|g| match g {
-                DistinctGroup::Rows(m) => {
-                    m.len() as u64 * (self.row_width as u64 * 8) + m.allocation_size() as u64
-                }
-                DistinctGroup::Values(m) => m.allocation_size() as u64,
-            })
-            .sum();
-        outer + own + self.inner.retained_bytes()
+        outer + self.groups_own_bytes + self.inner.retained_bytes()
+    }
+
+    fn init_growth(&self, groups: usize) -> u64 {
+        vec_growth(&self.groups, groups).saturating_add(self.inner.init_growth(groups))
     }
 
     fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
@@ -2249,34 +2528,47 @@ impl Accumulator for RetractableDistinct {
     }
 
     fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
-        match &mut self.groups[group] {
+        let old = distinct_group_bytes(&self.groups[group], self.row_width);
+        let row_width = self.row_width;
+        let load_res: Result<()> = match &mut self.groups[group] {
             DistinctGroup::Rows(m) => {
                 m.clear();
-                let inner_row = self.row_width as u64 * 8 + 48;
-                for _ in 0..r.u64()? {
+                let row_extra = row_width as u64 * 8;
+                (0..r.u64()?).try_for_each(|_| {
                     let row = r.row()?;
-                    r.charge_state(inner_row)?;
-                    m.insert(row, r.i64()?);
-                }
+                    let c = r.i64()?;
+                    hbmap_load_insert(r, m, row, c, row_extra)
+                })
             }
             DistinctGroup::Values(m) => {
-                r.charge_state(48)?;
                 m.clear();
-                for _ in 0..r.u64()? {
+                (0..r.u64()?).try_for_each(|_| {
                     let v = r.id()?;
-                    r.charge_state(24)?;
-                    m.insert(v, r.i64()?);
-                }
+                    let c = r.i64()?;
+                    hbmap_load_insert(r, m, v, c, 0)
+                })
             }
-        }
+        };
+        let new = distinct_group_bytes(&self.groups[group], self.row_width);
+        self.groups_own_bytes = self
+            .groups_own_bytes
+            .saturating_sub(old)
+            .saturating_add(new);
+        load_res?;
         self.inner.load_group(group, r)
     }
 
     fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
         let inner = self.inner.clone_box()?;
+        let groups = self.groups.clone();
+        let groups_own_bytes = groups
+            .iter()
+            .map(|g| distinct_group_bytes(g, self.row_width))
+            .sum();
         Some(Box::new(Self {
             inner,
-            groups: self.groups.clone(),
+            groups,
+            groups_own_bytes,
             star: self.star,
             row_width: self.row_width,
         }))
@@ -2750,5 +3042,448 @@ impl Accumulator for Rows {
 
     fn as_any(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::incr::persist::{Reader, Writer};
+    use crate::incr::terms::Terms;
+    use crate::sparql::bignum::{BigDec, BigInt};
+    use crate::sparql::ctx::Ctx;
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{Literal, Term};
+
+    fn make_ctx() -> (Store, Ctx) {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let ctx = Ctx::new(snap);
+        (store, ctx)
+    }
+
+    fn sum_agg() -> Agg {
+        Agg {
+            func: AggregateFunction::Sum,
+            expr: Some(Expr::Var(0)),
+            distinct: false,
+            fold: None,
+            registered: None,
+        }
+    }
+
+    /// Regression for P2-1: when a full 128-bucket hashbrown map loses one entry to a
+    /// deletion leaving a tombstone (`len == 111, capacity == 111, growth_left == 0`),
+    /// the next insert can double the table to 256 buckets. Both `RetractableSum` and
+    /// `RetractableDistinct` must pre-admit that resize before allocating so a tight
+    /// budget refuses with `allocation_size()` unchanged.
+    #[test]
+    fn tombstone_in_full_retractable_map_refuses_before_resize() {
+        let (_store, ctx) = make_ctx();
+        let empty_table = Table::new(Vec::new());
+
+        // 1. RetractableSum decimal map: fill to 112 distinct decimals (128 buckets,
+        // growth_left == 0), retract one entry that leaves a tombstone, then verify a
+        // tight budget refuses before `decs.allocation_size()` increases.
+        let mut sum = RetractableSum::new(&sum_agg());
+        sum.init(1);
+        let dec_ids: Vec<Id> = (0..130i64)
+            .map(|i| ctx.intern_value(&Value::Decimal(Decimal::from(i + 1))))
+            .collect();
+        let init_slots = vec![0u32; 112];
+        let mut allow_all = |_delta: u64| Ok(());
+        {
+            let mut budget = BatchBudget::Retain(&mut allow_all);
+            let batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&dec_ids[..112]),
+                rows: None,
+                weights: None,
+                base: 0,
+            };
+            sum.add_batch(&ctx, &batch, &init_slots, &mut budget)
+                .unwrap();
+        }
+        assert_eq!(sum.groups[0].decs.len(), 112);
+        assert_eq!(sum.groups[0].decs.capacity(), 112);
+        let alloc_128 = sum.groups[0].decs.allocation_size();
+
+        // Find a key among the 112 whose retraction leaves a tombstone (`capacity == len`).
+        let mut left_tombstone = false;
+        for &victim in &dec_ids[..112] {
+            let ret_batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&[victim]),
+                rows: None,
+                weights: Some(&[-1]),
+                base: 0,
+            };
+            assert!(sum.retract(&ctx, &ret_batch, &[0]).unwrap());
+            if sum.groups[0].decs.capacity() == sum.groups[0].decs.len() {
+                left_tombstone = true;
+                break;
+            }
+            let add_batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&[victim]),
+                rows: None,
+                weights: Some(&[1]),
+                base: 0,
+            };
+            let mut budget = BatchBudget::Retain(&mut allow_all);
+            sum.add_batch(&ctx, &add_batch, &[0], &mut budget).unwrap();
+        }
+        assert!(
+            left_tombstone,
+            "expected at least one deletion in full 128-bucket decs map to leave a tombstone"
+        );
+        assert_eq!(sum.groups[0].decs.len(), 111);
+        assert_eq!(sum.groups[0].decs.capacity(), 111);
+        assert_eq!(sum.groups[0].decs.allocation_size(), alloc_128);
+        let predicted = hbmap_insert_growth(&sum.groups[0].decs, 0);
+        assert!(
+            predicted > 0,
+            "hbmap_insert_growth must predict 256-bucket resize on exhausted tombstone map"
+        );
+
+        let mut refused_delta = None;
+        let mut tight = |delta: u64| {
+            refused_delta = Some(delta);
+            Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                limit: alloc_128 as u64 + 64,
+                requested: alloc_128 as u64 + delta,
+            }))
+        };
+        {
+            let mut budget = BatchBudget::Retain(&mut tight);
+            let batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&[dec_ids[120]]),
+                rows: None,
+                weights: Some(&[1]),
+                base: 0,
+            };
+            let err = sum
+                .add_batch(&ctx, &batch, &[0], &mut budget)
+                .expect_err("tight budget must refuse tombstone-triggered decimal resize");
+            assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+        }
+        assert_eq!(refused_delta, Some(predicted));
+        assert_eq!(
+            sum.groups[0].decs.allocation_size(),
+            alloc_128,
+            "decs table must not resize before budget admission"
+        );
+
+        // 2. RetractableDistinct Values map: same tombstone-at-capacity scenario.
+        let mut distinct =
+            RetractableDistinct::new(Box::new(RetractableSum::new(&sum_agg())), false, 1);
+        distinct.init(1);
+        let int_ids: Vec<Id> = (0..130i64)
+            .map(|i| Id::from_i64((i * 1_000_003) ^ 0x55aa).unwrap())
+            .collect();
+        {
+            let mut budget = BatchBudget::Retain(&mut allow_all);
+            let batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&int_ids[..112]),
+                rows: None,
+                weights: None,
+                base: 0,
+            };
+            distinct
+                .add_batch(&ctx, &batch, &init_slots, &mut budget)
+                .unwrap();
+        }
+        let distinct_alloc_128 = match &distinct.groups[0] {
+            DistinctGroup::Values(m) => {
+                assert_eq!(m.len(), 112);
+                assert_eq!(m.capacity(), 112);
+                m.allocation_size()
+            }
+            DistinctGroup::Rows(_) => unreachable!(),
+        };
+
+        let mut distinct_tombstone = false;
+        for &victim in &int_ids[..112] {
+            let ret_batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&[victim]),
+                rows: None,
+                weights: Some(&[-1]),
+                base: 0,
+            };
+            assert!(distinct.retract(&ctx, &ret_batch, &[0]).unwrap());
+            let exhausted = match &distinct.groups[0] {
+                DistinctGroup::Values(m) => m.capacity() == m.len(),
+                DistinctGroup::Rows(_) => unreachable!(),
+            };
+            if exhausted {
+                distinct_tombstone = true;
+                break;
+            }
+            let add_batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&[victim]),
+                rows: None,
+                weights: Some(&[1]),
+                base: 0,
+            };
+            let mut budget = BatchBudget::Retain(&mut allow_all);
+            distinct
+                .add_batch(&ctx, &add_batch, &[0], &mut budget)
+                .unwrap();
+        }
+        assert!(
+            distinct_tombstone,
+            "expected at least one deletion in full 128-bucket distinct map to leave a tombstone"
+        );
+        let distinct_predicted = match &distinct.groups[0] {
+            DistinctGroup::Values(m) => hbmap_insert_growth(m, 0),
+            DistinctGroup::Rows(_) => unreachable!(),
+        };
+        assert!(distinct_predicted > 0);
+
+        let mut refused_distinct = None;
+        let mut tight_distinct = |delta: u64| {
+            refused_distinct = Some(delta);
+            Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                limit: distinct_alloc_128 as u64 + 64,
+                requested: distinct_alloc_128 as u64 + delta,
+            }))
+        };
+        {
+            let mut budget = BatchBudget::Retain(&mut tight_distinct);
+            let batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&[int_ids[125]]),
+                rows: None,
+                weights: Some(&[1]),
+                base: 0,
+            };
+            let err = distinct
+                .add_batch(&ctx, &batch, &[0], &mut budget)
+                .expect_err("tight budget must refuse tombstone-triggered distinct resize");
+            assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+        }
+        assert_eq!(refused_distinct, Some(distinct_predicted));
+        match &distinct.groups[0] {
+            DistinctGroup::Values(m) => assert_eq!(
+                m.allocation_size(),
+                distinct_alloc_128,
+                "distinct Values table must not resize before budget admission"
+            ),
+            DistinctGroup::Rows(_) => unreachable!(),
+        }
+    }
+
+    /// Regression for P2-2: O(1) incremental `retained_bytes()` on `RetractableSum`,
+    /// `Ordered`, and `RetractableDistinct` must match a direct full scan across big-number
+    /// inserts, retractions, `swap_remove`, `shrink_unused`, `finish`, `clear`, and
+    /// checkpoint round-trips.
+    #[test]
+    fn retractable_retained_bytes_matches_exact_scan() {
+        let (store, ctx) = make_ctx();
+        let snap = store.snapshot();
+        let empty_table = Table::new(Vec::new());
+        let mut allow_all = |_delta: u64| Ok(());
+
+        let exact_sum_bytes = |acc: &RetractableSum| -> u64 {
+            acc.groups.capacity() as u64 * size_of::<SumState>() as u64
+                + acc
+                    .groups
+                    .iter()
+                    .map(SumState::exact_map_bytes)
+                    .sum::<u64>()
+        };
+        let exact_ordered_bytes = |acc: &Ordered| -> u64 {
+            acc.groups.capacity() as u64 * size_of::<Multiset>() as u64
+                + acc
+                    .groups
+                    .iter()
+                    .map(|m| m.vals.capacity() as u64 * size_of::<(Id, i64)>() as u64)
+                    .sum::<u64>()
+        };
+        let exact_distinct_bytes = |acc: &RetractableDistinct| -> u64 {
+            acc.groups.capacity() as u64 * size_of::<DistinctGroup>() as u64
+                + acc
+                    .groups
+                    .iter()
+                    .map(|g| distinct_group_bytes(g, acc.row_width))
+                    .sum::<u64>()
+                + acc.inner.retained_bytes()
+        };
+
+        // 1. RetractableSum across BigInt, BigDec, Decimal, Float, Double and 3 groups.
+        let mut sum = RetractableSum::new(&sum_agg());
+        sum.init(3);
+        assert_eq!(sum.retained_bytes(), exact_sum_bytes(&sum));
+
+        let mut vals = Vec::new();
+        let mut slots = Vec::new();
+        for i in 0..300u64 {
+            let bi = BigInt::parse(&format!("9999999999999999999999999999999999{i:04}")).unwrap();
+            let bd = BigDec::parse(&format!("1234567890123456789012345678901234.{i:04}")).unwrap();
+            vals.push(ctx.intern_value(&Value::from_bigint(bi)));
+            slots.push((i % 3) as u32);
+            vals.push(ctx.intern_value(&Value::from_bigdec(bd)));
+            slots.push(((i + 1) % 3) as u32);
+            vals.push(ctx.intern_value(&Value::Double(Double::from(i as f64 + 0.5))));
+            slots.push(((i + 2) % 3) as u32);
+        }
+        {
+            let mut budget = BatchBudget::Retain(&mut allow_all);
+            let batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&vals),
+                rows: None,
+                weights: None,
+                base: 0,
+            };
+            sum.add_batch(&ctx, &batch, &slots, &mut budget).unwrap();
+        }
+        assert_eq!(sum.retained_bytes(), exact_sum_bytes(&sum));
+        assert!(sum.maps_bytes > 0);
+
+        // Retract half the big-number values.
+        let half = vals.len() / 2;
+        let neg_w = vec![-1i64; half];
+        let ret_batch = Batch {
+            table: &empty_table,
+            arg: Arg::Column(&vals[..half]),
+            rows: None,
+            weights: Some(&neg_w),
+            base: 0,
+        };
+        assert!(sum.retract(&ctx, &ret_batch, &slots[..half]).unwrap());
+        assert_eq!(sum.retained_bytes(), exact_sum_bytes(&sum));
+
+        // Checkpoint save + load round-trip on group 0.
+        let terms = Terms::default();
+        let mut w = Writer::new(&snap, &terms);
+        sum.save_group(0, &mut w).unwrap();
+        let bytes = w.finish();
+        let mut load_terms = Terms::default();
+        let mut r = Reader::new(&bytes, &snap, &mut load_terms).unwrap();
+        let mut reloaded = RetractableSum::new(&sum_agg());
+        reloaded.init(1);
+        reloaded.load_group(0, &mut r).unwrap();
+        assert_eq!(reloaded.retained_bytes(), exact_sum_bytes(&reloaded));
+
+        // swap_remove, finish, shrink_unused, clear.
+        sum.swap_remove(1);
+        assert_eq!(sum.retained_bytes(), exact_sum_bytes(&sum));
+        let _ = sum.finish(&ctx, 0).unwrap();
+        assert_eq!(sum.retained_bytes(), exact_sum_bytes(&sum));
+        sum.shrink_unused();
+        assert_eq!(sum.retained_bytes(), exact_sum_bytes(&sum));
+        sum.clear();
+        assert_eq!(sum.retained_bytes(), 0);
+
+        // 2. Ordered (MIN) across adds, retracts, swap_remove, finish, clear.
+        let min_agg = Agg {
+            func: AggregateFunction::Min,
+            expr: Some(Expr::Var(0)),
+            distinct: false,
+            fold: None,
+            registered: None,
+        };
+        let mut ordered = Ordered::new(&min_agg);
+        ordered.init(2);
+        let str_ids: Vec<Id> = (0..64)
+            .map(|i| {
+                ctx.intern_term(&Term::Literal(Literal::new_simple_literal(format!(
+                    "v{i:03}"
+                ))))
+            })
+            .collect();
+        let ord_slots: Vec<u32> = (0..64).map(|i| (i % 2) as u32).collect();
+        {
+            let mut budget = BatchBudget::Retain(&mut allow_all);
+            let batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&str_ids),
+                rows: None,
+                weights: None,
+                base: 0,
+            };
+            ordered
+                .add_batch(&ctx, &batch, &ord_slots, &mut budget)
+                .unwrap();
+        }
+        assert_eq!(ordered.retained_bytes(), exact_ordered_bytes(&ordered));
+        let ord_neg = vec![-1i64; 32];
+        assert!(
+            ordered
+                .retract(
+                    &ctx,
+                    &Batch {
+                        table: &empty_table,
+                        arg: Arg::Column(&str_ids[..32]),
+                        rows: None,
+                        weights: Some(&ord_neg),
+                        base: 0,
+                    },
+                    &ord_slots[..32],
+                )
+                .unwrap()
+        );
+        assert_eq!(ordered.retained_bytes(), exact_ordered_bytes(&ordered));
+        ordered.swap_remove(0);
+        assert_eq!(ordered.retained_bytes(), exact_ordered_bytes(&ordered));
+        let _ = ordered.finish(&ctx, 0).unwrap();
+        assert_eq!(ordered.retained_bytes(), exact_ordered_bytes(&ordered));
+        ordered.clear();
+        assert_eq!(ordered.retained_bytes(), 0);
+
+        // 3. RetractableDistinct (Values) across adds, retracts, clone_box, swap_remove, clear.
+        let mut distinct =
+            RetractableDistinct::new(Box::new(RetractableSum::new(&sum_agg())), false, 1);
+        distinct.init(2);
+        {
+            let mut budget = BatchBudget::Retain(&mut allow_all);
+            let batch = Batch {
+                table: &empty_table,
+                arg: Arg::Column(&vals[..60]),
+                rows: None,
+                weights: None,
+                base: 0,
+            };
+            distinct
+                .add_batch(&ctx, &batch, &ord_slots[..60], &mut budget)
+                .unwrap();
+        }
+        assert_eq!(distinct.retained_bytes(), exact_distinct_bytes(&distinct));
+        let mut cloned = distinct.clone_box().unwrap();
+        let cloned_ref = cloned
+            .as_any()
+            .downcast_ref::<RetractableDistinct>()
+            .expect("cloned RetractableDistinct");
+        assert_eq!(
+            cloned_ref.retained_bytes(),
+            exact_distinct_bytes(cloned_ref)
+        );
+        assert!(
+            distinct
+                .retract(
+                    &ctx,
+                    &Batch {
+                        table: &empty_table,
+                        arg: Arg::Column(&vals[..30]),
+                        rows: None,
+                        weights: Some(&ord_neg[..30]),
+                        base: 0,
+                    },
+                    &ord_slots[..30],
+                )
+                .unwrap()
+        );
+        assert_eq!(distinct.retained_bytes(), exact_distinct_bytes(&distinct));
+        distinct.swap_remove(0);
+        assert_eq!(distinct.retained_bytes(), exact_distinct_bytes(&distinct));
+        distinct.clear();
+        assert_eq!(distinct.retained_bytes(), 0);
     }
 }

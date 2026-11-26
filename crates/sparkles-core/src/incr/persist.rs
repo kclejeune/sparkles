@@ -280,6 +280,17 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    /// Release excess pre-admitted persistent state bytes when an actual allocation is
+    /// smaller than its conservative preflight estimate.
+    pub(crate) fn release_state(&self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(budget) = &self.budget {
+            budget.release_pass(delta);
+        }
+    }
+
     pub fn u64(&mut self) -> Result<u64> {
         let mut v = 0u64;
         let mut shift = 0;
