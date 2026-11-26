@@ -98,6 +98,10 @@ Datasets serialize to a versioned canonical directory layout (`format_version = 
 
 `Dataset::export_git` and `sparkles git export` (including `--branch`) export a branch to a standalone non-bare Git repository commit-by-commit or squashed, writing UTC timestamps, messages, RFC 822 commit trailers (including inherited origin, merge, and replay provenance), and a bounded versioned per-branch bidirectional Sparkles-commit to Git-SHA mapping (`format_version = 1`, stored by default under `<git-dir>/sparkles/mappings/`). Exports refuse bare repositories, linked worktrees, dirty indexes, and in-progress Git merge or rebase states; stage commits through an isolated temporary index and `commit-tree`; synchronize the working tree from raw blob objects without attribute filters; and record a crash-recoverable pending publication journal around compare-and-swap ref updates. Exports use the branch's live prefix table, pin the target branch by UUID, require retained commit history for per-commit replay, and fail before publishing if a retained change-log segment is corrupt or unreadable. Git ref import onto `git/<remote>/<ref>` branches, webhook-driven sync, and server-to-server remotes remain tracked in roadmap [item 460](../ROADMAP.md).
 
+Checkout uses a version 3 pending journal. When checkout moves a tracked file aside, it keeps the file in a private directory until the destination directory has been synced. Recovery checks the directory's ownership receipt before restoring or retiring that file. If a receipt name is occupied by another file, export stops and leaves the occupant in place. Version 3 readers refuse earlier pending journals and leave them available for inspection.
+
+Moving a tracked entry requires atomic no-replace rename on Linux, macOS or Windows. The move-out filesystem must support hard links for ownership receipts. Windows checkout also requires the filesystem to accept a directory flush through a writable directory handle. Export reports an error when the required operation is unavailable.
+
 ## Configuration and usage
 
 | Topic | Reference |
