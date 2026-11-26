@@ -3027,9 +3027,35 @@ impl Store {
         range: CommitRange,
         limit: usize,
     ) -> Result<Vec<BranchCommit>> {
-        let set = self.owned_set()?;
         let id = self.branch_id_of(name)?;
         let head = self.branch(name)?.head_commit().seq;
+        self.branch_commits_for_id(id, head, range, limit)
+    }
+
+    /// [`branch_commits`](Self::branch_commits) for an already-retained branch store in
+    /// this dataset family, pinned by UUID rather than resolved again by branch name.
+    pub fn branch_commits_pinned(
+        &self,
+        store: &Store,
+        range: CommitRange,
+        limit: usize,
+    ) -> Result<Vec<BranchCommit>> {
+        if self.owner_dataset_id() != store.owner_dataset_id() {
+            return Err(Error::invalid(
+                "the pinned branch belongs to a different dataset family",
+            ));
+        }
+        self.branch_commits_for_id(store.branch_id(), store.head_commit().seq, range, limit)
+    }
+
+    fn branch_commits_for_id(
+        &self,
+        id: uuid::Uuid,
+        head: u64,
+        range: CommitRange,
+        limit: usize,
+    ) -> Result<Vec<BranchCommit>> {
+        let set = self.owned_set()?;
         let chain = set.chain(CommitRef {
             branch_id: id,
             seq: head,

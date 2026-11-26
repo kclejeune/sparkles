@@ -4977,16 +4977,28 @@ impl Store {
         if p.is_empty() {
             return Ok(());
         }
+        let PreparedPrefixes {
+            mut cur,
+            next,
+            skipped,
+        } = self.prepare_added_prefixes(&p);
+        if let Some(next) = next {
+            self.save_prefixes(&next)?;
+            *cur = next;
+        }
+        self.warn_skipped_prefixes(skipped);
+        Ok(())
+    }
+
+    fn prepare_added_prefixes(&self, p: &BTreeMap<String, String>) -> PreparedPrefixes<'_> {
         let filter = self.prefix_filter.lock().clone();
-        let removed = self.removed_prefixes.lock();
-        let mut cur = self.prefixes.lock();
+        let removed = self.removed_prefixes.lock().clone();
+        let cur = self.prefixes.lock();
         let mut next: Option<BTreeMap<String, String>> = None;
         let mut skipped = 0usize;
         for (k, v) in p {
             let map = next.as_ref().unwrap_or(&*cur);
-            if map.contains_key(&k)
-                || removed.contains(&k)
-                || filter.as_ref().is_some_and(|f| !f(&k))
+            if map.contains_key(k) || removed.contains(k) || filter.as_ref().is_some_and(|f| !f(k))
             {
                 continue;
             }
@@ -4997,12 +5009,13 @@ impl Store {
                 skipped += 1;
                 continue;
             }
-            next.get_or_insert_with(|| cur.clone()).insert(k, v);
+            next.get_or_insert_with(|| cur.clone())
+                .insert(k.clone(), v.clone());
         }
-        if let Some(next) = next {
-            self.save_prefixes(&next)?;
-            *cur = next;
-        }
+        PreparedPrefixes { cur, next, skipped }
+    }
+
+    fn warn_skipped_prefixes(&self, skipped: usize) {
         if skipped > 0 {
             tracing::warn!(
                 target: "sparkles::store",
@@ -5010,7 +5023,6 @@ impl Store {
                 self.opts.max_prefixes
             );
         }
-        Ok(())
     }
 
     /// Set (or replace) one prefix, and clear a removal of its name. Prefixes are
@@ -5595,6 +5607,7 @@ impl Store {
                 Some(crate::managed::ManagedState::Installed(i)) if i.configuration_history.is_some()),
             stamp: None,
             control: None,
+            staged_prefixes: BTreeMap::new(),
         }
     }
 
@@ -7093,6 +7106,12 @@ impl std::ops::DerefMut for TxnGuard<'_> {
     }
 }
 
+struct PreparedPrefixes<'a> {
+    cur: parking_lot::MutexGuard<'a, BTreeMap<String, String>>,
+    next: Option<BTreeMap<String, String>>,
+    skipped: usize,
+}
+
 /// The single write transaction. Changes are invisible until [`commit`](Self::commit).
 pub struct WriteTxn<'s> {
     _callback_owner: crate::sparql::extensions::WriterOwner,
@@ -7136,6 +7155,8 @@ pub struct WriteTxn<'s> {
     stamp: Option<i64>,
     /// the control records staged by an owner ([`Self::set_control`])
     control: Option<control_store::ControlTxn>,
+    /// prefixes staged for joint persistence with this transaction's commit
+    staged_prefixes: BTreeMap<String, String>,
 }
 
 impl Drop for WriteTxn<'_> {
@@ -7168,6 +7189,14 @@ impl Drop for OrdinarySyncObservation<'_> {
 }
 
 impl WriteTxn<'_> {
+    /// Stage prefixes to be persisted jointly with this transaction's commit.
+    ///
+    /// Dry runs and refused transactions never touch the dataset's prefix table. If
+    /// persisting `prefixes.json` fails, the transaction aborts before publishing quads.
+    pub fn stage_prefixes(&mut self, prefixes: BTreeMap<String, String>) {
+        self.staged_prefixes.extend(prefixes);
+    }
+
     /// [`Error::NotPermitted`] unless the write's graph view lets it change graph `g`.
     /// Called before a quad is looked up, so the answer never depends on the data.
     fn check_graph(&mut self, g: Id) -> Result<()> {
@@ -7779,7 +7808,10 @@ impl WriteTxn<'_> {
         }
         // a commit with a merge record (a merge, or a commit a merge replays) passes
         let as_new_branch = self.opts.preview_as_new_branch && self.opts.dry_run.is_some();
-        if (self.is_dirty() || self.force) && self.merge.is_none() && !as_new_branch {
+        if (self.is_dirty() || self.force || !self.staged_prefixes.is_empty())
+            && self.merge.is_none()
+            && !as_new_branch
+        {
             self.store.check_protected(self.kind)?;
         }
         self.check_requested_all()
@@ -7824,6 +7856,10 @@ impl WriteTxn<'_> {
                     return self.publish_control_only();
                 }
                 // no net change: no commit, nothing to validate or publish
+                if !self.staged_prefixes.is_empty() {
+                    let staged = std::mem::take(&mut self.staged_prefixes);
+                    self.store.add_prefixes(staged)?;
+                }
                 let head = self.guard.head;
                 return Ok(Receipt {
                     dataset_id: self.store.owner_dataset_id(),
@@ -7852,6 +7888,41 @@ impl WriteTxn<'_> {
             };
             // the last check, after the validation, right before publication
             self.opts.check_publish()?;
+            let staged_prefixes = std::mem::take(&mut self.staged_prefixes);
+            if staged_prefixes.is_empty() {
+                if self.guard.wal.is_none() {
+                    return self.publish_memory(validation);
+                }
+                return self.publish_grouped(validation, grouped, sync);
+            }
+            let store = self.store;
+            let PreparedPrefixes {
+                mut cur,
+                next: next_opt,
+                skipped,
+            } = store.prepare_added_prefixes(&staged_prefixes);
+            if let Some(next) = next_opt {
+                store.save_prefixes(&next)?;
+                let res = if self.guard.wal.is_none() {
+                    self.publish_memory(validation)
+                } else {
+                    self.publish_grouped(validation, grouped, sync)
+                };
+                match res {
+                    Ok(receipt) => {
+                        *cur = next;
+                        drop(cur);
+                        store.warn_skipped_prefixes(skipped);
+                        return Ok(receipt);
+                    }
+                    Err(e) => {
+                        let _ = store.save_prefixes(&cur);
+                        return Err(e);
+                    }
+                }
+            }
+            drop(cur);
+            store.warn_skipped_prefixes(skipped);
             if self.guard.wal.is_none() {
                 return self.publish_memory(validation);
             }
@@ -7885,9 +7956,44 @@ impl WriteTxn<'_> {
             },
             &self.opts,
         );
+        let staged_prefixes = std::mem::take(&mut self.staged_prefixes);
+        if staged_prefixes.is_empty() {
+            let (_, receipt) = self.store.rebuild_locked(
+                &mut self.guard,
+                &view,
+                &[],
+                &bulk,
+                &[],
+                commit,
+                check,
+            )?;
+            return Ok(receipt);
+        }
+        let store = self.store;
+        let PreparedPrefixes {
+            mut cur,
+            next: next_opt,
+            skipped,
+        } = store.prepare_added_prefixes(&staged_prefixes);
+        if let Some(next) = next_opt {
+            store.save_prefixes(&next)?;
+            match store.rebuild_locked(&mut self.guard, &view, &[], &bulk, &[], commit, check) {
+                Ok((_, receipt)) => {
+                    *cur = next;
+                    drop(cur);
+                    store.warn_skipped_prefixes(skipped);
+                    return Ok(receipt);
+                }
+                Err(e) => {
+                    let _ = store.save_prefixes(&cur);
+                    return Err(e);
+                }
+            }
+        }
+        drop(cur);
+        store.warn_skipped_prefixes(skipped);
         let (_, receipt) =
-            self.store
-                .rebuild_locked(&mut self.guard, &view, &[], &bulk, &[], commit, check)?;
+            store.rebuild_locked(&mut self.guard, &view, &[], &bulk, &[], commit, check)?;
         Ok(receipt)
     }
 
@@ -7903,7 +8009,8 @@ impl WriteTxn<'_> {
                 if self.force
                     || self.merge.is_some()
                     || self.managed.is_some()
-                    || self.control.is_some() =>
+                    || self.control.is_some()
+                    || !self.staged_prefixes.is_empty() =>
             {
                 Some(Fallback::Kind)
             }

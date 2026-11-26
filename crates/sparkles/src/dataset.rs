@@ -1594,6 +1594,11 @@ impl Transaction<'_> {
         self.insert(t.as_ref().in_graph(GraphNameRef::DefaultGraph))
     }
 
+    /// Stage prefixes to be persisted jointly with this transaction's commit.
+    pub(crate) fn stage_prefixes(&mut self, prefixes: BTreeMap<String, String>) {
+        self.txn.stage_prefixes(prefixes);
+    }
+
     /// Remove a quad; blank nodes are matched by the labels this store hands out
     /// (`find` results) or by labels inserted earlier in this transaction.
     pub fn remove(&mut self, quad: QuadRef<'_>) -> Result<bool> {

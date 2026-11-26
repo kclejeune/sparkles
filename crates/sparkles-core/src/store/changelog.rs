@@ -2230,13 +2230,11 @@ impl ChangeLog {
                     continue;
                 }
                 let meta = match (&file, &seg.mem) {
-                    (Some(f), _) => read_record_meta_from_file(f, rec.offset)?,
-                    (None, mem) => read_record_meta_from_mem(mem, rec.offset as usize),
+                    (Some(f), _) => read_record_meta_from_file(f, rec.offset, seq)?,
+                    (None, mem) => read_record_meta_from_mem(mem, rec.offset as usize, seq)?,
                 };
-                if let Some(m) = meta
-                    && (m.author.is_some() || m.message.is_some())
-                {
-                    out.insert(seq, (m.author, m.message));
+                if meta.author.is_some() || meta.message.is_some() {
+                    out.insert(seq, (meta.author, meta.message));
                 }
             }
         }
@@ -2274,47 +2272,64 @@ fn sorted(mut v: Vec<(QuadKey, bool)>) -> Vec<(bool, QuadKey)> {
     v.into_iter().map(|(k, add)| (add, k)).collect()
 }
 
-fn decode_record_meta_prefix(prefix: &[u8]) -> Option<ChangeCommit> {
+fn decode_record_meta_prefix(prefix: &[u8], expected_seq: u64) -> Option<ChangeCommit> {
     let mut c = Cur { b: prefix, i: 0 };
     let ty = c.u8()?;
     let seq = c.u64()?;
+    if seq != expected_seq {
+        return None;
+    }
     match ty {
         REC_CHANGES | REC_SUMMARY => decode_meta(&mut c, seq),
         _ => None,
     }
 }
 
-fn read_record_meta_from_mem(mem: &[u8], offset: usize) -> Option<ChangeCommit> {
-    let header = mem.get(offset..offset.checked_add(8)?)?;
-    let len = u32::from_le_bytes(header[0..4].try_into().ok()?) as usize;
-    let body = mem.get(offset + 8..offset.checked_add(8)?.checked_add(len)?)?;
-    decode_record_meta_prefix(body)
+fn read_record_meta_from_mem(mem: &[u8], offset: usize, expected_seq: u64) -> Result<ChangeCommit> {
+    let Some((body, _)) = frame(mem, offset) else {
+        return Err(Error::Corrupt(format!(
+            "corrupt change-log record frame for commit {expected_seq} at offset {offset}"
+        )));
+    };
+    decode_record_meta_prefix(body, expected_seq).ok_or_else(|| {
+        Error::Corrupt(format!(
+            "corrupt change-log record metadata for commit {expected_seq} at offset {offset}"
+        ))
+    })
 }
 
-fn read_record_meta_from_file(f: &File, offset: u64) -> Result<Option<ChangeCommit>> {
+fn read_record_meta_from_file(f: &File, offset: u64, expected_seq: u64) -> Result<ChangeCommit> {
     const INITIAL_PREFIX: usize = 4096;
     const MAX_META_PREFIX: usize = 1 << 20;
     let mut h = [0u8; 8];
     read_exact_at(f, &mut h, offset)?;
     let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
     if len == 0 {
-        return Ok(None);
+        return Err(Error::Corrupt(format!(
+            "zero-length change-log record for commit {expected_seq} at offset {offset}"
+        )));
     }
     let first_read = len.min(INITIAL_PREFIX);
     let mut buf = vec![0u8; first_read];
     read_exact_at(f, &mut buf, offset + 8)?;
-    if let Some(meta) = decode_record_meta_prefix(&buf) {
-        return Ok(Some(meta));
+    if let Some(meta) = decode_record_meta_prefix(&buf, expected_seq) {
+        return Ok(meta);
     }
-    // Only retry with a larger prefix if the record is larger than INITIAL_PREFIX and
-    // starts with a metadata-bearing record type (e.g. a very long commit message).
-    if len > first_read && matches!(buf.first().copied(), Some(REC_CHANGES | REC_SUMMARY)) {
+    // Check record header type and seq before expanding the read buffer.
+    let mut header_cur = Cur { b: &buf, i: 0 };
+    let header_ok = matches!(header_cur.u8(), Some(REC_CHANGES | REC_SUMMARY))
+        && header_cur.u64() == Some(expected_seq);
+    if len > first_read && header_ok {
         let cap = len.min(MAX_META_PREFIX);
         buf.resize(cap, 0);
         read_exact_at(f, &mut buf[first_read..], offset + 8 + first_read as u64)?;
-        return Ok(decode_record_meta_prefix(&buf));
+        if let Some(meta) = decode_record_meta_prefix(&buf, expected_seq) {
+            return Ok(meta);
+        }
     }
-    Ok(None)
+    Err(Error::Corrupt(format!(
+        "corrupt change-log record metadata for commit {expected_seq} at offset {offset}"
+    )))
 }
 
 /// Write a file through a temporary one, durably.
