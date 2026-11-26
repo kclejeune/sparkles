@@ -123,6 +123,19 @@ pub struct SelectionRequirements {
     pub structured_content: bool,
 }
 
+/// Outcome of probing a record's metadata and selection availability before Phase 2
+/// content verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionProbe {
+    /// All requested availability checks completed in Phase 1.
+    Complete,
+    /// A single visible `Vocab`/`Delta` object ID was found for the selected retained
+    /// literal (`ev:normalizedText` or `ev:retainedBytes`); its exact literal shape will
+    /// be confirmed in one read during Phase 2 (or via
+    /// [`Resolver::verify_selection_literal_shape`] if Phase 2 is short-circuited).
+    DeferredLiteralShape,
+}
+
 /// An authenticated profile record at the resolving view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedRecord {
@@ -493,7 +506,7 @@ impl Resolver {
         request: &RecordRequest,
     ) -> Result<VerifiedRecord> {
         let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
-        self.record_in_view(
+        let (verified, _) = self.record_in_view(
             key,
             view_key,
             index,
@@ -502,7 +515,9 @@ impl Resolver {
             &request.kinds,
             request.content_digest.as_ref(),
             SelectionRequirements::default(),
-        )
+            false,
+        )?;
+        Ok(verified)
     }
 
     /// Verify a record reference without allocating an owned [`RecordRequest`] or
@@ -542,7 +557,95 @@ impl Resolver {
         selection: SelectionRequirements,
     ) -> Result<()> {
         let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
-        let _ = self.record_in_view(key, view_key, index, main, iri, kinds, None, selection)?;
+        let _ = self.record_in_view(
+            key, view_key, index, main, iri, kinds, None, selection, false,
+        )?;
+        Ok(())
+    }
+
+    /// Probe a record reference and its selection-target availability without
+    /// reconstructing a compatible retained literal (`ev:normalizedText` or
+    /// `ev:retainedBytes`) when a single `Vocab`/`Delta` object ID is present, so a
+    /// subsequent Phase 2 verifier reads each retained literal only once. When `kinds`
+    /// conflicts with a selected record's actual kind, literal shape is verified
+    /// immediately so unavailable or masked selections still precede kind conflicts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe_record_with_selection(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: Option<&Arc<GraphAccess>>,
+        iri: &NamedNode,
+        kinds: &[RecordKind],
+        selection: SelectionRequirements,
+    ) -> Result<SelectionProbe> {
+        let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
+        let (_, probe) = self.record_in_view(
+            key, view_key, index, main, iri, kinds, None, selection, true,
+        )?;
+        Ok(probe)
+    }
+
+    /// Verify the exact vocabulary literal shape of a selected target whose single
+    /// `Vocab`/`Delta` object ID was deferred by [`probe_record_with_selection`](Self::probe_record_with_selection).
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_selection_literal_shape(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: Option<&Arc<GraphAccess>>,
+        iri: &NamedNode,
+        selection: SelectionRequirements,
+    ) -> Result<()> {
+        let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
+        let cached = &self.views[&view_key][index];
+        let rg = self.record_graphs.as_ref().expect("prepared");
+        let (graphs, _filtered) =
+            readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, key)?;
+        let mut lookups = Lookups::new(&self.preparation, &cached.view);
+        let Some((graph, kind)) = find_record(&mut lookups, &graphs, iri, key)? else {
+            return Err(unavailable(key));
+        };
+        if kind == RecordKind::Rendition && selection.rendition_content {
+            match lookups
+                .one_text(iri.as_str(), &format!("{EV}normalizedText"), &graph, |_| {
+                    Ok(())
+                })
+                .map_err(|e| classify(key, e))?
+            {
+                Text::Some(()) => {}
+                Text::Many => {
+                    return Err(conflict(
+                        key,
+                        "the rendition has more than one normalized text",
+                    ));
+                }
+                Text::None => return Err(unavailable(key)),
+            }
+        }
+        if kind == RecordKind::SourceRevision && selection.structured_content {
+            match lookups
+                .one_typed_literal(
+                    iri.as_str(),
+                    &format!("{EV}retainedBytes"),
+                    XSD_BASE64_BINARY,
+                    &graph,
+                    |_| Ok(()),
+                )
+                .map_err(|e| classify(key, e))?
+            {
+                Text::Some(()) => {}
+                Text::Many => {
+                    return Err(conflict(
+                        key,
+                        "the revision has more than one retained bytes value",
+                    ));
+                }
+                Text::None => return Err(unavailable(key)),
+            }
+        }
         Ok(())
     }
 
@@ -557,20 +660,37 @@ impl Resolver {
         kinds: &[RecordKind],
         expected_content_digest: Option<&Sha256Digest>,
         selection: SelectionRequirements,
-    ) -> Result<VerifiedRecord> {
-        let (auth, cached_span) = {
+        defer_literal_shape: bool,
+    ) -> Result<(VerifiedRecord, SelectionProbe)> {
+        let (auth, cached_span, probe) = {
             let cached = &self.views[&view_key][index];
             let rg = self.record_graphs.as_ref().expect("prepared");
             let (graphs, _filtered) =
                 readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, key)?;
             let mut lookups = Lookups::new(&self.preparation, &cached.view);
-            let auth = authenticate_record(
+            let Some((graph, kind)) = find_record(&mut lookups, &graphs, iri, key)? else {
+                return Err(unavailable(key));
+            };
+            let wrong_kind = !kinds.is_empty() && !kinds.contains(&kind);
+            let selected_kind = (kind == RecordKind::Rendition && selection.rendition_content)
+                || (kind == RecordKind::SourceRevision && selection.structured_content)
+                || (kind == RecordKind::Passage && selection.passage_lineage);
+            // When the found record is itself a selected target (rendition, structured
+            // revision or passage), verify its authentication and selection availability
+            // before rejecting an incompatible ordinary kind constraint on the same IRI,
+            // so masked or metadata-only selections still match absent/denied targets.
+            if wrong_kind && !selected_kind {
+                return Err(conflict(
+                    key,
+                    "the record exists with another kind than the reference expects",
+                ));
+            }
+            let auth = authenticate_record_body(
                 &mut lookups,
-                &graphs,
+                graph,
+                kind,
                 &rg.protections,
                 iri,
-                kinds,
-                "the record exists with another kind than the reference expects",
                 main,
                 key,
             )?;
@@ -582,6 +702,7 @@ impl Resolver {
                     "the record's content digest differs from the expected digest",
                 ));
             }
+            let mut probe = SelectionProbe::Complete;
             let cached_span = if auth.kind == RecordKind::Passage {
                 if selection.passage_lineage {
                     match lookups
@@ -651,52 +772,98 @@ impl Resolver {
                         }
                         One::None | One::Some(_) => return Err(unavailable(key)),
                     }
-                    match lookups
-                        .one_text(
-                            iri.as_str(),
-                            &format!("{EV}normalizedText"),
-                            &auth.graph,
-                            |_| Ok(()),
-                        )
-                        .map_err(|e| classify(key, e))?
-                    {
-                        Text::Some(()) => {}
-                        Text::Many => {
-                            return Err(conflict(
-                                key,
-                                "the rendition has more than one normalized text",
-                            ));
+                    if defer_literal_shape && !wrong_kind {
+                        match lookups
+                            .one_vocab_object_id(
+                                iri.as_str(),
+                                &format!("{EV}normalizedText"),
+                                &auth.graph,
+                            )
+                            .map_err(|e| classify(key, e))?
+                        {
+                            Text::Some(()) => probe = SelectionProbe::DeferredLiteralShape,
+                            Text::Many => {
+                                return Err(conflict(
+                                    key,
+                                    "the rendition has more than one normalized text",
+                                ));
+                            }
+                            Text::None => return Err(unavailable(key)),
                         }
-                        Text::None => return Err(unavailable(key)),
+                    } else {
+                        match lookups
+                            .one_text(
+                                iri.as_str(),
+                                &format!("{EV}normalizedText"),
+                                &auth.graph,
+                                |_| Ok(()),
+                            )
+                            .map_err(|e| classify(key, e))?
+                        {
+                            Text::Some(()) => {}
+                            Text::Many => {
+                                return Err(conflict(
+                                    key,
+                                    "the rendition has more than one normalized text",
+                                ));
+                            }
+                            Text::None => return Err(unavailable(key)),
+                        }
                     }
                 }
                 if auth.kind == RecordKind::SourceRevision && selection.structured_content {
                     if auth.content_digest.is_none() {
                         return Err(unavailable(key));
                     }
-                    match lookups
-                        .one_typed_literal(
-                            iri.as_str(),
-                            &format!("{EV}retainedBytes"),
-                            XSD_BASE64_BINARY,
-                            &auth.graph,
-                            |_| Ok(()),
-                        )
-                        .map_err(|e| classify(key, e))?
-                    {
-                        Text::Some(()) => {}
-                        Text::Many => {
-                            return Err(conflict(
-                                key,
-                                "the revision has more than one retained bytes value",
-                            ));
+                    if defer_literal_shape && !wrong_kind {
+                        match lookups
+                            .one_vocab_object_id(
+                                iri.as_str(),
+                                &format!("{EV}retainedBytes"),
+                                &auth.graph,
+                            )
+                            .map_err(|e| classify(key, e))?
+                        {
+                            Text::Some(()) => probe = SelectionProbe::DeferredLiteralShape,
+                            Text::Many => {
+                                return Err(conflict(
+                                    key,
+                                    "the revision has more than one retained bytes value",
+                                ));
+                            }
+                            Text::None => return Err(unavailable(key)),
                         }
-                        Text::None => return Err(unavailable(key)),
+                    } else {
+                        match lookups
+                            .one_typed_literal(
+                                iri.as_str(),
+                                &format!("{EV}retainedBytes"),
+                                XSD_BASE64_BINARY,
+                                &auth.graph,
+                                |_| Ok(()),
+                            )
+                            .map_err(|e| classify(key, e))?
+                        {
+                            Text::Some(()) => {}
+                            Text::Many => {
+                                return Err(conflict(
+                                    key,
+                                    "the revision has more than one retained bytes value",
+                                ));
+                            }
+                            Text::None => return Err(unavailable(key)),
+                        }
                     }
                 }
                 None
             };
-            (auth, cached_span)
+            if wrong_kind {
+                return Err(conflict(
+                    key,
+                    "the record exists with another kind than the reference expects",
+                ));
+            }
+            (auth, cached_span, probe)
         };
         let span = match cached_span {
             Some((Some(rendition_graph), span)) => {
@@ -714,15 +881,18 @@ impl Resolver {
             Some((None, span)) => Some(span),
             None => None,
         };
-        Ok(VerifiedRecord {
-            iri: iri.clone(),
-            kind: auth.kind,
-            graph: auth.graph,
-            receipt: auth.receipt,
-            content_digest: auth.content_digest,
-            record_digest: auth.record_digest,
-            span,
-        })
+        Ok((
+            VerifiedRecord {
+                iri: iri.clone(),
+                kind: auth.kind,
+                graph: auth.graph,
+                receipt: auth.receipt,
+                content_digest: auth.content_digest,
+                record_digest: auth.record_digest,
+                span,
+            },
+            probe,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1549,6 +1719,8 @@ fn readable_record_graphs<'a>(
 #[cfg(test)]
 std::thread_local! {
     static PASSAGE_TEXT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SIMPLE_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TYPED_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CANCEL_BASE64_AT_CHUNK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1651,6 +1823,28 @@ impl<'a> Lookups<'a> {
         Ok(ids)
     }
 
+    /// Check via the GSPO index alone that `s p ?o` in `graph` has a single object
+    /// whose term ID is stored in `Vocab` or `Delta` (the only storage tags that can
+    /// hold a simple literal or `xsd:base64Binary` typed literal), without reading or
+    /// reconstructing the vocabulary key.
+    fn one_vocab_object_id(&mut self, s: &str, p: &str, graph: &NamedNode) -> Result<Text<()>> {
+        if !self.readable(graph) {
+            return Ok(Text::None);
+        }
+        let (Some(s), Some(p), Some(g)) = (self.iri(s)?, self.iri(p)?, self.iri(graph.as_str())?)
+        else {
+            return Ok(Text::None);
+        };
+        match self.object_ids(s, p, g)?.as_slice() {
+            [] => Ok(Text::None),
+            [id] => match id.tag() {
+                crate::id::Tag::Vocab | crate::id::Tag::Delta => Ok(Text::Some(())),
+                _ => Ok(Text::None),
+            },
+            _ => Ok(Text::Many),
+        }
+    }
+
     /// The one object of `s p ?o` in `graph`, read as a stored simple literal's text
     /// without decoding it as a term.
     fn one_text<R>(
@@ -1669,12 +1863,15 @@ impl<'a> Lookups<'a> {
         };
         match self.object_ids(s, p, g)?.as_slice() {
             [] => Ok(Text::None),
-            [id] => self
-                .preparation
-                .with_simple_literal(self.snap(), *id, |text| match text {
-                    Some(text) => Ok(Text::Some(each(text)?)),
-                    None => Ok(Text::None),
-                }),
+            [id] => {
+                #[cfg(test)]
+                SIMPLE_LITERAL_READS.with(|count| count.set(count.get() + 1));
+                self.preparation
+                    .with_simple_literal(self.snap(), *id, |text| match text {
+                        Some(text) => Ok(Text::Some(each(text)?)),
+                        None => Ok(Text::None),
+                    })
+            }
             _ => Ok(Text::Many),
         }
     }
@@ -1698,12 +1895,15 @@ impl<'a> Lookups<'a> {
         };
         match self.object_ids(s, p, g)?.as_slice() {
             [] => Ok(Text::None),
-            [id] => self
-                .preparation
-                .with_typed_literal(self.snap(), *id, datatype, |text| match text {
-                    Some(text) => Ok(Text::Some(each(text)?)),
-                    None => Ok(Text::None),
-                }),
+            [id] => {
+                #[cfg(test)]
+                TYPED_LITERAL_READS.with(|count| count.set(count.get() + 1));
+                self.preparation
+                    .with_typed_literal(self.snap(), *id, datatype, |text| match text {
+                        Some(text) => Ok(Text::Some(each(text)?)),
+                        None => Ok(Text::None),
+                    })
+            }
             _ => Ok(Text::Many),
         }
     }
@@ -1898,6 +2098,19 @@ fn authenticate_record(
     if !kinds.is_empty() && !kinds.contains(&kind) {
         return Err(conflict(key, wrong_kind_msg));
     }
+    authenticate_record_body(lookups, graph, kind, protections, iri, main, key)
+}
+
+/// Complete record authentication once `find_record` has resolved `(graph, kind)`.
+fn authenticate_record_body(
+    lookups: &mut Lookups<'_>,
+    graph: NamedNode,
+    kind: RecordKind,
+    protections: &BTreeMap<String, Uuid>,
+    iri: &NamedNode,
+    main: &Store,
+    key: &str,
+) -> Result<AuthenticatedRecord> {
     let rec = receipt(
         lookups,
         &graph,

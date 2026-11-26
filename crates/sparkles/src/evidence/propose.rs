@@ -24,7 +24,7 @@
 //! key acquires the same hold again.
 
 use super::resolve::{
-    MAX_REFERENCES, MEMORY_BYTES, ProposedPassage, ProposedStructured, Resolution,
+    MAX_REFERENCES, MEMORY_BYTES, ProposedPassage, ProposedStructured, Resolution, SelectionProbe,
     SelectionRequirements, unavailable,
 };
 use crate::access::GraphAccess;
@@ -540,6 +540,69 @@ fn verify_requirements(
     )
 }
 
+enum GenericReq<'a> {
+    Record(&'a NamedNode, &'a [RecordKind], SelectionRequirements),
+    Fact(&'a str, &'a StoredFactRef),
+}
+
+type PassageGroup<'a> = (usize, &'a NamedNode, AdmittedVec<ProposedPassage<'a>>);
+type StructuredGroup<'a> = (usize, &'a NamedNode, AdmittedVec<ProposedStructured<'a>>);
+
+#[allow(clippy::too_many_arguments)]
+fn check_deferred_literal_shapes(
+    resolution: &mut Resolution,
+    main: &Dataset,
+    logical: &Dataset,
+    access: Option<Arc<GraphAccess>>,
+    passages: &mut [PassageGroup<'_>],
+    structured: &mut [StructuredGroup<'_>],
+    limit_req_idx: usize,
+    control: &Control,
+) -> Result<()> {
+    passages.sort_unstable_by_key(|(req_idx, _, _)| *req_idx);
+    structured.sort_unstable_by_key(|(req_idx, _, _)| *req_idx);
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    while pi < passages.len() || si < structured.len() {
+        control.check()?;
+        let p_idx = passages.get(pi).map_or(usize::MAX, |(idx, _, _)| *idx);
+        let s_idx = structured.get(si).map_or(usize::MAX, |(idx, _, _)| *idx);
+        if p_idx >= limit_req_idx && s_idx >= limit_req_idx {
+            break;
+        }
+        if p_idx <= s_idx {
+            let iri = passages[pi].1;
+            pi += 1;
+            resolution.verify_selection_literal_shape(
+                iri.as_str(),
+                main,
+                logical,
+                access.clone(),
+                iri,
+                SelectionRequirements {
+                    rendition_content: true,
+                    ..Default::default()
+                },
+            )?;
+        } else {
+            let iri = structured[si].1;
+            si += 1;
+            resolution.verify_selection_literal_shape(
+                iri.as_str(),
+                main,
+                logical,
+                access.clone(),
+                iri,
+                SelectionRequirements {
+                    structured_content: true,
+                    ..Default::default()
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_requirements_with_memory(
     catalog: Option<&Catalog>,
@@ -564,18 +627,12 @@ fn verify_requirements_with_memory(
     };
     let mut resolution = Resolution::with_memory(control.clone(), memory_bytes).map_err(admit)?;
     let prep = resolution.preparation().clone();
-    enum GenericReq<'a> {
-        Record(&'a NamedNode, &'a [RecordKind], SelectionRequirements),
-        Fact(&'a str, &'a StoredFactRef),
-    }
     let mut generic_count = 0usize;
     let mut generic_reqs: AdmittedVec<GenericReq<'_>> = AdmittedVec::new(&prep, &admit)?;
-    let mut passage_groups: AdmittedVec<(&NamedNode, AdmittedVec<ProposedPassage<'_>>)> =
-        AdmittedVec::new(&prep, &admit)?;
+    let mut passage_groups: AdmittedVec<PassageGroup<'_>> = AdmittedVec::new(&prep, &admit)?;
     let mut passage_refs: AdmittedVec<(&str, &NamedNode, &NamedNode, &NamedNode)> =
         AdmittedVec::new(&prep, &admit)?;
-    let mut structured_groups: AdmittedVec<(&NamedNode, AdmittedVec<ProposedStructured<'_>>)> =
-        AdmittedVec::new(&prep, &admit)?;
+    let mut structured_groups: AdmittedVec<StructuredGroup<'_>> = AdmittedVec::new(&prep, &admit)?;
     {
         // Build O(log N) lookup and grouping maps once upfront, charged under the
         // shared preparation allowance, and drop them before Phase 1 runs.
@@ -726,12 +783,16 @@ fn verify_requirements_with_memory(
                                     || {
                                         let i = passage_groups.len();
                                         let group = AdmittedVec::new(&prep, &admit)?;
-                                        passage_groups.push(&prep, (rendition, group), &admit)?;
+                                        passage_groups.push(
+                                            &prep,
+                                            (usize::MAX, rendition, group),
+                                            &admit,
+                                        )?;
                                         Ok(i)
                                     },
                                     &admit,
                                 )?;
-                                passage_groups.as_mut_slice()[idx].1.push(
+                                passage_groups.as_mut_slice()[idx].2.push(
                                     &prep,
                                     ProposedPassage {
                                         key: passage.key.as_str(),
@@ -778,12 +839,16 @@ fn verify_requirements_with_memory(
                                     || {
                                         let i = passage_groups.len();
                                         let group = AdmittedVec::new(&prep, &admit)?;
-                                        passage_groups.push(&prep, (rendition, group), &admit)?;
+                                        passage_groups.push(
+                                            &prep,
+                                            (usize::MAX, rendition, group),
+                                            &admit,
+                                        )?;
                                         Ok(i)
                                     },
                                     &admit,
                                 )?;
-                                passage_groups.as_mut_slice()[idx].1.push(
+                                passage_groups.as_mut_slice()[idx].2.push(
                                     &prep,
                                     ProposedPassage {
                                         key: passage.key.as_str(),
@@ -897,12 +962,16 @@ fn verify_requirements_with_memory(
                                 || {
                                     let i = structured_groups.len();
                                     let group = AdmittedVec::new(&prep, &admit)?;
-                                    structured_groups.push(&prep, (rev_iri, group), &admit)?;
+                                    structured_groups.push(
+                                        &prep,
+                                        (usize::MAX, rev_iri, group),
+                                        &admit,
+                                    )?;
                                     Ok(i)
                                 },
                                 &admit,
                             )?;
-                            structured_groups.as_mut_slice()[idx].1.push(
+                            structured_groups.as_mut_slice()[idx].2.push(
                                 &prep,
                                 ProposedStructured {
                                     key: reference.key.as_str(),
@@ -916,30 +985,49 @@ fn verify_requirements_with_memory(
                 }
             }
         }
-        for req in generic_reqs.as_mut_slice() {
+        for (req_idx, req) in generic_reqs.as_mut_slice().iter_mut().enumerate() {
             control.check()?;
             if let GenericReq::Record(iri, _, selection) = req
                 && let Some(needs) = selection_needs.get(iri)
             {
                 *selection = *needs;
+                if needs.rendition_content
+                    && let Some(&g_idx) = passage_group_idx.get(iri)
+                {
+                    let first = &mut passage_groups.as_mut_slice()[g_idx].0;
+                    if *first == usize::MAX {
+                        *first = req_idx;
+                    }
+                }
+                if needs.structured_content
+                    && let Some(&g_idx) = structured_group_idx.get(iri)
+                {
+                    let first = &mut structured_groups.as_mut_slice()[g_idx].0;
+                    if *first == usize::MAX {
+                        *first = req_idx;
+                    }
+                }
             }
         }
     }
-    // Phase 1: resolve every ExistingRecord (with any selection-target availability
-    // requirements attached) and every StoredFact first so missing, graph-denied,
-    // metadata-only and triple-masked targets always share identical precedence before
-    // any identity or content comparison runs.
+    // Phase 1: probe every ExistingRecord (with selection-target availability attached
+    // without reconstructing compatible retained literals yet) and every StoredFact so
+    // missing, graph-denied, metadata-only and predicate-masked targets share identical
+    // precedence, then release `generic_reqs` before reading any retained literal.
     let mut record_access: Option<Option<Arc<GraphAccess>>> = None;
-    for req in generic_reqs.as_slice() {
+    let mut has_deferred_literal = false;
+    let mut phase1_err: Option<(usize, Error)> = None;
+    for (req_idx, req) in generic_reqs.as_slice().iter().enumerate() {
         control.check()?;
-        match req {
+        let outcome = match req {
             GenericReq::Fact(key, fact) => {
-                let _ = match catalog {
+                let res = match catalog {
                     Some(catalog) if fact.dataset != main.dataset_id() => {
-                        resolution.stored_fact(key, catalog, fact, &mut *read)?
+                        resolution.stored_fact(key, catalog, fact, &mut *read)
                     }
-                    _ => resolution.stored_fact_in(key, main, fact, &mut *read)?,
+                    _ => resolution.stored_fact_in(key, main, fact, &mut *read),
                 };
+                res.map(|_| SelectionProbe::Complete)
             }
             GenericReq::Record(iri, kinds, selection) => {
                 let granted = match &record_access {
@@ -950,7 +1038,7 @@ fn verify_requirements_with_memory(
                         access
                     }
                 };
-                resolution.verify_record_with_selection(
+                resolution.probe_record_with_selection(
                     iri.as_str(),
                     main,
                     logical,
@@ -958,13 +1046,42 @@ fn verify_requirements_with_memory(
                     iri,
                     kinds,
                     *selection,
-                )?;
+                )
+            }
+        };
+        match outcome {
+            Ok(SelectionProbe::Complete) => {}
+            Ok(SelectionProbe::DeferredLiteralShape) => has_deferred_literal = true,
+            Err(e) => {
+                if !has_deferred_literal {
+                    return Err(e);
+                }
+                phase1_err = Some((req_idx, e));
+                break;
             }
         }
     }
     drop(generic_reqs);
-    // Phase 2: run content and identity comparisons, dropping each phase's admitted
-    // buffer as soon as it finishes so its reservation is released before the next.
+    if let Some((err_idx, err)) = phase1_err {
+        let access = match record_access {
+            Some(access) => access,
+            None => resolution.logical_access(main, logical, read)?,
+        };
+        check_deferred_literal_shapes(
+            &mut resolution,
+            main,
+            logical,
+            access,
+            passage_groups.as_mut_slice(),
+            structured_groups.as_mut_slice(),
+            err_idx,
+            control,
+        )?;
+        return Err(err);
+    }
+    // Phase 2: read each retained literal once for content/identity verification,
+    // dropping each phase's admitted buffer as soon as it finishes so its reservation
+    // is released before the next.
     if !passage_groups.is_empty() {
         let access = match &record_access {
             Some(access) => access.clone(),
@@ -974,15 +1091,39 @@ fn verify_requirements_with_memory(
                 access
             }
         };
-        for (rendition, passages) in passage_groups.as_slice() {
+        for idx in 0..passage_groups.len() {
             control.check()?;
-            resolution.verify_proposed_passages(
+            let (group_req_idx, rendition) = {
+                let g = &passage_groups.as_slice()[idx];
+                (g.0, g.1)
+            };
+            let res = resolution.verify_proposed_passages(
                 main,
                 logical,
                 access.clone(),
                 rendition,
-                passages.as_slice(),
-            )?;
+                passage_groups.as_slice()[idx].2.as_slice(),
+            );
+            if let Err(e) = res {
+                let limit = match e.code() {
+                    "invalid" | "span-mismatch" => Some(usize::MAX),
+                    "evidence-unavailable" => Some(group_req_idx),
+                    _ => None,
+                };
+                if let Some(limit) = limit {
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut passage_groups.as_mut_slice()[idx + 1..],
+                        structured_groups.as_mut_slice(),
+                        limit,
+                        control,
+                    )?;
+                }
+                return Err(e);
+            }
         }
     }
     drop(passage_groups);
@@ -999,8 +1140,8 @@ fn verify_requirements_with_memory(
             AdmittedSet::new(&prep, &admit)?;
         for (ref_key, passage, expected_rev, expected_rend) in passage_refs.as_slice() {
             control.check()?;
-            if checked_passage_refs.insert((*passage, *expected_rev, *expected_rend), &admit)? {
-                resolution.verify_passage_reference(
+            if checked_passage_refs.insert((*passage, *expected_rev, *expected_rend), &admit)?
+                && let Err(e) = resolution.verify_passage_reference(
                     ref_key,
                     main,
                     logical,
@@ -1008,7 +1149,22 @@ fn verify_requirements_with_memory(
                     passage,
                     expected_rev,
                     expected_rend,
-                )?;
+                )
+            {
+                if e.code() == "invalid" {
+                    drop(checked_passage_refs);
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        structured_groups.as_mut_slice(),
+                        usize::MAX,
+                        control,
+                    )?;
+                }
+                return Err(e);
             }
         }
         drop(checked_passage_refs);
@@ -1019,15 +1175,39 @@ fn verify_requirements_with_memory(
             Some(access) => access,
             None => resolution.logical_access(main, logical, read)?,
         };
-        for (revision, structured) in structured_groups.as_slice() {
+        for idx in 0..structured_groups.len() {
             control.check()?;
-            resolution.verify_structured_references(
+            let (group_req_idx, revision) = {
+                let g = &structured_groups.as_slice()[idx];
+                (g.0, g.1)
+            };
+            let res = resolution.verify_structured_references(
                 main,
                 logical,
                 access.clone(),
                 revision,
-                structured.as_slice(),
-            )?;
+                structured_groups.as_slice()[idx].2.as_slice(),
+            );
+            if let Err(e) = res {
+                let limit = match e.code() {
+                    "span-mismatch" | "immutable-record-conflict" => Some(usize::MAX),
+                    "evidence-unavailable" => Some(group_req_idx),
+                    _ => None,
+                };
+                if let Some(limit) = limit {
+                    check_deferred_literal_shapes(
+                        &mut resolution,
+                        main,
+                        logical,
+                        access,
+                        &mut [],
+                        &mut structured_groups.as_mut_slice()[idx + 1..],
+                        limit,
+                        control,
+                    )?;
+                }
+                return Err(e);
+            }
         }
     }
     drop(structured_groups);
@@ -1426,12 +1606,22 @@ mod tests {
         RecordKey::new(s).unwrap()
     }
 
+    fn btree_total_charge<K, V>(n: usize) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        btree_insert_charge::<K, V>(true)
+            .saturating_add(((n - 1) as u64).saturating_mul(btree_insert_charge::<K, V>(false)))
+    }
+
     #[test]
     fn admitted_containers_charge_exact_singleton_capacity_before_insert_and_release_on_drop() {
         let admit = |e: Error| e;
         let prep = Preparation::new(Control::none(), 64 * 1024).unwrap();
         let baseline = prep.available_bytes();
+        let context_bytes = 64 * 1024 - baseline;
         let digest = Sha256Digest::of_bytes(b"1", &Control::none()).unwrap();
+        let slot = std::mem::size_of::<ProposedStructured<'_>>() as u64;
 
         // Singleton AdmittedVec allocates exact capacity 1 and charges its exact bytes.
         {
@@ -1448,10 +1638,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(vec.values.capacity(), 1);
-            assert_eq!(
-                baseline - prep.available_bytes(),
-                std::mem::size_of::<ProposedStructured<'_>>() as u64
-            );
+            assert_eq!(baseline - prep.available_bytes(), slot);
             // Second push grows capacity 1 -> 2 and settles to 2 slots after dropping old.
             vec.push(
                 &prep,
@@ -1464,15 +1651,81 @@ mod tests {
             )
             .unwrap();
             assert_eq!(vec.values.capacity(), 2);
-            assert_eq!(
-                baseline - prep.available_bytes(),
-                (std::mem::size_of::<ProposedStructured<'_>>() * 2) as u64
-            );
+            assert_eq!(baseline - prep.available_bytes(), slot * 2);
         }
         assert_eq!(prep.available_bytes(), baseline);
 
+        // Vector growth must admit old + new capacity (1 + 2 = 3 slots) simultaneously:
+        // refuse when the new 2-slot buffer fits inside the allowance by itself (3*slot - 1)
+        // but old + new exceeds it, and succeed with 1 extra byte (3*slot).
+        {
+            let tight_peak =
+                Preparation::new(Control::none(), context_bytes + slot * 3 - 1).unwrap();
+            let mut vec: AdmittedVec<ProposedStructured<'_>> =
+                AdmittedVec::new(&tight_peak, &admit).unwrap();
+            vec.push(
+                &tight_peak,
+                ProposedStructured {
+                    key: "p0",
+                    pointer: "/a",
+                    value_digest: digest,
+                },
+                &admit,
+            )
+            .unwrap();
+            assert_eq!(vec.values.capacity(), 1);
+            let before_refusal = tight_peak.available_bytes();
+            assert!(matches!(
+                vec.push(
+                    &tight_peak,
+                    ProposedStructured {
+                        key: "p1",
+                        pointer: "/b",
+                        value_digest: digest,
+                    },
+                    &admit,
+                ),
+                Err(Error::BudgetExceeded(_))
+            ));
+            assert_eq!(vec.len(), 1);
+            assert_eq!(vec.values.capacity(), 1);
+            assert_eq!(tight_peak.available_bytes(), before_refusal);
+        }
+        {
+            let exact_peak = Preparation::new(Control::none(), context_bytes + slot * 3).unwrap();
+            let exact_baseline = exact_peak.available_bytes();
+            {
+                let mut vec: AdmittedVec<ProposedStructured<'_>> =
+                    AdmittedVec::new(&exact_peak, &admit).unwrap();
+                vec.push(
+                    &exact_peak,
+                    ProposedStructured {
+                        key: "p0",
+                        pointer: "/a",
+                        value_digest: digest,
+                    },
+                    &admit,
+                )
+                .unwrap();
+                vec.push(
+                    &exact_peak,
+                    ProposedStructured {
+                        key: "p1",
+                        pointer: "/b",
+                        value_digest: digest,
+                    },
+                    &admit,
+                )
+                .unwrap();
+                assert_eq!(vec.len(), 2);
+                assert_eq!(vec.values.capacity(), 2);
+                assert_eq!(exact_baseline - exact_peak.available_bytes(), slot * 2);
+            }
+            assert_eq!(exact_peak.available_bytes(), exact_baseline);
+        }
+
         // AdmittedSet and AdmittedMap refuse before inserting when budget is too small.
-        let tiny = Preparation::new(Control::none(), 320).unwrap();
+        let tiny = Preparation::new(Control::none(), context_bytes + 64).unwrap();
         let mut set: AdmittedSet<&str> = AdmittedSet::new(&tiny, &admit).unwrap();
         assert!(matches!(
             set.insert("first", &admit),
@@ -1508,10 +1761,14 @@ mod tests {
             identity_graph: None,
         };
 
-        // 1. 64 singleton structured groups require admitting outer Vec, 64 inner
-        //    singleton Vecs, index maps, and generic_reqs; a tight 8 KiB budget refuses
-        //    with `incomplete-evidence` before any store access runs.
-        let refs: Vec<EvidenceRefInput> = (0..64)
+        // 1. 64 singleton structured groups: compute the exact admitted classification
+        //    cost (all 5 populated index/dedup maps + outer vectors + 64 inner singleton
+        //    group vectors). Setting the allowance 1 byte below that total admits every
+        //    index map, outer vector and the first 63 inner singleton groups, so the 64th
+        //    inner singleton group allocation decides refusal (`incomplete-evidence` with
+        //    zero store reads). Adding 1 byte completes classification and reaches Phase 1.
+        const N: usize = 64;
+        let refs: Vec<EvidenceRefInput> = (0..N)
             .map(|i| EvidenceRefInput {
                 version: RecordVersion::V1,
                 key: key(&format!("sr-{i}")),
@@ -1540,6 +1797,22 @@ mod tests {
             &Control::none(),
         )
         .unwrap();
+        let context_bytes = 64 * 1024
+            - Preparation::new(Control::none(), 64 * 1024)
+                .unwrap()
+                .available_bytes();
+        let index_and_outer_bytes = context_bytes
+            + btree_total_charge::<&str, &NamedNode>(N)
+            + btree_total_charge::<&str, &EvidenceRefInput>(N)
+            + btree_total_charge::<(&NamedNode, u32), ()>(N)
+            + (N as u64) * (std::mem::size_of::<GenericReq<'_>>() as u64)
+            + btree_total_charge::<&NamedNode, SelectionRequirements>(N)
+            + btree_total_charge::<&NamedNode, usize>(N)
+            + (N as u64) * (std::mem::size_of::<StructuredGroup<'_>>() as u64);
+        let inner_singleton_bytes =
+            (N as u64) * (std::mem::size_of::<ProposedStructured<'_>>() as u64);
+        let exact_classified_bytes = index_and_outer_bytes + inner_singleton_bytes;
+
         let reads = AtomicUsize::new(0);
         let err = verify_requirements_with_memory(
             None,
@@ -1550,14 +1823,35 @@ mod tests {
             prepared.requirements(),
             &mut |_, _| {
                 reads.fetch_add(1, Ordering::Relaxed);
-                Some(Arc::new(GraphAccess::all()))
+                None
             },
             &Control::none(),
-            8 * 1024,
+            exact_classified_bytes - 1,
         )
         .unwrap_err();
         assert_eq!(err.code(), "incomplete-evidence");
         assert_eq!(reads.load(Ordering::Relaxed), 0);
+
+        // One more byte admits the 64th inner singleton group, releases the index maps,
+        // and enters Phase 1 (invoking `read` once before refusing with unavailable).
+        let exact_reads = AtomicUsize::new(0);
+        let exact_err = verify_requirements_with_memory(
+            None,
+            &ds,
+            &ds,
+            &input,
+            &plan,
+            prepared.requirements(),
+            &mut |_, _| {
+                exact_reads.fetch_add(1, Ordering::Relaxed);
+                None
+            },
+            &Control::none(),
+            exact_classified_bytes,
+        )
+        .unwrap_err();
+        assert_eq!(exact_err.code(), "evidence-unavailable");
+        assert_eq!(exact_reads.load(Ordering::Relaxed), 1);
 
         // 2. Unsupported normalization method carrying a long method IRI fails
         //    immediately with the input-only error without buffering deferred errors

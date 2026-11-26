@@ -13,8 +13,8 @@
 
 pub use sparkles_core::evidence::resolve::{
     MAX_REFERENCES, MEMORY_BYTES, ProposedPassage, ProposedStructured, Receipt, RecordRequest,
-    SelectionRequirements, VerifiedFact, VerifiedRecord, VerifiedSpan, check_anchor, kind_iri,
-    unavailable,
+    SelectionProbe, SelectionRequirements, VerifiedFact, VerifiedRecord, VerifiedSpan,
+    check_anchor, kind_iri, unavailable,
 };
 pub use sparkles_core::evidence::{BlankAnchor, GraphIdentity, RecordKind, StoredFactRef};
 
@@ -148,10 +148,11 @@ impl Resolution {
         self.resolver.preparation()
     }
 
-    /// Verify a record reference without cloning its IRI or returning a [`VerifiedRecord`],
-    /// optionally checking selection-target availability predicates in the same pass.
+    /// Probe a record reference and its selection-target availability without
+    /// reconstructing a compatible retained literal (`ev:normalizedText` or
+    /// `ev:retainedBytes`) when a single `Vocab`/`Delta` object ID is present.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn verify_record_with_selection(
+    pub(crate) fn probe_record_with_selection(
         &mut self,
         key: &str,
         main: &Dataset,
@@ -160,14 +161,36 @@ impl Resolution {
         iri: &NamedNode,
         kinds: &[RecordKind],
         selection: SelectionRequirements,
-    ) -> Result<()> {
-        self.resolver.verify_record_with_selection(
+    ) -> Result<SelectionProbe> {
+        self.resolver.probe_record_with_selection(
             key,
             main.store(),
             logical.store(),
             access.as_ref(),
             iri,
             kinds,
+            selection,
+        )
+    }
+
+    /// Verify the exact vocabulary literal shape of a selected target whose single
+    /// `Vocab`/`Delta` object ID was deferred by `probe_record_with_selection`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_selection_literal_shape(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        iri: &NamedNode,
+        selection: SelectionRequirements,
+    ) -> Result<()> {
+        self.resolver.verify_selection_literal_shape(
+            key,
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            iri,
             selection,
         )
     }

@@ -3074,3 +3074,368 @@ fn propose_mixed_batches_preserve_masked_vs_missing_parity_and_input_order() {
         local_bad_absent
     );
 }
+
+#[test]
+fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
+    let (_dir, ds) = retained();
+    const SOURCES_TWO: &str = "urn:ev:sources-two";
+    let settings = Settings {
+        enabled: true,
+        source_records: vec![SOURCES.into(), SOURCES_TWO.into()],
+        proposals: vec![CLAIMS.into()],
+        ..Default::default()
+    };
+    evidence::configure(&ds, &settings, &Control::none()).unwrap();
+    let opts_in = |sg: &str| {
+        let mut o = options();
+        o.source_graph = Some(iri(sg));
+        o
+    };
+
+    let json_doc = r#"{"score":1.000}"#;
+    let seed_other = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("rev-other"),
+                source: iri("urn:doc:same-other"),
+                source_key: key("doc-same-other"),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly {
+                    digest: sha(json_doc),
+                },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+            }],
+            ..Default::default()
+        },
+        &opts_in(SOURCES),
+    )
+    .unwrap();
+    let rev_other = iri_of(&seed_other, "rev-other");
+
+    let seed1 = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![
+                SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("rev1"),
+                    source: iri("urn:doc:same-1"),
+                    source_key: key("doc-same-1"),
+                    upstream_version: None,
+                    content: SourceContent::Retained {
+                        bytes: json_doc.as_bytes().to_vec(),
+                        expected_digest: None,
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                },
+                SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("rev-meta"),
+                    source: iri("urn:doc:same-meta"),
+                    source_key: key("doc-same-meta"),
+                    upstream_version: None,
+                    content: SourceContent::MetadataOnly {
+                        digest: sha(json_doc),
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                },
+            ],
+            ..Default::default()
+        },
+        &opts_in(SOURCES_TWO),
+    )
+    .unwrap();
+    let rev1 = iri_of(&seed1, "rev1");
+    let rev_meta = iri_of(&seed1, "rev-meta");
+
+    let seed2 = propose(
+        &ds,
+        &EvidenceInput {
+            renditions: vec![
+                RenditionInput {
+                    version: RecordVersion::V1,
+                    key: key("rend2"),
+                    revision: RecordRef::Existing(rev1.clone()),
+                    occurrence_key: key("rend2-occ"),
+                    conversion: method("urn:method:same-2"),
+                    media_type: "text/plain".into(),
+                    language: None,
+                    content: RenditionContent::NormalizedText(TEXT.into()),
+                    expected_digest: None,
+                },
+                RenditionInput {
+                    version: RecordVersion::V1,
+                    key: key("rend2-meta"),
+                    revision: RecordRef::Existing(rev1.clone()),
+                    occurrence_key: key("rend2-meta-occ"),
+                    conversion: method("urn:method:same-meta-2"),
+                    media_type: "text/plain".into(),
+                    language: None,
+                    content: RenditionContent::MetadataOnly(sha(TEXT)),
+                    expected_digest: None,
+                },
+            ],
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("pass2"),
+                revision: RecordRef::Existing(rev1.clone()),
+                rendition: local("rend2"),
+                occurrence_key: key("pass2-occ"),
+                start: 0,
+                end: 11,
+                text_digest: sha("Release 1.2"),
+                quote: Some("Release 1.2".into()),
+            }],
+            ..Default::default()
+        },
+        &opts_in(SOURCES_TWO),
+    )
+    .unwrap();
+    let rend2 = iri_of(&seed2, "rend2");
+    let rend2_meta = iri_of(&seed2, "rend2-meta");
+    let pass2 = iri_of(&seed2, "pass2");
+    let missing_b = iri("urn:uuid:00000000-0000-4000-8000-0000000000d9");
+
+    let deny_sources_two = Some(Arc::new(GraphAccess::with_triples(
+        Graphs::Only(GraphRule::new([SOURCES, CLAIMS], &[])),
+        Graphs::All,
+        TripleRules {
+            rules: Vec::new(),
+            caller: Default::default(),
+            limits: Default::default(),
+        },
+    )));
+
+    let hide_pred = |pred: &str| {
+        let protection = Protection {
+            name: "hidden".into(),
+            predicates: Some(vec![pred.to_string()]),
+            classes: None,
+            subclasses: false,
+            graphs: Some(Graphs::Only(GraphRule::new([SOURCES_TWO], &[]))),
+            pattern: None,
+            prefixes: Default::default(),
+            hide_inferences: false,
+        };
+        let rules = TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(protection),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Default::default(),
+            limits: Default::default(),
+        };
+        Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            rules,
+        )))
+    };
+
+    let run_err = |input: &EvidenceInput, target: &NamedNode, access: Option<Arc<GraphAccess>>| {
+        let mut o = options();
+        if !input.revisions.is_empty() || !input.renditions.is_empty() || !input.passages.is_empty()
+        {
+            o.source_graph = Some(iri(SOURCES));
+        }
+        let e = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            input,
+            &o,
+            &mut |_, _| access.clone(),
+            &Control::none(),
+        )
+        .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string().replace(target.as_str(), "TARGET"),
+        )
+    };
+
+    // 1. Same IRI named as both `revision` (SourceRevision) and `rendition` (Rendition)
+    //    of a nonempty proposed passage: absent, graph-denied, rdf:type-masked,
+    //    metadata-only, ev:normalizedText-masked, and prov:wasDerivedFrom-masked targets
+    //    all answer identically with `evidence-unavailable` naming the target; a fully
+    //    readable rendition preserves `immutable-record-conflict`.
+    let same_iri_passage = |target: &NamedNode| EvidenceInput {
+        passages: vec![PassageInput {
+            version: RecordVersion::V1,
+            key: key("p-same"),
+            revision: RecordRef::Existing(target.clone()),
+            rendition: RecordRef::Existing(target.clone()),
+            occurrence_key: key("p-same"),
+            start: 0,
+            end: 11,
+            text_digest: sha("Release 1.2"),
+            quote: Some("Release 1.2".into()),
+        }],
+        ..Default::default()
+    };
+    let absent = run_err(&same_iri_passage(&missing_b), &missing_b, all());
+    assert_eq!(absent.0, "evidence-unavailable");
+    assert_eq!(absent.1, "evidence reference `TARGET` is unavailable");
+    assert_eq!(
+        run_err(&same_iri_passage(&rend2), &rend2, deny_sources_two.clone()),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_passage(&rend2),
+            &rend2,
+            hide_pred("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(&same_iri_passage(&rend2_meta), &rend2_meta, all()),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_passage(&rend2),
+            &rend2,
+            hide_pred("urn:x-sparkles:evidence:normalizedText"),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_passage(&rend2),
+            &rend2,
+            hide_pred("http://www.w3.org/ns/prov#wasDerivedFrom"),
+        ),
+        absent
+    );
+    let readable_rend = run_err(&same_iri_passage(&rend2), &rend2, all());
+    assert_eq!(readable_rend.0, "immutable-record-conflict");
+    assert!(readable_rend.1.contains("another kind"));
+
+    // 2. Same IRI named as an earlier `rendition` (Rendition) and a later structured
+    //    reference's `revision` (SourceRevision): unavailable parity for absent,
+    //    graph-denied, metadata-only, masked ev:retainedBytes and masked ev:contentDigest;
+    //    `immutable-record-conflict` when the retained SourceRevision is fully readable.
+    let same_iri_struct = |target: &NamedNode| EvidenceInput {
+        passages: vec![PassageInput {
+            version: RecordVersion::V1,
+            key: key("p-wrong-rend"),
+            revision: RecordRef::Existing(rev_other.clone()),
+            rendition: RecordRef::Existing(target.clone()),
+            occurrence_key: key("p-wrong-rend"),
+            start: 0,
+            end: 11,
+            text_digest: sha("Release 1.2"),
+            quote: Some("Release 1.2".into()),
+        }],
+        references: vec![EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: key("s-same"),
+            occurrence_key: key("s-same"),
+            target: EvidenceRefTarget::Structured {
+                revision: RecordRef::Existing(target.clone()),
+                pointer: "/score".into(),
+                method: MethodRef {
+                    method: iri(sparkles::evidence::JSON_LEXICAL_UTF8_V1),
+                    version: key(sparkles::evidence::JSON_LEXICAL_UTF8_VERSION),
+                },
+                value_digest: sha("1.000"),
+            },
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        run_err(&same_iri_struct(&missing_b), &missing_b, all()),
+        absent
+    );
+    assert_eq!(
+        run_err(&same_iri_struct(&rev1), &rev1, deny_sources_two.clone()),
+        absent
+    );
+    assert_eq!(
+        run_err(&same_iri_struct(&rev_meta), &rev_meta, all()),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_struct(&rev1),
+            &rev1,
+            hide_pred("urn:x-sparkles:evidence:retainedBytes"),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_struct(&rev1),
+            &rev1,
+            hide_pred("urn:x-sparkles:evidence:contentDigest"),
+        ),
+        absent
+    );
+    let readable_rev = run_err(&same_iri_struct(&rev1), &rev1, all());
+    assert_eq!(readable_rev.0, "immutable-record-conflict");
+    assert!(readable_rev.1.contains("another kind"));
+
+    // 3. Same IRI named in all three roles (`revision`, `rendition`, `passage`) of an
+    //    existing-passage reference: absent, graph-denied, masked ev:sourceRevision,
+    //    masked rendition ev:normalizedText and masked rendition prov:wasDerivedFrom
+    //    answer identically with `evidence-unavailable`; a fully readable verified
+    //    passage preserves `immutable-record-conflict`.
+    let same_iri_pass_ref = |target: &NamedNode| EvidenceInput {
+        references: vec![EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: key("r-same"),
+            occurrence_key: key("r-same"),
+            target: EvidenceRefTarget::Passage {
+                revision: RecordRef::Existing(target.clone()),
+                rendition: RecordRef::Existing(target.clone()),
+                passage: RecordRef::Existing(target.clone()),
+            },
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        run_err(&same_iri_pass_ref(&missing_b), &missing_b, all()),
+        absent
+    );
+    assert_eq!(
+        run_err(&same_iri_pass_ref(&pass2), &pass2, deny_sources_two),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_pass_ref(&pass2),
+            &pass2,
+            hide_pred("urn:x-sparkles:evidence:sourceRevision"),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_pass_ref(&pass2),
+            &pass2,
+            hide_pred("urn:x-sparkles:evidence:normalizedText"),
+        ),
+        absent
+    );
+    assert_eq!(
+        run_err(
+            &same_iri_pass_ref(&pass2),
+            &pass2,
+            hide_pred("http://www.w3.org/ns/prov#wasDerivedFrom"),
+        ),
+        absent
+    );
+    let readable_pass = run_err(&same_iri_pass_ref(&pass2), &pass2, all());
+    assert_eq!(readable_pass.0, "immutable-record-conflict");
+    assert!(readable_pass.1.contains("another kind"));
+}

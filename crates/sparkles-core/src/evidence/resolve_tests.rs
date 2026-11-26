@@ -2069,3 +2069,347 @@ fn direct_verify_passage_reference_refuses_duplicate_or_malformed_record_digests
         "immutable-record-conflict"
     );
 }
+
+#[test]
+fn probe_plus_verify_reads_each_retained_literal_once_on_compacted_store() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:single-read");
+    let rev_ok = iri("urn:rev:single-ok");
+    let rev_meta = iri("urn:rev:single-meta");
+    let rev_bad_shape = iri("urn:rev:single-bad-shape");
+    let rend_ok = iri("urn:rend:single-ok");
+    let rend_meta = iri("urn:rend:single-meta");
+    let rend_bad_shape = iri("urn:rend:single-bad-shape");
+    let json = r#"{"score":42}"#;
+    let json_digest = Sha256Digest::of_bytes(json.as_bytes(), &Control::none()).unwrap();
+    let val_digest = Sha256Digest::of_bytes(b"42", &Control::none()).unwrap();
+    let json_b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let text = "single vocabulary read check";
+    let span_digest = Sha256Digest::of_bytes(b"single", &Control::none()).unwrap();
+
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            // Retained JSON SourceRevision
+            q(
+                &rev_ok,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_ok,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_ok,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_ok,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_ok,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(json_b64, iri(XSD_BASE64_BINARY))),
+            ),
+            // Metadata-only SourceRevision
+            q(
+                &rev_meta,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_meta,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_meta,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_meta,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            // SourceRevision whose ev:retainedBytes is a Vocab IRI (wrong literal shape)
+            q(
+                &rev_bad_shape,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_bad_shape,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_bad_shape,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_bad_shape,
+                &format!("{EV}contentDigest"),
+                lit(&json_digest.to_string()),
+            ),
+            q(
+                &rev_bad_shape,
+                &format!("{EV}retainedBytes"),
+                iri("urn:not:base64").into(),
+            ),
+            // Retained Rendition
+            q(
+                &rend_ok,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Rendition)).into(),
+            ),
+            q(
+                &rend_ok,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend_ok,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend_ok, PROV_WAS_DERIVED_FROM, rev_ok.clone().into()),
+            q(&rend_ok, &format!("{EV}normalizedText"), lit(text)),
+            // Metadata-only Rendition
+            q(
+                &rend_meta,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Rendition)).into(),
+            ),
+            q(
+                &rend_meta,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend_meta,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend_meta, PROV_WAS_DERIVED_FROM, rev_ok.clone().into()),
+            // Rendition whose ev:normalizedText is a Vocab IRI (wrong literal shape)
+            q(
+                &rend_bad_shape,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Rendition)).into(),
+            ),
+            q(
+                &rend_bad_shape,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend_bad_shape,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rend_bad_shape,
+                PROV_WAS_DERIVED_FROM,
+                rev_ok.clone().into(),
+            ),
+            q(
+                &rend_bad_shape,
+                &format!("{EV}normalizedText"),
+                iri("urn:not:simple-literal").into(),
+            ),
+        ],
+    );
+    s.compact().unwrap();
+
+    // 1. Proposed passage on compacted rendition: Phase 1 probe does 0 literal reads,
+    //    Phase 2 verify does 1 literal read -> 1 total read.
+    let mut r = resolver();
+    SIMPLE_LITERAL_READS.with(|c| c.set(0));
+    let probe = r
+        .probe_record_with_selection(
+            rend_ok.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_ok,
+            &[RecordKind::Rendition],
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(probe, SelectionProbe::DeferredLiteralShape);
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 0);
+    r.verify_proposed_passages(
+        &s,
+        &s,
+        Some(&all()),
+        &rend_ok,
+        &[ProposedPassage {
+            key: "p0",
+            revision: &rev_ok,
+            start: 0,
+            end: 6,
+            text_digest: span_digest,
+            quote: Some("single"),
+        }],
+    )
+    .unwrap();
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 1);
+
+    // 2. Structured reference on compacted revision: Phase 1 probe does 0 literal reads,
+    //    Phase 2 verify does 1 literal read -> 1 total read.
+    TYPED_LITERAL_READS.with(|c| c.set(0));
+    let probe = r
+        .probe_record_with_selection(
+            rev_ok.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rev_ok,
+            &[RecordKind::SourceRevision],
+            SelectionRequirements {
+                structured_content: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(probe, SelectionProbe::DeferredLiteralShape);
+    assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 0);
+    r.verify_structured_references(
+        &s,
+        &s,
+        Some(&all()),
+        &rev_ok,
+        &[ProposedStructured {
+            key: "s0",
+            pointer: "/score",
+            value_digest: val_digest,
+        }],
+    )
+    .unwrap();
+    assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 1);
+
+    // 3. Metadata-only targets fail in Phase 1 with 0 literal reads.
+    SIMPLE_LITERAL_READS.with(|c| c.set(0));
+    TYPED_LITERAL_READS.with(|c| c.set(0));
+    assert_eq!(
+        code(r.probe_record_with_selection(
+            rend_meta.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_meta,
+            &[RecordKind::Rendition],
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(r.probe_record_with_selection(
+            rev_meta.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rev_meta,
+            &[RecordKind::SourceRevision],
+            SelectionRequirements {
+                structured_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 0);
+    assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 0);
+
+    // 4. Incompatible kind constraint on selected target: verifies literal shape once so
+    //    wrong-shape targets answer `evidence-unavailable` while readable targets preserve
+    //    `immutable-record-conflict`.
+    SIMPLE_LITERAL_READS.with(|c| c.set(0));
+    assert_eq!(
+        code(r.probe_record_with_selection(
+            rend_ok.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_ok,
+            &[RecordKind::SourceRevision],
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 1);
+    assert_eq!(
+        code(r.probe_record_with_selection(
+            rend_bad_shape.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rend_bad_shape,
+            &[RecordKind::SourceRevision],
+            SelectionRequirements {
+                rendition_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(SIMPLE_LITERAL_READS.with(std::cell::Cell::get), 2);
+
+    // 5. Fallback literal-shape verifier catches wrong-shape Vocab targets cleanly.
+    TYPED_LITERAL_READS.with(|c| c.set(0));
+    assert_eq!(
+        code(r.verify_selection_literal_shape(
+            rev_bad_shape.as_str(),
+            &s,
+            &s,
+            Some(&all()),
+            &rev_bad_shape,
+            SelectionRequirements {
+                structured_content: true,
+                ..Default::default()
+            },
+        )),
+        "evidence-unavailable"
+    );
+    assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 1);
+}
