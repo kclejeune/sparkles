@@ -75,6 +75,18 @@ impl Shapes {
         graphs: &[String],
         prefixes: &[(String, String)],
     ) -> Result<Shapes> {
+        Self::for_rules_with_data(snap, graphs, &[], prefixes)
+    }
+
+    /// Like [`Shapes::for_rules`], also consulting `data_graphs` for `rdf:type` and
+    /// `rdfs:subClassOf` when checking class-valued SPIN `spl:valueType` template arguments
+    /// across separate shapes and data graphs.
+    pub fn for_rules_with_data(
+        snap: &Snapshot,
+        graphs: &[String],
+        data_graphs: &[String],
+        prefixes: &[(String, String)],
+    ) -> Result<Shapes> {
         let mut g = oxrdf::Graph::new();
         for iri in graphs {
             if sparkles_core::validation::graph_id(snap, iri).is_none() {
@@ -83,7 +95,9 @@ impl Shapes {
             g.extend(crate::data::read_graph(snap, Some(iri))?.iter());
         }
         if crate::spin::has_rules(&g) {
-            let spin = crate::spin::translate(&g, prefixes)?;
+            let extra =
+                (!data_graphs.is_empty()).then(|| crate::spin::ExtraTypes::new(snap, data_graphs));
+            let spin = crate::spin::translate_with_extra_types(&g, extra.as_ref(), prefixes)?;
             g.extend(spin.iter());
         }
         let mut shapes = Parser::new(&g).parse(true)?;

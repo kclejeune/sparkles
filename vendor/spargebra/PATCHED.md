@@ -174,5 +174,51 @@ IRIs in an `Arc<HashSet<NamedNode>>` and `with_custom_aggregate_functions` accep
 shared registry, avoiding a copy on each parser construction. Registration through
 `with_custom_aggregate_function` keeps copy-on-write behavior.
 
+Four further local helpers support bounded query parsing and standalone fragment
+validation:
+
+- **`SparqlSyntaxError::is_too_deep`.** Reports whether an error came from the nesting
+  and depth pre-scan (`SparqlSyntaxErrorKind::TooDeep`), so callers such as SPIN
+  dual-form translation can propagate limit refusals instead of treating them as
+  ordinary syntax errors.
+
+- **`SparqlParser::with_max_resolved_iri_bytes` and `SparqlSyntaxError::is_resolved_iri_limit_exceeded`.**
+  Enforces a cumulative byte budget on resolved IRIs directly inside `ParserState` across
+  `BASE` / `PREFIX` declarations, `IRIREF`s, and `PrefixedName` expansions (`PNAME_LN` and
+  bare `PNAME_NS`) before allocating each resolved IRI string or calling
+  `base_iri.resolve_into`. Escaped `IRIREF`s measure decoded length, scheme presence, and
+  leading delimiter bytes without allocation before admission (an admitted escaped relative
+  `IRIREF` allocates only its bounded decoded scratch buffer before `resolve_into`), and
+  relative IRI bounds are computed in O(1) from `oxiri`'s cached component slices only when
+  a budget is configured. Once exceeded, the limit latches on `ParserState` so PEG
+  backtracking cannot mask or allocate past it, and `parse_query` / `parse_update` return
+  `SparqlSyntaxErrorKind::ResolvedIriLimitExceeded`. Because enforcement runs inside the
+  actual parser rules, compact zero-whitespace forms (`PREFIXp:<ns/>`, `FILTERp:f(?x)`,
+  `?this ap:C`, `VALUES ?x { truetruetruetruep:a0 UNDEFp:a1 }`) and short-prefix shadowing
+  cannot diverge from parser resolution.
+
+- **`SparqlParser::with_placeholder_prefix`.** Registers synthetic placeholder prefixes
+  for standalone fragment validation when real prefix declarations are not yet known.
+  Single-argument calls written with a synthetic prefixed name are admitted as potential
+  custom aggregates in grouped `SELECT` projections, with or without `DISTINCT`, while
+  zero- and multi-argument scalar calls keep argument-based variable binding checks and
+  explicit `<IRI>` calls and prefixes redeclared in the query prologue keep strict
+  validation. A synthetic prefixed call using `DISTINCT` also fixes that synthetic
+  prefixed name as an aggregate across the parse so nested calls to the same prefixed
+  name (including across sibling and nested subselects in either order) are rejected across
+  `SELECT` projections, `HAVING`, `ORDER BY`, and bare `FunctionCall` constraints without
+  affecting explicit `<IRI>` calls, and parser context stacks unwind across failed PEG
+  alternatives. When a synthetic placeholder prefix starting with `a` (such as `ap` or `a`)
+  is registered alongside its stripped suffix (`p` or `""`), verb+object rules fall back to
+  the compact `a` (`rdf:type`) verb only when that prefix remains synthetic and the two-term
+  `Verb ObjectList` parse fails, so both `?s ap:C .` and `?s ap:p ?o .` validate in
+  standalone mode without changing behavior for declared prefixes.
+
+- **Bounded `BASE` IRI resolution.** `ParserState::parse_iriref` parses absolute IRI
+  references directly with `Iri::parse` instead of routing them through
+  `base_iri.resolve`, and resolves relative references through `base_iri.resolve_into`
+  into a fresh `String`. This avoids retaining `base_iri.len()` excess capacity in every
+  parsed `NamedNode` when a query declares a long `BASE`.
+
 Drop this copy once a spargebra release supplies the remaining fixes and extensions,
 with the nesting check retained in Sparkles callers if upstream does not provide it.

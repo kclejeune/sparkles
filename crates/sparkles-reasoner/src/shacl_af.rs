@@ -245,7 +245,9 @@ pub(crate) fn derive(
     } else {
         cfg.shapes.clone()
     };
-    let shapes = Shapes::for_rules(&snap, &shape_graphs, &[]).context("reading the shapes")?;
+    let data_type_graphs: &[String] = if cfg.shapes.is_empty() { &[] } else { &iris };
+    let shapes = Shapes::for_rules_with_data(&snap, &shape_graphs, data_type_graphs, &[])
+        .context("reading the shapes")?;
     let rules = shapes.rules().context("reading the SHACL rules")?;
     let vopts = ValidateOptions {
         cancel: opts.cancel.clone(),

@@ -619,7 +619,31 @@ impl QueryResult {
 }
 
 pub fn parse_query(q: &str, base: Option<&str>, prefixes: &[(String, String)]) -> Result<Query> {
+    parse_query_inner(q, base, prefixes, None)
+}
+
+/// Like [`parse_query`], while bounding cumulative resolved IRI bytes materialized by
+/// `spargebra` during parsing (`BASE` / `PREFIX` declarations, `IRIREF`s, and
+/// `PrefixedName` expansions).
+pub fn parse_query_with_max_resolved_iri_bytes(
+    q: &str,
+    base: Option<&str>,
+    prefixes: &[(String, String)],
+    max_resolved_iri_bytes: usize,
+) -> Result<Query> {
+    parse_query_inner(q, base, prefixes, Some(max_resolved_iri_bytes))
+}
+
+fn parse_query_inner(
+    q: &str,
+    base: Option<&str>,
+    prefixes: &[(String, String)],
+    max_resolved_iri_bytes: Option<usize>,
+) -> Result<Query> {
     let mut p = aggext::register(SparqlParser::new());
+    if let Some(limit) = max_resolved_iri_bytes {
+        p = p.with_max_resolved_iri_bytes(limit);
+    }
     if let Some(b) = base {
         p = p
             .with_base_iri(b)

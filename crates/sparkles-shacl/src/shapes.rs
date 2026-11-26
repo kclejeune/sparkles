@@ -762,7 +762,7 @@ impl<'g> G<'g> {
     }
 
     pub fn has(&self, s: &Term, p: NamedNodeRef<'_>) -> bool {
-        self.object(s, p).is_some()
+        as_subject(s).is_some_and(|sub| self.g.object_for_subject_predicate(sub, p).is_some())
     }
 
     /// Elements of an RDF list.

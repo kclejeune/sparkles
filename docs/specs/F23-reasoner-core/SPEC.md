@@ -135,13 +135,13 @@ The columnar derived tier, the first phase of the core, is built under item 835.
 shared maintenance core of Phase 4 is built in exact mode under item 837, including the
 second half of item 521 for incremental closure operators, while derivation records remain
 for item 836 and stratified maintenance for `noValue` and negated atoms waits on item 839's
-strata. The SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with its
-maintenance in item 958 and SPIN's RDF syntax in item 959. The rule IR of the n-ary core
-is built under item 839, with its evaluation by strata, maintenance, explanations,
-witnesses, demand and the rule frontend, and its restricted chase and planner over
-relations remain. Phase 2, closure operators in demand programs, is built as the first
-half of item 521. The other core and convergence phases remain under
-[item 456](../../ROADMAP.md).
+strata. The SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with SPIN's RDF
+syntax and template calls built under item 959 and incremental maintenance remaining in
+item 958. The rule IR of the n-ary core is built under item 839, with its evaluation by
+strata, maintenance, explanations, witnesses, demand and the rule frontend, and its
+restricted chase and planner over relations remain. Phase 2, closure operators in demand
+programs, is built as the first half of item 521. The other core and convergence phases
+remain under [item 456](../../ROADMAP.md).
 
 ### Columnar derived tier
 
@@ -458,8 +458,19 @@ An incremental run of the profile therefore materializes in full and says why, a
 958 holds the compiled form and its maintenance. The SHACL-AF 2017 node expressions map
 onto the SHACL 1.2 expression tree, with a new `SparqlCall` node for `sh:SPARQLFunction`
 calls over the combinations of their arguments. TopBraid's seven rule tests pass and are
-vendored with their licence. SPIN rules run from `sp:text`, and SPIN's RDF syntax and
-template calls are item 959. The Fuseki converter maps `ja:reasonerURL sh:Rules`, a
+vendored with their licence. SPIN rules require an outer `CONSTRUCT` query and run from
+`sp:text`, from SPIN RDF syntax (outer `sp:Construct` with `sp:Select` subqueries, graph
+patterns, property paths, expressions, built-ins, aggregates and solution modifiers), and
+from SPIN template calls (`spin:Template`, `spin:ConstructTemplate`, `spin:body` and
+`spl:Argument` with defaults, optional arguments, value-type checks and `rdfs:subClassOf`
+inheritance), which item 959 added. `spin::serialize_query` also serializes `sp:Select`,
+`sp:Ask`, `sp:Describe`, `VALUES`, `MINUS` and `SERVICE`, while translated SPIN rules pass
+through SHACL-SPARQL validation that refuses `VALUES`, `MINUS` and `SERVICE`. Translation
+enforces shared work, depth, list-length and output-size bounds across graph reads,
+template discovery, inheritance and AST serialization, preserves `sp:text` fallback for
+dual-form rules whose structural form uses an unsupported construct, and refuses
+blank-node template argument values because templates expand to SPARQL query text rather
+than runtime pre-bound blank-node identities. The Fuseki converter maps `ja:reasonerURL sh:Rules`, a
 Sparkles convention, with `sh:shapesGraph` and `tosh:maxIterations`.
 
 The example `shacl_af_bench` of the reasoner measures the evaluator. It makes N rectangles,

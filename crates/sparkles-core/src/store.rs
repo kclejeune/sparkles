@@ -922,7 +922,7 @@ impl Snapshot {
 
     /// Decode a stored id into an RDF term under explicit memory and control callbacks,
     /// propagating any refusal with its original error instead of returning `None`.
-    pub(crate) fn term_controlled(
+    pub fn term_controlled(
         &self,
         id: Id,
         reserve: &mut dyn FnMut(usize) -> Result<()>,
