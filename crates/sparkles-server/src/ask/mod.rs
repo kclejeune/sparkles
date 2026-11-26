@@ -186,6 +186,16 @@ pub struct Turn {
     pub query: String,
 }
 
+/// Wrapper around [`sparkles::access::Preparation`] implementing `Debug` for [`AskOptions`].
+#[derive(Clone)]
+pub struct AskPreparation(pub sparkles::access::Preparation);
+
+impl std::fmt::Debug for AskPreparation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AskPreparation(..)")
+    }
+}
+
 /// What one ask is asked to do.
 #[derive(Clone, Debug)]
 pub struct AskOptions {
@@ -237,6 +247,8 @@ pub struct AskOptions {
     /// queries charge. The pipeline runs on a blocking thread, where the request's
     /// task-local grant does not reach, so the route captures it here.
     pub grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+    /// an existing request preparation owner to reuse (e.g. from an MCP tool call)
+    pub preparation: Option<AskPreparation>,
     /// answer from the data, from community reports, or as the question needs
     pub mode: AskMode,
     /// use only reviewed community reports (`reviewedOnly`, C22 A7)
@@ -288,6 +300,7 @@ impl Default for AskOptions {
             full_results: false,
             cancel: None,
             grant: None,
+            preparation: None,
             mode: AskMode::Auto,
             reviewed_only: false,
             report_context: false,
@@ -321,29 +334,30 @@ pub fn ask(
     let _entered = pipeline.enter();
     let cancel = o.cancel.clone().unwrap_or_default();
     let deadline = started + o.deadline;
-    let preparation = match sparkles::access::Preparation::for_request(
-        &sparkles::sparql::QueryOptions {
+    let preparation = match o.preparation.clone() {
+        Some(AskPreparation(preparation)) => preparation,
+        None => match sparkles::access::Preparation::for_request(&sparkles::sparql::QueryOptions {
             max_memory_bytes: server.cfg().query_memory_bytes,
             pool: server.state.catalog.pool().cloned(),
             grant: o.grant.clone(),
             cancel: Some(cancel.clone()),
             deadline: Some(deadline),
             ..Default::default()
-        },
-    ) {
-        Ok(preparation) => preparation,
-        Err(error) => {
-            let error = crate::mcp::errors::ErrorContext {
-                timeout_secs: o.deadline.as_secs_f64(),
-                max_timeout_secs: server.cfg().max_timeout.as_secs_f64(),
-                prefix_names: &[],
-                request_id: "ask",
+        }) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let error = crate::mcp::errors::ErrorContext {
+                    timeout_secs: o.deadline.as_secs_f64(),
+                    max_timeout_secs: server.cfg().max_timeout.as_secs_f64(),
+                    prefix_names: &[],
+                    request_id: "ask",
+                }
+                .engine(error);
+                let failure = error.meta();
+                on("error", &failure);
+                return json!({"outcome":"error","error":failure,"dataset":o.dataset,"question":o.question});
             }
-            .engine(error);
-            let failure = error.meta();
-            on("error", &failure);
-            return json!({"outcome":"error","error":failure,"dataset":o.dataset,"question":o.question});
-        }
+        },
     };
     let mut lists = o.lists.clone().unwrap_or_else(|| {
         Role::ALL

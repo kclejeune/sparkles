@@ -32,6 +32,7 @@ pub fn all_tools() -> Vec<&'static str> {
         "recall",
         "community_reports",
         "why_empty",
+        "ask",
         "share_query",
         "read_chunks",
         "list_sources",
@@ -114,7 +115,7 @@ pub(super) fn ds() -> Value {
     json!({"type":"string","pattern":"^[A-Za-z0-9_.-]+$","description":"Dataset name from list_datasets. Optional when there is exactly one dataset."})
 }
 
-fn at() -> Value {
+pub(super) fn at() -> Value {
     json!({"type":"integer","minimum":0,"description":"Read the snapshot of this commit (the `commit` of an earlier result) for consistent multi-call reads. A past commit is readable while the server holds it or the dataset's history keeps it; otherwise the call fails and you rerun without atCommit."})
 }
 
@@ -266,7 +267,8 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                     "modified":{"type":"string"},
                     "reasoning":{"type":["object","null"],"properties":{"profile":{"type":"string"},"stale":{"type":["boolean","null"]}}},
                     "textSearch":{"type":"boolean"},"writable":{"type":"boolean"},
-                    "graphql":{"type":"boolean","description":"The dataset has a GraphQL schema that graphql_query reads"}}}},
+                    "graphql":{"type":"boolean","description":"The dataset has a GraphQL schema that graphql_query reads"},
+                    "ask":{"type":"boolean","description":"The dataset has an enabled assistant that the ask tool queries"}}}},
                 "limits":{"type":"object","properties":{
                     "defaultMaxRows":{"type":"integer"},"maxRows":{"type":"integer"},
                     "defaultMaxBytes":{"type":"integer"},"maxBytes":{"type":"integer"},
@@ -758,6 +760,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "atCommit": at(), "at": at_sel()}}),
             Some(why_empty_output()),
         ),
+        super::ask::tool_def(cfg),
         read(
             "explain_inference",
             "Explain why a triple is inferred",

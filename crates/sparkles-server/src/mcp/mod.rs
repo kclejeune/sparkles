@@ -11,6 +11,7 @@
 
 mod adapter;
 mod algo;
+mod ask;
 pub(crate) mod branches;
 #[cfg(feature = "auth")]
 mod bridge;
@@ -63,6 +64,8 @@ mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validate;
 
+#[cfg(test)]
+mod ask_tests;
 #[cfg(test)]
 mod expiry_tests;
 #[cfg(test)]
@@ -129,6 +132,8 @@ pub struct McpArgs {
     pub allow_update: bool,
     #[command(flatten)]
     pub outbound: crate::outbound::OutboundArgs,
+    #[command(flatten)]
+    pub models: crate::models::ModelArgs,
     /// Largest query timeout a call may request, in seconds (calls default to 30)
     #[arg(long, value_name = "SECS", default_value_t = 60.0)]
     pub timeout: f64,
@@ -483,6 +488,7 @@ impl McpServer {
             }
             #[cfg(feature = "graphql")]
             "graphql_query" => self.graphql_available(p),
+            "ask" => self.ask_available(p),
             _ => true,
         }
     }
@@ -626,6 +632,11 @@ impl McpServer {
 pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
     #[cfg(feature = "auth")]
     if let Some(url) = &args.url {
+        if args.models.model_config.is_some() || !args.models.model_secret.is_empty() {
+            bail!(
+                "--model-config and --model-secret apply with --loc or --data; a bridged server uses its own model configuration"
+            );
+        }
         return bridge::run(url, args.token.clone(), args.insecure_http);
     }
     if !(args.timeout.is_finite() && args.timeout > 0.0) {
@@ -655,6 +666,9 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
     st.read_only = !args.allow_update;
     st.allow_service = args.allow_service;
     st.outbound = args.outbound.policy()?;
+    if let Some(models) = args.models.load(args.outbound.local_policy()?)? {
+        st.models.store(Some(models));
+    }
     st.schema_max_entries = args.schema_max_entries;
     st.schema_statistics_above = args.schema_statistics_above.0;
     let memory = (args.query_memory_mb > 0).then_some(args.query_memory_mb << 20);

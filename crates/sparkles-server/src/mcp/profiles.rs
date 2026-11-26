@@ -36,6 +36,7 @@ pub const PROFILES: &[Profile] = &[
             "similar_queries",
             "community_reports",
             "why_empty",
+            "ask",
             "share_query",
             "explain_inference",
             "graphql_query",

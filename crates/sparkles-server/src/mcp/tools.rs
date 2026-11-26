@@ -181,6 +181,7 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         RECALL_PREFLIGHT => t.recall_preflight(args),
         "community_reports" => t.community_reports(args),
         "why_empty" => t.why_empty(args),
+        "ask" => t.ask(args),
         #[cfg(feature = "reasoning")]
         "explain_inference" => t.explain_inference(args),
         #[cfg(feature = "reasoning")]
@@ -848,6 +849,10 @@ impl Tools<'_> {
                 // graphql_query reads this dataset
                 if self.server.offers("graphql_query") && super::graphql_on(p, ds) {
                     j["graphql"] = true.into();
+                }
+                // ask queries this dataset
+                if self.server.offers("ask") && super::ask::ask_on(&self.server.state, p, ds) {
+                    j["ask"] = true.into();
                 }
                 j
             })

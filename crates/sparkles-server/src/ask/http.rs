@@ -87,7 +87,7 @@ fn bad(m: impl Into<String>) -> crate::http::ApiError {
 }
 
 /// The HTTP status of an error event's code, for the JSON form.
-pub(super) fn status_of(code: &str) -> StatusCode {
+pub(crate) fn status_of(code: &str) -> StatusCode {
     match code {
         "bad-argument" => StatusCode::BAD_REQUEST,
         "unknown-dataset" | "no-model" => StatusCode::NOT_FOUND,
