@@ -154,6 +154,8 @@ pub struct Dataset {
     pub ephemeral: bool,
     /// write-time validation counters (the store's guard observer)
     pub validation_metrics: Arc<crate::obs::ValidationMetrics>,
+    /// per-dataset rebuild accounting and generation id for metrics parity
+    pub metrics_state: crate::obs::DatasetMetricsState,
     /// taken offline by `POST /$/datasets/{ds}?state=offline` (Fuseki): its services
     /// answer `503` until `?state=active`; not persisted
     pub offline: AtomicBool,
@@ -1011,6 +1013,7 @@ impl AppState {
             branches: Mutex::new(BTreeMap::new()),
             ephemeral,
             validation_metrics,
+            metrics_state: crate::obs::DatasetMetricsState::new(),
             offline: AtomicBool::new(false),
             dataset,
         })
@@ -1350,6 +1353,10 @@ impl AppState {
             .as_ref()
             .map(|ds| ds.store.dataset_id())
             .or_else(|| self.catalog.info(name).map(|info| info.id));
+        let delete_rebuilds = cached.as_ref().map(|ds| {
+            let raw = sparkles::store::RebuildReason::ALL.map(|r| ds.store.rebuilds(r));
+            ds.metrics_state.rebuilds_for_other_retirement(raw)
+        });
         drop(cached);
         if managed {
             // Other holders of the dataset itself, not this server's wrapper, get the
@@ -1364,7 +1371,7 @@ impl AppState {
         match deleted {
             Ok(deleted) => {
                 if deleted {
-                    self.metrics.forget(name);
+                    self.metrics.forget_with_rebuilds(name, delete_rebuilds);
                     self.volatile.forget(name);
                 }
                 Ok((deleted, deleted.then_some(identity).flatten()))
@@ -1428,6 +1435,11 @@ impl AppState {
         let offline = cached
             .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
+        let prev_metrics_state = cached.as_ref().map(|ds| {
+            let s = crate::obs::DatasetMetricsState::new();
+            s.copy_other_rebuilds_from(&ds.metrics_state);
+            s
+        });
         drop(cached);
         // As in delete, wait for the workers that hold the dataset itself. The catalog
         // refuses a rename for those handles only on a persistent dataset.
@@ -1452,6 +1464,9 @@ impl AppState {
                     tracing::warn!("backup policies still name /{from}: {e:#}");
                 }
                 if let Some(ds) = self.get(to) {
+                    if let Some(prev) = &prev_metrics_state {
+                        ds.metrics_state.copy_other_rebuilds_from(prev);
+                    }
                     ds.offline.store(offline, Ordering::Relaxed);
                 }
                 Ok(())

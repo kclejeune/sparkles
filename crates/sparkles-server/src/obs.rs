@@ -17,7 +17,7 @@ use axum::extract::{MatchedPath, Path, Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde_json::{Value as J, json};
 use sparkles::BudgetKind;
 use sparkles::sparql::Timing;
@@ -38,10 +38,131 @@ mod completion_dispatch_tests;
 
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
+/// Default value of `--metrics-max-datasets`.
+pub const DEFAULT_METRICS_MAX_DATASETS: usize = 100;
+
 /// Dataset label of requests that name no existing dataset.
 const NONE: &str = "$none";
 /// Dataset label shared by the datasets beyond the label cap.
 const OTHER: &str = "$other";
+
+static NEXT_METRICS_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_metrics_id() -> u64 {
+    NEXT_METRICS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+struct MetricsId(u64);
+
+impl Default for MetricsId {
+    fn default() -> Self {
+        Self(next_metrics_id())
+    }
+}
+
+fn clone_rebuild(h: &RebuildHistogram) -> RebuildHistogram {
+    RebuildHistogram {
+        buckets: h.buckets,
+        sum_seconds: h.sum_seconds,
+    }
+}
+
+fn add_rebuild(dst: &mut RebuildHistogram, src: &RebuildHistogram) {
+    for (a, b) in dst.buckets.iter_mut().zip(src.buckets) {
+        *a = a.saturating_add(b);
+    }
+    dst.sum_seconds += src.sum_seconds;
+}
+
+fn sub_rebuild(a: &RebuildHistogram, b: &RebuildHistogram) -> RebuildHistogram {
+    let mut buckets = [0u64; REBUILD_BUCKETS.len() + 1];
+    for ((out, x), y) in buckets.iter_mut().zip(a.buckets).zip(b.buckets) {
+        *out = x.saturating_sub(y);
+    }
+    RebuildHistogram {
+        buckets,
+        sum_seconds: (a.sum_seconds - b.sum_seconds).max(0.0),
+    }
+}
+
+fn max_rebuild(a: &RebuildHistogram, b: &RebuildHistogram) -> RebuildHistogram {
+    let mut buckets = [0u64; REBUILD_BUCKETS.len() + 1];
+    for ((out, x), y) in buckets.iter_mut().zip(a.buckets).zip(b.buckets) {
+        *out = x.max(y);
+    }
+    RebuildHistogram {
+        buckets,
+        sum_seconds: a.sum_seconds.max(b.sum_seconds),
+    }
+}
+
+fn any_rebuild(hs: &[RebuildHistogram; 2]) -> bool {
+    hs.iter()
+        .any(|h| h.buckets.iter().any(|&c| c > 0) || h.sum_seconds > 0.0)
+}
+
+#[derive(Default)]
+struct OtherRebuildState {
+    /// Highest rebuild counts observed while this dataset was aggregated under `$other`.
+    seen_under_other: [RebuildHistogram; 2],
+    /// Rebuild counts retired to `$other` when this dataset was promoted to a named slot,
+    /// subtracted from its named slot to prevent both `$other` shrinkage and double counting.
+    promoted_offset: [RebuildHistogram; 2],
+}
+
+/// Per-dataset rebuild accounting across `$other` promotion and deletion, plus a
+/// server-local monotonic instance id for OTLP reset detection.
+pub struct DatasetMetricsState {
+    pub(crate) instance_id: u64,
+    other_rebuilds: Mutex<OtherRebuildState>,
+}
+
+impl Default for DatasetMetricsState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DatasetMetricsState {
+    pub fn new() -> Self {
+        Self {
+            instance_id: next_metrics_id(),
+            other_rebuilds: Mutex::new(OtherRebuildState::default()),
+        }
+    }
+
+    /// Rebuilds to retire into `$other` when this dataset is deleted while aggregated there.
+    pub(crate) fn rebuilds_for_other_retirement(
+        &self,
+        raw: [RebuildHistogram; 2],
+    ) -> [RebuildHistogram; 2] {
+        let g = self.other_rebuilds.lock();
+        [
+            max_rebuild(
+                &sub_rebuild(&raw[0], &g.promoted_offset[0]),
+                &g.seen_under_other[0],
+            ),
+            max_rebuild(
+                &sub_rebuild(&raw[1], &g.promoted_offset[1]),
+                &g.seen_under_other[1],
+            ),
+        ]
+    }
+
+    /// Preserve `$other` promotion accounting across a dataset rename.
+    pub(crate) fn copy_other_rebuilds_from(&self, prev: &DatasetMetricsState) {
+        let src = prev.other_rebuilds.lock();
+        let mut dst = self.other_rebuilds.lock();
+        dst.seen_under_other = [
+            clone_rebuild(&src.seen_under_other[0]),
+            clone_rebuild(&src.seen_under_other[1]),
+        ];
+        dst.promoted_offset = [
+            clone_rebuild(&src.promoted_offset[0]),
+            clone_rebuild(&src.promoted_offset[1]),
+        ];
+    }
+}
 
 // ---------------------------------------------------------------- request ids ------
 
@@ -652,6 +773,7 @@ struct OpMetrics {
 /// Counters of one dataset label.
 #[derive(Default)]
 pub struct DsMetrics {
+    series_id: MetricsId,
     ops: [OpMetrics; Op::ALL.len()],
     result_rows: AtomicU64,
     budget: [AtomicU64; BudgetKind::ALL.len()],
@@ -668,6 +790,9 @@ pub struct DsMetrics {
     /// queries by their estimated memory peak, by [`MEMORY_BUCKETS`], not cumulative
     mem_peak: [AtomicU64; MEMORY_BUCKETS.len() + 1],
     mem_peak_sum: AtomicU64,
+    /// retired rebuild histograms preserved under `$other` when overflow datasets are
+    /// deleted or promoted to a named slot, keeping `$other` monotonic
+    retired_rebuilds: Mutex<[RebuildHistogram; 2]>,
 }
 
 /// Upper bounds in bytes of the `sparkles_query_memory_peak_bytes` histogram, without
@@ -798,10 +923,13 @@ impl Metrics {
         {
             ds.result_rows.fetch_add(n, Ordering::Relaxed);
         }
-        if let Some(n) = r.rows_produced {
+        if dataset.is_some()
+            && let Some(n) = r.rows_produced
+        {
             ds.rows_produced.fetch_add(n, Ordering::Relaxed);
         }
-        if op == Op::Query
+        if dataset.is_some()
+            && op == Op::Query
             && let Some(b) = r.mem_peak_bytes
         {
             let i = MEMORY_BUCKETS
@@ -851,14 +979,63 @@ impl Metrics {
     }
 
     /// `--metrics-max-datasets` (other capped labels, like backup repositories, share it).
-    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "backup", feature = "otel")), allow(dead_code))]
     pub fn max_datasets(&self) -> usize {
         self.max_datasets
     }
 
     /// Drop a deleted dataset's series (a recreated name starts again at zero).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn forget(&self, dataset: &str) {
-        self.datasets.write().remove(dataset);
+        self.forget_with_rebuilds(dataset, None);
+    }
+
+    /// Drop a deleted dataset's named series, or retire its rebuilds into `$other` when
+    /// it was aggregated under `$other` so shared overflow counters stay monotonic.
+    pub(crate) fn forget_with_rebuilds(
+        &self,
+        dataset: &str,
+        rebuilds: Option<[RebuildHistogram; 2]>,
+    ) {
+        let mut w = self.datasets.write();
+        if w.remove(dataset).is_some() {
+            return;
+        }
+        if let Some(rebuilds) = rebuilds
+            && let Some(other) = w.get(OTHER)
+        {
+            let mut dst = other.retired_rebuilds.lock();
+            add_rebuild(&mut dst[0], &rebuilds[0]);
+            add_rebuild(&mut dst[1], &rebuilds[1]);
+        }
+    }
+
+    fn retire_other_rebuilds(&self, rebuilds: &[RebuildHistogram; 2]) {
+        let mut w = self.datasets.write();
+        let other = w.entry(OTHER.to_string()).or_default().clone();
+        drop(w);
+        let mut dst = other.retired_rebuilds.lock();
+        add_rebuild(&mut dst[0], &rebuilds[0]);
+        add_rebuild(&mut dst[1], &rebuilds[1]);
+    }
+
+    fn other_retired_rebuilds(&self) -> Option<[RebuildHistogram; 2]> {
+        let r = self.datasets.read();
+        let other = r.get(OTHER)?;
+        let g = other.retired_rebuilds.lock();
+        Some([clone_rebuild(&g[0]), clone_rebuild(&g[1])])
+    }
+
+    #[cfg(all(test, feature = "otel"))]
+    pub(crate) fn record_test_work(&self, dataset: &str, rows_produced: u64, mem_peak_bytes: u64) {
+        let (_, ds) = self.series(Some(dataset));
+        ds.rows_produced.fetch_add(rows_produced, Ordering::Relaxed);
+        let i = MEMORY_BUCKETS
+            .iter()
+            .position(|m| mem_peak_bytes <= *m)
+            .unwrap_or(MEMORY_BUCKETS.len());
+        ds.mem_peak[i].fetch_add(1, Ordering::Relaxed);
+        ds.mem_peak_sum.fetch_add(mem_peak_bytes, Ordering::Relaxed);
     }
 
     /// Carry a renamed dataset's series over to its new name.
@@ -1118,6 +1295,8 @@ fn add_totals(t: &mut ValidationTotals, m: &LanguageCounters) {
 /// Scrape-time state of one dataset label (summed over datasets sharing `$other`).
 #[derive(Default)]
 struct DsGauges {
+    /// server-local store instance id for a named dataset (0 for `$other`)
+    instance_id: u64,
     quads: u64,
     delta_inserts: u64,
     delta_deletes: u64,
@@ -1156,7 +1335,11 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         } else {
             d.name.clone()
         };
+        let is_other = label == OTHER;
         let g = out.entry(label).or_default();
+        if !is_other {
+            g.instance_id = d.metrics_state.instance_id;
+        }
         let snap = d.store.snapshot();
         let (c, r) = (d.store.cache(), d.store.result_cache());
         g.quads += snap.len();
@@ -1193,12 +1376,44 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         g.rcache_hits += r.hits();
         g.rcache_misses += r.misses();
         g.commit.merge(&d.store.commit_metrics());
-        for (h, reason) in g.rebuilds.iter_mut().zip(RebuildReason::ALL) {
-            let d = d.store.rebuilds(reason);
-            for (a, b) in h.buckets.iter_mut().zip(d.buckets) {
-                *a += b;
+        let raw = RebuildReason::ALL.map(|reason| d.store.rebuilds(reason));
+        let effective = {
+            let mut st_other = d.metrics_state.other_rebuilds.lock();
+            if is_other {
+                let eff = [
+                    sub_rebuild(&raw[0], &st_other.promoted_offset[0]),
+                    sub_rebuild(&raw[1], &st_other.promoted_offset[1]),
+                ];
+                st_other.seen_under_other[0] = max_rebuild(&st_other.seen_under_other[0], &eff[0]);
+                st_other.seen_under_other[1] = max_rebuild(&st_other.seen_under_other[1], &eff[1]);
+                eff
+            } else {
+                if any_rebuild(&st_other.seen_under_other) {
+                    let retired = [
+                        clone_rebuild(&st_other.seen_under_other[0]),
+                        clone_rebuild(&st_other.seen_under_other[1]),
+                    ];
+                    st.metrics.retire_other_rebuilds(&retired);
+                    add_rebuild(&mut st_other.promoted_offset[0], &retired[0]);
+                    add_rebuild(&mut st_other.promoted_offset[1], &retired[1]);
+                    st_other.seen_under_other = Default::default();
+                }
+                [
+                    sub_rebuild(&raw[0], &st_other.promoted_offset[0]),
+                    sub_rebuild(&raw[1], &st_other.promoted_offset[1]),
+                ]
             }
-            h.sum_seconds += d.sum_seconds;
+        };
+        for (h, eff) in g.rebuilds.iter_mut().zip(&effective) {
+            add_rebuild(h, eff);
+        }
+    }
+    if st.metrics.enabled
+        && let Some(retired) = st.metrics.other_retired_rebuilds()
+    {
+        let g = out.entry(OTHER.to_string()).or_default();
+        for (h, r) in g.rebuilds.iter_mut().zip(&retired) {
+            add_rebuild(h, r);
         }
     }
     out
@@ -1659,6 +1874,9 @@ pub fn render_prometheus(st: &AppState) -> String {
         "Rows produced by all operators of queries and updates (the rows-produced work).",
     );
     for (ds, m) in &series {
+        if ds == NONE {
+            continue;
+        }
         let _ = writeln!(
             o,
             "sparkles_rows_produced_total{{dataset=\"{}\"}} {}",
@@ -1673,6 +1891,9 @@ pub fn render_prometheus(st: &AppState) -> String {
         "Estimated peak memory of queries in bytes.",
     );
     for (ds, m) in &series {
+        if ds == NONE {
+            continue;
+        }
         let Some((cum, sum)) = m.mem_peak_snapshot() else {
             continue;
         };
@@ -2114,11 +2335,29 @@ fn io_metrics(o: &mut String) {
     );
 }
 
+/// Internal snapshot shared by `/$/metrics?format=json` and the OTLP observer.
+/// `dataset_gens` carries `(series_id, instance_id)` per dataset label so OTLP can
+/// detect same-cycle delete/recreate resets without changing the public JSON schema.
+pub(crate) struct OtelMetricsSnapshot {
+    pub(crate) json: J,
+    #[cfg_attr(not(feature = "otel"), allow(dead_code))]
+    pub(crate) dataset_gens: BTreeMap<String, (u64, u64)>,
+}
+
 /// The JSON snapshot of the registry (`/$/metrics?format=json`) for the UI.
 pub fn metrics_json(st: &AppState) -> J {
+    metrics_otel_snapshot(st).json
+}
+
+pub(crate) fn metrics_otel_snapshot(st: &AppState) -> OtelMetricsSnapshot {
+    // Match `render_prometheus`: compute gauges first so live datasets register their
+    // metric slots before `st.metrics.snapshot()` runs.
+    let gauges = gauges(st);
     let mut requests = Vec::new();
     let mut counters = serde_json::Map::new();
+    let mut series_ids: BTreeMap<String, u64> = BTreeMap::new();
     for (ds, m) in st.metrics.snapshot() {
+        series_ids.insert(ds.clone(), m.series_id.0);
         for op in Op::ALL {
             let om = &m.ops[op.index()];
             if !om.seen.load(Ordering::Relaxed) {
@@ -2178,9 +2417,14 @@ pub fn metrics_json(st: &AppState) -> J {
         );
     }
     let geo = crate::geo::series(st);
-    let datasets: Vec<J> = gauges(st)
+    let mut dataset_gens = BTreeMap::new();
+    let datasets: Vec<J> = gauges
         .into_iter()
         .map(|(ds, g)| {
+            dataset_gens.insert(
+                ds.clone(),
+                (series_ids.get(&ds).copied().unwrap_or(0), g.instance_id),
+            );
             let rebuilds: serde_json::Map<String, J> = RebuildReason::ALL
                 .iter()
                 .zip(&g.rebuilds)
@@ -2250,7 +2494,7 @@ pub fn metrics_json(st: &AppState) -> J {
         .map(|op| (op.as_str().to_string(), st.metrics.active(*op).into()))
         .collect();
     let (status, states) = (server_status(st), dataset_states(st));
-    json!({
+    let json = json!({
         "formatVersion": 1,
         "version": env!("CARGO_PKG_VERSION"),
         "uptimeSeconds": st.started.elapsed().as_secs_f64(),
@@ -2271,7 +2515,8 @@ pub fn metrics_json(st: &AppState) -> J {
         "requests": requests,
         "datasets": datasets,
         "memoryReview": memory_review(st),
-    })
+    });
+    OtelMetricsSnapshot { json, dataset_gens }
 }
 
 /// The open items of the agent memory review inboxes (`memoryReview`).

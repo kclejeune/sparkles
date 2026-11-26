@@ -14,11 +14,12 @@ use opentelemetry::trace::{
 use opentelemetry::{Context, KeyValue};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::{Instrument, MeterProviderBuilder, SdkMeterProvider, Stream};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 use parking_lot::Mutex;
-use serde_json::Value as J;
+use serde_json::{Value as J, json};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tracing::Span;
@@ -207,7 +208,7 @@ impl Providers {
                 Protocol::HttpProtobuf => MetricExporter::builder().with_http().build()?,
             };
             Some(
-                SdkMeterProvider::builder()
+                meter_provider_builder(settings.metrics_max_datasets)
                     .with_periodic_exporter(e)
                     .with_resource(res.clone())
                     .build(),
@@ -770,28 +771,365 @@ pub(super) fn update_done(span: &Span, t0: SystemTime, s: &sparkles::sparql::upd
 
 // ------------------------------------------------------------------- metrics ------
 
-/// One registry snapshot per collection, shared by every observable instrument.
-struct Snapshot {
-    st: Arc<AppState>,
-    last: Mutex<Option<Arc<J>>>,
+/// OpenTelemetry SDK's default per-stream cardinality limit.
+const SDK_DEFAULT_CARDINALITY_LIMIT: usize = 2000;
+/// Upper bound on a single OTLP stream's cardinality limit so an extreme
+/// `--metrics-max-datasets` cannot preallocate unbounded HashMap capacity in the SDK.
+const MAX_OTLP_CARDINALITY_LIMIT: usize = 250_000;
+
+/// Per-stream cardinality limit required to avoid `otel.metric.overflow` within
+/// `--metrics-max-datasets` (`+2` for `$other` and `$none`), or `None` when the SDK
+/// default (2000) already suffices.
+pub(super) fn stream_cardinality_limit(name: &str, max_datasets: usize) -> Option<usize> {
+    let ds_labels = max_datasets.saturating_add(2);
+    let per_ds = match name {
+        "sparkles.rebuild.duration.bucket" => {
+            sparkles::store::RebuildReason::ALL.len() * (sparkles::store::REBUILD_BUCKETS.len() + 1)
+        }
+        "sparkles.query.memory.peak.bucket" => crate::obs::MEMORY_BUCKETS.len() + 1,
+        "sparkles.requests" => crate::obs::Op::ALL.len() * crate::obs::Outcome::ALL.len(),
+        "sparkles.response.size" => crate::obs::Op::ALL.len(),
+        "sparkles.budget.exceeded" => sparkles::BudgetKind::ALL.len(),
+        "sparkles.rate_limited" => crate::ratelimit::Class::COUNT,
+        "sparkles.memory.review.pending" | "sparkles.memory.review.oldest" => 7,
+        "sparkles.geo.rows" => 3,
+        "sparkles.rebuilds"
+        | "sparkles.rebuild.duration.sum"
+        | "sparkles.rebuild.duration.count"
+        | "sparkles.delta.quads" => 2,
+        n if n.starts_with("sparkles.") => 1,
+        _ => return None,
+    };
+    let needed = ds_labels
+        .saturating_mul(per_ds)
+        .min(MAX_OTLP_CARDINALITY_LIMIT);
+    (needed > SDK_DEFAULT_CARDINALITY_LIMIT).then_some(needed)
 }
 
-impl Snapshot {
-    /// Returns the snapshot for the current collection cycle. Callback index 0 refreshes
-    /// unconditionally so consecutive collections never observe stale state, while every
-    /// later callback in the same collection reads the same snapshot.
-    fn get(&self, refresh: bool) -> Arc<J> {
-        let mut last = self.last.lock();
-        if !refresh && let Some(v) = &*last {
-            return v.clone();
+/// Build an [`SdkMeterProvider`] with Sparkles' per-stream cardinality views sized for
+/// `max_datasets`. Used by both [`Providers::from_env`] and the OTLP test harness.
+pub(super) fn meter_provider_builder(max_datasets: usize) -> MeterProviderBuilder {
+    SdkMeterProvider::builder().with_view(move |inst: &Instrument| {
+        let limit = stream_cardinality_limit(inst.name(), max_datasets)?;
+        Stream::builder().with_cardinality_limit(limit).build().ok()
+    })
+}
+
+#[derive(Clone, Default)]
+struct PeakMonotonic {
+    count: u64,
+    sum_bytes: u64,
+    buckets: Vec<u64>,
+}
+
+#[derive(Clone, Default)]
+struct RebuildDurMonotonic {
+    count: u64,
+    sum_seconds: f64,
+    buckets: Vec<u64>,
+}
+
+#[derive(Clone, Default)]
+struct RebuildMonotonic {
+    count: u64,
+    duration: Option<RebuildDurMonotonic>,
+}
+
+struct DatasetMonotonic {
+    series_id: u64,
+    instance_id: u64,
+    rows_offset: u64,
+    last_rows: u64,
+    peak_offset: Option<PeakMonotonic>,
+    last_peak: Option<PeakMonotonic>,
+    rebuilds_offset: [RebuildMonotonic; 2],
+    last_rebuilds: [RebuildMonotonic; 2],
+}
+
+fn parse_peak(v: &J) -> Option<PeakMonotonic> {
+    if v.is_null() {
+        return None;
+    }
+    let buckets: Vec<u64> = v["buckets"]
+        .as_array()?
+        .iter()
+        .map(|b| b.as_u64().unwrap_or(0))
+        .collect();
+    let count = v["count"]
+        .as_u64()
+        .unwrap_or_else(|| buckets.last().copied().unwrap_or(0));
+    let sum_bytes = v["sumBytes"].as_u64().unwrap_or(0);
+    Some(PeakMonotonic {
+        count,
+        sum_bytes,
+        buckets,
+    })
+}
+
+fn parse_rebuild(v: &J) -> RebuildMonotonic {
+    let count = v["count"].as_u64().unwrap_or(0);
+    let dur = &v["duration"];
+    let duration = if dur.is_null() {
+        None
+    } else {
+        dur["buckets"].as_array().map(|arr| {
+            let buckets: Vec<u64> = arr.iter().map(|b| b.as_u64().unwrap_or(0)).collect();
+            let dcount = dur["count"]
+                .as_u64()
+                .unwrap_or_else(|| buckets.last().copied().unwrap_or(0));
+            let sum_seconds = dur["sumSeconds"].as_f64().unwrap_or(0.0);
+            RebuildDurMonotonic {
+                count: dcount,
+                sum_seconds,
+                buckets,
+            }
+        })
+    };
+    RebuildMonotonic { count, duration }
+}
+
+fn combine_peak(
+    offset: Option<&PeakMonotonic>,
+    raw: Option<&PeakMonotonic>,
+    prev: Option<&PeakMonotonic>,
+) -> Option<PeakMonotonic> {
+    if offset.is_none() && raw.is_none() && prev.is_none() {
+        return None;
+    }
+    let len = raw
+        .map(|p| p.buckets.len())
+        .or_else(|| offset.map(|p| p.buckets.len()))
+        .or_else(|| prev.map(|p| p.buckets.len()))
+        .unwrap_or(0);
+    let mut buckets = Vec::with_capacity(len);
+    let mut running = 0u64;
+    for i in 0..len {
+        let o = offset.and_then(|p| p.buckets.get(i).copied()).unwrap_or(0);
+        let r = raw.and_then(|p| p.buckets.get(i).copied()).unwrap_or(0);
+        let p = prev.and_then(|p| p.buckets.get(i).copied()).unwrap_or(0);
+        let v = o.saturating_add(r).max(p).max(running);
+        running = v;
+        buckets.push(v);
+    }
+    let count = buckets.last().copied().unwrap_or(0);
+    let sum_bytes = offset
+        .map_or(0, |p| p.sum_bytes)
+        .saturating_add(raw.map_or(0, |p| p.sum_bytes))
+        .max(prev.map_or(0, |p| p.sum_bytes));
+    Some(PeakMonotonic {
+        count,
+        sum_bytes,
+        buckets,
+    })
+}
+
+fn combine_rebuild(
+    offset: &RebuildMonotonic,
+    raw: &RebuildMonotonic,
+    prev: &RebuildMonotonic,
+) -> RebuildMonotonic {
+    let duration = if offset.duration.is_none() && raw.duration.is_none() && prev.duration.is_none()
+    {
+        None
+    } else {
+        let len = raw
+            .duration
+            .as_ref()
+            .map(|d| d.buckets.len())
+            .or_else(|| offset.duration.as_ref().map(|d| d.buckets.len()))
+            .or_else(|| prev.duration.as_ref().map(|d| d.buckets.len()))
+            .unwrap_or(0);
+        let mut buckets = Vec::with_capacity(len);
+        let mut running = 0u64;
+        for i in 0..len {
+            let o = offset
+                .duration
+                .as_ref()
+                .and_then(|d| d.buckets.get(i).copied())
+                .unwrap_or(0);
+            let r = raw
+                .duration
+                .as_ref()
+                .and_then(|d| d.buckets.get(i).copied())
+                .unwrap_or(0);
+            let p = prev
+                .duration
+                .as_ref()
+                .and_then(|d| d.buckets.get(i).copied())
+                .unwrap_or(0);
+            let v = o.saturating_add(r).max(p).max(running);
+            running = v;
+            buckets.push(v);
         }
-        let v = Arc::new(crate::obs::metrics_json(&self.st));
-        *last = Some(v.clone());
-        v
+        let dcount = buckets.last().copied().unwrap_or(0);
+        let sum_seconds = (offset.duration.as_ref().map_or(0.0, |d| d.sum_seconds)
+            + raw.duration.as_ref().map_or(0.0, |d| d.sum_seconds))
+        .max(prev.duration.as_ref().map_or(0.0, |d| d.sum_seconds));
+        Some(RebuildDurMonotonic {
+            count: dcount,
+            sum_seconds,
+            buckets,
+        })
+    };
+    let count = offset
+        .count
+        .saturating_add(raw.count)
+        .max(prev.count)
+        .max(duration.as_ref().map_or(0, |d| d.count));
+    RebuildMonotonic { count, duration }
+}
+
+/// Preserve monotonic OTLP Phase 2 counters when a dataset name is deleted and recreated
+/// between two consecutive collections without an intervening absent collection. When a
+/// dataset is absent from a collection, its tracker entry is dropped (matching the SDK's
+/// delta `reported` map eviction) so a later recreation restarts cleanly at zero.
+fn apply_monotonic_continuation(
+    snap: &mut crate::obs::OtelMetricsSnapshot,
+    monotonic: &mut BTreeMap<String, DatasetMonotonic>,
+) {
+    monotonic.retain(|name, _| snap.dataset_gens.contains_key(name));
+    let Some(datasets) = snap.json["datasets"].as_array_mut() else {
+        return;
+    };
+    const REASONS: [&str; 2] = ["compact", "bulk"];
+    for d in datasets {
+        let Some(name) = d["name"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let (series_id, instance_id) = snap.dataset_gens.get(&name).copied().unwrap_or((0, 0));
+        let raw_rows = d["rowsProduced"].as_u64().unwrap_or(0);
+        let raw_peak = parse_peak(&d["queryMemoryPeak"]);
+        let raw_rebuilds = REASONS.map(|r| parse_rebuild(&d["rebuilds"][r]));
+        let Some(entry) = monotonic.get_mut(&name) else {
+            monotonic.insert(
+                name,
+                DatasetMonotonic {
+                    series_id,
+                    instance_id,
+                    rows_offset: 0,
+                    last_rows: raw_rows,
+                    peak_offset: None,
+                    last_peak: raw_peak,
+                    rebuilds_offset: Default::default(),
+                    last_rebuilds: raw_rebuilds,
+                },
+            );
+            continue;
+        };
+        if series_id != entry.series_id {
+            entry.series_id = series_id;
+            entry.rows_offset = entry.last_rows;
+            entry.peak_offset = entry.last_peak.clone();
+        }
+        if instance_id != entry.instance_id {
+            entry.instance_id = instance_id;
+            entry.rebuilds_offset = entry.last_rebuilds.clone();
+        }
+        let adj_rows = entry
+            .rows_offset
+            .saturating_add(raw_rows)
+            .max(entry.last_rows);
+        let adj_peak = combine_peak(
+            entry.peak_offset.as_ref(),
+            raw_peak.as_ref(),
+            entry.last_peak.as_ref(),
+        );
+        let adj_rebuilds = [
+            combine_rebuild(
+                &entry.rebuilds_offset[0],
+                &raw_rebuilds[0],
+                &entry.last_rebuilds[0],
+            ),
+            combine_rebuild(
+                &entry.rebuilds_offset[1],
+                &raw_rebuilds[1],
+                &entry.last_rebuilds[1],
+            ),
+        ];
+        let needs_rewrite = entry.rows_offset > 0
+            || entry.peak_offset.is_some()
+            || entry.rebuilds_offset.iter().any(|r| r.count > 0)
+            || adj_rows != raw_rows;
+        entry.last_rows = adj_rows;
+        entry.last_peak = adj_peak.clone();
+        entry.last_rebuilds = adj_rebuilds.clone();
+        if needs_rewrite {
+            d["rowsProduced"] = J::from(adj_rows);
+            d["queryMemoryPeak"] = adj_peak.map_or(J::Null, |p| {
+                json!({
+                    "count": p.count,
+                    "sumBytes": p.sum_bytes,
+                    "buckets": p.buckets,
+                })
+            });
+            for (r, adj) in REASONS.iter().zip(&adj_rebuilds) {
+                let dur = adj.duration.as_ref().map_or(J::Null, |dur| {
+                    json!({
+                        "count": dur.count,
+                        "sumSeconds": dur.sum_seconds,
+                        "buckets": dur.buckets,
+                    })
+                });
+                d["rebuilds"][*r] = json!({
+                    "count": adj.count,
+                    "duration": dur,
+                });
+            }
+        }
     }
 }
 
-type Observe = fn(&J, &mut dyn FnMut(f64, Vec<KeyValue>));
+struct SnapshotState {
+    last: Option<Arc<J>>,
+    seen: u64,
+    monotonic: BTreeMap<String, DatasetMonotonic>,
+}
+
+/// One registry snapshot per collection cycle, shared by every observable instrument.
+/// Uses a per-cycle seen-bitmask so callbacks refresh once per collection regardless of
+/// callback execution order or SDK views that drop individual instruments (including index 0).
+/// Designed for a single-reader `SdkMeterProvider`, matching [`Providers::from_env`].
+pub(super) struct Snapshot {
+    st: Arc<AppState>,
+    state: Mutex<SnapshotState>,
+}
+
+impl Snapshot {
+    pub(super) fn new(st: Arc<AppState>) -> Self {
+        Self {
+            st,
+            state: Mutex::new(SnapshotState {
+                last: None,
+                seen: 0,
+                monotonic: BTreeMap::new(),
+            }),
+        }
+    }
+
+    pub(super) fn get(&self, idx: usize) -> Arc<J> {
+        debug_assert!(idx < 64);
+        let bit = 1u64 << idx;
+        let mut g = self.state.lock();
+        if g.last.is_none() || (g.seen & bit) != 0 {
+            let mut snap = crate::obs::metrics_otel_snapshot(&self.st);
+            apply_monotonic_continuation(&mut snap, &mut g.monotonic);
+            let v = Arc::new(snap.json);
+            g.last = Some(v.clone());
+            g.seen = bit;
+            return v;
+        }
+        g.seen |= bit;
+        g.last.as_ref().expect("checked above").clone()
+    }
+}
+
+type ObserveF64 = fn(&J, &mut dyn FnMut(f64, Vec<KeyValue>));
+type ObserveU64 = fn(&J, &mut dyn FnMut(u64, Vec<KeyValue>));
+
+enum Observe {
+    F64(ObserveF64),
+    U64(ObserveU64),
+}
 
 /// The registry's series (from its JSON snapshot) as OTel instruments.
 pub(super) fn register_metrics(st: Arc<AppState>) {
@@ -802,13 +1140,11 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
 }
 
 pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
-    let snap = Arc::new(Snapshot {
-        st,
-        last: Mutex::new(None),
-    });
+    let snap = Arc::new(Snapshot::new(st));
     // (name, unit, description, kind, observe)
     enum Kind {
         Counter,
+        U64Counter,
         UpDown,
         Gauge,
     }
@@ -818,7 +1154,7 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
             "{request}",
             "Completed requests by dataset, operation and outcome.",
             Kind::Counter,
-            |j, f| {
+            Observe::F64(|j, f| {
                 for r in j["requests"].as_array().into_iter().flatten() {
                     for (oc, n) in r["outcomes"].as_object().into_iter().flatten() {
                         f(
@@ -831,14 +1167,14 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         );
                     }
                 }
-            },
+            }),
         ),
         (
             "sparkles.response.size",
             "By",
             "Uncompressed bytes of response bodies whose size is known.",
             Kind::Counter,
-            |j, f| {
+            Observe::F64(|j, f| {
                 for r in j["requests"].as_array().into_iter().flatten() {
                     f(
                         r["responseBytes"].as_f64().unwrap_or(0.0),
@@ -848,49 +1184,49 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         ],
                     );
                 }
-            },
+            }),
         ),
         (
             "sparkles.requests.active",
             "{request}",
             "Requests in progress by operation.",
             Kind::UpDown,
-            |j, f| {
+            Observe::F64(|j, f| {
                 for (op, n) in j["active"].as_object().into_iter().flatten() {
                     f(
                         n.as_f64().unwrap_or(0.0),
                         vec![KeyValue::new("operation", op.clone())],
                     );
                 }
-            },
+            }),
         ),
         (
             "sparkles.result.rows",
             "{row}",
             "Result rows of queries (triples for CONSTRUCT and DESCRIBE).",
             Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["resultRows"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["resultRows"].as_f64())),
         ),
         (
             "sparkles.rows.produced",
             "{row}",
             "Rows produced by all operators of queries and updates (the rows-produced work).",
-            Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["rowsProduced"].as_f64()),
+            Kind::U64Counter,
+            Observe::U64(|j, f| per_dataset_u64(j, f, |d| d["rowsProduced"].as_u64())),
         ),
         (
             "sparkles.query.memory.peak.bucket",
             "{query}",
             "Cumulative query counts by estimated peak memory bucket in bytes.",
-            Kind::Counter,
-            |j, f| {
+            Kind::U64Counter,
+            Observe::U64(|j, f| {
                 let bounds = j["queryMemoryPeakBucketBounds"].as_array();
                 for d in j["datasets"].as_array().into_iter().flatten() {
                     let Some(buckets) = d["queryMemoryPeak"]["buckets"].as_array() else {
                         continue;
                     };
                     let ds = str_of(&d["name"]);
-                    observe_histogram_buckets(bounds, buckets, |le, n| {
+                    observe_histogram_buckets_u64(bounds, buckets, |le, n| {
                         f(
                             n,
                             vec![
@@ -900,32 +1236,34 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         );
                     });
                 }
-            },
+            }),
         ),
         (
             "sparkles.query.memory.peak.sum",
             "By",
             "Sum of estimated peak memory of queries in bytes.",
-            Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["queryMemoryPeak"]["sumBytes"].as_f64()),
+            Kind::U64Counter,
+            Observe::U64(|j, f| {
+                per_dataset_u64(j, f, |d| d["queryMemoryPeak"]["sumBytes"].as_u64())
+            }),
         ),
         (
             "sparkles.query.memory.peak.count",
             "{query}",
             "Number of queries observed in the peak memory histogram.",
-            Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["queryMemoryPeak"]["count"].as_f64()),
+            Kind::U64Counter,
+            Observe::U64(|j, f| per_dataset_u64(j, f, |d| d["queryMemoryPeak"]["count"].as_u64())),
         ),
         (
             "sparkles.rebuilds",
             "{rebuild}",
             "New generations published since the dataset was opened, by reason: compact or bulk.",
-            Kind::Counter,
-            |j, f| {
+            Kind::U64Counter,
+            Observe::U64(|j, f| {
                 for d in j["datasets"].as_array().into_iter().flatten() {
                     let ds = str_of(&d["name"]);
                     for (reason, entry) in d["rebuilds"].as_object().into_iter().flatten() {
-                        if let Some(n) = entry["count"].as_f64() {
+                        if let Some(n) = entry["count"].as_u64() {
                             f(
                                 n,
                                 vec![
@@ -936,14 +1274,14 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         }
                     }
                 }
-            },
+            }),
         ),
         (
             "sparkles.rebuild.duration.bucket",
             "{rebuild}",
             "Cumulative rebuild counts by duration bucket in seconds.",
-            Kind::Counter,
-            |j, f| {
+            Kind::U64Counter,
+            Observe::U64(|j, f| {
                 let bounds = j["rebuildDurationBucketBounds"].as_array();
                 for d in j["datasets"].as_array().into_iter().flatten() {
                     let ds = str_of(&d["name"]);
@@ -951,7 +1289,7 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         let Some(buckets) = entry["duration"]["buckets"].as_array() else {
                             continue;
                         };
-                        observe_histogram_buckets(bounds, buckets, |le, n| {
+                        observe_histogram_buckets_u64(bounds, buckets, |le, n| {
                             f(
                                 n,
                                 vec![
@@ -963,14 +1301,14 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         });
                     }
                 }
-            },
+            }),
         ),
         (
             "sparkles.rebuild.duration.sum",
             "s",
             "Sum of rebuild durations for published generations, in seconds.",
             Kind::Counter,
-            |j, f| {
+            Observe::F64(|j, f| {
                 for d in j["datasets"].as_array().into_iter().flatten() {
                     let ds = str_of(&d["name"]);
                     for (reason, entry) in d["rebuilds"].as_object().into_iter().flatten() {
@@ -985,18 +1323,18 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         }
                     }
                 }
-            },
+            }),
         ),
         (
             "sparkles.rebuild.duration.count",
             "{rebuild}",
             "Number of rebuilds observed in the duration histogram.",
-            Kind::Counter,
-            |j, f| {
+            Kind::U64Counter,
+            Observe::U64(|j, f| {
                 for d in j["datasets"].as_array().into_iter().flatten() {
                     let ds = str_of(&d["name"]);
                     for (reason, entry) in d["rebuilds"].as_object().into_iter().flatten() {
-                        if let Some(count) = entry["duration"]["count"].as_f64() {
+                        if let Some(count) = entry["duration"]["count"].as_u64() {
                             f(
                                 count,
                                 vec![
@@ -1007,35 +1345,35 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         }
                     }
                 }
-            },
+            }),
         ),
         (
             "sparkles.budget.exceeded",
             "{request}",
             "Requests that exceeded a budget.",
             Kind::Counter,
-            |j, f| per_dataset_map(j, f, "budgetExceeded", "budget"),
+            Observe::F64(|j, f| per_dataset_map(j, f, "budgetExceeded", "budget")),
         ),
         (
             "sparkles.rate_limited",
             "{request}",
             "Requests refused by a rate or concurrency limit.",
             Kind::Counter,
-            |j, f| per_dataset_map(j, f, "rateLimited", "class"),
+            Observe::F64(|j, f| per_dataset_map(j, f, "rateLimited", "class")),
         ),
         (
             "sparkles.dataset.quads",
             "{quad}",
             "Quads in the dataset.",
             Kind::Gauge,
-            |j, f| per_dataset(j, f, |d| d["quads"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["quads"].as_f64())),
         ),
         (
             "sparkles.delta.quads",
             "{quad}",
             "Inserted and deleted quads not yet compacted into the index.",
             Kind::Gauge,
-            |j, f| {
+            Observe::F64(|j, f| {
                 for d in j["datasets"].as_array().into_iter().flatten() {
                     for (kind, key) in [("insert", "deltaInserts"), ("delete", "deltaDeletes")] {
                         f(
@@ -1047,91 +1385,91 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         );
                     }
                 }
-            },
+            }),
         ),
         (
             "sparkles.wal.size",
             "By",
             "Size of the write-ahead log.",
             Kind::Gauge,
-            |j, f| per_dataset(j, f, |d| d["walBytes"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["walBytes"].as_f64())),
         ),
         (
             "sparkles.disk.size",
             "By",
             "Size of the database directory.",
             Kind::Gauge,
-            |j, f| per_dataset(j, f, |d| d["diskBytes"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["diskBytes"].as_f64())),
         ),
         (
             "sparkles.block_cache.size",
             "By",
             "Bytes held by the decoded-block cache.",
             Kind::Gauge,
-            |j, f| per_dataset(j, f, |d| d["blockCache"]["bytes"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["blockCache"]["bytes"].as_f64())),
         ),
         (
             "sparkles.block_cache.capacity",
             "By",
             "Capacity of the decoded-block cache.",
             Kind::Gauge,
-            |j, f| per_dataset(j, f, |d| d["blockCache"]["capacityBytes"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["blockCache"]["capacityBytes"].as_f64())),
         ),
         (
             "sparkles.block_cache.hits",
             "{hit}",
             "Decoded-block cache hits.",
             Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["blockCache"]["hits"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["blockCache"]["hits"].as_f64())),
         ),
         (
             "sparkles.block_cache.misses",
             "{miss}",
             "Decoded-block cache misses.",
             Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["blockCache"]["misses"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["blockCache"]["misses"].as_f64())),
         ),
         (
             "sparkles.result_cache.size",
             "By",
             "Bytes held by the query result cache.",
             Kind::Gauge,
-            |j, f| per_dataset(j, f, |d| d["resultCache"]["bytes"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["resultCache"]["bytes"].as_f64())),
         ),
         (
             "sparkles.result_cache.capacity",
             "By",
             "Capacity of the query result cache.",
             Kind::Gauge,
-            |j, f| per_dataset(j, f, |d| d["resultCache"]["capacityBytes"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["resultCache"]["capacityBytes"].as_f64())),
         ),
         (
             "sparkles.result_cache.entries",
             "{entry}",
             "Entries in the query result cache.",
             Kind::Gauge,
-            |j, f| per_dataset(j, f, |d| d["resultCache"]["entries"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["resultCache"]["entries"].as_f64())),
         ),
         (
             "sparkles.result_cache.hits",
             "{hit}",
             "Query result cache hits.",
             Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["resultCache"]["hits"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["resultCache"]["hits"].as_f64())),
         ),
         (
             "sparkles.result_cache.misses",
             "{miss}",
             "Query result cache misses.",
             Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["resultCache"]["misses"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["resultCache"]["misses"].as_f64())),
         ),
         (
             "sparkles.geo.rows",
             "{row}",
             "Rows of the spatial index by part (base, overlay, tail).",
             Kind::Gauge,
-            |j, f| {
+            Observe::F64(|j, f| {
                 for d in j["datasets"].as_array().into_iter().flatten() {
                     let rows = &d["geo"]["rows"];
                     if d["geo"]["enabled"] != true {
@@ -1147,118 +1485,136 @@ pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
                         );
                     }
                 }
-            },
+            }),
         ),
         (
             "sparkles.geo.build.duration",
             "s",
             "Duration of the last build of the spatial index's base.",
             Kind::Gauge,
-            |j, f| per_dataset(j, f, |d| d["geo"]["buildSeconds"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["geo"]["buildSeconds"].as_f64())),
         ),
         (
             "sparkles.geo.candidates",
             "{row}",
             "Index candidates of spatial operators (rows whose envelope matched).",
             Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["geo"]["candidates"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["geo"]["candidates"].as_f64())),
         ),
         (
             "sparkles.geo.refined",
             "{test}",
             "Exact geometry tests run by spatial operators.",
             Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["geo"]["refined"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["geo"]["refined"].as_f64())),
         ),
         (
             "sparkles.geo.matches",
             "{row}",
             "Rows that passed the exact test of spatial operators.",
             Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["geo"]["matches"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["geo"]["matches"].as_f64())),
         ),
         (
             "sparkles.geo.rechecked",
             "{row}",
             "Candidates of spatial operators that the index could not place, tested whatever the search window.",
             Kind::Counter,
-            |j, f| per_dataset(j, f, |d| d["geo"]["rechecked"].as_f64()),
+            Observe::F64(|j, f| per_dataset(j, f, |d| d["geo"]["rechecked"].as_f64())),
         ),
         (
             "sparkles.memory.review.pending",
             "{item}",
             "Open items of the agent memory review inbox: unreviewed facts, or open review branches.",
             Kind::Gauge,
-            |j, f| memory_review(j, f, "pending"),
+            Observe::F64(|j, f| memory_review(j, f, "pending")),
         ),
         (
             "sparkles.memory.review.oldest",
             "s",
             "Age of the oldest open item of the agent memory review inbox, 0 when none is open.",
             Kind::Gauge,
-            |j, f| memory_review(j, f, "oldestSeconds"),
+            Observe::F64(|j, f| memory_review(j, f, "oldestSeconds")),
         ),
         (
             "sparkles.ready",
             "1",
             "Whether the server is ready to serve requests (1) or not (0).",
             Kind::Gauge,
-            |j, f| f(if j["ready"] == true { 1.0 } else { 0.0 }, vec![]),
+            Observe::F64(|j, f| f(if j["ready"] == true { 1.0 } else { 0.0 }, vec![])),
         ),
         (
             "process.uptime",
             "s",
             "The time the process has been running.",
             Kind::Gauge,
-            |j, f| f(j["uptimeSeconds"].as_f64().unwrap_or(0.0), vec![]),
+            Observe::F64(|j, f| f(j["uptimeSeconds"].as_f64().unwrap_or(0.0), vec![])),
         ),
         (
             "process.memory.usage",
             "By",
             "The amount of physical memory in use.",
             Kind::Gauge,
-            |j, f| {
+            Observe::F64(|j, f| {
                 if let Some(v) = j["processResidentBytes"].as_f64() {
                     f(v, vec![]);
                 }
-            },
+            }),
         ),
     ];
+    assert!(
+        series.len() <= 64,
+        "Snapshot seen-bitmask supports at most 64 series"
+    );
     for (idx, (name, unit, desc, kind, observe)) in series.into_iter().enumerate() {
         let snap = snap.clone();
-        let refresh = idx == 0;
         // the instruments live as long as the meter provider
-        match kind {
-            Kind::Counter => {
+        match (kind, observe) {
+            (Kind::Counter, Observe::F64(observe)) => {
                 meter
                     .f64_observable_counter(name)
                     .with_unit(unit)
                     .with_description(desc)
                     .with_callback(move |o| {
-                        observe(&snap.get(refresh), &mut |v, a| o.observe(v, &a));
+                        observe(&snap.get(idx), &mut |v, a| o.observe(v, &a));
                     })
                     .build();
             }
-            Kind::UpDown => {
+            (Kind::U64Counter, Observe::U64(observe)) => {
+                meter
+                    .u64_observable_counter(name)
+                    .with_unit(unit)
+                    .with_description(desc)
+                    .with_callback(move |o| {
+                        observe(&snap.get(idx), &mut |v, a| {
+                            // OTLP NumberDataPoint stores integers as sfixed64 (i64); clamp
+                            // at i64::MAX so values remain exact and non-negative on the wire.
+                            o.observe(v.min(i64::MAX as u64), &a);
+                        });
+                    })
+                    .build();
+            }
+            (Kind::UpDown, Observe::F64(observe)) => {
                 meter
                     .f64_observable_up_down_counter(name)
                     .with_unit(unit)
                     .with_description(desc)
                     .with_callback(move |o| {
-                        observe(&snap.get(refresh), &mut |v, a| o.observe(v, &a));
+                        observe(&snap.get(idx), &mut |v, a| o.observe(v, &a));
                     })
                     .build();
             }
-            Kind::Gauge => {
+            (Kind::Gauge, Observe::F64(observe)) => {
                 meter
                     .f64_observable_gauge(name)
                     .with_unit(unit)
                     .with_description(desc)
                     .with_callback(move |o| {
-                        observe(&snap.get(refresh), &mut |v, a| o.observe(v, &a));
+                        observe(&snap.get(idx), &mut |v, a| o.observe(v, &a));
                     })
                     .build();
             }
+            _ => unreachable!("mismatched OTel instrument kind and observer type"),
         }
     }
 }
@@ -1273,17 +1629,17 @@ fn bound_label(v: &J) -> String {
     }
 }
 
-fn observe_histogram_buckets(
+fn observe_histogram_buckets_u64(
     bounds: Option<&Vec<J>>,
     buckets: &[J],
-    mut emit: impl FnMut(String, f64),
+    mut emit: impl FnMut(String, u64),
 ) {
     let bounds = bounds.map(Vec::as_slice).unwrap_or(&[]);
     for (i, n) in buckets.iter().enumerate() {
         let le = bounds
             .get(i)
             .map_or_else(|| "+Inf".to_string(), bound_label);
-        emit(le, n.as_f64().unwrap_or(0.0));
+        emit(le, n.as_u64().unwrap_or(0));
     }
 }
 
@@ -1292,6 +1648,14 @@ fn str_of(v: &J) -> String {
 }
 
 fn per_dataset(j: &J, f: &mut dyn FnMut(f64, Vec<KeyValue>), get: fn(&J) -> Option<f64>) {
+    for d in j["datasets"].as_array().into_iter().flatten() {
+        if let Some(v) = get(d) {
+            f(v, vec![KeyValue::new("dataset", str_of(&d["name"]))]);
+        }
+    }
+}
+
+fn per_dataset_u64(j: &J, f: &mut dyn FnMut(u64, Vec<KeyValue>), get: fn(&J) -> Option<u64>) {
     for d in j["datasets"].as_array().into_iter().flatten() {
         if let Some(v) = get(d) {
             f(v, vec![KeyValue::new("dataset", str_of(&d["name"]))]);

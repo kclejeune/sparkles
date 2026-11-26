@@ -697,7 +697,102 @@ async fn metrics_parity_dataset_cap_reset_reopen_and_auth() {
     assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
     assert_eq!(other["rebuilds"]["compact"]["count"], 2);
 
-    // 2. Delete and recreate resets all Phase 2 counters and clears histograms.
+    // Deleting one overflow dataset must keep `$other` counters and rebuilds monotonic.
+    assert!(s.state.delete("extra1").unwrap());
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["queryMemoryPeak"]["count"], 2);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 2);
+
+    // Deleting the final overflow dataset keeps `$other` in both Prometheus and JSON
+    // with zero live quads and preserved monotonic counters/rebuilds.
+    assert!(s.state.delete("extra2").unwrap());
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["quads"], 0);
+    assert_eq!(other["queryMemoryPeak"]["count"], 2);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 2);
+
+    // Adding a new overflow dataset continues `$other` monotonically.
+    {
+        let d = s.state.attach("extra3", DbType::Mem, None).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        d.store.compact().unwrap();
+    }
+    assert_eq!(
+        get(
+            &s.app,
+            "/extra3/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D"
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["queryMemoryPeak"]["count"], 3);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 3);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 3);
+
+    // Deleting the named slot (`ds`) promotes `extra3` cleanly to its own named slot
+    // while retiring `extra3`'s earlier rebuilds into `$other` without double counting.
+    assert!(s.state.delete("ds").unwrap());
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert!(!m.contains(r#"dataset="ds""#), "{m}");
+    assert_prom_json_phase2_parity(&m, &j, "extra3");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let promoted = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "extra3")
+        .unwrap();
+    assert_eq!(promoted["rowsProduced"], 0);
+    assert_eq!(promoted["rebuilds"]["bulk"]["count"], 0);
+    assert_eq!(promoted["rebuilds"]["compact"]["count"], 0);
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 3);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 3);
+
+    // 2. Rename preserves Phase 2 counters and histograms, then delete/recreate resets them.
     let s = server();
     let create = Request::post("/$/datasets")
         .header(header::CONTENT_TYPE, "application/json")
@@ -727,34 +822,64 @@ async fn metrics_parity_dataset_cap_reset_reopen_and_auth() {
     let m_before = metrics(&s.app).await;
     let j_before = metrics_json_resp(&s.app).await;
     assert_prom_json_phase2_parity(&m_before, &j_before, "tmp");
-    let del = Request::delete("/$/datasets/tmp")
+    let tmp_before = j_before["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "tmp")
+        .unwrap()
+        .clone();
+    s.state.rename("tmp", "tmp_renamed").unwrap();
+    let m_renamed = metrics(&s.app).await;
+    let j_renamed = metrics_json_resp(&s.app).await;
+    assert!(!m_renamed.contains(r#"dataset="tmp""#), "{m_renamed}");
+    assert!(
+        !j_renamed["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "tmp"),
+        "{j_renamed}"
+    );
+    assert_prom_json_phase2_parity(&m_renamed, &j_renamed, "tmp_renamed");
+    let renamed_ds = j_renamed["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "tmp_renamed")
+        .unwrap();
+    assert_eq!(renamed_ds["rowsProduced"], tmp_before["rowsProduced"]);
+    assert_eq!(renamed_ds["queryMemoryPeak"], tmp_before["queryMemoryPeak"]);
+    assert_eq!(renamed_ds["rebuilds"], tmp_before["rebuilds"]);
+
+    let del = Request::delete("/$/datasets/tmp_renamed")
         .body(Body::empty())
         .unwrap();
     assert_eq!(send(&s.app, del).await.status, StatusCode::OK);
     let m_del = metrics(&s.app).await;
     let j_del = metrics_json_resp(&s.app).await;
-    assert!(!m_del.contains(r#"dataset="tmp""#), "{m_del}");
+    assert!(!m_del.contains(r#"dataset="tmp_renamed""#), "{m_del}");
     assert!(
         !j_del["datasets"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|d| d["name"] == "tmp"),
+            .any(|d| d["name"] == "tmp_renamed"),
         "{j_del}"
     );
     let create = Request::post("/$/datasets")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"dbName":"tmp","dbType":"mem"}"#))
+        .body(Body::from(r#"{"dbName":"tmp_renamed","dbType":"mem"}"#))
         .unwrap();
     assert_eq!(send(&s.app, create).await.status, StatusCode::CREATED);
     let m_new = metrics(&s.app).await;
     let j_new = metrics_json_resp(&s.app).await;
-    assert_prom_json_phase2_parity(&m_new, &j_new, "tmp");
+    assert_prom_json_phase2_parity(&m_new, &j_new, "tmp_renamed");
     let new_ds = j_new["datasets"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|d| d["name"] == "tmp")
+        .find(|d| d["name"] == "tmp_renamed")
         .unwrap();
     assert_eq!(new_ds["rowsProduced"], 0);
     assert!(new_ds["queryMemoryPeak"].is_null());
@@ -902,6 +1027,27 @@ server = ["metrics"]
         let j = json_r.json();
         assert!(!m.contains("secret"), "{m}");
         assert!(!j.to_string().contains("secret"), "{j}");
+        // `$none` belongs to request series only, never dataset work/memory series.
+        assert!(
+            m.contains(r#"sparkles_requests_total{dataset="$none""#),
+            "{m}"
+        );
+        assert!(
+            !m.contains(r#"sparkles_rows_produced_total{dataset="$none"}"#),
+            "{m}"
+        );
+        assert!(
+            !m.contains(r#"sparkles_query_memory_peak_bytes_count{dataset="$none"}"#),
+            "{m}"
+        );
+        assert!(
+            !j["datasets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["name"] == "$none"),
+            "{j}"
+        );
         assert_prom_json_phase2_parity(&m, &j, "ds");
     }
 }

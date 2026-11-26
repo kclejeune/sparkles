@@ -13,7 +13,10 @@ use axum::http::{Request as HttpRequest, StatusCode};
 use opentelemetry::trace::{SpanId, SpanKind, TraceId};
 use opentelemetry::{KeyValue, Value};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::metrics::{
+    Aggregation, InMemoryMetricExporter, InMemoryMetricExporterBuilder, Instrument, PeriodicReader,
+    SdkMeterProvider, Stream, Temporality,
+};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use sparkles::io::Source;
 use sparkles::store::StoreOptions;
@@ -76,7 +79,7 @@ fn server() -> Server {
     // the requests name the server by its public host
     st.hosts = crate::exposure::Hosts::new("127.0.0.1", &["sparql.example".into()]).unwrap();
     let st = Arc::new(st);
-    let ds = st.create("ds", DbType::Mem).unwrap();
+    let ds = st.attach("ds", DbType::Mem, None).unwrap();
     ds.store
         .load(&[Source::from_bytes(
             DATA.as_bytes().to_vec(),
@@ -566,6 +569,12 @@ fn prom_sample(text: &str, series: &str) -> Option<f64> {
         .map(|v| v.parse().unwrap())
 }
 
+fn prom_sample_u64(text: &str, series: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' '))
+        .map(|v| v.parse().unwrap())
+}
+
 /// Isolated OTel meter provider for deterministic cross-format parity assertions.
 struct MetricsHarness {
     exporter: InMemoryMetricExporter,
@@ -578,21 +587,44 @@ impl Drop for MetricsHarness {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OtlpValue {
+    U64(u64),
+    F64(f64),
+}
+
 struct OtlpMetric {
     unit: String,
     monotonic: bool,
-    points: Vec<(Vec<(String, String)>, f64)>,
+    temporality: Temporality,
+    points: Vec<(Vec<(String, String)>, OtlpValue)>,
 }
 
 type OtlpSnapshot = std::collections::BTreeMap<String, OtlpMetric>;
 
 impl MetricsHarness {
     fn new(st: &Arc<AppState>) -> Self {
+        Self::with_temporality(st, Temporality::Cumulative)
+    }
+
+    fn with_temporality(st: &Arc<AppState>, temporality: Temporality) -> Self {
+        Self::with_builder(st, temporality, |b| b)
+    }
+
+    fn with_builder(
+        st: &Arc<AppState>,
+        temporality: Temporality,
+        configure: impl FnOnce(
+            opentelemetry_sdk::metrics::MeterProviderBuilder,
+        ) -> opentelemetry_sdk::metrics::MeterProviderBuilder,
+    ) -> Self {
         use opentelemetry::metrics::MeterProvider as _;
-        let exporter = InMemoryMetricExporter::default();
-        let provider = SdkMeterProvider::builder()
-            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        let exporter = InMemoryMetricExporterBuilder::new()
+            .with_temporality(temporality)
             .build();
+        let builder = sdk::meter_provider_builder(st.metrics.max_datasets())
+            .with_reader(PeriodicReader::builder(exporter.clone()).build());
+        let provider = configure(builder).build();
         let meter = provider.meter("sparkles");
         sdk::register_metrics_on(&meter, st.clone());
         MetricsHarness { exporter, provider }
@@ -608,26 +640,56 @@ impl MetricsHarness {
         let mut out = OtlpSnapshot::new();
         for sm in last.scope_metrics() {
             for m in sm.metrics() {
-                if let AggregatedMetrics::F64(MetricData::Sum(sum)) = m.data() {
-                    let points = sum
-                        .data_points()
-                        .map(|p| {
-                            let mut attrs: Vec<(String, String)> = p
-                                .attributes()
-                                .map(|kv| (kv.key.as_str().to_string(), kv.value.as_str().into()))
-                                .collect();
-                            attrs.sort();
-                            (attrs, p.value())
-                        })
-                        .collect();
-                    out.insert(
-                        m.name().to_string(),
-                        OtlpMetric {
-                            unit: m.unit().to_string(),
-                            monotonic: sum.is_monotonic(),
-                            points,
-                        },
-                    );
+                match m.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                        let points = sum
+                            .data_points()
+                            .map(|p| {
+                                let mut attrs: Vec<(String, String)> = p
+                                    .attributes()
+                                    .map(|kv| {
+                                        (kv.key.as_str().to_string(), kv.value.as_str().into())
+                                    })
+                                    .collect();
+                                attrs.sort();
+                                (attrs, OtlpValue::U64(p.value()))
+                            })
+                            .collect();
+                        out.insert(
+                            m.name().to_string(),
+                            OtlpMetric {
+                                unit: m.unit().to_string(),
+                                monotonic: sum.is_monotonic(),
+                                temporality: sum.temporality(),
+                                points,
+                            },
+                        );
+                    }
+                    AggregatedMetrics::F64(MetricData::Sum(sum)) => {
+                        let points = sum
+                            .data_points()
+                            .map(|p| {
+                                let mut attrs: Vec<(String, String)> = p
+                                    .attributes()
+                                    .map(|kv| {
+                                        (kv.key.as_str().to_string(), kv.value.as_str().into())
+                                    })
+                                    .collect();
+                                attrs.sort();
+                                (attrs, OtlpValue::F64(p.value()))
+                            })
+                            .collect();
+                        out.insert(
+                            m.name().to_string(),
+                            OtlpMetric {
+                                unit: m.unit().to_string(),
+                                monotonic: sum.is_monotonic(),
+                                temporality: sum.temporality(),
+                                points,
+                            },
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -635,7 +697,12 @@ impl MetricsHarness {
     }
 }
 
-fn otel_point(otlp: &OtlpSnapshot, name: &str, unit: &str, attrs: &[(&str, &str)]) -> Option<f64> {
+fn otel_value(
+    otlp: &OtlpSnapshot,
+    name: &str,
+    unit: &str,
+    attrs: &[(&str, &str)],
+) -> Option<OtlpValue> {
     let metric = otlp.get(name)?;
     assert_eq!(metric.unit, unit, "unit mismatch for {name}");
     assert!(metric.monotonic, "{name} must be monotonic");
@@ -650,6 +717,20 @@ fn otel_point(otlp: &OtlpSnapshot, name: &str, unit: &str, attrs: &[(&str, &str)
         .find_map(|(a, v)| (a == &want).then_some(*v))
 }
 
+fn otel_u64(otlp: &OtlpSnapshot, name: &str, unit: &str, attrs: &[(&str, &str)]) -> Option<u64> {
+    otel_value(otlp, name, unit, attrs).map(|v| match v {
+        OtlpValue::U64(n) => n,
+        OtlpValue::F64(n) => panic!("{name} expected U64 sum, got F64({n})"),
+    })
+}
+
+fn otel_f64(otlp: &OtlpSnapshot, name: &str, unit: &str, attrs: &[(&str, &str)]) -> Option<f64> {
+    otel_value(otlp, name, unit, attrs).map(|v| match v {
+        OtlpValue::F64(n) => n,
+        OtlpValue::U64(n) => panic!("{name} expected F64 sum, got U64({n})"),
+    })
+}
+
 fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, label: &str) {
     let prom = crate::obs::render_prometheus(st);
     let json = crate::obs::metrics_json(st);
@@ -662,10 +743,10 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
         .find(|d| d["name"] == label)
         .unwrap_or_else(|| panic!("dataset {label} missing in JSON: {json}"));
 
-    // 1. Produced rows counter
-    let rows_produced = ds["rowsProduced"].as_u64().unwrap() as f64;
+    // 1. Produced rows counter (exact u64 across all three formats)
+    let rows_produced = ds["rowsProduced"].as_u64().unwrap();
     assert_eq!(
-        prom_sample(
+        prom_sample_u64(
             &prom,
             &format!(r#"sparkles_rows_produced_total{{dataset="{label}"}}"#)
         ),
@@ -673,7 +754,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
         "prom rows_produced mismatch for {label}"
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp,
             "sparkles.rows.produced",
             "{row}",
@@ -696,7 +777,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
             r#"sparkles_query_memory_peak_bytes_count{{dataset="{label}"}}"#
         )));
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &otlp,
                 "sparkles.query.memory.peak.count",
                 "{query}",
@@ -705,7 +786,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
             None
         );
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &otlp,
                 "sparkles.query.memory.peak.sum",
                 "By",
@@ -714,7 +795,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
             None
         );
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &otlp,
                 "sparkles.query.memory.peak.bucket",
                 "{query}",
@@ -724,8 +805,8 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
         );
     } else {
         let peak = &ds["queryMemoryPeak"];
-        let count = peak["count"].as_u64().unwrap() as f64;
-        let sum = peak["sumBytes"].as_u64().unwrap() as f64;
+        let count = peak["count"].as_u64().unwrap();
+        let sum = peak["sumBytes"].as_u64().unwrap();
         let buckets: Vec<u64> = peak["buckets"]
             .as_array()
             .unwrap()
@@ -733,23 +814,23 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
             .map(|v| v.as_u64().unwrap())
             .collect();
         assert_eq!(buckets.len(), mem_bounds.len() + 1);
-        assert_eq!(*buckets.last().unwrap() as f64, count);
+        assert_eq!(*buckets.last().unwrap(), count);
         assert_eq!(
-            prom_sample(
+            prom_sample_u64(
                 &prom,
                 &format!(r#"sparkles_query_memory_peak_bytes_count{{dataset="{label}"}}"#)
             ),
             Some(count)
         );
         assert_eq!(
-            prom_sample(
+            prom_sample_u64(
                 &prom,
                 &format!(r#"sparkles_query_memory_peak_bytes_sum{{dataset="{label}"}}"#)
             ),
             Some(sum)
         );
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &otlp,
                 "sparkles.query.memory.peak.count",
                 "{query}",
@@ -758,7 +839,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
             Some(count)
         );
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &otlp,
                 "sparkles.query.memory.peak.sum",
                 "By",
@@ -771,22 +852,22 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
                 .get(i)
                 .map_or("+Inf".to_string(), |v| v.to_string());
             assert_eq!(
-                prom_sample(
+                prom_sample_u64(
                     &prom,
                     &format!(
                         r#"sparkles_query_memory_peak_bytes_bucket{{dataset="{label}",le="{le}"}}"#
                     )
                 ),
-                Some(*b as f64)
+                Some(*b)
             );
             assert_eq!(
-                otel_point(
+                otel_u64(
                     &otlp,
                     "sparkles.query.memory.peak.bucket",
                     "{query}",
                     &[("dataset", label), ("le", &le)]
                 ),
-                Some(*b as f64),
+                Some(*b),
                 "otlp query.memory.peak.bucket mismatch for {label} le={le}"
             );
         }
@@ -803,16 +884,16 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
     for reason in sparkles::store::RebuildReason::ALL {
         let r = reason.as_str();
         let entry = &ds["rebuilds"][r];
-        let count = entry["count"].as_u64().unwrap() as f64;
+        let count = entry["count"].as_u64().unwrap();
         assert_eq!(
-            prom_sample(
+            prom_sample_u64(
                 &prom,
                 &format!(r#"sparkles_rebuilds_total{{dataset="{label}",reason="{r}"}}"#)
             ),
             Some(count)
         );
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &otlp,
                 "sparkles.rebuilds",
                 "{rebuild}",
@@ -821,13 +902,13 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
             Some(count),
             "otlp rebuilds mismatch for {label}/{r}"
         );
-        if count == 0.0 {
+        if count == 0 {
             assert!(entry["duration"].is_null());
             assert!(!prom.contains(&format!(
                 r#"sparkles_rebuild_duration_seconds_count{{dataset="{label}",reason="{r}"}}"#
             )));
             assert_eq!(
-                otel_point(
+                otel_u64(
                     &otlp,
                     "sparkles.rebuild.duration.count",
                     "{rebuild}",
@@ -836,7 +917,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
                 None
             );
             assert_eq!(
-                otel_point(
+                otel_f64(
                     &otlp,
                     "sparkles.rebuild.duration.sum",
                     "s",
@@ -845,7 +926,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
                 None
             );
             assert_eq!(
-                otel_point(
+                otel_u64(
                     &otlp,
                     "sparkles.rebuild.duration.bucket",
                     "{rebuild}",
@@ -855,7 +936,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
             );
         } else {
             let dur = &entry["duration"];
-            let dcount = dur["count"].as_u64().unwrap() as f64;
+            let dcount = dur["count"].as_u64().unwrap();
             let dsum = dur["sumSeconds"].as_f64().unwrap();
             let buckets: Vec<u64> = dur["buckets"]
                 .as_array()
@@ -865,9 +946,9 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
                 .collect();
             assert_eq!(dcount, count);
             assert_eq!(buckets.len(), rebuild_bounds.len() + 1);
-            assert_eq!(*buckets.last().unwrap() as f64, dcount);
+            assert_eq!(*buckets.last().unwrap(), dcount);
             assert_eq!(
-                prom_sample(
+                prom_sample_u64(
                     &prom,
                     &format!(
                         r#"sparkles_rebuild_duration_seconds_count{{dataset="{label}",reason="{r}"}}"#
@@ -876,7 +957,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
                 Some(dcount)
             );
             assert_eq!(
-                otel_point(
+                otel_u64(
                     &otlp,
                     "sparkles.rebuild.duration.count",
                     "{rebuild}",
@@ -891,7 +972,7 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
                 ),
             )
             .unwrap();
-            let osum = otel_point(
+            let osum = otel_f64(
                 &otlp,
                 "sparkles.rebuild.duration.sum",
                 "s",
@@ -905,22 +986,22 @@ fn assert_all_three_phase2_parity(st: &Arc<AppState>, harness: &MetricsHarness, 
                     .get(i)
                     .map_or("+Inf".to_string(), |v| v.to_string());
                 assert_eq!(
-                    prom_sample(
+                    prom_sample_u64(
                         &prom,
                         &format!(
                             r#"sparkles_rebuild_duration_seconds_bucket{{dataset="{label}",reason="{r}",le="{le}"}}"#
                         )
                     ),
-                    Some(*b as f64)
+                    Some(*b)
                 );
                 assert_eq!(
-                    otel_point(
+                    otel_u64(
                         &otlp,
                         "sparkles.rebuild.duration.bucket",
                         "{rebuild}",
                         &[("dataset", label), ("reason", r), ("le", &le)]
                     ),
-                    Some(*b as f64),
+                    Some(*b),
                     "otlp rebuild.duration.bucket mismatch for {label}/{r} le={le}"
                 );
             }
@@ -980,26 +1061,52 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // Probe a nonexistent dataset (`$none`): request series records `$none`, while
+    // dataset work/memory series omit `$none` consistently across all three formats.
+    let (status, _, _) = call(
+        &app,
+        HttpRequest::get("/nonexistent/sparql?query=ASK%7B%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_all_three_phase2_parity(&st, &harness, "ds");
-    let otlp = harness.collect();
+    let prom_none = crate::obs::render_prometheus(&st);
     assert!(
-        otel_point(
+        prom_none.contains(r#"sparkles_requests_total{dataset="$none""#),
+        "{prom_none}"
+    );
+    assert!(!prom_none.contains(r#"sparkles_rows_produced_total{dataset="$none"}"#));
+    assert!(!prom_none.contains(r#"sparkles_query_memory_peak_bytes_count{dataset="$none"}"#));
+    let otlp = harness.collect();
+    assert_eq!(
+        otel_u64(
+            &otlp,
+            "sparkles.rows.produced",
+            "{row}",
+            &[("dataset", "$none")]
+        ),
+        None
+    );
+    assert!(
+        otel_u64(
             &otlp,
             "sparkles.rows.produced",
             "{row}",
             &[("dataset", "ds")]
         )
         .unwrap()
-            >= 3.0
+            >= 3
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp,
             "sparkles.query.memory.peak.count",
             "{query}",
             &[("dataset", "ds")]
         ),
-        Some(1.0)
+        Some(1)
     );
 
     // 3. Failed bulk load, dry-run bulk load, and cancelled compaction do not change counts.
@@ -1042,22 +1149,22 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
     assert_all_three_phase2_parity(&st, &harness, "ds");
     let otlp = harness.collect();
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp,
             "sparkles.rebuilds",
             "{rebuild}",
             &[("dataset", "ds"), ("reason", "bulk")]
         ),
-        Some(1.0)
+        Some(1)
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp,
             "sparkles.rebuilds",
             "{rebuild}",
             &[("dataset", "ds"), ("reason", "compact")]
         ),
-        Some(0.0)
+        Some(0)
     );
 
     // 4. Successful compaction + second bulk commit.
@@ -1071,30 +1178,78 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
         .unwrap();
     assert_all_three_phase2_parity(&st, &harness, "ds");
     let otlp = harness.collect();
+    let rows_before_rename = otel_u64(
+        &otlp,
+        "sparkles.rows.produced",
+        "{row}",
+        &[("dataset", "ds")],
+    )
+    .unwrap();
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp,
             "sparkles.rebuilds",
             "{rebuild}",
             &[("dataset", "ds"), ("reason", "compact")]
         ),
-        Some(1.0)
+        Some(1)
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp,
             "sparkles.rebuilds",
             "{rebuild}",
             &[("dataset", "ds"), ("reason", "bulk")]
         ),
-        Some(2.0)
+        Some(2)
     );
 
-    // 5. Delete & recreate `ds` removes old OTLP data points and resets counters/histograms.
+    // 4b. Rename `ds` -> `ds_renamed` moves all Phase 2 counters and histograms cleanly.
     drop(ds);
+    st.rename("ds", "ds_renamed").unwrap();
+    assert_all_three_phase2_parity(&st, &harness, "ds_renamed");
+    let otlp_renamed = harness.collect();
+    assert_eq!(
+        otel_u64(
+            &otlp_renamed,
+            "sparkles.rows.produced",
+            "{row}",
+            &[("dataset", "ds")]
+        ),
+        None
+    );
+    assert_eq!(
+        otel_u64(
+            &otlp_renamed,
+            "sparkles.rows.produced",
+            "{row}",
+            &[("dataset", "ds_renamed")]
+        ),
+        Some(rows_before_rename)
+    );
+    assert_eq!(
+        otel_u64(
+            &otlp_renamed,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "ds_renamed"), ("reason", "bulk")]
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        otel_u64(
+            &otlp_renamed,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "ds_renamed"), ("reason", "compact")]
+        ),
+        Some(1)
+    );
+
+    // 5. Delete & recreate `ds_renamed` removes old OTLP data points and resets counters/histograms.
     let (status, _, _) = call(
         &app,
-        HttpRequest::delete("/$/datasets/ds")
+        HttpRequest::delete("/$/datasets/ds_renamed")
             .body(Body::empty())
             .unwrap(),
     )
@@ -1102,29 +1257,29 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
     assert_eq!(status, StatusCode::OK);
     let otlp_deleted = harness.collect();
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp_deleted,
             "sparkles.rows.produced",
             "{row}",
-            &[("dataset", "ds")]
+            &[("dataset", "ds_renamed")]
         ),
         None
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp_deleted,
             "sparkles.query.memory.peak.count",
             "{query}",
-            &[("dataset", "ds")]
+            &[("dataset", "ds_renamed")]
         ),
         None
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp_deleted,
             "sparkles.rebuilds",
             "{rebuild}",
-            &[("dataset", "ds"), ("reason", "bulk")]
+            &[("dataset", "ds_renamed"), ("reason", "bulk")]
         ),
         None
     );
@@ -1132,39 +1287,39 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
         &app,
         HttpRequest::post("/$/datasets")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"dbName":"ds","dbType":"mem"}"#))
+            .body(Body::from(r#"{"dbName":"ds_renamed","dbType":"mem"}"#))
             .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    assert_all_three_phase2_parity(&st, &harness, "ds");
+    assert_all_three_phase2_parity(&st, &harness, "ds_renamed");
     let otlp_recreated = harness.collect();
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp_recreated,
             "sparkles.rows.produced",
             "{row}",
-            &[("dataset", "ds")]
+            &[("dataset", "ds_renamed")]
         ),
-        Some(0.0)
+        Some(0)
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp_recreated,
             "sparkles.query.memory.peak.count",
             "{query}",
-            &[("dataset", "ds")]
+            &[("dataset", "ds_renamed")]
         ),
         None
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &otlp_recreated,
             "sparkles.rebuilds",
             "{rebuild}",
-            &[("dataset", "ds"), ("reason", "bulk")]
+            &[("dataset", "ds_renamed"), ("reason", "bulk")]
         ),
-        Some(0.0)
+        Some(0)
     );
 
     // 6. Dataset-label cap (`max_datasets = 1`): `$other` aggregates identically in all 3 formats.
@@ -1207,7 +1362,7 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
     assert_all_three_phase2_parity(&cap_st, &cap_harness, "$other");
     let cap_otlp = cap_harness.collect();
     assert_eq!(
-        otel_point(
+        otel_u64(
             &cap_otlp,
             "sparkles.rows.produced",
             "{row}",
@@ -1216,22 +1371,22 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
         None
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &cap_otlp,
             "sparkles.rebuilds",
             "{rebuild}",
             &[("dataset", "$other"), ("reason", "bulk")]
         ),
-        Some(2.0)
+        Some(2)
     );
     assert_eq!(
-        otel_point(
+        otel_u64(
             &cap_otlp,
             "sparkles.query.memory.peak.count",
             "{query}",
             &[("dataset", "$other")]
         ),
-        Some(2.0)
+        Some(2)
     );
 
     // 7. Reopening a persistent dataset resets rebuild counters and duration histograms in all 3 formats.
@@ -1259,22 +1414,22 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
         assert_all_three_phase2_parity(&st1, &h1, "disk");
         let o1 = h1.collect();
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &o1,
                 "sparkles.rebuilds",
                 "{rebuild}",
                 &[("dataset", "disk"), ("reason", "bulk")]
             ),
-            Some(1.0)
+            Some(1)
         );
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &o1,
                 "sparkles.rebuilds",
                 "{rebuild}",
                 &[("dataset", "disk"), ("reason", "compact")]
             ),
-            Some(1.0)
+            Some(1)
         );
     }
     {
@@ -1291,25 +1446,25 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
         assert_all_three_phase2_parity(&st2, &h2, "disk");
         let o2 = h2.collect();
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &o2,
                 "sparkles.rebuilds",
                 "{rebuild}",
                 &[("dataset", "disk"), ("reason", "bulk")]
             ),
-            Some(0.0)
+            Some(0)
         );
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &o2,
                 "sparkles.rebuilds",
                 "{rebuild}",
                 &[("dataset", "disk"), ("reason", "compact")]
             ),
-            Some(0.0)
+            Some(0)
         );
         assert_eq!(
-            otel_point(
+            otel_u64(
                 &o2,
                 "sparkles.rebuild.duration.count",
                 "{rebuild}",
@@ -1318,4 +1473,723 @@ async fn phase2_metrics_match_prometheus_json_and_otlp() {
             None
         );
     }
+}
+
+#[tokio::test]
+async fn phase2_otlp_cardinality_limit_at_default_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::new(
+        dir.path(),
+        StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    st.metrics = crate::obs::Metrics::new(true, crate::obs::DEFAULT_METRICS_MAX_DATASETS);
+    let st = Arc::new(st);
+    // 75 datasets × 2 reasons × 14 buckets = 2,100 attribute sets (> SDK default 2,000),
+    // well within Sparkles' default `--metrics-max-datasets=100`.
+    let n_datasets = 75usize;
+    let tiny = b"<http://example.org/s> <http://example.org/p> \"1\" .\n";
+    for i in 0..n_datasets {
+        let name = format!("d{i:02}");
+        let d = st.attach(&name, DbType::Mem, None).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                tiny.to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        d.store.compact().unwrap();
+    }
+    st.set_phase(Phase::Ready);
+    let harness = MetricsHarness::new(&st);
+    let otlp = harness.collect();
+    let bucket_metric = otlp
+        .get("sparkles.rebuild.duration.bucket")
+        .expect("rebuild duration bucket metric");
+    assert!(
+        !bucket_metric
+            .points
+            .iter()
+            .any(|(attrs, _)| attrs.iter().any(|(k, _)| k == "otel.metric.overflow")),
+        "unexpected otel.metric.overflow on sparkles.rebuild.duration.bucket"
+    );
+    let expected_points = n_datasets * 2 * (sparkles::store::REBUILD_BUCKETS.len() + 1);
+    assert_eq!(bucket_metric.points.len(), expected_points);
+    for i in 0..n_datasets {
+        let name = format!("d{i:02}");
+        for reason in ["compact", "bulk"] {
+            let cnt = otel_u64(
+                &otlp,
+                "sparkles.rebuild.duration.count",
+                "{rebuild}",
+                &[("dataset", &name), ("reason", reason)],
+            );
+            let inf = otel_u64(
+                &otlp,
+                "sparkles.rebuild.duration.bucket",
+                "{rebuild}",
+                &[("dataset", &name), ("reason", reason), ("le", "+Inf")],
+            );
+            assert_eq!(cnt, Some(1), "missing count for {name}/{reason}");
+            assert_eq!(inf, cnt, "+Inf mismatch for {name}/{reason}");
+        }
+    }
+    // Verify scaling for `sparkles.query.memory.peak.bucket` above `--metrics-max-datasets=222`.
+    assert_eq!(
+        sdk::stream_cardinality_limit("sparkles.query.memory.peak.bucket", 250),
+        Some(252 * (crate::obs::MEMORY_BUCKETS.len() + 1))
+    );
+}
+
+#[tokio::test]
+async fn phase2_otlp_delta_and_cumulative_monotonic_on_other_delete_and_same_cycle_recreate() {
+    // Part A: `$other` deletion, final overflow deletion, new overflow arrival, and promotion
+    // under both Cumulative and Delta temporalities.
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::new(
+        dir.path(),
+        StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    st.metrics = crate::obs::Metrics::new(true, 1);
+    let st = Arc::new(st);
+    for name in ["a", "b", "c"] {
+        let d = st.create(name, DbType::Mem).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        d.store.compact().unwrap();
+    }
+    st.set_phase(Phase::Ready);
+    let app = router(st.clone());
+    let cum_h = MetricsHarness::with_temporality(&st, Temporality::Cumulative);
+    let delta_h = MetricsHarness::with_temporality(&st, Temporality::Delta);
+
+    for name in ["a", "b", "c"] {
+        let (status, _, _) = call(
+            &app,
+            HttpRequest::get(format!(
+                "/{name}/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d1 = delta_h.collect();
+    assert_eq!(
+        d1.get("sparkles.rebuilds").unwrap().temporality,
+        Temporality::Delta
+    );
+    assert_eq!(
+        otel_u64(
+            &d1,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(2)
+    );
+
+    // Delete one overflow dataset (`b`): `$other` must NOT shrink or emit negative delta.
+    assert!(st.delete("b").unwrap());
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d2 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &d2,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &d2,
+            "sparkles.rebuild.duration.count",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &d2,
+            "sparkles.rebuild.duration.bucket",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk"), ("le", "+Inf")]
+        ),
+        Some(0)
+    );
+    assert!(
+        otel_f64(
+            &d2,
+            "sparkles.rebuild.duration.sum",
+            "s",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        )
+        .unwrap()
+            >= 0.0
+    );
+
+    // Surviving overflow dataset `c` publishes another bulk rebuild + query.
+    {
+        let c = st.get("c").unwrap();
+        let bulk_nt: String = (0..5)
+            .map(|i| format!("<http://example.org/x{i}> <http://example.org/p> \"{i}\" .\n"))
+            .collect();
+        c.store
+            .load(&[Source::from_bytes(
+                bulk_nt.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    let (status, _, _) = call(
+        &app,
+        HttpRequest::get("/c/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d3 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &d3,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        otel_u64(
+            &d3,
+            "sparkles.query.memory.peak.count",
+            "{query}",
+            &[("dataset", "$other")]
+        ),
+        Some(1)
+    );
+
+    // Delete final overflow dataset (`c`): `$other` remains present in all three formats
+    // with zero delta, and a later overflow dataset `d` adds only its own increment.
+    assert!(st.delete("c").unwrap());
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d4 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &d4,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &d4,
+            "sparkles.rows.produced",
+            "{row}",
+            &[("dataset", "$other")]
+        ),
+        Some(0)
+    );
+    {
+        let d = st.create("d", DbType::Mem).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    let (status, _, _) = call(
+        &app,
+        HttpRequest::get("/d/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d5 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &d5,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        otel_u64(
+            &d5,
+            "sparkles.query.memory.peak.count",
+            "{query}",
+            &[("dataset", "$other")]
+        ),
+        Some(1)
+    );
+
+    // Delete named slot owner `a`: `d` promotes to named slot `"d"` at 0 while `$other`
+    // retains its totals with 0 delta.
+    assert!(st.delete("a").unwrap());
+    assert_all_three_phase2_parity(&st, &cum_h, "d");
+    assert_all_three_phase2_parity(&st, &cum_h, "$other");
+    let d6 = delta_h.collect();
+    assert_eq!(
+        otel_u64(
+            &d6,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "$other"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &d6,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "d"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+
+    // Part B: Named dataset delete & recreate BETWEEN collections (no absent cycle) under
+    // both Delta and Cumulative temporalities.
+    let dir2 = tempfile::tempdir().unwrap();
+    let st2 = Arc::new(
+        AppState::new(
+            dir2.path(),
+            StoreOptions {
+                bulk_threshold: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    {
+        let tmp = st2.create("tmp", DbType::Mem).unwrap();
+        for batch in 0..2 {
+            let nt: String = (0..5)
+                .map(|i| format!("<http://ex/b{batch}_{i}> <http://ex/p> \"{i}\" .\n"))
+                .collect();
+            tmp.store
+                .load(&[Source::from_bytes(
+                    nt.into_bytes(),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        }
+        tmp.store.compact().unwrap();
+    }
+    st2.set_phase(Phase::Ready);
+    let app2 = router(st2.clone());
+    let cum2 = MetricsHarness::with_temporality(&st2, Temporality::Cumulative);
+    let delta2 = MetricsHarness::with_temporality(&st2, Temporality::Delta);
+
+    let (status, _, _) = call(
+        &app2,
+        HttpRequest::get("/tmp/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let c1 = cum2.collect();
+    let dl1 = delta2.collect();
+    let c1_rows = otel_u64(
+        &c1,
+        "sparkles.rows.produced",
+        "{row}",
+        &[("dataset", "tmp")],
+    )
+    .unwrap();
+    assert_eq!(
+        otel_u64(
+            &dl1,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(2)
+    );
+
+    // Delete & immediately recreate `tmp` untouched (no collect while absent).
+    assert!(st2.delete("tmp").unwrap());
+    st2.create("tmp", DbType::Mem).unwrap();
+    let c2 = cum2.collect();
+    let dl2 = delta2.collect();
+    assert_eq!(
+        otel_u64(
+            &dl2,
+            "sparkles.rows.produced",
+            "{row}",
+            &[("dataset", "tmp")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &dl2,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &dl2,
+            "sparkles.rebuild.duration.count",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert!(
+        otel_f64(
+            &dl2,
+            "sparkles.rebuild.duration.sum",
+            "s",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        )
+        .unwrap()
+            >= 0.0
+    );
+    assert_eq!(
+        otel_u64(
+            &c2,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        otel_u64(
+            &c2,
+            "sparkles.rebuild.duration.bucket",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk"), ("le", "+Inf")]
+        ),
+        Some(2)
+    );
+
+    // Delete & immediately recreate `tmp` with 1 bulk rebuild + 1 query before next collect.
+    assert!(st2.delete("tmp").unwrap());
+    {
+        let tmp = st2.create("tmp", DbType::Mem).unwrap();
+        tmp.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    }
+    let (status, _, _) = call(
+        &app2,
+        HttpRequest::get("/tmp/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let c3 = cum2.collect();
+    let dl3 = delta2.collect();
+    assert_eq!(
+        otel_u64(
+            &dl3,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        otel_u64(
+            &dl3,
+            "sparkles.rebuild.duration.count",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        otel_u64(
+            &dl3,
+            "sparkles.rebuild.duration.bucket",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk"), ("le", "+Inf")]
+        ),
+        Some(1)
+    );
+    assert!(
+        otel_f64(
+            &dl3,
+            "sparkles.rebuild.duration.sum",
+            "s",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        )
+        .unwrap()
+            > 0.0
+    );
+    assert_eq!(
+        otel_u64(
+            &dl3,
+            "sparkles.query.memory.peak.count",
+            "{query}",
+            &[("dataset", "tmp")]
+        ),
+        Some(1)
+    );
+    assert!(
+        otel_u64(
+            &dl3,
+            "sparkles.rows.produced",
+            "{row}",
+            &[("dataset", "tmp")]
+        )
+        .unwrap()
+            > 0
+    );
+    assert_eq!(
+        otel_u64(
+            &c3,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(3)
+    );
+    assert_eq!(
+        otel_u64(
+            &c3,
+            "sparkles.rebuild.duration.bucket",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk"), ("le", "+Inf")]
+        ),
+        Some(3)
+    );
+    assert!(
+        otel_u64(
+            &c3,
+            "sparkles.rows.produced",
+            "{row}",
+            &[("dataset", "tmp")]
+        )
+        .unwrap()
+            > c1_rows
+    );
+
+    // Delete `tmp`, collect its absence, then recreate: both Delta and Cumulative restart at 0.
+    assert!(st2.delete("tmp").unwrap());
+    let c4 = cum2.collect();
+    let dl4 = delta2.collect();
+    assert_eq!(
+        otel_u64(
+            &c4,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        None
+    );
+    assert_eq!(
+        otel_u64(
+            &dl4,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        None
+    );
+    st2.create("tmp", DbType::Mem).unwrap();
+    let c5 = cum2.collect();
+    let dl5 = delta2.collect();
+    assert_eq!(
+        otel_u64(
+            &c5,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        otel_u64(
+            &dl5,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "tmp"), ("reason", "bulk")]
+        ),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn phase2_otlp_snapshot_refreshes_when_index_zero_dropped_and_out_of_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = Arc::new(
+        AppState::new(
+            dir.path(),
+            StoreOptions {
+                bulk_threshold: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let ds = st.attach("ds", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    st.set_phase(Phase::Ready);
+    let app = router(st.clone());
+
+    // Drop `sparkles.requests` (callback index 0) via an SDK View.
+    let harness = MetricsHarness::with_builder(&st, Temporality::Cumulative, |b| {
+        b.with_view(|inst: &Instrument| {
+            if inst.name() == "sparkles.requests" {
+                Stream::builder()
+                    .with_aggregation(Aggregation::Drop)
+                    .build()
+                    .ok()
+            } else {
+                None
+            }
+        })
+    });
+    let o1 = harness.collect();
+    assert!(!o1.contains_key("sparkles.requests"));
+    assert_eq!(
+        otel_u64(
+            &o1,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "ds"), ("reason", "compact")]
+        ),
+        Some(0)
+    );
+
+    // Mutate state and verify the next collection still refreshes despite index 0 being dropped.
+    ds.store.compact().unwrap();
+    let (status, _, _) = call(
+        &app,
+        HttpRequest::get("/ds/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let o2 = harness.collect();
+    assert_eq!(
+        otel_u64(
+            &o2,
+            "sparkles.rebuilds",
+            "{rebuild}",
+            &[("dataset", "ds"), ("reason", "compact")]
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        otel_u64(
+            &o2,
+            "sparkles.query.memory.peak.count",
+            "{query}",
+            &[("dataset", "ds")]
+        ),
+        Some(1)
+    );
+
+    // Direct unit check on `sdk::Snapshot` with reversed callback order across cycles.
+    let snap = sdk::Snapshot::new(st.clone());
+    let a = snap.get(10);
+    let b = snap.get(5);
+    let c = snap.get(2);
+    assert!(Arc::ptr_eq(&a, &b));
+    assert!(Arc::ptr_eq(&a, &c));
+    // First repeated callback (in any order) starts a new cycle and refreshes the snapshot.
+    let d = snap.get(5);
+    let e = snap.get(10);
+    assert!(!Arc::ptr_eq(&a, &d));
+    assert!(Arc::ptr_eq(&d, &e));
+}
+
+#[tokio::test]
+async fn phase2_otlp_preserves_u64_precision_above_f64_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    st.attach("ds", DbType::Mem, None).unwrap();
+    st.set_phase(Phase::Ready);
+    let harness = MetricsHarness::new(&st);
+
+    let two_to_53: u64 = 1u64 << 53; // 9_007_199_254_740_992
+    st.metrics.record_test_work("ds", two_to_53, two_to_53);
+    assert_all_three_phase2_parity(&st, &harness, "ds");
+    let o1 = harness.collect();
+    assert_eq!(
+        otel_u64(&o1, "sparkles.rows.produced", "{row}", &[("dataset", "ds")]),
+        Some(two_to_53)
+    );
+    assert_eq!(
+        otel_u64(
+            &o1,
+            "sparkles.query.memory.peak.sum",
+            "By",
+            &[("dataset", "ds")]
+        ),
+        Some(two_to_53)
+    );
+
+    // +1 crosses the exact `f64` integer precision boundary (9_007_199_254_740_993).
+    st.metrics.record_test_work("ds", 1, 1);
+    assert_all_three_phase2_parity(&st, &harness, "ds");
+    let o2 = harness.collect();
+    assert_eq!(
+        otel_u64(&o2, "sparkles.rows.produced", "{row}", &[("dataset", "ds")]),
+        Some(two_to_53 + 1)
+    );
+    assert_eq!(
+        otel_u64(
+            &o2,
+            "sparkles.query.memory.peak.sum",
+            "By",
+            &[("dataset", "ds")]
+        ),
+        Some(two_to_53 + 1)
+    );
 }

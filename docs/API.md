@@ -327,7 +327,12 @@ its first request, and from then on with all nine outcomes. The `denied` outcome
 refusal by the auth layer. Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI
 assets are not counted. The validation series cover every validated write to a dataset
 with write-time validation, whether it comes over HTTP, over MCP or from a reasoning task.
-Deleting a dataset removes its series. The block, result, SERVICE and history caches are
+Deleting a dataset removes its named series. Once datasets past
+`--metrics-max-datasets` have recorded activity under `$other`, the `$other` series keeps
+its accumulated counters and retired rebuild counts across Prometheus, JSON, and OTLP even
+when no overflow dataset remains open. Request series use `$none` for requests that name
+no existing dataset, while dataset work, peak memory, and rebuild series apply only to
+existing datasets and `$other`. The block, result, SERVICE and history caches are
 shared by all datasets and sized once by `--cache-mb`, `--result-cache-mb`,
 `--service-cache-mb` and `--history-cache-mb`. The per-dataset cache series count the
 bytes, entries, hits and misses that the dataset caused. Before this sharing, the capacity
@@ -536,7 +541,10 @@ twice and `/$/metrics` does not change. These instruments are
 (`dataset`, `part`), `sparkles.geo.build.duration`,
 `sparkles.geo.{candidates,refined,matches,rechecked}`,
 `sparkles.memory.review.pending` and `sparkles.memory.review.oldest` (`dataset`, `kind`),
-`sparkles.ready`, `process.uptime` and `process.memory.usage`.
+`sparkles.ready`, `process.uptime` and `process.memory.usage`. Integer counters for
+produced rows, query memory peaks, and rebuild counts export as exact 64-bit integers up
+to the signed 64-bit OTLP wire limit, and per-stream cardinality limits scale with
+`--metrics-max-datasets`.
 
 **Logs.** With `--otel-logs` or `OTEL_LOGS_EXPORTER=otlp`, every log event that passes
 `RUST_LOG` is also exported as an OTLP log record, with the trace and span id of its
