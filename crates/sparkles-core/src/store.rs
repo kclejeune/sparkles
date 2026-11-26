@@ -10936,12 +10936,26 @@ mod ordinary_sync_tests {
 
         // Directly verify history_generation_with forwards HistoryCeiling's ReadLimit
         // (and not a blank HistoryOptions) into authenticate_retained_generation:
-        // let the entry check(0) pass once, then cancel inside authenticate_retained_generation.
-        struct CancelAfterFirst(std::sync::atomic::AtomicUsize);
-        impl crate::history::ReadControl for CancelAfterFirst {
+        // clear the open-generation cache so the uncached !C::ACCOUNTS branch runs,
+        // corrupt commit.json so authentication fails with Error::Corrupt if reached,
+        // then let the entry check(0) pass once and trigger cancel/timeout inside
+        // authenticate_retained_generation before commit.json is read.
+        struct FailAfterFirst {
+            calls: std::sync::atomic::AtomicUsize,
+            timeout: bool,
+        }
+        impl crate::history::ReadControl for FailAfterFirst {
             fn check_read(&self) -> Result<()> {
-                if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1 {
-                    Err(Error::Cancelled)
+                if self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    >= 1
+                {
+                    if self.timeout {
+                        Err(Error::Timeout)
+                    } else {
+                        Err(Error::Cancelled)
+                    }
                 } else {
                     Ok(())
                 }
@@ -10958,10 +10972,28 @@ mod ordinary_sync_tests {
         let owner = h.owner(r1.commit.seq, current, live.commit).unwrap();
         assert_ne!(owner, current);
         let entry = h.gens[&owner].clone();
-        let after_first = CancelAfterFirst(std::sync::atomic::AtomicUsize::new(0));
-        let ceiling = HistoryCeiling {
+        h.open.clear();
+        std::fs::write(entry.dir.join("commit.json"), b"{corrupt").unwrap();
+        // Confirm the tampered fixture fails authentication with Error::Corrupt when uninterrupted.
+        assert!(matches!(
+            store.history_generation_with(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &entry,
+                r1.commit.seq,
+                &crate::budgeted::Unlimited,
+            ),
+            Err(Error::Corrupt(_))
+        ));
+        let cancel_after_first = FailAfterFirst {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            timeout: false,
+        };
+        let cancel_ceiling = HistoryCeiling {
             limit: crate::history::ReadLimit {
-                options: &after_first,
+                options: &cancel_after_first,
                 memory: None,
                 held: 0,
             },
@@ -10975,9 +11007,33 @@ mod ordinary_sync_tests {
                 &live,
                 &entry,
                 r1.commit.seq,
-                &ceiling
+                &cancel_ceiling,
             ),
             Err(Error::Cancelled)
+        ));
+        let timeout_after_first = FailAfterFirst {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            timeout: true,
+        };
+        let timeout_ceiling = HistoryCeiling {
+            limit: crate::history::ReadLimit {
+                options: &timeout_after_first,
+                memory: None,
+                held: 0,
+            },
+            ceiling: u64::MAX,
+        };
+        assert!(matches!(
+            store.history_generation_with(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &entry,
+                r1.commit.seq,
+                &timeout_ceiling,
+            ),
+            Err(Error::Timeout)
         ));
     }
 }

@@ -221,125 +221,141 @@ impl Generation {
             .used()
             .checked_sub(loaded.charge)
             .expect("link metadata was admitted by the same budget");
-        let file = loaded.value;
-        let root_charge = branch_root.as_os_str().len() as u64 + 64;
-        control.charge(root_charge)?;
-        let dataset_root = dataset_root_of(branch_root)?;
-        let (base, vocab) = if C::ACCOUNTS {
-            let opened = cold::open_link_vocabulary(gen_dir, &dataset_root, &file, control)?;
-            (opened.base, opened.vocab)
-        } else {
-            let base = cold::Loaded {
-                value: file.segments[0].dir(&dataset_root),
-                charge: 0,
-            };
-            let prefix: Vec<(PathBuf, u64)> = file
-                .segments
-                .iter()
-                .map(|s| (s.dir(&dataset_root).join("delta.vocab"), s.dvocab_len))
-                .collect();
-            let vocab =
-                control.open_dvocab_layered(&prefix, &gen_dir.join("delta.vocab"), read_only)?;
-            (base, vocab)
-        };
-        let written_by = if C::ACCOUNTS {
-            None
-        } else {
-            base.value.parent().and_then(commit::read_written_by)
-        };
-        let mut generation = Self::open_base_with(
-            &base.value,
-            name,
-            written_by.as_deref(),
-            Some(vocab),
-            control,
-        )?
-        .value;
-        control.charge(gen_dir.as_os_str().len() as u64 + 64)?;
-        generation.dir = Some(gen_dir.to_path_buf());
-        let mut delta = Delta::default();
-        let mut delta_charge = 0u64;
-        for segment in &file.segments {
-            let source = if C::ACCOUNTS {
-                cold::segment_dir(segment, &dataset_root, control)?
+        let result = (|| -> Result<cold::Loaded<Generation>> {
+            let file = loaded.value;
+            if C::ACCOUNTS && !read_only {
+                return Err(Error::invalid(
+                    "accounting linked generation opens are read-only",
+                ));
+            }
+            let root_charge = branch_root.as_os_str().len() as u64 + 64;
+            control.charge(root_charge)?;
+            let dataset_root = dataset_root_of(branch_root)?;
+            let (base, vocab) = if C::ACCOUNTS {
+                let opened = cold::open_link_vocabulary(gen_dir, &dataset_root, &file, control)?;
+                (opened.base, opened.vocab)
             } else {
-                cold::Loaded {
-                    value: segment.dir(&dataset_root),
+                let base = cold::Loaded {
+                    value: file.segments[0].dir(&dataset_root),
                     charge: 0,
-                }
+                };
+                let prefix: Vec<(PathBuf, u64)> = file
+                    .segments
+                    .iter()
+                    .map(|s| (s.dir(&dataset_root).join("delta.vocab"), s.dvocab_len))
+                    .collect();
+                let vocab = control.open_dvocab_layered(
+                    &prefix,
+                    &gen_dir.join("delta.vocab"),
+                    read_only,
+                )?;
+                (base, vocab)
             };
-            // A child of a relinked branch inherits its immutable base overlay as
-            // well as its log. The layered vocabulary keeps the same prefix IDs.
-            if let Some(inherited) = read_link_with(&source.value, control)? {
-                if let Some(overlay) = &inherited.value.overlay {
-                    apply_overlay_with(
-                        &source.value,
-                        overlay,
-                        &mut generation,
-                        cache,
-                        &mut delta,
-                        &mut delta_charge,
-                        control,
-                    )?;
-                }
-                drop(inherited.value);
-                control.release(inherited.charge);
-            }
-            // WAL replay owns and admits the delta itself. Keep all dictionary,
-            // descriptor and link storage in the same remaining allowance.
-            control.release(delta_charge);
-            delta_charge = 0;
-            control.check(0)?;
-            wal::apply_forward(
-                &source.value.join("wal.log"),
-                &generation,
-                cache,
-                &mut delta,
-                wal::WalPoint {
-                    seq: segment.base_seq,
-                    offset: 0,
-                },
-                wal::WalPoint {
-                    seq: segment.end_seq,
-                    offset: segment.wal_end,
-                },
-                &*control,
-            )?;
-            if C::ACCOUNTS {
-                let next = history_limited::preparation_delta_bytes(&delta);
-                control.charge(next)?;
-                delta_charge = next;
-            }
-            drop(source.value);
-            control.release(source.charge);
-        }
-        if let Some(overlay) = &file.overlay {
-            apply_overlay_with(
-                gen_dir,
-                overlay,
-                &mut generation,
-                cache,
-                &mut delta,
-                &mut delta_charge,
+            let written_by = if C::ACCOUNTS {
+                None
+            } else {
+                base.value.parent().and_then(commit::read_written_by)
+            };
+            let mut generation = Self::open_base_with(
+                &base.value,
+                name,
+                written_by.as_deref(),
+                Some(vocab),
                 control,
-            )?;
+            )?
+            .value;
+            control.charge(gen_dir.as_os_str().len() as u64 + 64)?;
+            generation.dir = Some(gen_dir.to_path_buf());
+            let mut delta = Delta::default();
+            let mut delta_charge = 0u64;
+            for segment in &file.segments {
+                let source = if C::ACCOUNTS {
+                    cold::segment_dir(segment, &dataset_root, control)?
+                } else {
+                    cold::Loaded {
+                        value: segment.dir(&dataset_root),
+                        charge: 0,
+                    }
+                };
+                // A child of a relinked branch inherits its immutable base overlay as
+                // well as its log. The layered vocabulary keeps the same prefix IDs.
+                if let Some(inherited) = read_link_with(&source.value, control)? {
+                    if let Some(overlay) = &inherited.value.overlay {
+                        apply_overlay_with(
+                            &source.value,
+                            overlay,
+                            &mut generation,
+                            cache,
+                            &mut delta,
+                            &mut delta_charge,
+                            control,
+                        )?;
+                    }
+                    drop(inherited.value);
+                    control.release(inherited.charge);
+                }
+                // WAL replay owns and admits the delta itself. Keep all dictionary,
+                // descriptor and link storage in the same remaining allowance.
+                control.release(delta_charge);
+                delta_charge = 0;
+                control.check(0)?;
+                wal::apply_forward(
+                    &source.value.join("wal.log"),
+                    &generation,
+                    cache,
+                    &mut delta,
+                    wal::WalPoint {
+                        seq: segment.base_seq,
+                        offset: 0,
+                    },
+                    wal::WalPoint {
+                        seq: segment.end_seq,
+                        offset: segment.wal_end,
+                    },
+                    &*control,
+                )?;
+                if C::ACCOUNTS {
+                    let next = history_limited::preparation_delta_bytes(&delta);
+                    control.charge(next)?;
+                    delta_charge = next;
+                }
+                drop(source.value);
+                control.release(source.charge);
+            }
+            if let Some(overlay) = &file.overlay {
+                apply_overlay_with(
+                    gen_dir,
+                    overlay,
+                    &mut generation,
+                    cache,
+                    &mut delta,
+                    &mut delta_charge,
+                    control,
+                )?;
+            }
+            control.charge(std::mem::size_of::<Linked>() as u64 + 64)?;
+            generation.link = Some(Arc::new(Linked {
+                file,
+                base_delta: delta,
+                base_dir: base.value,
+            }));
+            // base.value now belongs to Linked; its admission stays retained.
+            drop(dataset_root);
+            control.release(root_charge);
+            let charge = control.used() - start;
+            generation.cold_bytes = charge;
+            control.check(0)?;
+            Ok(cold::Loaded {
+                value: generation,
+                charge,
+            })
+        })();
+        if result.is_err() && C::ACCOUNTS {
+            // `loaded` and every intermediate structure allocated inside the closure
+            // have already been dropped; restore the pre-link budget baseline.
+            control.release(control.used() - start);
         }
-        control.charge(std::mem::size_of::<Linked>() as u64 + 64)?;
-        generation.link = Some(Arc::new(Linked {
-            file,
-            base_delta: delta,
-            base_dir: base.value,
-        }));
-        // base.value now belongs to Linked; its admission stays retained.
-        drop(dataset_root);
-        control.release(root_charge);
-        let charge = control.used() - start;
-        generation.cold_bytes = charge;
-        control.check(0)?;
-        Ok(cold::Loaded {
-            value: generation,
-            charge,
-        })
+        result
     }
 
     /// Give this generation's permutations the block-cache identities of `other`'s when
@@ -397,16 +413,15 @@ fn apply_overlay_with<C: crate::budgeted::BudgetControl>(
             }
             let quad = wal::record_quad(record);
             let in_base = if C::ACCOUNTS {
-                control.release(*delta_charge);
-                *delta_charge = 0;
                 control.check(0)?;
                 let mutation = history_limited::preparation_mutation_bytes(delta);
-                control.check(mutation)?;
+                let extra = mutation.saturating_sub(*delta_charge);
+                control.check(extra)?;
                 generation.perm(Perm::Spo).contains_with(
                     cache,
                     &Perm::Spo.to_key(&quad),
                     &*control,
-                    mutation,
+                    extra,
                 )?
             } else {
                 generation
@@ -416,7 +431,11 @@ fn apply_overlay_with<C: crate::budgeted::BudgetControl>(
             apply(delta, &quad, record[0] == WAL_INSERT, in_base);
             if C::ACCOUNTS {
                 let next = history_limited::preparation_delta_bytes(delta);
-                control.charge(next)?;
+                if next > *delta_charge {
+                    control.charge(next - *delta_charge)?;
+                } else if next < *delta_charge {
+                    control.release(*delta_charge - next);
+                }
                 *delta_charge = next;
             }
         }
@@ -515,7 +534,7 @@ mod tests {
     use super::*;
     use crate::history::{HistoryOptions, ReadControl, ReadLimit};
     use crate::store::cold::ColdBudget;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct SwitchTimeout(AtomicBool);
 
@@ -531,6 +550,50 @@ mod tests {
         fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
             crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
         }
+    }
+
+    struct CountingControl(AtomicUsize);
+
+    impl ReadControl for CountingControl {
+        fn check_read(&self) -> Result<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+            crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+        }
+    }
+
+    struct FailAfter {
+        calls: AtomicUsize,
+        limit: usize,
+        timeout: bool,
+    }
+
+    impl ReadControl for FailAfter {
+        fn check_read(&self) -> Result<()> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) >= self.limit {
+                if self.timeout {
+                    Err(Error::Timeout)
+                } else {
+                    Err(Error::Cancelled)
+                }
+            } else {
+                Ok(())
+            }
+        }
+
+        fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+            crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+        }
+    }
+
+    fn delta_keys(delta: &Delta) -> (Vec<crate::index::Key>, Vec<crate::index::Key>) {
+        (
+            delta.ins[Perm::Spo.index()].iter().copied().collect(),
+            delta.del[Perm::Spo.index()].iter().copied().collect(),
+        )
     }
 
     fn linked_overlay_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, LinkFile) {
@@ -550,7 +613,7 @@ mod tests {
         .unwrap();
         store
             .load(&[Source::from_bytes(
-                b"<urn:base> <urn:p> \"b\" .\n".to_vec(),
+                b"<urn:base> <urn:p> \"b\" .\n<urn:base-del> <urn:p> \"gone\" .\n".to_vec(),
                 oxrdfio::RdfFormat::NTriples,
                 None,
             )])
@@ -559,7 +622,13 @@ mod tests {
         let dev = store.branch("dev").unwrap();
         update(
             &dev,
-            "INSERT DATA { <urn:dev> <urn:p> \"overlay\" }",
+            "INSERT DATA { <urn:dev> <urn:p> \"overlay\" . _:b0 <urn:p> \"bnode\" }",
+            &Default::default(),
+        )
+        .unwrap();
+        update(
+            &dev,
+            "DELETE DATA { <urn:base-del> <urn:p> \"gone\" }",
             &Default::default(),
         )
         .unwrap();
@@ -574,7 +643,8 @@ mod tests {
         let gen_dir = dev.snapshot().generation.dir.clone().unwrap();
         let branch_root = gen_dir.parent().unwrap().to_path_buf();
         let link = read_link(&gen_dir).unwrap().expect("linked generation");
-        assert!(link.overlay.is_some());
+        let overlay = link.overlay.as_ref().expect("relinked overlay");
+        assert!(overlay.next_bnode > 0);
         drop(dev);
         drop(store);
         (dir, gen_dir, branch_root, link)
@@ -594,7 +664,8 @@ mod tests {
         )
         .unwrap();
 
-        // Controlled open matches ordinary open and accounts for retained bytes.
+        // Controlled open matches ordinary open on actual inserted/deleted keys,
+        // next_bnode, and retained-byte accounting.
         let options = HistoryOptions::default();
         let limit = ReadLimit {
             options: &options,
@@ -613,21 +684,134 @@ mod tests {
             &mut budget,
         )
         .unwrap();
-        assert_eq!(
-            plain.base_delta().ins[Perm::Spo.index()].len(),
-            controlled.value.base_delta().ins[Perm::Spo.index()].len()
-        );
+        let (plain_ins, plain_del) = delta_keys(&plain.base_delta());
+        let (ctrl_ins, ctrl_del) = delta_keys(&controlled.value.base_delta());
+        assert!(!plain_ins.is_empty());
+        assert!(!plain_del.is_empty());
+        assert_eq!(plain_ins, ctrl_ins);
+        assert_eq!(plain_del, ctrl_del);
+        assert!(plain.meta.next_bnode > 0);
+        assert_eq!(plain.meta.next_bnode, controlled.value.meta.next_bnode);
         assert_eq!(controlled.charge, controlled.value.cold_bytes);
+
+        // retained_bytes_with results and interruption behavior across applicable controls.
+        assert_eq!(
+            plain
+                .retained_bytes_with(&crate::budgeted::Unlimited)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            controlled
+                .value
+                .retained_bytes_with(&crate::budgeted::Unlimited)
+                .unwrap(),
+            0
+        );
         assert_eq!(
             controlled.value.retained_bytes_with(&limit).unwrap(),
             controlled.charge
         );
-        assert!(plain.retained_bytes_with(&limit).unwrap() > 0);
+        let plain_retained = plain.retained_bytes_with(&limit).unwrap();
+        assert!(plain_retained > 0);
+        let exact_plain_limit = ReadLimit {
+            options: &options,
+            memory: Some(plain_retained),
+            held: 0,
+        };
+        assert_eq!(
+            plain.retained_bytes_with(&exact_plain_limit).unwrap(),
+            plain_retained
+        );
+        let short_plain_limit = ReadLimit {
+            options: &options,
+            memory: Some(plain_retained - 1),
+            held: 0,
+        };
+        assert!(matches!(
+            plain.retained_bytes_with(&short_plain_limit),
+            Err(Error::BudgetExceeded(_))
+        ));
+
+        let uncapped_ok = ReadLimit {
+            options: &options,
+            memory: None,
+            held: 0,
+        };
+        assert_eq!(
+            controlled.value.retained_bytes_with(&uncapped_ok).unwrap(),
+            controlled.charge
+        );
+        assert_eq!(
+            plain.retained_bytes_with(&uncapped_ok).unwrap(),
+            plain_retained
+        );
+
+        let uncapped_cancel_opts = HistoryOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            deadline: None,
+        };
+        let uncapped_cancel = ReadLimit {
+            options: &uncapped_cancel_opts,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            controlled.value.retained_bytes_with(&uncapped_cancel),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            plain.retained_bytes_with(&uncapped_cancel),
+            Err(Error::Cancelled)
+        ));
+
+        let retained_timeout = SwitchTimeout(AtomicBool::new(true));
+        let uncapped_timeout = ReadLimit {
+            options: &retained_timeout,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            controlled.value.retained_bytes_with(&uncapped_timeout),
+            Err(Error::Timeout)
+        ));
+        assert!(matches!(
+            plain.retained_bytes_with(&uncapped_timeout),
+            Err(Error::Timeout)
+        ));
+
+        let prep_ok = crate::access::Preparation::new(
+            crate::task::Control::none(),
+            plain_retained + (1 << 20),
+        )
+        .unwrap();
+        assert_eq!(plain.retained_bytes_with(&prep_ok).unwrap(), plain_retained);
+        let prep_short =
+            crate::access::Preparation::new(crate::task::Control::none(), plain_retained - 1)
+                .unwrap();
+        assert!(matches!(
+            plain.retained_bytes_with(&prep_short),
+            Err(Error::BudgetExceeded(_))
+        ));
+        let prep_cancel_ctrl = crate::task::Control::none();
+        let prep_cancel = prep_cancel_ctrl.cancel.clone();
+        let prep_cancelled =
+            crate::access::Preparation::new(prep_cancel_ctrl, plain_retained + (1 << 20)).unwrap();
+        prep_cancel.cancel();
+        assert!(matches!(
+            plain.retained_bytes_with(&prep_cancelled),
+            Err(Error::Cancelled)
+        ));
+
         drop(controlled.value);
         budget.release(controlled.charge);
         assert_eq!(budget.used(), 0);
 
-        // Uncapped cancel and deterministic timeout stop open_linked_with cleanly.
+        // Error-boundary accounting: pre-link unrelated charges survive intact and no
+        // link/intermediate charges leak on entry cancel, entry timeout, read_only=false,
+        // or a mid-open failure inside overlay replay.
+        let unrelated = 1234u64;
+
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_opts = HistoryOptions {
             cancel: Some(cancel.clone()),
@@ -639,9 +823,11 @@ mod tests {
             held: 0,
         })
         .unwrap();
+        cancel_budget.charge(unrelated).unwrap();
         let link_for_cancel = read_link_with(&gen_dir, &mut cancel_budget)
             .unwrap()
             .unwrap();
+        assert!(cancel_budget.used() > unrelated);
         cancel.store(true, Ordering::Relaxed);
         assert!(matches!(
             Generation::open_linked_with(
@@ -655,6 +841,9 @@ mod tests {
             ),
             Err(Error::Cancelled)
         ));
+        assert_eq!(cancel_budget.used(), unrelated);
+        cancel_budget.release(unrelated);
+        assert_eq!(cancel_budget.used(), 0);
 
         let timeout = SwitchTimeout(AtomicBool::new(false));
         let mut timeout_budget = ColdBudget::new(ReadLimit {
@@ -663,6 +852,7 @@ mod tests {
             held: 0,
         })
         .unwrap();
+        timeout_budget.charge(unrelated).unwrap();
         let link_for_timeout = read_link_with(&gen_dir, &mut timeout_budget)
             .unwrap()
             .unwrap();
@@ -679,26 +869,129 @@ mod tests {
             ),
             Err(Error::Timeout)
         ));
+        assert_eq!(timeout_budget.used(), unrelated);
+        timeout_budget.release(unrelated);
+        assert_eq!(timeout_budget.used(), 0);
+
+        // Accounting open_linked_with refuses read_only=false at its entry point and
+        // restores the pre-link baseline.
+        let mut ro_budget = ColdBudget::new(limit).unwrap();
+        ro_budget.charge(unrelated).unwrap();
+        let link_for_ro = read_link_with(&gen_dir, &mut ro_budget).unwrap().unwrap();
+        assert!(matches!(
+            Generation::open_linked_with(
+                &gen_dir,
+                "gen-0001",
+                &branch_root,
+                link_for_ro,
+                false,
+                &cache,
+                &mut ro_budget,
+            ),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(ro_budget.used(), unrelated);
+        ro_budget.release(unrelated);
+        assert_eq!(ro_budget.used(), 0);
+
+        // Mid-open error inside overlay replay (after vocabulary, base, and WAL replay)
+        // restores the pre-link baseline cleanly.
+        let mut mid_budget = ColdBudget::new(limit).unwrap();
+        mid_budget.charge(unrelated).unwrap();
+        let mut link_for_mid = read_link_with(&gen_dir, &mut mid_budget).unwrap().unwrap();
+        link_for_mid.value.overlay.as_mut().unwrap().bytes += 1;
+        assert!(matches!(
+            Generation::open_linked_with(
+                &gen_dir,
+                "gen-0001",
+                &branch_root,
+                link_for_mid,
+                true,
+                &cache,
+                &mut mid_budget,
+            ),
+            Err(Error::Corrupt(_))
+        ));
+        assert_eq!(mid_budget.used(), unrelated);
+        mid_budget.release(unrelated);
+        assert_eq!(mid_budget.used(), 0);
+
+        // Nonempty seed delta for overlay parity and error-accounting tests.
+        let mut seed_delta = Delta::default();
+        let seed_quad = [Id(999_001), Id(999_002), Id(999_003), Id::DEFAULT_GRAPH];
+        apply(&mut seed_delta, &seed_quad, true, false);
+        let seed_charge = history_limited::preparation_delta_bytes(&seed_delta);
+        assert!(seed_charge > 0);
+        let (seed_ins, seed_del) = delta_keys(&seed_delta);
+
+        // Success parity with nonempty seed on the real relinked overlay (insertions,
+        // deletion, and next_bnode advancement).
+        let valid_overlay = file.overlay.as_ref().unwrap();
+        let mut plain_seed_gen =
+            Generation::open_sealed(&plain.link.as_ref().unwrap().base_dir, "gen-0001").unwrap();
+        let mut ctrl_seed_gen =
+            Generation::open_sealed(&plain.link.as_ref().unwrap().base_dir, "gen-0001").unwrap();
+        let mut plain_seed_delta = seed_delta.clone();
+        let mut plain_seed_charge = 0;
+        apply_overlay_with(
+            &gen_dir,
+            valid_overlay,
+            &mut plain_seed_gen,
+            &cache,
+            &mut plain_seed_delta,
+            &mut plain_seed_charge,
+            &mut crate::budgeted::Unlimited,
+        )
+        .unwrap();
+        let mut ctrl_seed_budget = ColdBudget::new(limit).unwrap();
+        ctrl_seed_budget.charge(unrelated).unwrap();
+        ctrl_seed_budget.charge(seed_charge).unwrap();
+        let mut ctrl_seed_delta = seed_delta.clone();
+        let mut ctrl_seed_charge = seed_charge;
+        apply_overlay_with(
+            &gen_dir,
+            valid_overlay,
+            &mut ctrl_seed_gen,
+            &cache,
+            &mut ctrl_seed_delta,
+            &mut ctrl_seed_charge,
+            &mut ctrl_seed_budget,
+        )
+        .unwrap();
+        assert_eq!(delta_keys(&plain_seed_delta), delta_keys(&ctrl_seed_delta));
+        assert_eq!(
+            plain_seed_gen.meta.next_bnode,
+            ctrl_seed_gen.meta.next_bnode
+        );
+        assert_eq!(
+            ctrl_seed_charge,
+            history_limited::preparation_delta_bytes(&ctrl_seed_delta)
+        );
+        assert_eq!(ctrl_seed_budget.used(), unrelated + ctrl_seed_charge);
+        ctrl_seed_budget.release(ctrl_seed_charge);
+        ctrl_seed_budget.release(unrelated);
+        assert_eq!(ctrl_seed_budget.used(), 0);
 
         // Craft a checksum-valid overlay whose first record is valid and second has a bad opcode.
         let overlay_dir = tempfile::tempdir().unwrap();
-        let mut raw = std::fs::read(gen_dir.join(OVERLAY_FILE)).unwrap();
-        assert!(raw.len() >= WAL_REC);
+        let valid_raw = std::fs::read(gen_dir.join(OVERLAY_FILE)).unwrap();
+        assert!(valid_raw.len() >= WAL_REC * 2);
+        let mut bad_op_raw = valid_raw[..WAL_REC].to_vec();
         let mut bad_rec = [0u8; WAL_REC];
         bad_rec[0] = 0xFF;
-        raw.extend_from_slice(&bad_rec);
+        bad_op_raw.extend_from_slice(&bad_rec);
         let malformed = Overlay {
-            bytes: raw.len() as u64,
-            sha256: overlay_checksum(&raw),
+            bytes: bad_op_raw.len() as u64,
+            sha256: overlay_checksum(&bad_op_raw),
             next_bnode: 10,
         };
-        std::fs::write(overlay_dir.path().join(OVERLAY_FILE), &raw).unwrap();
+        std::fs::write(overlay_dir.path().join(OVERLAY_FILE), &bad_op_raw).unwrap();
 
         // Ordinary apply_overlay_with prechecks opcodes before any index lookup or cache fill.
         let fresh_cache = BlockCache::new(1 << 20);
         let mut plain_gen =
             Generation::open_sealed(&plain.link.as_ref().unwrap().base_dir, "gen-0001").unwrap();
-        let mut plain_delta = Delta::default();
+        let mut plain_delta = seed_delta.clone();
         let mut plain_charge = 0;
         let err = apply_overlay_with(
             overlay_dir.path(),
@@ -712,15 +1005,21 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Corrupt(_)));
         assert!(err.to_string().contains("invalid base overlay operation"));
-        assert!(plain_delta.ins[Perm::Spo.index()].is_empty());
+        assert_eq!(
+            delta_keys(&plain_delta),
+            (seed_ins.clone(), seed_del.clone())
+        );
         assert_eq!(fresh_cache.entries(), 0);
         assert_eq!(fresh_cache.misses(), 0);
 
-        // Controlled apply_overlay_with returns static path-free errors and releases buffer & delta charges.
+        // Controlled apply_overlay_with returns static path-free errors and preserves
+        // live delta charges while releasing the overlay buffer.
         let dir_str = overlay_dir.path().display().to_string();
         let mut c_budget = ColdBudget::new(limit).unwrap();
-        let mut c_delta = Delta::default();
-        let mut c_charge = 0;
+        c_budget.charge(unrelated).unwrap();
+        c_budget.charge(seed_charge).unwrap();
+        let mut c_delta = seed_delta.clone();
+        let mut c_charge = seed_charge;
         let err = apply_overlay_with(
             overlay_dir.path(),
             &malformed,
@@ -736,19 +1035,38 @@ mod tests {
             Error::Corrupt("invalid linked base overlay operation".into()).to_string()
         );
         assert!(!err.to_string().contains(&dir_str));
-        // Only the admitted first-record delta remains charged; the overlay buffer was dropped.
-        assert_eq!(c_budget.used(), c_charge);
+        assert_eq!(c_charge, history_limited::preparation_delta_bytes(&c_delta));
+        assert_eq!(c_budget.used(), unrelated + c_charge);
         c_budget.release(c_charge);
+        c_budget.release(unrelated);
         assert_eq!(c_budget.used(), 0);
 
-        // Bad length short-circuits cleanly, is path-free under ColdBudget, and leaves budget.used() == 0.
+        // Bad length (with a VALID checksum) short-circuits before sha256, whereas
+        // correct length + bad checksum executes sha256 and fails with the same error.
+        let big_raw = vec![WAL_INSERT; WAL_REC * 3000];
+        let big_sha = overlay_checksum(&big_raw);
+        let mut bad_sha = big_sha.clone();
+        let flipped = if bad_sha.ends_with('0') { '1' } else { '0' };
+        bad_sha.pop();
+        bad_sha.push(flipped);
+        std::fs::write(overlay_dir.path().join(OVERLAY_FILE), &big_raw).unwrap();
+
         let bad_len = Overlay {
-            bytes: raw.len() as u64 + 1,
-            sha256: "not-even-hex".into(),
+            bytes: big_raw.len() as u64 + 1,
+            sha256: big_sha,
             next_bnode: 10,
         };
-        let mut len_delta = Delta::default();
-        let mut len_charge = 0;
+        let len_counter = CountingControl(AtomicUsize::new(0));
+        let mut len_budget = ColdBudget::new(ReadLimit {
+            options: &len_counter,
+            memory: Some(16 << 20),
+            held: 0,
+        })
+        .unwrap();
+        len_budget.charge(unrelated).unwrap();
+        len_budget.charge(seed_charge).unwrap();
+        let mut len_delta = seed_delta.clone();
+        let mut len_charge = seed_charge;
         let err = apply_overlay_with(
             overlay_dir.path(),
             &bad_len,
@@ -756,7 +1074,7 @@ mod tests {
             &fresh_cache,
             &mut len_delta,
             &mut len_charge,
-            &mut c_budget,
+            &mut len_budget,
         )
         .unwrap_err();
         assert_eq!(
@@ -764,43 +1082,93 @@ mod tests {
             Error::Corrupt("invalid linked base overlay length or checksum".into()).to_string()
         );
         assert!(!err.to_string().contains(&dir_str));
-        assert_eq!(c_budget.used(), 0);
+        assert_eq!(len_charge, seed_charge);
+        assert_eq!(len_budget.used(), unrelated + seed_charge);
+        let bad_len_checks = len_counter.0.load(Ordering::Relaxed);
+        len_budget.release(len_charge);
+        len_budget.release(unrelated);
+        assert_eq!(len_budget.used(), 0);
 
-        // Cancellation inside read_verified_overlay_with (during sha256) drops the read buffer,
-        // and pre-charged *delta_charge is preserved without double-release.
-        struct CancelAfter(std::sync::atomic::AtomicUsize, usize);
-        impl ReadControl for CancelAfter {
-            fn check_read(&self) -> Result<()> {
-                let n = self.0.fetch_add(1, Ordering::Relaxed);
-                if n >= self.1 {
-                    Err(Error::Cancelled)
-                } else {
-                    Ok(())
-                }
-            }
+        let bad_checksum = Overlay {
+            bytes: big_raw.len() as u64,
+            sha256: bad_sha,
+            next_bnode: 10,
+        };
+        let sha_counter = CountingControl(AtomicUsize::new(0));
+        let mut bad_sha_budget = ColdBudget::new(ReadLimit {
+            options: &sha_counter,
+            memory: Some(16 << 20),
+            held: 0,
+        })
+        .unwrap();
+        bad_sha_budget.charge(unrelated).unwrap();
+        bad_sha_budget.charge(seed_charge).unwrap();
+        let mut bad_sha_delta = seed_delta.clone();
+        let mut bad_sha_charge = seed_charge;
+        let err = apply_overlay_with(
+            overlay_dir.path(),
+            &bad_checksum,
+            &mut plain_gen,
+            &fresh_cache,
+            &mut bad_sha_delta,
+            &mut bad_sha_charge,
+            &mut bad_sha_budget,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            Error::Corrupt("invalid linked base overlay length or checksum".into()).to_string()
+        );
+        assert!(!err.to_string().contains(&dir_str));
+        assert_eq!(bad_sha_charge, seed_charge);
+        assert_eq!(bad_sha_budget.used(), unrelated + seed_charge);
+        let bad_sha_checks = sha_counter.0.load(Ordering::Relaxed);
+        // Proves sha256 chunk checks ran for bad_checksum and were skipped for bad_len.
+        assert_eq!(
+            bad_sha_checks,
+            bad_len_checks + big_raw.len().div_ceil(64 << 10) + 1
+        );
+        bad_sha_budget.release(bad_sha_charge);
+        bad_sha_budget.release(unrelated);
+        assert_eq!(bad_sha_budget.used(), 0);
+        // Ordinary path also refuses correct-length bad checksum with the path included.
+        let mut plain_sha_delta = seed_delta.clone();
+        let mut plain_sha_charge = 0;
+        let err = apply_overlay_with(
+            overlay_dir.path(),
+            &bad_checksum,
+            &mut plain_gen,
+            &fresh_cache,
+            &mut plain_sha_delta,
+            &mut plain_sha_charge,
+            &mut crate::budgeted::Unlimited,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)));
+        assert!(err.to_string().contains(&dir_str));
 
-            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
-                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
-            }
-        }
-        let big_raw = vec![WAL_INSERT; WAL_REC * 3000];
+        // Cancellation inside read_verified_overlay_with (during sha256) drops the read buffer
+        // and preserves the pre-charged nonempty seed without double-release.
         let big_overlay = Overlay {
             bytes: big_raw.len() as u64,
             sha256: overlay_checksum(&big_raw),
             next_bnode: 1,
         };
-        std::fs::write(overlay_dir.path().join(OVERLAY_FILE), &big_raw).unwrap();
-        // ColdBudget::new + read_file checks run first; cancel during sha256 chunk loop.
-        let sha_ctrl = CancelAfter(std::sync::atomic::AtomicUsize::new(0), 10);
+        let sha_ctrl = FailAfter {
+            calls: AtomicUsize::new(0),
+            limit: bad_len_checks + 1,
+            timeout: false,
+        };
         let mut sha_budget = ColdBudget::new(ReadLimit {
             options: &sha_ctrl,
             memory: Some(2 << 20),
             held: 0,
         })
         .unwrap();
-        sha_budget.charge(64).unwrap();
-        let mut delta_cancel = Delta::default();
-        let mut charge_cancel = 64;
+        sha_budget.charge(unrelated).unwrap();
+        sha_budget.charge(seed_charge).unwrap();
+        let mut delta_cancel = seed_delta.clone();
+        let mut charge_cancel = seed_charge;
         assert!(matches!(
             apply_overlay_with(
                 overlay_dir.path(),
@@ -813,8 +1181,198 @@ mod tests {
             ),
             Err(Error::Cancelled)
         ));
-        assert_eq!(sha_budget.used(), charge_cancel);
+        assert_eq!(charge_cancel, seed_charge);
+        assert_eq!(sha_budget.used(), unrelated + charge_cancel);
         sha_budget.release(charge_cancel);
+        sha_budget.release(unrelated);
         assert_eq!(sha_budget.used(), 0);
+
+        // Capped failure at the record-0 mutation check preserves the still-live seed
+        // delta charge instead of zeroing it.
+        let two_rec_raw = &valid_raw[..WAL_REC * 2];
+        let two_rec_overlay = Overlay {
+            bytes: two_rec_raw.len() as u64,
+            sha256: overlay_checksum(two_rec_raw),
+            next_bnode: 10,
+        };
+        let one_rec_raw = &valid_raw[..WAL_REC];
+        let one_rec_overlay = Overlay {
+            bytes: one_rec_raw.len() as u64,
+            sha256: overlay_checksum(one_rec_raw),
+            next_bnode: 10,
+        };
+        std::fs::write(overlay_dir.path().join(OVERLAY_FILE), two_rec_raw).unwrap();
+        let tight_cap = unrelated + seed_charge + (two_rec_raw.len() as u64) + 8192;
+        assert!(tight_cap < unrelated + history_limited::preparation_mutation_bytes(&seed_delta));
+        let mut tight_budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(tight_cap),
+            held: 0,
+        })
+        .unwrap();
+        tight_budget.charge(unrelated).unwrap();
+        tight_budget.charge(seed_charge).unwrap();
+        let mut tight_delta = seed_delta.clone();
+        let mut tight_charge = seed_charge;
+        assert!(matches!(
+            apply_overlay_with(
+                overlay_dir.path(),
+                &two_rec_overlay,
+                &mut plain_gen,
+                &fresh_cache,
+                &mut tight_delta,
+                &mut tight_charge,
+                &mut tight_budget,
+            ),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(
+            delta_keys(&tight_delta),
+            (seed_ins.clone(), seed_del.clone())
+        );
+        assert_eq!(tight_charge, seed_charge);
+        assert_eq!(tight_budget.used(), unrelated + seed_charge);
+        tight_budget.release(tight_charge);
+        tight_budget.release(unrelated);
+        assert_eq!(tight_budget.used(), 0);
+
+        // Measure exact check counts for verify and 1-record replay so uncapped
+        // cancellation and timeout hit replay deterministically before and after
+        // record 0 transfers its updated delta charge.
+        let verify_counter = CountingControl(AtomicUsize::new(0));
+        let mut verify_budget = ColdBudget::new(ReadLimit {
+            options: &verify_counter,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        let verified = read_verified_overlay_with(
+            &overlay_dir.path().join(OVERLAY_FILE),
+            &two_rec_overlay,
+            &mut verify_budget,
+        )
+        .unwrap();
+        verify_budget.drop_vec(verified);
+        let verify_checks = verify_counter.0.load(Ordering::Relaxed);
+
+        let one_rec_dir = tempfile::tempdir().unwrap();
+        std::fs::write(one_rec_dir.path().join(OVERLAY_FILE), one_rec_raw).unwrap();
+        let one_rec_counter = CountingControl(AtomicUsize::new(0));
+        let mut one_rec_budget = ColdBudget::new(ReadLimit {
+            options: &one_rec_counter,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        one_rec_budget.charge(unrelated).unwrap();
+        one_rec_budget.charge(seed_charge).unwrap();
+        let mut one_rec_delta = seed_delta.clone();
+        let mut one_rec_charge = seed_charge;
+        apply_overlay_with(
+            one_rec_dir.path(),
+            &one_rec_overlay,
+            &mut plain_gen,
+            &fresh_cache,
+            &mut one_rec_delta,
+            &mut one_rec_charge,
+            &mut one_rec_budget,
+        )
+        .unwrap();
+        let one_rec_checks = one_rec_counter.0.load(Ordering::Relaxed);
+        let expected_after_rec0 = delta_keys(&one_rec_delta);
+        assert_ne!(expected_after_rec0, (seed_ins.clone(), seed_del.clone()));
+        assert!(one_rec_charge > seed_charge);
+        one_rec_budget.release(one_rec_charge);
+        one_rec_budget.release(unrelated);
+        assert_eq!(one_rec_budget.used(), 0);
+
+        // Uncapped cancel and timeout reaching replay on record 0 (before apply) and on
+        // record 1 (after record 0 transfers its updated delta charge).
+        for timeout_mode in [false, true] {
+            // Record 0: fails inside the replay loop before record 0 mutates delta.
+            // ColdBudget::new consumes 1 check, unrelated+seed charges consume 2 checks,
+            // read_verified_overlay_with consumes (verify_checks - 1) checks, so
+            // (verify_checks + 2 + 1) fires inside record 0 after verify succeeds.
+            let pre_apply_ctrl = FailAfter {
+                calls: AtomicUsize::new(0),
+                limit: verify_checks + 3,
+                timeout: timeout_mode,
+            };
+            let mut replay_budget = ColdBudget::new(ReadLimit {
+                options: &pre_apply_ctrl,
+                memory: None,
+                held: 0,
+            })
+            .unwrap();
+            replay_budget.charge(unrelated).unwrap();
+            replay_budget.charge(seed_charge).unwrap();
+            let mut replay_delta = seed_delta.clone();
+            let mut replay_charge = seed_charge;
+            let err = apply_overlay_with(
+                overlay_dir.path(),
+                &two_rec_overlay,
+                &mut plain_gen,
+                &fresh_cache,
+                &mut replay_delta,
+                &mut replay_charge,
+                &mut replay_budget,
+            )
+            .unwrap_err();
+            if timeout_mode {
+                assert!(matches!(err, Error::Timeout));
+            } else {
+                assert!(matches!(err, Error::Cancelled));
+            }
+            assert_eq!(
+                delta_keys(&replay_delta),
+                (seed_ins.clone(), seed_del.clone())
+            );
+            assert_eq!(replay_charge, seed_charge);
+            assert_eq!(replay_budget.used(), unrelated + seed_charge);
+            replay_budget.release(replay_charge);
+            replay_budget.release(unrelated);
+            assert_eq!(replay_budget.used(), 0);
+
+            // Record 1: fails strictly after record 0 applied and updated delta_charge.
+            // one_rec_checks includes the final post-loop check(0) of the 1-record run,
+            // so (one_rec_checks - 1) is the exact check index at record 1's loop entry.
+            let post_rec0_ctrl = FailAfter {
+                calls: AtomicUsize::new(0),
+                limit: one_rec_checks - 1,
+                timeout: timeout_mode,
+            };
+            let mut post_budget = ColdBudget::new(ReadLimit {
+                options: &post_rec0_ctrl,
+                memory: None,
+                held: 0,
+            })
+            .unwrap();
+            post_budget.charge(unrelated).unwrap();
+            post_budget.charge(seed_charge).unwrap();
+            let mut post_delta = seed_delta.clone();
+            let mut post_charge = seed_charge;
+            let err = apply_overlay_with(
+                overlay_dir.path(),
+                &two_rec_overlay,
+                &mut plain_gen,
+                &fresh_cache,
+                &mut post_delta,
+                &mut post_charge,
+                &mut post_budget,
+            )
+            .unwrap_err();
+            if timeout_mode {
+                assert!(matches!(err, Error::Timeout));
+            } else {
+                assert!(matches!(err, Error::Cancelled));
+            }
+            assert_eq!(delta_keys(&post_delta), expected_after_rec0);
+            assert_eq!(post_charge, one_rec_charge);
+            assert_eq!(post_budget.used(), unrelated + post_charge);
+            drop(post_delta);
+            post_budget.release(post_charge);
+            post_budget.release(unrelated);
+            assert_eq!(post_budget.used(), 0);
+        }
     }
 }

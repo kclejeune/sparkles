@@ -555,8 +555,16 @@ impl Control for crate::access::Preparation {
     #[inline]
     fn check(&self, bytes: u64) -> Result<()> {
         crate::access::Preparation::check(self)?;
-        if bytes > 0 && bytes > self.available_room() {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if bytes > self.room() {
             return Err(self.exhausted());
+        }
+        if let Some(grant) = self.grant()
+            && bytes > grant.growth_room()
+        {
+            return Err(grant.pool().exhausted(grant.used().saturating_add(bytes)));
         }
         Ok(())
     }
@@ -993,25 +1001,48 @@ mod tests {
         assert!(Control::check(&prep, 0).is_ok());
         assert!(matches!(
             Control::check(&prep, u64::MAX),
-            Err(Error::BudgetExceeded(_))
+            Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                limit: 4096,
+                ..
+            }))
         ));
-        let pool = crate::sparql::pool::QueryPool::new(16 << 20);
+        let pool_cap = 16 << 20;
+        let local_cap = 64 << 20;
+        let pool = crate::sparql::pool::QueryPool::new(pool_cap);
         let grant = Arc::new(pool.empty_grant());
         let pooled = crate::access::Preparation::with_grant(
             crate::task::Control::none(),
-            64 << 20,
+            local_cap,
             grant.clone(),
         )
         .unwrap();
         let expected_room = pooled.available_room();
-        assert!(expected_room <= 16 << 20);
+        assert!(expected_room <= pool_cap);
+        assert!(expected_room < local_cap);
         assert_eq!(Control::remaining(&pooled), expected_room);
         assert_eq!(Control::read_limit(&pooled).memory, Some(expected_room));
         assert!(Control::check(&pooled, 0).is_ok());
         assert!(Control::check(&pooled, expected_room).is_ok());
+        // When local headroom remains but the pool grant is the limiting resource,
+        // precheck preserves BudgetKind::ServerMemory and the pool capacity.
+        let pool_exceed = expected_room + 1;
         assert!(matches!(
-            Control::check(&pooled, expected_room + 1),
-            Err(Error::BudgetExceeded(_))
+            Control::check(&pooled, pool_exceed),
+            Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::ServerMemory,
+                limit,
+                requested,
+            })) if limit == pool_cap && requested == grant.used().saturating_add(pool_exceed)
+        ));
+        // Exceeding the local preparation cap still reports BudgetKind::Memory.
+        assert!(matches!(
+            Control::check(&pooled, local_cap + 1),
+            Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                limit,
+                ..
+            })) if limit == local_cap
         ));
         drop(pooled);
         drop(grant);
