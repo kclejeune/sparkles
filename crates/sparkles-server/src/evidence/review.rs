@@ -588,12 +588,17 @@ pub(super) async fn reconcile_projection(
             .unwrap_or_else(|| sparkles::branch::MAIN.to_string()),
         cancel,
         deadline: None,
-        grant: None,
+        grant: crate::server_memory::current_grant(),
     };
-    let out =
-        crate::http::blocking(move || reconcile_projection_now(st, name, p, bytes, execution))
-            .await?;
-    Ok(axum::Json(out).into_response())
+    match crate::http::blocking(move || reconcile_projection_now(st, name, p, bytes, execution))
+        .await
+    {
+        Ok(out) => Ok(axum::Json(out).into_response()),
+        Err(error) if error.audit_code() == "authority-changed" => {
+            Ok(crate::auth::routes::authority_changed_response())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn reconcile_projection_now(
@@ -603,6 +608,7 @@ fn reconcile_projection_now(
     bytes: axum::body::Bytes,
     execution: super::Execution,
 ) -> ApiResult<J> {
+    let _grant = execution.grant.clone();
     let r: ReconcileProjectionRequest = body_of(&st, &bytes, "projection reconciliation")?;
     let branch = execution.branch.clone();
     let main = crate::http::main_dataset(&st, &name)?;

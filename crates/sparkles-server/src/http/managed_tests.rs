@@ -1515,4 +1515,25 @@ async fn projection_reconciliation_over_http() {
             assert_eq!(j["code"], code, "{body}: {j}");
         }
     }
+
+    // Read-only server refuses projection reconciliation with 403.
+    let ro_dir = tempfile::tempdir().unwrap();
+    let mut ro_state = AppState::new(
+        ro_dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    ro_state.attach("d", DbType::Persistent, None).unwrap();
+    ro_state.read_only = true;
+    let ro_app = router(Arc::new(ro_state));
+    let (status, j) = call(
+        &ro_app,
+        "POST",
+        "/$/evidence/d/projections/reconcile",
+        Some("application/json"),
+        &json!({"policy": "main"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{j}");
 }

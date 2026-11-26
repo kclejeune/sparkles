@@ -1073,7 +1073,7 @@ export interface paths {
         put?: never;
         /**
          * Reconcile a review policy's accepted projection
-         * @description Needs `admin` on the dataset or selected branch, with update grants on the policy's supports and output graphs and unmasked read grants on its decisions, supports and output graphs and on every configured proposal graph. Rebuilds the review policy's output graph strictly from the live acceptance supports that authenticate under the current protections, or empties it when none vouch, and records the new protection nonces in a fresh `ev:Projection` record that supersedes prior unsuperseded projection records of the policy. Restores normal reviews, withdrawals and policy reads after a detach and new protection of the policy's decisions, supports or output graph. Refusals write nothing: `400` for a malformed request, unknown policy or matching policy, `403` for a read-only server or missing or masked grants, `409 evidence-settings-drift`, `409 policy-changed`, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile` when the profile is disabled or a policy graph is still detached, `422 incomplete-evidence`, and `503` for `managed-unavailable`, `projection-unavailable` when the output or conflict mode changed without raising the policy version, or `authority-changed`.
+         * @description Needs `admin` on the dataset or selected branch, with update grants on the policy's supports and output graphs and unmasked read grants on its decisions, supports and output graphs and on every configured proposal graph. Rebuilds the review policy's output graph strictly from the live acceptance supports that authenticate under the current protections, or empties it when none vouch, and records the new protection nonces in a fresh `ev:Projection` record that supersedes prior unsuperseded projection records of the policy, or reuses the active projection record when the protections and output are already valid. Restores normal reviews, withdrawals and policy reads after a detach and new protection of the policy's decisions, supports or output graph. Refusals write nothing: `400` for a malformed request, unknown policy or matching policy, `403` for a read-only server or missing or masked grants, `409 evidence-settings-drift`, `409 policy-changed`, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile` when the profile is disabled or a policy graph is still detached, `422 incomplete-evidence`, and `503` for `managed-unavailable`, `projection-unavailable` when the output or conflict mode changed without raising the policy version, or `authority-changed`.
          */
         post: operations["reconcileEvidenceProjection"];
         delete?: never;
@@ -7451,7 +7451,7 @@ export interface components {
                 inserted: number;
                 wouldCommit: boolean;
             };
-            /** @description The operation, which is the projection record's availability receipt. */
+            /** @description The reconciliation operation, which is the availability receipt of any fresh projection record it publishes. */
             operation: string;
             /** @description The policy's output graph. */
             output: string;

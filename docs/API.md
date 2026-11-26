@@ -13793,7 +13793,8 @@ on every configured proposal graph. Its body is
 rebuilds the review policy's output graph to hold exactly the triples owned by live
 acceptance supports that authenticate under the current protections, or empties it when
 none vouch, and records the new protection nonces in a fresh `ev:Projection` record in
-the supports graph that supersedes prior unsuperseded projection records of the policy.
+the supports graph that supersedes prior unsuperseded projection records of the policy,
+or reuses the active projection record when the protections and output already match.
 The answer is `{operation, committed, replayed, commit, branchId, policy,
 policyVersion, output, projection, vouchedSupports, changed}` with `dryRun` on a
 preview. Reconciling restores normal reviews, withdrawals and policy reads. It refuses

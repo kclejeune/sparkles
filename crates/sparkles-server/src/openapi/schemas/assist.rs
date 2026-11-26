@@ -1161,7 +1161,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                     "changed",
                 ],
                 json!({
-                    "operation": iri("The operation, which is the projection record's availability receipt."),
+                    "operation": iri("The reconciliation operation, which is the availability receipt of any fresh projection record it publishes."),
                     "committed": with_desc(boolean(), "Whether this request published a commit."),
                     "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload, whose receipt this is."),
                     "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),

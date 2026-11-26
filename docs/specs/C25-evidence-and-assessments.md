@@ -2371,14 +2371,16 @@ decisions or supports were detached and re-protected, prior records no longer
 authenticate, so the output graph is emptied.
 
 In the same atomic commit of the evidence owner, the operation appends a fresh immutable
-`ev:Projection` record to the supports graph, minted from the policy, version and three
-current protection nonces, with `prov:wasRevisionOf` naming every prior unsuperseded
-projection record of the policy. `check_projection` ignores any projection record
-superseded through `prov:wasRevisionOf` by a currently authenticated projection record
-of the same policy, while still refusing an output or conflict-mode change made without
-raising `policy.version` under unchanged protections. Reconciling an already-valid
-projection whose output matches its vouched supports reuses its active projection
-record. Normal reviews, withdrawals and policy reads resume after reconciliation.
+`ev:Projection` record to the supports graph, minted from the policy, version, operation
+and three current protection nonces, with `prov:wasRevisionOf` naming every prior
+unsuperseded projection record of the policy. `check_projection` ignores any projection
+record superseded through `prov:wasRevisionOf` by a currently authenticated projection
+record of the same policy, while still refusing an output or conflict-mode change made
+without raising `policy.version` under unchanged protections (including swapping protected
+outputs between policies). Reconciling an already-valid projection whose output matches
+its vouched supports reuses its active projection record and links the operation to it
+through `prov:used` so keyed replays return the original receipt. Normal reviews,
+withdrawals and policy reads resume after reconciliation.
 
 ### Scope changes
 
