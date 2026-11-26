@@ -603,17 +603,19 @@ through it and returns the tier's signed delta in `inferred_change` for incremen
 
 The incremental core maintains transitive and equivalence closure relations through
 operators inside `TierProgram`, completing the incremental half of item 521. During
-deletion, `closure::DeletionOps` handles operator-owned predicates directly over explicit
-edges and live derived edges from other rules rather than running the quadratic transitive
-and equivalence rules as backward joins. Undirected equivalences and symmetric transitive
-properties check reachability by union-find components, while directed transitive
-properties check reachability by Tarjan SCC condensation and pruned search. When a guard
-triple such as `owl:TransitiveProperty` is deleted and unprovable, the operator deletes
-all derived pairs for that predicate without scanning rule instances, and when a clique
-loses edges, deleting 24 edges of a 600-member clique stays incremental instead of falling
-back to a full run. Forward saturation then resets dirty closure predicates and runs the
-closure operators through `engine::run_with_dirty`, reviving any facts that remain
-derivable.
+deletion, `closure::DeletionOps` proves operator-owned predicates directly over confirmed
+explicit edges rather than running the quadratic transitive and equivalence rules as
+backward joins, while pairs supported by derived edges from other rules are handled
+through `Search`, `dirty_preds`, `engine::run_from_with_dirty` and `revive_overdeleted`
+during saturation. Undirected equivalences and symmetric transitive properties check
+reachability by union-find components, while directed transitive properties check
+reachability by Tarjan SCC condensation with bounded SCC reachability and pruned search.
+When a guard triple such as `owl:TransitiveProperty` is deleted and unprovable, the
+operator deletes all derived pairs for that predicate without scanning rule instances,
+and when a clique loses edges, deleting 24 edges of a 600-member clique stays incremental
+instead of falling back to a full run. Forward saturation then resets dirty closure
+predicates and runs the closure operators through `engine::run_from_with_dirty`, reviving
+any facts that remain derivable.
 
 `crates/sparkles-core/src/incr/footprint.rs` is the single footprint representation across
 views and reasoning. `Footprint` and `Resolved` support graph patterns, wildcards and

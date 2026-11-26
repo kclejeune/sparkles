@@ -789,6 +789,25 @@ impl Resolved {
     /// and those an import that did not resolve would be read from, in deterministic
     /// graph order.
     pub fn footprint(&self) -> Footprint {
+        let entries = self
+            .watched()
+            .into_iter()
+            .map(|g| sparkles_core::incr::footprint::Entry {
+                g: g.to_fgraph(),
+                s: None,
+                p: None,
+                o: None,
+            })
+            .collect();
+        Footprint {
+            entries,
+            all: false,
+        }
+    }
+
+    /// The graphs whose changes make the inferences stale: those read, and those an
+    /// import that did not resolve would be read from.
+    pub fn watched(&self) -> Vec<GraphRef> {
         let mut out: BTreeSet<GraphRef> = self.graphs.iter().cloned().collect();
         out.extend(self.also_read.iter().cloned());
         for i in self.imports.iter().filter(|i| i.graph.is_none()) {
@@ -797,21 +816,7 @@ impl Resolved {
                 out.insert(GraphRef::Named(l.clone()));
             }
         }
-        let mut fp = Footprint::default();
-        for g in out {
-            fp.add_graph(g.to_fgraph());
-        }
-        fp
-    }
-
-    /// The graphs whose changes make the inferences stale: those read, and those an
-    /// import that did not resolve would be read from.
-    pub fn watched(&self) -> Vec<GraphRef> {
-        self.footprint()
-            .entries
-            .iter()
-            .filter_map(|e| GraphRef::from_fgraph(&e.g))
-            .collect()
+        out.into_iter().collect()
     }
 
     /// The graphs read, sorted: two runs over the same set read the same triples.
