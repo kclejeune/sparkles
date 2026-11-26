@@ -225,7 +225,7 @@ impl Accumulator for Running {
         for _ in 0..groups {
             self.states.push(AggState::new(&self.agg));
         }
-        if self.is_best() || (self.track && self.is_sum()) {
+        if self.is_best() {
             self.payload.resize(self.states.len(), 0);
         }
     }
@@ -276,6 +276,7 @@ impl Accumulator for Running {
             _ => {
                 let track_payload = self.track && (self.is_best() || self.is_sum());
                 let states = &mut self.states;
+                let n_states = states.len();
                 let payload = &mut self.payload;
                 let growth = &mut self.growth;
                 for (row, &slot) in slots.iter().enumerate() {
@@ -285,7 +286,10 @@ impl Accumulator for Running {
                     let id = batch.value(row);
                     let slot_idx = slot as usize;
                     let mut on_payload = |new_bytes: u64| -> Result<()> {
-                        if track_payload {
+                        if track_payload && new_bytes > 0 {
+                            if payload.len() <= slot_idx {
+                                payload.resize(n_states, 0);
+                            }
                             let held = &mut payload[slot_idx];
                             if new_bytes > *held {
                                 let delta = new_bytes - *held;
@@ -347,12 +351,17 @@ impl Accumulator for Running {
             }
             if self.track && self.is_sum() {
                 let held_now = self.states[to as usize].sum_heap_bytes();
-                let held = &mut self.payload[to as usize];
-                if held_now > *held {
-                    let delta = held_now - *held;
-                    retain(delta)?;
-                    self.growth += delta;
-                    *held = held_now;
+                if held_now > 0 {
+                    if self.payload.len() <= to as usize {
+                        self.payload.resize(self.states.len(), 0);
+                    }
+                    let held = &mut self.payload[to as usize];
+                    if held_now > *held {
+                        let delta = held_now - *held;
+                        retain(delta)?;
+                        self.growth += delta;
+                        *held = held_now;
+                    }
                 }
             }
         }
@@ -374,11 +383,15 @@ impl Accumulator for Running {
         deferred: &mut Deferred,
     ) -> Result<Id> {
         let state = &mut self.states[group];
-        if state.sum_deferred() {
+        let _subtotal = if state.sum_deferred() {
+            let charge = ctx.charge(crate::sparql::bignum::AGG_SUM_PAYLOAD_BYTES)?;
             deferred.replay(ctx, subtotal(group, aggregate), |id| {
                 state.add(ctx, &self.agg, Some(id), &mut |_| Ok(()))
             })?;
-        }
+            Some(charge)
+        } else {
+            None
+        };
         self.finish(ctx, group)
     }
 

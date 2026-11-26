@@ -26,7 +26,6 @@ use super::acc::{Accumulator, Arg, Batch, Concat, Distinct, RowIndex, Rows, Runn
 use super::deferred::{Deferred, subtotal};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::sparql::bignum::AGG_SUM_PAYLOAD_BYTES;
 use crate::sparql::ctx::{Ctx, RetainedCharge};
 use crate::sparql::exec::{compute_column, stat_aggregate};
 use crate::sparql::expr::Expr;
@@ -327,19 +326,11 @@ impl Grouping {
             None
         };
         let agg_list: Vec<Agg> = aggs.iter().map(|(_, a)| a.clone()).collect();
-        // One fold at a time can align both operands, produce a result and
-        // normalize it. Replay can also hold a subtotal of its own in this space.
-        let sum_scratch = if query.is_some() && agg_list.iter().any(sum_or_avg) {
-            6 * AGG_SUM_PAYLOAD_BYTES
-        } else {
-            0
-        };
-        let base_bytes = if spill {
+        let bytes = if spill {
             aggs.len() as u64 * 256 + keys.len() as u64 * 64 + 1024
         } else {
             aggs.len() as u64 * 64 + keys.len() as u64 * 64 + 64
         };
-        let bytes = base_bytes + sum_scratch;
         let charge = if charged {
             ctx.retained_charge(bytes)?
         } else {

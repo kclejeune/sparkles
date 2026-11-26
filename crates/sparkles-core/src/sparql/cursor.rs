@@ -3199,6 +3199,7 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
     fn walk_node(
         node: &Node,
         charge_node: bool,
+        include_root: bool,
         seen_specs: &mut FxHashSet<usize>,
         seen_patterns: &mut FxHashSet<usize>,
         seen_view_patterns: &mut FxHashSet<usize>,
@@ -3258,6 +3259,7 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
                 .saturating_add(walk_node(
                     &top.fallback,
                     charge_node,
+                    true,
                     seen_specs,
                     seen_patterns,
                     seen_view_patterns,
@@ -3310,6 +3312,7 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
                 acc.saturating_add(walk_node(
                     branch,
                     false,
+                    true,
                     seen_specs,
                     seen_patterns,
                     seen_view_patterns,
@@ -3321,13 +3324,18 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
             extra = extra.saturating_add(walk_node(
                 child,
                 charge_node,
+                false,
                 seen_specs,
                 seen_patterns,
                 seen_view_patterns,
             ));
         }
         if charge_node {
-            1024u64.saturating_add(extra)
+            let actual = super::checked_layout::node_shallow_retained_bytes(node, include_root);
+            let floor = (node.desc.len() as u64)
+                .saturating_add(node.vars.len() as u64 * 32)
+                .saturating_add(1024);
+            actual.max(floor).saturating_add(extra)
         } else {
             extra
         }
@@ -3336,13 +3344,14 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
     let mut seen_specs = FxHashSet::default();
     let mut seen_patterns = FxHashSet::default();
     let mut seen_view_patterns = FxHashSet::default();
-    super::checked_layout::node_retained_bytes(node).saturating_add(walk_node(
+    walk_node(
         node,
+        true,
         true,
         &mut seen_specs,
         &mut seen_patterns,
         &mut seen_view_patterns,
-    ))
+    )
 }
 
 /// Bytes copied when cloning a cached [`Node`] into a cursor (`exists_streams`, `drain`).

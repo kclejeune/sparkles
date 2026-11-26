@@ -558,7 +558,14 @@ impl<'a> Layout<'a> {
     pub(super) fn shallow(&mut self, node: &Node) -> Result<()> {
         self.metadata(node)?;
         self.vector(&node.children)?;
-        self.kind(&node.kind)
+        self.kind(&node.kind, true)
+    }
+
+    /// A node's own storage without recursing into `node.children` or `OrderedTopK::fallback`.
+    fn shallow_own(&mut self, node: &Node) -> Result<()> {
+        self.metadata(node)?;
+        self.vector(&node.children)?;
+        self.kind(&node.kind, false)
     }
 
     pub(super) fn node(&mut self, node: &Node) -> Result<()> {
@@ -567,10 +574,10 @@ impl<'a> Layout<'a> {
         for child in &node.children {
             self.node(child)?;
         }
-        self.kind(&node.kind)
+        self.kind(&node.kind, true)
     }
 
-    fn kind(&mut self, kind: &Kind) -> Result<()> {
+    fn kind(&mut self, kind: &Kind, include_fallback: bool) -> Result<()> {
         match kind {
             Kind::Empty
             | Kind::GraphNames(_)
@@ -597,8 +604,11 @@ impl<'a> Layout<'a> {
                 self.expressions(&spec.filter)?;
                 self.expressions(&spec.range_filter)?;
                 self.vector(&spec.tie_order)?;
-                self.slots::<Node>(1)?;
-                self.node(&spec.fallback)
+                if include_fallback {
+                    self.slots::<Node>(1)?;
+                    self.node(&spec.fallback)?;
+                }
+                Ok(())
             }
             Kind::Values(table) => self.table(table),
             Kind::Join { keys, .. }
@@ -783,12 +793,15 @@ pub(super) fn node_copy_bytes(node: &Node) -> u64 {
     layout.bytes()
 }
 
-/// Owned retained heap bytes of [`Node`] using vector/string capacities (mirrors
-/// [`Layout::retained`] without requiring a checked [`Preparation`]).
-pub(super) fn node_retained_bytes(node: &Node) -> u64 {
+/// Owned retained heap bytes of one [`Node`] using vector/string capacities (its own
+/// `Node` slot when `include_root` is set, metadata, `children` vector buffer, and
+/// `Kind` storage, without recursing into `node.children` or `OrderedTopK::fallback`).
+pub(super) fn node_shallow_retained_bytes(node: &Node, include_root: bool) -> u64 {
     let mut layout = Layout::unchecked(true);
-    let _ = layout.slots::<Node>(1);
-    let _ = layout.node(node);
+    if include_root {
+        let _ = layout.slots::<Node>(1);
+    }
+    let _ = layout.shallow_own(node);
     layout.bytes()
 }
 
