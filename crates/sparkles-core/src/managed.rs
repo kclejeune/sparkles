@@ -989,7 +989,6 @@ fn decode_inner(
             .map_err(|error| (error.to_string(), false))?;
     }
     let mut owners = BTreeMap::new();
-    let mut settings = BTreeMap::new();
     for (name, value) in raw.owners {
         let Some(owner) = OwnerKind::parse(&name) else {
             return Err((
@@ -1026,43 +1025,17 @@ fn decode_inner(
                 false,
             ));
         }
-        if owner != OwnerKind::Evidence && !entry.projection_only.is_empty() {
+        if entry
+            .protections
+            .iter()
+            .any(|(graph, nonce)| nonce.is_nil() || !entry.graphs.contains(graph))
+        {
             return Err((
-                format!(
-                    "{FILE}: owner {name}: only the evidence owner can carry projectionOnly graphs"
-                ),
+                format!("{FILE}: owner {name} has an invalid graph protection"),
                 false,
             ));
         }
-        for g in &entry.projection_only {
-            if !entry.graphs.contains(g) || !entry.protections.contains_key(g) {
-                return Err((
-                    format!(
-                        "{FILE}: owner {name}: projectionOnly graph <{g}> is not a protected graph"
-                    ),
-                    false,
-                ));
-            }
-        }
         check_graphs(&entry.graphs).map_err(|e| (format!("{FILE}: owner {name}: {e}"), false))?;
-        let file = owner.settings_file();
-        let found = read_settings(owner).map_err(|e| (format!("{file}: {e}"), false))?;
-        let Some(found) = found else {
-            return Err((
-                format!("{file} of the managed owner {name} is missing"),
-                true,
-            ));
-        };
-        if settings_digest(&found) != entry.settings_digest {
-            return Err((
-                format!("{file} does not match the digest {FILE} records for it"),
-                true,
-            ));
-        }
-        if let Some(why) = owner.check_settings(&found, entry.profile) {
-            return Err((why, false));
-        }
-        settings.insert(owner, Arc::from(found));
         owners.insert(owner, entry);
     }
     if raw.format == 4 && !owners_have_projection_only(&owners) {
@@ -1076,7 +1049,7 @@ fn decode_inner(
             revision: raw.revision,
             owners,
         },
-        settings,
+        BTreeMap::new(),
     )
     .map_err(|e| (e.to_string(), false))?;
     installed.configuration_history = raw.configuration_history;
@@ -1085,6 +1058,28 @@ fn decode_inner(
             format!("{FILE}: history registry is not its unique canonical encoding"),
             false,
         ));
+    }
+    // Repair may replace settings only after every owner and the complete
+    // registry have passed structural validation.
+    for (owner, entry) in &installed.graphs.owners {
+        let file = owner.settings_file();
+        let found = read_settings(*owner).map_err(|e| (format!("{file}: {e}"), false))?;
+        let Some(found) = found else {
+            return Err((
+                format!("{file} of the managed owner {owner} is missing"),
+                true,
+            ));
+        };
+        if settings_digest(&found) != entry.settings_digest {
+            return Err((
+                format!("{file} does not match the digest {FILE} records for it"),
+                true,
+            ));
+        }
+        if let Some(why) = owner.check_settings(&found, entry.profile) {
+            return Err((why, false));
+        }
+        installed.settings.insert(*owner, Arc::from(found));
     }
     Ok(installed)
 }
@@ -1293,6 +1288,8 @@ mod tests {
         for (bytes, repairable, settings) in [
             (&newer[..], false, Some(b"{}".to_vec())),
             (&empty_v4, false, Some(b"{}".to_vec())),
+            (&empty_v4, false, None),
+            (&unknown_owner, false, None),
             (&unknown_future, false, Some(b"{}".to_vec())),
             (&unknown_owner, false, Some(b"{}".to_vec())),
             (&unknown_profile, false, Some(b"{}".to_vec())),

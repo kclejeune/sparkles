@@ -929,11 +929,14 @@ nonce.
 
 The protection nonce is the operation marker that resolution decision 1 required.
 `managed.json` format 2 adds a `protections` map from each protected graph to a random
-UUID. Protecting a graph keeps its nonce while the owner keeps protecting it, detaching
-drops the nonce, and protecting it again chooses a new one. This build reads formats 1
-and 2 and writes format 2, and an older build refuses format 2 as written by a newer
-release. A format 1 registry has no nonces, so its graphs take no typed writes until
-the owner protects them again. Resolution now requires the receipt to be an
+UUID. Detaching a graph drops its nonce, and protecting it again chooses a new one.
+A continuously protected graph keeps its nonce unless it moves from a dedicated
+projection output with no record history into a record role. That transition chooses
+a new nonce. This build reads registry formats 1 through 4. A registry with any
+`projectionOnly` graphs writes format 4 so an older writer refuses the registry.
+Otherwise an unactivated store writes format 2 and an activated store writes format 3.
+A format 1 registry has no nonces, so its graphs take no typed writes until the owner
+protects them again. Resolution now requires the receipt to be an
 `ev:Operation` in the record's graph, and both the record and the receipt to carry that
 graph's current nonce as `ev:graphProtection`, otherwise the answer is
 `origin-not-reproduced`. A record written while its graph was detached cannot carry a
@@ -1370,20 +1373,20 @@ anchored history or a covered commit cannot fall back to legacy absence when a
 reference, flag, generation or coverage file is missing. Complete accepted seals
 are authenticated before recovery can truncate a log or expose recovered data.
 
-The newer file versions are written only after activation, so a store that never
-activates stays readable by older releases. Such a store writes version 1 logs,
-generation `commit.json` format 1 and `managed.json` format 2, and its dataset
-records reader 5, or the managed-graph reader when it has managed graphs.
-Activation first raises the dataset reader of every branch to 8, the
-configuration-history reader. It then upgrades each current log header in place
-and publishes the registry root. From then on the family writes version 2 logs,
-`commit.json` format 2, `managed.json` format 3, `history.json` format 2 and
-`branch.json` format 2. Branches and captures of an activated family record reader 8
-before they write any of these. An older release refuses an activated dataset by its
-reader before it reads anything else. A dataset's recorded reader also bounds the
-versions this build accepts in it. Open and reidentification check every generation's
-log and `commit.json` and the dataset's settings and registry against it, before they
-read or change them. One of these versions in a dataset that records an older reader
+Before activation the evidence profile uses version 1 logs and generation
+`commit.json` format 1. A plain dataset records reader 5, and managed graphs require
+reader 6. A registry that marks dedicated outputs as `projectionOnly` can therefore
+use format 4 at reader 6.
+Activation raises the dataset reader of every branch to 8, upgrades each current log
+header in place and publishes the registry root. The family then writes version 2
+logs and format 2 for `commit.json`, `history.json` and `branch.json`. Its registry
+uses format 3 or 4. Each immutable configuration generation uses format 2 when its
+owners carry `projectionOnly` and format 1 otherwise. The lineage can contain both
+formats. Branches and captures record reader 8 before publishing an activated
+family's files. An older release refuses an activated dataset by its reader. A dataset's
+recorded reader also bounds the versions this build accepts in it. Open and
+reidentification check every generation's log and `commit.json` and the dataset's
+settings and registry against it before they read or change them. One of these versions in a dataset that records an older reader
 is refused as a newer release's file. Bounded history readers do not repeat the check,
 so it adds no read to their allowance.
 
@@ -2373,6 +2376,20 @@ quad not owned by a vouched support (deleting by physical quad ID so blank nodes
 inserted while detached are removed), and inserts every missing vouched triple. When
 decisions or supports were detached and re-protected, prior records no longer
 authenticate, so the output graph is emptied.
+
+On legacy registries a dedicated output can have held a record role under the same
+protection. Before assigning `projectionOnly`, the store checks the family for an
+operation whose graph contains a record bearing that protection and naming the
+operation as both `ev:availabilityReceipt` and `prov:wasGeneratedBy`. A typed write
+that reuses every record leaves the earlier receipts in place. An operation's nine
+mandatory description triples alone can all be projected, even when their supports
+have since been cleared. A projected protection triple can also coincide with a
+genuine publication. Reconciliation preserves the graph when it finds record history
+under the current protection. Format 2 records the current owner and nonce for each
+graph. It has no per-triple publication origin or history of graph roles. A projection
+that copies both a complete operation and its receipt-bearing record can therefore
+leave the same RDF after supports are cleared. The guard preserves that case too.
+Keyed replay also requires the operation's stored key in a former record graph.
 
 In the same atomic commit of the evidence owner, the operation appends a fresh immutable
 `ev:Projection` record to the supports graph, minted from the policy, version, operation

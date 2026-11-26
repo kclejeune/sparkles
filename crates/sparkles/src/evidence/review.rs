@@ -711,12 +711,7 @@ impl State<'_> {
     /// history under its unchanged protection nonce (as when a former record-role graph
     /// was reassigned as a dedicated projection output without detaching it first),
     /// while ignoring ordinary and support-projected RDF assertions in the output.
-    fn check_output_record_history(
-        &self,
-        p: &PolicyGraphs,
-        dataset_id: Uuid,
-        protected_record_graphs: &[(&str, Uuid)],
-    ) -> Result<()> {
+    fn check_output_record_history(&self, p: &PolicyGraphs, dataset_id: Uuid) -> Result<()> {
         if p.output_projection_only {
             return Ok(());
         }
@@ -724,7 +719,6 @@ impl State<'_> {
             p.output.0.as_str(),
             p.output.1,
             dataset_id,
-            protected_record_graphs,
         )? {
             return Err(managed(
                 ManagedErrorKind::ImmutableRecordConflict,
@@ -1873,10 +1867,6 @@ pub fn review(
             .iter()
             .map(|(g, n)| (g.as_str(), *n))
             .collect();
-        let protected_records: Vec<(&str, Uuid)> = records
-            .iter()
-            .filter_map(|(g, n)| n.map(|n| (g.as_str(), n)))
-            .collect();
         state.check_same_version_drift(
             main.dataset_id(),
             &p,
@@ -1885,7 +1875,7 @@ pub fn review(
             &protected_refs,
             control,
         )?;
-        state.check_output_record_history(&p, main.dataset_id(), &protected_records)?;
+        state.check_output_record_history(&p, main.dataset_id())?;
         let existing = state.check_projection(&p, Some((policy_version, &record)))?;
         batch.records.push(record);
         skip.push(existing);
@@ -2630,12 +2620,8 @@ pub fn reconcile_projection_prepared(
         };
         let record_graphs = record_graph_nonces(&settings, &capability);
         let projection_graphs = projection_graph_nonces(&settings, &capability);
-        let protected_records: Vec<(&str, Uuid)> = record_graphs
-            .iter()
-            .filter_map(|(g, n)| n.map(|n| (g.as_str(), n)))
-            .collect();
         let op_iri = operation_iri(operation);
-        if options.idempotency_key.is_some() {
+        if let Some(key) = &options.idempotency_key {
             let probe = Batch {
                 operation,
                 operation_iri: op_iri.clone(),
@@ -2651,12 +2637,12 @@ pub fn reconcile_projection_prepared(
                 .operation(&probe.operation_iri, &record_graphs)?;
             let mut published_op_outputs: Vec<G> = Vec::new();
             for (g, nonce) in &projection_graphs {
-                if state.reads.is_published_operation_in_output(
+                if state.reads.has_keyed_operation_in_output(
                     &op_iri,
+                    key,
                     g.as_str(),
                     *nonce,
                     main.dataset_id(),
-                    &protected_records,
                 )? {
                     let copy = state
                         .reads
@@ -2817,7 +2803,7 @@ pub fn reconcile_projection_prepared(
             &protected_refs,
             control,
         )?;
-        state.check_output_record_history(&p, main.dataset_id(), &protected_records)?;
+        state.check_output_record_history(&p, main.dataset_id())?;
         // Existing projection records of this policy, and which remain unsuperseded.
         let mut proj_held = preparation.reserve(0)?;
         let (existing_projections, superseded_projections) =
@@ -3087,7 +3073,6 @@ pub fn reconcile_projection_prepared(
                     g.as_str(),
                     *nonce,
                     main.dataset_id(),
-                    &protected_records,
                 )? {
                     return Err(managed(
                         ManagedErrorKind::ImmutableRecordConflict,

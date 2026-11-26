@@ -3812,12 +3812,7 @@ fn projected_operation_assertions_do_not_block_output_or_keyed_replay() {
 /// without detaching must rotate its nonce so projected lookalikes never authenticate.
 #[test]
 fn projected_operation_lookalike_empties_after_supports_rotation() {
-    use oxrdf::Literal;
     use sparkles::managed::OwnerKind;
-
-    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-    const PROV: &str = "http://www.w3.org/ns/prov#";
-    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
     let ds = Dataset::memory();
     let s = settings(ConflictMode::Refuse);
@@ -3839,97 +3834,9 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
         .expect("OUTPUT protected");
     assert!(ev_entry.projection_only.contains(OUTPUT));
 
-    let project_lookalike = |ds: &Dataset, tag: &str, op_iri: NamedNode, nonce: uuid::Uuid| {
-        let ds_id = ds.dataset_id().to_string();
-        let branch_id = ds.store().branch_id().to_string();
-        let payload_sha = sha(&format!("lookalike-{tag}")).to_string();
-        let dt =
-            Literal::new_typed_literal("2026-11-26T00:00:00.000Z", iri(&format!("{XSD}dateTime")));
-        let commit_int = Literal::new_typed_literal("99", iri(&format!("{XSD}integer")));
-        let triples = vec![
-            (
-                "type",
-                Triple::new(
-                    op_iri.clone(),
-                    iri(RDF_TYPE),
-                    iri(&format!("{EV}Operation")),
-                ),
-            ),
-            (
-                "act",
-                Triple::new(
-                    op_iri.clone(),
-                    iri(RDF_TYPE),
-                    iri(&format!("{PROV}Activity")),
-                ),
-            ),
-            (
-                "assoc",
-                Triple::new(
-                    op_iri.clone(),
-                    iri(&format!("{PROV}wasAssociatedWith")),
-                    iri("urn:principal:reviewer"),
-                ),
-            ),
-            (
-                "ended",
-                Triple::new(op_iri.clone(), iri(&format!("{PROV}endedAtTime")), dt),
-            ),
-            (
-                "ds",
-                Triple::new(
-                    op_iri.clone(),
-                    iri(&format!("{EV}datasetId")),
-                    Literal::new_simple_literal(ds_id),
-                ),
-            ),
-            (
-                "br",
-                Triple::new(
-                    op_iri.clone(),
-                    iri(&format!("{EV}branchId")),
-                    Literal::new_simple_literal(branch_id),
-                ),
-            ),
-            (
-                "commit",
-                Triple::new(op_iri.clone(), iri(&format!("{EV}commit")), commit_int),
-            ),
-            (
-                "digest",
-                Triple::new(
-                    op_iri.clone(),
-                    iri(&format!("{EV}payloadDigest")),
-                    Literal::new_simple_literal(payload_sha),
-                ),
-            ),
-            (
-                "prot",
-                Triple::new(
-                    op_iri,
-                    iri(&format!("{EV}graphProtection")),
-                    Literal::new_simple_literal(nonce.to_string()),
-                ),
-            ),
-        ];
-        let mut decs = Vec::new();
-        for (k, t) in triples {
-            let key = format!("{tag}-{k}");
-            let input = EvidenceInput {
-                revisions: vec![revision(&key)],
-                claims: vec![claim("c", Polarity::Positive, t)],
-                ..Default::default()
-            };
-            let c = claim_of(&propose(ds, &input));
-            decs.push(decision(&key, &c, Disposition::Accepted, None));
-        }
-        let res = review(ds, &decs).unwrap();
-        assert!(res.committed);
-    };
-
     // 1. Project a 9-triple lookalike into OUTPUT, then detach & re-protect SUPPORTS
     // while RETAINING old SUPPORTS quads and keeping OUTPUT continuously protected.
-    project_lookalike(&ds, "retain", iri("urn:proj:op-retain"), out_nonce);
+    project_lookalike(&ds, "main", "retain", iri("urn:proj:op-retain"), out_nonce);
     evidence::detach(&ds, SUPPORTS).unwrap();
     evidence::configure(&ds, &s, &Control::none()).unwrap();
     let out_nonce_1 = ds
@@ -3956,7 +3863,7 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
 
     // 2. Project a 9-triple lookalike again, then detach, CLEAR, and re-protect SUPPORTS
     // while keeping OUTPUT continuously protected.
-    project_lookalike(&ds, "clear", iri("urn:proj:op-clear"), out_nonce);
+    project_lookalike(&ds, "main", "clear", iri("urn:proj:op-clear"), out_nonce);
     evidence::detach(&ds, SUPPORTS).unwrap();
     ds.update(&format!(
         "DELETE WHERE {{ GRAPH <{SUPPORTS}> {{ ?s ?p ?o }} }}"
@@ -3988,7 +3895,13 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
     // 3. Promoting a dedicated projection output into a record role without detaching
     // must drop it from `projection_only` and rotate its nonce so any projected
     // lookalike cannot escalate into an authenticated operation record.
-    project_lookalike(&ds, "promote", iri("urn:proj:op-promote"), out_nonce);
+    project_lookalike(
+        &ds,
+        "main",
+        "promote",
+        iri("urn:proj:op-promote"),
+        out_nonce,
+    );
     let mut promoted = s.clone();
     promoted.supports.push(OUTPUT.into());
     promoted.projections = vec!["urn:ev:accepted-new".into()];
@@ -4753,6 +4666,137 @@ fn same_version_drift_supersession_is_linear_across_retained_revisions() {
     );
 }
 
+fn project_lookalike(
+    ds: &Dataset,
+    policy_name: &str,
+    tag: &str,
+    op_iri: NamedNode,
+    nonce: uuid::Uuid,
+) {
+    use oxrdf::Literal;
+
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    const PROV: &str = "http://www.w3.org/ns/prov#";
+    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+    let ds_id = ds.dataset_id().to_string();
+    let branch_id = ds.store().branch_id().to_string();
+    let payload_sha = sha(&format!("legacy-lookalike-{tag}")).to_string();
+    let dt = Literal::new_typed_literal("2026-11-26T00:00:00.000Z", iri(&format!("{XSD}dateTime")));
+    let commit_int = Literal::new_typed_literal("99", iri(&format!("{XSD}integer")));
+    let triples = vec![
+        (
+            "type",
+            Triple::new(
+                op_iri.clone(),
+                iri(RDF_TYPE),
+                iri(&format!("{EV}Operation")),
+            ),
+        ),
+        (
+            "act",
+            Triple::new(
+                op_iri.clone(),
+                iri(RDF_TYPE),
+                iri(&format!("{PROV}Activity")),
+            ),
+        ),
+        (
+            "assoc",
+            Triple::new(
+                op_iri.clone(),
+                iri(&format!("{PROV}wasAssociatedWith")),
+                iri("urn:principal:reviewer"),
+            ),
+        ),
+        (
+            "ended",
+            Triple::new(op_iri.clone(), iri(&format!("{PROV}endedAtTime")), dt),
+        ),
+        (
+            "ds",
+            Triple::new(
+                op_iri.clone(),
+                iri(&format!("{EV}datasetId")),
+                Literal::new_simple_literal(ds_id),
+            ),
+        ),
+        (
+            "br",
+            Triple::new(
+                op_iri.clone(),
+                iri(&format!("{EV}branchId")),
+                Literal::new_simple_literal(branch_id),
+            ),
+        ),
+        (
+            "commit",
+            Triple::new(op_iri.clone(), iri(&format!("{EV}commit")), commit_int),
+        ),
+        (
+            "digest",
+            Triple::new(
+                op_iri.clone(),
+                iri(&format!("{EV}payloadDigest")),
+                Literal::new_simple_literal(payload_sha),
+            ),
+        ),
+        (
+            "prot",
+            Triple::new(
+                op_iri,
+                iri(&format!("{EV}graphProtection")),
+                Literal::new_simple_literal(nonce.to_string()),
+            ),
+        ),
+    ];
+    let mut decs = Vec::new();
+    for (k, t) in triples {
+        let key = format!("{tag}-{k}");
+        let input = EvidenceInput {
+            revisions: vec![revision(&key)],
+            claims: vec![claim("c", Polarity::Positive, t)],
+            ..Default::default()
+        };
+        let c = claim_of(&propose(ds, &input));
+        decs.push(decision(&key, &c, Disposition::Accepted, None));
+    }
+    let mut opts = reviewer();
+    opts.if_head = Some(ds.store().head_commit().seq);
+    let res = evidence::review(
+        None,
+        ds,
+        ds,
+        policy_name,
+        1,
+        &decs,
+        &opts,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(res.committed);
+}
+
+// A closed, pre-581 registry retained the nonce of every continuously protected
+// graph across role changes. Both configurations in these fixtures own the same graphs.
+fn legacy_settings(root: &std::path::Path, settings: &Settings) {
+    let path = root.join("managed.json");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let canonical = settings.canonical(&Control::none()).unwrap();
+    raw["format"] = 2.into();
+    raw["owners"]["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("projectionOnly");
+    raw["owners"]["evidence"]["settingsDigest"] =
+        sparkles::managed::settings_digest(canonical.bytes()).into();
+    raw["revision"] = (raw["revision"].as_u64().unwrap() + 1).into();
+    std::fs::write(root.join("evidence.json"), canonical.bytes()).unwrap();
+    std::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+}
+
 /// A dataset upgraded from a pre-581 format-2 registry keeps its legacy protection nonces
 /// on dedicated projection outputs without `projectionOnly`. Follow-on projecting reviews,
 /// reconciliation, narrow-grant keyed replay, and supports resets (both retained and
@@ -4762,12 +4806,7 @@ fn same_version_drift_supersession_is_linear_across_retained_revisions() {
 /// graphs protected.
 #[test]
 fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
-    use oxrdf::Literal;
     use sparkles::managed::OwnerKind;
-
-    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-    const PROV: &str = "http://www.w3.org/ns/prov#";
-    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
     let decisions2 = "urn:ev:decisions2";
     let supports2 = "urn:ev:supports2";
@@ -4833,110 +4872,6 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     assert_eq!(e0.protections[output2], legacy_out2_nonce);
     assert!(!e0.projection_only.contains(OUTPUT));
     assert!(!e0.projection_only.contains(output2));
-
-    let project_lookalike =
-        |ds: &Dataset, policy_name: &str, tag: &str, op_iri: NamedNode, nonce: uuid::Uuid| {
-            let ds_id = ds.dataset_id().to_string();
-            let branch_id = ds.store().branch_id().to_string();
-            let payload_sha = sha(&format!("legacy-lookalike-{tag}")).to_string();
-            let dt = Literal::new_typed_literal(
-                "2026-11-26T00:00:00.000Z",
-                iri(&format!("{XSD}dateTime")),
-            );
-            let commit_int = Literal::new_typed_literal("99", iri(&format!("{XSD}integer")));
-            let triples = vec![
-                (
-                    "type",
-                    Triple::new(
-                        op_iri.clone(),
-                        iri(RDF_TYPE),
-                        iri(&format!("{EV}Operation")),
-                    ),
-                ),
-                (
-                    "act",
-                    Triple::new(
-                        op_iri.clone(),
-                        iri(RDF_TYPE),
-                        iri(&format!("{PROV}Activity")),
-                    ),
-                ),
-                (
-                    "assoc",
-                    Triple::new(
-                        op_iri.clone(),
-                        iri(&format!("{PROV}wasAssociatedWith")),
-                        iri("urn:principal:reviewer"),
-                    ),
-                ),
-                (
-                    "ended",
-                    Triple::new(op_iri.clone(), iri(&format!("{PROV}endedAtTime")), dt),
-                ),
-                (
-                    "ds",
-                    Triple::new(
-                        op_iri.clone(),
-                        iri(&format!("{EV}datasetId")),
-                        Literal::new_simple_literal(ds_id),
-                    ),
-                ),
-                (
-                    "br",
-                    Triple::new(
-                        op_iri.clone(),
-                        iri(&format!("{EV}branchId")),
-                        Literal::new_simple_literal(branch_id),
-                    ),
-                ),
-                (
-                    "commit",
-                    Triple::new(op_iri.clone(), iri(&format!("{EV}commit")), commit_int),
-                ),
-                (
-                    "digest",
-                    Triple::new(
-                        op_iri.clone(),
-                        iri(&format!("{EV}payloadDigest")),
-                        Literal::new_simple_literal(payload_sha),
-                    ),
-                ),
-                (
-                    "prot",
-                    Triple::new(
-                        op_iri,
-                        iri(&format!("{EV}graphProtection")),
-                        Literal::new_simple_literal(nonce.to_string()),
-                    ),
-                ),
-            ];
-            let mut decs = Vec::new();
-            for (k, t) in triples {
-                let key = format!("{tag}-{k}");
-                let input = EvidenceInput {
-                    revisions: vec![revision(&key)],
-                    claims: vec![claim("c", Polarity::Positive, t)],
-                    ..Default::default()
-                };
-                let c = claim_of(&propose(ds, &input));
-                decs.push(decision(&key, &c, Disposition::Accepted, None));
-            }
-            let mut opts = reviewer();
-            opts.if_head = Some(ds.store().head_commit().seq);
-            let res = evidence::review(
-                None,
-                ds,
-                ds,
-                policy_name,
-                1,
-                &decs,
-                &opts,
-                &mut |_, _| all(),
-                &Control::none(),
-            )
-            .unwrap();
-            assert!(res.committed);
-        };
 
     // 1. Project a 9-triple lookalike into legacy OUTPUT and verify a follow-on
     // projecting review and keyed reconciliation both succeed (not immutable-record-conflict).
@@ -5034,6 +4969,10 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     ))
     .unwrap();
     evidence::configure(&ds, &s, &Control::none()).unwrap();
+    // Reopen the cleared state with the registry a pre-581 writer would leave.
+    drop(ds);
+    legacy_settings(&root, &s);
+    let ds = Dataset::open(&root).unwrap();
     let head_after_s2_clear = ds.store().head_commit().seq;
     let replayed3 = evidence::reconcile_projection(
         &ds,
@@ -5513,67 +5452,142 @@ fn legacy_format2_review_output_preserves_rival_drift_on_takeover_and_detach() {
 fn legacy_format2_pre_upgrade_supports_reset_reconciles_cleanly() {
     use sparkles::managed::OwnerKind;
 
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("ds");
-    let s = settings(ConflictMode::Refuse);
-    let legacy_out_nonce;
-    {
+    for configure_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ds");
+        let s = settings(ConflictMode::Refuse);
         let ds = Dataset::open(&root).unwrap();
         evidence::configure(&ds, &s, &Control::none()).unwrap();
-        let c = claim_of(&propose(
-            &ds,
-            &occurrence_with("pre-reset", "urn:cve:pre-reset", Polarity::Positive),
-        ));
-        review(&ds, &[decision("d", &c, Disposition::Accepted, None)]).unwrap();
-        assert_eq!(
-            accepted(&ds),
-            vec!["<urn:release> <urn:affectedBy> <urn:cve:pre-reset>".to_string()]
-        );
-        // Simulate a supports reset that happened on a pre-581 release (before upgrade).
+        let nonce = ds.store().managed_graphs().unwrap().unwrap().owners[&OwnerKind::Evidence]
+            .protections[OUTPUT];
+        let op = evidence::operation_iri(uuid::Uuid::new_v4());
+        project_lookalike(&ds, "main", "pre-reset", op, nonce);
+        assert_eq!(accepted(&ds).len(), 9);
         evidence::detach(&ds, SUPPORTS).unwrap();
         ds.update(&format!(
             "DELETE WHERE {{ GRAPH <{SUPPORTS}> {{ ?s ?p ?o }} }}"
         ))
         .unwrap();
         evidence::configure(&ds, &s, &Control::none()).unwrap();
-        legacy_out_nonce = ds
-            .store()
-            .managed_graphs()
-            .unwrap()
-            .unwrap()
-            .owners
-            .get(&OwnerKind::Evidence)
-            .unwrap()
-            .protections[OUTPUT];
+        drop(ds);
+        legacy_settings(&root, &s);
+
+        let ds = Dataset::open(&root).unwrap();
+        if configure_first {
+            evidence::configure(&ds, &s, &Control::none()).unwrap();
+            let registry = ds.store().managed_graphs().unwrap().unwrap();
+            assert!(
+                registry.owners[&OwnerKind::Evidence]
+                    .projection_only
+                    .contains(OUTPUT)
+            );
+            assert_eq!(
+                registry.owners[&OwnerKind::Evidence].protections[OUTPUT],
+                nonce
+            );
+        }
+        assert!(
+            reconcile(&ds, "main", Some(1), &reviewer())
+                .unwrap()
+                .committed
+        );
+        assert!(accepted(&ds).is_empty());
     }
-    // Downgrade `managed.json` back to pre-581 format 2 (no `projectionOnly`).
-    {
-        let managed_path = root.join("managed.json");
-        let mut raw: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&managed_path).unwrap()).unwrap();
-        raw["format"] = 2.into();
-        raw["owners"]["evidence"]
-            .as_object_mut()
-            .unwrap()
-            .remove("projectionOnly");
-        std::fs::write(&managed_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+}
+
+#[test]
+fn legacy_format2_projected_nonce_also_belongs_to_a_published_proposal() {
+    check_legacy_dual_origin(false);
+    check_legacy_dual_origin(true);
+}
+
+fn check_legacy_dual_origin(extra_value: bool) {
+    use sparkles::managed::OwnerKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let s = settings(ConflictMode::Refuse);
+    let ds = Dataset::open(&root).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let nonce = ds.store().managed_graphs().unwrap().unwrap().owners[&OwnerKind::Evidence]
+        .protections[OUTPUT];
+    let principal = iri("urn:principal:importer");
+    let key = "dual-origin";
+    let op = evidence::operation_iri(evidence::operation_id(ds.dataset_id(), &principal, key));
+    let marker = Triple::new(
+        op.clone(),
+        iri(&format!("{EV}graphProtection")),
+        oxrdf::Literal::new_simple_literal(nonce.to_string()),
+    );
+    let mut triples = vec![marker];
+    if extra_value {
+        triples.push(Triple::new(
+            op.clone(),
+            iri(&format!("{EV}payloadDigest")),
+            oxrdf::Literal::new_simple_literal(sha("projected").to_string()),
+        ));
     }
+    let mut decisions = Vec::new();
+    for (i, triple) in triples.into_iter().enumerate() {
+        let tag = format!("marker-{i}");
+        let input = EvidenceInput {
+            revisions: vec![revision(&tag)],
+            claims: vec![claim("c", Polarity::Positive, triple)],
+            ..Default::default()
+        };
+        let c = claim_of(&propose(&ds, &input));
+        decisions.push(decision(&tag, &c, Disposition::Accepted, None));
+    }
+    review(&ds, &decisions).unwrap();
+    assert_eq!(accepted(&ds).len(), decisions.len());
+    drop(ds);
+
+    let mut swapped = s.clone();
+    swapped.source_records = vec![OUTPUT.into()];
+    swapped.projections = vec![SOURCES.into()];
+    let policy = swapped.policies.get_mut("main").unwrap();
+    policy.output = SOURCES.into();
+    policy.boundary = vec![OUTPUT.into(), CLAIMS.into(), OTHER.into()];
+    legacy_settings(&root, &swapped);
+    let ds = Dataset::open(&root).unwrap();
+    let mut opts = ProposeOptions::new(principal);
+    opts.idempotency_key = Some(key.into());
+    let receipt = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &EvidenceInput {
+            revisions: vec![revision("dual-origin")],
+            ..Default::default()
+        },
+        &opts,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(receipt.operation, op);
+    let record = &receipt.records[0].iri;
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{OUTPUT}> {{ {record} <{EV}availabilityReceipt> {op} }} }}"
+        ))
+        .unwrap()
+    );
+    let history = accepted(&ds);
+    drop(ds);
+    legacy_settings(&root, &s);
 
     let ds = Dataset::open(&root).unwrap();
-    let rec = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
-    assert!(rec.committed);
-    assert!(accepted(&ds).is_empty());
-
     evidence::configure(&ds, &s, &Control::none()).unwrap();
-    let entry = ds
-        .store()
-        .managed_graphs()
-        .unwrap()
-        .unwrap()
-        .owners
-        .get(&OwnerKind::Evidence)
-        .unwrap()
-        .clone();
-    assert_eq!(entry.protections[OUTPUT], legacy_out_nonce);
-    assert!(entry.projection_only.contains(OUTPUT));
+    let registry = ds.store().managed_graphs().unwrap().unwrap();
+    let entry = &registry.owners[&OwnerKind::Evidence];
+    assert_eq!(entry.protections[OUTPUT], nonce);
+    assert!(!entry.projection_only.contains(OUTPUT));
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert_eq!(accepted(&ds), history);
 }

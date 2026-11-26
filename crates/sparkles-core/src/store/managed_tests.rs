@@ -535,6 +535,25 @@ fn an_unenforceable_registry_refuses_writes_and_keeps_reads() {
     }
 }
 
+#[test]
+fn missing_settings_cannot_repair_an_empty_format_4_registry() {
+    let (dir, store) = setup();
+    enable(&store, &[M]);
+    drop(store);
+    let root = dir.path().join("ds");
+    edit(&root, "managed.json", |registry| {
+        registry["format"] = 4.into()
+    });
+    let path = root.join("managed.json");
+    let malformed = std::fs::read(&path).unwrap();
+    std::fs::remove_file(root.join("evidence.json")).unwrap();
+    let store = Store::open(&root, StoreOptions::default()).unwrap();
+    let result = store.enable_managed(OwnerKind::Evidence, entry(&[M], SETTINGS), SETTINGS);
+    assert_eq!(managed_code(result), "managed-unavailable");
+    assert_eq!(std::fs::read(path).unwrap(), malformed);
+    assert!(!root.join("evidence.json").exists());
+}
+
 /// Enable on a closed copy of `setup`'s dataset with a panic at `failpoint`, as a crash
 /// there would stop it, then reopen.
 fn crash_at(failpoint: &'static str, first: &[u8], second: &[u8]) -> (tempfile::TempDir, Store) {
@@ -1181,10 +1200,30 @@ fn projection_only_registry_writes_format_4_upgrades_from_v1_and_works_with_hist
         s.managed_graphs().unwrap().unwrap().owners[&OwnerKind::Evidence].protections["urn:proj"],
         proj_nonce
     );
+    // Removing the last marked graph publishes a format-1 generation whose
+    // predecessor still requires format 2. Reopen and verify the complete lineage.
+    s.detach_managed(OwnerKind::Evidence, "urn:proj").unwrap();
     drop(s);
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();
+    assert_eq!(current["format"], 3);
+    let lineage = &current["configurationHistory"];
+    let dir = root
+        .join("evidence-history")
+        .join(lineage["lineageId"].as_str().unwrap())
+        .join("generations");
+    let generation = |digest: &serde_json::Value| -> serde_json::Value {
+        let hash = digest.as_str().unwrap().strip_prefix("sha256:").unwrap();
+        serde_json::from_slice(&std::fs::read(dir.join(format!("{hash}.json"))).unwrap()).unwrap()
+    };
+    let newest = generation(&lineage["currentGeneration"]);
+    assert_eq!(newest["format"], 1);
+    assert_eq!(generation(&newest["previous"])["format"], 2);
+    crate::check::configuration_history(&root, true, &crate::task::Control::none()).unwrap();
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
 
     // On an activated store, an unknown future format (format 5) refuses open cleanly.
-    let mut future = activated_json;
+    let mut future = current;
     future["format"] = 5.into();
     std::fs::write(
         root.join("managed.json"),

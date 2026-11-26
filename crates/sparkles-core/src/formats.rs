@@ -321,10 +321,10 @@ pub const GENERATION_COMMIT: FileKind = FileKind {
 pub const CONFIGURATION_GENERATION: FileKind = FileKind {
     id: "configuration-generation",
     files: "evidence-history/LINEAGE/generations/SHA256.json",
-    marker: "format 1 and the digest of the unique canonical document",
+    marker: "format and the digest of the unique canonical document. Format 2 records projectionOnly graphs",
     class: Class::Primary,
-    writes: 1,
-    reads: &[1],
+    writes: crate::store::managed_history::GENERATION_FORMAT,
+    reads: &[1, 2],
 };
 
 pub const CONFIGURATION_COVERAGE: FileKind = FileKind {

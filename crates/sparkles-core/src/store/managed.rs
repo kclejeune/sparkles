@@ -363,18 +363,6 @@ impl Store {
             } else {
                 EvidenceGraphRoles::default()
             };
-            let prev_protected_records: Vec<(&str, uuid::Uuid)> = previous
-                .map(|p| {
-                    p.protections
-                        .iter()
-                        .filter(|(g, _)| {
-                            prev_roles.record_roles.contains(g.as_str())
-                                && !p.projection_only.contains(g.as_str())
-                        })
-                        .map(|(g, n)| (g.as_str(), *n))
-                        .collect()
-                })
-                .unwrap_or_default();
             let mut entry = entry;
             let mut protections = BTreeMap::new();
             let mut projection_only = std::collections::BTreeSet::new();
@@ -400,7 +388,6 @@ impl Store {
                         let mark = !self.output_has_published_operation_in_family(
                             g,
                             prev,
-                            &prev_protected_records,
                         );
                         (prev, mark)
                     }
@@ -412,8 +399,7 @@ impl Store {
                             && !self.output_has_published_operation_in_family(
                                 g,
                                 prev,
-                                &prev_protected_records,
-                            ) =>
+                                ) =>
                     {
                         (uuid::Uuid::new_v4(), false)
                     }
@@ -540,33 +526,14 @@ impl Store {
                     "graph <{graph}> is not managed by {owner}"
                 )));
             };
-            // Before removing `graph`'s nonce, upgrade any legacy pre-format-4
-            // dedicated projection output that holds no genuinely published
-            // `ev:Operation` history anywhere in the family into `projection_only`
-            // while preserving its existing protection nonce unchanged. Checking
-            // before removal keeps `graph`'s authenticated supports visible to
-            // `graph_protection_projected_by_support`, preserving active resolution
-            // maps and same-version rival drift guards while keeping genuine
-            // former-record graphs protected.
+            // A legacy record-role detach also upgrades dedicated outputs
+            // whose current protection has no record history in the family.
             if owner == OwnerKind::Evidence
                 && let Some(settings_bytes) = current.settings.get(&OwnerKind::Evidence)
                 && crate::managed::settings_digest(settings_bytes) == entry.settings_digest
             {
                 let roles = evidence_graph_roles(settings_bytes);
                 if roles.record_roles.contains(graph) {
-                    let prev_protected_records: Vec<(String, uuid::Uuid)> = entry
-                        .protections
-                        .iter()
-                        .filter(|(g, _)| {
-                            roles.record_roles.contains(g.as_str())
-                                && !entry.projection_only.contains(g.as_str())
-                        })
-                        .map(|(g, n)| (g.clone(), *n))
-                        .collect();
-                    let prev_record_refs: Vec<(&str, uuid::Uuid)> = prev_protected_records
-                        .iter()
-                        .map(|(g, n)| (g.as_str(), *n))
-                        .collect();
                     let candidates: Vec<(String, uuid::Uuid)> = roles
                         .projection_only
                         .iter()
@@ -579,11 +546,7 @@ impl Store {
                         })
                         .collect();
                     for (out, out_nonce) in candidates {
-                        if !self.output_has_published_operation_in_family(
-                            &out,
-                            out_nonce,
-                            &prev_record_refs,
-                        ) {
+                        if !self.output_has_published_operation_in_family(&out, out_nonce) {
                             entry.projection_only.insert(out);
                         }
                     }
@@ -1049,12 +1012,7 @@ impl Store {
     /// Whether `output` holds any genuinely published `ev:Operation` under its legacy
     /// v4 protection `nonce` on `main` or any listed branch (failing safe to `true` if
     /// any branch is broken or unreadable or if preparation fails).
-    fn output_has_published_operation_in_family(
-        &self,
-        output: &str,
-        nonce: uuid::Uuid,
-        protected_record_graphs: &[(&str, uuid::Uuid)],
-    ) -> bool {
+    fn output_has_published_operation_in_family(&self, output: &str, nonce: uuid::Uuid) -> bool {
         let Ok(preparation) = crate::access::Preparation::new(
             crate::task::Control::none(),
             crate::evidence::resolve::MEMORY_BYTES,
@@ -1066,12 +1024,7 @@ impl Store {
             let snap = store.snapshot();
             let reads = crate::evidence::write::Reads::new(&preparation, &snap);
             reads
-                .has_published_operation_in_output(
-                    output,
-                    Some(nonce),
-                    dataset_id,
-                    protected_record_graphs,
-                )
+                .has_published_operation_in_output(output, Some(nonce), dataset_id)
                 .unwrap_or(true)
         };
         if check_store(self) {
