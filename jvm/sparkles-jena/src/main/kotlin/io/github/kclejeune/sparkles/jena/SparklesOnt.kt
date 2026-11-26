@@ -662,6 +662,8 @@ public data class DlQuery @JvmOverloads public constructor(
     public val answers: List<String> = emptyList(),
     public val limit: Int = 1000,
     public val threads: Int = 0,
+    /** classify by the OWL 2 EL rules alone, as ELK does */
+    public val elOnly: Boolean = false,
 ) {
     init {
         require(limit > 0 && threads >= 0)
@@ -671,6 +673,7 @@ public data class DlQuery @JvmOverloads public constructor(
         j.put("expression", expression)
         j.put("syntax", syntax)
         j.put("reasoning", reasoning)
+        if (elOnly) j.put("elOnly", true)
         if (answers.isNotEmpty()) j.put("answers", JsonArray().also { a -> answers.forEach { a.add(it) } })
         j.put("limit", limit.toLong())
         j.put("threads", threads.toLong())
@@ -701,6 +704,8 @@ public data class ClassifyQuery @JvmOverloads public constructor(
      * true whenever there is one
      */
     public val strict: Boolean = false,
+    /** classify by the OWL 2 EL rules alone, as ELK does */
+    public val elOnly: Boolean = false,
 ) {
     init {
         require(limit > 0 && offset >= 0 && threads >= 0)
@@ -709,6 +714,7 @@ public data class ClassifyQuery @JvmOverloads public constructor(
 
     internal fun into(j: JsonObject) {
         j.put("assertions", assertions)
+        if (elOnly) j.put("elOnly", true)
         about?.let { j.put("about", it) }
         j.put("nodes", nodes)
         j.put("limit", limit.toLong())
@@ -732,6 +738,8 @@ public data class KeptClassificationQuery @JvmOverloads public constructor(
     public val limit: Int = 100,
     public val resultId: String? = null,
     public val languages: List<String> = emptyList(),
+    /** read the kept EL-only classification instead of the default classification */
+    public val elOnly: Boolean = false,
 ) {
     internal fun into(j: JsonObject) {
         require(limit in 1..1000 && offset >= 0)
@@ -741,5 +749,6 @@ public data class KeptClassificationQuery @JvmOverloads public constructor(
         j.put("limit", limit.toLong())
         resultId?.let { j.put("resultId", it) }
         if (languages.isNotEmpty()) j.put("lang", languages.joinToString(","))
+        if (elOnly) j.put("elOnly", true)
     }
 }

@@ -499,7 +499,7 @@ impl PyOntologies {
 
     /// Read an existing kept classification without classifying on a miss. Page
     /// continuations require its `result_id` and exact returned commit as `at`.
-    #[pyo3(signature=(graph=None, *, part="status", about=None, offset=0, limit=100, result_id=None, lang=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    #[pyo3(signature=(graph=None, *, part="status", about=None, offset=0, limit=100, result_id=None, lang=None, el_only=false, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn kept_classification<'py>(
         &self,
@@ -511,6 +511,7 @@ impl PyOntologies {
         limit: usize,
         result_id: Option<&str>,
         lang: Option<&Bound<'py, PyAny>>,
+        el_only: bool,
         imports: bool,
         mode: &str,
         at: Option<&Bound<'py, PyAny>>,
@@ -526,6 +527,7 @@ impl PyOntologies {
         a.insert("limit".into(), json!(limit));
         a.insert("resultId".into(), json!(result_id));
         a.insert("lang".into(), names_json(lang)?);
+        a.insert("elOnly".into(), json!(el_only));
         let j = self.run(py, "keptClassification", a, cancel, timeout, false)?;
         answer(py, j, &[])
     }
@@ -735,13 +737,14 @@ impl PyOntologies {
     /// `complete` is true only when the answer is complete for the whole ontology, and
     /// `strict` raises `UnsupportedError`, with `code` `classification-incomplete`, when
     /// the classifier would leave an axiom out or use one only in part.
-    #[pyo3(signature=(graph=None, *, assertions=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, partial=false, strict=false, expansion=None, projection=None, lang=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    #[pyo3(signature=(graph=None, *, assertions=false, el_only=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, partial=false, strict=false, expansion=None, projection=None, lang=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn classify<'py>(
         &self,
         py: Python<'py>,
         graph: Option<&Bound<'py, PyAny>>,
         assertions: bool,
+        el_only: bool,
         about: Option<&Bound<'py, PyAny>>,
         nodes: bool,
         limit: Option<usize>,
@@ -764,6 +767,7 @@ impl PyOntologies {
         a.remove("inferences");
         a.insert("at".into(), at_json(at)?);
         a.insert("assertions".into(), json!(assertions));
+        a.insert("elOnly".into(), json!(el_only));
         a.insert("partial".into(), json!(partial));
         a.insert("strict".into(), json!(strict));
         a.insert("expansion".into(), json!(expansion));
@@ -820,7 +824,7 @@ impl PyOntologies {
     /// inside OWL 2 EL and the RL rules by demand outside it; `reasoning` (`auto`, `el`
     /// or `rl`) chooses, and the answer's `reasoning` names the engine, whether the
     /// answers are complete and the axioms that can make them incomplete.
-    #[pyo3(signature=(expression, graph=None, *, syntax=None, reasoning="auto", answers=None, limit=None, threads=None, max_derived=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    #[pyo3(signature=(expression, graph=None, *, syntax=None, reasoning="auto", el_only=false, answers=None, limit=None, threads=None, max_derived=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn dl_query<'py>(
         &self,
@@ -829,6 +833,7 @@ impl PyOntologies {
         graph: Option<&Bound<'py, PyAny>>,
         syntax: Option<&str>,
         reasoning: &str,
+        el_only: bool,
         answers: Option<Vec<String>>,
         limit: Option<usize>,
         threads: Option<usize>,
@@ -850,6 +855,7 @@ impl PyOntologies {
         a.insert("expression".into(), e);
         a.insert("syntax".into(), json!(syntax));
         a.insert("reasoning".into(), json!(reasoning));
+        a.insert("elOnly".into(), json!(el_only));
         a.insert("answers".into(), json!(answers));
         a.insert("limit".into(), json!(limit));
         a.insert("threads".into(), json!(threads));

@@ -706,4 +706,74 @@ class OntologyTest {
             assertEquals(listOf("http://ex.org/ann"), r.get("instances").asArray.map { it.asString.value() })
         }
     }
+
+    @Test fun el_only_classifies_queries_and_caches_separately_from_default() {
+        SparklesDatasets.memory().use { ds ->
+            UpdateAction.parseExecute(
+                """PREFIX : <http://ex.org/>
+                   PREFIX owl: <http://www.w3.org/2002/07/owl#>
+                   PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                   INSERT DATA {
+                     :o a owl:Ontology .
+                     :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . :BC a owl:Class .
+                     :r a owl:ObjectProperty .
+                     :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] ,
+                                        [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :C ] .
+                     :BC owl:equivalentClass [ a owl:Class ; owl:intersectionOf ( :B :C ) ] .
+                     [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :BC ] rdfs:subClassOf :D .
+                   }""",
+                ds,
+            )
+            val onto = ds.ontology()
+
+            val full = onto.classify(query = ClassifyQuery(about = "http://ex.org/A"))
+            assertFalse(full.getBoolean("reused"))
+            assertEquals("horn", full.getString("tier"))
+            assertTrue(full.getBoolean("complete"))
+            assertFalse(full.get("classificationSource").asObject.get("producer").asObject.getBoolean("elOnly"))
+            assertTrue(full.get("class").asObject.get("superClasses").asArray.map { it.asString.value() }.contains("http://ex.org/D"))
+
+            val elk = onto.classify(query = ClassifyQuery(about = "http://ex.org/A", elOnly = true))
+            assertFalse(elk.getBoolean("reused"))
+            assertEquals("horn", elk.getString("tier"))
+            assertFalse(elk.getBoolean("complete"))
+            assertTrue(elk.getBoolean("completeForTaken"))
+            assertEquals(1L, elk.get("excludedCount").asNumber.value().toLong())
+            assertTrue(elk.get("classificationSource").asObject.get("producer").asObject.getBoolean("elOnly"))
+            assertFalse(elk.get("class").asObject.get("superClasses").asArray.map { it.asString.value() }.contains("http://ex.org/D"))
+
+            val full2 = onto.classify(query = ClassifyQuery(about = "http://ex.org/A"))
+            assertTrue(full2.getBoolean("reused"))
+            assertEquals(full.getString("resultId"), full2.getString("resultId"))
+
+            val elk2 = onto.classify(query = ClassifyQuery(about = "http://ex.org/A", elOnly = true))
+            assertTrue(elk2.getBoolean("reused"))
+            assertEquals(elk.getString("resultId"), elk2.getString("resultId"))
+
+            val keptFull = onto.keptClassification()
+            assertEquals("available", keptFull.getString("status"))
+            assertFalse(keptFull.get("result").asObject.getBoolean("elOnly"))
+            assertEquals(full.getString("resultId"), keptFull.get("result").asObject.getString("resultId"))
+
+            val keptElk = onto.keptClassification(query = KeptClassificationQuery(elOnly = true))
+            assertEquals("available", keptElk.getString("status"))
+            assertTrue(keptElk.get("result").asObject.getBoolean("elOnly"))
+            assertEquals(elk.getString("resultId"), keptElk.get("result").asObject.getString("resultId"))
+
+            val qHorn = onto.dlQuery(DlQuery("r some (B and C)", reasoning = "el", answers = listOf("subclasses")))
+            assertEquals("el", qHorn.get("reasoning").asObject.getString("engine"))
+            assertFalse(qHorn.get("reasoning").asObject.getBoolean("elOnly"))
+            assertEquals(listOf("http://ex.org/A"), qHorn.get("subclasses").asArray.map { it.asString.value() })
+
+            val qElk = onto.dlQuery(DlQuery("r some (B and C)", answers = listOf("subclasses"), elOnly = true))
+            assertEquals("el", qElk.get("reasoning").asObject.getString("engine"))
+            assertTrue(qElk.get("reasoning").asObject.getBoolean("elOnly"))
+            assertFalse(qElk.get("reasoning").asObject.getBoolean("complete"))
+            assertTrue(qElk.get("subclasses").asArray.isEmpty())
+
+            assertThrows(SparklesInvalidException::class.java) {
+                onto.dlQuery(DlQuery("r some (B and C)", reasoning = "rl", elOnly = true))
+            }
+        }
+    }
 }
