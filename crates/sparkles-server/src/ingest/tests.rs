@@ -5114,9 +5114,11 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
     }
 
     // Subcase B: Moderate-length (~180 B) intermediate C18 renditions across a 40-hop
-    // lineage chain with 120 planted candidates stay within a 2 MiB cap and link `rev1`,
-    // while a tight 140 KiB cap fits any single `decode_term` (~24 KiB) and `record_graphs`
-    // (~65 KiB) yet rejects the accumulated rendition/key copies with 422 incomplete-evidence.
+    // lineage chain with 65 planted (~143 B) candidates stay within a 2 MiB cap and link
+    // `rev1`, while a tight 106 KiB cap lets candidate enumeration (step 3, peak ~96 KiB)
+    // complete comfortably and causes the step 4 40-hop C18 rendition walk (peak ~111 KiB)
+    // to exhaust the cap with 422 incomplete-evidence (verified by counting
+    // `ingest-claims-match-rendition` calls).
     let g_rend = "https://example.org/notes/tight-cap-rendition";
     let rend_sk_framed = json!([
         "ingest-claims-source",
@@ -5135,10 +5137,11 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         )
         .unwrap()
     );
+    let rend_cand_pad = "c".repeat(120);
     let rend_pad = "r".repeat(160);
     let rend_max_encoded_len = format!("<urn:test:long-rend:999:{rend_pad}").len() as u64;
     let rend_decode_peak = rend_max_encoded_len * 128 + 1024;
-    let rend_tight_cap = 140 * 1024;
+    let rend_tight_cap = 106 * 1024;
     assert!(
         rend_decode_peak < rend_tight_cap / 4,
         "single-term decode ({rend_decode_peak} B) must stay far below tight cap ({rend_tight_cap} B)"
@@ -5149,7 +5152,7 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         evidence(&app).await;
         put_org_profile(&app, "default").await;
 
-        // Plant 120 ~180 B candidates in EV_SOURCES *before* ingesting `v1` so that
+        // Plant 65 ~143 B candidates in EV_SOURCES *before* ingesting `v1` so that
         // re-protecting EV_SOURCES rotates the nonce prior to `v1` (leaving `rev1`
         // authenticated under the current nonce). During `v1`, C18 has no prior
         // rendition for `g_rend` so `predecessor_revision` returns before step 3.
@@ -5164,15 +5167,15 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         .await;
         assert_eq!(s, StatusCode::OK);
         let mut ev_ins = format!("INSERT DATA {{ GRAPH <{EV_SOURCES}> {{\n");
-        for i in 0..120 {
+        for i in 0..65 {
             ev_ins.push_str(&format!(
-                "  <urn:test:rcand-rev:{i:03}:{rend_pad}> a <urn:x-sparkles:evidence:SourceRevision> ;\n\
+                "  <urn:test:rcand-rev:{i:03}:{rend_cand_pad}> a <urn:x-sparkles:evidence:SourceRevision> ;\n\
                    <urn:x-sparkles:evidence:sourceKey> \"{rend_sk}\" ;\n\
                    <http://www.w3.org/ns/prov#specializationOf> <{g_rend}> .\n\
-                 <urn:test:rcand-rnd:{i:03}:{rend_pad}> a <urn:x-sparkles:evidence:Rendition> ;\n\
-                   <http://www.w3.org/ns/prov#wasDerivedFrom> <urn:test:rcand-rev:{i:03}:{rend_pad}> ;\n\
-                   <urn:x-sparkles:evidence:availabilityReceipt> <urn:test:rcand-op:{i:03}:{rend_pad}> .\n\
-                 <urn:test:rcand-op:{i:03}:{rend_pad}> <http://www.w3.org/ns/prov#wasAssociatedWith> <urn:test:rcand-who:{i:03}:{rend_pad}> .\n"
+                 <urn:test:rcand-rnd:{i:03}:{rend_cand_pad}> a <urn:x-sparkles:evidence:Rendition> ;\n\
+                   <http://www.w3.org/ns/prov#wasDerivedFrom> <urn:test:rcand-rev:{i:03}:{rend_cand_pad}> ;\n\
+                   <urn:x-sparkles:evidence:availabilityReceipt> <urn:test:rcand-op:{i:03}:{rend_cand_pad}> .\n\
+                 <urn:test:rcand-op:{i:03}:{rend_cand_pad}> <http://www.w3.org/ns/prov#wasAssociatedWith> <urn:test:rcand-who:{i:03}:{rend_cand_pad}> .\n"
             ));
         }
         ev_ins.push_str("} }");
@@ -5229,6 +5232,15 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         let (s, body) = send(&app, upd).await;
         assert!(s.is_success(), "{s} {body}");
 
+        let match_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let match_calls_fp = match_calls.clone();
+        st.get("org").unwrap().store.set_failpoint(
+            "ingest-claims-match-rendition",
+            Some(Arc::new(move |_| {
+                match_calls_fp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+        );
+
         let mut req_v3 = claims_request("# Rend cap v3\n");
         req_v3.graph = Some(g_rend.into());
         req_v3.iri = Some(g_rend.into());
@@ -5236,15 +5248,198 @@ async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memor
         let res = tokio::task::spawn_blocking(move || run_direct(&st2, req_v3))
             .await
             .unwrap();
+        st.get("org")
+            .unwrap()
+            .store
+            .set_failpoint("ingest-claims-match-rendition", None);
+        let reached_hops = match_calls.load(std::sync::atomic::Ordering::SeqCst);
         if expect_ok {
             let v = res.unwrap_or_else(|e| panic!("cap={cap} should succeed: {e}"));
             assert_eq!(v["previousRevision"], rev1, "{v}");
+            assert!(
+                reached_hops >= 41,
+                "2 MiB arm must traverse full 40-hop chain (saw {reached_hops} match_rendition calls)"
+            );
         } else {
             let err = res.expect_err("tight cap must reject overflowing rendition lookup");
             assert_eq!(err["code"], "incomplete-evidence", "{err}");
             assert_eq!(err["status"], 422, "{err}");
+            assert!(
+                reached_hops >= 5,
+                "tight cap must complete step 3 candidate enumeration and enter the step 4 rendition walk (saw {reached_hops} match_rendition calls)"
+            );
         }
     }
+}
+
+/// Production-path copy-site budget regression: drives `claims::match_rendition` directly
+/// after controlled `objects_in_graph` decoding with a drained remaining allowance, so
+/// removing the production `charge_record_key` or `charge_named_node` call inside
+/// `match_rendition` immediately changes the outcome from `422 incomplete-evidence` to
+/// `Ok(vec![])`.
+#[test]
+fn claims_match_rendition_charges_rendition_and_principal_keys_to_cap() {
+    use oxrdf::NamedNode;
+    use sparkles::access::GraphAccess;
+    use sparkles::evidence::RecordKey;
+    use sparkles::evidence::resolve::Resolution;
+    use sparkles::task::Control;
+
+    let ds = sparkles::Dataset::memory();
+    let long_rend = format!("urn:test:prod-rend:{}", "r".repeat(300));
+    let long_who = format!("urn:test:prod-who:{}", "w".repeat(300));
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <urn:g> {{ <urn:s> <urn:p> <{long_rend}> }} }}"
+    ))
+    .unwrap();
+
+    let mut resolution = Resolution::with_memory(Control::none(), 256 * 1024).unwrap();
+    let access = Arc::new(GraphAccess::all());
+    let source_graph = NamedNode::new_unchecked("urn:sources");
+    let principal = NamedNode::new_unchecked("urn:principal:alice");
+    let prov_was_associated_with =
+        NamedNode::new_unchecked("http://www.w3.org/ns/prov#wasAssociatedWith");
+    let control = Control::none();
+    let dataset_id = ds.dataset_id();
+    let mut scans = 100u64;
+    let decoded = resolution
+        .objects_in_graph(
+            "predecessor",
+            &ds,
+            &ds,
+            &access,
+            &NamedNode::new_unchecked("urn:g"),
+            &NamedNode::new_unchecked("urn:s"),
+            &NamedNode::new_unchecked("urn:p"),
+            10,
+            &mut scans,
+        )
+        .unwrap();
+    let rend_node = &decoded.nodes()[0];
+    assert_eq!(rend_node.as_str(), long_rend);
+
+    // 1. With an empty candidate slice, the ONLY allocation inside production
+    //    `match_rendition` is `charge_record_key(rend_iri)`. Draining remaining room
+    //    below `long_rend.len() + 32` must fail with 422 incomplete-evidence; removing
+    //    the production `charge_record_key` call would return `Ok(vec![])`.
+    let mut held = resolution.preparation().reserve(0).unwrap();
+    let avail = resolution.preparation().available_bytes();
+    assert!(
+        avail > 1024,
+        "unexpected low headroom after decode: {avail}"
+    );
+    let drain = resolution.preparation().reserve(avail - 100).unwrap();
+    let err = super::claims::match_rendition(
+        &mut resolution,
+        &mut held,
+        &mut scans,
+        &ds,
+        &ds,
+        &source_graph,
+        &access,
+        &principal,
+        dataset_id,
+        &control,
+        &prov_was_associated_with,
+        &[],
+        rend_node,
+        None,
+    )
+    .err()
+    .expect(
+        "production match_rendition must refuse when remaining room is below rendition key copy",
+    );
+    assert_eq!(err.0["code"], "incomplete-evidence", "{}", err.0);
+    assert_eq!(err.0["status"], 422, "{}", err.0);
+    drop(drain);
+
+    // Freeing 512 B (> long_rend.len() + 32) lets `match_rendition` succeed and release
+    // its temporary rendition-key reservation upon return.
+    let avail2 = resolution.preparation().available_bytes();
+    let drain2 = resolution.preparation().reserve(avail2 - 512).unwrap();
+    let before = resolution.preparation().available_bytes();
+    let ok = super::claims::match_rendition(
+        &mut resolution,
+        &mut held,
+        &mut scans,
+        &ds,
+        &ds,
+        &source_graph,
+        &access,
+        &principal,
+        dataset_id,
+        &control,
+        &prov_was_associated_with,
+        &[],
+        rend_node,
+        None,
+    )
+    .ok()
+    .expect("match_rendition should succeed with room for rendition key");
+    assert!(ok.is_empty());
+    assert_eq!(resolution.preparation().available_bytes(), before);
+    drop(drain2);
+
+    // 2. With a short rendition IRI (~20 B -> 52 B charge) and one candidate whose
+    //    `rend_who` is ~320 B, leaving 150 B lets `charge_record_key` succeed while
+    //    `charge_named_node(&cand.rend_who)` fails with 422 incomplete-evidence.
+    let short_rend = NamedNode::new_unchecked("urn:test:short-rend");
+    let cand = super::claims::LineageCandidate {
+        rev: NamedNode::new_unchecked("urn:test:rev:1"),
+        rev_key: RecordKey::new("urn:test:rev:1").unwrap(),
+        ev_rend: NamedNode::new_unchecked("urn:test:ev-rend:mismatch"),
+        rend_receipt: NamedNode::new_unchecked("urn:test:op:1"),
+        rend_who: NamedNode::new_unchecked(long_who),
+    };
+    let avail3 = resolution.preparation().available_bytes();
+    let drain3 = resolution.preparation().reserve(avail3 - 150).unwrap();
+    let who_err = super::claims::match_rendition(
+        &mut resolution,
+        &mut held,
+        &mut scans,
+        &ds,
+        &ds,
+        &source_graph,
+        &access,
+        &principal,
+        dataset_id,
+        &control,
+        &prov_was_associated_with,
+        std::slice::from_ref(&cand),
+        &short_rend,
+        None,
+    )
+    .err()
+    .expect("production match_rendition must refuse when remaining room is below rend_who copy");
+    assert_eq!(who_err.0["code"], "incomplete-evidence", "{}", who_err.0);
+    assert_eq!(who_err.0["status"], 422, "{}", who_err.0);
+    drop(drain3);
+
+    // Leaving 512 B allows both `charge_record_key` and `charge_named_node` to succeed
+    // and release cleanly when `expected != cand.ev_rend`.
+    let avail4 = resolution.preparation().available_bytes();
+    let _drain4 = resolution.preparation().reserve(avail4 - 512).unwrap();
+    let before4 = resolution.preparation().available_bytes();
+    let ok2 = super::claims::match_rendition(
+        &mut resolution,
+        &mut held,
+        &mut scans,
+        &ds,
+        &ds,
+        &source_graph,
+        &access,
+        &principal,
+        dataset_id,
+        &control,
+        &prov_was_associated_with,
+        std::slice::from_ref(&cand),
+        &short_rend,
+        None,
+    )
+    .ok()
+    .expect("match_rendition should succeed with room for rendition and principal keys");
+    assert!(ok2.is_empty());
+    assert_eq!(resolution.preparation().available_bytes(), before4);
 }
 
 /// Focused copy-site budget regression: after controlled graph decoding (`objects_in_graph`)
@@ -5772,4 +5967,205 @@ async fn claims_source_retry_refuses_ambiguous_dual_content_digest() {
             "case {idx}: moved head with two visible digests must not publish a SourceRevision"
         );
     }
+}
+
+#[tokio::test]
+async fn claims_source_ambiguous_rendition_preserves_recorded_digest() {
+    use base64::Engine;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    put_org_profile(&app, "default").await;
+    put_org_profile(&app, "alt").await;
+    put_org_profile(&app, "moved").await;
+
+    let g = "https://example.org/notes/ambiguous-rendition-crlf";
+    let text_lf = format!("{NOTES}\nCRLF original bytes.\n");
+    let text_crlf = text_lf.replace('\n', "\r\n");
+    let lf_digest = sparkles::evidence::Sha256Digest::of_bytes(
+        text_lf.as_bytes(),
+        &sparkles::task::Control::none(),
+    )
+    .unwrap()
+    .to_string();
+    let crlf_digest = sparkles::evidence::Sha256Digest::of_bytes(
+        text_crlf.as_bytes(),
+        &sparkles::task::Control::none(),
+    )
+    .unwrap()
+    .to_string();
+    assert_ne!(lf_digest, crlf_digest);
+    let orig_b64 = base64::engine::general_purpose::STANDARD.encode(text_crlf.as_bytes());
+
+    let (s, reg) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({
+                "graph": g,
+                "iri": g,
+                "format": "text/markdown",
+                "text": text_lf,
+                "original": orig_b64,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg}");
+    assert_eq!(reg["digest"], crlf_digest, "{reg}");
+
+    // 1. Complete first registered-source claims run in the default profile.
+    let run1 = ingest(&app, claims(json!({ "source": g }))).await;
+    assert_eq!(run1["status"], "done", "{run1}");
+    let rev1 = run1["result"]["revision"].as_str().unwrap().to_string();
+    let op1 = run1["result"]["operation"].as_str().unwrap().to_string();
+
+    let rev_count_query = format!(
+        "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{EV_SOURCES}> {{ ?r a <urn:x-sparkles:evidence:SourceRevision> ; <http://www.w3.org/ns/prov#specializationOf> <{g}> }} }}"
+    );
+    assert_eq!(count(&app, &rev_count_query).await, 1);
+
+    // 2. Add a literal spk:rendition alongside the valid named rendition while leaving
+    //    the named rendition and single valid CRLF spk:contentDigest intact.
+    let upd = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(format!(
+            "INSERT DATA {{ GRAPH <{g}> {{ <{g}> <urn:x-sparkles:rendition> \"extra-literal\" }} }}"
+        )))
+        .unwrap();
+    let (s, body) = send(&app, upd).await;
+    assert!(s.is_success(), "{s} {body}");
+
+    // 3. Re-run in the same profile at a stable head: must preserve the recorded CRLF
+    //    digest, hit the existing idempotency receipt (`already-proposed`), publish no
+    //    second SourceRevision, and never substitute the normalized-text LF digest.
+    let run2 = ingest(&app, claims(json!({ "source": g }))).await;
+    assert_eq!(run2["status"], "done", "{run2}");
+    assert_eq!(run2["result"]["outcome"], "already-proposed", "{run2}");
+    assert_eq!(run2["result"]["operation"], op1, "{run2}");
+    assert_eq!(count(&app, &rev_count_query).await, 1);
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ ?r a <urn:x-sparkles:evidence:SourceRevision> ; <urn:x-sparkles:evidence:contentDigest> \"{lf_digest}\" }} }}"
+            )
+        )
+        .await,
+        "normalized-text digest must never replace the recorded original-byte digest"
+    );
+    assert!(
+        ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev1}> <urn:x-sparkles:evidence:contentDigest> \"{crlf_digest}\" }} }}"
+            )
+        )
+        .await
+    );
+
+    // 4. Running in a second profile at the same stable head must still use the CRLF
+    //    digest and reuse `rev1` via `RecordRef::Existing` with no duplicate revision.
+    let run_alt = ingest(&app, claims(json!({ "source": g, "profile": "alt" }))).await;
+    assert_eq!(run_alt["status"], "done", "{run_alt}");
+    assert_eq!(run_alt["result"]["revision"], rev1, "{run_alt}");
+    assert_eq!(count(&app, &rev_count_query).await, 1);
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ ?r a <urn:x-sparkles:evidence:SourceRevision> ; <urn:x-sparkles:evidence:contentDigest> \"{lf_digest}\" }} }}"
+            )
+        )
+        .await
+    );
+
+    // 5. Ambiguous rendition selection must remain ineligible for a moved-head retry.
+    let st_fp = st.clone();
+    let fired = Arc::new(AtomicUsize::new(0));
+    let fired_fp = fired.clone();
+    st.get("org").unwrap().store.set_failpoint(
+        "ingest-claims-after-extract",
+        Some(Arc::new(move |_| {
+            if fired_fp.fetch_add(1, Ordering::SeqCst) == 0 {
+                let ds = st_fp.get("org").unwrap();
+                ds.dataset
+                    .update("INSERT DATA { GRAPH <urn:unrelated> { <urn:u> <urn:p> \"tick\" } }")
+                    .unwrap();
+            }
+        })),
+    );
+    let req_moved = super::pipeline::Request {
+        dataset: "org".into(),
+        mode: super::pipeline::Mode::Claims,
+        source: Some(g.into()),
+        profile: Some("moved".into()),
+        ..Default::default()
+    };
+    let st2 = st.clone();
+    let err = tokio::task::spawn_blocking(move || run_direct(&st2, req_moved))
+        .await
+        .unwrap()
+        .unwrap_err();
+    st.get("org")
+        .unwrap()
+        .store
+        .set_failpoint("ingest-claims-after-extract", None);
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+    assert_eq!(err["code"], "head-changed", "{err}");
+    assert_eq!(err["status"], 409, "{err}");
+    assert_eq!(count(&app, &rev_count_query).await, 1);
+
+    // 6. Two visible spk:contentDigest values at initial read must be refused before
+    //    extraction rather than substituting the normalized-text hash.
+    let g_dup = "https://example.org/notes/ambiguous-initial-digest";
+    let (s, reg_dup) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({
+                "graph": g_dup,
+                "iri": g_dup,
+                "format": "text/markdown",
+                "text": text_lf,
+                "original": orig_b64,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_dup}");
+    let upd_dup = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(format!(
+            "INSERT DATA {{ GRAPH <{g_dup}> {{ <{g_dup}> <urn:x-sparkles:contentDigest> \"0000000000000000000000000000000000000000000000000000000000000000\" }} }}"
+        )))
+        .unwrap();
+    let (s, body) = send(&app, upd_dup).await;
+    assert!(s.is_success(), "{s} {body}");
+    let req_dup = super::pipeline::Request {
+        dataset: "org".into(),
+        mode: super::pipeline::Mode::Claims,
+        source: Some(g_dup.into()),
+        ..Default::default()
+    };
+    let st3 = st.clone();
+    let err_dup = tokio::task::spawn_blocking(move || run_direct(&st3, req_dup))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err_dup["code"], "conflict", "{err_dup}");
+    assert_eq!(err_dup["status"], 409, "{err_dup}");
+    let dup_rev_count = count(
+        &app,
+        &format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{EV_SOURCES}> {{ ?r a <urn:x-sparkles:evidence:SourceRevision> ; <http://www.w3.org/ns/prov#specializationOf> <{g_dup}> }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(dup_rev_count, 0);
 }

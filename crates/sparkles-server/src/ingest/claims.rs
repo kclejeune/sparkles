@@ -433,14 +433,29 @@ pub(super) fn charge_named_node(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservedDigest {
+    /// Source has exactly one visible `spk:contentDigest` in `c18_graph` and it parses
+    /// as a valid SHA-256 digest.
+    Unique(Sha256Digest),
+    /// Source has no visible `spk:contentDigest`, or a single unparseable value.
+    MissingOrInvalid,
+    /// Source has multiple visible `spk:contentDigest` objects in `c18_graph`.
+    Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObservedSource {
-    /// Source is live in `c18_graph` at `at_commit` with `expected_rendition` as its
-    /// unique visible `spk:rendition`. `unique_digest` is `Some(d)` only when the source
-    /// has exactly one visible `spk:contentDigest` in `c18_graph` and it parses as a
-    /// valid SHA-256 digest; `None` when absent, invalid, or ambiguous.
-    Live { unique_digest: Option<Sha256Digest> },
-    /// Source is missing, unreadable, invalidated, has another rendition, or has multiple
-    /// visible renditions at `at_commit`.
+    /// Source is live in `c18_graph` at `at_commit` and still carries
+    /// `expected_rendition` as a visible `spk:rendition`. `rendition_unique` is true
+    /// only when `expected_rendition` is the sole visible `spk:rendition` object.
+    /// `digest` is observed independently so an extra `spk:rendition` triple at a
+    /// stable head never discards a unique recorded original-byte digest.
+    Live {
+        rendition_unique: bool,
+        digest: ObservedDigest,
+    },
+    /// Source is missing, unreadable, invalidated, or does not carry
+    /// `expected_rendition` at `at_commit`.
     UnavailableOrChanged,
 }
 
@@ -466,7 +481,10 @@ fn observe_source_at_commit(
     ) else {
         return Ok(ObservedSource::UnavailableOrChanged);
     };
-    let Ok(c18_g) = NamedNode::new(c18_graph) else {
+    let (Ok(c18_g), Ok(expected_rend_node)) = (
+        NamedNode::new(c18_graph),
+        NamedNode::new(expected_rendition),
+    ) else {
         return Ok(ObservedSource::UnavailableOrChanged);
     };
     let limits = &r.ctx.server.state.limits;
@@ -518,7 +536,7 @@ fn observe_source_at_commit(
         |term| {
             Ok(matches!(
                 term,
-                Some(Term::NamedNode(n)) if n.as_str() == expected_rendition
+                Some(Term::NamedNode(n)) if n == &expected_rend_node
             ))
         },
     ) {
@@ -526,9 +544,32 @@ fn observe_source_at_commit(
         Err(e) if is_unavailable(&e) => return Ok(ObservedSource::UnavailableOrChanged),
         Err(e) => return Err(resolve_err(e)),
     };
-    if !matches!(rend_match, SingleObject::One(true)) {
-        return Ok(ObservedSource::UnavailableOrChanged);
-    }
+    let rendition_unique = match rend_match {
+        SingleObject::One(true) => true,
+        SingleObject::Many => {
+            let expected_present = match resolution.has_triple(
+                "source",
+                &t.main.dataset,
+                &t.logical.dataset,
+                &access,
+                &c18_g,
+                source,
+                &spk_rendition,
+                &Term::NamedNode(expected_rend_node),
+            ) {
+                Ok(v) => v,
+                Err(e) if is_unavailable(&e) => return Ok(ObservedSource::UnavailableOrChanged),
+                Err(e) => return Err(resolve_err(e)),
+            };
+            if !expected_present {
+                return Ok(ObservedSource::UnavailableOrChanged);
+            }
+            false
+        }
+        SingleObject::None | SingleObject::One(false) => {
+            return Ok(ObservedSource::UnavailableOrChanged);
+        }
+    };
     let digest = match resolution.single_object_in_graph(
         "source",
         &t.main.dataset,
@@ -544,13 +585,15 @@ fn observe_source_at_commit(
             })
         },
     ) {
-        Ok(SingleObject::One(Some(d))) => Some(d),
-        Ok(SingleObject::None | SingleObject::One(None) | SingleObject::Many) => None,
+        Ok(SingleObject::One(Some(d))) => ObservedDigest::Unique(d),
+        Ok(SingleObject::None | SingleObject::One(None)) => ObservedDigest::MissingOrInvalid,
+        Ok(SingleObject::Many) => ObservedDigest::Ambiguous,
         Err(e) if is_unavailable(&e) => return Ok(ObservedSource::UnavailableOrChanged),
         Err(e) => return Err(resolve_err(e)),
     };
     Ok(ObservedSource::Live {
-        unique_digest: digest,
+        rendition_unique,
+        digest,
     })
 }
 
@@ -560,15 +603,16 @@ fn observe_source_at_commit(
 /// returned reservation is dropped.
 fn verify_record(
     res: &mut sparkles::evidence::resolve::Resolution,
-    t: &Target,
+    main: &sparkles::Dataset,
+    logical: &sparkles::Dataset,
     access: &Arc<sparkles::access::GraphAccess>,
     iri: &NamedNode,
     kind: RecordKind,
 ) -> Result<Verify, Failed> {
     match res.record_charged(
         "predecessor",
-        &t.main.dataset,
-        &t.logical.dataset,
+        main,
+        logical,
         Some(access.clone()),
         iri,
         &[kind],
@@ -613,21 +657,139 @@ impl RevisionLink {
     }
 }
 
-struct LineageCandidate {
-    rev: NamedNode,
-    rev_key: RecordKey,
-    ev_rend: NamedNode,
-    rend_receipt: NamedNode,
-    rend_who: NamedNode,
+pub(super) struct LineageCandidate {
+    pub(super) rev: NamedNode,
+    pub(super) rev_key: RecordKey,
+    pub(super) ev_rend: NamedNode,
+    pub(super) rend_receipt: NamedNode,
+    pub(super) rend_who: NamedNode,
 }
 
 #[derive(Clone)]
-struct MatchedRev {
+pub(super) struct MatchedRev {
     c18_rendition: NamedNode,
     iri: NamedNode,
     is_other_principal: bool,
     branch: uuid::Uuid,
     commit: u64,
+}
+
+/// Match a C18 rendition against enumerated candidates, charging rendition-key and
+/// principal copies to the preparation allowance and authenticating both the evidence
+/// Rendition and SourceRevision in `source_graph`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn match_rendition(
+    resolution: &mut sparkles::evidence::resolve::Resolution,
+    held: &mut sparkles::access::Reservation,
+    remaining_scans: &mut u64,
+    main: &sparkles::Dataset,
+    logical: &sparkles::Dataset,
+    source_graph: &NamedNode,
+    access: &Arc<sparkles::access::GraphAccess>,
+    principal: &NamedNode,
+    dataset_id: uuid::Uuid,
+    control: &Control,
+    prov_was_associated_with: &NamedNode,
+    candidates: &[LineageCandidate],
+    rend_iri: &NamedNode,
+    exclude_digest: Option<Sha256Digest>,
+) -> Result<Vec<MatchedRev>, Failed> {
+    let Some((rend_key, _rend_held)) =
+        charge_record_key(resolution.preparation(), rend_iri.as_str())?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut matched = Vec::new();
+    for cand in candidates {
+        resolution.preparation().check().map_err(resolve_err)?;
+        let (who, who_held) = charge_named_node(resolution.preparation(), cand.rend_who.as_str())?;
+        let expected = IdentityNamespace::new(dataset_id, who)
+            .map_err(resolve_err)?
+            .record_id(RecordKind::Rendition, &cand.rev_key, &rend_key, control)
+            .map_err(resolve_err)?;
+        drop(who_held);
+        if expected != cand.ev_rend {
+            continue;
+        }
+        let Verify::Verified(v_rend, v_rend_held) = verify_record(
+            resolution,
+            main,
+            logical,
+            access,
+            &cand.ev_rend,
+            RecordKind::Rendition,
+        )?
+        else {
+            continue;
+        };
+        let rend_ok = v_rend.graph == *source_graph && v_rend.receipt.iri == cand.rend_receipt;
+        drop(v_rend);
+        drop(v_rend_held);
+        if !rend_ok {
+            continue;
+        }
+        let Verify::Verified(v_rev, v_rev_held) = verify_record(
+            resolution,
+            main,
+            logical,
+            access,
+            &cand.rev,
+            RecordKind::SourceRevision,
+        )?
+        else {
+            continue;
+        };
+        if v_rev.graph != *source_graph
+            || (exclude_digest.is_some() && v_rev.content_digest == exclude_digest)
+        {
+            drop(v_rev);
+            drop(v_rev_held);
+            continue;
+        }
+        let whos = resolution
+            .objects_in_graph(
+                "predecessor",
+                main,
+                logical,
+                access,
+                source_graph,
+                &v_rev.receipt.iri,
+                prov_was_associated_with,
+                2,
+                remaining_scans,
+            )
+            .map_err(resolve_err)?;
+        if whos.is_truncated() {
+            return Err(incomplete_lineage());
+        }
+        let is_other_principal = !matches!(whos.nodes(), [w] if w == principal);
+        drop(whos);
+        let v_rev_branch = v_rev.receipt.branch;
+        let v_rev_commit = v_rev.receipt.commit;
+        drop(v_rev);
+        drop(v_rev_held);
+        let rend_copy = resolution
+            .preparation()
+            .copy_string(rend_iri.as_str(), held)
+            .map_err(resolve_err)?;
+        let rev_copy = resolution
+            .preparation()
+            .copy_string(cand.rev.as_str(), held)
+            .map_err(resolve_err)?;
+        held.grow_by(std::mem::size_of::<MatchedRev>() as u64)
+            .map_err(resolve_err)?;
+        matched
+            .try_reserve(1)
+            .map_err(|_| resolve_err(resolution.preparation().exhausted()))?;
+        matched.push(MatchedRev {
+            c18_rendition: NamedNode::new_unchecked(rend_copy),
+            iri: NamedNode::new_unchecked(rev_copy),
+            is_other_principal,
+            branch: v_rev_branch,
+            commit: v_rev_commit,
+        });
+    }
+    Ok(matched)
 }
 
 /// Choose one predecessor from authenticated matches on a single C18 rendition.
@@ -765,8 +927,14 @@ fn select_from_frontier(
                         .map_err(resolve_err)?,
                 );
                 drop(objs);
-                let Verify::Verified(v_next, v_next_held) =
-                    verify_record(resolution, t, access, &next_iri, RecordKind::SourceRevision)?
+                let Verify::Verified(v_next, v_next_held) = verify_record(
+                    resolution,
+                    &t.main.dataset,
+                    &t.logical.dataset,
+                    access,
+                    &next_iri,
+                    RecordKind::SourceRevision,
+                )?
                 else {
                     break;
                 };
@@ -932,7 +1100,8 @@ fn predecessor_revision(
     //    edge or target is masked from the caller.
     if let Verify::Verified(v, v_held) = verify_record(
         &mut resolution,
-        t,
+        &t.main.dataset,
+        &t.logical.dataset,
         &access,
         &new_rev_iri,
         RecordKind::SourceRevision,
@@ -962,7 +1131,8 @@ fn predecessor_revision(
                 && matches!(
                     verify_record(
                         &mut resolution,
-                        t,
+                        &t.main.dataset,
+                        &t.logical.dataset,
                         &access,
                         prev,
                         RecordKind::SourceRevision
@@ -1232,96 +1402,24 @@ fn predecessor_revision(
                            rend_iri: &NamedNode,
                            exclude_digest: Option<Sha256Digest>|
      -> Result<Vec<MatchedRev>, Failed> {
-        let Some((rend_key, _rend_held)) =
-            charge_record_key(resolution.preparation(), rend_iri.as_str())?
-        else {
-            return Ok(Vec::new());
-        };
-        let mut matched = Vec::new();
-        for cand in &candidates {
-            resolution.preparation().check().map_err(resolve_err)?;
-            let (who, who_held) =
-                charge_named_node(resolution.preparation(), cand.rend_who.as_str())?;
-            let expected = IdentityNamespace::new(dataset_id, who)
-                .map_err(resolve_err)?
-                .record_id(RecordKind::Rendition, &cand.rev_key, &rend_key, &control)
-                .map_err(resolve_err)?;
-            drop(who_held);
-            if expected != cand.ev_rend {
-                continue;
-            }
-            let Verify::Verified(v_rend, v_rend_held) =
-                verify_record(resolution, t, &access, &cand.ev_rend, RecordKind::Rendition)?
-            else {
-                continue;
-            };
-            let rend_ok = v_rend.graph == t.source_graph && v_rend.receipt.iri == cand.rend_receipt;
-            drop(v_rend);
-            drop(v_rend_held);
-            if !rend_ok {
-                continue;
-            }
-            let Verify::Verified(v_rev, v_rev_held) = verify_record(
-                resolution,
-                t,
-                &access,
-                &cand.rev,
-                RecordKind::SourceRevision,
-            )?
-            else {
-                continue;
-            };
-            if v_rev.graph != t.source_graph
-                || (exclude_digest.is_some() && v_rev.content_digest == exclude_digest)
-            {
-                drop(v_rev);
-                drop(v_rev_held);
-                continue;
-            }
-            let whos = resolution
-                .objects_in_graph(
-                    "predecessor",
-                    &t.main.dataset,
-                    &t.logical.dataset,
-                    &access,
-                    &t.source_graph,
-                    &v_rev.receipt.iri,
-                    &prov_was_associated_with,
-                    2,
-                    remaining_scans,
-                )
-                .map_err(resolve_err)?;
-            if whos.is_truncated() {
-                return Err(incomplete_lineage());
-            }
-            let is_other_principal = !matches!(whos.nodes(), [w] if w == principal);
-            drop(whos);
-            let v_rev_branch = v_rev.receipt.branch;
-            let v_rev_commit = v_rev.receipt.commit;
-            drop(v_rev);
-            drop(v_rev_held);
-            let rend_copy = resolution
-                .preparation()
-                .copy_string(rend_iri.as_str(), held)
-                .map_err(resolve_err)?;
-            let rev_copy = resolution
-                .preparation()
-                .copy_string(cand.rev.as_str(), held)
-                .map_err(resolve_err)?;
-            held.grow_by(std::mem::size_of::<MatchedRev>() as u64)
-                .map_err(resolve_err)?;
-            matched
-                .try_reserve(1)
-                .map_err(|_| resolve_err(resolution.preparation().exhausted()))?;
-            matched.push(MatchedRev {
-                c18_rendition: NamedNode::new_unchecked(rend_copy),
-                iri: NamedNode::new_unchecked(rev_copy),
-                is_other_principal,
-                branch: v_rev_branch,
-                commit: v_rev_commit,
-            });
-        }
-        Ok(matched)
+        #[cfg(test)]
+        t.main.store.failpoint("ingest-claims-match-rendition");
+        match_rendition(
+            resolution,
+            held,
+            remaining_scans,
+            &t.main.dataset,
+            &t.logical.dataset,
+            &t.source_graph,
+            &access,
+            principal,
+            dataset_id,
+            &control,
+            &prov_was_associated_with,
+            &candidates,
+            rend_iri,
+            exclude_digest,
+        )
     };
 
     // Read all query-visible C18 prov:wasRevisionOf predecessors of `rend` that are
@@ -2106,7 +2204,8 @@ fn publish(
                             new_head,
                         )?,
                         ObservedSource::Live {
-                            unique_digest: Some(d),
+                            rendition_unique: true,
+                            digest: ObservedDigest::Unique(d),
                         } if d == expected_digest
                     );
                     if !still_current {
@@ -2608,7 +2707,7 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     let read_head = read
         .commit
         .unwrap_or_else(|| t.logical.store.snapshot().commit);
-    let observed_source_digest = match observe_source_at_commit(
+    let (revision_digest, observed_source_digest) = match observe_source_at_commit(
         r,
         &t,
         &source_node,
@@ -2616,10 +2715,42 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
         &read.rendition,
         read_head,
     )? {
-        ObservedSource::Live { unique_digest } => unique_digest,
-        ObservedSource::UnavailableOrChanged => None,
+        ObservedSource::Live {
+            rendition_unique,
+            digest: ObservedDigest::Unique(d),
+        } => (d, rendition_unique.then_some(d)),
+        ObservedSource::Live {
+            digest: ObservedDigest::MissingOrInvalid,
+            ..
+        } => (rendition_digest, None),
+        ObservedSource::Live {
+            digest: ObservedDigest::Ambiguous,
+            ..
+        } => {
+            return Err(failed(
+                "conflict",
+                409,
+                "the registered source has multiple visible content digests",
+            ));
+        }
+        ObservedSource::UnavailableOrChanged => {
+            if t.logical.store.snapshot().commit != read_head {
+                return Err(failed(
+                    "head-changed",
+                    409,
+                    "the registered source changed while it was being read",
+                ));
+            }
+            return Err(failed(
+                "unknown-source",
+                404,
+                format!(
+                    "no live source you can read is registered in graph <{}>",
+                    read.graph
+                ),
+            ));
+        }
     };
-    let revision_digest = observed_source_digest.unwrap_or(rendition_digest);
     let key = idempotency_key(
         &t,
         &source_iri,
