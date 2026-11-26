@@ -2377,22 +2377,49 @@ inserted while detached are removed), and inserts every missing vouched triple. 
 decisions or supports were detached and re-protected, prior records no longer
 authenticate, so the output graph is emptied.
 
-On legacy registries a dedicated output can have held a record role under the same
-protection. Before assigning `projectionOnly`, the store checks the family for an
-`ev:Operation` and a record that names it as its `ev:availabilityReceipt`. Both
-must carry the graph's current protection. A legacy withdrawal could remove a
-shared `prov:wasGeneratedBy` triple or other descriptive metadata while leaving
-the receipt intact. A typed write that reuses every record leaves the earlier
-receipts in place. An operation's nine mandatory description triples alone can
-all be projected, even when their supports have since been cleared.
-Reconciliation preserves the graph when it finds record history under the current
-protection. Format 2 records the current owner and nonce for each graph. It has
-no per-triple publication origin or history of graph roles. A projection that
-copies the receipt relationship and protection markers can therefore leave the
-same evidence. The guard preserves that case too. Keyed replay checks the named
-operation's stored key and description. The operation must itself be the receipt
-of an authenticated record in that graph or name an authenticated projection there
-through `prov:used`.
+Before item 581, a format 2 registry could keep the same protection nonce while a
+graph served first as a record graph and then as a projection output. A projected
+triple identical to a published triple occupies the same RDF quad. Withdrawing its
+last support can therefore remove a publication link. Format 2 records the owner
+and nonce but has no per-triple origin or history of graph roles.
+
+On upgrade, the store checks every branch in the family before marking a dedicated
+output as `projectionOnly`. An `ev:Operation` and a record naming it as its
+`ev:availabilityReceipt`, both carrying the current protection, suffice to preserve
+the graph even if a withdrawal removed `prov:wasGeneratedBy`. A projected copy of
+that evidence receives the same protection. A projected operation description alone
+does not establish record history. Format 4 prevents new mixed histories. The writer
+rejects record writes to outputs marked `projectionOnly`. Moving such an output into a
+record role rotates its nonce. A former record graph with surviving receipt evidence
+retains its nonce and reconciliation refuses to replace its contents.
+
+A reconciliation publishes its keyed operation in exactly one supports graph. A retry
+first checks current record-role graphs. When one contains the operation, its payload
+and read-grant checks decide replay. Statements in a legacy output cannot add a
+payload conflict, a read grant or a projection to that receipt.
+
+If the operation is absent from current record-role graphs, replay checks former
+record graphs among the unmarked outputs. A candidate must have record history under
+its current nonce and the named operation's stored key and description for this
+dataset. An unrelated record receipt establishes graph history only. Finding a
+candidate reserves the key even when its original link has disappeared. Replay
+requires one candidate graph, an identifiable branch and commit, a matching payload
+and read access to that graph. It looks for an authenticated projection of the
+requested policy through `prov:wasGeneratedBy` or `prov:used`. The operation can
+name at most one reuse target, and qualifying links must agree on the projection.
+A generating edge must agree with the record's receipt. If neither link identifies
+a projection, replay checks `ev:availabilityReceipt` to recover a created
+projection whose generating edge was withdrawn. A link owned by a live support
+of the output's current review policy cannot identify the publication on its own. After support
+records have been cleared, format 2 cannot distinguish a fully copied publication
+from the original. Both are subject to the same replay checks.
+
+A different payload returns `409 idempotency-conflict`. Ambiguous legacy publishers,
+a missing or ambiguous projection association, or missing or ambiguous receipt
+metadata return `409 immutable-record-conflict`. In particular, a reuse operation
+whose shared `prov:used` edge was withdrawn has no creation receipt to fall back
+on. The refusal preserves the branch head, the old output and the current supports
+graph even if the retry omitted the policy version and the policy has since changed.
 
 In the same atomic commit of the evidence owner, the operation appends a fresh immutable
 `ev:Projection` record to the supports graph, minted from the policy, version, operation

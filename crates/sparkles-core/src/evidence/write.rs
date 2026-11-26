@@ -1928,15 +1928,6 @@ impl<'a> Reads<'a> {
         graph: &str,
         nonce: Option<Uuid>,
     ) -> Result<bool> {
-        self.output_has_receipt(graph, nonce, None)
-    }
-
-    fn output_has_receipt(
-        &self,
-        graph: &str,
-        nonce: Option<Uuid>,
-        named: Option<&NamedNode>,
-    ) -> Result<bool> {
         let Some(nonce) = nonce else {
             return Ok(false);
         };
@@ -1954,37 +1945,23 @@ impl<'a> Reads<'a> {
         ) else {
             return Ok(false);
         };
-        let has_receipt = |op| {
-            let mut found = false;
-            self.for_each_pos_intersection_in_graph(
-                g,
-                &[(receipt, op), (protection, nonce)],
-                |record| {
-                    // Migration preserves ambiguous history. Replay needs a record whose
-                    // own receipt and protection identify this particular publication.
-                    found = named.is_none()
-                        || self.authenticated_record_id(
-                            record, g, nonce, rdf_type, op_class, protection, receipt,
-                        )?;
-                    Ok(!found)
-                },
-            )?;
-            Ok(found)
-        };
-        if let Some(named) = named {
-            let Some(op) = self.preparation.lookup_iri(self.snap, named.as_str())? else {
-                return Ok(false);
-            };
-            return has_receipt(op);
-        }
         let mut found = false;
         self.for_each_pos_intersection_in_graph(
             g,
             &[(rdf_type, op_class), (protection, nonce)],
             |op| {
-                found = self.preparation.with_term(self.snap, op, |term| {
+                if self.preparation.with_term(self.snap, op, |term| {
                     Ok(matches!(term, Some(Term::NamedNode(_))))
-                })? && has_receipt(op)?;
+                })? {
+                    self.for_each_pos_intersection_in_graph(
+                        g,
+                        &[(receipt, op), (protection, nonce)],
+                        |_| {
+                            found = true;
+                            Ok(false)
+                        },
+                    )?;
+                }
                 Ok(!found)
             },
         )?;
@@ -2091,8 +2068,8 @@ impl<'a> Reads<'a> {
             )?)
     }
 
-    /// A keyed operation must have published a record here or used an authenticated
-    /// projection here. A receipt for an unrelated operation proves neither.
+    /// Whether this output has record history and could be the former publisher of
+    /// the keyed operation. Withdrawal of a shared link can leave just its description.
     pub fn has_keyed_operation_in_output(
         &mut self,
         op: &NamedNode,
@@ -2101,27 +2078,13 @@ impl<'a> Reads<'a> {
         nonce: Option<Uuid>,
         dataset_id: Uuid,
     ) -> Result<bool> {
-        if !self.contains(
+        Ok(self.contains(
             op.as_str(),
             &format!("{EV}idempotencyKey"),
             &string(key),
             graph,
-        )? || !self.described_output_operation(graph, nonce, dataset_id, op)?
-        {
-            return Ok(false);
-        }
-        if self.output_has_receipt(graph, nonce, Some(op))? {
-            return Ok(true);
-        }
-        let Some(Term::NamedNode(record)) =
-            self.single(op.as_str(), &format!("{PROV}used"), graph)?
-        else {
-            return Ok(false);
-        };
-        Ok(
-            self.contains(record.as_str(), RDF_TYPE, &ev("Projection").into(), graph)?
-                && self.authenticated(record.as_str(), graph, nonce)?,
-        )
+        )? && self.described_output_operation(graph, nonce, dataset_id, op)?
+            && self.has_published_operation_in_output(graph, nonce)?)
     }
 
     /// Whether the named record bears a receipt for an operation in this graph.

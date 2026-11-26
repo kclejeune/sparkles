@@ -52,6 +52,7 @@ const EV: &str = "urn:x-sparkles:evidence:";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
 const PROV_WAS_REVISION_OF: &str = "http://www.w3.org/ns/prov#wasRevisionOf";
+const PROV_WAS_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
 const PROV_USED: &str = "http://www.w3.org/ns/prov#used";
 
 fn ev(local: &str) -> String {
@@ -537,6 +538,79 @@ impl State<'_> {
             }
         }
         Ok(false)
+    }
+
+    /// A reconciliation publishes in one graph. Prefer its generating or reuse edge.
+    /// A withdrawn generating edge can leave the created record's receipt intact.
+    fn replay_projection(
+        &mut self,
+        op: &NamedNode,
+        policy: &NamedNode,
+        graphs: &[G],
+        output_policy: Option<&PolicyGraphs>,
+    ) -> Result<Option<(NamedNode, G)>> {
+        let receipt = ev("availabilityReceipt");
+        let mut linked = None;
+        for predicate in [PROV_WAS_GENERATED_BY, PROV_USED, &receipt] {
+            if predicate == receipt && linked.is_some() {
+                break;
+            }
+            for g in graphs {
+                let mut held = self.reads.preparation().reserve(0)?;
+                let candidates = if predicate == PROV_USED {
+                    let (mut targets, more) = self.reads.objects_up_to_held(
+                        op.as_str(),
+                        predicate,
+                        g.0.as_str(),
+                        1,
+                        &mut held,
+                    )?;
+                    if more {
+                        return Err(ambiguous_legacy_replay());
+                    }
+                    match targets.pop() {
+                        Some(Term::NamedNode(r)) => vec![r],
+                        _ => Vec::new(),
+                    }
+                } else {
+                    self.subjects_held(
+                        predicate,
+                        &Term::NamedNode(op.clone()),
+                        g,
+                        "projections",
+                        &mut held,
+                    )?
+                };
+                for r in candidates {
+                    if !self.typed(&r, g, RecordKind::Projection)?
+                        || self.iri(&r, &ev("reviewPolicy"), g)?.as_ref() != Some(policy)
+                        || (predicate == PROV_WAS_GENERATED_BY
+                            && self.reads.receipt_of(&r, &g.0)?.as_ref() != Some(op))
+                    {
+                        continue;
+                    }
+                    if let Some(owner) = output_policy {
+                        let pred = NamedNode::new_unchecked(predicate);
+                        let edge = if predicate == PROV_USED {
+                            Triple::new(op.clone(), pred, r.clone())
+                        } else {
+                            Triple::new(r.clone(), pred, op.clone())
+                        };
+                        if self.owned(&edge, owner)? {
+                            continue;
+                        }
+                    }
+                    if linked
+                        .as_ref()
+                        .is_some_and(|(prior, graph)| prior != &r || graph != g)
+                    {
+                        return Err(ambiguous_legacy_replay());
+                    }
+                    linked = Some((r, g.clone()));
+                }
+            }
+        }
+        Ok(linked)
     }
 
     /// All `ev:Projection` records of `p.policy_iri` in `p.supports`, and the subset
@@ -2005,22 +2079,11 @@ fn projection_graph_nonces(settings: &Settings, capability: &ManagedWrite) -> Ve
         .collect()
 }
 
-fn merge_recorded_operation(
-    prev: Option<sparkles_core::evidence::write::RecordedOperation>,
-    this: Option<sparkles_core::evidence::write::RecordedOperation>,
-) -> Option<sparkles_core::evidence::write::RecordedOperation> {
-    match (prev, this) {
-        (None, other) | (other, None) => other,
-        (Some(prev), Some(this)) => Some(sparkles_core::evidence::write::RecordedOperation {
-            authenticated: prev.authenticated && this.authenticated,
-            payload_digest: prev
-                .payload_digest
-                .filter(|d| Some(*d) == this.payload_digest),
-            branch: prev.branch.filter(|b| Some(*b) == this.branch),
-            commit: prev.commit.filter(|c| Some(*c) == this.commit),
-            ended_at: prev.ended_at,
-        }),
-    }
+fn ambiguous_legacy_replay() -> Error {
+    managed(
+        ManagedErrorKind::ImmutableRecordConflict,
+        "the original reconciliation receipt cannot be identified in legacy projection history",
+    )
 }
 
 /// Refuse when a record identity the operation mints already has content in a record
@@ -2633,85 +2696,62 @@ pub fn reconcile_projection_prepared(
             let mut found = state
                 .reads
                 .operation(&probe.operation_iri, &record_graphs)?;
-            let mut published_op_outputs: Vec<G> = Vec::new();
-            for (g, nonce) in &projection_graphs {
-                if state.reads.has_keyed_operation_in_output(
-                    &op_iri,
-                    key,
-                    g.as_str(),
-                    *nonce,
-                    main.dataset_id(),
-                )? {
-                    let copy = state
-                        .reads
-                        .operation(&probe.operation_iri, &[(g.clone(), *nonce)])?;
-                    found = merge_recorded_operation(found, copy);
-                    published_op_outputs.push((g.clone(), *nonce));
+            // Reconciliation writes its operation only to the supports graph. A
+            // record-role copy settles the key before any mixed-history output is read.
+            let mut legacy_publisher = None;
+            if found.is_none() {
+                for (g, nonce) in &projection_graphs {
+                    if state.reads.has_keyed_operation_in_output(
+                        &op_iri,
+                        key,
+                        g.as_str(),
+                        *nonce,
+                        main.dataset_id(),
+                    )? {
+                        if legacy_publisher.is_some() {
+                            return Err(ambiguous_legacy_replay());
+                        }
+                        legacy_publisher = Some((g.clone(), *nonce));
+                    }
+                }
+                if let Some(g) = &legacy_publisher {
+                    found = state.reads.operation(&op_iri, std::slice::from_ref(g))?;
+                    if !found.as_ref().is_some_and(|op| {
+                        op.commit.is_some() && op.branch.is_some() && op.payload_digest.is_some()
+                    }) {
+                        return Err(ambiguous_legacy_replay());
+                    }
                 }
             }
             if let Some((commit, recorded_branch)) = replayed(found, &probe)? {
-                // Preserve keyed refusal semantics above, then enforce caller read
-                // authorization on every graph that published the replayed operation
-                // before exposing any metadata from it.
-                for (g, _) in &record_graphs {
-                    if state.reads.has_operation(op_iri.as_str(), g.as_str())? {
-                        readable_optional(access.as_ref(), g)?;
-                    }
-                }
-                for (g, _) in &published_op_outputs {
-                    readable_optional(access.as_ref(), g)?;
-                }
-                let mut search_graphs: Vec<G> = vec![p.supports.clone()];
-                for (g, nonce) in &record_graphs {
-                    if *g != p.supports.0 {
-                        search_graphs.push((g.clone(), *nonce));
-                    }
-                }
-                for (g, nonce) in &published_op_outputs {
-                    if *g != p.supports.0 {
-                        search_graphs.push((g.clone(), *nonce));
-                    }
-                }
-                let mut linked: Option<(NamedNode, G)> = None;
-                'find_linked: for g in &search_graphs {
-                    let mut receipts_held = preparation.reserve(0)?;
-                    for r in state.subjects_held(
-                        &ev("availabilityReceipt"),
-                        &Term::NamedNode(op_iri.clone()),
-                        g,
-                        "projections",
-                        &mut receipts_held,
-                    )? {
-                        if state.typed(&r, g, RecordKind::Projection)?
-                            && state.reads.contains(
-                                r.as_str(),
-                                &ev("reviewPolicy"),
-                                &Term::NamedNode(p.policy_iri.clone()),
-                                g.0.as_str(),
-                            )?
-                        {
-                            linked = Some((r, g.clone()));
-                            break 'find_linked;
+                let mut publishers = Vec::new();
+                let mut output_policy = None;
+                if let Some(g) = &legacy_publisher {
+                    readable_optional(access.as_ref(), &g.0)?;
+                    publishers.push(g.clone());
+                    for (name, policy) in &settings.policies {
+                        if policy.output == g.0.as_str() {
+                            output_policy = Some(PolicyGraphs::new(name, policy, &capability)?);
+                            break;
                         }
                     }
-                    if let Some(r) = state.iri(&op_iri, PROV_USED, g)?
-                        && state.typed(&r, g, RecordKind::Projection)?
-                        && state.reads.contains(
-                            r.as_str(),
-                            &ev("reviewPolicy"),
-                            &Term::NamedNode(p.policy_iri.clone()),
-                            g.0.as_str(),
-                        )?
-                    {
-                        linked = Some((r, g.clone()));
-                        break 'find_linked;
+                } else {
+                    for g in &record_graphs {
+                        if state.reads.has_operation(op_iri.as_str(), g.0.as_str())? {
+                            readable_optional(access.as_ref(), &g.0)?;
+                            publishers.push(g.clone());
+                        }
                     }
                 }
+                let linked = state.replay_projection(
+                    &op_iri,
+                    &p.policy_iri,
+                    &publishers,
+                    output_policy.as_ref(),
+                )?;
                 let (projection, proj_graph) = match linked {
-                    Some((r, g)) => {
-                        readable_optional(access.as_ref(), &g.0)?;
-                        (r, g)
-                    }
+                    Some(link) => link,
+                    None if legacy_publisher.is_some() => return Err(ambiguous_legacy_replay()),
                     None => {
                         let mut proj_held = preparation.reserve(0)?;
                         let (all_proj, superseded_proj) =
@@ -2742,13 +2782,18 @@ pub fn reconcile_projection_prepared(
                         (proj, p.supports.clone())
                     }
                 };
-                let recorded_version = state
+                let version = state
                     .text(&projection, &ev("policyVersion"), &proj_graph)?
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(policy.version);
-                let recorded_output = state
-                    .iri(&projection, &ev("output"), &proj_graph)?
-                    .unwrap_or_else(|| p.output.0.clone());
+                    .and_then(|v| v.parse().ok());
+                let output = state.iri(&projection, &ev("output"), &proj_graph)?;
+                let (recorded_version, recorded_output) = match (version, output) {
+                    (Some(v), Some(g)) => (v, g),
+                    _ if legacy_publisher.is_some() => return Err(ambiguous_legacy_replay()),
+                    (v, g) => (
+                        v.unwrap_or(policy.version),
+                        g.unwrap_or_else(|| p.output.0.clone()),
+                    ),
+                };
                 let replay_resp_bytes = (op_iri.as_str().len() as u64)
                     .saturating_add(p.policy_iri.as_str().len() as u64)
                     .saturating_add(recorded_output.as_str().len() as u64)

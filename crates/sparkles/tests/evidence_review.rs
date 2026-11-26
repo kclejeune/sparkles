@@ -3219,14 +3219,37 @@ fn ordinary_review_skips_unrelated_unreadable_policy_rows() {
 #[test]
 fn keyed_replay_finds_operation_after_supports_becomes_dedicated_output() {
     for reuse_projection in [false, true] {
-        check_keyed_replay_in_former_supports(reuse_projection);
+        check_keyed_replay_in_former_supports(reuse_projection, None);
     }
 }
 
-fn check_keyed_replay_in_former_supports(reuse_projection: bool) {
+enum LegacyLink {
+    WithdrawGeneration,
+    WithdrawLink,
+    ProjectReceipt,
+}
+
+#[test]
+fn legacy_replay_refuses_a_withdrawn_shared_reuse_link() {
+    check_keyed_replay_in_former_supports(true, Some(LegacyLink::WithdrawLink));
+}
+
+#[test]
+fn legacy_replay_prefers_intact_reuse_link_to_projected_receipt() {
+    check_keyed_replay_in_former_supports(true, Some(LegacyLink::ProjectReceipt));
+}
+
+#[test]
+fn legacy_replay_recovers_created_projection_after_generation_edge_withdrawal() {
+    check_keyed_replay_in_former_supports(false, Some(LegacyLink::WithdrawGeneration));
+}
+
+fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<LegacyLink>) {
     use sparkles::managed::OwnerKind;
 
-    let ds = Dataset::memory();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let ds = Dataset::open(&root).unwrap();
     let decisions2 = "urn:ev:decisions2";
     let supports2 = "urn:ev:supports2";
     let supports3 = "urn:ev:supports3";
@@ -3235,7 +3258,31 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool) {
     s1.decisions.push(decisions2.into());
     s1.supports.push(supports2.into());
     s1.supports.push(supports3.into());
-    evidence::configure(&ds, &s1, &Control::none()).unwrap();
+    let ds = if legacy.is_some() {
+        // The legacy output policy already had a healthy projection before this
+        // graph also began accepting records under its original nonce.
+        let mut original = s1.clone();
+        original.supports.retain(|g| g != SUPPORTS);
+        original.projections.push(SUPPORTS.into());
+        original.policies.get_mut("main").unwrap().supports = supports2.into();
+        let mut other = policy(ConflictMode::Refuse);
+        other.decisions = decisions2.into();
+        other.supports = supports3.into();
+        other.output = SUPPORTS.into();
+        original.policies.insert("other".into(), other);
+        evidence::configure(&ds, &original, &Control::none()).unwrap();
+        assert!(
+            reconcile(&ds, "other", Some(1), &reviewer())
+                .unwrap()
+                .committed
+        );
+        drop(ds);
+        legacy_settings(&root, &s1);
+        Dataset::open(&root).unwrap()
+    } else {
+        evidence::configure(&ds, &s1, &Control::none()).unwrap();
+        ds
+    };
 
     if reuse_projection {
         let a = claim_of(&propose(
@@ -3319,6 +3366,95 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool) {
         .expect("SUPPORTS still protected");
     assert_eq!(nonce_after, nonce_before);
 
+    let ds = if let Some(case) = legacy {
+        drop(ds);
+        let ds = legacy_projection_writer(&root, SUPPORTS);
+        let triples = match case {
+            LegacyLink::WithdrawGeneration => vec![Triple::new(
+                projection.clone(),
+                iri("http://www.w3.org/ns/prov#wasGeneratedBy"),
+                op.clone(),
+            )],
+            LegacyLink::WithdrawLink => vec![Triple::new(
+                op.clone(),
+                iri("http://www.w3.org/ns/prov#used"),
+                projection.clone(),
+            )],
+            LegacyLink::ProjectReceipt => {
+                let shadow = iri("urn:legacy:shadow:projection");
+                use oxrdf::Literal;
+                vec![
+                    Triple::new(
+                        shadow.clone(),
+                        oxrdf::vocab::rdf::TYPE,
+                        iri(&format!("{EV}Projection")),
+                    ),
+                    Triple::new(
+                        shadow.clone(),
+                        iri(&format!("{EV}graphProtection")),
+                        Literal::new_simple_literal(nonce_before.to_string()),
+                    ),
+                    Triple::new(
+                        shadow.clone(),
+                        iri(&format!("{EV}reviewPolicy")),
+                        first.policy.clone(),
+                    ),
+                    Triple::new(
+                        shadow.clone(),
+                        iri(&format!("{EV}availabilityReceipt")),
+                        op.clone(),
+                    ),
+                    Triple::new(
+                        shadow.clone(),
+                        iri(&format!("{EV}policyVersion")),
+                        Literal::new_simple_literal("99"),
+                    ),
+                    Triple::new(
+                        shadow,
+                        iri(&format!("{EV}output")),
+                        iri("urn:legacy:shadow:output"),
+                    ),
+                ]
+            }
+        };
+        let claims = project_legacy_triples(&ds, "other", triples);
+        drop(ds);
+        legacy_settings(&root, &s2);
+        let ds = Dataset::open(&root).unwrap();
+        if matches!(case, LegacyLink::WithdrawLink) {
+            // While live, the support makes even this genuine reuse edge
+            // indistinguishable from a projection of the same quad.
+            let head = ds.store().head_commit().seq;
+            assert_eq!(
+                code(reconcile(&ds, "main", None, &opts)),
+                "immutable-record-conflict"
+            );
+            assert_eq!(ds.store().head_commit().seq, head);
+            withdraw(&ds, &claims[0]);
+            assert!(
+                !ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {link} }} }}"))
+                    .unwrap()
+            );
+            let head = ds.store().head_commit().seq;
+            assert_eq!(
+                code(reconcile(&ds, "main", None, &opts)),
+                "immutable-record-conflict"
+            );
+            assert_eq!(ds.store().head_commit().seq, head);
+            assert!(
+                !ds.ask(&format!("ASK {{ GRAPH <{supports2}> {{ ?s ?p ?o }} }}"))
+                    .unwrap()
+            );
+            return;
+        }
+        if matches!(case, LegacyLink::WithdrawGeneration) {
+            withdraw(&ds, &claims[0]);
+            assert!(!ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {projection} <http://www.w3.org/ns/prov#wasGeneratedBy> {op} }} }}")).unwrap());
+        }
+        ds
+    } else {
+        ds
+    };
     let head = ds.store().head_commit().seq;
 
     // Narrow grants omitting SUPPORTS: payload conflict still returns idempotency-conflict,
@@ -4843,6 +4979,55 @@ fn legacy_settings(root: &std::path::Path, settings: &Settings) {
     std::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
 }
 
+// Allow the fixture's ordinary review to write into a former record graph as the
+// format-2 writer did. Restore format 2 before exercising replay or withdrawal.
+fn legacy_projection_writer(root: &std::path::Path, graph: &str) -> Dataset {
+    let path = root.join("managed.json");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    raw["format"] = 4.into();
+    raw["owners"]["evidence"]["projectionOnly"] = serde_json::json!([graph]);
+    std::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+    Dataset::open(root).unwrap()
+}
+
+fn project_legacy_triples(
+    ds: &Dataset,
+    policy: &str,
+    triples: Vec<Triple>,
+) -> Vec<(NamedNode, Sha256Digest)> {
+    let mut claims = Vec::new();
+    let mut decisions = Vec::new();
+    for (i, triple) in triples.into_iter().enumerate() {
+        let key = format!("legacy-edge-{i}");
+        let c = claim_of(&propose(
+            ds,
+            &EvidenceInput {
+                revisions: vec![revision(&key)],
+                claims: vec![claim("c", Polarity::Positive, triple)],
+                ..Default::default()
+            },
+        ));
+        decisions.push(decision(&key, &c, Disposition::Accepted, None));
+        claims.push(c);
+    }
+    let mut opts = reviewer();
+    opts.if_head = Some(ds.store().head_commit().seq);
+    evidence::review(
+        None,
+        ds,
+        ds,
+        policy,
+        1,
+        &decisions,
+        &opts,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    claims
+}
+
 /// A dataset upgraded from a pre-581 format-2 registry keeps its legacy protection nonces
 /// on dedicated projection outputs without `projectionOnly`. Follow-on projecting reviews,
 /// reconciliation, narrow-grant keyed replay, and supports resets (both retained and
@@ -4852,15 +5037,25 @@ fn legacy_settings(root: &std::path::Path, settings: &Settings) {
 /// graphs protected.
 #[test]
 fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
-    check_legacy_output_replay(false);
+    check_legacy_output_replay(None);
 }
 
 #[test]
 fn legacy_output_with_unrelated_receipt_ignores_projected_key_on_replay() {
-    check_legacy_output_replay(true);
+    check_legacy_output_replay(Some(LegacyRecord::Source));
 }
 
-fn check_legacy_output_replay(mixed_history: bool) {
+#[test]
+fn legacy_replay_ignores_projected_use_of_another_policys_projection() {
+    check_legacy_output_replay(Some(LegacyRecord::Projection));
+}
+
+enum LegacyRecord {
+    Source,
+    Projection,
+}
+
+fn check_legacy_output_replay(mixed_history: Option<LegacyRecord>) {
     use sparkles::managed::OwnerKind;
 
     let decisions2 = "urn:ev:decisions2";
@@ -4886,6 +5081,10 @@ fn check_legacy_output_replay(mixed_history: bool) {
             output: output2.into(),
         },
     );
+
+    if matches!(mixed_history, Some(LegacyRecord::Projection)) {
+        s.supports.push("urn:ev:third-output".into());
+    }
 
     // Seed a persistent dataset with a pre-581 format-2 `managed.json` whose dedicated
     // outputs (`OUTPUT`, `output2`) carry legacy version-4 protection nonces and no
@@ -4965,7 +5164,44 @@ fn check_legacy_output_replay(mixed_history: bool) {
         legacy_out2_nonce,
         keyed_opts.idempotency_key.as_deref(),
     );
-    let ds = if mixed_history {
+    let ds = if matches!(mixed_history, Some(LegacyRecord::Projection)) {
+        drop(ds);
+        let mut swapped = s.clone();
+        swapped.supports.retain(|g| g != "urn:ev:third-output");
+        swapped.projections.push("urn:ev:third-output".into());
+        swapped.supports.push(output2.into());
+        swapped.projections.retain(|g| g != output2);
+        let mut third = swapped.policies.remove("other").unwrap();
+        third.output = "urn:ev:third-output".into();
+        third.supports = output2.into();
+        swapped.policies.insert("third".into(), third);
+        legacy_settings(&root, &swapped);
+        let ds = Dataset::open(&root).unwrap();
+        let third = reconcile(&ds, "third", Some(1), &reviewer()).unwrap();
+        assert!(third.committed);
+        drop(ds);
+        legacy_settings(&root, &s);
+        let ds = legacy_projection_writer(&root, output2);
+        project_legacy_triples(
+            &ds,
+            "other",
+            vec![Triple::new(
+                first.operation.clone(),
+                iri("http://www.w3.org/ns/prov#used"),
+                third.projection.clone(),
+            )],
+        );
+        assert!(
+            ds.ask(&format!(
+                "ASK {{ GRAPH <{output2}> {{ {} <http://www.w3.org/ns/prov#used> {} }} }}",
+                first.operation, third.projection
+            ))
+            .unwrap()
+        );
+        drop(ds);
+        legacy_settings(&root, &s);
+        Dataset::open(&root).unwrap()
+    } else if mixed_history.is_some() {
         drop(ds);
         let mut swapped = s.clone();
         swapped.policies.remove("other");
@@ -5020,7 +5256,7 @@ fn check_legacy_output_replay(mixed_history: bool) {
     assert_eq!(replayed1.projection, first.projection);
     assert_eq!(ds.store().head_commit().seq, head_before_replay);
 
-    if mixed_history {
+    if mixed_history.is_some() {
         return;
     }
 
