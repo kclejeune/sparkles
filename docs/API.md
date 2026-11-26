@@ -13902,7 +13902,8 @@ record or, for a transitive dependent, the assessment it depends on, `dependence
 `target` or `used`, and `depth` is 0 for a direct dependent. Each report entry in
 `reports` is `{report, community, graph, on, dependence, depth}`, where `community` is
 the report's `gr:community` IRI or `null` when absent, `graph` is its guarded reports
-graph, `dependence` is `used`, and `on` and `depth` follow the same rules. Person-edited
+graph, `dependence` is `used`, `on` is the changed record or, for a transitive dependent,
+the assessment or report it depends on, and `depth` is 0 for a direct dependent. Person-edited
 reports linked through `gr:editOf` inherit the edited report's inputs at the same depth,
 while build replacements linked only by `prov:wasRevisionOf` are not followed. Each
 assessment and each report is reported once, at its smallest depth, sorted by depth and

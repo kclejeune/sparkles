@@ -1869,3 +1869,110 @@ graphs = ["{ORG}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}"]
         );
     }
 }
+
+/// Item 810: Router-level HTTP and MCP `claims/dependents` return a higher-level parent
+/// report at `depth: 1` when `transitive: true`, omit it when `transitive: false`, and
+/// keep the entire hierarchy hidden from callers that fail the C22 §6 disclosure guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_dependents_transitive_parent_report_through_http_and_mcp() {
+    let e = Arc::new(env(true));
+    let ds = e.dataset();
+    let a = propose(&ds, "advisory", leads());
+    decide(&ds, &a, Disposition::Accepted, 1);
+
+    let e2 = e.clone();
+    let o =
+        tokio::task::spawn_blocking(move || e2.run(settings(serde_json::json!({})), Mode::Build))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(o.stopped, None, "{o:?}");
+    let leaf = e.report_of("http://ex/x0");
+    let leaf_comm = e.community_of("http://ex/x0");
+
+    // Reuse the real C22 §6 disclosure footprint committed by the build for a higher-level
+    // parent report whose generating activity used `leaf`.
+    let fp_rows = e.rows(&format!(
+        "SELECT ?fp WHERE {{ GRAPH <{REPORTS}> {{ <{leaf}> <{}> ?fp }} }}",
+        gr("disclosure")
+    ));
+    assert_eq!(fp_rows.len(), 1, "{fp_rows:?}");
+    let fp = fp_rows[0][0].trim_matches(['<', '>']).to_string();
+    let parent = "urn:uuid:11111111-2222-3333-4444-555555555555";
+    let parent_act = format!("{parent}#activity");
+    let parent_comm = "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{REPORTS}> {{ \
+         <{parent}> a <{}> ; <{}> <{parent_comm}> ; <{}> <{fp}> ; <{PROV}wasGeneratedBy> <{parent_act}> . \
+         <{parent_act}> a <{PROV}Activity> ; <{PROV}used> <{leaf}> . }} }}",
+        gr("Report"),
+        gr("community"),
+        gr("disclosure"),
+    ))
+    .unwrap();
+
+    // Direct query (`transitive: false`) returns only `leaf` at depth 0.
+    let direct_body =
+        serde_json::json!({ "changed": [a.0.as_str()], "transitive": false }).to_string();
+    let direct = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rhide")),
+            ("content-type", "application/json"),
+        ],
+        &direct_body,
+    )
+    .await;
+    assert_eq!(direct.status, StatusCode::OK, "{}", direct.text());
+    let direct_reports = direct.json()["reports"].as_array().unwrap().clone();
+    assert_eq!(direct_reports.len(), 1, "{direct_reports:?}");
+    assert_eq!(direct_reports[0]["report"], leaf);
+    assert_eq!(direct_reports[0]["community"], leaf_comm);
+    assert_eq!(direct_reports[0]["depth"], 0);
+
+    // Transitive query (`transitive: true`) returns both `leaf` (depth 0) and `parent`
+    // (depth 1, `on: leaf`) via HTTP and MCP for proven reader `rhide`, and nothing for
+    // unproven reader `rnoclaims`.
+    let trans_body =
+        serde_json::json!({ "changed": [a.0.as_str()], "transitive": true }).to_string();
+    let http_proven = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rhide")),
+            ("content-type", "application/json"),
+        ],
+        &trans_body,
+    )
+    .await;
+    assert_eq!(http_proven.status, StatusCode::OK, "{}", http_proven.text());
+    let http_json = http_proven.json();
+    let reps = http_json["reports"].as_array().unwrap();
+    assert_eq!(reps.len(), 2, "{reps:?}");
+    assert_eq!(reps[0]["report"], leaf);
+    assert_eq!(reps[0]["on"], a.0.as_str());
+    assert_eq!(reps[0]["depth"], 0);
+    assert_eq!(reps[1]["report"], parent);
+    assert_eq!(reps[1]["community"], parent_comm);
+    assert_eq!(reps[1]["graph"], REPORTS);
+    assert_eq!(reps[1]["on"], leaf);
+    assert_eq!(reps[1]["dependence"], "used");
+    assert_eq!(reps[1]["depth"], 1);
+
+    let e_mcp = e.clone();
+    let claim_iri = a.0.as_str().to_string();
+    let (mcp_proven, mcp_unproven) = tokio::task::spawn_blocking(move || {
+        let args = serde_json::json!({ "changed": [claim_iri], "transitive": true });
+        (
+            tool_as(&e_mcp.s, "rhide", "find_evidence_dependents", args.clone()),
+            tool_as(&e_mcp.s, "rnoclaims", "find_evidence_dependents", args),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(mcp_proven, http_json);
+    assert_eq!(mcp_unproven["reports"], serde_json::json!([]));
+}
