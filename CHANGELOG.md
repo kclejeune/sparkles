@@ -1322,8 +1322,13 @@ each evaluation child.
   add a public `el_only: bool` field for EL-only (ELK) classification and DL queries
   (roadmap item 694). Callers using `DlQueryRequest::new` or `KeptQuery::default` keep
   their existing defaults; downstream exhaustive struct literals or patterns must include
-  `el_only` or `..`. HTTP, CLI, Python, Node.js and JVM contracts remain backwards
-  compatible.
+  `el_only` or `..`. In the JVM bindings (`io.github.kclejeune.sparkles.jena`),
+  `DlQuery`, `ClassifyQuery` and `KeptClassificationQuery` add `elOnly: Boolean = false`
+  at the end of their primary constructors while preserving pre-694 JVM binary linkage
+  and Java `@JvmOverloads` constructors; Kotlin callers invoking untyped callable
+  references (`::DlQuery`, `q::copy`) without an expected function type and Java source
+  callers of `copy(...)` must pass `elOnly`. HTTP, CLI, Python and Node.js contracts
+  remain backwards compatible.
 - Layered dataset settings responses can return `evidence` as the `kind`.
   Clients that exhaustively handle the former kinds can regenerate their types
   from the updated OpenAPI document. Dataset administrators can declare and lock
