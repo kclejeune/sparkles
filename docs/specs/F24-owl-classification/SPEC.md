@@ -170,24 +170,26 @@ before any context changes, and an unsatisfiable context keeps no map. On `wally
 threads, in alternating runs of 7885a660 against 3afa8c52 that each passed the check against
 a fresh run, the kept index stage of `ore_ont_13482` fell from 423.5 to 347.6 ms and its edit
 from 485.9 to 408.1 ms, 0.68 of a run that starts again, and the edit of `ore_ont_9499` fell
-from 146.6 to 138.6 ms. Items 590 and 664 wait for item 1254, since on `ore_ont_13482`
+from 146.6 to 138.6 ms. Item 590 still waits for item 1254, since on `ore_ont_13482`
 the index build and the checks before it are 0.47 of a run
-that starts again.
+that starts again, while item 664 shipped ahead of item 1254 over the index-comparison path.
 
 Item 664 extends incremental OWL 2 EL classification to edits involving individuals,
 nominals, assertions, keys, context merges, universal roles and conditional worlds. Plain
-EL terminologies without individuals keep the zero-overhead bitset invalidation path of
-item 1256. Strictly EL runs that enter Phase 2 record an acyclic `real_parent` forest for
-`real` reachability, pre-broadcast grounded supports for derived global universal facts,
-per-merge causal context and real-reachability dependencies for `HasKey` merges and
-per-world context, expression, key, named-individual and datatype-checker dependencies for
-cached conditional worlds. Incremental invalidation compares the old and new indexes,
-propagates through backward existential edges, nominal members, real-context nominal
-merges, the `real_parent` forest and `HasKey` dependencies, re-seeds kept contexts that
-retain an alternative real predecessor and reuses unaffected cached conditional worlds
-while replaying sticky datatype-checker rows. A kept run restarts cleanly when a
-previously broadcast global universal fact loses all grounded supports or when a tight
-memory budget refuses the dependency tables, and `Interner::met_individuals` filters
+EL terminologies without individuals continue to take the bitset invalidation path of
+item 1256, adding only an edit-signature check and an inactive modification-bit guard on
+the shared saturation path. Strictly EL runs that enter Phase 2 record an acyclic
+`real_parent` forest for `real` reachability, pre-broadcast grounded supports for derived
+global universal facts, per-merge causal context and real-reachability dependencies for
+`HasKey` merges and per-world context, expression, key, named-individual and
+datatype-checker dependencies for cached conditional worlds. Incremental invalidation
+compares the old and new indexes, propagates through backward existential edges, nominal
+members, real-context nominal merges, the `real_parent` forest and `HasKey` dependencies,
+re-seeds kept contexts that retain an alternative real predecessor and reuses unaffected
+cached conditional worlds while replaying sticky datatype-checker rows. A kept run
+restarts cleanly when a previously broadcast global universal fact loses all grounded
+supports, drops optional tracking to a fresh next run when a tight memory budget or
+shared pool refuses the dependency tables, and uses `Interner::met_individuals` to filter
 removed individuals out of live nominals and `Saturation::describe`. Targeted and
 randomized differential tests in `crates/sparkles-owl/tests/el_incremental_individuals.rs`,
 `tests/classify.rs` and `tests/incremental_sweep.rs` verify exact taxonomy, consistency
