@@ -70,14 +70,18 @@ pub struct Parser<'v> {
 impl<'v> Parser<'v> {
     pub fn new(text: &str, v: &'v Vocabulary) -> Result<Parser<'v>, Error> {
         let toks = lex::tokens(text)?;
-        Ok(Parser {
+        Ok(Self::from_tokens(toks, text.len(), v))
+    }
+
+    pub(super) fn from_tokens(toks: Vec<(Tok, Span)>, len: usize, v: &'v Vocabulary) -> Parser<'v> {
+        Parser {
             end: toks.len(),
             toks,
             pos: 0,
-            len: text.len(),
+            len,
             v,
             depth: 0,
-        })
+        }
     }
 
     /// Reads with `f` and checks that nothing is left.
@@ -285,21 +289,21 @@ impl<'v> Parser<'v> {
         }
     }
 
-    fn class(&mut self) -> Result<Class, Error> {
+    pub(super) fn class(&mut self) -> Result<Class, Error> {
         match self.entity(&[K::Class], "a class")? {
             (Entity::Class(c), _) => Ok(c),
             _ => unreachable!("asked for a class"),
         }
     }
 
-    fn datatype(&mut self) -> Result<Datatype, Error> {
+    pub(super) fn datatype(&mut self) -> Result<Datatype, Error> {
         match self.entity(&[K::Datatype], "a datatype")? {
             (Entity::Datatype(d), _) => Ok(d),
             _ => unreachable!("asked for a datatype"),
         }
     }
 
-    fn object_property(&mut self) -> Result<ObjectProperty, Error> {
+    pub(super) fn object_property(&mut self) -> Result<ObjectProperty, Error> {
         match self.entity(&[K::ObjectProperty], "an object property")? {
             (Entity::ObjectProperty(p), _) => Ok(p),
             _ => unreachable!("asked for an object property"),
@@ -307,7 +311,7 @@ impl<'v> Parser<'v> {
     }
 
     /// An object property expression: a property, `inverse p` or `inverse (p)`.
-    fn ope(&mut self) -> Result<Ope, Error> {
+    pub(super) fn ope(&mut self) -> Result<Ope, Error> {
         if self.eat_word("inverse") {
             let paren = self.peek() == Some(&Tok::LParen);
             if paren {
@@ -975,14 +979,14 @@ impl<'v> Parser<'v> {
         Left::of(es[0].clone())
     }
 
-    fn data_property(&mut self) -> Result<DataProperty, Error> {
+    pub(super) fn data_property(&mut self) -> Result<DataProperty, Error> {
         match self.entity(&[K::DataProperty], "a data property")? {
             (Entity::DataProperty(p), _) => Ok(p),
             _ => unreachable!("asked for a data property"),
         }
     }
 
-    fn annotation_property(&mut self) -> Result<AnnotationProperty, Error> {
+    pub(super) fn annotation_property(&mut self) -> Result<AnnotationProperty, Error> {
         match self.entity(&[K::AnnotationProperty], "an annotation property")? {
             (Entity::AnnotationProperty(p), _) => Ok(p),
             _ => unreachable!("asked for an annotation property"),

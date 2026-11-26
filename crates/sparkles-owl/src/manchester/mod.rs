@@ -39,10 +39,12 @@
 //! assert_eq!((e.span.start, e.span.end), (15, 18));
 //! ```
 
+pub mod doc;
 mod lex;
 mod parse;
 mod render;
 
+pub use doc::{document, parse_document, write_document};
 pub use render::{Renderer, quote_name};
 
 use crate::model::*;
