@@ -2317,6 +2317,14 @@ pub(crate) fn read_bounded_regular_file(
 /// Atomically write `bytes` to `path` via an exclusively created temporary file in the same
 /// directory, refusing symlinks on `path` and its parent directory.
 pub(crate) fn write_atomic_safe(path: &Path, bytes: &[u8]) -> GitResult<()> {
+    write_atomic_with_dir_sync(path, bytes, fsutil::sync_dir)
+}
+
+pub(super) fn write_atomic_with_dir_sync(
+    path: &Path,
+    bytes: &[u8],
+    sync_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> GitResult<()> {
     let parent = effective_parent(path)?;
     let file_name = path.file_name().ok_or_else(|| GitError::UnsafePath {
         path: path.display().to_string(),
@@ -2336,8 +2344,7 @@ pub(crate) fn write_atomic_safe(path: &Path, bytes: &[u8]) -> GitResult<()> {
     temp_path
         .persist(&clean_target)
         .map_err(|e| GitError::io(&clean_target, e.error))?;
-    fsutil::sync_dir(&parent).map_err(|e| GitError::io(&parent, e))?;
-    Ok(())
+    sync_dir(&parent).map_err(|e| GitError::io(&parent, e))
 }
 
 /// Stream serialized bytes to an exclusively created temporary file (`O_CREAT | O_EXCL`)
