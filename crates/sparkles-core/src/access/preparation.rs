@@ -1680,14 +1680,15 @@ impl Reservation {
         Ok(())
     }
     /// Release the allowance above `bytes` once the owner retains no more than that.
-    pub(crate) fn release_to(&mut self, bytes: u64) {
+    pub fn release_to(&mut self, bytes: u64) {
         if bytes < self.bytes {
             self.preparation.release_bytes(self.bytes - bytes);
             self.bytes = bytes;
         }
     }
 
-    pub(crate) fn bytes(&self) -> u64 {
+    /// Bytes currently reserved by this owner.
+    pub fn bytes(&self) -> u64 {
         self.bytes
     }
 

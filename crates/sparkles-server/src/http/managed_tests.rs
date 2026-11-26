@@ -1539,9 +1539,16 @@ async fn projection_reconciliation_over_http() {
 }
 
 /// `POST /$/evidence/{ds}/projections/reconcile` participates in query memory pool
-/// admission: saturating the pool returns `503` with `Retry-After`, normal execution
-/// charges its `Preparation::with_grant` against the pool, and pool usage returns to
-/// zero when the request finishes.
+/// admission and response lifetime accounting:
+/// - saturating the pool returns `503` with `Retry-After`,
+/// - leaving room only for the initial grant forces `Preparation::with_grant` growth to
+///   refuse with retryable `503` and `Retry-After` (proving the preparation uses the pool),
+/// - normal execution over a multi-MiB escaped-JSON diff near a power-of-two growth
+///   boundary grows the grant past the initial grant, retains the response buffer's pool
+///   charge while the HTTP response remains outstanding, and releases all pool credit once
+///   the response body is consumed and dropped,
+/// - a pool smaller than the operation's preparation requirement returns `507` without
+///   `Retry-After`.
 #[tokio::test]
 async fn projection_reconciliation_participates_in_query_memory_pool() {
     let dir = tempfile::tempdir().unwrap();
@@ -1549,10 +1556,13 @@ async fn projection_reconciliation_participates_in_query_memory_pool() {
         dir.path(),
         StoreOptions::default(),
         Duration::from_secs(30),
-        Some(64 << 20),
+        Some(32 << 20),
     )
     .unwrap();
     state.admission.wait = Duration::from_millis(25);
+    // Cap initial grant at 4 MiB so a ~5.6 MiB escaped JSON response must grow the
+    // grant past initial admission and cross a 4 MiB vector growth boundary.
+    state.limits.query_memory_bytes = Some(4 << 20);
     let state = Arc::new(state);
     state.attach("d", DbType::Memory, None).unwrap();
     let ds = state.get("d").unwrap();
@@ -1589,10 +1599,44 @@ async fn projection_reconciliation_participates_in_query_memory_pool() {
     .await;
     assert_eq!(status, StatusCode::OK, "{j}");
 
+    // Detach output, seed 80 stray triples with 10 KiB of `\u0000` (~800 KiB raw,
+    // ~5.6 MiB JSON — past the 4 MiB initial grant and 4 MiB geometric growth boundary),
+    // then re-protect.
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/$/evidence/d/detach",
+        Some("application/json"),
+        &json!({"graph": "urn:ev:accepted"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let escaped = "\\u0000".repeat(10 * 1024);
+    let mut nq = String::with_capacity(80 * (escaped.len() + 64));
+    for i in 0..80 {
+        nq.push_str(&format!(
+            "<urn:stray:{i}> <urn:p> \"{escaped}\" <urn:ev:accepted> .\n"
+        ));
+    }
+    ds.dataset
+        .load_str(&nq, oxrdfio::RdfFormat::NQuads)
+        .unwrap();
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
     let pool = state.catalog.pool().expect("pool configured");
+    let init_grant = crate::server_memory::initial_grant(&state, pool);
+    assert_eq!(init_grant, 4 << 20);
     assert_eq!(pool.granted(), 0);
 
-    // Saturate the pool so admission times out with 503 + Retry-After.
+    // 1. Saturate the pool so admission times out with 503 + Retry-After.
     let hog = pool.try_grant(pool.capacity()).expect("saturate pool");
     let req = Request::builder()
         .method("POST")
@@ -1606,8 +1650,27 @@ async fn projection_reconciliation_participates_in_query_memory_pool() {
     drop(hog);
     assert_eq!(pool.granted(), 0);
 
-    // Release the hog: reconciliation acquires a grant, actively charges the pool
-    // during execution, and releases all pool credit before returning.
+    // 2. Leave room ONLY for the 4 MiB initial grant: admission succeeds, then
+    // Preparation::with_grant must grow past 4 MiB and fail with retryable 503 + Retry-After.
+    // An unpooled Preparation::new would miss this check and succeed with 200 OK.
+    let tight_hog = pool
+        .try_grant(pool.capacity() - init_grant)
+        .expect("leave only initial grant");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(res.headers().contains_key("retry-after"));
+    drop(tight_hog);
+    assert_eq!(pool.granted(), 0);
+
+    // 3. Release the hog: reconciliation grows past the 4 MiB initial grant during
+    // execution, keeps the ~5.6 MiB response buffer charged while the HTTP response
+    // remains outstanding, and releases all pool credit once the body is consumed.
     let observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let observed_hook = observed.clone();
     let pool_hook = pool.clone();
@@ -1617,21 +1680,103 @@ async fn projection_reconciliation_participates_in_query_memory_pool() {
             observed_hook.store(pool_hook.granted(), std::sync::atomic::Ordering::SeqCst);
         })),
     );
-    let (status, j) = call(
-        &app,
-        "POST",
-        "/$/evidence/d/projections/reconcile",
-        Some("application/json"),
-        &json!({"policy": "main"}).to_string(),
-    )
-    .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
     ds.store
         .set_failpoint("evidence-reconcile-before-publish", None);
-    assert_eq!(status, StatusCode::OK, "{j}");
-    assert_eq!(j["committed"], true);
+    assert_eq!(res.status(), StatusCode::OK);
+    let content_len: u64 = res
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .expect("exact content-length header")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(
-        observed.load(std::sync::atomic::Ordering::SeqCst) > 0,
-        "expected reconciliation to hold pool grant during execution"
+        content_len > init_grant,
+        "expected response near >4 MiB growth boundary, got {content_len} bytes"
     );
+    assert!(
+        observed.load(std::sync::atomic::Ordering::SeqCst) > init_grant,
+        "expected Preparation::with_grant to grow pool charge past initial grant"
+    );
+    // While `res` (and its HeldBody) remains outstanding, the pool retains the charge
+    // for the buffered response allocation.
+    let outstanding = pool.granted();
+    assert!(
+        outstanding >= content_len && outstanding > init_grant,
+        "expected outstanding response to retain pool charge >= {content_len}, got {outstanding}"
+    );
+    let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body_bytes.len() as u64, content_len);
+    let j: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(j["committed"], true);
+    assert_eq!(j["changed"]["removed"].as_array().unwrap().len(), 80);
     assert_eq!(pool.granted(), 0);
+
+    // 4. A pool smaller than the operation's preparation requirement admits the initial
+    // grant and then refuses with non-retryable 507 Insufficient Storage (no Retry-After).
+    let small_dir = tempfile::tempdir().unwrap();
+    let small_state = Arc::new(
+        AppState::with_memory(
+            small_dir.path(),
+            StoreOptions::default(),
+            Duration::from_secs(30),
+            Some(4 << 20),
+        )
+        .unwrap(),
+    );
+    small_state.attach("d", DbType::Memory, None).unwrap();
+    let small_ds = small_state.get("d").unwrap();
+    let small_app = router(small_state.clone());
+    let (status, j) = call(
+        &small_app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let (status, j) = call(
+        &small_app,
+        "POST",
+        "/$/evidence/d/detach",
+        Some("application/json"),
+        &json!({"graph": "urn:ev:accepted"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    small_ds
+        .dataset
+        .load_str(&nq, oxrdfio::RdfFormat::NQuads)
+        .unwrap();
+    let (status, j) = call(
+        &small_app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &ev_settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/$/evidence/d/projections/reconcile")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"policy": "main"}).to_string()))
+        .unwrap();
+    let res = small_app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert!(!res.headers().contains_key("retry-after"));
+    assert_eq!(small_state.catalog.pool().unwrap().granted(), 0);
 }

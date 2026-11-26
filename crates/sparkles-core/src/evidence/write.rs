@@ -1240,7 +1240,7 @@ fn literal_formatted_bytes(literal: &Literal, json_escape: bool) -> u64 {
             .saturating_add(1)
             .saturating_add(lang.len() as u64)
             .saturating_add(6);
-    } else if literal.datatype().as_str() != format!("{XSD}string") {
+    } else if literal.datatype() != oxrdf::vocab::xsd::STRING {
         // `^^<datatype>`
         n = n
             .saturating_add(4)

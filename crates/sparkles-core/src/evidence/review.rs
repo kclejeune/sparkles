@@ -463,6 +463,7 @@ pub fn reconciled_projection_record(
     let mut prior: Vec<&NamedNode> = supersedes.iter().collect();
     prior.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     prior.dedup();
+    r.triples.reserve(7 + prior.len());
     for p in prior {
         r.add(prov("wasRevisionOf"), p.clone());
     }

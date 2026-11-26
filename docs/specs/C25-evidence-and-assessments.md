@@ -2379,9 +2379,9 @@ In the same atomic commit of the evidence owner, the operation appends a fresh i
 and three current protection nonces, with `prov:wasRevisionOf` naming every prior
 unsuperseded projection record of the policy. `check_projection` ignores any projection
 record superseded through `prov:wasRevisionOf` by a currently authenticated projection
-record of the same policy, while still refusing an output or conflict-mode change made
-without raising `policy.version` under unchanged protections (including swapping protected
-outputs between policies). Reconciling an already-valid projection whose output matches
+record of the same policy, while still refusing a supports, output or conflict-mode
+change made without raising `policy.version` under unchanged protections (including
+swapping protected outputs or supports graphs between policies). Reconciling an already-valid projection whose output matches
 its vouched supports reuses its active projection record and links the operation to it
 through `prov:used` so keyed replays return the original receipt. Normal reviews,
 withdrawals and policy reads resume after reconciliation.

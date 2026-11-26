@@ -13802,9 +13802,11 @@ with `400` for a malformed request, unknown policy or matching policy, `403` for
 read-only server or missing or masked grants, `409` for `evidence-settings-drift`,
 `policy-changed`, `head-changed`, `idempotency-conflict`, `immutable-record-conflict`
 or `unsupported-profile` while a policy graph is still detached, `422
-incomplete-evidence` beyond the record or memory bounds, and `503` for
-`managed-unavailable`, `projection-unavailable` when the output or conflict mode
-changed without raising `policyVersion`, or `authority-changed`.
+incomplete-evidence` beyond the record or 64 MiB per-operation memory bounds, `503` for
+`managed-unavailable`, `projection-unavailable` when the supports, output or conflict mode
+changed without raising `policyVersion`, `authority-changed`, or temporary query memory
+pool exhaustion (with `Retry-After`), and `507` when the request exceeds the configured
+query memory pool.
 
 ### Evidence identities
 

@@ -596,15 +596,108 @@ pub(super) async fn reconcile_projection(
     match crate::http::blocking(move || reconcile_projection_now(st, name, p, request, execution))
         .await
     {
-        Ok(body) => Ok((
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            body,
+        Ok((len, body)) => Ok((
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                ),
+                (
+                    axum::http::header::CONTENT_LENGTH,
+                    axum::http::HeaderValue::from(len),
+                ),
+            ],
+            axum::body::Body::new(body),
         )
             .into_response()),
         Err(error) if error.audit_code() == "authority-changed" => {
             Ok(crate::auth::routes::authority_changed_response())
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Chunk size yielded per frame from [`HeldBody`] so the reservation and underlying pool
+/// grant stay live while the response stream is consumed.
+const RESPONSE_CHUNK_BYTES: usize = 64 << 10;
+
+/// Buffered JSON response body whose bytes drop before its memory reservation (and
+/// underlying pool grant) is released.
+struct HeldBody {
+    data: axum::body::Bytes,
+    _held: sparkles::access::Reservation,
+}
+
+impl http_body::Body for HeldBody {
+    type Data = axum::body::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.data.is_empty() {
+            return std::task::Poll::Ready(None);
+        }
+        let n = self.data.len().min(RESPONSE_CHUNK_BYTES);
+        let chunk = self.data.split_to(n);
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.data.len() as u64)
+    }
+}
+
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(buf.len()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "response size overflow")
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct ExactVecWriter {
+    buf: Vec<u8>,
+}
+
+impl ExactVecWriter {
+    fn with_exact_capacity(cap: usize) -> Self {
+        let mut buf = Vec::new();
+        buf.reserve_exact(cap);
+        Self { buf }
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+impl std::io::Write for ExactVecWriter {
+    fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+        if src.len() > self.buf.capacity() - self.buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "serialized JSON exceeded reserved response capacity",
+            ));
+        }
+        self.buf.extend_from_slice(src);
+        Ok(src.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -690,7 +783,7 @@ fn reconcile_projection_now(
     p: Principal,
     r: ReconcileProjectionRequest,
     execution: super::Execution,
-) -> ApiResult<Vec<u8>> {
+) -> ApiResult<(usize, HeldBody)> {
     let branch = execution.branch.clone();
     let main = crate::http::main_dataset(&st, &name)?;
     crate::settings::evidence::require_reconciled(&st, &main)?;
@@ -720,7 +813,7 @@ fn reconcile_projection_now(
             sparkles::evidence::resolve::MEMORY_BYTES,
         ),
     }?;
-    let (reconciled, _response_held) = sparkles::evidence::reconcile_projection_prepared(
+    let (reconciled, mut response_held) = sparkles::evidence::reconcile_projection_prepared(
         &prepared.main.dataset,
         &prepared.logical.dataset,
         &r.policy,
@@ -740,6 +833,9 @@ fn reconcile_projection_now(
             error: preview.error(),
         }
     });
+    if let Some(error) = dry_run.as_ref().and_then(|d| d.error.as_deref()) {
+        response_held.grow_by((error.len() as u64).saturating_mul(6).saturating_add(64))?;
+    }
     let response = ReconcileProjectionResponse {
         operation: reconciled.operation.as_str(),
         committed: reconciled.committed,
@@ -759,11 +855,30 @@ fn reconcile_projection_now(
         },
         dry_run,
     };
-    let body = serde_json::to_vec(&response)
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, &response)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    drop(_response_held);
+    let exact_len = counter.0;
+    response_held.grow_to(exact_len as u64)?;
+    let mut writer = ExactVecWriter::with_exact_capacity(exact_len);
+    serde_json::to_writer(&mut writer, &response)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let body = writer.into_vec();
+    let cap = body.capacity() as u64;
+    drop(reconciled);
+    // Keep the exact buffer allocation charged to the preparation (and pool grant)
+    // until the HTTP response body finishes streaming or is dropped.
+    response_held.grow_to(cap)?;
+    response_held.release_to(cap);
     drop(preparation);
-    Ok(body)
+    let len = body.len();
+    Ok((
+        len,
+        HeldBody {
+            data: axum::body::Bytes::from(body),
+            _held: response_held,
+        },
+    ))
 }
 
 type Policy = Option<Arc<sparkles::access::GraphAccess>>;
