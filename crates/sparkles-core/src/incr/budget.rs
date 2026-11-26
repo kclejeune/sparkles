@@ -1036,6 +1036,45 @@ mod tests {
         drop(taken_budget);
     }
 
+    #[test]
+    fn operator_state_returns_active_and_retired_chunks_on_unwind() {
+        use sparkles_budget::{LIVE_SLACK, LIVE_STEP};
+
+        struct Interrupted;
+
+        let pool = QueryPool::new(4 * LIVE_SLACK);
+        let parent = pool.work_parent();
+        let sibling = parent.reserve(17).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let budget = ViewBudget::new(None, Some(parent));
+            budget.try_set_state(LIVE_STEP - 1).unwrap();
+            assert_eq!(pool.granted(), sibling.bytes() + LIVE_STEP);
+            budget.try_set_state(LIVE_STEP).unwrap();
+            assert_eq!(pool.granted(), sibling.bytes() + LIVE_STEP);
+            budget.try_set_state(LIVE_STEP + 1).unwrap();
+            assert_eq!(pool.granted(), sibling.bytes() + 2 * LIVE_STEP);
+
+            budget.try_set_state(2 * LIVE_SLACK + 1).unwrap();
+            let peak = sibling.bytes() + 2 * LIVE_SLACK + LIVE_STEP;
+            assert_eq!(pool.granted(), peak);
+            budget.try_set_state(1).unwrap();
+            assert_eq!(pool.granted(), peak);
+            drop(budget.drain_retired());
+            assert!(pool.granted() < peak);
+            assert!(pool.granted() > sibling.bytes());
+            // The next reduction leaves both active and retired credit to unwind.
+            budget.try_set_state(2 * LIVE_SLACK + 1).unwrap();
+            budget.try_set_state(LIVE_STEP + 1).unwrap();
+            assert_eq!(pool.granted(), peak);
+            std::panic::panic_any(Interrupted);
+        }))
+        .unwrap_err();
+        assert!(panic.is::<Interrupted>());
+        assert_eq!(pool.granted(), sibling.bytes());
+        drop(sibling);
+        assert_eq!(pool.granted(), 0);
+    }
+
     /// Proves that `local_limit` is enforced without a 64 KiB `LIVE_STEP` slack overshoot
     /// when a nested child reserves alongside operator pass bytes.
     #[test]

@@ -101,8 +101,7 @@ used in part. General composition through the top object property, canonical XML
 ill-typed literal semantics and datatypes outside the supported map remain in item 663.
 Item 692 runs the Horn
 rules on ontologies with individuals, functional data properties and top properties, as
-[The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
-shared hierarchical budget remains in item 675.
+[The Horn rules with individuals](#the-horn-rules-with-individuals) describes.
 
 Item 694 exposes EL-only (ELK) classification across the Rust API, HTTP routes, CLI and
 Python, Node.js and JVM bindings and keys the dataset's kept classification cache by
@@ -1169,8 +1168,7 @@ storage remains counted until the last alias drops. Index copies, functional-dat
 groups and key scratch admit overlapping storage before growth. A numeric memory,
 cancellation or deadline refusal stays a typed classification error through the Horn
 and DL paths. It does not turn the value into an opaque atom or a completed fallback.
-This accounting does not charge standalone XML lexical-validation scratch or complete
-the hierarchical owner integration of item 675.
+Standalone XML lexical validation uses its own scratch space.
 A counting allocator measured each run's peak heap within 15% of the estimate on GO,
 ChEBI lite and the largest ORE 2015 EL ontologies. A run that stops before its saturation ends
 drops its contexts, since the next run starts again. In the handle the threads come from the

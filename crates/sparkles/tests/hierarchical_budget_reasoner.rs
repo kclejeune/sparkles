@@ -302,6 +302,115 @@ fn concurrent_query_and_reasoner_overshoot_refused_with_server_memory() {
 }
 
 #[test]
+fn query_reasoning_and_view_share_one_capacity() {
+    use sparkles::incr::views::ViewDef;
+    use sparkles::task::{Control, Progress};
+    use std::time::Duration;
+
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    let wait = Duration::from_secs(10);
+    ds.views()
+        .put("types", ViewDef::table("SELECT ?s ?t WHERE { ?s a ?t }"))
+        .unwrap();
+    ds.views().wait_built("types", wait).unwrap();
+    ds.views().settle(wait);
+    let view_bytes = pool.granted();
+    assert!(view_bytes > 0, "the maintained view must hold credit");
+
+    let grant = Arc::new(pool.empty_grant());
+    let result = ds
+        .query_with(
+            "CONSTRUCT { ?s a ?t } WHERE { ?s a ?t }",
+            &QueryOptions {
+                grant: Some(grant.clone()),
+                max_memory_bytes: Some(32 * MIB),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    let query_bytes = grant.granted();
+    assert!(query_bytes > 0);
+    let siblings = view_bytes + query_bytes;
+    assert_eq!(pool.granted(), siblings);
+
+    let mut ctl = Control::none();
+    let cancel = ctl.cancel.clone();
+    let probe_pool = pool.clone();
+    let probe_grant = grant.clone();
+    ctl.progress = Progress::new(move |_, stage| {
+        if stage != "reasoning" || cancel.is_cancelled() {
+            return;
+        }
+        let admitted = probe_pool.granted();
+        assert!(admitted > siblings, "the active reasoner must hold credit");
+        let used = probe_grant.used();
+        let slack = query_bytes - used;
+        let more = probe_pool.capacity() - admitted + slack + 1;
+        let err = probe_grant.charge(more).unwrap_err();
+        assert!(is_server_memory(&err), "query growth error: {err:?}");
+        assert_eq!(probe_grant.used(), used);
+        assert_eq!(probe_pool.granted(), admitted);
+        cancel.cancel();
+    });
+    let err = ds
+        .reasoning()
+        .run_with(
+            &ReasonRequest {
+                profile: Profile::RdfsSimple,
+                max_memory: Some((32 * MIB) as usize),
+                incremental: false,
+                ..Default::default()
+            },
+            &ctl,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Cancelled), "{err:?}");
+    drop(ctl);
+    assert_eq!(pool.granted(), siblings);
+
+    drop(result);
+    drop(grant);
+    assert_eq!(pool.granted(), view_bytes);
+    assert!(ds.views().delete("types").unwrap());
+    ds.views().settle(wait);
+    ds.views().settle(wait);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn owl_ql_status_uses_the_request_pool_and_releases_its_credit() {
+    use sparkles::reasoning::QuerySetting;
+
+    let (_dir, dataset_pool, ds) = pooled_dataset(16 * MIB);
+    ds.set_query_reasoning(Some(QuerySetting {
+        profile: Some("owl-ql".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let request_pool = QueryPool::new(4 * MIB);
+    let opts = QueryOptions {
+        pool: Some(request_pool.clone()),
+        ..Default::default()
+    };
+    let full = request_pool
+        .work_parent()
+        .reserve(request_pool.capacity())
+        .unwrap();
+    let err = ds.owl_ql_status(&opts).unwrap_err();
+    assert!(is_server_memory(&err), "OWL 2 QL status error: {err:?}");
+    assert_eq!(request_pool.granted(), full.bytes());
+    assert_eq!(dataset_pool.granted(), 0);
+
+    drop(full);
+    assert!(ds.owl_ql_status(&opts).unwrap().is_some());
+    assert_eq!(request_pool.granted(), 0);
+    assert_eq!(dataset_pool.granted(), 0);
+}
+
+#[test]
 fn public_rewritten_and_literal_typings_struct_literals_compile_and_work() {
     use sparkles::reasoning::reasoner::diagnostics::LiteralTypings;
     use sparkles::sparql::reasoning::{

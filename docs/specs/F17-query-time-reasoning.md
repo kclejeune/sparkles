@@ -712,8 +712,8 @@ capabilities and remaining work are described by the spec status and Outcome.
    retained-cache occupancy. Its weighting is 24 bytes per fact, 64 bytes per chunk,
    each local term's byte length plus 40 bytes, and 64 bytes per table. Spare vector
    capacity, cache-key strings, hash-table capacity and exact allocator metadata are
-   not counted. Item 757 covers measuring and calibrating that estimator, while
-   hierarchical live charging remains item 675.
+   not counted. Item 757 covers measuring and calibrating that estimator. Active
+   demand sessions charge live memory to the query pool under item 675.
 8. Lists that rules derive are complete in a lower stage, which derives every list the
    rules give rather than the lists a query reaches. This costs a derivation of all such
    lists for each query that reads one and keeps the answers equal to a fixpoint. Lists

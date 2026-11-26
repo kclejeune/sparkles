@@ -549,10 +549,12 @@ impl Circuit {
         }
     }
 
-    /// Bind this circuit's accounting to `pool` and `parent` before any state is built.
+    /// Bind this circuit's accounting before building state. An explicit parent
+    /// supplies the caller's limits. Otherwise the circuit reserves from the pool.
     pub fn set_pool(&mut self, pool: Option<Arc<QueryPool>>, parent: Option<ParentHandle>) {
+        self.budget
+            .set_parent(parent.or_else(|| pool.as_ref().map(QueryPool::work_parent)));
         self.pool = pool;
-        self.budget.set_parent(parent);
     }
 
     /// Set the circuit's local byte limit (`None`: unlimited locally).

@@ -347,6 +347,43 @@ fn subclass_tbox() -> Tbox {
 }
 
 #[test]
+fn rewrite_releases_credit_on_cancellation_and_unwind() {
+    struct Interrupted;
+
+    let t = subclass_tbox();
+    let query = parse(&format!("PREFIX ex: <{EX}> SELECT ?s {{ ?s a ex:A }}"));
+    let pool = sparkles_core::sparql::pool::QueryPool::new(1 << 20);
+    for unwind in [false, true] {
+        let stop = || {
+            if pool.granted() == 0 {
+                return Ok(());
+            }
+            if unwind {
+                std::panic::panic_any(Interrupted);
+            }
+            Err(sparkles_core::Error::Cancelled)
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rewrite_query_guarded_with_parent(
+                &query,
+                &[],
+                &t,
+                DEFAULT_MAX_UNION,
+                None,
+                Some(pool.work_parent()),
+                &stop,
+            )
+        }));
+        match outcome {
+            Err(panic) if unwind => assert!(panic.is::<Interrupted>()),
+            Ok(Err(sparkles_core::Error::Cancelled)) if !unwind => {}
+            _ => panic!("expected interruption after the rewriter reserved credit"),
+        }
+        assert_eq!(pool.granted(), 0);
+    }
+}
+
+#[test]
 fn temporary_group_backing_capacity_is_admitted() {
     let t = subclass_tbox();
     let query = parse(&format!("PREFIX ex: <{EX}> SELECT ?s {{ ?s a ex:A }}"));

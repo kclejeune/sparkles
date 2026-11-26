@@ -657,6 +657,121 @@ fn explain_whynot_and_analysis_respect_parent_pool_and_return_credit() {
 }
 
 #[test]
+fn materialization_unwind_returns_work_credit() {
+    struct Interrupted;
+
+    let store = Store::in_memory(StoreOptions::default());
+    load_turtle(
+        &store,
+        "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         <urn:A> rdfs:subClassOf <urn:B> . <urn:x> a <urn:A> .",
+    );
+    let pool = QueryPool::new((16 * MIB) as u64);
+    let progress_pool = pool.clone();
+    let opts = crate::ReasonOptions {
+        memory_parent: Some(pool.work_parent()),
+        progress: Some(Arc::new(move |_, stage| {
+            if stage == "reasoning" {
+                assert!(progress_pool.granted() > 0);
+                std::panic::panic_any(Interrupted);
+            }
+        })),
+        ..Default::default()
+    };
+    let commit = store.snapshot().commit;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::materialize(&store, &crate::Profile::RdfsSimple, &opts)
+    }))
+    .unwrap_err();
+    assert!(panic.is::<Interrupted>());
+    assert_eq!(pool.granted(), 0);
+    assert_eq!(store.snapshot().commit, commit);
+}
+
+#[test]
+fn demand_preparation_releases_credit_on_cancellation_and_unwind() {
+    use sparkles_core::sparql::reasoning::{ReasoningProvider, SessionRequest};
+
+    struct Interrupted;
+
+    let store = Store::in_memory(StoreOptions::default());
+    let pool = QueryPool::new((16 * MIB) as u64);
+    let reasoner = crate::query::QueryReasoner::new(
+        crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Inputs::default(),
+    )
+    .unwrap()
+    .with_pool(pool.clone());
+
+    for unwind in [false, true] {
+        let stop_pool = pool.clone();
+        let req = SessionRequest {
+            snap: store.snapshot(),
+            readable: None,
+            stop: Arc::new(move || {
+                if stop_pool.granted() == 0 {
+                    return Ok(());
+                }
+                if unwind {
+                    std::panic::panic_any(Interrupted);
+                }
+                Err(sparkles_core::Error::Cancelled)
+            }),
+            max_memory: None,
+            memory_parent: None,
+            no_cache: true,
+        };
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reasoner.start(req)));
+        match outcome {
+            Err(panic) if unwind => assert!(panic.is::<Interrupted>()),
+            Ok(Err(sparkles_core::Error::Cancelled)) if !unwind => {}
+            _ => panic!("expected interruption after demand preparation reserved credit"),
+        }
+        assert_eq!(pool.granted(), 0);
+    }
+}
+
+#[test]
+fn ontology_analysis_releases_credit_on_cancellation_and_unwind() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Interrupted;
+
+    let pool = QueryPool::new((16 * MIB) as u64);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let analysis = || {
+        let witnesses = crate::analysis::WitnessMap::with_memory_parent(
+            1,
+            Some(MIB),
+            Some(pool.work_parent()),
+            cancel.clone(),
+            None,
+        );
+        let ctx =
+            crate::analysis::AnalysisContext::new(witnesses, Some(MIB), "program".into()).unwrap();
+        ctx.witness(vec!["bound term".into()]).unwrap();
+        assert!(pool.granted() > 0);
+        ctx
+    };
+    let ctx = analysis();
+    cancel.store(true, Ordering::Relaxed);
+    assert!(ctx.witness(vec!["another term".into()]).is_err());
+    drop(ctx);
+    assert_eq!(pool.granted(), 0);
+
+    cancel.store(false, Ordering::Relaxed);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ctx = analysis();
+        std::panic::panic_any(Interrupted);
+    }))
+    .unwrap_err();
+    assert!(panic.is::<Interrupted>());
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
 fn session_payloads_drop_before_parent_credit() {
     use sparkles_budget::MemoryDomain;
     use sparkles_core::sparql::reasoning::{ReasoningProvider, SessionRequest};

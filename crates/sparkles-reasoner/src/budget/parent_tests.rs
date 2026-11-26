@@ -189,3 +189,32 @@ fn charges_inside_parent_credit_do_not_invoke_the_backend() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     b.release(1024);
 }
+
+#[test]
+fn reasoner_shrinks_whole_chunks_and_returns_its_final_reservation() {
+    let step = PARENT_STEP;
+    let pool = QueryPool::new((4 * PARENT_SLACK) as u64);
+    let parent = pool.work_parent();
+    let sibling = parent.reserve(17).unwrap();
+    let budget = Budget::with_parent(None, Some(parent));
+
+    budget.try_charge(step - 1).unwrap();
+    assert_eq!(pool.granted(), sibling.bytes() + step as u64);
+    budget.try_charge(1).unwrap();
+    assert_eq!(pool.granted(), sibling.bytes() + step as u64);
+    budget.try_charge(1).unwrap();
+    assert_eq!(pool.granted(), sibling.bytes() + (2 * step) as u64);
+
+    budget.try_charge(2 * PARENT_SLACK).unwrap();
+    assert_eq!(
+        pool.granted(),
+        sibling.bytes() + (2 * PARENT_SLACK + 2 * step) as u64
+    );
+    budget.release(2 * PARENT_SLACK);
+    assert_eq!(pool.granted(), sibling.bytes() + (2 * step) as u64);
+    budget.release(step + 1);
+    drop(budget);
+    assert_eq!(pool.granted(), sibling.bytes());
+    drop(sibling);
+    assert_eq!(pool.granted(), 0);
+}

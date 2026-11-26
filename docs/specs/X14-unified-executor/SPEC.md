@@ -226,10 +226,20 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's accounting model, mode-neutral kernels and decoding twins have
-shipped, and the hierarchical budget of item 675 remains. Stage 5's
-join-kernel library has shipped, and its other phases follow the
-[plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
+479 of stage 2. Stage 4's accounting model, mode-neutral kernels, decoding twins and
+hierarchical budget have shipped. Stage 5's join-kernel library has shipped, and its other
+phases follow the [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
+
+Item 675 links materialization, demand reasoning, OWL 2 QL rewriting, bounded ontology
+analysis and incremental view circuits to the query pool. A nested reasoner uses the
+query's parent handle, so its reservations also count against the query's local limit.
+Standalone runs and maintained circuits use the pool's work parent. Children grow their
+reservations in 64 KiB chunks and can request the exact shortfall when a rounded
+reservation fails. Dropping a child returns its full reservation after releasing its
+payloads. Retained view versions can outlive the circuit and hold their own credit until
+their last reader drops them. Regression tests hold a live query result, a reasoning run
+and a view together under one pool ceiling and check exact credit return on completion,
+refusal, cancellation and unwind.
 
 Items 678 and 1069 have shipped. The string floors of `string_order_mask` read their keys
 and search for a string's first extension inside the decoding envelope, and a refused
@@ -568,10 +578,9 @@ rather than one cell at a time, and its additional live storage counts against t
 budget. These remain estimated heap charges rather than process RSS limits.
 
 The remaining stage 4 ownership seams are tracked by their own items. Retaining every
-result table under its own lease belongs to the merge phase of item 453, linking the
-reasoner's budgets and incremental views into the query pool belongs to item 675, binding
-result buffers belong to item 1306, strict decoding across all callers belongs to item
-1308 and the post-merge retained-source flip for MCP rendering belongs to item 1305.
+result table under its own lease belongs to the merge phase of item 453. Binding result
+buffers belong to item 1306, strict decoding across all callers belongs to item 1308
+and the post-merge retained-source flip for MCP rendering belongs to item 1305.
 
 MCP tool results, resource reads and completed task results keep their rendered payloads
 and encoded wire frames under query memory credit until the transport writes or drops

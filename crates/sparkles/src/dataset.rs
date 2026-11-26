@@ -683,11 +683,12 @@ impl Dataset {
             .as_ref()
             .filter(|a| !a.reads_all())
             .map(|a| a.bound(&snap));
-        let memory_parent = opts
-            .grant
-            .as_ref()
-            .map(|g| g.memory_parent())
-            .or_else(|| self.inner.pool.as_ref().map(|p| p.work_parent()));
+        let memory_parent = opts.grant.as_ref().map(|g| g.memory_parent()).or_else(|| {
+            opts.pool
+                .as_ref()
+                .or(self.inner.pool.as_ref())
+                .map(|p| p.work_parent())
+        });
         let req = SessionRequest {
             snap,
             readable,

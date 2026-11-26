@@ -299,6 +299,46 @@ fn query_and_view_cannot_overshoot_shared_pool_together() {
 }
 
 #[test]
+fn standalone_circuit_uses_its_pool_without_an_explicit_parent() {
+    use sparkles_core::incr::circuit::Circuit;
+    use sparkles_core::incr::compile::compile;
+    use sparkles_core::task::Control;
+
+    let store = Store::in_memory(StoreOptions::default());
+    load_rows(&store, "pooled", 2000, 32);
+    let query = sparql::parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
+    let pool = QueryPool::new(4 * MB);
+
+    let mut circuit = Circuit::new(compile(&query, None).unwrap(), None);
+    circuit.set_pool(Some(pool.clone()), None);
+    let occupied = pool.work_parent().reserve(pool.capacity() - KB).unwrap();
+    let err = circuit
+        .build(store.snapshot(), &Control::none())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory
+    ));
+    drop(circuit);
+    assert_eq!(pool.granted(), occupied.bytes());
+    drop(occupied);
+    assert_eq!(pool.granted(), 0);
+
+    let mut circuit = Circuit::new(compile(&query, None).unwrap(), None);
+    circuit.set_pool(Some(pool.clone()), None);
+    circuit.build(store.snapshot(), &Control::none()).unwrap();
+    assert!(pool.granted() > 0);
+    let control = Control::none();
+    control.cancel.cancel();
+    assert!(matches!(
+        circuit.build(store.snapshot(), &control),
+        Err(Error::Cancelled)
+    ));
+    drop(circuit);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
 fn window_and_path_views_enforce_pool_cap_mid_pass() {
     let store = Store::in_memory(StoreOptions::default());
     let mut nt = String::new();
