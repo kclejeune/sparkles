@@ -102,13 +102,14 @@ impl Saturation {
         let individuals = || -> Vec<(Ex, NamedIndividual)> {
             let mut out: Vec<(Ex, NamedIndividual)> = self
                 .interner
-                .individuals
+                .met_individuals
                 .iter()
                 .enumerate()
-                .filter_map(|(i, n)| {
+                .filter(|(_, m)| **m)
+                .filter_map(|(i, _)| {
                     self.interner
                         .get(&Node::Nominal(i as u32))
-                        .map(|e| (e, n.clone()))
+                        .map(|e| (e, self.interner.individuals[i].clone()))
                 })
                 .filter(|(e, _)| self.named_subsumers(*e).is_some())
                 .collect();
@@ -119,6 +120,12 @@ impl Saturation {
                         continue;
                     }
                     if let Some(id) = self.interner.individuals.get(rep)
+                        && self
+                            .interner
+                            .met_individuals
+                            .get(id as usize)
+                            .copied()
+                            .unwrap_or(false)
                         && let Some(e) = self.interner.get(&Node::Nominal(id))
                         && self.named_subsumers(e).is_some()
                     {
