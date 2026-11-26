@@ -409,7 +409,7 @@ impl Record {
 
 /// The digest of a record's immutable content: the sorted digests of its triples,
 /// framed under the record kind, without the large values listed in [`LARGE`].
-pub(super) fn record_digest(
+pub fn record_digest(
     kind: RecordKind,
     triples: &[Triple],
     control: &Control,
@@ -1205,6 +1205,10 @@ impl<'a> Reads<'a> {
         self.preparation
     }
 
+    pub(super) fn snap(&self) -> &'a Snapshot {
+        self.snap
+    }
+
     pub fn new(preparation: &'a Preparation, snap: &'a Snapshot) -> Self {
         Reads {
             preparation,
@@ -1239,7 +1243,7 @@ impl<'a> Reads<'a> {
         Self::new(preparation, view.snapshot())
     }
 
-    fn id(&mut self, iri: &str) -> Result<Option<Id>> {
+    pub(super) fn id(&mut self, iri: &str) -> Result<Option<Id>> {
         if let Some(id) = self.ids.get(iri) {
             return Ok(*id);
         }
@@ -1422,7 +1426,7 @@ impl<'a> Reads<'a> {
         Ok(if v.len() == 1 { v.pop() } else { None })
     }
 
-    fn one_string(&mut self, s: &str, p: &str, g: &str) -> Result<Option<String>> {
+    pub(super) fn one_string(&mut self, s: &str, p: &str, g: &str) -> Result<Option<String>> {
         Ok(match self.one(s, p, g)? {
             Some(Term::Literal(l)) if l.datatype().as_str() == format!("{XSD}string") => {
                 Some(l.value().to_string())
@@ -1431,7 +1435,7 @@ impl<'a> Reads<'a> {
         })
     }
 
-    fn has_subject(&mut self, s: &str, g: &str) -> Result<bool> {
+    pub(super) fn has_subject(&mut self, s: &str, g: &str) -> Result<bool> {
         let (Some(s), Some(g)) = (self.id(s)?, self.id(g)?) else {
             return Ok(false);
         };
@@ -1444,7 +1448,7 @@ impl<'a> Reads<'a> {
         Ok(found)
     }
 
-    fn is_operation(&mut self, op: &str, g: &str) -> Result<bool> {
+    pub(super) fn is_operation(&mut self, op: &str, g: &str) -> Result<bool> {
         let (Some(s), Some(p), Some(o), Some(g)) = (
             self.id(op)?,
             self.id(RDF_TYPE)?,
@@ -1457,14 +1461,14 @@ impl<'a> Reads<'a> {
     }
 
     /// The single protection nonce that `s` carries in `g`.
-    fn nonce_of(&mut self, s: &str, g: &str) -> Result<Option<Uuid>> {
+    pub(super) fn nonce_of(&mut self, s: &str, g: &str) -> Result<Option<Uuid>> {
         Ok(self
             .one_string(s, &format!("{EV}graphProtection"), g)?
             .and_then(|v| Uuid::parse_str(&v).ok()))
     }
 
     /// Whether `op` is an operation in `g` whose marker is `nonce`.
-    fn marked(&mut self, op: &str, g: &str, nonce: Option<Uuid>) -> Result<bool> {
+    pub(super) fn marked(&mut self, op: &str, g: &str, nonce: Option<Uuid>) -> Result<bool> {
         let Some(nonce) = nonce else {
             return Ok(false);
         };

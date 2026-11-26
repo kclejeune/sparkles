@@ -300,6 +300,7 @@ fn replay(
     plan: &Plan,
     found: write::RecordedOperation,
     reads: &mut Reads<'_>,
+    records: &[ProtectedGraph],
     branch: Uuid,
     hold: Option<Uuid>,
 ) -> Result<Proposed> {
@@ -318,10 +319,31 @@ fn replay(
             "this idempotency key was used with a different payload",
         ));
     }
+    // Every record of the replayed payload must still be present and authenticated in
+    // its graph with the same digest (for instance, after a partial re-authentication
+    // following a detach where another record of the operation was left unvouched).
     // A record whose receipt is another operation was already published when the
     // first operation ran, which reported it as existing.
     let mut existing = Vec::with_capacity(plan.records.len());
     for r in &plan.records {
+        match reads.record(&r.iri, records)? {
+            ExistingRecord::Present {
+                graph,
+                digest,
+                authenticated: true,
+            } if graph == r.graph && digest == Some(r.digest) => {}
+            _ => {
+                return Err(managed(
+                    ManagedErrorKind::ImmutableRecordConflict,
+                    format!(
+                        "{}: <{}> from replayed operation <{}> is not authenticated",
+                        r.key,
+                        r.iri.as_str(),
+                        plan.operation_iri.as_str()
+                    ),
+                ));
+            }
+        }
         existing.push(
             reads
                 .receipt_of(&r.iri, &r.graph)?
@@ -596,7 +618,7 @@ pub fn propose(
         let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
         let mut reads = Reads::new(&preparation, &head);
         if let Some(found) = reads.operation(&plan.operation_iri, &records)? {
-            return replay(&plan, found, &mut reads, branch, hold);
+            return replay(&plan, found, &mut reads, &records, branch, hold);
         }
     }
     // The caller's reads decide every reference, before anything is written.
@@ -676,7 +698,7 @@ pub fn propose(
     if options.idempotency_key.is_some()
         && let Some(found) = reads.operation(&plan.operation_iri, &records)?
     {
-        return replay(&plan, found, &mut reads, branch, hold);
+        return replay(&plan, found, &mut reads, &records, branch, hold);
     }
     // An identity already published with equal content is not written again. Any other
     // content under the identity, or content that is not an authenticated record, is
