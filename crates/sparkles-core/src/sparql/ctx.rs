@@ -970,7 +970,8 @@ pub struct Ctx {
     pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
-    /// Bytes of `local` currently covered by `self.retained` (mutated under `local.write()`).
+    /// Bytes of `local` currently covered by retained context credit (mutated under
+    /// `local.write()`).
     local_retained: AtomicU64,
     values: ValueCache,
     floors: FloorCache,
@@ -2148,37 +2149,47 @@ impl Ctx {
         }
     }
 
-    /// Retain `bytes` of query-local state by transferring already-admitted credit out of
-    /// `source` without releasing it back to the pool first. Any excess above `bytes`
-    /// stays on `source` to be released once temporary growth buffers have freed.
+    /// Retain `bytes` of query-local state by consuming spare `self.retained` headroom
+    /// first and keeping any remainder permanently charged directly out of `source`
+    /// without releasing it back to the pool. Never advances `self.retained.charge.reserved`,
+    /// preserving the `StepReservation` invariant (`reserved >= used`) against concurrent
+    /// `retain_bytes` callers. Any excess above `bytes` stays on `source` to be released
+    /// once temporary growth buffers have freed.
     fn retain_from_charge(&self, bytes: u64, source: &Charge<'_>) {
         if bytes == 0 {
             return;
         }
         debug_assert!(source.belongs_to(self));
         debug_assert!(source.bytes() >= bytes);
-        let mut owner = self.retained.charge.grow.lock();
-        let used = self.retained.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
-        let reserved = self.retained.charge.reserved.load(Ordering::Acquire);
-        let transfer = used.saturating_sub(reserved).min(bytes);
-        if transfer > 0 {
-            let id = source.owner.get();
-            debug_assert!(
-                owner.is_none() || id.is_none() || *owner == id,
-                "one owner of a reservation"
-            );
-            if owner.is_none() {
-                *owner = id;
+        let from_spare = {
+            let _grow = self.retained.charge.grow.lock();
+            let reserved = self.retained.charge.reserved.load(Ordering::Acquire);
+            let mut claimed = 0u64;
+            if self
+                .retained
+                .used
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    let take = bytes.min(reserved.saturating_sub(cur));
+                    if take == 0 {
+                        None
+                    } else {
+                        claimed = take;
+                        Some(cur + take)
+                    }
+                })
+                .is_err()
+            {
+                claimed = 0;
             }
-            let remaining = source.bytes.get() - transfer;
+            claimed
+        };
+        let direct = bytes - from_spare;
+        if direct > 0 {
+            let remaining = source.bytes.get() - direct;
             source.bytes.set(remaining);
             if remaining == 0 {
                 source.disarm();
             }
-            self.retained
-                .charge
-                .reserved
-                .store(reserved + transfer, Ordering::Release);
         }
     }
 
@@ -5918,5 +5929,131 @@ mod charge_tests {
         assert_eq!(grant.used(), 0);
         drop(grant);
         assert_eq!(pool.granted(), 0);
+    }
+
+    /// `retain_from_charge` never advances `self.retained.charge.reserved`, so concurrent
+    /// `retain_bytes` calls cannot mistake directly-retained bytes for `StepReservation`
+    /// headroom and skip charging past `mem_limit`.
+    #[test]
+    fn retain_from_charge_preserves_step_reservation_invariant_under_concurrency() {
+        let store = Store::in_memory(StoreOptions::default());
+
+        // 1. Deterministic A < B interleaving (16 KiB retain_bytes pauses before
+        // `grow_reservation`, 60 KiB `retain_from_charge` completes under a 64 KiB cap):
+        // `grow_reservation` must refuse rather than observing `used_a <= reserved`.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 64 << 10;
+            let used_a = ctx.retained.used.fetch_add(16 << 10, Ordering::AcqRel) + (16 << 10);
+            assert!(!ctx.retained.charge.covers(used_a));
+
+            let src = ctx.charge(60 << 10).unwrap();
+            ctx.retain_from_charge(60 << 10, &src);
+            drop(src);
+
+            let res = ctx.grow_reservation(&ctx.retained.charge, used_a, u64::MAX, true);
+            assert!(
+                res.is_err(),
+                "16 KiB retain_bytes must refuse when 60 KiB is already retained under 64 KiB cap"
+            );
+            ctx.retained.used.fetch_sub(16 << 10, Ordering::AcqRel);
+            assert!(
+                ctx.retained.charge.reserved() >= ctx.retained.used.load(Ordering::Acquire),
+                "reserved ({}) must stay >= used ({})",
+                ctx.retained.charge.reserved(),
+                ctx.retained.used.load(Ordering::Acquire)
+            );
+            assert_eq!(ctx.live_bytes(), 60 << 10);
+        }
+
+        // 2. Deterministic A > B interleaving (60 KiB retain_bytes pauses before
+        // `grow_reservation`, 16 KiB `retain_from_charge` completes): under 64 KiB cap it
+        // must refuse; under 128 KiB cap it must charge all 60 KiB on top of the 16 KiB.
+        for (limit, expect_ok) in [(64 << 10, false), (128 << 10, true)] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit;
+            let used_a = ctx.retained.used.fetch_add(60 << 10, Ordering::AcqRel) + (60 << 10);
+
+            let src = ctx.charge(16 << 10).unwrap();
+            ctx.retain_from_charge(16 << 10, &src);
+            drop(src);
+
+            let res = ctx.grow_reservation(&ctx.retained.charge, used_a, u64::MAX, true);
+            assert_eq!(res.is_ok(), expect_ok);
+            if res.is_err() {
+                ctx.retained.used.fetch_sub(60 << 10, Ordering::AcqRel);
+            } else {
+                assert!(
+                    ctx.live_bytes() >= (76 << 10),
+                    "live bytes ({}) must cover both 60 KiB and 16 KiB",
+                    ctx.live_bytes()
+                );
+            }
+            assert!(ctx.retained.charge.reserved() >= ctx.retained.used.load(Ordering::Acquire));
+            assert!(ctx.live_bytes() <= limit);
+        }
+
+        // 3. Existing spare headroom in `self.retained` is reused without changing
+        // `reserved`, while only the overflow stays permanently charged out of `source`.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 16 << 20;
+            assert!(ctx.retain_bytes(16 << 10));
+            let reserved_before = ctx.retained.charge.reserved();
+            assert!(reserved_before > (16 << 10));
+            let spare = reserved_before - (16 << 10);
+            let want = spare + (12 << 10);
+            let src = ctx.charge(want + (4 << 10)).unwrap();
+            ctx.retain_from_charge(want, &src);
+            drop(src);
+            assert_eq!(ctx.retained.charge.reserved(), reserved_before);
+            assert_eq!(ctx.retained.used.load(Ordering::Acquire), reserved_before);
+            assert_eq!(ctx.live_bytes(), reserved_before + (12 << 10));
+        }
+
+        // 4. Multi-threaded stress test: concurrent `retain_bytes` and
+        // `intern_key_checked` under a tight budget preserve `reserved >= used` and
+        // `live_bytes <= mem_limit`.
+        for trial in 0..8usize {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 96 << 10;
+            let ctx = Arc::new(raw);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|s| {
+                let c1 = ctx.clone();
+                let b1 = barrier.clone();
+                s.spawn(move || {
+                    b1.wait();
+                    for _ in 0..32 {
+                        if !c1.retain_bytes(4 << 10) {
+                            break;
+                        }
+                    }
+                });
+                let c2 = ctx.clone();
+                let b2 = barrier.clone();
+                s.spawn(move || {
+                    b2.wait();
+                    for i in 0..32usize {
+                        let key = format!("<urn:t{trial}:{i}:{}>", "x".repeat(2048));
+                        if c2.intern_key_checked(key.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            });
+            assert!(
+                ctx.retained.charge.reserved() >= ctx.retained.used.load(Ordering::Acquire),
+                "trial {trial}: reserved ({}) < used ({})",
+                ctx.retained.charge.reserved(),
+                ctx.retained.used.load(Ordering::Acquire)
+            );
+            assert!(
+                ctx.live_bytes() <= ctx.mem_limit,
+                "trial {trial}: live bytes ({}) exceeded mem_limit ({})",
+                ctx.live_bytes(),
+                ctx.mem_limit
+            );
+        }
     }
 }

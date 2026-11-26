@@ -2006,6 +2006,47 @@ fn eager_service_refuses_escaped_token_scratch_and_late_buffered_bindings() {
         matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
         "expected Memory BudgetExceeded for comma-preceded long-prefix escaped link, got {err:?}"
     );
+
+    // 5. Missing-colon malformed plain-ASCII value (3,000 B) in the first 4 KiB read
+    // refuses under a 6 KiB eager budget before `LowLevelJsonParser` clones it into
+    // `buffered_event`.
+    let missing_colon = format!(r#"{{"head":{{"x" "{}"}}}}"#, "m".repeat(3_000)).into_bytes();
+    let ep_colon = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(missing_colon.clone())])
+    }));
+    let q_colon = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_colon.url);
+    let tight_colon = QueryOptions {
+        max_memory_bytes: Some(6 << 10),
+        ..opts()
+    };
+    let err = eager(&snap, &q_colon, &tight_colon).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for missing-colon plain-ASCII error copy, got {err:?}"
+    );
+
+    // 6. Valid 1,000-level nested array head extension fits in one 4 KiB read and stays
+    // within `nesting::MAX_ELEMENTS`, but refuses under a 4,608-byte eager budget once
+    // parser `state_stack` growth pushes live memory past the budget.
+    let nested_head = format!(
+        r#"{{"head":{{"ext":{}0{},"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+        "[".repeat(1_000),
+        "]".repeat(1_000),
+    )
+    .into_bytes();
+    let ep_nested = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(nested_head.clone())])
+    }));
+    let q_nested = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_nested.url);
+    let tight_nested = QueryOptions {
+        max_memory_bytes: Some(4_608),
+        ..opts()
+    };
+    let err = eager(&snap, &q_nested, &tight_nested).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+        "expected Memory BudgetExceeded for deeply nested head extension, got {err:?}"
+    );
 }
 
 /// Whitespace compaction never turns a misplaced UTF-8 BOM after leading spaces into a
