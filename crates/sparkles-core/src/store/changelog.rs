@@ -100,6 +100,7 @@ fn observe_changelog_read(event: ChangeLogReadEvent) {
 
 use super::diff::{Keys, QuadKey};
 use super::*;
+use crate::budgeted::{BudgetControl, Control, FnMutControl, Unlimited};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -280,22 +281,59 @@ struct SettingsFile {
 }
 
 pub(crate) fn read_settings(root: &Path) -> Result<ChangeLogSettings> {
-    match std::fs::read(root.join(CHANGE_LOG_FILE)) {
-        Ok(b) => {
-            let mut v: serde_json::Value = serde_json::from_slice(&b)
-                .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
-            crate::formats::check_settings(CHANGE_LOG_FILE, &v)?;
-            // a file without the member is format 1
-            if let Some(o) = v.as_object_mut() {
-                o.entry("format").or_insert(1.into());
-            }
-            let f: SettingsFile = serde_json::from_value(v)
-                .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
-            Ok(f.settings)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ChangeLogSettings::default()),
-        Err(e) => Err(e.into()),
+    read_settings_with(root, &mut Unlimited)
+}
+
+/// Read `changelog.json` under `control`. Under [`Unlimited`], all accounting compiles
+/// away; under an accounting carrier, temporary path, file, and JSON buffers are charged
+/// and released before returning.
+pub(crate) fn read_settings_with<C: BudgetControl>(
+    root: &Path,
+    control: &mut C,
+) -> Result<ChangeLogSettings> {
+    let start = control.used();
+    if C::ACCOUNTS {
+        control.charge(
+            (root.as_os_str().len() as u64)
+                .saturating_mul(4)
+                .saturating_add(2048),
+        )?;
     }
+    let result = (|| {
+        let bytes = match control.read_file(&root.join(CHANGE_LOG_FILE)) {
+            Ok(bytes) => bytes,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ChangeLogSettings::default());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut raw: crate::store::cold::Loaded<serde_json::Value> =
+            control.json(&bytes, CHANGE_LOG_FILE)?;
+        if raw
+            .value
+            .get("format")
+            .is_some_and(|value| !value.is_null() && !value.is_number())
+        {
+            return Err(Error::Corrupt(
+                "changelog.json: format is not a version".into(),
+            ));
+        }
+        crate::formats::check_settings(CHANGE_LOG_FILE, &raw.value)?;
+        // a file without the member is format 1
+        if let Some(object) = raw.value.as_object_mut() {
+            object.entry("format").or_insert(1.into());
+        }
+        let file: SettingsFile = control.value(raw.value, CHANGE_LOG_FILE)?;
+        control.check(0)?;
+        Ok(file.settings)
+    })();
+    if C::ACCOUNTS {
+        control.release(control.used() - start);
+    }
+    result.and_then(|value| {
+        control.check(0)?;
+        Ok(value)
+    })
 }
 
 fn write_settings(root: &Path, s: &ChangeLogSettings) -> Result<()> {
@@ -471,7 +509,7 @@ fn put_str(out: &mut Vec<u8>, s: Option<&str>) {
 }
 
 /// A bounds-checked reader of a record body.
-struct Cur<'a> {
+pub(super) struct Cur<'a> {
     b: &'a [u8],
     i: usize,
 }
@@ -502,18 +540,95 @@ impl<'a> Cur<'a> {
         }
         None
     }
-
-    fn str(&mut self) -> Option<Option<Arc<str>>> {
-        let n = self.varint()? as usize;
-        let s = std::str::from_utf8(self.bytes(n)?).ok()?;
-        Some((!s.is_empty()).then(|| Arc::from(s)))
-    }
 }
 
 fn crc32(b: &[u8]) -> u32 {
-    let mut c = flate2::Crc::new();
-    c.update(b);
-    c.sum()
+    crc32_with(b, &Unlimited).expect("unlimited crc32 cannot fail")
+}
+
+/// Compute CRC-32 under `control`. Under [`Unlimited`], hashes `body` in one pass; under
+/// a checked control, hashes in 64 KiB chunks polling `control`.
+fn crc32_with<C: Control>(body: &[u8], control: &C) -> Result<u32> {
+    if !C::CHECKS {
+        let mut c = flate2::Crc::new();
+        c.update(body);
+        return Ok(c.sum());
+    }
+    control.check(0)?;
+    let mut crc = flate2::Crc::new();
+    for chunk in body.chunks(64 << 10) {
+        control.check(0)?;
+        #[cfg(test)]
+        open_tests::observe(open_tests::Event::IndexCrcChunk);
+        crc.update(chunk);
+    }
+    control.check(0)?;
+    Ok(crc.sum())
+}
+
+/// Copy opaque term bytes into an `Arc<[u8]>` under `control`. Under [`Unlimited`],
+/// copies in one shot; under a checked control, copies in 64 KiB cooperative chunks.
+pub(super) fn arc_bytes_with<C: Control>(bytes: &[u8], control: &C) -> Result<Arc<[u8]>> {
+    if !C::CHECKS {
+        return Ok(Arc::from(bytes));
+    }
+    control.check(0)?;
+    let mut owned = Arc::<[u8]>::new_uninit_slice(bytes.len());
+    let output = Arc::get_mut(&mut owned).expect("new byte storage is uniquely owned");
+    for (target, source) in output.chunks_mut(64 << 10).zip(bytes.chunks(64 << 10)) {
+        control.check(0)?;
+        for (slot, byte) in target.iter_mut().zip(source) {
+            slot.write(*byte);
+        }
+    }
+    control.check(0)?;
+    // SAFETY: all bytes of the uniquely owned exact-length allocation were
+    // initialized by the safe loop. An error drops MaybeUninit storage directly.
+    Ok(unsafe { owned.assume_init() })
+}
+
+/// Validate UTF-8 under `control`. Under [`Unlimited`], validates in one shot; under a
+/// checked control, validates in 64 KiB code-point-aligned chunks.
+pub(super) fn valid_utf8_with<C: Control>(bytes: &[u8], control: &C) -> Result<bool> {
+    if !C::CHECKS {
+        return Ok(std::str::from_utf8(bytes).is_ok());
+    }
+    let mut start = 0;
+    while start < bytes.len() {
+        control.check(0)?;
+        let mut end = start.saturating_add(64 << 10).min(bytes.len());
+        if end < bytes.len() {
+            // Keep a UTF-8 code point in one validation chunk. A malformed run of
+            // continuation bytes is rejected rather than making no progress.
+            while end > start && bytes[end] & 0xc0 == 0x80 {
+                end -= 1;
+            }
+        }
+        if end == start || std::str::from_utf8(&bytes[start..end]).is_err() {
+            return Ok(false);
+        }
+        start = end;
+    }
+    control.check(0)?;
+    Ok(true)
+}
+
+/// Validate and copy UTF-8 text into an `Arc<str>` under `control`.
+pub(super) fn arc_text_with<C: Control>(bytes: &[u8], control: &C) -> Result<Option<Arc<str>>> {
+    if !C::CHECKS {
+        return Ok(std::str::from_utf8(bytes).ok().map(Arc::from));
+    }
+    if !valid_utf8_with(bytes, control)? {
+        return Ok(None);
+    }
+    let owned = arc_bytes_with(bytes, control)?;
+    // SAFETY: the payload was validated as UTF-8 and copied without changes.
+    // str and [u8] have identical element alignment and length metadata, so this
+    // transfers the same Arc allocation exactly once with its existing reference
+    // count and deallocation layout. No reference to the old Arc remains.
+    let text = unsafe { Arc::from_raw(Arc::into_raw(owned) as *const str) };
+    control.check(0)?;
+    Ok(Some(text))
 }
 
 fn encode_meta(out: &mut Vec<u8>, c: &ChangeCommit) {
@@ -578,25 +693,279 @@ fn encode(r: &Record) -> Vec<u8> {
     out
 }
 
-fn decode_meta(c: &mut Cur<'_>, seq: u64) -> Option<ChangeCommit> {
-    let ts = c.u64()? as i64;
-    let kind = CommitKind::from_code(c.u8()?);
-    let flags = c.u8()?;
-    Some(ChangeCommit {
+pub(super) fn decode_meta_with<C: Control>(
+    c: &mut Cur<'_>,
+    seq: u64,
+    control: &C,
+) -> Result<Option<Arc<ChangeCommit>>> {
+    let Some((timestamp_ms, kind, bulk, inserted, deleted, author, message)) = (|| {
+        let timestamp_ms = c.u64()? as i64;
+        let kind = CommitKind::from_code(c.u8()?);
+        let bulk = c.u8()? & 1 != 0;
+        let inserted = c.varint()?;
+        let deleted = c.varint()?;
+        let n = usize::try_from(c.varint()?).ok()?;
+        let author = c.bytes(n)?;
+        let n = usize::try_from(c.varint()?).ok()?;
+        let message = c.bytes(n)?;
+        Some((timestamp_ms, kind, bulk, inserted, deleted, author, message))
+    })() else {
+        return Ok(None);
+    };
+    let author = if author.is_empty() {
+        None
+    } else {
+        let Some(text) = arc_text_with(author, control)? else {
+            return Ok(None);
+        };
+        Some(text)
+    };
+    let message = if message.is_empty() {
+        None
+    } else {
+        let Some(text) = arc_text_with(message, control)? else {
+            return Ok(None);
+        };
+        Some(text)
+    };
+    control.check(0)?;
+    Ok(Some(Arc::new(ChangeCommit {
         seq,
-        timestamp_ms: ts,
+        timestamp_ms,
         kind,
-        bulk: flags & 1 != 0,
-        inserted: c.varint()?,
-        deleted: c.varint()?,
-        author: c.str()?,
-        message: c.str()?,
-    })
+        bulk,
+        inserted,
+        deleted,
+        author,
+        message,
+    })))
+}
+
+/// Output builder for the unified [`decode_record_with`] record decoder (item 1062).
+///
+/// The same wire parser serves owned [`Record`] decoding (both unchecked and admitted),
+/// borrowed [`readonly::RecordView`] decoding (retaining the term table while borrowing
+/// validated change entries), and timestamp-only validation (allocating neither terms
+/// nor change vectors).
+pub(super) trait RecordSink<'a> {
+    type Output;
+    type Terms;
+
+    fn make_terms<C: Control>(&mut self, count: usize, control: &C) -> Result<Self::Terms>;
+    fn push_term<C: Control>(
+        &mut self,
+        terms: &mut Self::Terms,
+        idx: usize,
+        raw: &[u8],
+        control: &C,
+    ) -> Result<()>;
+    fn finish_changes<C: Control>(
+        self,
+        meta: Arc<ChangeCommit>,
+        terms: Self::Terms,
+        term_count: usize,
+        count: usize,
+        c: &mut Cur<'a>,
+        control: &C,
+    ) -> Result<Option<Self::Output>>;
+    fn finish_summary(self, meta: Arc<ChangeCommit>) -> Self::Output;
+    fn finish_gap(self, from: u64, through: u64) -> Self::Output;
+}
+
+/// Builds an owned [`Record`], either unchecked (`Unlimited`) or admitted/checked.
+struct OwnedRecordSink {
+    exact: bool,
+    bytes_since_check: usize,
+}
+
+impl<'a> RecordSink<'a> for OwnedRecordSink {
+    type Output = Record;
+    type Terms = Vec<Arc<[u8]>>;
+
+    #[inline]
+    fn make_terms<C: Control>(&mut self, count: usize, _control: &C) -> Result<Self::Terms> {
+        if !C::CHECKS {
+            let cap = if self.exact {
+                count
+            } else {
+                count.min(1 << 16)
+            };
+            return Ok(Vec::with_capacity(cap));
+        }
+        let mut terms = Vec::new();
+        terms.try_reserve_exact(count).map_err(|_| {
+            Error::HistoryUnsupported("history term-table allocation was refused".into())
+        })?;
+        Ok(terms)
+    }
+
+    #[inline]
+    fn push_term<C: Control>(
+        &mut self,
+        terms: &mut Self::Terms,
+        idx: usize,
+        raw: &[u8],
+        control: &C,
+    ) -> Result<()> {
+        if !C::CHECKS {
+            terms.push(Arc::from(raw));
+            return Ok(());
+        }
+        if idx.is_multiple_of(CHECK_STRIDE) {
+            control.check(0)?;
+            self.bytes_since_check = 0;
+        }
+        if raw.len() > (64 << 10) {
+            terms.push(arc_bytes_with(raw, control)?);
+            self.bytes_since_check = 0;
+        } else {
+            if self.bytes_since_check.saturating_add(raw.len()) > (64 << 10) {
+                control.check(0)?;
+                self.bytes_since_check = 0;
+            }
+            terms.push(Arc::from(raw));
+            self.bytes_since_check = self.bytes_since_check.saturating_add(raw.len());
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn finish_changes<C: Control>(
+        self,
+        meta: Arc<ChangeCommit>,
+        terms: Self::Terms,
+        _term_count: usize,
+        count: usize,
+        c: &mut Cur<'a>,
+        control: &C,
+    ) -> Result<Option<Self::Output>> {
+        if C::CHECKS {
+            control.check(0)?;
+        }
+        let mut changes = if !C::CHECKS {
+            let cap = if self.exact {
+                count
+            } else {
+                count.min(1 << 16)
+            };
+            Vec::with_capacity(cap)
+        } else {
+            let mut changes = Vec::new();
+            changes.try_reserve_exact(count).map_err(|_| {
+                Error::HistoryUnsupported("history change-table allocation was refused".into())
+            })?;
+            changes
+        };
+        for idx in 0..count {
+            if C::CHECKS && idx.is_multiple_of(CHECK_STRIDE) {
+                control.check(0)?;
+            }
+            let Some(add_byte) = c.u8() else {
+                return Ok(None);
+            };
+            let add = add_byte == 1;
+            let mut k: [Option<Arc<[u8]>>; 4] = Default::default();
+            for slot in &mut k {
+                let Some(tid) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                    return Ok(None);
+                };
+                let Some(term) = terms.get(tid) else {
+                    return Ok(None);
+                };
+                *slot = Some(term.clone());
+            }
+            changes.push((add, k.map(|t| t.expect("filled above"))));
+        }
+        Ok(Some(Record::Changes(meta, changes)))
+    }
+
+    #[inline]
+    fn finish_summary(self, meta: Arc<ChangeCommit>) -> Self::Output {
+        Record::Summary(meta)
+    }
+
+    #[inline]
+    fn finish_gap(self, from: u64, through: u64) -> Self::Output {
+        Record::Gap { from, through }
+    }
+}
+
+/// Decode a record body (its CRC already checked) into the sink's representation under
+/// `control`. Under [`Unlimited`], all control checks compile away.
+pub(super) fn decode_record_with<'a, C: Control, S: RecordSink<'a>>(
+    body: &'a [u8],
+    control: &C,
+    mut sink: S,
+) -> Result<Option<S::Output>> {
+    control.check(0)?;
+    let mut c = Cur { b: body, i: 0 };
+    let Some((ty, seq)) = c.u8().zip(c.u64()) else {
+        return Ok(None);
+    };
+    let record = match ty {
+        REC_GAP => {
+            let Some(from) = c.u64() else {
+                return Ok(None);
+            };
+            if from > seq {
+                return Ok(None);
+            }
+            sink.finish_gap(from, seq)
+        }
+        REC_SUMMARY => {
+            let Some(meta) = decode_meta_with(&mut c, seq, control)? else {
+                return Ok(None);
+            };
+            sink.finish_summary(meta)
+        }
+        REC_CHANGES => {
+            let Some(meta) = decode_meta_with(&mut c, seq, control)? else {
+                return Ok(None);
+            };
+            let Some(n) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                return Ok(None);
+            };
+            if n > body.len() - c.i {
+                return Ok(None);
+            }
+            let mut terms = sink.make_terms(n, control)?;
+            for idx in 0..n {
+                let Some(len) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                    return Ok(None);
+                };
+                let Some(raw) = c.bytes(len) else {
+                    return Ok(None);
+                };
+                sink.push_term(&mut terms, idx, raw, control)?;
+            }
+            let Some(m) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                return Ok(None);
+            };
+            if m > (body.len() - c.i) / 5 {
+                return Ok(None);
+            }
+            let Some(record) = sink.finish_changes(meta, terms, n, m, &mut c, control)? else {
+                return Ok(None);
+            };
+            record
+        }
+        _ => return Ok(None),
+    };
+    control.check(0)?;
+    Ok((c.i == body.len()).then_some(record))
 }
 
 /// Decode a record body (its CRC already checked).
 fn decode(body: &[u8]) -> Option<Record> {
-    decode_with(body, false)
+    decode_record_with(
+        body,
+        &Unlimited,
+        OwnedRecordSink {
+            exact: false,
+            bytes_since_check: 0,
+        },
+    )
+    .expect("unlimited record decode cannot fail")
 }
 
 /// The bytes an `Arc<[u8]>` or `Arc<str>` of `len` bytes allocates.
@@ -620,18 +989,15 @@ pub(super) struct Footprint {
 /// reads and decoding.
 const CHECK_STRIDE: usize = 1024;
 
-pub(super) fn footprint_checked(
-    body: &[u8],
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<Option<Footprint>> {
-    check()?;
+pub(super) fn footprint_with<C: Control>(body: &[u8], control: &C) -> Result<Option<Footprint>> {
+    control.check(0)?;
     let mut c = Cur { b: body, i: 0 };
     let Some((ty, _)) = c.u8().zip(c.u64()) else {
         return Ok(None);
     };
     let mut f = Footprint::default();
     if ty == REC_GAP {
-        check()?;
+        control.check(0)?;
         return Ok(Some(f));
     }
     if ty != REC_SUMMARY && ty != REC_CHANGES {
@@ -658,7 +1024,7 @@ pub(super) fn footprint_checked(
         }
     }
     if ty == REC_SUMMARY {
-        check()?;
+        control.check(0)?;
         return Ok(Some(f));
     }
     let Some(n) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
@@ -670,8 +1036,8 @@ pub(super) fn footprint_checked(
     }
     f.terms = n as u64 * std::mem::size_of::<Arc<[u8]>>() as u64;
     for idx in 0..n {
-        if idx.is_multiple_of(CHECK_STRIDE) {
-            check()?;
+        if C::CHECKS && idx.is_multiple_of(CHECK_STRIDE) {
+            control.check(0)?;
         }
         let Some(len) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
             return Ok(None);
@@ -689,179 +1055,50 @@ pub(super) fn footprint_checked(
         return Ok(None);
     }
     f.changes = m as u64 * std::mem::size_of::<(bool, QuadKey)>() as u64;
-    check()?;
+    control.check(0)?;
     Ok(Some(f))
 }
 
-/// Decode a record body. `exact` reserves the term table and the changes at their
-/// counts, which the caller has admitted from [`footprint_checked`]; otherwise each
-/// reservation is capped, since a damaged count must not allocate before the bytes run
-/// out.
-fn decode_with(body: &[u8], exact: bool) -> Option<Record> {
-    let cap = |n: usize| if exact { n } else { n.min(1 << 16) };
-    let mut c = Cur { b: body, i: 0 };
-    let ty = c.u8()?;
-    let seq = c.u64()?;
-    let r = match ty {
-        REC_GAP => {
-            let from = c.u64()?;
-            if from > seq {
-                return None;
-            }
-            Record::Gap { from, through: seq }
-        }
-        REC_SUMMARY => Record::Summary(Arc::new(decode_meta(&mut c, seq)?)),
-        REC_CHANGES => {
-            let meta = Arc::new(decode_meta(&mut c, seq)?);
-            let n = c.varint()? as usize;
-            let mut terms: Vec<Arc<[u8]>> = Vec::with_capacity(cap(n));
-            for _ in 0..n {
-                let len = c.varint()? as usize;
-                terms.push(Arc::from(c.bytes(len)?));
-            }
-            let m = c.varint()? as usize;
-            let mut changes = Vec::with_capacity(cap(m));
-            for _ in 0..m {
-                let add = c.u8()? == 1;
-                let mut k: [Option<Arc<[u8]>>; 4] = Default::default();
-                for slot in &mut k {
-                    *slot = Some(terms.get(c.varint()? as usize)?.clone());
-                }
-                changes.push((add, k.map(|t| t.expect("filled above"))));
-            }
-            Record::Changes(meta, changes)
-        }
-        _ => return None,
-    };
-    (c.i == body.len()).then_some(r)
+#[cfg(test)]
+pub(super) fn footprint_checked(
+    body: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<Footprint>> {
+    footprint_with(body, &FnMutControl::new(check))
 }
 
-/// Checked variant of `decode_with(body, true)` for admitted paged reads. Polls `check`
-/// at entry and exit, at most every [`CHECK_STRIDE`] term or change entries, and in
-/// 64 KiB chunks while validating UTF-8 or copying metadata and term payloads so stop
-/// errors propagate as `Err` instead of being mistaken for corruption.
+#[cfg(test)]
 fn decode_admitted_checked(
     body: &[u8],
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<Record>> {
-    check()?;
-    let mut c = Cur { b: body, i: 0 };
-    let Some((ty, seq)) = c.u8().zip(c.u64()) else {
-        return Ok(None);
-    };
-    let r = match ty {
-        REC_GAP => {
-            let Some(from) = c.u64() else {
-                return Ok(None);
-            };
-            if from > seq {
-                return Ok(None);
-            }
-            Record::Gap { from, through: seq }
-        }
-        REC_SUMMARY => {
-            let Some(meta) = readonly::meta_checked(&mut c, seq, check)? else {
-                return Ok(None);
-            };
-            Record::Summary(meta)
-        }
-        REC_CHANGES => {
-            let Some(meta) = readonly::meta_checked(&mut c, seq, check)? else {
-                return Ok(None);
-            };
-            let Some(n) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
-                return Ok(None);
-            };
-            if n > body.len() - c.i {
-                return Ok(None);
-            }
-            let mut terms: Vec<Arc<[u8]>> = Vec::new();
-            terms.try_reserve_exact(n).map_err(|_| {
-                Error::HistoryUnsupported("history term-table allocation was refused".into())
-            })?;
-            let mut bytes_since_check: usize = 0;
-            for idx in 0..n {
-                if idx.is_multiple_of(CHECK_STRIDE) {
-                    check()?;
-                    bytes_since_check = 0;
-                }
-                let Some(len) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
-                    return Ok(None);
-                };
-                let Some(raw) = c.bytes(len) else {
-                    return Ok(None);
-                };
-                if len > (64 << 10) {
-                    terms.push(readonly::arc_bytes_checked(raw, check)?);
-                    bytes_since_check = 0;
-                } else {
-                    if bytes_since_check.saturating_add(len) > (64 << 10) {
-                        check()?;
-                        bytes_since_check = 0;
-                    }
-                    terms.push(Arc::from(raw));
-                    bytes_since_check = bytes_since_check.saturating_add(len);
-                }
-            }
-            let Some(m) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
-                return Ok(None);
-            };
-            if m > (body.len() - c.i) / 5 {
-                return Ok(None);
-            }
-            check()?;
-            let mut changes = Vec::new();
-            changes.try_reserve_exact(m).map_err(|_| {
-                Error::HistoryUnsupported("history change-table allocation was refused".into())
-            })?;
-            for idx in 0..m {
-                if idx.is_multiple_of(CHECK_STRIDE) {
-                    check()?;
-                }
-                let Some(add_byte) = c.u8() else {
-                    return Ok(None);
-                };
-                let add = add_byte == 1;
-                let mut k: [Option<Arc<[u8]>>; 4] = Default::default();
-                for slot in &mut k {
-                    let Some(tid) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
-                        return Ok(None);
-                    };
-                    let Some(term) = terms.get(tid) else {
-                        return Ok(None);
-                    };
-                    *slot = Some(term.clone());
-                }
-                changes.push((add, k.map(|t| t.expect("filled above"))));
-            }
-            Record::Changes(meta, changes)
-        }
-        _ => return Ok(None),
-    };
-    check()?;
-    Ok((c.i == body.len()).then_some(r))
+    decode_record_with(
+        body,
+        &FnMutControl::new(check),
+        OwnedRecordSink {
+            exact: true,
+            bytes_since_check: 0,
+        },
+    )
 }
 
-fn crc32_checked(body: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Result<u32> {
-    check()?;
-    let mut crc = flate2::Crc::new();
-    for chunk in body.chunks(64 << 10) {
-        check()?;
-        #[cfg(test)]
-        open_tests::observe(open_tests::Event::IndexCrcChunk);
-        crc.update(chunk);
-    }
-    check()?;
-    Ok(crc.sum())
-}
-
-/// Checked variant of [`frame`] that hashes the body in 64 KiB chunks with stop polls.
+#[cfg(test)]
 fn frame_checked<'a>(
     buf: &'a [u8],
     at: usize,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<(&'a [u8], usize)>> {
-    check()?;
+    frame_with(buf, at, &FnMutControl::new(check))
+}
+
+/// The next framed record of `buf` at `at` under `control`: (body, the offset after it).
+/// `None` at the end, at a torn record or at damage.
+fn frame_with<'a, C: Control>(
+    buf: &'a [u8],
+    at: usize,
+    control: &C,
+) -> Result<Option<(&'a [u8], usize)>> {
+    control.check(0)?;
     let Some(end_h) = at.checked_add(8) else {
         return Ok(None);
     };
@@ -879,20 +1116,90 @@ fn frame_checked<'a>(
     let Some(body) = buf.get(end_h..end) else {
         return Ok(None);
     };
-    Ok((crc32_checked(body, check)? == crc).then_some((body, end)))
+    Ok((crc32_with(body, control)? == crc).then_some((body, end)))
 }
 
 /// The next framed record of `buf` at `at`: (body, the offset after it). `None` at the
 /// end, at a torn record or at damage.
 fn frame(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
-    let h = buf.get(at..at + 8)?;
-    let len = u32::from_le_bytes(h[0..4].try_into().ok()?) as usize;
-    let crc = u32::from_le_bytes(h[4..8].try_into().ok()?);
-    if len == 0 {
-        return None;
+    frame_with(buf, at, &Unlimited).expect("unlimited frame read cannot fail")
+}
+
+/// Read one framed record body from `file` at `offset` under `control`, verifying its
+/// CRC-32 and admitting its allocation before reserving. Returns `Ok(None)` when `offset`
+/// or the declared frame extends past `max_end`, when the length is zero, or when the
+/// CRC does not match.
+pub(super) fn read_file_frame_with<C: Control>(
+    file: &File,
+    offset: u64,
+    max_end: Option<u64>,
+    header_in_admit: bool,
+    observe_chunk: bool,
+    control: &C,
+    admit: &mut impl FnMut(u64) -> Result<()>,
+) -> Result<Option<Vec<u8>>> {
+    control.check(0)?;
+    if let Some(extent) = max_end
+        && offset.checked_add(8).is_none_or(|end| end > extent)
+    {
+        return Ok(None);
     }
-    let body = buf.get(at + 8..at + 8 + len)?;
-    (crc32(body) == crc).then_some((body, at + 8 + len))
+    let mut h = [0u8; 8];
+    read_exact_at_with(file, &mut h, offset, control)?;
+    let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+    let expected_crc = u32::from_le_bytes(h[4..8].try_into().unwrap());
+    if len == 0 {
+        return Ok(None);
+    }
+    if let Some(extent) = max_end
+        && offset
+            .checked_add(8)
+            .and_then(|n| n.checked_add(len as u64))
+            .is_none_or(|end| end > extent)
+    {
+        return Ok(None);
+    }
+    if !C::CHECKS {
+        let mut body = vec![0u8; len];
+        read_exact_at_with(file, &mut body, offset + 8, control)?;
+        if observe_chunk {
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
+        }
+        return Ok((crc32(&body) == expected_crc).then_some(body));
+    }
+    let header_bytes = if header_in_admit { 8u64 } else { 0u64 };
+    control.check(0)?;
+    admit(header_bytes + len as u64)?;
+    control.check(0)?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(len).map_err(|_| {
+        Error::HistoryUnsupported("history-log record allocation was refused".into())
+    })?;
+    if header_in_admit && body.capacity() > len {
+        admit(header_bytes + body.capacity() as u64)?;
+        control.check(0)?;
+    }
+    let mut crc = flate2::Crc::new();
+    while body.len() < len {
+        control.check(0)?;
+        let start = body.len();
+        let end = start.saturating_add(64 << 10).min(len);
+        body.resize(end, 0);
+        let read_offset = offset
+            .checked_add(8)
+            .and_then(|n| n.checked_add(start as u64))
+            .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
+        read_exact_at_with(file, &mut body[start..end], read_offset, control)?;
+        if observe_chunk {
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
+        }
+        control.check(0)?;
+        crc.update(&body[start..end]);
+    }
+    control.check(0)?;
+    Ok((crc.sum() == expected_crc).then_some(body))
 }
 
 /// The FNV-1a hash of a term key in a role (graph, subject, predicate, object). Stable
@@ -1065,25 +1372,20 @@ fn hole_key(h: &Unrecorded) -> (u64, u8, u64) {
     (h.from, h.reason as u8, h.to)
 }
 
-fn reverse_holes_checked(
-    holes: &mut [Unrecorded],
-    checked: bool,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<()> {
+fn reverse_holes_with<C: Control>(holes: &mut [Unrecorded], control: &C) -> Result<()> {
     let len = holes.len();
     for i in 0..(len / 2) {
-        if checked && i != 0 && i.is_multiple_of(CHECK_STRIDE) {
-            check()?;
+        if C::CHECKS && i != 0 && i.is_multiple_of(CHECK_STRIDE) {
+            control.check(0)?;
         }
         holes.swap(i, len - 1 - i);
     }
     Ok(())
 }
 
-fn sort_holes_checked(
+pub(super) fn sort_holes_with<const PER_STEP: bool, C: Control>(
     holes: &mut [Unrecorded],
-    checked: bool,
-    check: &mut dyn FnMut() -> Result<()>,
+    control: &C,
 ) -> Result<()> {
     let len = holes.len();
     if len <= 1 {
@@ -1092,8 +1394,8 @@ fn sort_holes_checked(
     let mut steps = 0usize;
     let mut sift_down = |slice: &mut [Unrecorded], mut root: usize, end: usize| -> Result<()> {
         loop {
-            if checked && steps != 0 && steps.is_multiple_of(CHECK_STRIDE) {
-                check()?;
+            if C::CHECKS && (PER_STEP || (steps != 0 && steps.is_multiple_of(CHECK_STRIDE))) {
+                control.check(0)?;
             }
             steps += 1;
             let left = root * 2 + 1;
@@ -1123,21 +1425,26 @@ fn sort_holes_checked(
         holes.swap(0, end);
         sift_down(holes, 0, end)?;
     }
+    if C::CHECKS && PER_STEP {
+        control.check(0)?;
+    }
     Ok(())
 }
 
-fn dedup_holes_checked(
+pub(super) fn dedup_holes_with<const PER_STEP: bool, C: Control>(
     holes: &mut Vec<Unrecorded>,
-    checked: bool,
-    check: &mut dyn FnMut() -> Result<()>,
+    control: &C,
 ) -> Result<()> {
     if holes.len() <= 1 {
+        if C::CHECKS && PER_STEP {
+            control.check(0)?;
+        }
         return Ok(());
     }
     let mut write = 0usize;
     for read in 1..holes.len() {
-        if checked && read.is_multiple_of(CHECK_STRIDE) {
-            check()?;
+        if C::CHECKS && (PER_STEP || read.is_multiple_of(CHECK_STRIDE)) {
+            control.check(0)?;
         }
         let b = holes[read];
         let a = &mut holes[write];
@@ -1149,7 +1456,49 @@ fn dedup_holes_checked(
         }
     }
     holes.truncate(write + 1);
+    if C::CHECKS && PER_STEP {
+        control.check(0)?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+fn reverse_holes_checked(
+    holes: &mut [Unrecorded],
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    if checked {
+        reverse_holes_with(holes, &FnMutControl::new(check))
+    } else {
+        reverse_holes_with(holes, &Unlimited)
+    }
+}
+
+#[cfg(test)]
+fn sort_holes_checked(
+    holes: &mut [Unrecorded],
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    if checked {
+        sort_holes_with::<false, _>(holes, &FnMutControl::new(check))
+    } else {
+        sort_holes_with::<false, _>(holes, &Unlimited)
+    }
+}
+
+#[cfg(test)]
+fn dedup_holes_checked(
+    holes: &mut Vec<Unrecorded>,
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    if checked {
+        dedup_holes_with::<false, _>(holes, &FnMutControl::new(check))
+    } else {
+        dedup_holes_with::<false, _>(holes, &Unlimited)
+    }
 }
 
 /// Collects unrecorded ranges incrementally, merging adjacent/overlapping ranges of the
@@ -1219,24 +1568,28 @@ impl<'a> HoleCollector<'a> {
     }
 
     fn finish(
-        mut self,
+        self,
         checked: bool,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Vec<Unrecorded>> {
         if checked {
-            check()?;
+            self.finish_with(&FnMutControl::new(check))
+        } else {
+            self.finish_with(&Unlimited)
         }
+    }
+
+    fn finish_with<C: Control>(mut self, control: &C) -> Result<Vec<Unrecorded>> {
+        control.check(0)?;
         if self.ordered {
             if self.descending {
-                reverse_holes_checked(&mut self.holes, checked, check)?;
+                reverse_holes_with(&mut self.holes, control)?;
             }
         } else {
-            sort_holes_checked(&mut self.holes, checked, check)?;
-            dedup_holes_checked(&mut self.holes, checked, check)?;
+            sort_holes_with::<false, _>(&mut self.holes, control)?;
+            dedup_holes_with::<false, _>(&mut self.holes, control)?;
         }
-        if checked {
-            check()?;
-        }
+        control.check(0)?;
         Ok(self.holes)
     }
 }
@@ -1357,16 +1710,16 @@ impl SegIndex {
 
     /// Decode an index file: (first, last, index).
     fn decode(b: &[u8], dataset_id: uuid::Uuid) -> Option<(u64, u64, SegIndex)> {
-        Self::decode_with(b, dataset_id, None, None)
+        Self::decode_with(b, dataset_id, &Unlimited, None)
             .ok()
             .flatten()
             .map(|(first, last, ix, _)| (first, last, ix))
     }
 
-    fn decode_with<'a>(
+    fn decode_with<'a, C: Control>(
         b: &[u8],
         dataset_id: uuid::Uuid,
-        mut check: Option<&mut dyn FnMut() -> Result<()>>,
+        control: &C,
         budget: Option<&'a MemoryBudget>,
     ) -> Result<Option<DecodedSegIndex<'a>>> {
         if b.len() < IDX_HEADER || &b[0..8] != IDX_MAGIC {
@@ -1380,13 +1733,12 @@ impl SegIndex {
         let (first, last) = (u64_at(32), u64_at(40));
         let (nrecs, nposts) = (u32_at(48) as usize, u32_at(52) as usize);
         let body = &b[IDX_HEADER..];
-        let actual_crc = match check.as_deref_mut() {
-            Some(check) => crc32_checked(body, check)?,
-            None => {
-                #[cfg(test)]
-                open_tests::observe(open_tests::Event::IndexCrcChunk);
-                crc32(body)
-            }
+        let actual_crc = if C::CHECKS {
+            crc32_with(body, control)?
+        } else {
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexCrcChunk);
+            crc32(body)
         };
         if actual_crc != u32_at(56) {
             return Ok(None);
@@ -1433,10 +1785,8 @@ impl SegIndex {
         #[cfg(feature = "failpoints")]
         observe_changelog_read(ChangeLogReadEvent::IndexDecode);
         for idx in 0..nrecs {
-            if idx.is_multiple_of(CHECK_STRIDE)
-                && let Some(check) = check.as_deref_mut()
-            {
-                check()?;
+            if C::CHECKS && idx.is_multiple_of(CHECK_STRIDE) {
+                control.check(0)?;
             }
             #[cfg(test)]
             open_tests::observe(open_tests::Event::IndexRecord);
@@ -1447,10 +1797,8 @@ impl SegIndex {
         }
         let mut prev_posting: Option<(u64, u32)> = None;
         for idx in 0..nposts {
-            if idx.is_multiple_of(CHECK_STRIDE)
-                && let Some(check) = check.as_deref_mut()
-            {
-                check()?;
+            if C::CHECKS && idx.is_multiple_of(CHECK_STRIDE) {
+                control.check(0)?;
             }
             #[cfg(test)]
             open_tests::observe(open_tests::Event::IndexPosting);
@@ -1467,9 +1815,7 @@ impl SegIndex {
         if c.i != body.len() {
             return Ok(None);
         }
-        if let Some(check) = check {
-            check()?;
-        }
+        control.check(0)?;
         Ok(Some((first, last, ix, decoded_guard)))
     }
 }
@@ -2063,14 +2409,14 @@ impl ChangeLog {
 
     /// The index of segment `i`.
     fn index(&self, inner: &mut Inner, i: usize) -> Result<Arc<SegIndex>> {
-        Ok(self.index_with(inner, i, None, None)?.0)
+        Ok(self.index_with(inner, i, &Unlimited, None)?.0)
     }
 
-    fn index_with<'a>(
+    fn index_with<'a, C: Control>(
         &self,
         inner: &mut Inner,
         i: usize,
-        mut check: Option<&mut dyn FnMut() -> Result<()>>,
+        control: &C,
         budget: Option<&'a MemoryBudget>,
     ) -> Result<(Arc<SegIndex>, Option<BudgetGuard<'a>>)> {
         if let Some(ix) = &inner.segs[i].index {
@@ -2086,25 +2432,10 @@ impl ChangeLog {
         let path = inner.segs[i]
             .idx_path()
             .expect("a sealed persistent segment");
-        let (b, raw_guard) = match check.as_deref_mut() {
-            Some(check) => Self::read_index_checked(&path, check, budget)?,
-            None => {
-                #[cfg(test)]
-                open_tests::observe(open_tests::Event::IndexReadAttempt);
-                let bytes = std::fs::read(&path)?;
-                #[cfg(test)]
-                open_tests::observe(open_tests::Event::IndexReadChunk);
-                #[cfg(feature = "failpoints")]
-                observe_changelog_read(ChangeLogReadEvent::IndexReadChunk);
-                let guard = match budget {
-                    Some(budget) => Some(budget.reserve(bytes.capacity() as u64)?),
-                    None => None,
-                };
-                (bytes, guard)
-            }
-        };
-        let (_, _, ix, decoded_guard) = SegIndex::decode_with(&b, self.dataset_id, check, budget)?
-            .ok_or_else(|| Error::Corrupt(format!("{}: damaged index", path.display())))?;
+        let (b, raw_guard) = Self::read_index_with(&path, control, budget)?;
+        let (_, _, ix, decoded_guard) =
+            SegIndex::decode_with(&b, self.dataset_id, control, budget)?
+                .ok_or_else(|| Error::Corrupt(format!("{}: damaged index", path.display())))?;
         drop(b);
         drop(raw_guard);
         let ix = Arc::new(ix);
@@ -2115,13 +2446,28 @@ impl ChangeLog {
         Ok((ix, decoded_guard))
     }
 
-    /// Read the entire sidecar, polling before each read and every interrupted retry.
-    fn read_index_checked<'a>(
+    /// Read the entire sidecar under `control`. Under [`Unlimited`], reads in one pass;
+    /// under a checked control, polls before each read chunk and every interrupted retry.
+    fn read_index_with<'a, C: Control>(
         path: &Path,
-        check: &mut dyn FnMut() -> Result<()>,
+        control: &C,
         budget: Option<&'a MemoryBudget>,
     ) -> Result<(Vec<u8>, Option<BudgetGuard<'a>>)> {
-        check()?;
+        if !C::CHECKS {
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexReadAttempt);
+            let bytes = std::fs::read(path)?;
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexReadChunk);
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::IndexReadChunk);
+            let guard = match budget {
+                Some(budget) => Some(budget.reserve(bytes.capacity() as u64)?),
+                None => None,
+            };
+            return Ok((bytes, guard));
+        }
+        control.check(0)?;
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
         let mut bytes = Vec::new();
@@ -2143,7 +2489,7 @@ impl ChangeLog {
         };
         let mut chunk = [0; 64 << 10];
         loop {
-            check()?;
+            control.check(0)?;
             #[cfg(test)]
             open_tests::observe(open_tests::Event::IndexReadAttempt);
             match file.read(&mut chunk) {
@@ -2179,52 +2525,23 @@ impl ChangeLog {
 
     /// Read the record of segment `i` at `offset`.
     fn read(&self, inner: &Inner, i: usize, offset: u64) -> Result<Record> {
-        let seg = &inner.segs[i];
-        let damaged = || {
-            Error::Corrupt(format!(
-                "change log segment {}: damaged record at byte {offset}",
-                seg.first
-            ))
-        };
-        if seg.path.is_none() {
-            let (body, _) = frame(&seg.mem, offset as usize).ok_or_else(damaged)?;
-            #[cfg(feature = "failpoints")]
-            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
-            #[cfg(feature = "failpoints")]
-            observe_changelog_read(ChangeLogReadEvent::RecordDecode);
-            return decode(body).ok_or_else(damaged);
-        }
-        let path = seg.path.as_ref().expect("checked");
-        let f = File::open(path)?;
-        let mut h = [0u8; 8];
-        read_exact_at(&f, &mut h, offset)?;
-        let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
-        let mut buf = vec![0u8; 8 + len];
-        buf[..8].copy_from_slice(&h);
-        read_exact_at(&f, &mut buf[8..], offset + 8)?;
-        #[cfg(feature = "failpoints")]
-        observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
-        let (body, _) = frame(&buf, 0).ok_or_else(damaged)?;
-        #[cfg(feature = "failpoints")]
-        observe_changelog_read(ChangeLogReadEvent::RecordDecode);
-        decode(body).ok_or_else(damaged)
+        let mut no_admit = |_| Ok(());
+        self.read_with(inner, i, offset, &mut no_admit, &Unlimited)
     }
 
-    /// Read the record of segment `i` at `offset` as [`ChangeLog::read`] does, admitting
-    /// each allocation before it is made (item 829): the frame of a file-backed segment
-    /// before it is read, then the decoded record from its [`footprint_checked`] before
-    /// it is decoded. `admit` is told the bytes the record holds at each step, the frame
-    /// included until decoding ends, and `check` is polled across reads, CRC chunks,
-    /// admissions, footprint scanning and decoding.
-    fn read_admitted(
+    /// Read the record of segment `i` at `offset` under `control`. Under [`Unlimited`],
+    /// reads and decodes directly; under a checked control, admits each allocation before
+    /// it is made (item 829) and polls `control` across reads, CRC chunks, admissions,
+    /// footprint scanning and decoding.
+    fn read_with<C: Control>(
         &self,
         inner: &Inner,
         i: usize,
         offset: u64,
         admit: &mut Admit<'_>,
-        check: &mut dyn FnMut() -> Result<()>,
+        control: &C,
     ) -> Result<Record> {
-        check()?;
+        control.check(0)?;
         let seg = &inner.segs[i];
         let damaged = || {
             Error::Corrupt(format!(
@@ -2232,69 +2549,54 @@ impl ChangeLog {
                 seg.first
             ))
         };
-        let decode_admitted =
-            |body: &[u8],
-             frame: u64,
-             admit: &mut Admit<'_>,
-             check: &mut dyn FnMut() -> Result<()>| {
-                let f = footprint_checked(body, check)?.ok_or_else(damaged)?;
-                let held = f.meta + f.terms + f.changes;
-                check()?;
-                admit(frame + held)?;
-                check()?;
+        let decode_body =
+            |body: &[u8], frame_bytes: u64, admit: &mut Admit<'_>| -> Result<(Record, u64)> {
+                let held = if C::CHECKS {
+                    let f = footprint_with(body, control)?.ok_or_else(damaged)?;
+                    let held = f.meta + f.terms + f.changes;
+                    control.check(0)?;
+                    admit(frame_bytes + held)?;
+                    control.check(0)?;
+                    held
+                } else {
+                    0
+                };
                 #[cfg(feature = "failpoints")]
                 observe_changelog_read(ChangeLogReadEvent::RecordDecode);
-                let r = decode_admitted_checked(body, check)?.ok_or_else(damaged)?;
-                Ok::<_, Error>((r, held))
+                let r = decode_record_with(
+                    body,
+                    control,
+                    OwnedRecordSink {
+                        exact: C::CHECKS,
+                        bytes_since_check: 0,
+                    },
+                )?
+                .ok_or_else(damaged)?;
+                Ok((r, held))
             };
         if seg.path.is_none() {
-            let (body, _) = frame_checked(&seg.mem, offset as usize, check)?.ok_or_else(damaged)?;
-            return Ok(decode_admitted(body, 0, admit, check)?.0);
+            let (body, _) = frame_with(&seg.mem, offset as usize, control)?.ok_or_else(damaged)?;
+            if !C::CHECKS {
+                #[cfg(feature = "failpoints")]
+                observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
+            }
+            return Ok(decode_body(body, 0, admit)?.0);
         }
         let path = seg.path.as_ref().expect("checked");
         let f = File::open(path)?;
-        let mut h = [0u8; 8];
-        readonly::read_exact_at_checked(&f, &mut h, offset, check)?;
-        let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
-        let expected_crc = u32::from_le_bytes(h[4..8].try_into().unwrap());
-        if len == 0 {
-            return Err(damaged());
-        }
-        check()?;
-        admit(8 + len as u64)?;
-        check()?;
-        let mut body = Vec::new();
-        body.try_reserve_exact(len).map_err(|_| {
-            Error::HistoryUnsupported("history-log record allocation was refused".into())
-        })?;
-        if body.capacity() > len {
-            admit(8 + body.capacity() as u64)?;
-            check()?;
-        }
-        let mut crc = flate2::Crc::new();
-        while body.len() < len {
-            check()?;
-            let start = body.len();
-            let end = start.saturating_add(64 << 10).min(len);
-            body.resize(end, 0);
-            let read_offset = offset
-                .checked_add(8)
-                .and_then(|n| n.checked_add(start as u64))
-                .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
-            readonly::read_exact_at_checked(&f, &mut body[start..end], read_offset, check)?;
-            #[cfg(feature = "failpoints")]
-            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
-            check()?;
-            crc.update(&body[start..end]);
-        }
-        check()?;
-        if crc.sum() != expected_crc {
-            return Err(damaged());
-        }
-        let (r, held) = decode_admitted(&body, 8 + body.capacity() as u64, admit, check)?;
+        let body = read_file_frame_with(&f, offset, None, true, true, control, &mut |b| admit(b))?
+            .ok_or_else(damaged)?;
+        let frame_bytes = if C::CHECKS {
+            8 + body.capacity() as u64
+        } else {
+            0
+        };
+        let (r, held) = decode_body(&body, frame_bytes, admit)?;
         drop(body);
-        admit(held)?;
-        check()?;
+        if C::CHECKS {
+            admit(held)?;
+            control.check(0)?;
+        }
         Ok(r)
     }
 
@@ -2472,7 +2774,8 @@ impl ChangeLog {
             // Keep the decoded index guard bound before `ix` so `ix` always drops before
             // its budget charge is released on every exit path.
             let (_ix_guard, ix) = {
-                let (ix, guard) = self.index_with(&mut inner, i, Some(check), budget)?;
+                let control = FnMutControl::new(check);
+                let (ix, guard) = self.index_with(&mut inner, i, &control, budget)?;
                 (guard, ix)
             };
             let n = ix.recs.partition_point(|r| r.ts <= ms);
@@ -2605,7 +2908,8 @@ impl ChangeLog {
             // Keep the decoded index guard bound before `ix` so `ix` always drops before
             // its budget charge is released on every exit path.
             let (_ix_guard, ix) = if checked {
-                let (ix, guard) = self.index_with(&mut inner, i, Some(check), budget)?;
+                let control = FnMutControl::new(check);
+                let (ix, guard) = self.index_with(&mut inner, i, &control, budget)?;
                 (guard, ix)
             } else {
                 (None, self.index(&mut inner, i)?)
@@ -2841,8 +3145,12 @@ impl ChangeLog {
                 }
                 let mut record_guard = budget.map(MemoryBudget::guard);
                 let record = match paged.as_deref_mut() {
-                    Some(p) => self.read_admitted(&inner, i, e.offset, p.admit, check)?,
+                    Some(p) => {
+                        let control = FnMutControl::new(check);
+                        self.read_with(&inner, i, e.offset, p.admit, &control)?
+                    }
                     None if checked => {
+                        let control = FnMutControl::new(check);
                         let mut admit = |bytes: u64| {
                             if let Some(guard) = record_guard.as_mut() {
                                 guard.resize(bytes)
@@ -2850,7 +3158,7 @@ impl ChangeLog {
                                 Ok(())
                             }
                         };
-                        self.read_admitted(&inner, i, e.offset, &mut admit, check)?
+                        self.read_with(&inner, i, e.offset, &mut admit, &control)?
                     }
                     None => self.read(&inner, i, e.offset)?,
                 };
@@ -3007,22 +3315,64 @@ fn write_synced_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     )?)
 }
 
-#[cfg(unix)]
-fn read_exact_at(f: &File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::read_exact_at(f, buf, at)
+/// Positional reads do not share a cursor across concurrent queries. Under a checked
+/// control, every kernel request is at most 64 KiB and an interrupted syscall polls
+/// controls before retry. Under [`Unlimited`], reads the whole buffer directly.
+pub(super) fn read_exact_at_loop_with<C: Control>(
+    mut output: &mut [u8],
+    mut offset: u64,
+    control: &C,
+    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<()> {
+    while !output.is_empty() {
+        control.check(0)?;
+        let length = if C::CHECKS {
+            output.len().min(64 << 10)
+        } else {
+            output.len()
+        };
+        match read_at(&mut output[..length], offset) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
+            Ok(count) => {
+                offset = offset
+                    .checked_add(count as u64)
+                    .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
+                output = &mut output[count..];
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    control.check(0)
 }
 
-#[cfg(windows)]
-fn read_exact_at(f: &File, mut buf: &mut [u8], mut at: u64) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        let n = std::os::windows::fs::FileExt::seek_read(f, buf, at)?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        buf = &mut buf[n..];
-        at += n as u64;
+pub(super) fn read_exact_at_with<C: Control>(
+    file: &File,
+    output: &mut [u8],
+    offset: u64,
+    control: &C,
+) -> Result<()> {
+    #[cfg(unix)]
+    if !C::CHECKS {
+        return Ok(std::os::unix::fs::FileExt::read_exact_at(
+            file, output, offset,
+        )?);
     }
-    Ok(())
+    read_exact_at_loop_with(output, offset, control, |buf, at| {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(file, buf, at)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(file, buf, at)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (file, buf, at);
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    })
 }
 
 /// What a scan calls for each change: its commit, `true` for an addition, and its quad.
@@ -3867,30 +4217,26 @@ mod settings_format_tests {
         let mut interrupted_once = false;
         let polls = Cell::new(0usize);
         let mut polls_at_eintr = 0usize;
-        readonly::read_exact_at_checked_with(
-            &mut dst,
-            0,
-            &mut || {
-                polls.set(polls.get() + 1);
-                let cur = current_offset.get();
-                max_advance = max_advance.max(cur - last_polled_offset);
-                last_polled_offset = cur;
-                Ok(())
-            },
-            |buf, at| {
-                calls += 1;
-                max_chunk = max_chunk.max(buf.len());
-                if calls == 2 && !interrupted_once {
-                    interrupted_once = true;
-                    polls_at_eintr = polls.get();
-                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
-                }
-                let start = at as usize;
-                buf.copy_from_slice(&src[start..start + buf.len()]);
-                current_offset.set(at + buf.len() as u64);
-                Ok(buf.len())
-            },
-        )
+        let mut poll = || {
+            polls.set(polls.get() + 1);
+            let cur = current_offset.get();
+            max_advance = max_advance.max(cur - last_polled_offset);
+            last_polled_offset = cur;
+            Ok(())
+        };
+        read_exact_at_loop_with(&mut dst, 0, &FnMutControl::new(&mut poll), |buf, at| {
+            calls += 1;
+            max_chunk = max_chunk.max(buf.len());
+            if calls == 2 && !interrupted_once {
+                interrupted_once = true;
+                polls_at_eintr = polls.get();
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            let start = at as usize;
+            buf.copy_from_slice(&src[start..start + buf.len()]);
+            current_offset.set(at + buf.len() as u64);
+            Ok(buf.len())
+        })
         .unwrap();
         assert_eq!(dst, src);
         assert!(interrupted_once);
@@ -3904,17 +4250,15 @@ mod settings_format_tests {
         let mut polls2 = 0usize;
         let eintr_hit = Cell::new(false);
         let mut saw_retry_after_cancel = false;
-        let res = readonly::read_exact_at_checked_with(
-            &mut dst2,
-            0,
-            &mut || {
-                polls2 += 1;
-                if eintr_hit.get() {
-                    return Err(Error::Cancelled);
-                }
-                Ok(())
-            },
-            |buf, at| {
+        let mut poll2 = || {
+            polls2 += 1;
+            if eintr_hit.get() {
+                return Err(Error::Cancelled);
+            }
+            Ok(())
+        };
+        let res =
+            read_exact_at_loop_with(&mut dst2, 0, &FnMutControl::new(&mut poll2), |buf, at| {
                 calls2 += 1;
                 if eintr_hit.get() {
                     saw_retry_after_cancel = true;
@@ -3926,8 +4270,7 @@ mod settings_format_tests {
                 let start = at as usize;
                 buf.copy_from_slice(&src[start..start + buf.len()]);
                 Ok(buf.len())
-            },
-        );
+            });
         assert!(matches!(res, Err(Error::Cancelled)));
         assert!(eintr_hit.get());
         assert!(!saw_retry_after_cancel);
@@ -3952,8 +4295,12 @@ mod settings_format_tests {
         let inner = log.inner.lock();
         let mut total_polls = 0usize;
         let mut total_admits = 0usize;
+        let mut check_fn = || {
+            total_polls += 1;
+            Ok(())
+        };
         let rec = log
-            .read_admitted(
+            .read_with(
                 &inner,
                 0,
                 SEG_HEADER as u64,
@@ -3961,10 +4308,7 @@ mod settings_format_tests {
                     total_admits += 1;
                     Ok(())
                 },
-                &mut || {
-                    total_polls += 1;
-                    Ok(())
-                },
+                &FnMutControl::new(&mut check_fn),
             )
             .unwrap();
         assert!(matches!(rec, Record::Changes(_, ref c) if c.len() == 1));
@@ -3975,7 +4319,19 @@ mod settings_format_tests {
         for (fail_poll, expected_timeout) in [(2usize, false), (5, false), (7, true)] {
             let mut n = 0usize;
             let mut admits = 0usize;
-            let res = log.read_admitted(
+            let mut cancel_fn = || {
+                n += 1;
+                if n == fail_poll {
+                    Err(if expected_timeout {
+                        Error::Timeout
+                    } else {
+                        Error::Cancelled
+                    })
+                } else {
+                    Ok(())
+                }
+            };
+            let res = log.read_with(
                 &inner,
                 0,
                 SEG_HEADER as u64,
@@ -3983,18 +4339,7 @@ mod settings_format_tests {
                     admits += 1;
                     Ok(())
                 },
-                &mut || {
-                    n += 1;
-                    if n == fail_poll {
-                        Err(if expected_timeout {
-                            Error::Timeout
-                        } else {
-                            Error::Cancelled
-                        })
-                    } else {
-                        Ok(())
-                    }
-                },
+                &FnMutControl::new(&mut cancel_fn),
             );
             if expected_timeout {
                 assert!(matches!(res, Err(Error::Timeout)), "fail_poll={fail_poll}");
@@ -4249,7 +4594,7 @@ mod settings_format_tests {
         });
         let budget = MemoryBudget::new(spare_limit);
         let _raw_guard = budget.reserve(raw_with_spare.capacity() as u64).unwrap();
-        let res = SegIndex::decode_with(&raw_with_spare, dataset_id, None, Some(&budget));
+        let res = SegIndex::decode_with(&raw_with_spare, dataset_id, &Unlimited, Some(&budget));
         drop(observer);
         assert!(
             matches!(res, Err(Error::BudgetExceeded(_))),
@@ -4269,7 +4614,7 @@ mod settings_format_tests {
             .reserve(raw_with_spare.capacity() as u64)
             .unwrap();
         let (_, _, _, decoded_guard) =
-            SegIndex::decode_with(&raw_with_spare, dataset_id, None, Some(&exact_budget))
+            SegIndex::decode_with(&raw_with_spare, dataset_id, &Unlimited, Some(&exact_budget))
                 .unwrap()
                 .unwrap();
         assert_eq!(
@@ -4344,9 +4689,13 @@ mod settings_format_tests {
 
         // 2a. read_index_checked reserves exact capacity without geometric 2x jump past idx_len.
         let exact_raw_budget = MemoryBudget::new(seg1_idx_len);
-        let (raw_bytes, raw_guard) =
-            ChangeLog::read_index_checked(&seg1_idx_path, &mut || Ok(()), Some(&exact_raw_budget))
-                .unwrap();
+        let mut noop = || Ok(());
+        let (raw_bytes, raw_guard) = ChangeLog::read_index_with(
+            &seg1_idx_path,
+            &FnMutControl::new(&mut noop),
+            Some(&exact_raw_budget),
+        )
+        .unwrap();
         assert_eq!(raw_bytes.len() as u64, seg1_idx_len);
         assert!(raw_bytes.capacity() as u64 <= seg1_idx_len);
         let seg1_decoded_bytes = {
@@ -5608,5 +5957,143 @@ mod settings_format_tests {
             );
             assert_eq!(cancel_polls, stop_at);
         }
+    }
+
+    #[test]
+    fn unified_changelog_decoder_and_settings_parity_across_controls() {
+        use crate::history::{HistoryOptions, ReadLimit};
+        use crate::store::cold::ColdBudget;
+        use std::sync::atomic::AtomicBool;
+
+        // 1. Settings parity between Unlimited and ColdBudget, plus tight-budget refusal
+        //    and uncapped cancellation/timeout enforcement.
+        let dir = tempfile::tempdir().unwrap();
+        let wanted = ChangeLogSettings {
+            enabled: Some(true),
+            keep_commits: Some(42),
+            keep_age_ms: Some(60_000),
+            max_bytes: Some(8 << 20),
+        };
+        write_settings(dir.path(), &wanted).unwrap();
+        assert_eq!(
+            read_settings_with(dir.path(), &mut Unlimited).unwrap(),
+            wanted
+        );
+
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        assert_eq!(read_settings_with(dir.path(), &mut budget).unwrap(), wanted);
+        assert_eq!(budget.used(), 0);
+
+        let mut tiny = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(16),
+            held: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            read_settings_with(dir.path(), &mut tiny),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(tiny.used(), 0);
+
+        let cancel_opts = HistoryOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            deadline: None,
+        };
+        assert!(matches!(
+            ColdBudget::new(ReadLimit {
+                options: &cancel_opts,
+                memory: None,
+                held: 0,
+            }),
+            Err(Error::Cancelled)
+        ));
+        let expired_opts = HistoryOptions {
+            cancel: None,
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(matches!(
+            ColdBudget::new(ReadLimit {
+                options: &expired_opts,
+                memory: None,
+                held: 0,
+            }),
+            Err(Error::Timeout)
+        ));
+
+        // 2. Unified record decoder, framing, payload, and hole helpers agree between
+        //    Unlimited and checked Control carriers and honour cancellation/timeouts.
+        let meta = Arc::new(ChangeCommit {
+            seq: 7,
+            timestamp_ms: 123_456,
+            kind: CommitKind::Update,
+            bulk: false,
+            inserted: 1,
+            deleted: 0,
+            author: Some(Arc::from("alice")),
+            message: Some(Arc::from("unified codec")),
+        });
+        let quad: QuadKey = [b"".as_slice(), b"<urn:s>", b"<urn:p>", b"\"obj\""].map(Arc::from);
+        let wire = encode(&Record::Changes(meta.clone(), vec![(true, quad.clone())]));
+
+        let mut ok = || Ok(());
+        let (u_body, u_next) = frame_with(&wire, 0, &Unlimited).unwrap().unwrap();
+        let (c_body, c_next) = frame_with(&wire, 0, &FnMutControl::new(&mut ok))
+            .unwrap()
+            .unwrap();
+        assert_eq!((u_body, u_next), (c_body, c_next));
+
+        let u_rec = decode_record_with(
+            u_body,
+            &Unlimited,
+            OwnedRecordSink {
+                exact: false,
+                bytes_since_check: 0,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let mut ok = || Ok(());
+        let c_rec = decode_record_with(
+            c_body,
+            &FnMutControl::new(&mut ok),
+            OwnedRecordSink {
+                exact: true,
+                bytes_since_check: 0,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        match (u_rec, c_rec) {
+            (Record::Changes(um, uc), Record::Changes(cm, cc)) => {
+                assert_eq!(um, cm);
+                assert_eq!(uc, cc);
+            }
+            _ => panic!("expected changes records"),
+        }
+
+        let mut cancel_fn = || Err(Error::Cancelled);
+        assert!(matches!(
+            frame_with(&wire, 0, &FnMutControl::new(&mut cancel_fn)),
+            Err(Error::Cancelled)
+        ));
+        let mut timeout_fn = || Err(Error::Timeout);
+        assert!(matches!(
+            decode_record_with(
+                u_body,
+                &FnMutControl::new(&mut timeout_fn),
+                OwnedRecordSink {
+                    exact: true,
+                    bytes_since_check: 0,
+                }
+            ),
+            Err(Error::Timeout)
+        ));
     }
 }

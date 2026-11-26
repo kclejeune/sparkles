@@ -801,7 +801,7 @@ impl Store {
             .max(history_limited::SHARED_SNAPSHOT_BYTES);
         budget.charge(delta_bytes)?;
         budget.check()?;
-        let settings = ChangeLog::settings_controlled(&root, &mut budget)?;
+        let settings = changelog::read_settings_with(&root, &mut budget)?;
         let log = ChangeLog::capture_read_only(
             &root,
             id,
