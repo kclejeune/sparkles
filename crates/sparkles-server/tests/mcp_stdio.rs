@@ -507,6 +507,23 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     .unwrap();
     stdin.flush().unwrap();
 
+    // Measure a single `tools/list` response so we enqueue enough total bytes to exceed both
+    // Linux and macOS pipe buffers and can verify the pipe genuinely stalls below full volume.
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let mut sample = String::new();
+    stdout.read_line(&mut sample).unwrap();
+    let sample_v: Value = serde_json::from_str(&sample).unwrap();
+    assert_eq!(sample_v["id"], 2);
+    assert!(sample_v.get("result").is_some(), "{sample_v}");
+    let single_response_len = sample.len();
+    assert!(single_response_len > 0);
+
     // Stop reading stdout while keeping the read end open so the pipe fills and stalls.
     let stdout_pipe = stdout.into_inner();
     #[cfg(target_os = "linux")]
@@ -514,8 +531,12 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
         let _ = unsafe { libc::fcntl(stdout_pipe.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
     }
 
-    // Enqueue enough `tools/list` responses (~200 KiB) to exceed Linux and macOS pipe buffers.
-    for id in 2..=41u64 {
+    // Enqueue enough `tools/list` responses (>= 256 KiB and >= 40 replies) to exceed Linux
+    // and macOS pipe buffers.
+    let batch_count = ((256 * 1024) / single_response_len).max(40);
+    let total_expected_bytes = batch_count * single_response_len;
+    for offset in 0..batch_count {
+        let id = 3 + offset as u64;
         writeln!(
             stdin,
             "{}",
@@ -525,17 +546,32 @@ fn stdio_cli_exits_after_eof_with_stalled_stdout() {
     }
     stdin.flush().unwrap();
 
-    // Wait until stdout carries buffered response bytes so the server is actively stalled.
+    // Wait until stdout carries at least 4096 buffered bytes, remains strictly below the
+    // full batch volume, and plateaus unchanged for 60 ms so we know the pipe is actively
+    // backpressured on both Linux and macOS before closing stdin.
     let fill_deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_readable: libc::c_int = 0;
+    let mut stable_since: Option<Instant> = None;
     loop {
         let mut readable: libc::c_int = 0;
         let rc = unsafe { libc::ioctl(stdout_pipe.as_raw_fd(), libc::FIONREAD, &mut readable) };
-        if rc == 0 && readable >= 4096 {
-            break;
+        if rc == 0 {
+            assert!(
+                (readable as usize) < total_expected_bytes,
+                "all {batch_count} tools/list responses ({total_expected_bytes} B) unexpectedly fit in stdout pipe without stalling (readable={readable})"
+            );
+            if readable >= 4096 && readable == last_readable {
+                if stable_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(60)) {
+                    break;
+                }
+            } else {
+                last_readable = readable;
+                stable_since = (readable >= 4096).then(Instant::now);
+            }
         }
         assert!(
             Instant::now() < fill_deadline,
-            "stdout pipe did not fill before EOF test (readable={readable})"
+            "stdout pipe did not fill and plateau before EOF test (readable={readable})"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
