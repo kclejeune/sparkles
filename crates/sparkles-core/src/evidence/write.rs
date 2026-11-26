@@ -1356,6 +1356,93 @@ impl<'a> Reads<'a> {
         Ok((out, more))
     }
 
+    /// The `(subject, graph)` IRI pairs of `?s p o` in named graphs accepted by
+    /// `keep_graph`, at most `limit` of them, and whether more exist. Quads in
+    /// rejected graphs are skipped without counting toward `limit`. `o` is a ground
+    /// term.
+    pub fn subjects_in_graphs_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        limit: usize,
+        mut keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<(Vec<(NamedNode, NamedNode)>, bool)> {
+        let Some(p) = self.id(p)? else {
+            return Ok((Vec::new(), false));
+        };
+        let o = match o {
+            Term::NamedNode(n) => self.id(n.as_str())?,
+            t => self.preparation.lookup_term(self.snap, t)?,
+        };
+        let Some(o) = o else {
+            return Ok((Vec::new(), false));
+        };
+        const SKIP_SLOTS: usize = 256;
+        let mut skipped = [None::<Id>; SKIP_SLOTS];
+        let mut accepted: BTreeMap<Id, NamedNode> = BTreeMap::new();
+        let mut held: Option<Reservation> = None;
+        let mut pairs: Vec<(Id, Id)> = Vec::new();
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
+                let g = q[3];
+                if g == Id::DEFAULT_GRAPH {
+                    return Ok(true);
+                }
+                if let std::collections::btree_map::Entry::Vacant(e) = accepted.entry(g) {
+                    let slot =
+                        (g.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize % SKIP_SLOTS;
+                    if skipped[slot] == Some(g) {
+                        return Ok(true);
+                    }
+                    let node = self.preparation.with_term(self.snap, g, |t| match t {
+                        Some(Term::NamedNode(n)) if keep_graph(n.as_str()) => Ok(Some(n.clone())),
+                        _ => Ok(None),
+                    })?;
+                    let Some(node) = node else {
+                        skipped[slot] = Some(g);
+                        return Ok(true);
+                    };
+                    let bytes = node.as_str().len() as u64 + CACHE_ENTRY;
+                    match held.as_mut() {
+                        Some(r) => r.grow_by(bytes)?,
+                        None => held = Some(self.preparation.reserve(CACHE_START + bytes)?),
+                    }
+                    e.insert(node);
+                }
+                if pairs.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                let entry = std::mem::size_of::<(Id, Id)>() as u64 * 2;
+                match held.as_mut() {
+                    Some(r) => r.grow_by(entry)?,
+                    None => held = Some(self.preparation.reserve(IDENTITY_START + entry)?),
+                }
+                pairs.push((q[0], g));
+                Ok(true)
+            })?;
+        let mut out = Vec::with_capacity(pairs.len());
+        for (s_id, g_id) in pairs {
+            if let Some(Term::NamedNode(s)) = self
+                .preparation
+                .with_term(self.snap, s_id, |t| Ok(t.cloned()))?
+            {
+                let g = accepted
+                    .get(&g_id)
+                    .expect("accepted graph id retained for scan")
+                    .clone();
+                let bytes = (s.as_str().len() + g.as_str().len()) as u64 + IDENTITY_ENTRY;
+                match held.as_mut() {
+                    Some(r) => r.grow_by(bytes)?,
+                    None => held = Some(self.preparation.reserve(IDENTITY_START + bytes)?),
+                }
+                out.push((s, g));
+            }
+        }
+        Ok((out, more))
+    }
+
     /// The number of triples whose subject is `s` in `g`, counting at most `limit`.
     pub fn subject_triples(&mut self, s: &str, g: &str, limit: usize) -> Result<usize> {
         let (Some(s), Some(g)) = (self.id(s)?, self.id(g)?) else {
