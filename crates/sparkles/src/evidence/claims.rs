@@ -9,7 +9,7 @@
 //! withdrawal that ends it. Otherwise it answers as missing, so a reader learns nothing
 //! about hidden records, and an older decision never stands in for a hidden current one.
 
-use super::{G, PolicyGraphs, State, caller_view, caller_view_evidence, check_store};
+use super::{G, PolicyGraphs, State, caller_view, caller_view_evidence};
 use crate::access::GraphAccess;
 use crate::evidence::propose::READS_BYTES;
 use crate::managed::{ManagedErrorKind, OwnerKind};
@@ -276,7 +276,7 @@ pub fn claim_states(
 /// capture. Returns the read commit sequence alongside one entry per claim.
 pub(crate) fn claim_states_live(
     main: &Dataset,
-    logical: &Dataset,
+    logical: &crate::store::Store,
     policy: &str,
     claims: &[NamedNode],
     access: Option<Arc<GraphAccess>>,
@@ -287,7 +287,7 @@ pub(crate) fn claim_states_live(
 
 fn claim_states_live_with_hook(
     main: &Dataset,
-    logical: &Dataset,
+    logical: &crate::store::Store,
     policy: &str,
     claims: &[NamedNode],
     access: Option<Arc<GraphAccess>>,
@@ -296,7 +296,11 @@ fn claim_states_live_with_hook(
 ) -> Result<(u64, Vec<Option<ClaimOccurrence>>)> {
     const MAX_ATTEMPTS: usize = 3;
     control.check()?;
-    check_store(main, logical)?;
+    if main.store().is_branch() || logical.owner_dataset_id() != main.dataset_id() {
+        return Err(Error::invalid(
+            "an operation names the dataset's main store and one of its branches",
+        ));
+    }
     let attempts = if access.is_some() { 1 } else { MAX_ATTEMPTS };
     let mut selected = None;
     for attempt in 0..attempts {
@@ -310,7 +314,7 @@ fn claim_states_live_with_hook(
         }
         let rev_before = registry.as_ref().map_or(0, |s| s.graphs.revision);
         between_registry_and_head(attempt);
-        let head = logical.store().snapshot();
+        let head = logical.snapshot();
         let rev_after = main.store().managed_revision()?;
         if rev_after == rev_before {
             selected = Some((registry, head));
@@ -923,7 +927,7 @@ mod tests {
         // Sanity: coherent live read observes the accepted claim.
         let (_, states) = claim_states_live(
             &ds,
-            &ds,
+            ds.store(),
             "review-v1",
             std::slice::from_ref(&claim_iri),
             None,
@@ -938,7 +942,7 @@ mod tests {
         let mut did_detach = false;
         let err = claim_states_live_with_hook(
             &ds,
-            &ds,
+            ds.store(),
             "review-v1",
             std::slice::from_ref(&claim_iri),
             None,
@@ -960,7 +964,7 @@ mod tests {
         // managed-unavailable rather than pairing an older head with a newer policy.
         let err = claim_states_live_with_hook(
             &ds,
-            &ds,
+            ds.store(),
             "review-v1",
             std::slice::from_ref(&claim_iri),
             None,

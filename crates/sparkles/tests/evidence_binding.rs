@@ -2,10 +2,11 @@
 //! spec C25, roadmap item 509).
 
 use serde_json::{Value, json};
+use sparkles::branch::BranchOptions;
 use sparkles::evidence::binding;
-use sparkles::task::Control;
+use sparkles::task::{Control, Progress};
 use sparkles::{Dataset, Error};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -806,9 +807,138 @@ fn propose_preflight_meters_decoded_rdf_and_checks_nested_cancellation() {
         "expected BudgetExceeded before scope RDF parse, got {err:?}"
     );
 
-    // (e) Cancellation reaching nested conversion loops (scope and resolve kinds).
-    let mut big_scope: Vec<String> = (0..120_000).map(|i| format!("\"v{i}\"")).collect();
-    big_scope.push("not-valid-rdf".into());
+    // (e) Valid Unicode-escaped RDF that exceeds 16 MiB in raw serialized form (10 MiB source
+    // text + ~7.2 MiB of 6-byte `\u0061` escapes) but decodes to ~11.2 MiB (within both the
+    // 24 MiB raw JSON cap and the 16 MiB decoded-input cap) must succeed.
+    let ds_esc = Dataset::memory();
+    binding::configure(&ds_esc, &settings_bytes(), &ctl).unwrap();
+    let text_10m = "s".repeat(10 * 1024 * 1024);
+    let escaped_1_2m = "\\u0061".repeat(1_200_000);
+    let escaped_prop =
+        format!("<https://example.org/a> <https://example.org/b> \"{escaped_1_2m}\"");
+    assert!(
+        text_10m.len() + escaped_prop.len() > sparkles::evidence::RecordKey::MAX_BYTES,
+        "serialized source + escaped RDF must exceed 16 MiB to exercise escape metering"
+    );
+    let valid_escaped_req = serde_json::to_vec(&json!({
+        "revisions": [{
+            "key": "r1",
+            "source": "https://example.org/s",
+            "sourceKey": "k-esc",
+            "content": { "text": text_10m },
+        }],
+        "claims": [{
+            "key": "c1",
+            "occurrenceKey": "o-esc",
+            "revision": { "key": "r1" },
+            "proposition": escaped_prop,
+            "kind": "reported",
+            "polarity": "positive",
+            "author": "https://example.org/org/a",
+        }],
+    }))
+    .unwrap();
+    assert!(
+        valid_escaped_req.len() < binding::MAX_CLAIMS_BYTES,
+        "raw JSON payload ({}) must fit under 24 MiB",
+        valid_escaped_req.len()
+    );
+    let proposed = binding::propose_bytes(&ds_esc, None, None, None, &valid_escaped_req, &ctl)
+        .expect("valid escaped RDF within 16 MiB decoded + 24 MiB JSON must succeed");
+    assert_eq!(proposed["committed"], true);
+
+    // (f) Over-budget escaped RDF (15 MiB source text + ~7.2 MiB of `\u0061` decoding to
+    // ~1.2 MiB = ~16.2 MiB decoded, still under 24 MiB raw JSON) fails with BudgetExceeded
+    // before oxrdfio parses the trailing unterminated literal.
+    let text_15m = "s".repeat(15 * 1024 * 1024);
+    let over_escaped_prop =
+        format!("<https://example.org/a> <https://example.org/b> \"{escaped_1_2m}");
+    let over_escaped_req = serde_json::to_vec(&json!({
+        "revisions": [{
+            "key": "r1",
+            "source": "https://example.org/s",
+            "sourceKey": "k-over-esc",
+            "content": { "text": text_15m },
+        }],
+        "claims": [{
+            "key": "c1",
+            "occurrenceKey": "o-over-esc",
+            "revision": { "key": "r1" },
+            "proposition": over_escaped_prop,
+            "kind": "reported",
+            "polarity": "positive",
+            "author": "https://example.org/org/a",
+        }],
+    }))
+    .unwrap();
+    assert!(over_escaped_req.len() < binding::MAX_CLAIMS_BYTES);
+    let err = binding::propose_bytes(&ds, None, None, None, &over_escaped_req, &ctl).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded on over-budget escaped RDF, got {err:?}"
+    );
+
+    // (g) Long scope predicate IRI with many short values avoids quadratic diagnostic formatting
+    // and still reports the full predicate path when an entry is invalid.
+    let long_pred = format!("https://example.org/p/{}", "a".repeat(64 * 1024));
+    let many_short: Vec<String> = (0..2_000).map(|i| format!("\"v{i}\"")).collect();
+    let mut long_scope_map = serde_json::Map::new();
+    long_scope_map.insert(long_pred, json!(many_short));
+    let long_scope_req = serde_json::to_vec(&json!({
+        "revisions": [{
+            "key": "r1",
+            "source": "https://example.org/s",
+            "sourceKey": "k-scope",
+            "content": { "text": "x" },
+        }],
+        "claims": [{
+            "key": "c1",
+            "occurrenceKey": "o-scope",
+            "revision": { "key": "r1" },
+            "proposition": "<https://example.org/a> <https://example.org/b> <https://example.org/c>",
+            "kind": "reported",
+            "polarity": "positive",
+            "author": "https://example.org/org/a",
+            "scope": long_scope_map,
+        }],
+    }))
+    .unwrap();
+    let ds_scope = Dataset::memory();
+    binding::configure(&ds_scope, &settings_bytes(), &ctl).unwrap();
+    let res = binding::propose_bytes(&ds_scope, None, None, None, &long_scope_req, &ctl).unwrap();
+    assert_eq!(res["committed"], true);
+
+    let bad_scope_req = serde_json::to_vec(&json!({
+        "revisions": [{
+            "key": "r1",
+            "source": "https://example.org/s",
+            "sourceKey": "k-scope-bad",
+            "content": { "text": "x" },
+        }],
+        "claims": [{
+            "key": "c1",
+            "occurrenceKey": "o-scope-bad",
+            "revision": { "key": "r1" },
+            "proposition": "<https://example.org/a> <https://example.org/b> <https://example.org/c>",
+            "kind": "reported",
+            "polarity": "positive",
+            "author": "https://example.org/org/a",
+            "scope": {
+                "https://example.org/p": ["\"ok\"", "not-valid-rdf"],
+            },
+        }],
+    }))
+    .unwrap();
+    let err =
+        binding::propose_bytes(&ds_scope, None, None, None, &bad_scope_req, &ctl).unwrap_err();
+    assert!(
+        matches!(err, Error::Invalid(ref m) if m.contains("claims[0].scope[https://example.org/p][1]")),
+        "expected scope diagnostic with predicate and index, got {err:?}"
+    );
+
+    // (h) Deterministic cancellation triggered *after* entering nested conversion loops
+    // (both proposal scope values and resolution record kinds) interrupts before reaching
+    // the trailing invalid entry.
     let nested_scope_req = serde_json::to_vec(&json!({
         "revisions": [{
             "key": "r1",
@@ -825,18 +955,225 @@ fn propose_preflight_meters_decoded_rdf_and_checks_nested_cancellation() {
             "polarity": "positive",
             "author": "https://example.org/org/a",
             "scope": {
-                "https://example.org/p": big_scope,
+                "https://example.org/p": ["\"v0\"", "\"v1\"", "not-valid-rdf"],
             },
         }],
     }))
     .unwrap();
-    let short = Control {
-        deadline: Some(Instant::now() + Duration::from_millis(20)),
-        ..Control::with_cancel(Arc::new(AtomicBool::new(false)))
+    let scope_cancel = Arc::new(AtomicBool::new(false));
+    let saw_scope_nested = Arc::new(AtomicBool::new(false));
+    let scope_ctl = Control {
+        progress: Progress::new({
+            let cancel = scope_cancel.clone();
+            let saw = saw_scope_nested.clone();
+            move |_, stage| {
+                if stage == "evidence.binding.scope" {
+                    saw.store(true, Ordering::SeqCst);
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            }
+        }),
+        ..Control::with_cancel(scope_cancel)
     };
-    let err = binding::propose_bytes(&ds, None, None, None, &nested_scope_req, &short).unwrap_err();
+    let err =
+        binding::propose_bytes(&ds, None, None, None, &nested_scope_req, &scope_ctl).unwrap_err();
     assert!(
-        matches!(err, Error::Timeout),
-        "expected Timeout inside nested scope conversion, got {err:?}"
+        saw_scope_nested.load(Ordering::SeqCst),
+        "cancellation must trigger after entering nested scope loop"
     );
+    assert!(
+        matches!(err, Error::Cancelled),
+        "expected Cancelled inside nested scope conversion before trailing invalid term, got {err:?}"
+    );
+
+    let nested_kinds_req = serde_json::to_vec(&json!({
+        "references": [{
+            "key": "r1",
+            "record": {
+                "iri": "https://example.org/c/1",
+                "kinds": ["Claim", "SourceRevision", "not-a-valid-kind"],
+            },
+        }],
+    }))
+    .unwrap();
+    let kinds_cancel = Arc::new(AtomicBool::new(false));
+    let saw_kinds_nested = Arc::new(AtomicBool::new(false));
+    let kinds_ctl = Control {
+        progress: Progress::new({
+            let cancel = kinds_cancel.clone();
+            let saw = saw_kinds_nested.clone();
+            move |_, stage| {
+                if stage == "evidence.binding.resolve.kinds" {
+                    saw.store(true, Ordering::SeqCst);
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            }
+        }),
+        ..Control::with_cancel(kinds_cancel)
+    };
+    let err = binding::resolve_bytes(&ds, None, &nested_kinds_req, &kinds_ctl).unwrap_err();
+    assert!(
+        saw_kinds_nested.load(Ordering::SeqCst),
+        "cancellation must trigger after entering nested resolve kinds loop"
+    );
+    assert!(
+        matches!(err, Error::Cancelled),
+        "expected Cancelled inside nested resolve kinds conversion before trailing invalid kind, got {err:?}"
+    );
+}
+
+/// Regression for R3-1 (Sol P1 #1): resolving an uncached in-memory branch (created via
+/// `ds.store().create_branch(...)` without warming `Dataset`'s branch wrapper cache) during
+/// an open `main` write transaction must not call `branch_info`/`guarded_writer` or deadlock,
+/// both with configuration history active and on the legacy live-head fallback.
+#[test]
+fn claim_states_resolves_uncached_in_memory_branch_during_main_write_transaction() {
+    let ds = Dataset::memory();
+    let ctl = Control::none();
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    binding::configure(&ds, &settings_bytes(), &ctl).unwrap();
+
+    let proposed = binding::propose_bytes(
+        &ds,
+        None,
+        None,
+        None,
+        &claim_proposal_bytes("https://example.org/src/mem-uncached", "occ-mem-1"),
+        &ctl,
+    )
+    .unwrap();
+    let claim_iri = proposed["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "c1")
+        .unwrap()["iri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let main_seq = ds.head_commit().seq;
+
+    // Create branches at the Store layer so Dataset's branch wrapper cache stays cold.
+    ds.store()
+        .create_branch("uncached", &BranchOptions::default())
+        .unwrap();
+    ds.store()
+        .create_branch(
+            "uncached-child",
+            &BranchOptions {
+                from: "uncached".into(),
+                ..BranchOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(ds.cached_branch("uncached").unwrap().is_none());
+    assert!(ds.cached_branch("uncached-child").unwrap().is_none());
+
+    ds.transaction(|_tx| {
+        let tight = Control {
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+            ..Control::with_cancel(Arc::new(AtomicBool::new(false)))
+        };
+
+        for branch in ["uncached", "uncached-child"] {
+            let omitted = binding::claim_states(
+                &ds,
+                Some(branch),
+                None,
+                "review-v1",
+                std::slice::from_ref(&claim_iri),
+                &tight,
+            )?;
+            assert_eq!(omitted["commit"], main_seq);
+            assert_eq!(omitted["claims"][0]["state"], "unreviewed");
+
+            let explicit_head = binding::claim_states(
+                &ds,
+                Some(branch),
+                Some("head"),
+                "review-v1",
+                std::slice::from_ref(&claim_iri),
+                &tight,
+            )?;
+            assert_eq!(explicit_head["commit"], main_seq);
+            assert_eq!(explicit_head["claims"][0]["state"], "unreviewed");
+
+            let explicit_seq = binding::claim_states(
+                &ds,
+                Some(branch),
+                Some(&main_seq.to_string()),
+                "review-v1",
+                std::slice::from_ref(&claim_iri),
+                &tight,
+            )?;
+            assert_eq!(explicit_seq["commit"], main_seq);
+            assert_eq!(explicit_seq["claims"][0]["state"], "unreviewed");
+        }
+
+        // claim_states uses store-level resolution without warming Dataset's branch cache,
+        // and logical_dataset itself also resolves uncached in-memory branches without
+        // waiting on main's writer.
+        assert!(ds.cached_branch("uncached").unwrap().is_none());
+        let resolved = binding::logical_dataset(&ds, Some("uncached-child"))?;
+        assert_eq!(resolved.store().branch_name(), "uncached-child");
+        Ok(())
+    })
+    .unwrap();
+
+    // Legacy fallback (configuration history inactive) on an uncached in-memory branch
+    // inside a main write transaction also completes without waiting on main's writer.
+    let ds_legacy = Dataset::memory();
+    binding::configure(&ds_legacy, &settings_bytes(), &ctl).unwrap();
+    let legacy_prop = binding::propose_bytes(
+        &ds_legacy,
+        None,
+        None,
+        None,
+        &claim_proposal_bytes("https://example.org/src/mem-legacy", "occ-legacy-1"),
+        &ctl,
+    )
+    .unwrap();
+    let legacy_claim = legacy_prop["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "c1")
+        .unwrap()["iri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let legacy_seq = ds_legacy.head_commit().seq;
+    ds_legacy
+        .store()
+        .create_branch("legacy-uncached", &BranchOptions::default())
+        .unwrap();
+    assert!(
+        ds_legacy
+            .cached_branch("legacy-uncached")
+            .unwrap()
+            .is_none()
+    );
+
+    ds_legacy
+        .transaction(|_tx| {
+            let tight = Control {
+                deadline: Some(Instant::now() + Duration::from_millis(100)),
+                ..Control::with_cancel(Arc::new(AtomicBool::new(false)))
+            };
+            let states = binding::claim_states(
+                &ds_legacy,
+                Some("legacy-uncached"),
+                None,
+                "review-v1",
+                std::slice::from_ref(&legacy_claim),
+                &tight,
+            )?;
+            assert_eq!(states["commit"], legacy_seq);
+            assert_eq!(states["claims"][0]["state"], "unreviewed");
+            Ok(())
+        })
+        .unwrap();
 }

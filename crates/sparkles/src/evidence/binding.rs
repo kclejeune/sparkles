@@ -170,6 +170,24 @@ pub fn logical_dataset(main: &Dataset, branch: Option<&str>) -> Result<Dataset> 
     }
 }
 
+/// Resolve the logical branch store (`main` or a named branch) for a read-only
+/// evidence operation without constructing a `Dataset` wrapper or taking any writer
+/// lock.
+fn logical_store<'a>(
+    main: &'a Dataset,
+    branch: Option<&str>,
+) -> Result<crate::store::BranchStore<'a>> {
+    require_main(main)?;
+    match branch {
+        None | Some(crate::branch::MAIN) => Ok(crate::store::BranchStore::Main(main.store())),
+        Some(name) => {
+            // Confirm the main dataset handle is still open without taking writer locks.
+            main.branch(crate::branch::MAIN)?;
+            main.store().branch(name)
+        }
+    }
+}
+
 fn all_read(_ds: &Dataset, _branch: &str) -> Option<Arc<GraphAccess>> {
     Some(Arc::new(GraphAccess::all()))
 }
@@ -416,19 +434,27 @@ fn kind_name(kind: RecordKind) -> &'static str {
     iri.strip_prefix("urn:x-sparkles:evidence:").unwrap_or(iri)
 }
 
-fn parse_triple(field: &str, text: &str) -> Result<Triple> {
+fn parse_triple_with<F, D>(field: F, text: &str) -> Result<Triple>
+where
+    F: FnOnce() -> D,
+    D: std::fmt::Display,
+{
     let line = format!("{text} .\n");
     let mut quads =
         oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples).for_slice(line.as_bytes());
     let quad = match quads.next() {
         Some(Ok(q)) => q,
-        Some(Err(e)) => return Err(bad(field, e)),
-        None => return Err(bad(field, "expected one triple")),
+        Some(Err(e)) => return Err(bad(field(), e)),
+        None => return Err(bad(field(), "expected one triple")),
     };
     if quads.next().is_some() {
-        return Err(bad(field, "expected one triple"));
+        return Err(bad(field(), "expected one triple"));
     }
     Ok(Triple::new(quad.subject, quad.predicate, quad.object))
+}
+
+fn parse_triple(field: &str, text: &str) -> Result<Triple> {
+    parse_triple_with(|| field, text)
 }
 
 fn stored_fact_ref_with(
@@ -569,6 +595,11 @@ fn resolve_req(
                     })?;
                     if !kinds.contains(&kind) {
                         kinds.push(kind);
+                    }
+                    if j == 0 && control.progress.is_some() {
+                        control
+                            .progress
+                            .report(0.0, "evidence.binding.resolve.kinds");
                     }
                 }
                 let content_digest = rec
@@ -885,8 +916,12 @@ fn method_ref(field: &str, m: &MethodJson) -> Result<MethodRef> {
     })
 }
 
-fn parse_term(field: &str, text: &str) -> Result<Term> {
-    Ok(parse_triple(
+fn parse_term_with<F, D>(field: F, text: &str) -> Result<Term>
+where
+    F: FnOnce() -> D,
+    D: std::fmt::Display,
+{
+    Ok(parse_triple_with(
         field,
         &format!("<urn:x-sparkles:s> <urn:x-sparkles:p> {text}"),
     )?
@@ -966,6 +1001,162 @@ fn triple_decoded_bytes(triple: &Triple) -> usize {
     }
 }
 
+fn parse_hex_u32(bytes: &[u8]) -> Option<u32> {
+    let mut val = 0u32;
+    for &b in bytes {
+        let digit = match b {
+            b'0'..=b'9' => (b - b'0') as u32,
+            b'a'..=b'f' => (b - b'a' + 10) as u32,
+            b'A'..=b'F' => (b - b'A' + 10) as u32,
+            _ => return None,
+        };
+        val = (val << 4) | digit;
+    }
+    Some(val)
+}
+
+/// Meter decoded UTF-8 bytes of N-Triples text against `RecordKey::MAX_BYTES` before
+/// invoking `oxrdfio`. Valid escape sequences (`\uXXXX`, `\UXXXXXXXX`, and short string
+/// escapes) are charged by their decoded UTF-8 byte width rather than serialized length.
+fn preflight_rdf_decoded_bytes(
+    text: &str,
+    already_decoded: usize,
+    control: &Control,
+) -> Result<()> {
+    if already_decoded.saturating_add(text.len()) <= RecordKey::MAX_BYTES {
+        return Ok(());
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Outside,
+        InString,
+        InIri,
+    }
+    let bytes = text.as_bytes();
+    let mut state = State::Outside;
+    let mut produced = 0usize;
+    let mut i = 0usize;
+    let mut next_check = 65_536usize;
+    while i < bytes.len() {
+        if i >= next_check {
+            control.check()?;
+            next_check = i.saturating_add(65_536);
+        }
+        let b = bytes[i];
+        let add = match state {
+            State::Outside => match b {
+                b'"' => {
+                    state = State::InString;
+                    i += 1;
+                    0
+                }
+                b'<' => {
+                    if bytes.get(i + 1) == Some(&b'<') {
+                        i += 2;
+                    } else {
+                        state = State::InIri;
+                        i += 1;
+                    }
+                    0
+                }
+                b'#' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                        i += 1;
+                    }
+                    0
+                }
+                b'_' if bytes.get(i + 1) == Some(&b':') => {
+                    i += 2;
+                    0
+                }
+                b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'(' | b')' | b'^' | b'@' | b'.' | b'~' => {
+                    i += 1;
+                    0
+                }
+                _ => {
+                    i += 1;
+                    1
+                }
+            },
+            State::InIri => match b {
+                b'>' => {
+                    state = State::Outside;
+                    i += 1;
+                    0
+                }
+                b'\\' => match bytes.get(i + 1) {
+                    Some(b'u') if i + 6 <= bytes.len() => {
+                        let Some(ch) = parse_hex_u32(&bytes[i + 2..i + 6]).and_then(char::from_u32)
+                        else {
+                            return Ok(());
+                        };
+                        i += 6;
+                        ch.len_utf8()
+                    }
+                    Some(b'U') if i + 10 <= bytes.len() => {
+                        let Some(ch) =
+                            parse_hex_u32(&bytes[i + 2..i + 10]).and_then(char::from_u32)
+                        else {
+                            return Ok(());
+                        };
+                        i += 10;
+                        ch.len_utf8()
+                    }
+                    _ => return Ok(()),
+                },
+                _ => {
+                    i += 1;
+                    1
+                }
+            },
+            State::InString => match b {
+                b'"' => {
+                    state = State::Outside;
+                    i += 1;
+                    0
+                }
+                b'\\' => match bytes.get(i + 1) {
+                    Some(b't' | b'b' | b'n' | b'r' | b'f' | b'"' | b'\'' | b'\\') => {
+                        i += 2;
+                        1
+                    }
+                    Some(b'u') if i + 6 <= bytes.len() => {
+                        let Some(ch) = parse_hex_u32(&bytes[i + 2..i + 6]).and_then(char::from_u32)
+                        else {
+                            return Ok(());
+                        };
+                        i += 6;
+                        ch.len_utf8()
+                    }
+                    Some(b'U') if i + 10 <= bytes.len() => {
+                        let Some(ch) =
+                            parse_hex_u32(&bytes[i + 2..i + 10]).and_then(char::from_u32)
+                        else {
+                            return Ok(());
+                        };
+                        i += 10;
+                        ch.len_utf8()
+                    }
+                    _ => return Ok(()),
+                },
+                _ => {
+                    i += 1;
+                    1
+                }
+            },
+        };
+        if add > 0 {
+            produced = produced.saturating_add(add);
+            let prospective = already_decoded.saturating_add(produced);
+            if prospective > RecordKey::MAX_BYTES {
+                return Err(budget_exceeded(RecordKey::MAX_BYTES, prospective));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_triple_metered(
     field: &str,
     text: &str,
@@ -973,13 +1164,27 @@ fn parse_triple_metered(
     control: &Control,
 ) -> Result<Triple> {
     control.check()?;
-    let prospective = decoded_bytes.saturating_add(text.len());
-    if prospective > RecordKey::MAX_BYTES {
-        return Err(budget_exceeded(RecordKey::MAX_BYTES, prospective));
-    }
+    preflight_rdf_decoded_bytes(text, *decoded_bytes, control)?;
     let triple = parse_triple(field, text)?;
     charge_decoded(decoded_bytes, triple_decoded_bytes(&triple))?;
     Ok(triple)
+}
+
+fn parse_term_metered_with<F, D>(
+    field: F,
+    text: &str,
+    decoded_bytes: &mut usize,
+    control: &Control,
+) -> Result<Term>
+where
+    F: FnOnce() -> D,
+    D: std::fmt::Display,
+{
+    control.check()?;
+    preflight_rdf_decoded_bytes(text, *decoded_bytes, control)?;
+    let term = parse_term_with(field, text)?;
+    charge_decoded(decoded_bytes, term_decoded_bytes(&term))?;
+    Ok(term)
 }
 
 fn parse_term_metered(
@@ -988,14 +1193,7 @@ fn parse_term_metered(
     decoded_bytes: &mut usize,
     control: &Control,
 ) -> Result<Term> {
-    control.check()?;
-    let prospective = decoded_bytes.saturating_add(text.len());
-    if prospective > RecordKey::MAX_BYTES {
-        return Err(budget_exceeded(RecordKey::MAX_BYTES, prospective));
-    }
-    let term = parse_term(field, text)?;
-    charge_decoded(decoded_bytes, term_decoded_bytes(&term))?;
-    Ok(term)
+    parse_term_metered_with(|| field, text, decoded_bytes, control)
 }
 
 fn charge_opt_str(decoded_bytes: &mut usize, s: Option<&str>) -> Result<()> {
@@ -1026,15 +1224,18 @@ fn parse_scope(
         control.check()?;
         charge_decoded(decoded_bytes, p.len())?;
         named(&format!("{field}.scope"), p)?;
-        let mut terms = Vec::with_capacity(values.len());
+        let mut terms = Vec::new();
         for (i, v) in values.iter().enumerate() {
             control.check()?;
-            terms.push(parse_term_metered(
-                &format!("{field}.scope[{p}][{i}]"),
+            terms.push(parse_term_metered_with(
+                || format!("{field}.scope[{p}][{i}]"),
                 v,
                 decoded_bytes,
                 control,
             )?);
+            if i == 0 && control.progress.is_some() {
+                control.progress.report(0.0, "evidence.binding.scope");
+            }
         }
         out.insert(p.clone(), terms);
     }
@@ -2041,14 +2242,14 @@ pub fn claim_states(
         control.check()?;
         nodes.push(named(&format!("claims[{i}]"), c)?);
     }
-    let logical = logical_dataset(main, branch)?;
+    let logical = logical_store(main, branch)?;
     let (commit, occurrences) = match at {
         Some(raw) => {
             let selector = raw.parse::<crate::history::At>()?;
             let preparation =
                 crate::access::Preparation::new(control.clone(), super::propose::READS_BYTES)?;
             let view = main.store().evidence_view_committed_with_branch(
-                logical.store(),
+                &logical,
                 &selector,
                 &preparation,
             )?;
@@ -2060,7 +2261,7 @@ pub fn claim_states(
             let preparation =
                 crate::access::Preparation::new(control.clone(), super::propose::READS_BYTES)?;
             match main.store().evidence_view_committed_with_branch(
-                logical.store(),
+                &logical,
                 &crate::history::At::Head,
                 &preparation,
             ) {

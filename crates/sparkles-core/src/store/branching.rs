@@ -1648,6 +1648,27 @@ impl Store {
         Ok(self.owned_set()?.entry(name)?.id)
     }
 
+    /// The name of branch `name`'s nearest listed upstream branch, read from the
+    /// branch table without opening any branch store or taking any writer lock (`None`
+    /// for `main` or when no listed upstream remains).
+    pub fn branch_upstream_name(&self, name: &str) -> Result<Option<String>> {
+        if name == MAIN {
+            return Ok(None);
+        }
+        let set = self.owned_set()?;
+        let t = set.table.lock();
+        let e = t
+            .by_name(name)
+            .ok_or_else(|| branch::no_such_branch(name))?;
+        let Some(upstream_id) = set.upstream_in(&t, e.id) else {
+            return Ok(None);
+        };
+        if upstream_id == set.dataset_id {
+            return Ok(Some(MAIN.to_string()));
+        }
+        Ok(t.by_id(upstream_id).map(|u| u.name.clone()))
+    }
+
     /// The current name of the listed branch whose identity is `id`, `main` for the
     /// dataset id, through the dataset's main store. `None` for a deleted, retired or
     /// unknown identity. Reads only the branch table, so no branch store is opened, and
