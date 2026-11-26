@@ -781,18 +781,45 @@ fn eval_error(e: EvalError) -> ApiError {
     }
 }
 
+/// Allocation-free byte counter for measuring serialized JSON entries up to `max` bytes.
+struct BoundedLenWriter {
+    len: usize,
+    max: usize,
+}
+
+impl std::io::Write for BoundedLenWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next = self.len.saturating_add(buf.len());
+        if next > self.max {
+            return Err(std::io::Error::other("exceeded response byte cap"));
+        }
+        self.len = next;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_serialized_len_bounded<T: serde::Serialize>(val: &T, max: usize) -> Option<usize> {
+    let mut w = BoundedLenWriter { len: 0, max };
+    serde_json::to_writer(&mut w, val).ok()?;
+    Some(w.len)
+}
+
 fn headers_bounded(headers: &[String], used: &mut usize, max_bytes: usize) -> Vec<String> {
     let mut out = Vec::new();
     for h in headers {
-        if *used >= max_bytes {
+        let rem = max_bytes.saturating_sub(*used);
+        // A JSON string plus comma needs at least `h.len() + 3` bytes (`"..."` + `,`).
+        if rem <= 1 || h.len().saturating_add(3) > rem {
             break;
         }
-        let entry_bytes = serde_json::to_string(h)
-            .map_or(usize::MAX, |s| s.len())
-            .saturating_add(1);
-        if used.saturating_add(entry_bytes) > max_bytes {
+        let Some(str_bytes) = json_serialized_len_bounded(h, rem.saturating_sub(1)) else {
             break;
-        }
+        };
+        let entry_bytes = str_bytes.saturating_add(1);
         *used = used.saturating_add(entry_bytes);
         out.push(h.clone());
     }
@@ -807,7 +834,8 @@ fn diagnostics_json_bounded(
     let mut out = Vec::new();
     let mut truncated = res.diagnostics_truncated;
     for d in &res.diagnostics {
-        if *used >= max_bytes {
+        let rem = max_bytes.saturating_sub(*used);
+        if rem <= 1 {
             truncated = true;
             break;
         }
@@ -818,20 +846,18 @@ fn diagnostics_json_bounded(
             "code": d.code,
             "message": d.message,
         });
-        let entry_bytes = serde_json::to_string(&entry)
-            .map_or(usize::MAX, |s| s.len())
-            .saturating_add(1);
-        if used.saturating_add(entry_bytes) > max_bytes {
+        let Some(val_bytes) = json_serialized_len_bounded(&entry, rem.saturating_sub(1)) else {
             truncated = true;
             break;
-        }
+        };
+        let entry_bytes = val_bytes.saturating_add(1);
         *used = used.saturating_add(entry_bytes);
         out.push(entry);
     }
     (out, truncated)
 }
 
-fn pattern_summary_json_bounded(res: &PatternResult, max_bytes: usize) -> J {
+fn pattern_summary_shell_bytes(res: &PatternResult) -> usize {
     let shell = json!({
         "delimiter": res.delimiter.as_str(),
         "headers": [],
@@ -843,7 +869,11 @@ fn pattern_summary_json_bounded(res: &PatternResult, max_bytes: usize) -> J {
         "diagnostics": [],
         "diagnosticsTruncated": false,
     });
-    let mut used = serde_json::to_string(&shell).map_or(256, |s| s.len());
+    json_serialized_len_bounded(&shell, usize::MAX).unwrap_or(256)
+}
+
+fn pattern_summary_json_bounded(res: &PatternResult, max_bytes: usize) -> J {
+    let mut used = pattern_summary_shell_bytes(res);
     let headers = headers_bounded(&res.headers, &mut used, max_bytes);
     let (diagnostics, diagnostics_truncated) = diagnostics_json_bounded(res, &mut used, max_bytes);
     json!({
@@ -859,24 +889,111 @@ fn pattern_summary_json_bounded(res: &PatternResult, max_bytes: usize) -> J {
     })
 }
 
-/// Exact upper bound on the extra serialized JSON bytes that `write_response` appends when
-/// receipt negotiation (`receipt=true` or `Accept: application/x-sparkles+json`) is active.
-fn receipt_extra_bytes(
+/// Exact serialized byte delta added by inserting every key of `rm` (except `"committed"`,
+/// which overwrites the existing field on `edit_body`) into an existing JSON object.
+fn receipt_map_extra_bytes(rm: &serde_json::Map<String, J>) -> usize {
+    let mut total = 0usize;
+    for (k, v) in rm {
+        if k == "committed" {
+            continue;
+        }
+        let k_len = json_serialized_len_bounded(k, usize::MAX).unwrap_or(k.len() + 2);
+        let v_len = json_serialized_len_bounded(v, usize::MAX).unwrap_or(0);
+        // `,` + `"key"` + `:` + value
+        total = total
+            .saturating_add(2)
+            .saturating_add(k_len)
+            .saturating_add(v_len);
+    }
+    total
+}
+
+/// Build the receipt JSON members for `patterns/apply` within `max_extra_bytes`, capping
+/// optional write-guard validation results without serializing the full unbounded receipt.
+/// Preserves the committed outcome (`dataset`, `datasetId`, `committed`, `commit`); when
+/// validation results exceed the remaining allowance, truncates `validation.results` (with
+/// `truncated: true`) or omits `validation` from the JSON body if even its empty shell does
+/// not fit (while `write_response` still emits the `Sparkles-Validation` header).
+fn build_bounded_receipt_map(
     ds: &Dataset,
     receipt: &sparkles::commit::Receipt,
     restricted: bool,
-) -> usize {
-    let Ok(J::Object(mut rm)) = serde_json::to_value(receipt) else {
-        return 0;
+    max_extra_bytes: usize,
+) -> (serde_json::Map<String, J>, usize) {
+    let base_receipt = sparkles::commit::Receipt {
+        dataset_id: receipt.dataset_id,
+        committed: receipt.committed,
+        commit: receipt.commit,
+        validation: None,
+        annotation: receipt.annotation.clone(),
     };
-    if restricted {
-        rm.remove("validation");
-        if let Some(c) = rm.get_mut("commit") {
-            redact_commit_json(c);
-        }
+    let mut rm = match serde_json::to_value(&base_receipt) {
+        Ok(J::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    if restricted && let Some(c) = rm.get_mut("commit") {
+        redact_commit_json(c);
     }
     rm.insert("dataset".into(), ds.name.clone().into());
-    serde_json::to_string(&rm).map_or(0, |s| s.len())
+    let base_extra = receipt_map_extra_bytes(&rm);
+
+    if !restricted && let Some(v) = &receipt.validation {
+        let val_rem = max_extra_bytes.saturating_sub(base_extra);
+        // `,"validation":` is 14 bytes.
+        let key_overhead = 14usize;
+        if val_rem > key_overhead {
+            let mut shell = sparkles::guard::ValidationSummary {
+                language: v.language,
+                status: v.status,
+                mode: v.mode,
+                strategy: v.strategy,
+                threshold: v.threshold,
+                conforms: v.conforms,
+                blocking: v.blocking,
+                total: v.total,
+                by_severity: v.by_severity,
+                limit: v.limit,
+                // Measure with `truncated: false` (1 byte longer than `true`) as a safe upper bound.
+                truncated: false,
+                millis: v.millis,
+                results: Vec::new(),
+                shapes_error: v.shapes_error.clone(),
+                introduced: v.introduced,
+                focus_nodes: v.focus_nodes,
+                fallback: v.fallback.clone(),
+                report_turtle: None,
+            };
+            if let Some(shell_len) =
+                json_serialized_len_bounded(&shell, val_rem.saturating_sub(key_overhead))
+            {
+                let mut used_val = key_overhead.saturating_add(shell_len);
+                let mut kept_results: Vec<J> = Vec::new();
+                let mut results_truncated = v.truncated;
+                for item in &v.results {
+                    let comma = usize::from(!kept_results.is_empty());
+                    let entry_rem = val_rem.saturating_sub(used_val.saturating_add(comma));
+                    if entry_rem == 0 {
+                        results_truncated = true;
+                        break;
+                    }
+                    let Some(item_len) = json_serialized_len_bounded(item, entry_rem) else {
+                        results_truncated = true;
+                        break;
+                    };
+                    used_val = used_val.saturating_add(comma).saturating_add(item_len);
+                    kept_results.push(item.clone());
+                }
+                shell.results = kept_results;
+                shell.truncated = results_truncated;
+                if let Ok(val_json) = serde_json::to_value(&shell) {
+                    rm.insert("validation".into(), val_json);
+                }
+            }
+        }
+    }
+
+    let extra = receipt_map_extra_bytes(&rm);
+    (rm, extra)
 }
 
 fn pattern_errors_response(result: &PatternResult, max_response_bytes: usize) -> Response {
@@ -1355,21 +1472,26 @@ pub(crate) async fn apply(
             }
         };
 
-        let receipt_bytes = if wanted {
-            receipt_extra_bytes(&ds, &e.receipt, restricted)
-        } else {
-            0
-        };
         let edit_shell_bytes = sparkles::handles::ontology::wire::edit_body_shell_bytes(&e);
-        // Reserve space for the edit shell, negotiated receipt fields, and `,"pattern":` key.
+        let pattern_shell_bytes = pattern_summary_shell_bytes(&result).saturating_add(11);
+        let receipt_budget =
+            max_response_bytes.saturating_sub(edit_shell_bytes.saturating_add(pattern_shell_bytes));
+        let (receipt_map, receipt_bytes) = if wanted {
+            let (rm, extra) =
+                build_bounded_receipt_map(&ds, &e.receipt, restricted, receipt_budget);
+            (Some(rm), extra)
+        } else {
+            (None, 0)
+        };
+        // Reserve space for the edit shell, bounded receipt fields, and `,"pattern":` key.
         let pattern_budget = max_response_bytes.saturating_sub(
             edit_shell_bytes
                 .saturating_add(receipt_bytes)
                 .saturating_add(11),
         );
         let pattern_json = pattern_summary_json_bounded(&result, pattern_budget);
-        let pattern_bytes = serde_json::to_string(&pattern_json)
-            .map_or(0, |s| s.len())
+        let pattern_bytes = json_serialized_len_bounded(&pattern_json, usize::MAX)
+            .unwrap_or(0)
             .saturating_add(11);
         let remaining_for_edit =
             max_response_bytes.saturating_sub(receipt_bytes.saturating_add(pattern_bytes));
@@ -1378,11 +1500,12 @@ pub(crate) async fn apply(
         if let Some(map) = body.as_object_mut() {
             map.insert("pattern".to_string(), pattern_json);
         }
-        Ok(write_response(
+        Ok(write_response_with_receipt_map(
             &ds,
             StatusCode::OK,
             Some(body),
             &e.receipt,
+            receipt_map,
             wanted,
             restricted,
         ))

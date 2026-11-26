@@ -4136,5 +4136,129 @@ async fn patterns_r2_triple_limit_parity_dry_run_precondition_prefix_etag_and_re
     );
     assert_eq!(prev_multi.json()["code"], "triple-limit");
 
+    // Oversized SHACL warn-mode validation receipt on apply?receipt=true must preserve
+    // the committed outcome and stay strictly within the response byte ceiling.
+    let huge_shacl_msg = "V".repeat(2_000);
+    let warn_shapes = format!(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+         @prefix ex: <http://ex.org/> .\n\
+         ex:WarnShape a sh:NodeShape ; sh:targetClass ex:Person ;\n\
+           sh:property [ sh:path ex:mustHave ; sh:minCount 1 ; sh:message \"{huge_shacl_msg}\" ] .\n"
+    );
+    let put_guard = send(
+        &s.app,
+        "PUT",
+        "/$/validation/h",
+        &[("content-type", "application/json")],
+        &json!({
+            "mode": "warn",
+            "shapes": { "inline": warn_shapes, "format": "text/turtle" }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(put_guard.status, StatusCode::OK, "{}", put_guard.text());
+
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 1_400));
+    }
+    let shacl_apply_body = json!({
+        "table": {
+            "data": "ID,Kind,Class\nID,TYPE,TI %\nex:WarnInd1,owl:NamedIndividual,ex:Person\nex:WarnInd2,owl:NamedIndividual,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let apply_warn_capped = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?receipt=true",
+        shacl_apply_body,
+    )
+    .await;
+    assert_eq!(
+        apply_warn_capped.status,
+        StatusCode::OK,
+        "{}",
+        apply_warn_capped.text()
+    );
+    assert!(
+        apply_warn_capped.body.len() <= 1_400,
+        "apply?receipt=true with oversized SHACL warn receipt exceeded 1400-byte cap: {} bytes: {}",
+        apply_warn_capped.body.len(),
+        apply_warn_capped.text()
+    );
+    assert!(
+        apply_warn_capped
+            .headers
+            .contains_key("sparkles-validation"),
+        "Sparkles-Validation header must still be present"
+    );
+    let awj = apply_warn_capped.json();
+    assert_eq!(awj["committed"], true, "{awj}");
+    assert!(awj["commit"].is_object(), "commit receipt missing: {awj}");
+    assert_eq!(awj["validation"]["status"], "warned", "{awj}");
+    assert_eq!(awj["validation"]["truncated"], true, "{awj}");
+    assert_eq!(
+        awj["validation"]["results"].as_array().unwrap().len(),
+        0,
+        "oversized SHACL results must be omitted to stay under cap: {awj}"
+    );
+
+    // Even when the remaining budget cannot fit the validation shell itself, the commit
+    // outcome is preserved and the body stays within the cap while keeping the header.
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 700));
+    }
+    let shacl_tight_body = json!({
+        "table": {
+            "data": "ID,Kind,Class\nID,TYPE,TI %\nex:WarnInd3,owl:NamedIndividual,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let apply_warn_ultra_tight = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?receipt=true",
+        shacl_tight_body,
+    )
+    .await;
+    assert_eq!(
+        apply_warn_ultra_tight.status,
+        StatusCode::OK,
+        "{}",
+        apply_warn_ultra_tight.text()
+    );
+    assert!(
+        apply_warn_ultra_tight.body.len() <= 700,
+        "apply?receipt=true with ultra-tight cap exceeded 700 bytes: {} bytes: {}",
+        apply_warn_ultra_tight.body.len(),
+        apply_warn_ultra_tight.text()
+    );
+    assert!(
+        apply_warn_ultra_tight
+            .headers
+            .contains_key("sparkles-validation")
+    );
+    let awuj = apply_warn_ultra_tight.json();
+    assert_eq!(awuj["committed"], true, "{awuj}");
+    assert!(awuj["commit"].is_object(), "{awuj}");
+    assert!(awuj.get("validation").is_none(), "{awuj}");
+
+    let del_guard = send(&s.app, "DELETE", "/$/validation/h", &[], "").await;
+    assert_eq!(
+        del_guard.status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        del_guard.text()
+    );
+
     *s._state.pattern_test_limits.lock() = None;
 }

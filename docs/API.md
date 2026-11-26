@@ -2687,11 +2687,12 @@ commit, import targets, and dataset prefix bindings) and commit headers.
 `POST /$/ontology/{ds}/patterns/apply` evaluates the table and specification under the
 writer lock against the head snapshot and commits all generated axioms in one atomic
 ontology edit, requiring dataset write access on the `update` endpoint. It enforces
-read-only mode, protected branches, target graph write grants, `If-Match` preconditions
-including import-target and dataset prefix binding digest parity for ontology and pattern
-preview entity tags, `receipt=true`, `message`, and `dryRun=true` preview parity before
-reporting pattern diagnostics. With `onError` set to `abort` (the default), any error
-refuses the commit with `422` (`pattern-errors`) and writes nothing. With `onError` set to
+read-only mode, protected branches, target graph write grants, `If-Match` preconditions,
+`receipt=true`, `message`, and `dryRun=true` preview parity before reporting pattern
+diagnostics. For `If-Match`, ordinary ontology entity tags pin the head commit and
+import-target digest, while pattern preview entity tags pin the head commit and the
+combined import-target and dataset-prefix digest. With `onError` set to `abort` (the
+default), any error refuses the commit with `422` (`pattern-errors`) and writes nothing. With `onError` set to
 `skip`, erroneous rows are discarded atomically, valid rows are committed, and diagnostics
 are returned alongside the edit outcome under `pattern`. Request-wide budget failures and
 structural specification errors refuse the commit under either error policy.
