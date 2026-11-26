@@ -1360,7 +1360,7 @@ impl AppState {
                     self.metrics.forget(name);
                     self.volatile.forget(name);
                     #[cfg(feature = "mcp")]
-                    self.graphrag.detach_circuit(name);
+                    self.graphrag.forget(name);
                 }
                 Ok((deleted, deleted.then_some(identity).flatten()))
             }
@@ -1435,9 +1435,9 @@ impl AppState {
             Ok(ds) => {
                 drop(ds);
                 self.metrics.rename(from, to);
-                self.volatile.rename(from, to);
                 #[cfg(feature = "mcp")]
-                self.graphrag.detach_circuit_and_settle(from);
+                self.graphrag.rename(from, to);
+                self.volatile.rename(from, to);
                 self.compaction.rename(from, to);
                 if let Some(auto) = &self.auto_reason {
                     auto.rename(from, to);

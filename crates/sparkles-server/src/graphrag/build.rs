@@ -1353,7 +1353,7 @@ impl Run<'_> {
     pub(crate) fn private_check(&self) -> Result<Option<String>, RunError> {
         // the check calls no model, so it needs no provider: a refresh it starts without
         // one fails as a visible task, as one the principal's feed starts does
-        if !self.settings.enabled {
+        if !self.settings.enabled || !super::refresh::is_live_dataset(self.st, &self.ds) {
             return Ok(None);
         }
         self.settings.check().map_err(RunError::Refused)?;
@@ -1658,6 +1658,9 @@ pub fn spawn(
     trigger: Option<String>,
 ) -> Result<crate::state::Task, String> {
     let _admission = ADMISSION.lock();
+    if trigger.is_some() && !super::refresh::is_live_dataset(st, &ds) {
+        return Err(format!("dataset /{} is no longer live", ds.name));
+    }
     if let Some(id) = st.active_task(TASK_KIND, &ds.name) {
         return Err(id);
     }

@@ -297,39 +297,100 @@ pub fn start(st: &Arc<AppState>, h: &tokio::runtime::Handle) {
     });
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TickHookPoint {
+    BeforeRetain,
+    AfterSettings,
+    BeforeEnsureLock,
+    BeforeDue,
+    BeforePrivateCheck,
+    BeforeSpawn,
+}
+
+#[cfg(test)]
+type TickHook = Box<dyn FnMut(TickHookPoint, &str)>;
+
+#[cfg(test)]
+thread_local! {
+    static TICK_HOOK: std::cell::RefCell<Option<TickHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TickHookGuard;
+
+#[cfg(test)]
+impl Drop for TickHookGuard {
+    fn drop(&mut self) {
+        TICK_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_tick_hook(f: impl FnMut(TickHookPoint, &str) + 'static) -> TickHookGuard {
+    TICK_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    TickHookGuard
+}
+
+#[cfg(test)]
+fn fire_tick_hook(point: TickHookPoint, name: &str) {
+    let f = TICK_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = f {
+        f(point, name);
+        TICK_HOOK.with(|h| {
+            if h.borrow().is_none() {
+                *h.borrow_mut() = Some(f);
+            }
+        });
+    }
+}
+
 /// One look at every dataset: keep refresh circuits attached and start the refreshes that
 /// are due.
 pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: Instant) {
     let datasets = st.datasets();
     watches.retain(|name, _| datasets.contains_key(name));
-    st.graphrag
-        .retain_circuits(|name| datasets.contains_key(name));
+    #[cfg(test)]
+    fire_tick_hook(TickHookPoint::BeforeRetain, "");
+    st.graphrag.retain_circuits(
+        |name| datasets.contains_key(name),
+        |name, dataset_id, runtime| is_live_owner(st, name, dataset_id, runtime),
+    );
     for (name, ds) in datasets {
-        if st.catalog.restoring_by(&name).is_some() {
+        if !is_live_dataset(st, &ds) {
             watches.remove(&name);
-            st.graphrag.detach_circuit(&name);
+            detach_if_not_live(st, &ds);
             continue;
         }
         let settings: GraphragSettings =
             crate::settings::effective(st, &ds, &crate::settings::GRAPHRAG);
+        #[cfg(test)]
+        fire_tick_hook(TickHookPoint::AfterSettings, &name);
         if !settings.enabled || settings.refresh.mode != RefreshMode::Auto {
             watches.remove(&name);
-            st.graphrag.detach_circuit_for(&name, &ds);
+            detach_if_not_auto(st, &ds);
             continue;
         }
         let head = ds.store.head_commit().seq;
-        let debounce = Duration::from_secs(settings.refresh.debounce_seconds);
         let w = watches
             .entry(name.clone())
             .or_insert_with(|| Watch::for_dataset(&ds));
         if !w.same_dataset(&ds) {
             *w = Watch::for_dataset(&ds);
-            st.graphrag.detach_circuit(&name);
+            st.graphrag.detach_stale_circuit_for(&name, &ds);
         }
         // Keep the internal F13 accumulator attached ahead of the debounce window so
         // commits arriving after startup, settings updates or policy reloads are counted
         // incrementally rather than falling back.
-        ensure_attached(st, &ds, &settings, head, w);
+        let (settings, head) = match ensure_attached(st, &ds, &settings, head, w) {
+            AttachState::Active(s, h) => (*s, h),
+            AttachState::Inactive | AttachState::NotLive => {
+                watches.remove(&name);
+                continue;
+            }
+        };
+        let debounce = Duration::from_secs(settings.refresh.debounce_seconds);
         // the refresh this loop started: wait for it, and back off when it failed
         if let Some(id) = &w.task {
             let state = st
@@ -362,8 +423,15 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
         }
         w.checked();
         w.policy_checked = Some(now);
-        let reason = match due_reason(st, &ds, &settings, w) {
-            Ok(r) => r,
+        #[cfg(test)]
+        fire_tick_hook(TickHookPoint::BeforeDue, &name);
+        let (reason, settings) = match due_outcome(st, &ds, &settings, w, true) {
+            Ok(DueOutcome::Reason(r, live)) => (Some(r), *live),
+            Ok(DueOutcome::None(live)) => (None, *live),
+            Ok(DueOutcome::NotLive | DueOutcome::NotAuto) => {
+                watches.remove(&name);
+                continue;
+            }
             Err(e) => {
                 tracing::warn!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {e}");
                 w.failed(now, debounce);
@@ -372,7 +440,18 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
         };
         let reason = match reason {
             Some(r) => Some(r),
-            None => private_check(st, &ds, &settings, w, now, debounce),
+            None => {
+                #[cfg(test)]
+                fire_tick_hook(TickHookPoint::BeforePrivateCheck, &name);
+                match private_check(st, &ds, &settings, w, now, debounce) {
+                    PrivateOutcome::Reason(r) => Some(r),
+                    PrivateOutcome::None => None,
+                    PrivateOutcome::NotLive => {
+                        watches.remove(&name);
+                        continue;
+                    }
+                }
+            }
         };
         // the failures in a row end only when no refresh is needed, so the refreshes
         // that private checks start back off as the others do
@@ -380,9 +459,20 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
             w.failures = 0;
             continue;
         };
+        #[cfg(test)]
+        fire_tick_hook(TickHookPoint::BeforeSpawn, &name);
+        if !is_live_dataset(st, &ds) {
+            watches.remove(&name);
+            detach_if_not_live(st, &ds);
+            continue;
+        }
         tracing::info!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {reason}");
         match build::spawn(st, ds.clone(), settings, Mode::Refresh, true, Some(reason)) {
             Ok(t) => w.task = Some(t.id),
+            Err(_) if !is_live_dataset(st, &ds) => {
+                watches.remove(&name);
+                detach_if_not_live(st, &ds);
+            }
             // a build or refresh started meanwhile: check again after it
             Err(_) => w.retry_at = Some(now + debounce),
         }
@@ -393,7 +483,13 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
 /// record and no trigger, since the change may be one the principal cannot see.
 pub const CHECK_REASON: &str = "a check under the review policy found reports whose input changed";
 
-/// Run the private check when one is due and its backoff has passed. `Some` when it
+enum PrivateOutcome {
+    Reason(String),
+    None,
+    NotLive,
+}
+
+/// Run the private check when one is due and its backoff has passed. `Reason` when it
 /// found a change of a report's input; nothing else the check does is visible.
 fn private_check(
     st: &Arc<AppState>,
@@ -402,9 +498,13 @@ fn private_check(
     w: &mut Watch,
     now: Instant,
     debounce: Duration,
-) -> Option<String> {
+) -> PrivateOutcome {
+    if !is_live_dataset(st, ds) {
+        detach_if_not_live(st, ds);
+        return PrivateOutcome::NotLive;
+    }
     if settings.review_policy.is_none() || !w.private.ready(now) {
-        return None;
+        return PrivateOutcome::None;
     }
     w.private.runs += 1;
     let head = ds.store.head_commit().seq;
@@ -421,19 +521,31 @@ fn private_check(
     };
     match r.private_check() {
         Ok(None) => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return PrivateOutcome::NotLive;
+            }
             w.private.done();
             w.private.covered = Some(head);
-            None
+            PrivateOutcome::None
         }
         Ok(Some(why)) => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return PrivateOutcome::NotLive;
+            }
             // the refresh it starts clears the check once it ends well
             tracing::debug!(target: "sparkles::graphrag", dataset = %ds.name, "automatic refresh check: {why}");
-            Some(CHECK_REASON.into())
+            PrivateOutcome::Reason(CHECK_REASON.into())
         }
         Err(e) => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return PrivateOutcome::NotLive;
+            }
             tracing::warn!(target: "sparkles::graphrag", dataset = %ds.name, "automatic refresh check: {e}");
             w.private.failed(now, debounce);
-            None
+            PrivateOutcome::None
         }
     }
 }
@@ -700,7 +812,7 @@ enum EnsureCircuit {
 }
 
 /// Whether `ds` is still the live, non-restoring dataset registered under `ds.name`.
-fn is_live_dataset(st: &AppState, ds: &Dataset) -> bool {
+pub(crate) fn is_live_dataset(st: &AppState, ds: &Dataset) -> bool {
     if st.catalog.restoring_by(&ds.name).is_some() {
         return false;
     }
@@ -711,6 +823,48 @@ fn is_live_dataset(st: &AppState, ds: &Dataset) -> bool {
                 &ds.dataset.inner_state().views,
             )
     })
+}
+
+/// Whether `(dataset_id, runtime)` is still the live, non-restoring dataset registered
+/// under `name`.
+fn is_live_owner(
+    st: &AppState,
+    name: &str,
+    dataset_id: uuid::Uuid,
+    runtime: &Weak<sparkles::incr::Runtime>,
+) -> bool {
+    if st.catalog.restoring_by(name).is_some() {
+        return false;
+    }
+    runtime.strong_count() > 0
+        && st.get(name).is_some_and(|cur| {
+            cur.store.dataset_id() == dataset_id
+                && Weak::ptr_eq(runtime, &Arc::downgrade(&cur.dataset.inner_state().views))
+        })
+}
+
+/// Detach `ds`'s circuit under `circuit_lock` only if `ds` is still non-live.
+fn detach_if_not_live(st: &AppState, ds: &Dataset) {
+    let lock = st.graphrag.circuit_lock(&ds.name);
+    let _held = lock.lock();
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+    }
+}
+
+/// Detach `ds`'s circuit under `circuit_lock` only if `ds` is non-live or live settings
+/// are still disabled / non-auto.
+fn detach_if_not_auto(st: &AppState, ds: &Dataset) {
+    let lock = st.graphrag.circuit_lock(&ds.name);
+    let _held = lock.lock();
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return;
+    }
+    let live: GraphragSettings = crate::settings::effective(st, ds, &crate::settings::GRAPHRAG);
+    if !live.enabled || live.refresh.mode != RefreshMode::Auto {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+    }
 }
 
 fn is_internal_conflict(e: &sparkles::Error) -> bool {
@@ -917,6 +1071,19 @@ pub(crate) fn after_build(st: &AppState, ds: &Dataset, source_commit: u64) {
     }
 }
 
+enum AttachState {
+    Active(Box<GraphragSettings>, u64),
+    Inactive,
+    NotLive,
+}
+
+enum DueOutcome {
+    Reason(String, Box<GraphragSettings>),
+    None(Box<GraphragSettings>),
+    NotAuto,
+    NotLive,
+}
+
 /// Keep the internal accumulator attached ahead of the debounce window whenever `ds` has
 /// a `main` build, without reading `state.json` on idle ticks.
 fn ensure_attached(
@@ -925,7 +1092,7 @@ fn ensure_attached(
     settings: &GraphragSettings,
     head: u64,
     w: &mut Watch,
-) {
+) -> AttachState {
     let epoch = st.access_epoch();
     let settings_same = w.attached_settings.as_ref() == Some(settings);
     let epoch_same = w.attached_epoch == Some(epoch);
@@ -933,74 +1100,97 @@ fn ensure_attached(
     let has_matching = st
         .graphrag
         .has_matching_circuit(&ds.name, ds, settings, epoch);
-    if settings_same && epoch_same && !evidence_moved && (has_matching || w.attached_uncountable) {
-        return;
+    if settings_same
+        && epoch_same
+        && !evidence_moved
+        && (has_matching
+            || (w.attached_uncountable && !st.graphrag.has_refresh_circuit(&ds.name, ds)))
+    {
+        return AttachState::Active(Box::new(settings.clone()), head);
     }
     if !st.graphrag.has_refresh_circuit(&ds.name, ds)
         && w.no_build_head == Some(head)
         && settings_same
         && epoch_same
     {
-        return;
+        return AttachState::Active(Box::new(settings.clone()), head);
     }
-    let Ok(state) = build::state_of(st, ds) else {
-        return;
-    };
+    #[cfg(test)]
+    fire_tick_hook(TickHookPoint::BeforeEnsureLock, &ds.name);
     let lock = st.graphrag.circuit_lock(&ds.name);
     let _held = lock.lock();
     if !is_live_dataset(st, ds) {
         st.graphrag.detach_circuit_for_locked(&ds.name, ds);
         w.clear_attached();
-        return;
+        return AttachState::NotLive;
     }
-    // Re-read the live epoch under the circuit lock so any access reload racing with
-    // `state_of` is reflected in the attached handle and watch cache.
+    // Re-read live settings, access epoch, head and build state under the circuit lock so
+    // an older tick snapshot never clobbers or detaches a circuit published by a newer
+    // build or settings change.
+    let live_settings: GraphragSettings =
+        crate::settings::effective(st, ds, &crate::settings::GRAPHRAG);
+    if !live_settings.enabled || live_settings.refresh.mode != RefreshMode::Auto {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        w.clear_attached();
+        return AttachState::Inactive;
+    }
     let epoch = st.access_epoch();
+    let head = ds.store.head_commit().seq;
+    let Ok(state) = build::state_of(st, ds) else {
+        return AttachState::Active(Box::new(live_settings), head);
+    };
     let Some(b) = state
         .last_build
         .as_ref()
         .filter(|b| b.branch == sparkles::branch::MAIN)
     else {
         w.no_build_head = Some(head);
-        w.attached_settings = Some(settings.clone());
+        w.attached_settings = Some(live_settings.clone());
         w.attached_epoch = Some(epoch);
         w.attached_head = Some(head);
         w.attached_uncountable = false;
         st.graphrag.detach_circuit_for_locked(&ds.name, ds);
-        return;
+        return AttachState::Active(Box::new(live_settings), head);
     };
     w.no_build_head = None;
-    let evidence = match resolve_evidence(st, ds, settings) {
+    let evidence = match resolve_evidence(st, ds, &live_settings) {
         Ok(e) => e,
         Err(_) => {
             st.graphrag.detach_circuit_for_locked(&ds.name, ds);
             w.clear_attached();
-            return;
+            return AttachState::Active(Box::new(live_settings), head);
         }
     };
-    match plan_circuit_locked(st, ds, settings, evidence.as_ref()) {
+    match plan_circuit_locked(st, ds, &live_settings, evidence.as_ref()) {
         Ok(CircuitPlan::Attach {
             spec,
             access,
             access_fp,
-        }) => match ensure_circuit_locked(st, ds, settings, epoch, spec, access, access_fp) {
+        }) => match ensure_circuit_locked(st, ds, &live_settings, epoch, spec, access, access_fp) {
             EnsureCircuit::Attached(handle) => {
                 let through = advance_past_graphrag(&ds.store, b.source_commit, head);
                 handle.discard_through(through);
-                w.attached_settings = Some(settings.clone());
+                w.attached_settings = Some(live_settings.clone());
                 w.attached_epoch = Some(epoch);
                 w.attached_head = Some(head);
                 w.attached_uncountable = false;
+                AttachState::Active(Box::new(live_settings), head)
             }
-            EnsureCircuit::NotLive | EnsureCircuit::Failed(_) => {
+            EnsureCircuit::NotLive => {
                 w.clear_attached();
+                AttachState::NotLive
+            }
+            EnsureCircuit::Failed(_) => {
+                w.clear_attached();
+                AttachState::Active(Box::new(live_settings), head)
             }
         },
         Ok(CircuitPlan::Empty | CircuitPlan::Uncountable(_)) | Err(_) => {
-            w.attached_settings = Some(settings.clone());
+            w.attached_settings = Some(live_settings.clone());
             w.attached_epoch = Some(epoch);
             w.attached_head = Some(head);
             w.attached_uncountable = true;
+            AttachState::Active(Box::new(live_settings), head)
         }
     }
 }
@@ -1012,139 +1202,301 @@ pub(crate) fn due_reason(
     settings: &GraphragSettings,
     w: &mut Watch,
 ) -> Result<Option<String>, String> {
-    if !is_live_dataset(st, ds) {
-        st.graphrag.detach_circuit_for(&ds.name, ds);
-        return Ok(None);
+    match due_outcome(st, ds, settings, w, false)? {
+        DueOutcome::Reason(r, _) => Ok(Some(r)),
+        DueOutcome::None(_) | DueOutcome::NotAuto | DueOutcome::NotLive => Ok(None),
     }
-    let state = build::state_of(st, ds)?;
-    let Some(b) = &state.last_build else {
-        return Ok(None);
-    };
-    if b.branch != sparkles::branch::MAIN {
-        return Ok(None);
+}
+
+fn due_outcome(
+    st: &AppState,
+    ds: &Dataset,
+    _settings: &GraphragSettings,
+    w: &mut Watch,
+    require_auto: bool,
+) -> Result<DueOutcome, String> {
+    struct WaitStep {
+        live_settings: GraphragSettings,
+        state: BuildState,
+        evidence: Option<super::evidence::Evidence>,
+        head: u64,
+        effective_after: u64,
+        handle: InternalCircuit,
     }
-    w.has_pending = !b.pending.is_empty();
-    w.had_policy = b.policy.is_some();
-    // the policy the reports read under: enabling, switching or removing it, or a new
-    // version, rewrites every report (spec C25, "Reports on accepted evidence")
-    let evidence = match resolve_evidence(st, ds, settings) {
-        Ok(e) => e,
-        Err(e) => {
-            st.graphrag.detach_circuit_for(&ds.name, ds);
-            return Err(e);
-        }
-    };
-    if let Some(e) = &evidence {
-        note_private(st, ds, e, w);
+
+    enum LockStep {
+        Early {
+            outcome: DueOutcome,
+            evidence: Option<Box<super::evidence::Evidence>>,
+        },
+        Fallback {
+            live_settings: Box<GraphragSettings>,
+            evidence: Option<Box<super::evidence::Evidence>>,
+            head: u64,
+            msg: String,
+        },
+        Wait(Box<WaitStep>),
     }
-    match (&evidence, &b.policy) {
-        (None, None) => {}
-        (None, Some(_)) => {
-            return Ok(Some(
-                "the reports no longer read under a review policy".into(),
-            ));
-        }
-        (Some(e), stored) => {
-            if !stored.as_ref().is_some_and(|p| {
-                p.name == e.policy.name && p.iri == e.policy.iri && p.version == e.policy.version
-            }) {
-                return Ok(Some(format!(
-                    "the reports read under review policy {} at version {}",
-                    e.policy.name, e.policy.version
-                )));
-            }
-        }
-    }
-    if !b.pending.is_empty() {
-        let today = build::today();
-        if w.retried_day != Some(today) {
-            w.retried_day = Some(today);
-            return Ok(Some(format!(
-                "{} communities are pending from an earlier run",
-                b.pending.len()
-            )));
-        }
-    }
-    // only GraphRAG's own commits since then: nothing the reports read changed, which
-    // also keeps a refresh from following its own commit when counts are unavailable
-    if !source_changed(&ds.store, b.source_commit) {
-        return Ok(None);
-    }
-    let head = ds.store.head_commit().seq;
-    let effective_after = advance_past_graphrag(&ds.store, b.source_commit, head);
-    let fallback = |w: &mut Watch, msg: String| -> Result<Option<String>, String> {
-        if evidence.is_some() {
-            w.private.uncounted(head);
-            Ok(None)
-        } else {
-            Ok(Some(msg))
-        }
-    };
-    let handle = {
+
+    let step = {
         let lock = st.graphrag.circuit_lock(&ds.name);
         let _held = lock.lock();
-        let epoch = st.access_epoch();
-        let (spec, access, access_fp) =
-            match plan_circuit_locked(st, ds, settings, evidence.as_ref())? {
-                CircuitPlan::Empty => return Ok(None),
-                CircuitPlan::Uncountable(why) => {
-                    return fallback(
-                        w,
-                        format!("the incremental refresh circuit cannot count the changes: {why}"),
-                    );
-                }
+        if !is_live_dataset(st, ds) {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            w.clear_attached();
+            return Ok(DueOutcome::NotLive);
+        }
+        let live_settings: GraphragSettings =
+            crate::settings::effective(st, ds, &crate::settings::GRAPHRAG);
+        if !live_settings.enabled
+            || (require_auto && live_settings.refresh.mode != RefreshMode::Auto)
+        {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            w.clear_attached();
+            return Ok(DueOutcome::NotAuto);
+        }
+        let state = build::state_of(st, ds)?;
+        let Some(b) = &state.last_build else {
+            return Ok(DueOutcome::None(Box::new(live_settings)));
+        };
+        if b.branch != sparkles::branch::MAIN {
+            return Ok(DueOutcome::None(Box::new(live_settings)));
+        }
+        w.has_pending = !b.pending.is_empty();
+        w.had_policy = b.policy.is_some();
+        // the policy the reports read under: enabling, switching or removing it, or a new
+        // version, rewrites every report (spec C25, "Reports on accepted evidence")
+        let evidence = match resolve_evidence(st, ds, &live_settings) {
+            Ok(e) => e,
+            Err(e) => {
+                st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+                w.clear_attached();
+                return Err(e);
+            }
+        };
+        let policy_reason = match (&evidence, &b.policy) {
+            (None, None) => None,
+            (None, Some(_)) => Some("the reports no longer read under a review policy".into()),
+            (Some(e), stored) => (!stored.as_ref().is_some_and(|p| {
+                p.name == e.policy.name && p.iri == e.policy.iri && p.version == e.policy.version
+            }))
+            .then(|| {
+                format!(
+                    "the reports read under review policy {} at version {}",
+                    e.policy.name, e.policy.version
+                )
+            }),
+        };
+        if let Some(reason) = policy_reason {
+            LockStep::Early {
+                outcome: DueOutcome::Reason(reason, Box::new(live_settings)),
+                evidence: evidence.map(Box::new),
+            }
+        } else if !b.pending.is_empty() && w.retried_day != Some(build::today()) {
+            w.retried_day = Some(build::today());
+            LockStep::Early {
+                outcome: DueOutcome::Reason(
+                    format!(
+                        "{} communities are pending from an earlier run",
+                        b.pending.len()
+                    ),
+                    Box::new(live_settings),
+                ),
+                evidence: evidence.map(Box::new),
+            }
+        } else if !source_changed(&ds.store, b.source_commit) {
+            // only GraphRAG's own commits since then: nothing the reports read changed,
+            // which also keeps a refresh from following its own commit when counts are
+            // unavailable
+            LockStep::Early {
+                outcome: DueOutcome::None(Box::new(live_settings)),
+                evidence: evidence.map(Box::new),
+            }
+        } else {
+            let head = ds.store.head_commit().seq;
+            let effective_after = advance_past_graphrag(&ds.store, b.source_commit, head);
+            let epoch = st.access_epoch();
+            match plan_circuit_locked(st, ds, &live_settings, evidence.as_ref())? {
+                CircuitPlan::Empty => LockStep::Early {
+                    outcome: DueOutcome::None(Box::new(live_settings)),
+                    evidence: evidence.map(Box::new),
+                },
+                CircuitPlan::Uncountable(why) => LockStep::Fallback {
+                    live_settings: Box::new(live_settings),
+                    evidence: evidence.map(Box::new),
+                    head,
+                    msg: format!("the incremental refresh circuit cannot count the changes: {why}"),
+                },
                 CircuitPlan::Attach {
                     spec,
                     access,
                     access_fp,
-                } => (spec, access, access_fp),
-            };
-        if settings.refresh.mode == RefreshMode::Auto {
-            match ensure_circuit_locked(st, ds, settings, epoch, spec, access, access_fp) {
-                EnsureCircuit::Attached(h) => h,
-                EnsureCircuit::NotLive => return Ok(None),
-                EnsureCircuit::Failed(e) => {
-                    return fallback(
-                        w,
-                        format!("the incremental refresh circuit could not attach: {e}"),
-                    );
-                }
-            }
-        } else {
-            match st.graphrag.refresh_circuit(&ds.name, ds, &spec, access_fp) {
-                Some(h) => h,
-                None => {
-                    return fallback(
-                        w,
-                        "the incremental refresh circuit is not attached in manual mode".into(),
-                    );
+                } => {
+                    if live_settings.refresh.mode == RefreshMode::Auto {
+                        match ensure_circuit_locked(
+                            st,
+                            ds,
+                            &live_settings,
+                            epoch,
+                            spec,
+                            access,
+                            access_fp,
+                        ) {
+                            EnsureCircuit::Attached(handle) => {
+                                w.no_build_head = None;
+                                w.attached_settings = Some(live_settings.clone());
+                                w.attached_epoch = Some(epoch);
+                                w.attached_head = Some(head);
+                                w.attached_uncountable = false;
+                                LockStep::Wait(Box::new(WaitStep {
+                                    live_settings,
+                                    state,
+                                    evidence,
+                                    head,
+                                    effective_after,
+                                    handle,
+                                }))
+                            }
+                            EnsureCircuit::NotLive => {
+                                w.clear_attached();
+                                return Ok(DueOutcome::NotLive);
+                            }
+                            EnsureCircuit::Failed(e) => {
+                                w.clear_attached();
+                                LockStep::Fallback {
+                                    live_settings: Box::new(live_settings),
+                                    evidence: evidence.map(Box::new),
+                                    head,
+                                    msg: format!(
+                                        "the incremental refresh circuit could not attach: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                    } else {
+                        match st.graphrag.refresh_circuit(&ds.name, ds, &spec, access_fp) {
+                            Some(handle) => LockStep::Wait(Box::new(WaitStep {
+                                live_settings,
+                                state,
+                                evidence,
+                                head,
+                                effective_after,
+                                handle,
+                            })),
+                            None => LockStep::Fallback {
+                                live_settings: Box::new(live_settings),
+                                evidence: evidence.map(Box::new),
+                                head,
+                                msg:
+                                    "the incremental refresh circuit is not attached in manual mode"
+                                        .into(),
+                            },
+                        }
+                    }
                 }
             }
         }
     };
-    let caught_up = handle.wait(head, CIRCUIT_WAIT_TIMEOUT);
-    match handle.counts(effective_after) {
-        Ok(counts) if caught_up && counts.through >= head => {
-            if let Some(why) = counts.unknown {
-                fallback(
-                    w,
-                    format!("the incremental refresh circuit cannot count every commit: {why}"),
-                )
-            } else {
-                let mut counter = Counter::new(&state, settings);
-                if let Some(joined) = counter.apply_counts(&counts) {
-                    return Ok(Some(joined));
-                }
-                Ok(counter.verdict(settings.refresh.min_changed_fraction))
-            }
+
+    let fallback = |w: &mut Watch,
+                    has_evidence: bool,
+                    head: u64,
+                    live_settings: Box<GraphragSettings>,
+                    msg: String|
+     -> Result<DueOutcome, String> {
+        if has_evidence {
+            w.private.uncounted(head);
+            Ok(DueOutcome::None(live_settings))
+        } else {
+            Ok(DueOutcome::Reason(msg, live_settings))
         }
-        Ok(_) => Err(format!(
-            "the incremental refresh circuit did not reach commit {head} in time (at {})",
-            handle.commit()
-        )),
-        Err(e) => {
-            handle.rebuild();
-            fallback(w, format!("the incremental refresh circuit failed: {e}"))
+    };
+
+    match step {
+        LockStep::Early { outcome, evidence } => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return Ok(DueOutcome::NotLive);
+            }
+            if let Some(e) = &evidence {
+                note_private(st, ds, e, w);
+            }
+            Ok(outcome)
+        }
+        LockStep::Fallback {
+            live_settings,
+            evidence,
+            head,
+            msg,
+        } => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return Ok(DueOutcome::NotLive);
+            }
+            if let Some(e) = &evidence {
+                note_private(st, ds, e, w);
+            }
+            fallback(w, evidence.is_some(), head, live_settings, msg)
+        }
+        LockStep::Wait(wait) => {
+            let WaitStep {
+                live_settings,
+                state,
+                evidence,
+                head,
+                effective_after,
+                handle,
+            } = *wait;
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return Ok(DueOutcome::NotLive);
+            }
+            if let Some(e) = &evidence {
+                note_private(st, ds, e, w);
+            }
+            let caught_up = handle.wait(head, CIRCUIT_WAIT_TIMEOUT);
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return Ok(DueOutcome::NotLive);
+            }
+            match handle.counts(effective_after) {
+                Ok(counts) if caught_up && counts.through >= head => {
+                    if let Some(why) = counts.unknown {
+                        fallback(
+                            w,
+                            evidence.is_some(),
+                            head,
+                            Box::new(live_settings),
+                            format!(
+                                "the incremental refresh circuit cannot count every commit: {why}"
+                            ),
+                        )
+                    } else {
+                        let mut counter = Counter::new(&state, &live_settings);
+                        if let Some(joined) = counter.apply_counts(&counts) {
+                            return Ok(DueOutcome::Reason(joined, Box::new(live_settings)));
+                        }
+                        match counter.verdict(live_settings.refresh.min_changed_fraction) {
+                            Some(reason) => Ok(DueOutcome::Reason(reason, Box::new(live_settings))),
+                            None => Ok(DueOutcome::None(Box::new(live_settings))),
+                        }
+                    }
+                }
+                Ok(_) => Err(format!(
+                    "the incremental refresh circuit did not reach commit {head} in time (at {})",
+                    handle.commit()
+                )),
+                Err(e) => {
+                    handle.rebuild();
+                    fallback(
+                        w,
+                        evidence.is_some(),
+                        head,
+                        Box::new(live_settings),
+                        format!("the incremental refresh circuit failed: {e}"),
+                    )
+                }
+            }
         }
     }
 }

@@ -1592,7 +1592,15 @@ async fn auto_circuit_counts_only_policy_readable_graphs_without_uncounted_fallb
         // check fallback (`Ok(None)` + `private.due = true`) rather than returning `Err`.
         e.s.state.graphrag.detach_circuit("ev");
         let views = &srv_ds.dataset.inner_state().views;
-        views.settle(std::time::Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while views.internal_count() > 0 && std::time::Instant::now() < deadline {
+            views.settle(std::time::Duration::from_secs(2));
+        }
+        assert_eq!(
+            views.internal_count(),
+            0,
+            "old refresh circuit must be collected before inducing C25 attach failure"
+        );
         let prev_opts = views.options();
         let mut failing_opts = prev_opts.clone();
         failing_opts.pass_timeout = std::time::Duration::ZERO;
@@ -1621,7 +1629,64 @@ async fn auto_circuit_counts_only_policy_readable_graphs_without_uncounted_fallb
             watches["ev"].private().due,
             "attach failure under reviewPolicy must schedule the private check"
         );
+        assert_eq!(
+            views.internal_count(),
+            0,
+            "failed attach must not leave a circuit attached"
+        );
+        assert!(!e.s.state.graphrag.has_refresh_circuit("ev", &srv_ds));
         views.set_options(prev_opts);
+
+        // With `private.due == true`, acquiring a `Restore` reservation while `tick_once`
+        // is already processing `ev` must preserve `NotLive` through `due_outcome` so
+        // neither `private_check` nor `build::spawn` runs against the draining dataset.
+        let held_res: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let private_hook_hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held_hook = held_res.clone();
+        let private_hit_hook = private_hook_hit.clone();
+        let st_hook = e.s.state.clone();
+        let _guard = crate::graphrag::refresh::set_tick_hook(move |point, name| {
+            if point == crate::graphrag::refresh::TickHookPoint::BeforeDue && name == "ev" {
+                let r = st_hook
+                    .catalog
+                    .reserve(
+                        "ev",
+                        sparkles::catalog::ReservationKind::Restore,
+                        "c25-restore-mid-tick",
+                    )
+                    .unwrap();
+                *held_hook.lock() = Some(r);
+            } else if point == crate::graphrag::refresh::TickHookPoint::BeforePrivateCheck
+                && name == "ev"
+            {
+                private_hit_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        crate::graphrag::refresh::tick_once(
+            &e.s.state,
+            &mut watches,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        );
+        drop(_guard);
+        assert!(
+            held_res.lock().is_some(),
+            "test hook must have acquired restore reservation before due_outcome"
+        );
+        assert!(
+            !private_hook_hit.load(std::sync::atomic::Ordering::SeqCst),
+            "NotLive from due_outcome must skip private_check instead of falling through"
+        );
+        assert!(
+            !watches.contains_key("ev"),
+            "watch must be removed when due_outcome returns NotLive"
+        );
+        assert!(
+            e.s.state.tasks.lock().is_empty(),
+            "restore reservation mid-tick must not admit a C25 refresh task"
+        );
+        assert!(!e.s.state.graphrag.has_refresh_circuit("ev", &srv_ds));
+        drop(held_res.lock().take());
 
         // Re-attach cleanly, then break `reviewPolicy` so `Evidence::admit` fails:
         // `tick_once` must detach the previously attached internal circuit.

@@ -337,12 +337,20 @@ impl Runtime {
         self.detach_circuit_locked(dataset);
     }
 
-    /// Drop the refresh circuit of `dataset` only when it belongs to `ds`, serialized
-    /// per dataset.
-    pub(crate) fn detach_circuit_for(&self, dataset: &str, ds: &crate::state::Dataset) {
+    /// Drop the refresh circuit of `dataset` only when it belongs to a different dataset
+    /// instance than `ds`, serialized per dataset.
+    pub(crate) fn detach_stale_circuit_for(&self, dataset: &str, ds: &crate::state::Dataset) {
         let lock = self.circuit_lock(dataset);
         let _held = lock.lock();
-        self.detach_circuit_for_locked(dataset, ds);
+        let old = {
+            let mut map = self.circuits.lock();
+            if map.get(dataset).is_some_and(|c| !c.same_store(ds)) {
+                map.remove(dataset)
+            } else {
+                None
+            }
+        };
+        drop(old);
     }
 
     /// Drop any refresh circuit attached for `dataset` and settle its views runtime when
@@ -363,20 +371,95 @@ impl Runtime {
         }
     }
 
-    /// Keep only refresh circuits for datasets satisfying `keep`, dropping removed
-    /// handles outside the map lock.
-    pub(crate) fn retain_circuits(&self, keep: impl Fn(&str) -> bool) {
+    /// Detach and settle the refresh circuit of `from`, and move in-memory GraphRAG
+    /// state (`states`, `days`, `anomalies`, `figures`) to `to` after a dataset rename.
+    pub(crate) fn rename(&self, from: &str, to: &str) {
+        self.detach_circuit_and_settle(from);
+        if from == to {
+            return;
+        }
+        {
+            let mut map = self.states.lock();
+            match map.remove(from) {
+                Some(v) => {
+                    map.insert(to.to_string(), v);
+                }
+                None => {
+                    map.remove(to);
+                }
+            }
+        }
+        {
+            let mut map = self.days.lock();
+            match map.remove(from) {
+                Some(v) => {
+                    map.insert(to.to_string(), v);
+                }
+                None => {
+                    map.remove(to);
+                }
+            }
+        }
+        {
+            let mut map = self.anomalies.lock();
+            match map.remove(from) {
+                Some(v) => {
+                    map.insert(to.to_string(), v);
+                }
+                None => {
+                    map.remove(to);
+                }
+            }
+        }
+        {
+            let mut map = self.figures.lock();
+            match map.remove(from) {
+                Some(v) => {
+                    map.insert(to.to_string(), v);
+                }
+                None => {
+                    map.remove(to);
+                }
+            }
+        }
+    }
+
+    /// Detach the refresh circuit of `dataset` and clear its in-memory state after deletion.
+    pub(crate) fn forget(&self, dataset: &str) {
+        self.detach_circuit(dataset);
+        self.states.lock().remove(dataset);
+        self.days.lock().remove(dataset);
+        self.anomalies.lock().remove(dataset);
+        self.figures.lock().remove(dataset);
+    }
+
+    /// Keep only refresh circuits for datasets that remain live, dropping removed handles
+    /// outside the map lock. `in_snapshot` selects candidates outside per-dataset locks;
+    /// `is_live` re-validates each candidate's owner under its circuit lock without
+    /// holding `circuits`.
+    pub(crate) fn retain_circuits(
+        &self,
+        in_snapshot: impl Fn(&str) -> bool,
+        is_live: impl Fn(&str, uuid::Uuid, &Weak<sparkles::incr::Runtime>) -> bool,
+    ) {
         let gone: Vec<String> = self
             .circuits
             .lock()
             .keys()
-            .filter(|k| !keep(k))
+            .filter(|k| !in_snapshot(k))
             .cloned()
             .collect();
         for k in gone {
             let lock = self.circuit_lock(&k);
             let _held = lock.lock();
-            if !keep(&k) {
+            let owner = self
+                .circuits
+                .lock()
+                .get(&k)
+                .map(|c| (c.dataset_id, c.runtime.clone()));
+            if let Some((dataset_id, runtime)) = owner
+                && !is_live(&k, dataset_id, &runtime)
+            {
                 let old = self.circuits.lock().remove(&k);
                 drop(old);
             }

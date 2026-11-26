@@ -2025,16 +2025,27 @@ async fn circuit_refresh_detaches_and_reattaches_cleanly_on_rename() {
             })
             .unwrap();
             assert!(st.graphrag.has_refresh_circuit("org", &ds));
-            // Copy in-memory build state under the new name so the renamed in-memory
-            // dataset has a build record to attach against.
-            if kind == DbType::Mem {
-                let state = st.graphrag.state("org");
-                st.graphrag.set_state("org2", state);
-            }
+            let orig_source_commit = state_of(&st, &ds)
+                .unwrap()
+                .last_build
+                .unwrap()
+                .source_commit;
             drop(ds);
             st.rename("org", "org2").unwrap();
             let ds2 = st.datasets().get("org2").cloned().unwrap();
             assert!(!st.graphrag.has_refresh_circuit("org", &ds2));
+            let carried = state_of(&st, &ds2).unwrap();
+            assert_eq!(
+                carried.last_build.as_ref().map(|b| b.source_commit),
+                Some(orig_source_commit),
+                "{kind:?}: rename must preserve refresh baseline at destination without pre-seeding"
+            );
+            if kind == DbType::Mem {
+                assert!(
+                    st.graphrag.state("org").last_build.is_none(),
+                    "in-memory rename must move old baseline away from source name"
+                );
+            }
             // Give the renamed dataset a DIFFERENT projection so an uncollected old
             // handle on the shared in-memory views runtime would hit `internal-conflict`.
             let s2 = settings(json!({
@@ -2049,6 +2060,21 @@ async fn circuit_refresh_detaches_and_reattaches_cleanly_on_rename() {
                 "{kind:?}: renamed dataset must attach new circuit cleanly"
             );
             assert_eq!(ds2.dataset.inner_state().views.internal_count(), 1);
+            // A write under the new projection must trigger due_reason against the carried baseline.
+            sparkles::sparql::update::update(
+                &ds2.store,
+                "INSERT DATA { GRAPH <urn:g:renamed> { <http://ex/renamed_join> <http://ex/knows> <http://ex/x0> } }",
+                &Default::default(),
+            )
+            .unwrap();
+            let reason = crate::graphrag::refresh::due_reason(&st, &ds2, &s2, &mut Watch::default())
+                .unwrap();
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("renamed_join") && r.contains("joined")),
+                "{kind:?}: renamed dataset must count changes against carried baseline: {reason:?}"
+            );
         })
         .await
         .unwrap();
@@ -2068,11 +2094,20 @@ async fn circuit_refresh_falls_back_on_attachment_failure() {
         }));
         f.run(s.clone(), Mode::Build).unwrap();
         let ds = f.st.datasets().get("org").cloned().unwrap();
-        // Detach the circuit and set `pass_timeout = 0` so `attach_internal`'s initial
-        // build fails immediately with `pass-timeout`.
+        // Detach the circuit and wait until the views worker has collected the old cell so
+        // `attach_internal` cannot join the still-registered cell and must run its initial
+        // build under `pass_timeout = 0`.
         f.st.graphrag.detach_circuit("org");
         let views = &ds.dataset.inner_state().views;
-        views.settle(Duration::from_secs(10));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while views.internal_count() > 0 && Instant::now() < deadline {
+            views.settle(Duration::from_secs(2));
+        }
+        assert_eq!(
+            views.internal_count(),
+            0,
+            "old refresh circuit must be collected before inducing attach failure"
+        );
         let prev_opts = views.options();
         let mut failing_opts = prev_opts.clone();
         failing_opts.pass_timeout = Duration::ZERO;
@@ -2091,12 +2126,256 @@ async fn circuit_refresh_falls_back_on_attachment_failure() {
                 .is_some_and(|r| r.contains("could not attach")),
             "attach failure must route through fallback refresh: {reason:?}"
         );
+        assert_eq!(
+            views.internal_count(),
+            0,
+            "failed attach must not leave a circuit attached"
+        );
+        assert!(!f.st.graphrag.has_refresh_circuit("org", &ds));
 
         // Once the failure clears, the next tick attaches cleanly again.
         views.set_options(prev_opts);
         let mut w: HashMap<String, Watch> = HashMap::new();
         tick_once(&f.st, &mut w, Instant::now());
         assert!(f.st.graphrag.has_refresh_circuit("org", &ds));
+    })
+    .await
+    .unwrap();
+}
+
+/// Stale tick observations (older projection snapshot, `last_build = None` before first
+/// build completes, stale due settings, or a stale catalog snapshot before `retain_circuits`)
+/// must never replace, detach or prune a circuit published concurrently by a newer build.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_stale_tick_does_not_clobber_or_detach_newer_circuit() {
+    use crate::graphrag::refresh::{
+        TickHookPoint, Watch, after_build, due_reason, set_tick_hook, tick_once,
+    };
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        // 1. Stale `AfterSettings` projection A must not replace newer projection B
+        // published by `after_build`, and stale `BeforeDue` projection A must not replace B.
+        let proj_a = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.5 }
+        }));
+        let proj_b = settings(json!({
+            "projection": { "graphs": [ORG, "urn:g:extra"] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.5 }
+        }));
+        f.run(proj_a.clone(), Mode::Build).unwrap();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        let source_commit = state_of(&f.st, &ds)
+            .unwrap()
+            .last_build
+            .unwrap()
+            .source_commit;
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let now = Instant::now();
+        tick_once(&f.st, &mut w, now);
+
+        // Pause right after `tick_once` samples `proj_a`, update settings to `proj_b` and
+        // publish circuit B via `after_build`, then resume the tick.
+        let st_hook = f.st.clone();
+        let ds_hook = ds.clone();
+        let proj_b_hook = proj_b.clone();
+        let mut fired = false;
+        let _guard = set_tick_hook(move |point, name| {
+            if point == TickHookPoint::AfterSettings && name == "org" && !fired {
+                fired = true;
+                store_settings(&st_hook, &ds_hook, &proj_b_hook);
+                after_build(&st_hook, &ds_hook, source_commit);
+            }
+        });
+        tick_once(&f.st, &mut w, now + Duration::from_millis(100));
+        drop(_guard);
+        assert!(
+            f.st.graphrag
+                .has_matching_circuit("org", &ds, &proj_b, f.st.access_epoch()),
+            "stale tick must not replace projection B with A in ensure_attached"
+        );
+
+        // Same race on the `due_outcome` path: switch to `proj_c` right before `due_outcome`
+        // after `tick_once` already sampled `proj_b` and waited past debounce.
+        let proj_c = settings(json!({
+            "projection": { "graphs": [ORG, "urn:g:extra", "urn:g:third"] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.5 }
+        }));
+        sparkles::sparql::update::update(
+            &ds.store,
+            &format!("INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/tag> \"t1\" }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        tick_once(&f.st, &mut w, now + Duration::from_secs(1));
+        let st_hook = f.st.clone();
+        let ds_hook = ds.clone();
+        let proj_c_hook = proj_c.clone();
+        let mut fired = false;
+        let _guard = set_tick_hook(move |point, name| {
+            if point == TickHookPoint::BeforeDue && name == "org" && !fired {
+                fired = true;
+                store_settings(&st_hook, &ds_hook, &proj_c_hook);
+                // Simulate a build finishing at the current head before publishing proj_c.
+                let new_head = ds_hook.store.head_commit().seq;
+                let mut cur_state = st_hook.graphrag.state("org");
+                if let Some(b) = cur_state.last_build.as_mut() {
+                    b.source_commit = new_head;
+                }
+                st_hook.graphrag.set_state("org", cur_state);
+                after_build(&st_hook, &ds_hook, new_head);
+            }
+        });
+        tick_once(&f.st, &mut w, now + Duration::from_secs(3));
+        drop(_guard);
+        assert!(
+            f.st.graphrag
+                .has_matching_circuit("org", &ds, &proj_c, f.st.access_epoch()),
+            "stale due_outcome must not replace projection C with B"
+        );
+        sparkles::sparql::update::update(
+            &ds.store,
+            "INSERT DATA { GRAPH <urn:g:third> { <http://ex/third_join> <http://ex/knows> <http://ex/x0> } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let reason = due_reason(&f.st, &ds, &proj_c, &mut Watch::default()).unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("third_join") && r.contains("joined")),
+            "circuit under projection C must count changes in urn:g:third: {reason:?}"
+        );
+
+        // 2. Stale `last_build = None` before `ensure_attached` locks must not detach a
+        // first build's circuit published concurrently.
+        let saved_state = state_of(&f.st, &ds).unwrap();
+        f.st.graphrag.set_state("org", Default::default());
+        f.st.graphrag.detach_circuit("org");
+        let mut w_nobuild: HashMap<String, Watch> = HashMap::new();
+        tick_once(&f.st, &mut w_nobuild, now + Duration::from_secs(4));
+        assert!(!f.st.graphrag.has_refresh_circuit("org", &ds));
+        // Advance head (like report commit) so the next tick enters ensure_attached slow path.
+        sparkles::sparql::update::update(
+            &ds.store,
+            &format!("INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/tag> \"t2\" }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let st_hook = f.st.clone();
+        let ds_hook = ds.clone();
+        let mut fired = false;
+        let _guard = set_tick_hook(move |point, name| {
+            if point == TickHookPoint::BeforeEnsureLock && name == "org" && !fired {
+                fired = true;
+                st_hook.graphrag.set_state("org", saved_state.clone());
+                after_build(&st_hook, &ds_hook, source_commit);
+            }
+        });
+        tick_once(&f.st, &mut w_nobuild, now + Duration::from_secs(5));
+        drop(_guard);
+        assert!(
+            f.st.graphrag.has_refresh_circuit("org", &ds),
+            "ensure_attached must re-read build state under circuit_lock and keep first build's circuit"
+        );
+        // Subsequent idle tick must also keep the circuit attached.
+        tick_once(&f.st, &mut w_nobuild, now + Duration::from_secs(6));
+        assert!(f.st.graphrag.has_refresh_circuit("org", &ds));
+
+        // 3. `retain_circuits` must not prune a dataset created and built after
+        // `tick_once` captured its catalog snapshot.
+        let st_hook = f.st.clone();
+        let proj_a_hook = proj_a.clone();
+        let saved_for_new = state_of(&f.st, &ds).unwrap();
+        let mut fired = false;
+        let _guard = set_tick_hook(move |point, _| {
+            if point == TickHookPoint::BeforeRetain && !fired {
+                fired = true;
+                let ds_new = st_hook.create("org_new", DbType::Mem).unwrap();
+                store_settings(&st_hook, &ds_new, &proj_a_hook);
+                st_hook.graphrag.set_state("org_new", saved_for_new.clone());
+                after_build(&st_hook, &ds_new, 0);
+            }
+        });
+        tick_once(&f.st, &mut w_nobuild, now + Duration::from_secs(7));
+        drop(_guard);
+        let ds_new = f.st.datasets().get("org_new").cloned().unwrap();
+        assert!(
+            f.st.graphrag.has_refresh_circuit("org_new", &ds_new),
+            "retain_circuits must check live routing before pruning a newly built dataset"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// Acquiring a `Restore` reservation while `tick_once` is already processing a dataset
+/// must prevent admitting an automatic refresh task and detach any remaining circuit.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_restore_reservation_mid_tick_blocks_admission() {
+    use crate::graphrag::refresh::{TickHookPoint, Watch, set_tick_hook, tick_once};
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.1 }
+        }));
+        f.run(s, Mode::Build).unwrap();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let now = Instant::now();
+        tick_once(&f.st, &mut w, now);
+
+        // Trigger a direct refresh reason (entity joins community).
+        sparkles::sparql::update::update(
+            &ds.store,
+            &format!(
+                "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/new_ent> <http://ex/knows> <http://ex/x0> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        tick_once(&f.st, &mut w, now + Duration::from_secs(1));
+
+        // Hold the reservation slot outside the hook so it stays alive across `build::spawn`.
+        let held_res: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let held_hook = held_res.clone();
+        let st_hook = f.st.clone();
+        let _guard = set_tick_hook(move |point, name| {
+            if point == TickHookPoint::BeforeSpawn && name == "org" {
+                let r = st_hook
+                    .catalog
+                    .reserve(
+                        "org",
+                        sparkles::catalog::ReservationKind::Restore,
+                        "restore-mid-tick",
+                    )
+                    .unwrap();
+                *held_hook.lock() = Some(r);
+            }
+        });
+        tick_once(&f.st, &mut w, now + Duration::from_secs(3));
+        drop(_guard);
+        assert!(
+            held_res.lock().is_some(),
+            "test hook must have acquired restore reservation before spawn"
+        );
+        assert!(
+            f.st.tasks.lock().is_empty(),
+            "restore reservation acquired mid-tick must block automatic refresh admission"
+        );
+        assert!(
+            !w.contains_key("org"),
+            "watch must be cleared once dataset becomes non-live"
+        );
+        assert!(
+            !f.st.graphrag.has_refresh_circuit("org", &ds),
+            "circuit must be detached once restore reservation is seen"
+        );
+        drop(held_res.lock().take());
     })
     .await
     .unwrap();
