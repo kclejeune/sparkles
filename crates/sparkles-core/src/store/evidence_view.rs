@@ -350,7 +350,7 @@ impl Store {
                 memory: Some(selection.available_bytes()),
                 held: 0,
             };
-            self.owned_set()?.normalize_limited(
+            self.owned_set()?.normalize_with(
                 crate::branch::CommitRef {
                     branch_id: logical.branch_id(),
                     seq: commit,
@@ -472,7 +472,7 @@ impl Store {
         };
         let retained = charge
             .delta_bytes
-            .checked_add(snapshot.generation.retained_bytes_limited(&limit)?)
+            .checked_add(snapshot.generation.retained_bytes_with(&limit)?)
             .and_then(|bytes| bytes.checked_add(1024))
             .ok_or_else(|| preparation.exhausted())?;
         if retained > allowance {

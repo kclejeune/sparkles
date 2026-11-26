@@ -1230,7 +1230,7 @@ async fn ask_shares_snapshot_pins_across_calls() {
 
     // Direction 1: `sparql_query` pins commit 1 in outer server, head moves to commit 2,
     // and `ask(atCommit: 1)` reads the pinned commit 1 snapshot.
-    let Outcome::Text(q1) = server
+    let q1_doc = server
         .call(
             "sparql_query",
             args_map(json!({ "dataset": "org", "query": TEAMS_QUERY, "format": "json" })),
@@ -1239,10 +1239,7 @@ async fn ask_shares_snapshot_pins_across_calls() {
         .await
         .unwrap()
         .unwrap()
-    else {
-        panic!("expected text query result");
-    };
-    let q1_doc: Value = serde_json::from_str(&q1).unwrap();
+        .into_json_value();
     let commit1 = q1_doc["commit"].as_u64().unwrap();
     assert_eq!(q1_doc["returned"], 2);
     assert!(server.shared.pins.holds(&ds, commit1));
@@ -1310,7 +1307,7 @@ async fn ask_shares_snapshot_pins_across_calls() {
     let commit3 = ds.store.snapshot().commit;
     assert!(commit3 > commit2);
 
-    let Outcome::Text(q2) = server
+    let q2_doc = server
         .call(
             "sparql_query",
             args_map(json!({
@@ -1324,10 +1321,7 @@ async fn ask_shares_snapshot_pins_across_calls() {
         .await
         .unwrap()
         .unwrap()
-    else {
-        panic!("expected text query result at commit 2");
-    };
-    let q2_doc: Value = serde_json::from_str(&q2).unwrap();
+        .into_json_value();
     assert_eq!(q2_doc["commit"], commit2);
     assert_eq!(q2_doc["returned"], 3);
 }

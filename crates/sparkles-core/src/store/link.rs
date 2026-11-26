@@ -927,7 +927,7 @@ mod tests {
         // Nonempty seed delta for overlay parity and error-accounting tests.
         let mut seed_delta = Delta::default();
         let seed_quad = [Id(999_001), Id(999_002), Id(999_003), Id::DEFAULT_GRAPH];
-        apply(&mut seed_delta, &seed_quad, true, false);
+        apply(&plain, &mut seed_delta, &seed_quad, true, false);
         let seed_charge = history_limited::preparation_delta_bytes(&seed_delta);
         assert!(seed_charge > 0);
         let (seed_ins, seed_del) = delta_keys(&seed_delta);

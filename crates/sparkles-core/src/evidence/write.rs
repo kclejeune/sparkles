@@ -2003,12 +2003,6 @@ impl<'a> Reads<'a> {
         Ok(found)
     }
 
-    /// Look up the stored term ID of `iri` in this snapshot, caching the result under the
-    /// reader's preparation.
-    pub fn iri_id(&mut self, iri: &str) -> Result<Option<Id>> {
-        self.id(iri)
-    }
-
     /// Whether any protected identity graph in `graphs` holds an authenticated
     /// `ev:IdentityProposal` with a current authenticated `ev:Accepted` decision under
     /// `policy` in `decisions`.

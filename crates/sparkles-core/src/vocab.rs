@@ -2012,7 +2012,9 @@ impl Vocab {
         let (mut lo, mut hi) = (0usize, self.num_blocks());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if compare_prepared_bytes(self.block_first(mid), key, &mut checkpoint)?.is_le() {
+            if compare_prepared_bytes(self.block_first_at::<true>(mid), key, &mut checkpoint)?
+                .is_le()
+            {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -2130,7 +2132,9 @@ impl Vocab {
         let (mut lo, mut hi) = (0usize, self.num_blocks());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if compare_prepared_bytes(self.block_first(mid), key, &mut checkpoint)?.is_le() {
+            if compare_prepared_bytes(self.block_first_at::<true>(mid), key, &mut checkpoint)?
+                .is_le()
+            {
                 lo = mid + 1;
             } else {
                 hi = mid;

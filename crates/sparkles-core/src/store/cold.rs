@@ -1314,13 +1314,9 @@ mod tests {
             held: 0,
         })
         .unwrap();
-        let loaded = super::super::Generation::open_sealed_controlled(
-            dir.path(),
-            "gen-0001",
-            None,
-            &mut budget,
-        )
-        .unwrap();
+        let loaded =
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget)
+                .unwrap();
         assert!(loaded.value.reifiers.file.is_some());
         assert!(loaded.value.reifiers.is_indexed());
         assert_eq!(
@@ -1358,13 +1354,9 @@ mod tests {
         let mut future = orig.clone();
         future[8..12].copy_from_slice(&99u32.to_le_bytes());
         std::fs::write(&path, &future).unwrap();
-        let loaded = super::super::Generation::open_sealed_controlled(
-            dir.path(),
-            "gen-0001",
-            None,
-            &mut budget,
-        )
-        .unwrap();
+        let loaded =
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget)
+                .unwrap();
         assert!(loaded.value.reifiers.file.is_none());
         assert!(!loaded.value.reifiers.is_indexed());
         assert!(
@@ -1383,13 +1375,9 @@ mod tests {
         let mut damaged = orig;
         damaged[32 + 16] ^= 1;
         std::fs::write(&path, &damaged).unwrap();
-        let loaded = super::super::Generation::open_sealed_controlled(
-            dir.path(),
-            "gen-0001",
-            None,
-            &mut budget,
-        )
-        .unwrap();
+        let loaded =
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget)
+                .unwrap();
         assert!(loaded.value.reifiers.file.is_none());
         assert!(!loaded.value.reifiers.is_indexed());
         assert!(
