@@ -2386,11 +2386,11 @@ owner and nonce but has no per-triple origin or history of graph roles.
 On upgrade, the store checks every branch in the family before marking a dedicated
 output as `projectionOnly`. A record with a SHA-256 `ev:recordDigest` can identify
 its currently protected `ev:Operation` through either `ev:availabilityReceipt` or
-`prov:wasGeneratedBy`. A record with
-the current protection can also name the same `prov:Activity` through both links
-if the activity retains its operation type or the current protection. When only the
-receipt link survives, a SHA-256 record digest on the protected record corroborates
-its receipt if the publisher still has both the operation and activity types.
+`prov:wasGeneratedBy`. A currently protected record also identifies its publisher
+through a receipt to a distinct `ev:Operation` with the same protection. If the
+publisher has lost its operation type or its protection, the receipt still identifies
+a `prov:Activity` that retains the other marker when the record also has a generation
+link to that activity or a SHA-256 record digest.
 A projected copy of that evidence receives the same protection. A projected operation description alone
 does not establish record history. Format 4 prevents new mixed histories. The writer
 rejects record writes to outputs marked `projectionOnly`. Moving such an output into a

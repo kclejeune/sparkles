@@ -2009,35 +2009,42 @@ impl<'a> Reads<'a> {
         };
         let mut found = false;
         self.for_each_pos_intersection_in_graph(g, &[(protection, nonce)], |subject| {
-            if let (Some(receipt), Some((p, activity))) = (receipt, activity_type)
+            if let Some(receipt) = receipt
                 && is_iri(subject)?
             {
-                let mut receipt_to_operation = false;
+                let mut receipt_to_activity = false;
                 self.preparation.scan(
                     self.snap,
                     Perm::Gspo,
                     &[g.0, subject.0, receipt.0],
                     |quad| {
                         let op = quad[2];
-                        if op == subject || !is_iri(op)? || !self.contains_id(op, p, activity, g)? {
+                        if op == subject || !is_iri(op)? {
                             return Ok(true);
                         }
                         let is_operation = match operation_type {
                             Some((p, class)) => self.contains_id(op, p, class, g)?,
                             None => false,
                         };
-                        receipt_to_operation |= is_operation;
-                        if let Some(generated) = generated {
-                            found = self.contains_id(subject, generated, op, g)?
-                                && (is_operation || self.contains_id(op, protection, nonce, g)?);
+                        let op_protected = self.contains_id(op, protection, nonce, g)?;
+                        if is_operation && op_protected {
+                            found = true;
+                        } else if (is_operation || op_protected)
+                            && let Some((p, activity)) = activity_type
+                            && self.contains_id(op, p, activity, g)?
+                        {
+                            receipt_to_activity = true;
+                            if let Some(generated) = generated {
+                                found = self.contains_id(subject, generated, op, g)?;
+                            }
                         }
                         Ok(!found)
                     },
                 )?;
-                // A digest on this protected record corroborates its receipt
-                // even when the generation edge and publisher nonce are gone.
+                // The record digest can corroborate the receipt to a surviving
+                // activity when the generation edge has been withdrawn.
                 if !found
-                    && receipt_to_operation
+                    && receipt_to_activity
                     && let Some(digest) = digest
                 {
                     found = has_record_digest(subject, digest)?;

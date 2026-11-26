@@ -3234,7 +3234,8 @@ enum LegacyChange {
     ConflictingKey,
     KeyOnProjection,
     WithdrawGeneration,
-    WithdrawPublisherNonceAndGeneration,
+    WithdrawPublisherAndProjection(&'static str, &'static str),
+    WithdrawGenerationAndDigest,
     WithdrawLink,
     ProjectReceipt,
 }
@@ -3293,7 +3294,37 @@ fn legacy_replay_reserves_the_sole_publishers_key_after_withdrawal() {
 fn legacy_replay_preserves_a_receipt_after_withdrawing_nonce_and_generation() {
     check_keyed_replay_in_former_supports(
         false,
-        Some(LegacyChange::WithdrawPublisherNonceAndGeneration),
+        Some(LegacyChange::WithdrawPublisherAndProjection(
+            "ev:graphProtection ?o",
+            "prov:wasGeneratedBy ?o",
+        )),
+    );
+}
+
+#[test]
+fn legacy_receipt_replays_after_withdrawing_generation_and_digest() {
+    check_keyed_replay_in_former_supports(false, Some(LegacyChange::WithdrawGenerationAndDigest));
+}
+
+#[test]
+fn legacy_receipt_reserves_key_after_withdrawing_activity_and_digest() {
+    check_keyed_replay_in_former_supports(
+        false,
+        Some(LegacyChange::WithdrawPublisherAndProjection(
+            "a prov:Activity",
+            "ev:recordDigest ?o",
+        )),
+    );
+}
+
+#[test]
+fn legacy_receipt_reserves_key_after_withdrawing_operation_type_and_generation() {
+    check_keyed_replay_in_former_supports(
+        false,
+        Some(LegacyChange::WithdrawPublisherAndProjection(
+            "a ev:Operation",
+            "prov:wasGeneratedBy ?o",
+        )),
     );
 }
 
@@ -3475,23 +3506,27 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
     let ds = if let Some(case) = legacy {
         drop(ds);
         let ds = legacy_projection_writer(&root, SUPPORTS);
+        let stored_field = |subject: &NamedNode, field: &str| {
+            let result = ds.construct(&format!(
+                "PREFIX ev: <{EV}> PREFIX prov: <http://www.w3.org/ns/prov#>
+                 CONSTRUCT {{ {subject} {field} }} WHERE {{ GRAPH <{SUPPORTS}> {{ {subject} {field} }} }}"
+            )).unwrap();
+            assert_eq!(result.len(), 1, "{subject} {field}");
+            result.triples()[0].clone()
+        };
         let triples = match case {
-            LegacyChange::WithdrawMetadata(field)
-            | LegacyChange::WithdrawProjectionField(field) => {
-                let subject = if matches!(case, LegacyChange::WithdrawProjectionField(_)) {
-                    projection
-                } else {
-                    op
-                };
-                let result = ds
-                    .construct(&format!(
-                    "PREFIX ev: <{EV}> PREFIX prov: <http://www.w3.org/ns/prov#>
-                     CONSTRUCT {{ {subject} {field} }} WHERE {{ GRAPH <{SUPPORTS}> {{ {subject} {field} }} }}"
-                ))
-                    .unwrap();
-                assert_eq!(result.len(), 1, "{field}");
-                result.triples().to_vec()
+            LegacyChange::WithdrawMetadata(field) => vec![stored_field(op, field)],
+            LegacyChange::WithdrawProjectionField(field) => vec![stored_field(projection, field)],
+            LegacyChange::WithdrawPublisherAndProjection(publisher_field, projection_field) => {
+                vec![
+                    stored_field(op, publisher_field),
+                    stored_field(projection, projection_field),
+                ]
             }
+            LegacyChange::WithdrawGenerationAndDigest => vec![
+                stored_field(projection, "prov:wasGeneratedBy ?o"),
+                stored_field(projection, "ev:recordDigest ?o"),
+            ],
             LegacyChange::PropertyOnFreshOperation(ref predicate) => vec![Triple::new(
                 evidence::operation_iri(evidence::operation_id(
                     ds.dataset_id(),
@@ -3535,21 +3570,8 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                 triples.push(stamp(first.commit + 100));
                 triples
             }
-            LegacyChange::WithdrawGeneration
-            | LegacyChange::WithdrawPublisherNonceAndGeneration => {
-                let mut triples = vec![Triple::new(
-                    projection.clone(),
-                    iri("http://www.w3.org/ns/prov#wasGeneratedBy"),
-                    op.clone(),
-                )];
-                if matches!(case, LegacyChange::WithdrawPublisherNonceAndGeneration) {
-                    triples.push(Triple::new(
-                        op.clone(),
-                        iri(&format!("{EV}graphProtection")),
-                        oxrdf::Literal::new_simple_literal(nonce_before.to_string()),
-                    ));
-                }
-                triples
+            LegacyChange::WithdrawGeneration => {
+                vec![stored_field(projection, "prov:wasGeneratedBy ?o")]
             }
             LegacyChange::WithdrawLink => vec![Triple::new(
                 op.clone(),
@@ -3641,10 +3663,13 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
             case,
             LegacyChange::WithdrawMetadata(_)
                 | LegacyChange::WithdrawProjectionField(_)
-                | LegacyChange::WithdrawPublisherNonceAndGeneration
+                | LegacyChange::WithdrawPublisherAndProjection(_, _)
+                | LegacyChange::WithdrawGenerationAndDigest
                 | LegacyChange::ReplaceCommit
         ) {
-            assert_conflict(&opts);
+            if !matches!(case, LegacyChange::WithdrawGenerationAndDigest) {
+                assert_conflict(&opts);
+            }
             // Keep the projected replacement when withdrawing the original commit stamp.
             let shared = if matches!(case, LegacyChange::ReplaceCommit) {
                 &triples[..1]
@@ -3696,13 +3721,35 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                     .unwrap()
                 );
             }
-            if matches!(case, LegacyChange::WithdrawPublisherNonceAndGeneration) {
-                assert_conflict(&ReviewOptions {
+            let assert_retry = |opts: &ReviewOptions| {
+                if matches!(case, LegacyChange::WithdrawGenerationAndDigest) {
+                    let head = ds.store().head_commit().seq;
+                    let replay = reconcile(&ds, "main", None, opts).unwrap();
+                    assert!(replay.replayed && !replay.committed);
+                    assert_eq!(replay.operation, first.operation);
+                    assert_eq!(replay.projection, first.projection);
+                    assert_eq!(replay.commit, first.commit);
+                    assert_eq!(replay.policy_version, first.policy_version);
+                    assert_eq!(ds.store().head_commit().seq, head);
+                    assert!(
+                        !ds.ask(&format!("ASK {{ GRAPH <{supports2}> {{ ?s ?p ?o }} }}"))
+                            .unwrap()
+                    );
+                } else {
+                    assert_conflict(opts);
+                }
+            };
+            if matches!(
+                case,
+                LegacyChange::WithdrawPublisherAndProjection(_, _)
+                    | LegacyChange::WithdrawGenerationAndDigest
+            ) {
+                assert_retry(&ReviewOptions {
                     dry_run: true,
                     ..opts.clone()
                 });
             }
-            assert_conflict(&opts);
+            assert_retry(&opts);
             if !reuse_projection {
                 let head = ds.store().head_commit().seq;
                 assert_eq!(
@@ -3715,7 +3762,7 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                 let entry = &registry.owners[&OwnerKind::Evidence];
                 assert!(!entry.projection_only.contains(SUPPORTS));
                 assert_eq!(entry.protections[SUPPORTS], nonce_before);
-                assert_conflict(&opts);
+                assert_retry(&opts);
             }
             return;
         }
