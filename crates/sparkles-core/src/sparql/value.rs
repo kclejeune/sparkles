@@ -763,9 +763,20 @@ fn u128_terminates_base10(num: u128, mut den: u128) -> bool {
     num.is_multiple_of(den)
 }
 
+/// Whether `i / j` (`j != 0`) is a terminating decimal quotient whose exact fractional
+/// scale exceeds 18 digits (so [`exact_decimal`] delegates to `BigDec::checked_div`).
+pub(crate) fn int_div_needs_big(i: i64, j: i64) -> bool {
+    if j == 0 {
+        return false;
+    }
+    let num = i128::from(i) * DECIMAL_SCALE;
+    let den = i128::from(j);
+    num % den != 0 && u128_terminates_base10(i.unsigned_abs() as u128, j.unsigned_abs() as u128)
+}
+
 /// Whether `x / y` (`y != 0`) is a terminating decimal quotient whose exact fractional
 /// scale exceeds 18 digits (so the fixed-width `Decimal` path would truncate it).
-fn decimal_div_needs_big(x: Decimal, y: Decimal) -> bool {
+pub(crate) fn decimal_div_needs_big(x: Decimal, y: Decimal) -> bool {
     let rx = i128::from_be_bytes(x.to_be_bytes()).unsigned_abs();
     if rx == 0 {
         return false;
@@ -805,7 +816,10 @@ pub(crate) fn exact_sum(sum: i128) -> Value {
 /// final quotient can fit even when the subtotal itself exceeds the digit cap.
 pub(crate) fn avg_big_int(sum: BigInt, rows: u64) -> Option<Value> {
     if let Some(i) = sum.to_i64() {
-        let denom = Value::from_bigint(BigInt::from_u64(rows));
+        let denom = match i64::try_from(rows) {
+            Ok(r) => Value::Integer(r.into()),
+            Err(_) => Value::from_bigint(BigInt::from_u64(rows)),
+        };
         return arith(NumOp::Div, &Value::Integer(i.into()), &denom).ok();
     }
     BigDec::from_bigint(sum)
@@ -817,7 +831,10 @@ pub(crate) fn avg_big_int(sum: BigInt, rows: u64) -> Option<Value> {
 /// cancellation cannot change AVG.
 pub(crate) fn avg_big_decimal(sum: &BigDec, rows: u64) -> Option<Value> {
     if let Some(d) = sum.to_oxs_decimal() {
-        let denom = Value::from_bigint(BigInt::from_u64(rows));
+        let denom = match i64::try_from(rows) {
+            Ok(r) => Value::Integer(r.into()),
+            Err(_) => Value::from_bigint(BigInt::from_u64(rows)),
+        };
         return arith(NumOp::Div, &Value::Decimal(d), &denom).ok();
     }
     sum.checked_div(&BigDec::from_u64(rows))

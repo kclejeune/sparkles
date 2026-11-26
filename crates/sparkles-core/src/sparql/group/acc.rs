@@ -14,8 +14,8 @@ use super::deferred::{Deferred, subtotal};
 use super::op::BatchBudget;
 use crate::error::Result;
 use crate::id::Id;
-use crate::sparql::ctx::Ctx;
-use crate::sparql::exec::AggState;
+use crate::sparql::ctx::{Charge, Ctx};
+use crate::sparql::exec::{AggState, ScratchAdmit, SumAdmit};
 use crate::sparql::expr::Expr;
 use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
@@ -136,6 +136,16 @@ pub(crate) trait Accumulator: Send {
     /// The value of group `group`, which the call takes out of the accumulator.
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id>;
 
+    /// Like [`Accumulator::finish`], admitting any finalization scratch through `scratch`.
+    fn finish_with(
+        &mut self,
+        ctx: &Ctx,
+        group: usize,
+        _scratch: &mut dyn ScratchAdmit,
+    ) -> Result<Id> {
+        self.finish(ctx, group)
+    }
+
     /// Finish in slot and aggregate order when some subtotals have deferred arguments.
     fn finish_replay(
         &mut self,
@@ -247,10 +257,7 @@ impl Accumulator for Running {
                 }
                 let id = batch.value(row);
                 let state = &mut self.states[slot as usize];
-                if state.sum_deferred()
-                    || !state
-                        .add_admitted(ctx, agg, id, &mut |old, new| sum_budget.replace(old, new))?
-                {
+                if state.sum_deferred() || !state.add_admitted(ctx, agg, id, sum_budget)? {
                     sum_budget.defer(ctx, slot, id)?;
                     state.defer_sum();
                 }
@@ -274,6 +281,40 @@ impl Accumulator for Running {
                 }
             }
             _ => {
+                struct TrackAdmit<'a, 'b> {
+                    budget: &'a mut BatchBudget<'b>,
+                    track_payload: bool,
+                    n_states: usize,
+                    slot_idx: usize,
+                    payload: &'a mut Vec<u64>,
+                    growth: &'a mut u64,
+                }
+                impl ScratchAdmit for TrackAdmit<'_, '_> {
+                    fn charge_scratch<'c>(
+                        &mut self,
+                        ctx: &'c Ctx,
+                        bytes: u64,
+                    ) -> Result<Charge<'c>> {
+                        self.budget.charge_scratch(ctx, bytes)
+                    }
+                }
+                impl SumAdmit for TrackAdmit<'_, '_> {
+                    fn admit(&mut self, _old: u64, new_bytes: u64) -> Result<bool> {
+                        if self.track_payload && new_bytes > 0 {
+                            if self.payload.len() <= self.slot_idx {
+                                self.payload.resize(self.n_states, 0);
+                            }
+                            let held = &mut self.payload[self.slot_idx];
+                            if new_bytes > *held {
+                                let delta = new_bytes - *held;
+                                self.budget.retain(delta)?;
+                                *self.growth += delta;
+                                *held = new_bytes;
+                            }
+                        }
+                        Ok(true)
+                    }
+                }
                 let track_payload = self.track && (self.is_best() || self.is_sum());
                 let states = &mut self.states;
                 let n_states = states.len();
@@ -285,22 +326,15 @@ impl Accumulator for Running {
                     }
                     let id = batch.value(row);
                     let slot_idx = slot as usize;
-                    let mut on_payload = |new_bytes: u64| -> Result<()> {
-                        if track_payload && new_bytes > 0 {
-                            if payload.len() <= slot_idx {
-                                payload.resize(n_states, 0);
-                            }
-                            let held = &mut payload[slot_idx];
-                            if new_bytes > *held {
-                                let delta = new_bytes - *held;
-                                budget.retain(delta)?;
-                                *growth += delta;
-                                *held = new_bytes;
-                            }
-                        }
-                        Ok(())
+                    let mut admit = TrackAdmit {
+                        budget,
+                        track_payload,
+                        n_states,
+                        slot_idx,
+                        payload,
+                        growth,
                     };
-                    states[slot_idx].add(ctx, agg, id, &mut on_payload)?;
+                    states[slot_idx].add_admitted(ctx, agg, id, &mut admit)?;
                 }
                 ctx.check()?;
             }
@@ -370,7 +404,19 @@ impl Accumulator for Running {
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         let state = std::mem::replace(&mut self.states[group], AggState::Count(0));
-        let id = state.finish(ctx, &self.agg);
+        let id = state.finish(ctx, &self.agg)?;
+        ctx.check()?;
+        Ok(id)
+    }
+
+    fn finish_with(
+        &mut self,
+        ctx: &Ctx,
+        group: usize,
+        scratch: &mut dyn ScratchAdmit,
+    ) -> Result<Id> {
+        let state = std::mem::replace(&mut self.states[group], AggState::Count(0));
+        let id = state.finish_with(ctx, &self.agg, scratch)?;
         ctx.check()?;
         Ok(id)
     }
@@ -752,6 +798,15 @@ impl Accumulator for Distinct {
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         self.inner.finish(ctx, group)
+    }
+
+    fn finish_with(
+        &mut self,
+        ctx: &Ctx,
+        group: usize,
+        scratch: &mut dyn ScratchAdmit,
+    ) -> Result<Id> {
+        self.inner.finish_with(ctx, group, scratch)
     }
 
     fn finish_replay(

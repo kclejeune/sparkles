@@ -26,8 +26,8 @@ use super::acc::{Accumulator, Arg, Batch, Concat, Distinct, RowIndex, Rows, Runn
 use super::deferred::{Deferred, subtotal};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::sparql::ctx::{Ctx, RetainedCharge};
-use crate::sparql::exec::{compute_column, stat_aggregate};
+use crate::sparql::ctx::{Charge, Ctx, RetainedCharge};
+use crate::sparql::exec::{ScratchAdmit, SumAdmit, compute_column, stat_aggregate};
 use crate::sparql::expr::Expr;
 use crate::sparql::exprcache::Report as ExprReport;
 use crate::sparql::plan::Agg;
@@ -170,7 +170,7 @@ pub(crate) struct Grouping {
     pub(crate) passes: usize,
 }
 
-struct GroupMemory {
+pub(in crate::sparql) struct GroupMemory {
     charge: Option<RetainedCharge>,
     bytes: u64,
     reserved: u64,
@@ -178,6 +178,40 @@ struct GroupMemory {
 }
 
 impl GroupMemory {
+    fn spare(&self) -> u64 {
+        self.reserved.saturating_sub(self.bytes)
+    }
+
+    /// Release speculative headroom above the current retained estimate so another
+    /// charge on the query ledger can use that room.
+    fn trim(&mut self) -> Result<()> {
+        if self.reserved > self.bytes {
+            if let Some(charge) = &mut self.charge {
+                charge.resize(self.bytes)?;
+            }
+            self.reserved = self.bytes;
+        }
+        Ok(())
+    }
+
+    /// Admit `bytes` of transient scratch on `ctx`, reusing speculative headroom held
+    /// above `self.bytes` if the query ledger is too full to admit `bytes` directly.
+    pub(super) fn charge_scratch<'a>(&mut self, ctx: &'a Ctx, bytes: u64) -> Result<Charge<'a>> {
+        match ctx.charge(bytes) {
+            Ok(charge) => Ok(charge),
+            Err(error) if memory_refused(&error) && self.spare() > 0 => {
+                let taken = self.spare().min(bytes);
+                let Some(charge) = &mut self.charge else {
+                    return Err(error);
+                };
+                let scratch = charge.split(ctx, taken, bytes)?;
+                self.reserved -= taken;
+                Ok(scratch)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Count `bytes` more of retained state. The charge grows ahead in steps of at
     /// least 64 KiB, still before the state does, so that adding many small groups does
     /// not update the memory ledger for each of them. It overstates the state by less
@@ -212,23 +246,44 @@ impl GroupMemory {
     }
 }
 
+impl ScratchAdmit for GroupMemory {
+    fn charge_scratch<'a>(&mut self, ctx: &'a Ctx, bytes: u64) -> Result<Charge<'a>> {
+        GroupMemory::charge_scratch(self, ctx, bytes)
+    }
+}
+
 /// Access to the pass's memory and deferred arguments during a batch fold.
 pub(crate) enum BatchBudget<'a> {
+    #[cfg(test)]
     Retain(&'a mut dyn FnMut(u64) -> Result<()>),
+    Memory(&'a mut GroupMemory),
     SpillSum(SumBudget<'a>),
 }
 
 impl<'a> BatchBudget<'a> {
     pub(super) fn retain(&mut self, bytes: u64) -> Result<()> {
         match self {
+            #[cfg(test)]
             Self::Retain(f) => f(bytes),
+            Self::Memory(memory) => memory.retain(bytes),
             Self::SpillSum(b) => b.memory.retain(bytes),
+        }
+    }
+
+    pub(super) fn charge_scratch<'c>(&mut self, ctx: &'c Ctx, bytes: u64) -> Result<Charge<'c>> {
+        match self {
+            #[cfg(test)]
+            Self::Retain(_) => ctx.charge(bytes),
+            Self::Memory(memory) => memory.charge_scratch(ctx, bytes),
+            Self::SpillSum(b) => b.memory.charge_scratch(ctx, bytes),
         }
     }
 
     pub(super) fn sum_budget(&mut self) -> Option<&mut SumBudget<'a>> {
         match self {
+            #[cfg(test)]
             Self::Retain(_) => None,
+            Self::Memory(_) => None,
             Self::SpillSum(b) => Some(b),
         }
     }
@@ -261,7 +316,15 @@ impl SumBudget<'_> {
 
     pub(super) fn defer(&mut self, ctx: &Ctx, slot: u32, id: Option<Id>) -> Result<()> {
         if self.deferred.is_none() {
-            *self.deferred = Some(Box::new(Deferred::new(ctx)?));
+            let stream = match Deferred::new(ctx) {
+                Ok(stream) => stream,
+                Err(error) if memory_refused(&error) && self.memory.spare() > 0 => {
+                    self.memory.trim()?;
+                    Deferred::new(ctx)?
+                }
+                Err(error) => return Err(error),
+            };
+            *self.deferred = Some(Box::new(stream));
         }
         self.deferred
             .as_mut()
@@ -270,6 +333,18 @@ impl SumBudget<'_> {
                 subtotal(slot as usize, self.aggregate),
                 id.unwrap_or(Id::UNDEF),
             )
+    }
+}
+
+impl ScratchAdmit for SumBudget<'_> {
+    fn charge_scratch<'a>(&mut self, ctx: &'a Ctx, bytes: u64) -> Result<Charge<'a>> {
+        self.memory.charge_scratch(ctx, bytes)
+    }
+}
+
+impl SumAdmit for SumBudget<'_> {
+    fn admit(&mut self, old: u64, new: u64) -> Result<bool> {
+        self.replace(old, new)
     }
 }
 
@@ -608,9 +683,7 @@ impl Grouping {
                     });
                     self.accs[a].add_batch(ctx, &batch, &slots[base..end], &mut budget)?;
                 } else {
-                    let memory = &mut self.memory;
-                    let mut retain = |delta: u64| memory.retain(delta);
-                    let mut budget = BatchBudget::Retain(&mut retain);
+                    let mut budget = BatchBudget::Memory(&mut self.memory);
                     self.accs[a].add_batch(ctx, &batch, &slots[base..end], &mut budget)?;
                 }
                 ctx.check()?;
@@ -703,6 +776,9 @@ impl Grouping {
             out.cols[k].extend((self.at..self.at + n).map(|g| self.order[g * nk + k]));
         }
         if let Some(deferred) = &mut self.deferred {
+            // Release speculative group-growth headroom before replay reads spill frames
+            // and expands deferred subtotals.
+            self.memory.trim()?;
             // Replay the shared spill stream in its slot and aggregate order.
             for g in self.at..self.at + n {
                 ctx.check()?;
@@ -720,7 +796,7 @@ impl Grouping {
             for (a, acc) in self.accs.iter_mut().enumerate() {
                 ctx.check()?;
                 for g in self.at..self.at + n {
-                    let id = acc.finish(ctx, g)?;
+                    let id = acc.finish_with(ctx, g, &mut self.memory)?;
                     ctx.check()?;
                     out.cols[nk + a].push(id);
                 }

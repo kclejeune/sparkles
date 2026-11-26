@@ -5689,6 +5689,30 @@ impl RetainedCharge {
         }
         self.bytes = self.bytes.saturating_add(bytes);
     }
+
+    /// Split up to `take` already-admitted bytes from this charge into a [`Charge`] on
+    /// the same owner and admit any remaining shortfall up to `bytes`, without releasing
+    /// or re-acquiring the reused bytes. If admitting the shortfall fails, nothing changes.
+    pub(crate) fn split<'a>(&mut self, ctx: &'a Ctx, take: u64, bytes: u64) -> Result<Charge<'a>> {
+        debug_assert!(
+            std::ptr::eq(self.owner.as_ptr(), ctx),
+            "the charge's context"
+        );
+        let take = take.min(self.bytes).min(bytes);
+        let extra = bytes - take;
+        let charge = self.part(ctx);
+        if extra > 0 {
+            charge.add(extra)?;
+        }
+        if take > 0 {
+            self.bytes -= take;
+            if self.bytes == 0 {
+                self.id = None;
+            }
+            charge.bytes.set(charge.bytes.get() + take);
+        }
+        Ok(charge)
+    }
 }
 impl Drop for RetainedCharge {
     fn drop(&mut self) {

@@ -562,3 +562,411 @@ fn spill_group_distinct_avg_replays_arguments_once_in_order() {
     assert!(grouping.next_pass(&ctx).unwrap().is_none());
     assert_eq!(spill.reserved_bytes(), 0);
 }
+
+#[test]
+fn spill_group_sum_and_avg_use_speculative_group_headroom() {
+    use super::bignum::AGG_SUM_SCRATCH_BYTES;
+    use super::group::op::Grouping;
+    use crate::spill::{Spill, SpillOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: dir.path().to_path_buf(),
+        max_bytes: 1 << 30,
+        query_bytes: 1 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+
+    for (func, expected_str) in [
+        (
+            AggregateFunction::Sum,
+            "20000000000000000000000000000000000000004",
+        ),
+        (
+            AggregateFunction::Avg,
+            "10000000000000000000000000000000000000002",
+        ),
+    ] {
+        // Measure base + slots + first group's exact retained size first, then set a
+        // budget with 72 KiB of headroom so GroupMemory's 64 KiB speculative step succeeds
+        // and leaves only ~8 KiB (< AGG_SUM_SCRATCH_BYTES = 18,660 B) on the query ledger.
+        let mut ctx = ctx();
+        ctx.spill = Some(std::sync::Arc::new(spill.query(None)));
+        let key = ctx.var("key");
+        let value = ctx.var("value");
+        let out = ctx.var("out");
+        let a = ctx.intern_value(&Value::from_typed(
+            "10000000000000000000000000000000000000001",
+            oxrdf::vocab::xsd::INTEGER.as_str(),
+        ));
+        let b = ctx.intern_value(&Value::from_typed(
+            "10000000000000000000000000000000000000003",
+            oxrdf::vocab::xsd::INTEGER.as_str(),
+        ));
+        let _ = ctx.value_checked(a).unwrap();
+        let _ = ctx.value_checked(b).unwrap();
+
+        let mut table = Table::new(vec![key, value]);
+        table.push_row(&[int(&ctx, 1), a]);
+        table.push_row(&[int(&ctx, 1), b]);
+
+        let mut agg = agg(func.clone(), true, false);
+        agg.expr = Some(super::expr::Expr::Var(value));
+
+        let slots_bytes = table.len as u64 * 4 + 64;
+        let base_bytes = 256 + 64 + 1024;
+        let per_group_approx =
+            13 * 2 + 8 + (size_of::<super::exec::AggState>() as u64 * 2 + 8) + 16;
+        let setup_live = ctx.live_bytes();
+        // 72 KiB after base + slots + first group: 64 KiB goes to GroupMemory's
+        // speculative step, leaving ~8 KiB < AGG_SUM_SCRATCH_BYTES on the query ledger.
+        let headroom: u64 = 72 << 10;
+        assert!(headroom - (64 << 10) < AGG_SUM_SCRATCH_BYTES);
+        ctx.mem_limit = setup_live + base_bytes + slots_bytes + per_group_approx + headroom;
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+
+        let mut grouping =
+            Grouping::new(&ctx, &[key], &[(out, agg)], &table.vars, true, true).unwrap();
+        grouping.start_pass(&ctx);
+        grouping.add(&ctx, &table, &mut Default::default()).unwrap();
+        grouping.end_input().unwrap();
+        let result = grouping.output(&ctx, &[key, out], 1).unwrap().unwrap();
+        assert_eq!(result.len(), 1);
+        let got = ctx
+            .value(result.cols[1][0])
+            .unwrap()
+            .lexical()
+            .unwrap()
+            .to_string();
+        assert_eq!(got, expected_str, "{func:?}");
+    }
+}
+
+#[test]
+fn big_avg_finalization_charges_division_scratch_deferred_and_direct() {
+    use super::bignum::{AGG_SUM_PAYLOAD_BYTES, AGG_SUM_SCRATCH_BYTES};
+    use super::group::op::Grouping;
+    use crate::spill::{Spill, SpillOptions};
+
+    let big_str = format!("1{}1", "0".repeat(3_998));
+
+    // Direct (non-deferred) AVG finalization of a 4,000-digit integer over 3 rows takes
+    // the non-terminating BigDec::checked_div path and must charge division scratch.
+    let mut ctx_direct = ctx();
+    ctx_direct.mem_limit = 512 << 10;
+    let big = ctx_direct.intern_value(&Value::from_typed(
+        &big_str,
+        oxrdf::vocab::xsd::INTEGER.as_str(),
+    ));
+    let avg_agg = agg(AggregateFunction::Avg, true, false);
+    let mut acc = Running::new(&avg_agg, false);
+    acc.init(1);
+    fold(&ctx_direct, &mut acc, &[big, big, big], &[0, 0, 0]);
+    let pin = ctx_direct
+        .charge(ctx_direct.memory_room().saturating_sub(1024))
+        .unwrap();
+    let err = acc.finish(&ctx_direct, 0).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+        ),
+        "expected memory refusal during non-deferred big AVG finish, got {err:?}"
+    );
+    drop(pin);
+
+    // With room for division scratch, the same non-deferred AVG produces the exact quotient.
+    let mut acc_ok = Running::new(&avg_agg, false);
+    acc_ok.init(1);
+    fold(&ctx_direct, &mut acc_ok, &[big, big, big], &[0, 0, 0]);
+    let expected_id = acc_ok.finish(&ctx_direct, 0).unwrap();
+    let expected_lex = ctx_direct
+        .value(expected_id)
+        .unwrap()
+        .lexical()
+        .unwrap()
+        .to_string();
+    assert_eq!(expected_lex, big_str);
+
+    // Non-terminating division: 10^3999 + 1 + 0 + 0 = 10^3999 + 1 over 3 rows.
+    let zero = int(&ctx_direct, 0);
+    let mut acc_nt = Running::new(&avg_agg, false);
+    acc_nt.init(1);
+    fold(&ctx_direct, &mut acc_nt, &[big, zero, zero], &[0, 0, 0]);
+    let pin_nt = ctx_direct
+        .charge(ctx_direct.memory_room().saturating_sub(1024))
+        .unwrap();
+    assert!(acc_nt.finish(&ctx_direct, 0).is_err());
+    drop(pin_nt);
+
+    let mut acc_nt_ok = Running::new(&avg_agg, false);
+    acc_nt_ok.init(1);
+    fold(&ctx_direct, &mut acc_nt_ok, &[big, zero, zero], &[0, 0, 0]);
+    let nt_id = acc_nt_ok.finish(&ctx_direct, 0).unwrap();
+    let nt_lex = ctx_direct
+        .value(nt_id)
+        .unwrap()
+        .lexical()
+        .unwrap()
+        .to_string();
+    assert!(nt_lex.starts_with("3333333333"), "got {nt_lex}");
+
+    // Deferred AVG finalization must hold both the expanded subtotal charge and division
+    // scratch simultaneously.
+    let dir = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: dir.path().to_path_buf(),
+        max_bytes: 1 << 30,
+        query_bytes: 1 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+    let mut ctx_def = ctx();
+    ctx_def.mem_limit = 1 << 20;
+    ctx_def.spill = Some(std::sync::Arc::new(spill.query(None)));
+    let key = ctx_def.var("key");
+    let value = ctx_def.var("value");
+    let avg_var = ctx_def.var("avg");
+    let ctx_def = std::sync::Arc::new(ctx_def);
+    ctx_def.attach_owner();
+
+    let big_def = ctx_def.intern_value(&Value::from_typed(
+        &big_str,
+        oxrdf::vocab::xsd::INTEGER.as_str(),
+    ));
+    let zero_def = int(&ctx_def, 0);
+    let mut table = Table::new(vec![key, value]);
+    for group in 0..1024 {
+        table.push_row(&[int(&ctx_def, group), zero_def]);
+    }
+    let mut g_agg = agg(AggregateFunction::Avg, true, false);
+    g_agg.expr = Some(super::expr::Expr::Var(value));
+    let mut grouping = Grouping::new(
+        &ctx_def,
+        &[key],
+        &[(avg_var, g_agg)],
+        &table.vars,
+        true,
+        true,
+    )
+    .unwrap();
+    let mut report = super::exprcache::Report::default();
+    grouping.start_pass(&ctx_def);
+    grouping.add(&ctx_def, &table, &mut report).unwrap();
+    table.cols[1].fill(big_def);
+    grouping.add(&ctx_def, &table, &mut report).unwrap();
+    table.cols[1].fill(zero_def);
+    grouping.add(&ctx_def, &table, &mut report).unwrap();
+    grouping.end_input().unwrap();
+    assert!(grouping.spilled > 0, "expected deferred AVG subtotals");
+
+    // Emit one non-deferred prefix group first so `Grouping::output` trims any
+    // speculative GroupMemory headroom before we measure remaining room.
+    let first = grouping
+        .output(&ctx_def, &[key, avg_var], 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let first_lex = ctx_def
+        .value(first.cols[1][0])
+        .unwrap()
+        .lexical()
+        .unwrap()
+        .to_string();
+    assert_eq!(first_lex, nt_lex);
+
+    // Pin room below AGG_SUM_PAYLOAD_BYTES + AGG_SUM_SCRATCH_BYTES (but above
+    // AGG_SUM_PAYLOAD_BYTES + READER_BYTES) so deferred replay/finalization must refuse.
+    let insufficient = AGG_SUM_PAYLOAD_BYTES + AGG_SUM_SCRATCH_BYTES - 1;
+    let room = ctx_def.memory_room();
+    assert!(room > insufficient);
+    let pin_def = ctx_def.charge(room - insufficient).unwrap();
+    let mut refused = false;
+    while let Some(res) = match grouping.output(&ctx_def, &[key, avg_var], 64) {
+        Ok(batch) => batch,
+        Err(crate::error::Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory => {
+            refused = true;
+            None
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+    } {
+        assert!(!res.is_empty());
+    }
+    assert!(
+        refused,
+        "deferred AVG replay/finish should fail without room for both subtotal and division scratch"
+    );
+    drop(pin_def);
+}
+
+#[test]
+fn mixed_numeric_float_and_double_promotion_charges_conversion_scratch() {
+    let mut ctx = ctx();
+    ctx.mem_limit = 512 << 10;
+    // 30-digit values are arbitrary-precision (> i64/Decimal) yet finite in both f32 and f64,
+    // so to_f32_exact and to_f64_exact allocate their 150-byte and 820-byte decimal strings.
+    let big_int = ctx.intern_value(&Value::from_typed(
+        "100000000000000000000000000001",
+        oxrdf::vocab::xsd::INTEGER.as_str(),
+    ));
+    let big_dec = ctx.intern_value(&Value::from_typed(
+        "100000000000000000000000000001.5",
+        oxrdf::vocab::xsd::DECIMAL.as_str(),
+    ));
+    let flt = ctx.intern_value(&Value::Float(1.0f32.into()));
+    let dbl = ctx.intern_value(&Value::Double(1.0f64.into()));
+    for id in [big_int, big_dec, flt, dbl] {
+        let _ = ctx.value_checked(id).unwrap();
+    }
+
+    let sum_agg = agg(AggregateFunction::Sum, true, false);
+    let cases = [
+        ("BigInt + Float", big_int, flt),
+        ("BigInt + Double", big_int, dbl),
+        ("BigDec + Float", big_dec, flt),
+        ("BigDec + Double", big_dec, dbl),
+        ("Float + BigInt", flt, big_int),
+        ("Float + BigDec", flt, big_dec),
+        ("Double + BigInt", dbl, big_int),
+        ("Double + BigDec", dbl, big_dec),
+    ];
+
+    for (label, first, second) in cases {
+        let mut acc = Running::new(&sum_agg, false);
+        acc.init(1);
+        fold(&ctx, &mut acc, &[first], &[0]);
+        let table = Table::new(vec![0]);
+        let values = [second];
+        let batch = Batch {
+            table: &table,
+            arg: Arg::Column(&values),
+            rows: None,
+            base: 0,
+        };
+        // Leave only 64 bytes free (< TO_F32_SCRATCH_BYTES = 256 and TO_F64_SCRATCH_BYTES = 1024).
+        let pin = ctx.charge(ctx.memory_room().saturating_sub(64)).unwrap();
+        let mut noop = |_| Ok(());
+        let mut budget = super::group::op::BatchBudget::Retain(&mut noop);
+        let err = acc.add_batch(&ctx, &batch, &[0], &mut budget).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+            ),
+            "{label}: expected memory refusal for conversion scratch, got {err:?}"
+        );
+        drop(pin);
+
+        // After releasing the pin, retrying the refused row succeeds.
+        let mut noop = |_| Ok(());
+        let mut budget = super::group::op::BatchBudget::Retain(&mut noop);
+        acc.add_batch(&ctx, &batch, &[0], &mut budget).unwrap();
+        let out = acc.finish(&ctx, 0).unwrap();
+        assert_ne!(out, Id::UNDEF, "{label}: expected numeric result");
+    }
+}
+
+#[test]
+fn sum_replacement_stays_charged_across_admit_and_drop() {
+    use super::exec::{AggState, ScratchAdmit, SumAdmit};
+
+    struct ObserveAdmit<'a> {
+        ctx: &'a Ctx,
+        accept: bool,
+        seen: Option<(u64, u64, u64)>,
+    }
+
+    impl ScratchAdmit for ObserveAdmit<'_> {}
+
+    impl SumAdmit for ObserveAdmit<'_> {
+        fn admit(&mut self, old: u64, new: u64) -> crate::error::Result<bool> {
+            self.seen = Some((old, new, self.ctx.live_bytes()));
+            Ok(self.accept)
+        }
+    }
+
+    let ctx = ctx();
+    let small_big = ctx.intern_value(&Value::from_typed(
+        &format!("1{}", "0".repeat(1_500)),
+        oxrdf::vocab::xsd::INTEGER.as_str(),
+    ));
+    let large_big = ctx.intern_value(&Value::from_typed(
+        &format!("1{}", "0".repeat(3_999)),
+        oxrdf::vocab::xsd::INTEGER.as_str(),
+    ));
+    let one = int(&ctx, 1);
+    for id in [small_big, large_big, one] {
+        let _ = ctx.value_checked(id).unwrap();
+    }
+
+    let sum_agg = agg(AggregateFunction::Sum, true, false);
+    let mut state = AggState::new(&sum_agg);
+    state
+        .add(&ctx, &sum_agg, Some(small_big), &mut |_| Ok(()))
+        .unwrap();
+    let live_before = ctx.live_bytes();
+
+    // Refusal path: candidate must remain charged while `admit` inspects it, then both
+    // candidate and scratch drop cleanly and the old subtotal stays intact.
+    let mut refuse = ObserveAdmit {
+        ctx: &ctx,
+        accept: false,
+        seen: None,
+    };
+    let accepted = state
+        .add_admitted(&ctx, &sum_agg, Some(large_big), &mut refuse)
+        .unwrap();
+    assert!(!accepted);
+    let (old_b, new_b, live_during) = refuse.seen.expect("admit called on growing replacement");
+    assert!(new_b > old_b);
+    assert!(
+        live_during >= live_before + new_b,
+        "candidate ({new_b} B) must stay charged during admit (before {live_before}, during {live_during})"
+    );
+    assert_eq!(ctx.live_bytes(), live_before);
+
+    // Acceptance path: candidate remains charged across `admit`, then scratch drops only
+    // after the old subtotal is replaced and dropped.
+    let mut accept = ObserveAdmit {
+        ctx: &ctx,
+        accept: true,
+        seen: None,
+    };
+    let accepted = state
+        .add_admitted(&ctx, &sum_agg, Some(large_big), &mut accept)
+        .unwrap();
+    assert!(accepted);
+    let (old_b, new_b, live_during) = accept.seen.expect("admit called on growing replacement");
+    assert!(new_b > old_b);
+    assert!(
+        live_during >= live_before + new_b,
+        "candidate ({new_b} B) must stay charged during admit (before {live_before}, during {live_during})"
+    );
+    assert_eq!(ctx.live_bytes(), live_before);
+
+    // Same-capacity replacement skips `admit`, but still keeps scratch alive across
+    // replacement and releases it cleanly afterwards.
+    let mut same_cap = ObserveAdmit {
+        ctx: &ctx,
+        accept: true,
+        seen: None,
+    };
+    let accepted = state
+        .add_admitted(&ctx, &sum_agg, Some(one), &mut same_cap)
+        .unwrap();
+    assert!(accepted);
+    assert!(
+        same_cap.seen.is_none(),
+        "expected same-capacity replacement to skip admit"
+    );
+    assert_eq!(ctx.live_bytes(), live_before);
+
+    let final_id = state.finish(&ctx, &sum_agg).unwrap();
+    let lex = ctx.value(final_id).unwrap().lexical().unwrap().to_string();
+    assert!(lex.starts_with('1') && lex.ends_with('1'));
+    assert_eq!(lex.len(), 4_000);
+}

@@ -45,6 +45,13 @@ pub(crate) const AGG_MAX_DEC_DIGITS: usize = MAX_DIGITS + MAX_SCALE as usize + 3
 /// A decimal subtotal's aligned limbs, one carry limb, and the owned value.
 pub(crate) const AGG_SUM_PAYLOAD_BYTES: u64 =
     ((AGG_MAX_DEC_DIGITS + 2).div_ceil(BASE_DIGITS) as u64 + 1) * 4 + 72;
+/// Transient scratch for one arbitrary-precision `SUM`/`AVG` addition or `AVG` division
+/// (operand alignment or scaling, Knuth division buffers, result, and normalization).
+pub(crate) const AGG_SUM_SCRATCH_BYTES: u64 = 5 * AGG_SUM_PAYLOAD_BYTES;
+/// Transient decimal-string scratch for converting a [`BigInt`] or [`BigDec`] to `f32`.
+pub(crate) const TO_F32_SCRATCH_BYTES: u64 = 256;
+/// Transient decimal-string scratch for converting a [`BigInt`] or [`BigDec`] to `f64`.
+pub(crate) const TO_F64_SCRATCH_BYTES: u64 = 1024;
 /// Minimum fractional digits produced by a non-terminating [`BigDec`] division, matching
 /// `oxsdatatypes::Decimal`.
 const MIN_DIV_SCALE: u32 = 18;
