@@ -1031,10 +1031,48 @@ fn stateless_accumulator_build_scans_no_quads() {
     }
     rt.round(&s);
     assert_eq!(counts(&c, start), feed_counts(&s, start));
+    // Force a stateless reset via rebuild: still scans nothing and resumes exact counting.
+    c.rebuild();
+    rt.round(&s);
+    let after_reset = c.commit();
+    assert!(c.counts(after_reset).unwrap().complete());
+    upd(&s, "INSERT DATA { :p0 :age 999 }");
+    rt.round(&s);
+    assert_eq!(counts(&c, after_reset), feed_counts(&s, after_reset));
+}
+
+/// Cancelling a stateless accumulator `Circuit::build` clears any previous snapshot,
+/// matching the error contract of the stateful build path.
+#[test]
+fn stateless_build_cancel_clears_previous_snapshot() {
+    use crate::incr::circuit::Circuit;
+    use crate::incr::compile::compile;
+    use crate::sparql::parse_query;
+    use crate::task::Control;
+    use std::sync::atomic::AtomicBool;
+
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let q = parse_query(FACTS, None, &[]).unwrap();
+    let mut circuit = Circuit::new(compile(&q, None).unwrap(), None);
+    circuit.keep_result = false;
+    circuit.build(s.snapshot(), &Control::none()).unwrap();
+    assert!(circuit.snap.is_some());
+
+    let cancel = Arc::new(AtomicBool::new(true));
+    let err = circuit
+        .build(s.snapshot(), &Control::with_cancel(cancel))
+        .unwrap_err();
+    assert!(matches!(err, crate::Error::Cancelled), "{err:?}");
+    assert!(
+        circuit.snap.is_none(),
+        "failed stateless build must clear previous snapshot"
+    );
 }
 
 /// `InternalCircuit::wait` returns promptly when a circuit has failed instead of
-/// spinning until its timeout expires.
+/// spinning until its timeout expires — including when `applied >= target` already and
+/// when a worker thread fails a round concurrently with `wait`.
 #[test]
 fn wait_returns_promptly_when_circuit_failed() {
     let s = Store::in_memory(StoreOptions::default());
@@ -1046,6 +1084,12 @@ fn wait_returns_promptly_when_circuit_failed() {
             InternalAccess::everything(),
         )
         .unwrap();
+    // Apply commit 1 cleanly first so `applied == 1`.
+    upd(&s, "INSERT DATA { :ok :p \"v\" }");
+    rt.round(&s);
+    let applied_before_fail = c.commit();
+    assert!(applied_before_fail >= 1);
+
     let mut big = String::from("INSERT DATA { ");
     for i in 0..200 {
         big.push_str(&format!(":k{i} :p \"{}\" . ", "v".repeat(64)));
@@ -1055,6 +1099,20 @@ fn wait_returns_promptly_when_circuit_failed() {
     rt.round(&s);
     let head = s.snapshot().commit;
     assert!(c.rows().is_err(), "circuit should have failed over-budget");
+
+    // Failing circuit at or above the requested target commit must return `false`, not `true`.
+    let started = std::time::Instant::now();
+    assert!(
+        !c.wait(applied_before_fail, std::time::Duration::from_secs(10)),
+        "wait must return false for a failed circuit even when applied >= target"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "wait took {:?}",
+        started.elapsed()
+    );
+
+    // Failing circuit below the requested target commit must also return `false` promptly.
     let started = std::time::Instant::now();
     assert!(!c.wait(head, std::time::Duration::from_secs(10)));
     assert!(
@@ -1062,4 +1120,36 @@ fn wait_returns_promptly_when_circuit_failed() {
         "wait took {:?}",
         started.elapsed()
     );
+
+    // Concurrent worker failing a round while `wait` is entering/waiting must never miss
+    // the wakeup and sleep for the full timeout.
+    let s2 = Arc::new(Store::in_memory(StoreOptions::default()));
+    let rt2 = runtime(&s2, None);
+    let (tx, rx) = tokio::sync::watch::channel(0u64);
+    let s2_worker = s2.clone();
+    let worker = rt2
+        .spawn_worker("wait-fail-worker".into(), rx, move || {
+            Some(s2_worker.clone())
+        })
+        .unwrap();
+    let c2 = rt2
+        .attach_internal(
+            &s2,
+            InternalSpec::rows("tiny-concurrent", FACTS).with_memory(1024),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    upd(&s2, &big);
+    let target = s2.snapshot().commit;
+    let _ = tx.send(target);
+    let started = std::time::Instant::now();
+    assert!(!c2.wait(target, std::time::Duration::from_secs(10)));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "concurrent failed wait took {:?}",
+        started.elapsed()
+    );
+    rt2.close(&s2);
+    drop(tx);
+    worker.join().unwrap();
 }

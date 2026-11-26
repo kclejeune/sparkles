@@ -166,6 +166,7 @@ impl Runtime {
                 drop(retired);
                 *self.runtime.subscription.lock() = None;
                 self.runtime.kick();
+                let _e = self.runtime.epoch.lock();
                 self.runtime.cv.notify_all();
             }
         }
@@ -249,19 +250,33 @@ impl Runtime {
     /// Run a round on the worker and wait for it, at most `timeout`: views defined in
     /// the dataset are then attached and recovered.
     pub fn settle(&self, timeout: Duration) {
+        let start = self.round_epoch();
         self.kick();
-        self.wait_round(Instant::now() + timeout);
+        self.wait_round_after(start, Instant::now() + timeout);
     }
 
-    /// Wait until a round has finished after this call, at most until `until`.
-    pub(super) fn wait_round(&self, until: Instant) -> bool {
+    /// The current completed-round epoch, captured before inspecting a condition that
+    /// [`wait_round_after`](Self::wait_round_after) will wait on.
+    pub(super) fn round_epoch(&self) -> u64 {
+        *self.epoch.lock()
+    }
+
+    /// Wait until a round has finished after `start`, at most until `until`.
+    pub(super) fn wait_round_after(&self, start: u64, until: Instant) -> bool {
         let mut e = self.epoch.lock();
-        let start = *e;
         while *e == start {
+            if self.is_closed() {
+                return false;
+            }
             if self.cv.wait_until(&mut e, until).timed_out() {
                 return false;
             }
         }
         true
+    }
+
+    /// Wait until a round has finished after this call, at most until `until`.
+    pub(super) fn wait_round(&self, until: Instant) -> bool {
+        self.wait_round_after(self.round_epoch(), until)
     }
 }

@@ -33,6 +33,8 @@ pub(crate) struct InternalCell {
     pub(super) handles: AtomicUsize,
     /// the circuit's commit, for waiting without its lock
     pub(super) applied: AtomicU64,
+    /// whether `state.status` is `Status::Failed`, for waiting without its lock
+    pub(super) failed: AtomicBool,
 }
 
 /// `circuit` is declared last so `tally` (whose bytes are accounted on `circuit`'s
@@ -151,16 +153,11 @@ impl InternalCircuit {
     pub fn wait(&self, commit: u64, timeout: Duration) -> bool {
         let until = Instant::now() + timeout;
         loop {
-            if self.commit() >= commit {
-                return true;
-            }
-            if self
-                .cell
-                .state
-                .try_lock()
-                .is_some_and(|st| matches!(st.status, Status::Failed { .. }))
-            {
+            if self.cell.failed.load(Ordering::Acquire) {
                 return false;
+            }
+            if self.commit() >= commit {
+                return !self.cell.failed.load(Ordering::Acquire);
             }
             let Some(rt) = self.rt.upgrade() else {
                 return false;
@@ -168,9 +165,19 @@ impl InternalCircuit {
             if rt.is_closed() {
                 return false;
             }
+            let epoch = rt.round_epoch();
+            if self.cell.failed.load(Ordering::Acquire) {
+                return false;
+            }
+            if self.commit() >= commit {
+                return !self.cell.failed.load(Ordering::Acquire);
+            }
+            if rt.is_closed() {
+                return false;
+            }
             rt.kick();
-            if !rt.wait_round(until) {
-                return self.commit() >= commit;
+            if !rt.wait_round_after(epoch, until) {
+                return !self.cell.failed.load(Ordering::Acquire) && self.commit() >= commit;
             }
         }
     }
@@ -309,7 +316,10 @@ impl InternalCircuit {
     /// An accumulator keeps its counts and records the commits since its last pass as
     /// unknown.
     pub fn rebuild(&self) {
-        self.cell.state.lock().status = Status::Building;
+        let mut st = self.cell.state.lock();
+        st.status = Status::Building;
+        self.cell.failed.store(false, Ordering::Release);
+        drop(st);
         if let Some(rt) = self.rt.upgrade() {
             rt.kick();
         }
@@ -502,6 +512,7 @@ impl Runtime {
             }),
             handles: AtomicUsize::new(1),
             applied: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
         });
         // the state is locked before a round can see the circuit, so a round never
         // builds it ahead of its recovery
@@ -564,6 +575,7 @@ impl Runtime {
         match st.circuit.build(snap.clone(), &self.control()) {
             Ok(()) => {
                 st.status = Status::Ready;
+                cell.failed.store(false, Ordering::Release);
                 // a build's state is checkpointed even at the commit of the last one,
                 // such as commit 0 of a new store
                 st.dirty = true;
@@ -620,6 +632,7 @@ impl Runtime {
         }
         st.circuit.clear_state();
         st.status = Status::Failed { code, message };
+        cell.failed.store(true, Ordering::Release);
     }
 
     /// Reconcile an accumulator's tally bytes against the circuit's budget and parent
@@ -1068,6 +1081,7 @@ impl Runtime {
                     st.circuit.applied = h.commit;
                     st.checkpointed = h.commit;
                     st.status = Status::Ready;
+                    cell.failed.store(false, Ordering::Release);
                     cell.applied.store(h.commit, Ordering::Release);
                     self.counters.loaded.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(

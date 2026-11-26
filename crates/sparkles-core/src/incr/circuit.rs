@@ -1340,7 +1340,10 @@ impl Circuit {
         // An accumulator over stateless operators keeps neither result rows nor
         // operator state, so building it needs no full scan of the store.
         if !self.keep_result && self.prov.is_none() && self.root.is_stateless() {
-            control.check()?;
+            if let Err(e) = control.check() {
+                self.clear_state();
+                return Err(e);
+            }
             self.resolved = None;
             self.applied = snap.commit;
             self.snap = Some(snap);
