@@ -1071,12 +1071,32 @@ impl Vocab {
         self.get_with_shared_prefix(id, |_, key| f(key))
     }
 
+    /// [`Vocab::get_with`] reusing the caller's scratch buffer across calls.
+    pub(crate) fn get_with_in<T>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
+        mut f: impl FnMut(&[u8]) -> T,
+    ) -> Option<T> {
+        self.get_with_shared_prefix_in(id, key, |_, k| f(k))
+    }
+
     /// Decode a key with the length of its common prefix with the preceding key.
     /// Both vocabulary codecs store that length for keys after the first in a block.
     /// For the first key of a block, the prefix length is unknown.
     pub(crate) fn get_with_shared_prefix<T>(
         &self,
         id: u64,
+        f: impl FnMut(Option<usize>, &[u8]) -> T,
+    ) -> Option<T> {
+        self.get_with_shared_prefix_in(id, &mut Vec::new(), f)
+    }
+
+    /// [`Vocab::get_with_shared_prefix`] reusing the caller's scratch buffer across calls.
+    pub(crate) fn get_with_shared_prefix_in<T>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
         f: impl FnMut(Option<usize>, &[u8]) -> T,
     ) -> Option<T> {
         if id >= self.len {
@@ -1086,9 +1106,9 @@ impl Vocab {
         // a result of a few hundred terms decodes each with its own call
         if ioacct::profiling() {
             let _t = ioacct::timer(Phase::VocabRead);
-            self.get_with_at::<true, T>(id, f)
+            self.get_with_at::<true, T>(id, key, f)
         } else {
-            self.get_with_at::<false, T>(id, f)
+            self.get_with_at::<false, T>(id, key, f)
         }
     }
 
@@ -1096,54 +1116,135 @@ impl Vocab {
     fn get_with_at<const P: bool, T>(
         &self,
         id: u64,
+        key: &mut Vec<u8>,
         mut f: impl FnMut(Option<usize>, &[u8]) -> T,
     ) -> Option<T> {
         let b = (id as usize) / FC_BLOCK;
         let want = (id as usize) % FC_BLOCK;
         let mut out = None;
-        let mut key = Vec::with_capacity(self.scratch_capacity());
+        let mut buf = std::mem::take(key);
+        let cap = self.scratch_capacity();
+        if buf.capacity() < cap {
+            buf.clear();
+            buf.reserve(cap);
+        }
         let read = |_, shared, key: &[u8]| {
             out = Some(f((want != 0).then_some(shared), key));
             false
         };
         if self.fsst.is_some() {
-            self.decode_block_as::<P, true>(b, 1 << want, &mut key, read);
+            self.decode_block_as::<P, true>(b, 1 << want, &mut buf, read);
         } else {
-            self.decode_block_as::<P, false>(b, 1 << want, &mut key, read);
+            self.decode_block_as::<P, false>(b, 1 << want, &mut buf, read);
         }
+        *key = buf;
         out
+    }
+
+    /// If entry `id` is stored with an FSST-coded suffix, return its encoded code count
+    /// (for regression tests verifying `fast_room` eligibility).
+    #[cfg(test)]
+    pub(crate) fn entry_coded_len(&self, id: u64) -> Option<usize> {
+        if id >= self.len || self.fsst.is_none() {
+            return None;
+        }
+        let b = (id as usize) / FC_BLOCK;
+        let want = (id as usize) % FC_BLOCK;
+        let data = self.data.as_slice();
+        let mut pos = self.block_offset_at::<false>(b);
+        let mut e = self.entry::<true>(data, &mut pos, true);
+        for _ in 1..=want {
+            e = self.entry::<true>(data, &mut pos, false);
+        }
+        e.coded.then_some(e.len)
     }
 
     /// [`Vocab::get_with_shared_prefix`] with scratch admitted before the walk and
     /// every subsequent growth admitted before allocation.
+    #[cfg(test)]
     pub(crate) fn get_with_shared_prefix_checked<T, E>(
         &self,
         id: u64,
+        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        f: impl FnOnce(Option<usize>, &[u8]) -> T,
+    ) -> std::result::Result<Option<T>, E> {
+        self.get_with_shared_prefix_checked_impl::<false, T, E>(id, &mut Vec::new(), reserve, f)
+    }
+
+    /// [`Vocab::get_with_shared_prefix`] reusing the caller's scratch buffer across calls,
+    /// with initial scratch capacity and every subsequent growth admitted before allocation.
+    /// Preserves the required capacity so optional `FSST_ROOM` headroom never fails a
+    /// lookup that fits in the admitted buffer.
+    pub(crate) fn get_with_shared_prefix_checked_in<T, E>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
+        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        f: impl FnOnce(Option<usize>, &[u8]) -> T,
+    ) -> std::result::Result<Option<T>, E> {
+        self.get_with_shared_prefix_checked_impl::<false, T, E>(id, key, reserve, f)
+    }
+
+    #[inline(always)]
+    fn get_with_shared_prefix_checked_impl<const ROOM: bool, T, E>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
         mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnOnce(Option<usize>, &[u8]) -> T,
     ) -> std::result::Result<Option<T>, E> {
         if id >= self.len {
             return Ok(None);
         }
-        let _t = ioacct::timer(Phase::VocabRead);
         let b = (id as usize) / FC_BLOCK;
         let want = (id as usize) % FC_BLOCK;
         let capacity = self.scratch_capacity();
-        reserve(capacity)?;
-        let mut key = Vec::with_capacity(capacity);
-        #[cfg(any(test, feature = "failpoints"))]
-        crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
-            "checked-vocab-scratch-allocated",
-            key.capacity(),
-        ));
+        if key.capacity() < capacity {
+            reserve(capacity)?;
+            key.clear();
+            key.reserve_exact(capacity);
+            #[cfg(any(test, feature = "failpoints"))]
+            crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+                "checked-vocab-scratch-allocated",
+                key.capacity(),
+            ));
+        }
+        let mut buf = std::mem::take(key);
         let mut ignore = |_, _: &[u8]| Ok(());
         let mask = 1 << want;
-        let shared = if self.fsst.is_some() {
-            self.checked_block::<true, false, E>(b, mask, &mut key, &mut reserve, &mut ignore)?
+        let res = if ioacct::profiling() {
+            let _t = ioacct::timer(Phase::VocabRead);
+            if self.fsst.is_some() {
+                self.checked_block::<true, true, ROOM, E>(
+                    b,
+                    mask,
+                    &mut buf,
+                    &mut reserve,
+                    &mut ignore,
+                )
+            } else {
+                self.checked_block::<true, false, ROOM, E>(
+                    b,
+                    mask,
+                    &mut buf,
+                    &mut reserve,
+                    &mut ignore,
+                )
+            }
+        } else if self.fsst.is_some() {
+            self.checked_block::<false, true, ROOM, E>(b, mask, &mut buf, &mut reserve, &mut ignore)
         } else {
-            self.checked_block::<false, false, E>(b, mask, &mut key, &mut reserve, &mut ignore)?
+            self.checked_block::<false, false, ROOM, E>(
+                b,
+                mask,
+                &mut buf,
+                &mut reserve,
+                &mut ignore,
+            )
         };
-        Ok(Some(f((want != 0).then_some(shared), &key)))
+        *key = buf;
+        let shared = res?;
+        Ok(Some(f((want != 0).then_some(shared), key)))
     }
 
     /// Decode many ids (sorted ascending, deduplicated), touching each front-coded
@@ -1163,9 +1264,10 @@ impl Vocab {
         self.get_sorted_checked_in::<false, E>(ids, &mut Vec::new(), reserve, f)
     }
 
-    /// With `ROOM`, a coded step always has [`FSST_ROOM`] admitted bytes of room past
-    /// the key, so FSST decodes it with its fast loops. A reused buffer keeps that
-    /// room, and a fresh buffer per call would reallocate for it.
+    /// With `ROOM`, a coded step of at most eight codes prefers [`FSST_ROOM`] admitted
+    /// bytes of room past the key for FSST's branchless loop, falling back to the
+    /// required capacity when extra room is refused. A reused buffer keeps that room, and
+    /// a fresh buffer per call would reallocate for it.
     fn get_sorted_checked_in<const ROOM: bool, E>(
         &self,
         ids: &[u64],
@@ -1173,7 +1275,6 @@ impl Vocab {
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        let _t = ioacct::timer(Phase::VocabRead);
         // One key needs no read-ahead or prefetch of its block.
         let ahead = if ids.len() == 1 {
             Ahead::default()
@@ -1188,7 +1289,12 @@ impl Vocab {
         // Rebuild in a local buffer, which the decode loops can keep in registers, and
         // return it, with its capacity, to the caller on every path.
         let mut buf = std::mem::take(key);
-        let done = self.get_sorted_checked_dispatch::<ROOM, E>(ids, &mut buf, reserve, f, ahead);
+        let done = if ioacct::profiling() {
+            let _t = ioacct::timer(Phase::VocabRead);
+            self.get_sorted_checked_dispatch::<true, ROOM, E>(ids, &mut buf, reserve, f, ahead)
+        } else {
+            self.get_sorted_checked_dispatch::<false, ROOM, E>(ids, &mut buf, reserve, f, ahead)
+        };
         *key = buf;
         done
     }
@@ -1202,7 +1308,6 @@ impl Vocab {
         f: impl FnMut(u64, &[u8]) -> crate::error::Result<()>,
         read_ahead: bool,
     ) -> crate::error::Result<()> {
-        let _t = ioacct::timer(Phase::VocabRead);
         let ahead = if read_ahead {
             self.ahead_for(ids)
         } else {
@@ -1211,11 +1316,28 @@ impl Vocab {
         if read_ahead && ahead.end == 0 && ids.len() > 1 {
             self.prefetch_sorted_checked(ids, &mut reserve)?;
         }
-        self.get_sorted_checked_dispatch::<false, _>(ids, &mut Vec::new(), reserve, f, ahead)
+        if ioacct::profiling() {
+            let _t = ioacct::timer(Phase::VocabRead);
+            self.get_sorted_checked_dispatch::<true, false, _>(
+                ids,
+                &mut Vec::new(),
+                reserve,
+                f,
+                ahead,
+            )
+        } else {
+            self.get_sorted_checked_dispatch::<false, false, _>(
+                ids,
+                &mut Vec::new(),
+                reserve,
+                f,
+                ahead,
+            )
+        }
     }
 
     #[inline]
-    fn get_sorted_checked_dispatch<const ROOM: bool, E>(
+    fn get_sorted_checked_dispatch<const P: bool, const ROOM: bool, E>(
         &self,
         ids: &[u64],
         key: &mut Vec<u8>,
@@ -1224,14 +1346,14 @@ impl Vocab {
         ahead: Ahead,
     ) -> std::result::Result<(), E> {
         if self.fsst.is_some() {
-            self.get_sorted_checked_as::<true, ROOM, E>(ids, key, reserve, f, ahead)
+            self.get_sorted_checked_as::<P, true, ROOM, E>(ids, key, reserve, f, ahead)
         } else {
-            self.get_sorted_checked_as::<false, ROOM, E>(ids, key, reserve, f, ahead)
+            self.get_sorted_checked_as::<P, false, ROOM, E>(ids, key, reserve, f, ahead)
         }
     }
 
     #[inline(always)]
-    fn get_sorted_checked_as<const F: bool, const ROOM: bool, E>(
+    fn get_sorted_checked_as<const P: bool, const F: bool, const ROOM: bool, E>(
         &self,
         ids: &[u64],
         key: &mut Vec<u8>,
@@ -1245,7 +1367,7 @@ impl Vocab {
             if *id < self.len {
                 let b = *id as usize / FC_BLOCK;
                 let mask = 1u32 << (*id as usize % FC_BLOCK);
-                self.checked_block::<F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
+                self.checked_block::<P, F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
             }
             return Ok(());
         }
@@ -1262,7 +1384,7 @@ impl Vocab {
                 mask |= 1 << (x as usize % FC_BLOCK);
             }
             mask &= (1u32 << n) - 1;
-            self.checked_block::<F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
+            self.checked_block::<P, F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
             i = j;
         }
         Ok(())
@@ -1272,7 +1394,7 @@ impl Vocab {
     /// nonempty `mask`, which holds only keys of the block. Returns the last key's
     /// common prefix length with its predecessor within the block.
     #[inline(always)]
-    fn checked_block<const F: bool, const ROOM: bool, E>(
+    fn checked_block<const P: bool, const F: bool, const ROOM: bool, E>(
         &self,
         b: usize,
         mask: u32,
@@ -1282,9 +1404,11 @@ impl Vocab {
     ) -> std::result::Result<usize, E> {
         let data = self.data.as_slice();
         let last = 31 - mask.leading_zeros() as usize;
-        let mut pos = self.block_offset(b);
-        ioacct::vocab_blocks_scanned(1);
-        self.touch_block(b);
+        let mut pos = self.block_offset_at::<P>(b);
+        if P {
+            ioacct::vocab_blocks_scanned(1);
+            self.touch_block(b);
+        }
         key.clear();
         // The steps below grow the buffer only through the reservations here, so its
         // capacity is read once, rather than through `key` at every step.
@@ -1338,24 +1462,41 @@ impl Vocab {
                     (nd - e.shared).min(e.most())
                 };
                 let total = key.len().min(e.shared).saturating_add(add);
-                let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
+                let fast_room = e.coded && e.len <= 8;
+                let room = if ROOM && fast_room { FSST_ROOM } else { 0 };
                 if total.saturating_add(room) > cap {
-                    // an FSST suffix decodes fastest with room for eight symbols
-                    // past the key (`fsst::Table::decode_at`). The buffer starts at the
-                    // unchecked decoder's size, so that a block's short keys, each
-                    // decoded up to the next key's shared prefix, do not grow it one
-                    // step at a time.
-                    let total = total
-                        .saturating_add(FSST_ROOM * usize::from(e.coded))
-                        .max(self.scratch_capacity());
-                    reserve(total)?;
-                    key.reserve_exact(total - key.len());
-                    cap = key.capacity();
-                    #[cfg(any(test, feature = "failpoints"))]
-                    crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
-                        "checked-vocab-scratch-allocated",
-                        key.capacity(),
-                    ));
+                    // An FSST suffix of at most eight codes decodes fastest with room for
+                    // eight symbols (`fsst::Table::decode_at`). That headroom is optional:
+                    // if admitting it is refused, fall back to the required capacity (or
+                    // keep the already-admitted buffer when `total <= cap`) so checked
+                    // lookups never fail over optional headroom.
+                    let min_cap = total.max(self.scratch_capacity());
+                    let target = if fast_room {
+                        let preferred =
+                            total.saturating_add(FSST_ROOM).max(self.scratch_capacity());
+                        if reserve(preferred).is_ok() {
+                            Some(preferred)
+                        } else if total > cap {
+                            reserve(min_cap)?;
+                            Some(min_cap)
+                        } else {
+                            None
+                        }
+                    } else {
+                        reserve(min_cap)?;
+                        Some(min_cap)
+                    };
+                    if let Some(target) = target {
+                        key.reserve_exact(target - key.len());
+                        cap = key.capacity();
+                        #[cfg(any(test, feature = "failpoints"))]
+                        crate::algo::observe_projection(
+                            crate::algo::ProjectionEvent::Materialized(
+                                "checked-vocab-scratch-allocated",
+                                key.capacity(),
+                            ),
+                        );
+                    }
                 }
             }
             self.step::<F>(data, e, id, nd, key, true);
@@ -4918,6 +5059,311 @@ mod tests {
             assert_eq!(refused_growth, Err(keys[0].len()));
             assert_eq!(observed.load(Ordering::Relaxed), 1);
         }
+    }
+
+    #[test]
+    fn reused_shared_prefix_lookup_avoids_reallocations_and_enforces_admission() {
+        let mut keys = Vec::new();
+        for i in 0..40 {
+            keys.push(format!("\"k{i:03}\"\x7f").into_bytes());
+        }
+        keys.push(format!("\"z{}\"\x7f", "x".repeat(4096)).into_bytes());
+        keys.sort();
+        keys.dedup();
+        let long_idx = keys.iter().position(|k| k.len() > 4000).unwrap() as u64;
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let v = Vocab::open(dir.path()).unwrap();
+            let cap = v.scratch_capacity();
+
+            // Unchecked reuse matches single-shot across block boundaries.
+            let mut unchecked_buf = Vec::new();
+            for (i, expected) in keys.iter().enumerate() {
+                let mut single = None;
+                v.get_with_shared_prefix(i as u64, |p, k| single = Some((p, k.to_vec())));
+                let mut reused = None;
+                v.get_with_shared_prefix_in(i as u64, &mut unchecked_buf, |p, k| {
+                    reused = Some((p, k.to_vec()));
+                });
+                assert_eq!(reused, single, "fsst {fsst} id {i}");
+                assert_eq!(reused.unwrap().1, *expected);
+            }
+
+            // Checked reuse admits initial scratch once and does not reallocate for short keys.
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let observed = Arc::new(AtomicUsize::new(0));
+            let seen = observed.clone();
+            crate::algo::set_projection_observer(Some(Arc::new(move |event| {
+                if let crate::algo::ProjectionEvent::Materialized(
+                    "checked-vocab-scratch-allocated",
+                    _,
+                ) = event
+                {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                }
+            })));
+            let mut checked_buf = Vec::new();
+            let mut admissions = Vec::new();
+            for i in 0..keys.len() as u64 {
+                if i == long_idx {
+                    continue;
+                }
+                let got = v
+                    .get_with_shared_prefix_checked_in(
+                        i,
+                        &mut checked_buf,
+                        |need| {
+                            admissions.push(need);
+                            if need <= cap { Ok(()) } else { Err(need) }
+                        },
+                        |shared, key| (shared, key.to_vec()),
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(got.1, keys[i as usize], "fsst {fsst} id {i}");
+                let expected_shared = (!(i as usize).is_multiple_of(FC_BLOCK)).then(|| {
+                    keys[i as usize - 1]
+                        .iter()
+                        .zip(&keys[i as usize])
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                });
+                assert_eq!(got.0, expected_shared, "fsst {fsst} id {i}");
+            }
+            assert_eq!(admissions, [cap], "fsst {fsst}: single initial admission");
+            assert_eq!(
+                observed.load(Ordering::Relaxed),
+                1,
+                "fsst {fsst}: single scratch allocation across all short keys"
+            );
+
+            // Refusing growth for the long key fails before allocating more capacity.
+            let refused: Result<Option<()>, _> = v.get_with_shared_prefix_checked_in(
+                long_idx,
+                &mut checked_buf,
+                |need| if need <= cap { Ok(()) } else { Err(need) },
+                |_, _| panic!("growth refused"),
+            );
+            assert!(refused.is_err(), "fsst {fsst}: growth must refuse");
+            assert_eq!(
+                observed.load(Ordering::Relaxed),
+                1,
+                "fsst {fsst}: no growth allocation on refusal"
+            );
+
+            // Refusing initial scratch on a fresh buffer allocates nothing.
+            let mut empty_buf = Vec::new();
+            let refused_init: Result<Option<()>, _> =
+                v.get_with_shared_prefix_checked_in(0, &mut empty_buf, Err, |_, _| {
+                    panic!("initial scratch refused")
+                });
+            crate::algo::set_projection_observer(None);
+            assert_eq!(refused_init, Err(cap));
+            assert_eq!(empty_buf.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn checked_fsst_lookup_succeeds_when_optional_room_is_refused() {
+        let mut keys = Vec::new();
+        let mid_pad = "alpha_beta_gamma_delta_".repeat(5);
+        let long_pad = "alpha_beta_gamma_delta_".repeat(8);
+        for i in 0..160u32 {
+            keys.push(format!("\"m-{mid_pad}delta_tail_{i:04}_alpha_beta\"\x7f").into_bytes());
+        }
+        for i in 0..32u32 {
+            keys.push(format!("\"z-{long_pad}delta_tail_{i:02}_alpha_beta\"\x7f").into_bytes());
+        }
+        keys.sort();
+        keys.dedup();
+
+        let dir = tempfile::tempdir().unwrap();
+        write_codec(dir.path(), &keys, true);
+        let v = Vocab::open(dir.path()).unwrap();
+        assert!(v.is_fsst());
+        let cap = v.scratch_capacity();
+        assert_eq!(cap, 192);
+
+        // (a) A verified FSST-coded entry with at most 8 codes (`fast_room`) whose key fits
+        // in `cap` (192) while `len + FSST_ROOM` exceeds `cap`: refusing the preferred
+        // headroom reservation must fall back to the already-admitted buffer.
+        let fit_id = (0..keys.len())
+            .find(|&i| {
+                let len = keys[i].len();
+                len > cap - FSST_ROOM
+                    && len <= cap
+                    && !i.is_multiple_of(FC_BLOCK)
+                    && v.entry_coded_len(i as u64).is_some_and(|codes| codes <= 8)
+            })
+            .expect(
+                "fixture must contain a verified FSST-coded entry in (cap - FSST_ROOM, cap] with <= 8 codes",
+            ) as u64;
+        let fit_len = keys[fit_id as usize].len();
+        let expected_shared = (!(fit_id as usize).is_multiple_of(FC_BLOCK)).then(|| {
+            keys[fit_id as usize - 1]
+                .iter()
+                .zip(&keys[fit_id as usize])
+                .take_while(|(a, b)| a == b)
+                .count()
+        });
+
+        let mut shared_buf = Vec::new();
+        let mut shared_refused = Vec::new();
+        let got_shared = v.get_with_shared_prefix_checked_in(
+            fit_id,
+            &mut shared_buf,
+            |need| {
+                if need <= cap {
+                    Ok(())
+                } else {
+                    shared_refused.push(need);
+                    Err(need)
+                }
+            },
+            |shared, key| (shared, key.to_vec()),
+        );
+        assert_eq!(
+            got_shared,
+            Ok(Some((expected_shared, keys[fit_id as usize].clone()))),
+            "reused checked shared-prefix walk must succeed within admitted required capacity"
+        );
+        assert!(
+            shared_refused.is_empty(),
+            "ROOM = false shared-prefix walk must not request optional headroom: {shared_refused:?}"
+        );
+
+        let mut reused_buf = Vec::new();
+        let mut fit_refused = Vec::new();
+        let got_reused = v.get_with_checked_in(
+            fit_id,
+            &mut reused_buf,
+            |need| {
+                if need <= cap {
+                    Ok(())
+                } else {
+                    fit_refused.push(need);
+                    Err(need)
+                }
+            },
+            |key| key.to_vec(),
+        );
+        assert_eq!(
+            got_reused,
+            Ok(Some(keys[fit_id as usize].clone())),
+            "reused checked walk must succeed within admitted required capacity"
+        );
+        assert!(
+            fit_refused.contains(&(fit_len + FSST_ROOM)),
+            "fast_room must attempt and observe refusal of preferred headroom {}: {fit_refused:?}",
+            fit_len + FSST_ROOM
+        );
+        assert_eq!(
+            reused_buf.capacity(),
+            cap,
+            "falling back when total <= cap must keep the already-admitted buffer"
+        );
+
+        let mut fresh_refused = Vec::new();
+        let got_fresh = v.get_with_checked(
+            fit_id,
+            |need| {
+                if need <= cap {
+                    Ok(())
+                } else {
+                    fresh_refused.push(need);
+                    Err(need)
+                }
+            },
+            |key| key.to_vec(),
+        );
+        assert_eq!(
+            got_fresh,
+            Ok(Some(keys[fit_id as usize].clone())),
+            "fresh checked walk must succeed within admitted required capacity"
+        );
+        assert!(
+            fresh_refused.is_empty(),
+            "ROOM = false fresh walk must not request optional headroom: {fresh_refused:?}"
+        );
+
+        // (b) A verified FSST-coded entry longer than `cap` with at most 8 codes (`fast_room`):
+        // refusing `len + FSST_ROOM` must fall back to admitting `len` and growing the buffer.
+        let grown_id = (0..keys.len())
+            .find(|&i| {
+                keys[i].len() > cap
+                    && !i.is_multiple_of(FC_BLOCK)
+                    && v.entry_coded_len(i as u64).is_some_and(|codes| codes <= 8)
+            })
+            .expect(
+                "fixture must contain a verified FSST-coded entry longer than cap with <= 8 codes",
+            ) as u64;
+        let need_len = keys[grown_id as usize].len();
+
+        let mut grown_shared = Vec::new();
+        let mut grown_shared_admitted = Vec::new();
+        let mut grown_shared_refused = Vec::new();
+        assert_eq!(
+            v.get_with_shared_prefix_checked_in(
+                grown_id,
+                &mut grown_shared,
+                |need| {
+                    if need <= need_len {
+                        grown_shared_admitted.push(need);
+                        Ok(())
+                    } else {
+                        grown_shared_refused.push(need);
+                        Err(need)
+                    }
+                },
+                |_, k| k.to_vec()
+            ),
+            Ok(Some(keys[grown_id as usize].clone()))
+        );
+        assert!(
+            grown_shared_refused.contains(&(need_len + FSST_ROOM)),
+            "fast_room growth must attempt and observe refusal of preferred headroom {}: {grown_shared_refused:?}",
+            need_len + FSST_ROOM
+        );
+        assert!(
+            grown_shared_admitted.contains(&need_len),
+            "after preferred headroom refusal, shared-prefix walk must fall back to required size {need_len}: {grown_shared_admitted:?}"
+        );
+
+        let mut grown_reused = Vec::new();
+        let mut grown_admitted = Vec::new();
+        let mut grown_refused = Vec::new();
+        assert_eq!(
+            v.get_with_checked_in(
+                grown_id,
+                &mut grown_reused,
+                |need| {
+                    if need <= need_len {
+                        grown_admitted.push(need);
+                        Ok(())
+                    } else {
+                        grown_refused.push(need);
+                        Err(need)
+                    }
+                },
+                |k| k.to_vec()
+            ),
+            Ok(Some(keys[grown_id as usize].clone()))
+        );
+        assert!(
+            grown_refused.contains(&(need_len + FSST_ROOM)),
+            "fast_room must attempt and observe refusal of preferred headroom {}: {grown_refused:?}",
+            need_len + FSST_ROOM
+        );
+        assert!(
+            grown_admitted.contains(&need_len),
+            "after preferred headroom refusal, walk must fall back to admitting required size {need_len}: {grown_admitted:?}"
+        );
+        assert!(
+            grown_reused.capacity() >= need_len,
+            "buffer must grow to at least required length {need_len}"
+        );
     }
 
     #[test]
