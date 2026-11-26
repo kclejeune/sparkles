@@ -244,10 +244,15 @@ impl Store {
 
 impl WriteTxn<'_> {
     /// Project storage for the effective commit or a complete simulated replay prefix.
-    pub(super) fn preview_storage(&self, inserts: bool, pending_bytes: u64) -> StorageCheck {
+    pub(super) fn preview_storage(
+        &self,
+        inserts: bool,
+        quota_bytes: u64,
+        disk_bytes: u64,
+    ) -> StorageCheck {
         let store = self.store;
         let mut storage = match (&store.root, store.opts.max_memory_bytes) {
-            (Some(_), _) => match store.quota.project_commit(pending_bytes) {
+            (Some(_), _) => match store.quota.project_commit(quota_bytes) {
                 Some((limit, used, projected)) => StorageCheck {
                     refused: None,
                     limit: Some(limit),
@@ -266,7 +271,9 @@ impl WriteTxn<'_> {
             },
             (None, None) => StorageCheck::default(),
         };
-        storage.refused = self.check_storage_for(inserts, pending_bytes).err();
+        storage.refused = self
+            .check_storage_for(inserts, quota_bytes, disk_bytes)
+            .err();
         storage
     }
 
@@ -315,8 +322,13 @@ impl WriteTxn<'_> {
             let storage = match checks {
                 Some(checks) => checks.storage,
                 None => {
-                    let extra = self.pending_storage_bytes(self.mark.entries(), message.as_deref());
-                    self.preview_storage(self.net_ins > 0, self.wal_bytes().saturating_add(extra))
+                    let (vocab, annotation) =
+                        self.pending_storage_bytes(self.mark.entries(), message.as_deref());
+                    let bytes = self
+                        .wal_bytes()
+                        .saturating_add(vocab)
+                        .saturating_add(annotation);
+                    self.preview_storage(self.net_ins > 0, bytes, bytes)
                 }
             };
             let commit = self.next_commit(validation.as_deref());

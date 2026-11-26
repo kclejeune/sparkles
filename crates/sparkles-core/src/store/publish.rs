@@ -51,6 +51,8 @@ pub(super) struct Committed<'a> {
     /// where the commit's records end in its generation's log, when it wrote records
     /// (a bulk commit and a commit of an in-memory store write none)
     pub log_end: Option<u64>,
+    /// Charge the catalog append across the steps of a persistent merge or replay.
+    pub account_catalog: bool,
     /// the commit's changes, from which the view runtimes and the embedding worker
     /// read; a bulk commit has none and schedules that work itself
     pub changes: Option<&'a [(u8, [Id; 4])]>,
@@ -115,7 +117,14 @@ impl Store {
         {
             log.push(change);
         }
-        self.catalog.lock().append(c.info);
+        let measures = c.account_catalog.then(|| self.quota.measures());
+        let catalog_growth = self.catalog.lock().append(c.info);
+        if let Some(measures) = measures {
+            match catalog_growth {
+                Some(bytes) => self.quota.account_append(bytes, measures),
+                None => self.quota.invalidate(),
+            }
+        }
         // An in-memory store keeps annotations and past states only for the window its
         // catalog keeps. A store with a log keeps them on disk, so it has neither step.
         if self.root.is_none() {

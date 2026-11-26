@@ -766,9 +766,12 @@ schema change affects later source commits without changing the live guard cache
 
 The preview stops at the first refusal. Otherwise its retained candidate contains the
 complete replay, including zero-net steps that still create commits. Change counts
-summarize the net candidate while storage projections include each source commit's WAL
-marker. Insertion admission is evaluated for each step, so deletion followed by
-reinsertion cannot bypass an exceeded quota. Disk-size estimates remain approximate.
+summarize the net candidate. Quota projections include each source commit's WAL marker
+and carry forward the merge records, commit catalog entries and file framing of
+completed steps. The disk reserve projection credits space already allocated in the
+files that those steps fill.
+Insertion admission is evaluated for each step, so deletion followed by reinsertion
+cannot bypass an exceeded quota. Disk-size estimates remain approximate.
 The source and target heads, published snapshot, files and guard publication state stay
 unchanged. An actual replay still publishes each successful source step separately.
 

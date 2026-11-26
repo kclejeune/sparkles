@@ -349,6 +349,23 @@ impl Annotations {
         (was + std::mem::take(&mut self.retired), now)
     }
 
+    /// The space available for another record in the existing file.
+    pub(crate) fn preallocated(&self) -> u64 {
+        self.tail.as_ref().map_or(0, |tail| {
+            let io = tail.io.lock();
+            io.alloc.saturating_sub(io.end)
+        })
+    }
+
+    /// The header the next annotation will write if it creates the file.
+    pub(crate) fn pending_header(&self) -> u64 {
+        if self.path.is_some() && self.tail.is_none() {
+            HEADER as u64
+        } else {
+            0
+        }
+    }
+
     /// Cut the zeros preallocated after the records, before the store closes: a file that
     /// is no longer written ends at its last record (an open cuts them as well). The
     /// writer takes no more commits, so no fence writes after this.

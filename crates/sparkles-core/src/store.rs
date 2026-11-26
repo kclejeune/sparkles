@@ -4757,6 +4757,7 @@ impl Store {
         &self,
         c: &CommitInfo,
         message: Option<Arc<str>>,
+        account_header: bool,
         changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
     ) -> Result<(
         crate::annotations::Annotation,
@@ -4764,9 +4765,22 @@ impl Store {
     )> {
         let mut a = self.annotations.lock();
         let ann = self.annotation_of(&a, c, message, changes);
+        let header = if account_header && !ann.is_empty() {
+            a.pending_header()
+        } else {
+            0
+        };
+        let measures = (header > 0).then(|| self.quota.measures());
         // a grouped commit never takes its record back
-        let queued = a.append_queued(c.seq, ann.clone(), self.dataset_id)?;
-        Ok((ann, queued))
+        let queued = a.append_queued(c.seq, ann.clone(), self.dataset_id);
+        drop(a);
+        if let Some(measures) = measures {
+            match &queued {
+                Ok(_) => self.quota.account_append(header, measures),
+                Err(_) => self.quota.invalidate(),
+            }
+        }
+        Ok((ann, queued?))
     }
 
     fn annotation_of(
@@ -6917,6 +6931,7 @@ impl Store {
             snapshot: Arc::new(new_snap),
             configuration,
             log_end: None,
+            account_catalog: false,
             changes: None,
             change,
             validated: validation.is_some(),
@@ -8472,6 +8487,7 @@ impl WriteTxn<'_> {
             snapshot: snap,
             configuration: self.configuration,
             log_end: None,
+            account_catalog: false,
             changes: Some(&self.log),
             change,
             validated: validation.is_some(),
@@ -8495,18 +8511,14 @@ impl WriteTxn<'_> {
     }
 
     /// The pending dictionary and annotation records counted with a persistent commit.
-    fn pending_storage_bytes(&self, terms_from: u64, message: Option<&str>) -> u64 {
+    fn pending_storage_bytes(&self, terms_from: u64, message: Option<&str>) -> (u64, u64) {
         if self.store.root.is_none() {
-            return 0;
+            return (0, 0);
         }
-        self.base
-            .generation
-            .dvocab
-            .key_bytes(terms_from)
-            .saturating_add(crate::annotations::record_len(
-                message,
-                self.store.commit_digests(),
-            ))
+        (
+            self.base.generation.dvocab.key_bytes(terms_from),
+            crate::annotations::record_len(message, self.store.commit_digests()),
+        )
     }
 
     /// The most this commit may preallocate in the WAL past its records (see
@@ -8534,17 +8546,18 @@ impl WriteTxn<'_> {
     /// The storage checks of a commit through the WAL: the free disk space the store
     /// keeps, and for a commit that adds quads the quota or the in-memory size limit.
     fn check_storage(&self) -> Result<()> {
-        self.check_storage_for(self.net_ins > 0, self.wal_bytes())
+        let bytes = self.wal_bytes();
+        self.check_storage_for(self.net_ins > 0, bytes, bytes)
     }
 
-    fn check_storage_for(&self, inserts: bool, pending_bytes: u64) -> Result<()> {
+    fn check_storage_for(&self, inserts: bool, quota_bytes: u64, disk_bytes: u64) -> Result<()> {
         // grouped commits queued for their fence have not written their records and terms
         // yet, nor running fences their preallocation, so the free space on disk does not
         // show them
         self.store
-            .check_disk(pending_bytes.saturating_add(self.store.quota.unwritten()))?;
+            .check_disk(disk_bytes.saturating_add(self.store.quota.unwritten()))?;
         if inserts {
-            self.store.quota.check_commit(pending_bytes)?;
+            self.store.quota.check_commit(quota_bytes)?;
         }
         if inserts && self.store.root.is_none() && self.store.opts.max_memory_bytes.is_some() {
             self.store.check_memory(self.memory_size())?;

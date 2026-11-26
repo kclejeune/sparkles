@@ -1662,7 +1662,8 @@ impl Catalog {
     /// Append a durable commit, in sequence order under the catalog mutex.
     /// Publication is serialized by the writer or the opt-in prefix coordinator.
     /// A file error is logged and retried with the next append; it never fails the commit.
-    pub fn append(&mut self, c: CommitInfo) {
+    /// Return the file growth on success, or `None` when a write may be partial.
+    pub fn append(&mut self, c: CommitInfo) -> Option<u64> {
         if c.default_graph {
             self.last_default = c.seq;
         }
@@ -1675,8 +1676,11 @@ impl Catalog {
         }
         if self.file.is_some() {
             self.pending.push(c);
+            let bytes = (self.pending.len() * REC) as u64;
             self.flush_pending();
+            return self.pending.is_empty().then_some(bytes);
         }
+        Some(0)
     }
 
     fn flush_pending(&mut self) {

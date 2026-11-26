@@ -9,8 +9,8 @@
 //! commits that only delete are never refused.
 //!
 //! Size is measured by walking the directory, at most once a second while a quota is
-//! set, and after every rebuild. Between walks, small commits add the bytes they append
-//! to the write-ahead log. A rebuild is checked with walks of its own.
+//! set, and after every rebuild. Between walks, small commits account for growth in
+//! their files as they write them. A rebuild is checked with walks of its own.
 
 use super::{Store, dir_size, write_atomic};
 use crate::error::{Budget, BudgetKind, Error, Result};
@@ -294,6 +294,17 @@ impl Quota {
     pub(crate) fn add(&self, bytes: u64) {
         if self.root.is_some() {
             self.used.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Account for a file append outside the WAL fence. A walk that finished since
+    /// the append began may already include it, so refresh the cache in that case.
+    pub(super) fn account_append(&self, bytes: u64, measures_before: u64) {
+        let mut measured = self.measured.lock();
+        if self.measures() == measures_before {
+            self.add(bytes);
+        } else {
+            *measured = None;
         }
     }
 

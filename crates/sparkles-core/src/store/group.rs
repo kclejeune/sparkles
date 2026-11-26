@@ -830,6 +830,7 @@ impl Store {
             snapshot: p.snapshot.clone(),
             configuration: p.configuration,
             log_end: Some(p.wal_end),
+            account_catalog: p.merge.is_some(),
             changes: Some(&p.changes),
             change,
             validated: p.validation.is_some(),
@@ -872,9 +873,12 @@ impl WriteTxn<'_> {
         // until the fence has written both. The commit reserves them before it checks,
         // so that the check of a racing fence's preallocation sees them, or this check
         // sees its promise (see `Quota::unwritten`).
-        let extra = self.pending_storage_bytes(self.mark.entries(), message.as_deref());
-        let reserved = store.quota.reserve(bytes.saturating_add(extra));
-        self.check_storage_for(self.net_ins > 0, 0)?;
+        let (vocab, annotation) =
+            self.pending_storage_bytes(self.mark.entries(), message.as_deref());
+        let reserved = store
+            .quota
+            .reserve(bytes.saturating_add(vocab).saturating_add(annotation));
+        self.check_storage_for(self.net_ins > 0, 0, 0)?;
         let c = self.next_commit(validation.as_deref());
         // the control frame the commit carries, which names it (spec C26 §7.1)
         let control = self.control_frame(c.seq, c.timestamp_ms)?;
@@ -970,10 +974,15 @@ impl WriteTxn<'_> {
             // `merge-recorded` can leave a complete record for `c.seq` on disk, so no
             // later commit may reuse `c.seq` before reopen truncates it.
             self.guard.poisoned = true;
+            let measures = store.quota.measures();
             if let Err(e) = store.branching.merges.lock().append(rec) {
+                store.quota.invalidate();
                 group.fail();
                 return Err(e);
             }
+            store
+                .quota
+                .account_append(branching::MERGE_REC as u64, measures);
             store.failpoint("merge-recorded");
         }
         // The annotation record is queued with the WAL records, and the fence writes both:
@@ -982,7 +991,9 @@ impl WriteTxn<'_> {
         // the record is never taken back: if the commit is recovered, its annotation is
         // there.
         let (annotation, ann) =
-            match store.annotate_queued(&c, message, || Some(self.change_lines())) {
+            match store.annotate_queued(&c, message, self.merge.is_some(), || {
+                Some(self.change_lines())
+            }) {
                 Ok(a) => a,
                 Err(e) => {
                     if self.merge.is_some() {

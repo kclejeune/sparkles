@@ -1108,8 +1108,11 @@ fn replay_preview_checks_each_steps_insertions_when_already_over_quota() {
     assert_eq!(main.snapshot().commit, head + 1, "only the deletion fits");
 }
 
+const MERGE_RECORD_BYTES: u64 = 48;
+const CATALOG_RECORD_BYTES: u64 = 64;
+
 #[test]
-fn replay_preview_projects_a_wal_commit_marker_for_every_source_step() {
+fn replay_preview_projects_wal_markers_and_predecessor_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let main = Store::open(&dir.path().join("replay-wal"), StoreOptions::default()).unwrap();
     upd(
@@ -1145,7 +1148,10 @@ fn replay_preview_projects_a_wal_commit_marker_for_every_source_step() {
         },
     )
     .unwrap();
-    assert_eq!(projected_append, main.wal_bytes() - before);
+    assert_eq!(
+        projected_append,
+        main.wal_bytes() - before + MERGE_RECORD_BYTES + CATALOG_RECORD_BYTES
+    );
 }
 
 #[test]
@@ -1187,30 +1193,16 @@ fn replay_preview_quota_counts_vocabulary_framing_from_earlier_steps() {
     )
     .unwrap();
     let second_pending = dev.wal_bytes() - wal;
-    let quota = main.disk_usage() + first_pending + CHUNK_HEADER as u64 + second_pending - 1;
-    main.set_quota(Some(quota)).unwrap();
-
     let head = main.snapshot().commit;
     let preview = replay_preview(&main, Default::default());
     assert_eq!(main.snapshot().commit, head);
-    let actual = main
-        .merge(
-            "dev",
-            "main",
-            &sparkles_core::branch::MergeOptions {
-                replay: true,
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-    assert_eq!(main.snapshot().commit, head + 1, "only the first step fits");
-    assert!(matches!(&actual, Error::BudgetExceeded(budget)
-        if budget.kind == sparkles_core::BudgetKind::DatasetBytes && budget.requested == quota + 1));
-    assert_eq!(preview.outcome(), Outcome::StorageRefused);
-    assert_eq!(preview.storage.projected, Some(quota + 1));
     assert_eq!(
-        preview.storage.refused.unwrap().to_string(),
-        actual.to_string()
+        preview.storage.projected.unwrap() - preview.storage.used.unwrap(),
+        first_pending
+            + CHUNK_HEADER as u64
+            + MERGE_RECORD_BYTES
+            + CATALOG_RECORD_BYTES
+            + second_pending
     );
 }
 

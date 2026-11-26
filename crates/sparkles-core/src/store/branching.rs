@@ -397,7 +397,7 @@ pub(crate) const MERGE_FAST_FORWARD: u32 = 1;
 /// A commit that replays the source commit, in a replayed fast-forward.
 pub(crate) const MERGE_REPLAYED: u32 = 2;
 
-const MERGE_REC: usize = 48;
+pub(super) const MERGE_REC: usize = 48;
 
 impl MergeRec {
     fn encode(&self) -> [u8; MERGE_REC] {
