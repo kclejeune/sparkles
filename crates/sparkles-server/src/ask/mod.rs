@@ -414,11 +414,19 @@ pub fn ask(
     } else if let Some(c) = a.claims.take()
         && out["outcome"] == "answered"
     {
+        let mut policy = serde_json::Map::new();
         if !c["claims"].is_null() {
             out["claims"] = c["claims"].clone();
+            policy.insert("claims".into(), c["claims"].clone());
         }
         if !c["resolution"].is_null() {
             out["resolution"] = c["resolution"].clone();
+            policy.insert("resolution".into(), c["resolution"].clone());
+        }
+        // when no summary event ran, publish the checked policy metadata on a terminal
+        // event so SSE streams receive claims and resolution before usage (C25)
+        if out.get("summary").is_none() && !policy.is_empty() {
+            (a.on)("policy", &Value::Object(policy));
         }
     }
     // an event stream learns of the endings without their own event here
@@ -2350,8 +2358,8 @@ impl Asking<'_, '_> {
             Ok((value, _, pair)) => {
                 let raw = value["text"].as_str().unwrap_or("");
                 let mut text = prompts::drop_markers(raw, sent.max(1));
-                if has_claims {
-                    // a claim marker names a listed occurrence or is removed
+                if claims.is_some() {
+                    // a claim marker names a listed occurrence or is removed (C25)
                     text = prompts::drop_claim_markers(&text, &listed);
                 }
                 let mut citations: Vec<u64> = prompts::markers(&text);
@@ -2401,6 +2409,9 @@ impl Asking<'_, '_> {
                     if has_claims {
                         s["claims"] = c["claims"].clone();
                     }
+                    if !c["resolution"].is_null() {
+                        s["resolution"] = c["resolution"].clone();
+                    }
                     self.claims = Some(c.clone());
                 }
                 if citations.is_empty() {
@@ -2408,8 +2419,11 @@ impl Asking<'_, '_> {
                     self.notes.push("the summary cites no row".into());
                 }
                 self.emit("summary", &s);
-                if has_claims && let Some(m) = s.as_object_mut() {
-                    m.remove("claims");
+                if let Some(m) = s.as_object_mut() {
+                    if has_claims {
+                        m.remove("claims");
+                    }
+                    m.remove("resolution");
                 }
                 Some(s)
             }

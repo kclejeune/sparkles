@@ -1692,7 +1692,9 @@ through that context.
 The summary's JSON keeps its numeric `citations` for rows and gains `claimCitations`, a
 list of occurrence identifiers such as `"c1"`. The `summary` event and the final JSON
 carry the `claims` member that recall's JSON format defines, with its version, policy
-and occurrences. No earlier event carries claim content.
+and occurrences, and carry `resolution` when a matching policy is set. When no summary
+runs on an answered policy-bearing ask, a terminal `policy` event publishes the checked
+`claims` and `resolution` members before `usage`. No earlier event carries claim content.
 
 Before it emits the summary, Ask reads the claims section again with the same selector
 and the caller's current grants, protections and source holds, and compares it, with

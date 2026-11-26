@@ -253,7 +253,11 @@ fn run_cli_with(
     if args.json || args.events {
         writeln!(stdout, "{out}")?;
     } else {
-        write_human(&out, stdout, stderr)?;
+        let prefixes = server
+            .dataset(&Principal::local(), Some(&args.dataset))
+            .map(|ds| crate::mcp::tools::dataset_prefixes(&ds))
+            .unwrap_or_default();
+        write_human(&out, &prefixes, stdout, stderr)?;
     }
     Ok(out["outcome"] != "error")
 }
@@ -330,16 +334,38 @@ fn options(
     args: &AskArgs,
     settings: &crate::assistant::AssistantSettings,
     models: &crate::models::Models,
-    pairs: Vec<(Role, Pair)>,
+    mut pairs: Vec<(Role, Pair)>,
     question: String,
 ) -> AskOptions {
-    let lists = crate::assistant::lists(models, settings);
+    let mut lists = crate::assistant::lists(models, settings);
     let report_context = crate::assistant::rows_allowed(
         settings,
         &lists,
         &pairs,
         &[crate::models::Role::Draft, crate::models::Role::Repair],
     );
+    let policy_bearing = args.review_policy.is_some() || args.matching_policy.is_some();
+    let mut forced_summary_blocked = false;
+    if policy_bearing {
+        // C25: every provider that receives claim grounding (and rows under a
+        // policy-bearing ask) must be allowed to receive rows under the dataset's
+        // sharing policy, including when `--pair summarize=...` forces the provider.
+        pairs.retain(|(role, pair)| {
+            if *role == Role::Summarize
+                && settings.send_to(&pair.provider) < crate::assistant::Send::Rows
+            {
+                forced_summary_blocked = true;
+                false
+            } else {
+                true
+            }
+        });
+        if forced_summary_blocked {
+            lists.insert(Role::Summarize, Vec::new());
+        }
+    }
+    let summary_allowed = !policy_bearing
+        || (settings.send >= crate::assistant::Send::Rows && !forced_summary_blocked);
     let routing = settings.routing.clone().unwrap_or_default();
     let model_routing = models.config.routing.clone().unwrap_or_default();
     let mut o = AskOptions {
@@ -348,8 +374,9 @@ fn options(
         pairs,
         clarification: None,
         run: !args.no_run,
-        summary: !args.no_summary,
+        summary: !args.no_summary && summary_allowed,
         max_rows: args.max_rows,
+        rows_for_summary: settings.rows_for_summary(),
         deadline: Duration::from_secs_f64(args.deadline),
         max_tokens: args.max_tokens,
         lists: Some(lists),
@@ -565,8 +592,100 @@ fn batch(
     }
 }
 
+/// Split the inside of a rendered `<<( s p o )>>` triple term into its space-separated
+/// terms, respecting quoted literals and nested triple terms.
+fn split_triple_terms(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        let mut depth = 0usize;
+        let mut in_quotes = false;
+        let mut escaped = false;
+        while i < bytes.len() {
+            if in_quotes {
+                if escaped {
+                    escaped = false;
+                } else if bytes[i] == b'\\' {
+                    escaped = true;
+                } else if bytes[i] == b'"' {
+                    in_quotes = false;
+                }
+                i += 1;
+            } else if bytes[i] == b'"' {
+                in_quotes = true;
+                i += 1;
+            } else if bytes.get(i..i + 3) == Some(b"<<(") {
+                depth += 1;
+                i += 3;
+            } else if depth > 0 && bytes.get(i..i + 3) == Some(b")>>") {
+                depth -= 1;
+                i += 3;
+            } else if depth == 0 && bytes[i].is_ascii_whitespace() {
+                break;
+            } else {
+                i += 1;
+            }
+        }
+        parts.push(&s[start..i]);
+    }
+    parts
+}
+
+/// Record any dataset prefix used by a rendered RDF term (`prefix:local`, typed literal
+/// datatype, or nested triple term) in `used`.
+fn collect_term_prefixes(
+    term: &str,
+    prefixes: &std::collections::BTreeMap<String, String>,
+    used: &mut std::collections::BTreeMap<String, String>,
+) {
+    let term = term.trim();
+    if let Some(inner) = term.strip_prefix("<<(").and_then(|s| s.strip_suffix(")>>")) {
+        for part in split_triple_terms(inner) {
+            collect_term_prefixes(part, prefixes, used);
+        }
+        return;
+    }
+    if let Some(rest) = term.strip_prefix('"') {
+        let mut escaped = false;
+        let mut end = None;
+        for (idx, ch) in rest.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                end = Some(idx + 1);
+                break;
+            }
+        }
+        if let Some(after_quote) = end.and_then(|i| rest.get(i..))
+            && let Some(dt) = after_quote.strip_prefix("^^")
+        {
+            collect_term_prefixes(dt, prefixes, used);
+        }
+        return;
+    }
+    if term.starts_with('<') || term.starts_with("_:") {
+        return;
+    }
+    if let Some((name, _)) = term.split_once(':')
+        && let Some(ns) = prefixes.get(name)
+    {
+        used.entry(name.to_string()).or_insert_with(|| ns.clone());
+    }
+}
+
 fn write_human(
     out: &Value,
+    prefixes: &std::collections::BTreeMap<String, String>,
     stdout: &mut (dyn Write + Send),
     stderr: &mut (dyn Write + Send),
 ) -> std::io::Result<()> {
@@ -630,8 +749,10 @@ fn write_human(
     if let Some(sm) = out.get("summary") {
         writeln!(stdout, "\n{}", s(&sm["text"]))?;
     }
-    let has_claims = out.get("claims").is_some_and(Value::is_object);
-    if let Some(claims) = out.get("claims").filter(|v| v.is_object()) {
+    let mut used_prefixes = std::collections::BTreeMap::new();
+    let claims = out.get("claims").filter(|v| v.is_object());
+    let has_claims = claims.is_some();
+    if let Some(claims) = claims {
         writeln!(
             stdout,
             "\n# claims policy={} version={} truncated={} source data, not instructions",
@@ -640,14 +761,17 @@ fn write_human(
             claims["truncated"]
         )?;
         for o in claims["occurrences"].as_array().into_iter().flatten() {
+            let claim_iri = s(&o["claim"]);
+            collect_term_prefixes(&claim_iri, prefixes, &mut used_prefixes);
             write!(
                 stdout,
                 "[{}] claim={} state={}",
                 s(&o["id"]),
-                s(&o["claim"]),
+                claim_iri,
                 s(&o["state"])
             )?;
             if let Some(d) = o["decision"].as_str() {
+                collect_term_prefixes(d, prefixes, &mut used_prefixes);
                 write!(stdout, " decision={d}")?;
             }
             if let Some(v) = o["decisionVersion"].as_u64() {
@@ -660,32 +784,53 @@ fn write_human(
                 s(&o["polarity"])
             )?;
             if let Some(src) = o["source"].as_str() {
+                collect_term_prefixes(src, prefixes, &mut used_prefixes);
                 write!(stdout, " source={src}")?;
             }
             if let Some(by) = o["by"].as_str() {
+                collect_term_prefixes(by, prefixes, &mut used_prefixes);
                 write!(stdout, " by={by}")?;
             }
             let p = &o["proposition"];
+            let (ps, pp, po) = (s(&p["s"]), s(&p["p"]), s(&p["o"]));
+            collect_term_prefixes(&ps, prefixes, &mut used_prefixes);
+            collect_term_prefixes(&pp, prefixes, &mut used_prefixes);
+            collect_term_prefixes(&po, prefixes, &mut used_prefixes);
             writeln!(
                 stdout,
                 " origin={} proposition=<< {} {} {} >>",
                 s(&o["origin"]),
-                s(&p["s"]),
-                s(&p["p"]),
-                s(&p["o"])
+                ps,
+                pp,
+                po
             )?;
         }
     }
     if let Some(res) = out.get("resolution").filter(|v| v.is_object()) {
         let prefix = if has_claims { "" } else { "\n" };
+        let revision = res["revision"].as_str().unwrap_or("none");
+        if res["revision"].is_string() {
+            collect_term_prefixes(revision, prefixes, &mut used_prefixes);
+        }
         writeln!(
             stdout,
             "{prefix}# resolution policy={} version={} revision={} number={}",
             s(&res["policy"]),
             res["version"],
-            res["revision"].as_str().unwrap_or("none"),
+            revision,
             res["number"]
         )?;
+    }
+    if !used_prefixes.is_empty() {
+        let mut line = String::from("# prefixes");
+        for (name, ns) in &used_prefixes {
+            line.push(' ');
+            line.push_str(name);
+            line.push_str(": <");
+            crate::mcp::render::escape_into(&mut line, ns);
+            line.push('>');
+        }
+        writeln!(stdout, "{line}")?;
     }
     for n in out["notes"].as_array().into_iter().flatten() {
         writeln!(stdout, "note: {}", s(n))?;
@@ -1368,8 +1513,24 @@ mod tests {
         assert_eq!(occs.len(), 2, "{j_both}");
         assert_eq!(j_both["summary"]["claimCitations"], json!(["c1", "c2"]));
 
-        // 4. Parity with POST /{ds}/ask on the same persistent store
-        let http_both: Value = {
+        // 4. Parity with POST /{ds}/ask (JSON and SSE) on the same persistent store
+        let (http_both, http_sse_match, http_sse_match_nosum) = {
+            let parse_sse = |text: &str| -> Vec<(String, Value)> {
+                text.split("\n\n")
+                    .filter_map(|block| {
+                        let mut name = None;
+                        let mut data = String::new();
+                        for line in block.lines() {
+                            if let Some(e) = line.strip_prefix("event:") {
+                                name = Some(e.trim().to_string());
+                            } else if let Some(d) = line.strip_prefix("data:") {
+                                data.push_str(d.trim_start());
+                            }
+                        }
+                        Some((name?, serde_json::from_str(&data).unwrap_or(Value::Null)))
+                    })
+                    .collect()
+            };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -1425,7 +1586,55 @@ mod tests {
                 let body = axum::body::to_bytes(res.into_body(), usize::MAX)
                     .await
                     .unwrap();
-                serde_json::from_slice(&body).unwrap()
+                let both_json: Value = serde_json::from_slice(&body).unwrap();
+
+                let sse_res = router
+                    .clone()
+                    .oneshot(
+                        Request::post("/org/ask")
+                            .header("content-type", "application/json")
+                            .header("accept", "text/event-stream")
+                            .body(Body::from(
+                                json!({
+                                    "question": question,
+                                    "matchingPolicy": "people"
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(sse_res.status(), StatusCode::OK);
+                let sse_body = axum::body::to_bytes(sse_res.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let sse_match = parse_sse(&String::from_utf8_lossy(&sse_body));
+
+                let sse_nosum_res = router
+                    .clone()
+                    .oneshot(
+                        Request::post("/org/ask")
+                            .header("content-type", "application/json")
+                            .header("accept", "text/event-stream")
+                            .body(Body::from(
+                                json!({
+                                    "question": question,
+                                    "matchingPolicy": "people",
+                                    "summary": false
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(sse_nosum_res.status(), StatusCode::OK);
+                let sse_nosum_body = axum::body::to_bytes(sse_nosum_res.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let sse_match_nosum = parse_sse(&String::from_utf8_lossy(&sse_nosum_body));
+                (both_json, sse_match, sse_match_nosum)
             })
         };
 
@@ -1443,8 +1652,24 @@ mod tests {
             http_both["summary"]["claimCitations"]
         );
         assert_eq!(j_both["result"]["query"], http_both["result"]["query"]);
+        let sse_sum = &http_sse_match
+            .iter()
+            .find(|(n, _)| n == "summary")
+            .unwrap()
+            .1;
+        assert_eq!(sse_sum["resolution"], j_match["resolution"], "{sse_sum}");
+        assert!(sse_sum.get("claims").is_none(), "{sse_sum}");
+        assert!(sse_sum.get("claimCitations").is_none(), "{sse_sum}");
+        assert!(http_sse_match_nosum.iter().all(|(n, _)| n != "summary"));
+        let sse_pol = &http_sse_match_nosum
+            .iter()
+            .find(|(n, _)| n == "policy")
+            .unwrap()
+            .1;
+        assert_eq!(sse_pol["resolution"], j_match["resolution"], "{sse_pol}");
+        assert!(sse_pol.get("claims").is_none(), "{sse_pol}");
 
-        // 5. Human output with both policies shows claims and resolution sections
+        // 5. Human output with both policies shows claims, resolution, and # prefixes
         let (ok, human, err) =
             run_args(&["--review-policy", "main", "--matching-policy", "people"]);
         assert!(ok && err.is_empty(), "{human}\n{err}");
@@ -1464,12 +1689,17 @@ mod tests {
             "{human}"
         );
         assert!(human.contains(" number=1\n"), "{human}");
+        assert!(
+            human.contains("# prefixes ex: <http://example.org/ontology#> res: <http://example.org/resource/>\n"),
+            "{human}"
+        );
 
-        // 6. Human output without policies stays unchanged (no claims/resolution headers)
+        // 6. Human output without policies stays unchanged (no claims/resolution/prefixes headers)
         let (ok, plain_human, err) = run_args(&[]);
         assert!(ok && err.is_empty(), "{plain_human}\n{err}");
         assert!(!plain_human.contains("# claims"), "{plain_human}");
         assert!(!plain_human.contains("# resolution"), "{plain_human}");
+        assert!(!plain_human.contains("# prefixes"), "{plain_human}");
 
         // 7. --no-summary still carries claims and resolution
         let (ok, out, err) = run_args(&[
@@ -1486,7 +1716,8 @@ mod tests {
         assert_eq!(j_nosum["claims"], j_both["claims"]);
         assert_eq!(j_nosum["resolution"], j_both["resolution"]);
 
-        // 8. --events streams claimCitations and claims on the summary event only
+        // 8. --events streams claimCitations and claims on the summary event only, and
+        //    --matching-policy --events carries resolution on summary (or policy when --no-summary)
         let (ok, ev_out, err) = run_args(&["--review-policy", "main", "--events"]);
         assert!(ok && err.is_empty(), "{ev_out}\n{err}");
         let lines: Vec<Value> = ev_out
@@ -1502,6 +1733,43 @@ mod tests {
             }
         }
         assert_eq!(lines.last().unwrap()["claims"]["policy"]["name"], "main");
+
+        let (ok, ev_match_out, err) = run_args(&["--matching-policy", "people", "--events"]);
+        assert!(ok && err.is_empty(), "{ev_match_out}\n{err}");
+        let match_lines: Vec<Value> = ev_match_out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let match_sum = match_lines
+            .iter()
+            .find(|v| v["event"] == "summary")
+            .unwrap();
+        assert_eq!(match_sum["data"]["resolution"], j_match["resolution"]);
+        assert!(match_sum["data"].get("claims").is_none(), "{match_sum}");
+        assert!(
+            match_sum["data"].get("claimCitations").is_none(),
+            "{match_sum}"
+        );
+        assert_eq!(
+            match_lines.last().unwrap()["resolution"],
+            j_match["resolution"]
+        );
+
+        let (ok, ev_match_nosum, err) =
+            run_args(&["--matching-policy", "people", "--no-summary", "--events"]);
+        assert!(ok && err.is_empty(), "{ev_match_nosum}\n{err}");
+        let nosum_lines: Vec<Value> = ev_match_nosum
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(nosum_lines.iter().all(|v| v["event"] != "summary"));
+        let pol_ev = nosum_lines.iter().find(|v| v["event"] == "policy").unwrap();
+        assert_eq!(pol_ev["data"]["resolution"], j_match["resolution"]);
+        assert!(pol_ev["data"].get("claims").is_none(), "{pol_ev}");
+        assert_eq!(
+            nosum_lines.last().unwrap()["resolution"],
+            j_match["resolution"]
+        );
 
         // 9. --questions batch mode applies CLI policies to every line
         let qfile = dir.path().join("questions.jsonl");
@@ -1607,5 +1875,251 @@ mod tests {
             "{human}"
         );
         assert!(!human.contains("# claims"), "{human}");
+    }
+
+    #[test]
+    fn cli_claim_policies_enforce_summary_sharing_row_limit_and_claim_only_prefixes() {
+        use oxrdf::{NamedNode, Triple};
+        use sparkles::evidence::{
+            self, ClaimInput, ClaimKind, DecisionInput, Disposition, EvidenceInput, Polarity,
+            ProposeOptions, RecordKey, RecordRef, RecordVersion, ReviewOptions, Sha256Digest,
+            SourceContent, SourceRevisionInput,
+        };
+        use sparkles::task::Control;
+
+        let p_mock = claims_mock();
+        let q_mock = claims_mock();
+        let (dir, db) = setup_evidence_db(false);
+
+        // Register a claim-only dataset prefix (`evp:`) that never appears in the query
+        // or its result rows, and add an accepted claim using it.
+        {
+            let ds = sparkles::Dataset::open(&db).unwrap();
+            ds.store()
+                .load(&[Source::from_bytes(
+                    b"@prefix evp: <http://example.org/claim-only/> .\nevp:seed a evp:Unused .\n"
+                        .to_vec(),
+                    sparkles::io::RdfFormat::Turtle,
+                    None,
+                )])
+                .unwrap();
+            let iri = |s: &str| NamedNode::new(s).unwrap();
+            let key = |k: &str| RecordKey::new(k).unwrap();
+            let all = || Some(Arc::new(sparkles::access::GraphAccess::all()));
+            let mut po = ProposeOptions::new(iri("urn:principal:importer"));
+            po.proposal_graph = Some(iri("urn:ev:claims"));
+            let proposed = evidence::propose(
+                None,
+                &ds,
+                &ds,
+                &EvidenceInput {
+                    revisions: vec![SourceRevisionInput {
+                        version: RecordVersion::V1,
+                        key: key("rev-evp"),
+                        source: iri("urn:source:evp"),
+                        source_key: key("evp"),
+                        upstream_version: None,
+                        content: SourceContent::MetadataOnly {
+                            digest: Sha256Digest::of_bytes(b"evp", &Control::none()).unwrap(),
+                        },
+                        metadata: Default::default(),
+                        times: Default::default(),
+                        lineage: Default::default(),
+                    }],
+                    claims: vec![ClaimInput {
+                        version: RecordVersion::V1,
+                        key: key("claim-evp"),
+                        occurrence_key: key("ce"),
+                        revision: RecordRef::Local(key("rev-evp")),
+                        proposition: Triple::new(
+                            iri("http://example.org/resource/acme"),
+                            iri("http://example.org/claim-only/hq"),
+                            iri("http://example.org/claim-only/faro"),
+                        ),
+                        kind: ClaimKind::Reported,
+                        polarity: Polarity::Positive,
+                        attributed_author: iri("urn:registry"),
+                        scope: Default::default(),
+                        confidence: Default::default(),
+                        validity: None,
+                    }],
+                    ..Default::default()
+                },
+                &po,
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+            .unwrap();
+            let rec = proposed
+                .records
+                .iter()
+                .find(|r| r.key == "claim-evp")
+                .unwrap();
+            let mut ro = ReviewOptions::new(iri("urn:principal:reviewer"));
+            ro.if_head = Some(ds.store().head_commit().seq);
+            evidence::review(
+                None,
+                &ds,
+                &ds,
+                "main",
+                1,
+                &[DecisionInput {
+                    key: "de".into(),
+                    target: rec.iri.clone(),
+                    target_digest: rec.digest,
+                    disposition: Disposition::Accepted,
+                    supersedes: None,
+                }],
+                &ro,
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+            .unwrap();
+        }
+
+        let cfg_path = dir.path().join("two-providers.json");
+        let cfg = json!({
+            "providers": {
+                "p": {
+                    "kind": "openai",
+                    "endpoint": p_mock.url(),
+                    "requestTimeoutSecs": 5,
+                    "allowedModels": ["m"]
+                },
+                "q": {
+                    "kind": "openai",
+                    "endpoint": q_mock.url(),
+                    "requestTimeoutSecs": 5,
+                    "allowedModels": ["m"]
+                }
+            },
+            "roles": {
+                "draft": [{"provider": "p", "model": "m"}],
+                "repair": [{"provider": "p", "model": "m"}],
+                "summarize": [{"provider": "q", "model": "m"}]
+            }
+        });
+        std::fs::write(&cfg_path, cfg.to_string()).unwrap();
+
+        let db_str = db.to_str().unwrap().to_string();
+        let cfg_str = cfg_path.to_str().unwrap().to_string();
+        let run_args = |extra: &[&str]| {
+            let mut argv = vec![
+                "ask".to_string(),
+                "--loc".to_string(),
+                db_str.clone(),
+                "--model-config".to_string(),
+                cfg_str.clone(),
+                "org".to_string(),
+                "Which teams does Acme have?".to_string(),
+            ];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            invoke_cli(&argv)
+        };
+
+        // 1. Default send=schema: forced `--pair summarize=p/m` receives no summary call
+        //    and the result still returns claims.
+        let (ok, out, err) = run_args(&[
+            "--review-policy",
+            "main",
+            "--pair",
+            "summarize=p/m",
+            "--json",
+        ]);
+        assert!(ok && err.is_empty(), "{out}\n{err}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["outcome"], "answered", "{v}");
+        assert!(v.get("summary").is_none(), "{v}");
+        assert_eq!(v["claims"]["policy"]["name"], "main", "{v}");
+        assert!(p_mock.requests().iter().all(|r| !is_summary(r)));
+        assert!(q_mock.requests().is_empty());
+
+        // 2. send=rows with sendByProvider.p=schema: forced `--pair summarize=p/m` sends
+        //    no summary request to `p` and does not fall back to allowed `q`.
+        std::fs::write(
+            db.join("assistant.json"),
+            json!({
+                "enabled": true,
+                "send": "rows",
+                "sendByProvider": { "p": "schema" },
+                "rowsForSummary": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (ok, out, err) = run_args(&[
+            "--review-policy",
+            "main",
+            "--pair",
+            "summarize=p/m",
+            "--json",
+        ]);
+        assert!(ok && err.is_empty(), "{out}\n{err}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["outcome"], "answered", "{v}");
+        assert!(v.get("summary").is_none(), "{v}");
+        assert_eq!(
+            v["claims"]["occurrences"].as_array().unwrap().len(),
+            2,
+            "{v}"
+        );
+        assert!(p_mock.requests().iter().all(|r| !is_summary(r)));
+        assert!(q_mock.requests().is_empty());
+
+        // 3. Allowed provider `q` receives at most `rowsForSummary` (1) row even though
+        //    the query returns 2 rows.
+        let (ok, out, err) = run_args(&[
+            "--review-policy",
+            "main",
+            "--pair",
+            "summarize=q/m",
+            "--json",
+        ]);
+        assert!(ok && err.is_empty(), "{out}\n{err}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["outcome"], "answered", "{v}");
+        assert_eq!(v["summary"]["rowsSent"], 1, "{v}");
+        let q_sum = q_mock
+            .requests()
+            .into_iter()
+            .find(is_summary)
+            .expect("allowed provider summarizes");
+        let q_body = q_sum.body.to_string();
+        assert!(q_body.contains("first 1, numbered from 1"), "{q_body}");
+        assert!(!q_body.contains("[2] "), "{q_body}");
+
+        // 4. Human output prints `# prefixes` including the claim-only prefix `evp:`.
+        let (ok, human, err) = run_args(&["--review-policy", "main"]);
+        assert!(ok && err.is_empty(), "{human}\n{err}");
+        assert!(human.contains("evp:hq evp:faro"), "{human}");
+        assert!(
+            human.contains("# prefixes evp: <http://example.org/claim-only/> ex: <http://example.org/ontology#> res: <http://example.org/resource/>\n"),
+            "{human}"
+        );
+    }
+
+    #[test]
+    fn collect_term_prefixes_handles_iris_literals_and_triple_terms() {
+        let prefixes: std::collections::BTreeMap<String, String> = [
+            ("ex".into(), "http://example.org/ontology#".into()),
+            ("res".into(), "http://example.org/resource/".into()),
+            ("evp".into(), "http://example.org/claim-only/".into()),
+            ("xsd".into(), "http://www.w3.org/2001/XMLSchema#".into()),
+        ]
+        .into_iter()
+        .collect();
+        let mut used = std::collections::BTreeMap::new();
+        for term in [
+            "<http://example.org/full>",
+            "_:b0",
+            "\"plain text\"@en",
+            "\"2026-01-01\"^^xsd:date",
+            "<<( res:acme evp:notes \"café \\\"quoted\\\"\"^^evp:tag )>>",
+            "42",
+        ] {
+            collect_term_prefixes(term, &prefixes, &mut used);
+        }
+        let keys: Vec<&str> = used.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["evp", "res", "xsd"]);
     }
 }
