@@ -655,7 +655,7 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
  * `syntax = "functional"`, the engine (`auto`, `el` or `rl`), the answers wanted (every one
  * when empty) and the most IRIs each answer lists.
  */
-public class DlQuery public constructor(
+public data class DlQuery @JvmOverloads public constructor(
     public val expression: String,
     public val syntax: String = "manchester",
     public val reasoning: String = "auto",
@@ -663,30 +663,39 @@ public class DlQuery public constructor(
     public val limit: Int = 1000,
     public val threads: Int = 0,
     /** classify by the OWL 2 EL rules alone, as ELK does */
-    public val elOnly: Boolean,
+    public val elOnly: Boolean = false,
 ) {
-    @JvmOverloads
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
     public constructor(
         expression: String,
-        syntax: String = "manchester",
-        reasoning: String = "auto",
-        answers: List<String> = emptyList(),
-        limit: Int = 1000,
-        threads: Int = 0,
-    ) : this(expression, syntax, reasoning, answers, limit, threads, false)
+        syntax: String?,
+        reasoning: String?,
+        answers: List<String>?,
+        limit: Int,
+        threads: Int,
+        mask: Int,
+        @Suppress("UNUSED_PARAMETER") marker: kotlin.jvm.internal.DefaultConstructorMarker?,
+    ) : this(
+        expression = expression,
+        syntax = if (mask and 0x2 != 0) "manchester" else syntax!!,
+        reasoning = if (mask and 0x4 != 0) "auto" else reasoning!!,
+        answers = if (mask and 0x8 != 0) emptyList() else answers!!,
+        limit = if (mask and 0x10 != 0) 1000 else limit,
+        threads = if (mask and 0x20 != 0) 0 else threads,
+        elOnly = false,
+    )
 
     init {
         require(limit > 0 && threads >= 0)
     }
 
-    public operator fun component1(): String = expression
-    public operator fun component2(): String = syntax
-    public operator fun component3(): String = reasoning
-    public operator fun component4(): List<String> = answers
-    public operator fun component5(): Int = limit
-    public operator fun component6(): Int = threads
-    public operator fun component7(): Boolean = elOnly
-
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
     public fun copy(
         expression: String = this.expression,
         syntax: String = this.syntax,
@@ -694,43 +703,7 @@ public class DlQuery public constructor(
         answers: List<String> = this.answers,
         limit: Int = this.limit,
         threads: Int = this.threads,
-    ): DlQuery = DlQuery(expression, syntax, reasoning, answers, limit, threads, elOnly)
-
-    public fun copy(
-        expression: String = this.expression,
-        syntax: String = this.syntax,
-        reasoning: String = this.reasoning,
-        answers: List<String> = this.answers,
-        limit: Int = this.limit,
-        threads: Int = this.threads,
-        elOnly: Boolean,
-    ): DlQuery = DlQuery(expression, syntax, reasoning, answers, limit, threads, elOnly)
-
-    override public fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is DlQuery) return false
-        return expression == other.expression &&
-            syntax == other.syntax &&
-            reasoning == other.reasoning &&
-            answers == other.answers &&
-            limit == other.limit &&
-            threads == other.threads &&
-            elOnly == other.elOnly
-    }
-
-    override public fun hashCode(): Int {
-        var result = expression.hashCode()
-        result = 31 * result + syntax.hashCode()
-        result = 31 * result + reasoning.hashCode()
-        result = 31 * result + answers.hashCode()
-        result = 31 * result + limit
-        result = 31 * result + threads
-        result = 31 * result + elOnly.hashCode()
-        return result
-    }
-
-    override public fun toString(): String =
-        "DlQuery(expression=$expression, syntax=$syntax, reasoning=$reasoning, answers=$answers, limit=$limit, threads=$threads, elOnly=$elOnly)"
+    ): DlQuery = copy(expression, syntax, reasoning, answers, limit, threads, this.elOnly)
 
     internal fun into(j: JsonObject) {
         j.put("expression", expression)
@@ -744,7 +717,7 @@ public class DlQuery public constructor(
 }
 
 /** What a classification answers besides its counts, and where it writes the taxonomy. */
-public class ClassifyQuery public constructor(
+public data class ClassifyQuery @JvmOverloads public constructor(
     public val assertions: Boolean = false,
     public val about: String? = null,
     public val nodes: Boolean = false,
@@ -768,38 +741,43 @@ public class ClassifyQuery public constructor(
      */
     public val strict: Boolean = false,
     /** classify by the OWL 2 EL rules alone, as ELK does */
-    public val elOnly: Boolean,
+    public val elOnly: Boolean = false,
 ) {
-    @JvmOverloads
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
     public constructor(
-        assertions: Boolean = false,
-        about: String? = null,
-        nodes: Boolean = false,
-        limit: Int = 100,
-        offset: Long = 0,
-        threads: Int = 0,
-        target: String? = null,
-        message: String? = null,
-        partial: Boolean = false,
-        expansion: String? = null,
-        projection: String? = null,
-        languages: List<String> = emptyList(),
-        strict: Boolean = false,
+        assertions: Boolean,
+        about: String?,
+        nodes: Boolean,
+        limit: Int,
+        offset: Long,
+        threads: Int,
+        target: String?,
+        message: String?,
+        partial: Boolean,
+        expansion: String?,
+        projection: String?,
+        languages: List<String>?,
+        strict: Boolean,
+        mask: Int,
+        @Suppress("UNUSED_PARAMETER") marker: kotlin.jvm.internal.DefaultConstructorMarker?,
     ) : this(
-        assertions,
-        about,
-        nodes,
-        limit,
-        offset,
-        threads,
-        target,
-        message,
-        partial,
-        expansion,
-        projection,
-        languages,
-        strict,
-        false,
+        assertions = if (mask and 0x0001 != 0) false else assertions,
+        about = if (mask and 0x0002 != 0) null else about,
+        nodes = if (mask and 0x0004 != 0) false else nodes,
+        limit = if (mask and 0x0008 != 0) 100 else limit,
+        offset = if (mask and 0x0010 != 0) 0 else offset,
+        threads = if (mask and 0x0020 != 0) 0 else threads,
+        target = if (mask and 0x0040 != 0) null else target,
+        message = if (mask and 0x0080 != 0) null else message,
+        partial = if (mask and 0x0100 != 0) false else partial,
+        expansion = if (mask and 0x0200 != 0) null else expansion,
+        projection = if (mask and 0x0400 != 0) null else projection,
+        languages = if (mask and 0x0800 != 0) emptyList() else languages!!,
+        strict = if (mask and 0x1000 != 0) false else strict,
+        elOnly = false,
     )
 
     init {
@@ -807,21 +785,10 @@ public class ClassifyQuery public constructor(
         require(expansion == null || expansion == "cautious" || expansion == "eager")
     }
 
-    public operator fun component1(): Boolean = assertions
-    public operator fun component2(): String? = about
-    public operator fun component3(): Boolean = nodes
-    public operator fun component4(): Int = limit
-    public operator fun component5(): Long = offset
-    public operator fun component6(): Int = threads
-    public operator fun component7(): String? = target
-    public operator fun component8(): String? = message
-    public operator fun component9(): Boolean = partial
-    public operator fun component10(): String? = expansion
-    public operator fun component11(): String? = projection
-    public operator fun component12(): List<String> = languages
-    public operator fun component13(): Boolean = strict
-    public operator fun component14(): Boolean = elOnly
-
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
     public fun copy(
         assertions: Boolean = this.assertions,
         about: String? = this.about,
@@ -836,7 +803,7 @@ public class ClassifyQuery public constructor(
         projection: String? = this.projection,
         languages: List<String> = this.languages,
         strict: Boolean = this.strict,
-    ): ClassifyQuery = ClassifyQuery(
+    ): ClassifyQuery = copy(
         assertions,
         about,
         nodes,
@@ -850,80 +817,8 @@ public class ClassifyQuery public constructor(
         projection,
         languages,
         strict,
-        elOnly,
+        this.elOnly,
     )
-
-    public fun copy(
-        assertions: Boolean = this.assertions,
-        about: String? = this.about,
-        nodes: Boolean = this.nodes,
-        limit: Int = this.limit,
-        offset: Long = this.offset,
-        threads: Int = this.threads,
-        target: String? = this.target,
-        message: String? = this.message,
-        partial: Boolean = this.partial,
-        expansion: String? = this.expansion,
-        projection: String? = this.projection,
-        languages: List<String> = this.languages,
-        strict: Boolean = this.strict,
-        elOnly: Boolean,
-    ): ClassifyQuery = ClassifyQuery(
-        assertions,
-        about,
-        nodes,
-        limit,
-        offset,
-        threads,
-        target,
-        message,
-        partial,
-        expansion,
-        projection,
-        languages,
-        strict,
-        elOnly,
-    )
-
-    override public fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is ClassifyQuery) return false
-        return assertions == other.assertions &&
-            about == other.about &&
-            nodes == other.nodes &&
-            limit == other.limit &&
-            offset == other.offset &&
-            threads == other.threads &&
-            target == other.target &&
-            message == other.message &&
-            partial == other.partial &&
-            expansion == other.expansion &&
-            projection == other.projection &&
-            languages == other.languages &&
-            strict == other.strict &&
-            elOnly == other.elOnly
-    }
-
-    override public fun hashCode(): Int {
-        var result = assertions.hashCode()
-        result = 31 * result + (about?.hashCode() ?: 0)
-        result = 31 * result + nodes.hashCode()
-        result = 31 * result + limit
-        result = 31 * result + offset.hashCode()
-        result = 31 * result + threads
-        result = 31 * result + (target?.hashCode() ?: 0)
-        result = 31 * result + (message?.hashCode() ?: 0)
-        result = 31 * result + partial.hashCode()
-        result = 31 * result + (expansion?.hashCode() ?: 0)
-        result = 31 * result + (projection?.hashCode() ?: 0)
-        result = 31 * result + languages.hashCode()
-        result = 31 * result + strict.hashCode()
-        result = 31 * result + elOnly.hashCode()
-        return result
-    }
-
-    override public fun toString(): String =
-        "ClassifyQuery(assertions=$assertions, about=$about, nodes=$nodes, limit=$limit, offset=$offset, threads=$threads, target=$target, message=$message, partial=$partial, expansion=$expansion, projection=$projection, languages=$languages, strict=$strict, elOnly=$elOnly)"
 
     internal fun into(j: JsonObject) {
         j.put("assertions", assertions)
@@ -944,7 +839,7 @@ public class ClassifyQuery public constructor(
 }
 
 /** A bounded read from one kept classification. Nonzero offsets require an exact pin. */
-public class KeptClassificationQuery public constructor(
+public data class KeptClassificationQuery @JvmOverloads public constructor(
     public val part: String = "status",
     public val about: String? = null,
     public val offset: Long = 0,
@@ -952,26 +847,35 @@ public class KeptClassificationQuery public constructor(
     public val resultId: String? = null,
     public val languages: List<String> = emptyList(),
     /** read the kept EL-only classification instead of the default classification */
-    public val elOnly: Boolean,
+    public val elOnly: Boolean = false,
 ) {
-    @JvmOverloads
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
     public constructor(
-        part: String = "status",
-        about: String? = null,
-        offset: Long = 0,
-        limit: Int = 100,
-        resultId: String? = null,
-        languages: List<String> = emptyList(),
-    ) : this(part, about, offset, limit, resultId, languages, false)
+        part: String?,
+        about: String?,
+        offset: Long,
+        limit: Int,
+        resultId: String?,
+        languages: List<String>?,
+        mask: Int,
+        @Suppress("UNUSED_PARAMETER") marker: kotlin.jvm.internal.DefaultConstructorMarker?,
+    ) : this(
+        part = if (mask and 0x01 != 0) "status" else part!!,
+        about = if (mask and 0x02 != 0) null else about,
+        offset = if (mask and 0x04 != 0) 0 else offset,
+        limit = if (mask and 0x08 != 0) 100 else limit,
+        resultId = if (mask and 0x10 != 0) null else resultId,
+        languages = if (mask and 0x20 != 0) emptyList() else languages!!,
+        elOnly = false,
+    )
 
-    public operator fun component1(): String = part
-    public operator fun component2(): String? = about
-    public operator fun component3(): Long = offset
-    public operator fun component4(): Int = limit
-    public operator fun component5(): String? = resultId
-    public operator fun component6(): List<String> = languages
-    public operator fun component7(): Boolean = elOnly
-
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
     public fun copy(
         part: String = this.part,
         about: String? = this.about,
@@ -979,43 +883,7 @@ public class KeptClassificationQuery public constructor(
         limit: Int = this.limit,
         resultId: String? = this.resultId,
         languages: List<String> = this.languages,
-    ): KeptClassificationQuery = KeptClassificationQuery(part, about, offset, limit, resultId, languages, elOnly)
-
-    public fun copy(
-        part: String = this.part,
-        about: String? = this.about,
-        offset: Long = this.offset,
-        limit: Int = this.limit,
-        resultId: String? = this.resultId,
-        languages: List<String> = this.languages,
-        elOnly: Boolean,
-    ): KeptClassificationQuery = KeptClassificationQuery(part, about, offset, limit, resultId, languages, elOnly)
-
-    override public fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is KeptClassificationQuery) return false
-        return part == other.part &&
-            about == other.about &&
-            offset == other.offset &&
-            limit == other.limit &&
-            resultId == other.resultId &&
-            languages == other.languages &&
-            elOnly == other.elOnly
-    }
-
-    override public fun hashCode(): Int {
-        var result = part.hashCode()
-        result = 31 * result + (about?.hashCode() ?: 0)
-        result = 31 * result + offset.hashCode()
-        result = 31 * result + limit
-        result = 31 * result + (resultId?.hashCode() ?: 0)
-        result = 31 * result + languages.hashCode()
-        result = 31 * result + elOnly.hashCode()
-        return result
-    }
-
-    override public fun toString(): String =
-        "KeptClassificationQuery(part=$part, about=$about, offset=$offset, limit=$limit, resultId=$resultId, languages=$languages, elOnly=$elOnly)"
+    ): KeptClassificationQuery = copy(part, about, offset, limit, resultId, languages, this.elOnly)
 
     internal fun into(j: JsonObject) {
         require(limit in 1..1000 && offset >= 0)

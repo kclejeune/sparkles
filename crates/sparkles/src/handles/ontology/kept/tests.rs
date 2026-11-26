@@ -382,8 +382,14 @@ fn retention_counts_auxiliary_bytes_once_and_taxonomy_eviction_releases_owners()
         let tail = entry_aux_bytes(e) + p.classification.stats.taxonomy_memory + p.auxiliary_bytes;
         assert!(retain_dl(e, CACHE_MAX_BYTES - tail));
         assert!(e.result.is_some());
+        assert_eq!(e.retained_bytes, CACHE_MAX_BYTES);
         assert!(retain_dl(e, CACHE_MAX_BYTES - tail + 1));
         assert!(e.result.is_none());
+        assert_eq!(
+            e.retained_bytes,
+            dl_retained_bytes(e, CACHE_MAX_BYTES - tail + 1)
+        );
+        assert!(e.retained_bytes < CACHE_MAX_BYTES);
         Ok(((), true))
     })
     .unwrap();
@@ -1839,10 +1845,10 @@ fn el_only_and_full_classifications_are_keyed_separately_and_never_clobber() {
     })
     .unwrap();
 
-    // DL refill under combined cap: retain_dl updates retained_bytes and KeptFlight::finish evicts
-    // the opposite slot's saturation owner and publication.
+    // DL refill under combined cap: start from an empty EL-only slot (retained_bytes == 0) while
+    // the default slot is warm, then run an EL-only DL query under a cap that only overflows once
+    // retain_dl updates the EL-only slot's retained_bytes.
     let _full_dl = ds.ontology().classify(&req(), &full_req, &opts()).unwrap();
-    let _el_dl = ds.ontology().classify(&req(), &el_req, &opts()).unwrap();
     let full_bytes2 = ds
         .state()
         .classify_cache
@@ -1852,24 +1858,45 @@ fn el_only_and_full_classifications_are_keyed_separately_and_never_clobber() {
         .as_ref()
         .unwrap()
         .retained_bytes;
-    let el_bytes2 = ds
+    let mut dl_q = super::super::dl_query::DlQueryRequest::new(
+        sparkles_owl::ClassExpression::Class(sparkles_owl::Class::new("http://ex.org/A")),
+    );
+    dl_q.el_only = true;
+    dl_q.answers.instances = false;
+    {
+        let mut cache = ds.state().classify_cache.lock();
+        let el_slot = cache.slot_mut(true);
+        el_slot.entry = None;
+        el_slot.publication = None;
+    }
+    let _probe = ds.ontology().dl_query(&req(), &dl_q, &opts()).unwrap();
+    let el_dl_bytes = ds
         .state()
         .classify_cache
         .lock()
         .slot(true)
         .entry
         .as_ref()
-        .unwrap()
+        .expect("EL-only DL query must retain its slot")
         .retained_bytes;
-    let dl_cap = full_bytes2.max(el_bytes2) + full_bytes2.min(el_bytes2) / 2;
+    assert!(
+        el_dl_bytes > 0,
+        "retain_dl must record a nonzero byte charge"
+    );
+    {
+        let mut cache = ds.state().classify_cache.lock();
+        let el_slot = cache.slot_mut(true);
+        el_slot.entry = None;
+        el_slot.publication = None;
+    }
+    let dl_cap = full_bytes2.max(el_dl_bytes) + full_bytes2.min(el_dl_bytes) / 2;
+    assert!(
+        full_bytes2 <= dl_cap && full_bytes2 + el_dl_bytes > dl_cap,
+        "cap must admit the warm default slot alone ({full_bytes2} <= {dl_cap}) and overflow once retain_dl charges {el_dl_bytes}"
+    );
     {
         let _restore = CapRestore(TEST_RETENTION_CAP.with(|c| c.replace(dl_cap)));
-        let mut q = super::super::dl_query::DlQueryRequest::new(
-            sparkles_owl::ClassExpression::Class(sparkles_owl::Class::new("http://ex.org/A")),
-        );
-        q.el_only = true;
-        q.answers.instances = false;
-        let answer = ds.ontology().dl_query(&req(), &q, &opts()).unwrap();
+        let answer = ds.ontology().dl_query(&req(), &dl_q, &opts()).unwrap();
         assert!(answer.incremental);
         assert!(answer.reasoning.el_only);
         let cache = ds.state().classify_cache.lock();
@@ -1886,6 +1913,10 @@ fn el_only_and_full_classifications_are_keyed_separately_and_never_clobber() {
             .entry
             .as_ref()
             .expect("EL-only slot must stay retained after DL refill");
+        assert_eq!(
+            surviving.retained_bytes, el_dl_bytes,
+            "retain_dl must record the exact updated byte charge"
+        );
         assert!(
             surviving.retained_bytes <= dl_cap,
             "surviving EL-only slot must stay within cap after retain_dl: {} <= {dl_cap}",

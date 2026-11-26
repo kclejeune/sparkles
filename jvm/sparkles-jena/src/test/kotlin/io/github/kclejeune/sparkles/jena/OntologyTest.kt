@@ -932,5 +932,63 @@ class OntologyTest {
                 Any::class.java,
             ),
         )
+
+        // Pre-694 Java constructor overloads remain public and non-synthetic.
+        assertFalse(DlQuery::class.java.getDeclaredConstructor(String::class.java).isSynthetic)
+        assertFalse(
+            DlQuery::class.java.getDeclaredConstructor(
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+            ).isSynthetic,
+        )
+        assertFalse(ClassifyQuery::class.java.getDeclaredConstructor().isSynthetic)
+        assertFalse(KeptClassificationQuery::class.java.getDeclaredConstructor().isSynthetic)
+    }
+
+    /**
+     * Regression guard for round-2 P2: untyped and adapted Kotlin callable references to
+     * constructors and `copy` resolve unambiguously with no overload conflict.
+     */
+    @Test fun query_classes_preserve_unambiguous_kotlin_callable_references() {
+        val makeDl = ::DlQuery
+        val copyDl = DlQuery("http://ex.org/A")::copy
+        val makeDl1: (String) -> DlQuery = ::DlQuery
+        val makeDl6: (String, String, String, List<String>, Int, Int) -> DlQuery = ::DlQuery
+        val makeDl7: (String, String, String, List<String>, Int, Int, Boolean) -> DlQuery = ::DlQuery
+        val copyDl1: (String) -> DlQuery = DlQuery("http://ex.org/A", elOnly = true)::copy
+        val copyDl6: (String, String, String, List<String>, Int, Int) -> DlQuery =
+            DlQuery("http://ex.org/A", elOnly = true)::copy
+        val copyDl7: (String, String, String, List<String>, Int, Int, Boolean) -> DlQuery =
+            DlQuery("http://ex.org/A", elOnly = true)::copy
+        assertNotNull(makeDl)
+        assertNotNull(copyDl)
+        assertFalse(makeDl1("http://ex.org/A").elOnly)
+        assertFalse(makeDl6("http://ex.org/A", "manchester", "auto", emptyList(), 1000, 0).elOnly)
+        assertTrue(makeDl7("http://ex.org/A", "manchester", "auto", emptyList(), 1000, 0, true).elOnly)
+        assertTrue(copyDl1("http://ex.org/B").elOnly)
+        assertTrue(copyDl6("http://ex.org/B", "manchester", "auto", emptyList(), 1000, 0).elOnly)
+        assertFalse(copyDl7("http://ex.org/B", "manchester", "auto", emptyList(), 1000, 0, false).elOnly)
+
+        val makeClassify = ::ClassifyQuery
+        val copyClassify = ClassifyQuery()::copy
+        val makeClassify0: () -> ClassifyQuery = ::ClassifyQuery
+        val copyClassify0: () -> ClassifyQuery = ClassifyQuery(elOnly = true)::copy
+        assertNotNull(makeClassify)
+        assertNotNull(copyClassify)
+        assertFalse(makeClassify0().elOnly)
+        assertTrue(copyClassify0().elOnly)
+
+        val makeKept = ::KeptClassificationQuery
+        val copyKept = KeptClassificationQuery()::copy
+        val makeKept0: () -> KeptClassificationQuery = ::KeptClassificationQuery
+        val copyKept0: () -> KeptClassificationQuery = KeptClassificationQuery(elOnly = true)::copy
+        assertNotNull(makeKept)
+        assertNotNull(copyKept)
+        assertFalse(makeKept0().elOnly)
+        assertTrue(copyKept0().elOnly)
     }
 }
