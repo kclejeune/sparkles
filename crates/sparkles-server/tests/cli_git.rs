@@ -334,3 +334,89 @@ fn cli_git_supports_branch_option_and_scrubs_git_env() {
     assert_eq!(rel_json2["commits_exported"], 0);
     assert_eq!(rel_json2["commits_skipped"], 1);
 }
+
+#[test]
+fn cli_git_export_accepts_relative_out_path_initial_and_incremental() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    {
+        let ds = Dataset::open(&db).unwrap();
+        ds.set_prefix("ex", "http://example.org/").unwrap();
+        ds.load_str(
+            "PREFIX ex: <http://example.org/> ex:s1 ex:p 1 .",
+            RdfFormat::Turtle,
+        )
+        .unwrap();
+    }
+
+    // 1. Initial export with relative `--out rel-repo` (not `.`).
+    let exp1 = Command::new(BIN)
+        .current_dir(tmp.path())
+        .args([
+            "git",
+            "export",
+            "--loc",
+            db.to_str().unwrap(),
+            "--out",
+            "rel-repo",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        exp1.status.success(),
+        "relative --out initial export failed: {}",
+        String::from_utf8_lossy(&exp1.stderr)
+    );
+    let json1: serde_json::Value = serde_json::from_slice(&exp1.stdout).unwrap();
+    assert_eq!(json1["commits_exported"], 1);
+    assert_eq!(json1["mapping"]["entries"].as_array().unwrap().len(), 1);
+
+    // 2. Add another commit and continue incrementally with `./rel-repo`.
+    {
+        let ds = Dataset::open(&db).unwrap();
+        ds.load_str(
+            "PREFIX ex: <http://example.org/> ex:s2 ex:p 2 .",
+            RdfFormat::Turtle,
+        )
+        .unwrap();
+    }
+    let exp2 = Command::new(BIN)
+        .current_dir(tmp.path())
+        .args([
+            "git",
+            "export",
+            "--loc",
+            db.to_str().unwrap(),
+            "--out",
+            "./rel-repo",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        exp2.status.success(),
+        "relative --out incremental export failed: {}",
+        String::from_utf8_lossy(&exp2.stderr)
+    );
+    let json2: serde_json::Value = serde_json::from_slice(&exp2.stdout).unwrap();
+    assert_eq!(json2["commits_exported"], 1);
+    assert_eq!(json2["commits_skipped"], 1);
+    assert_eq!(json2["mapping"]["entries"].as_array().unwrap().len(), 2);
+
+    let ver = Command::new(BIN)
+        .current_dir(tmp.path())
+        .args(["git", "verify", "--dir", "rel-repo", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        ver.status.success(),
+        "relative --dir verify failed: {}",
+        String::from_utf8_lossy(&ver.stderr)
+    );
+    let ver_json: serde_json::Value = serde_json::from_slice(&ver.stdout).unwrap();
+    assert_eq!(ver_json["valid"], true);
+    assert_eq!(ver_json["quads"], 2);
+}

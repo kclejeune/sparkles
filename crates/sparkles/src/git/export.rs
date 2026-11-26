@@ -11,12 +11,12 @@ use crate::Dataset;
 use crate::branch::{CommitRef, MAIN, NamedCommitRef};
 use crate::commit::{CommitInfo, CommitKind, CommitRange, rfc3339_ms};
 use crate::git::profile::{
-    CanonicalSyntax, DEFAULT_MAX_MANIFEST_BYTES, MANIFEST_FORMAT_VERSION, MANIFEST_REL_PATH,
-    WriteOptions, check_dest_file_not_symlink, effective_parent, ensure_child_dir_no_symlink,
-    ensure_dir_no_symlink, normalize_dir_for_lstat, read_bounded_regular_file,
-    reject_duplicate_json_keys, resolve_safe_path, sanitize_slug, sha256_hex,
-    validate_relative_path, verify_existing_dir_no_symlink, write_atomic_safe,
-    write_snapshot_git_tree_tracked,
+    CanonicalSyntax, DEFAULT_MAX_MANIFEST_BYTES, GRAPHS_DIR, MANIFEST_FORMAT_VERSION,
+    MANIFEST_REL_PATH, METADATA_DIR, WriteOptions, check_dest_file_not_symlink, effective_parent,
+    ensure_child_dir_no_symlink, ensure_dir_no_symlink, normalize_dir_for_lstat,
+    open_regular_file_no_symlink, read_bounded_regular_file, reject_duplicate_json_keys,
+    resolve_safe_path, sanitize_slug, sha256_hex, validate_relative_path,
+    verify_existing_dir_no_symlink, write_atomic_safe, write_snapshot_git_tree_tracked,
 };
 use crate::git::{GitError, GitResult};
 use crate::history::{At, HistoryOptions};
@@ -24,7 +24,7 @@ use crate::store::{BranchCommit, Snapshot, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -221,8 +221,15 @@ impl CommitMapping {
 
     /// Read and validate a versioned mapping file with an explicit byte ceiling.
     pub fn read_with_max_bytes(path: &Path, max_bytes: u64) -> GitResult<Self> {
-        let label = path.display().to_string();
-        let bytes = read_bounded_regular_file(path, &label, max_bytes)?;
+        let parent = effective_parent(path)?;
+        verify_existing_dir_no_symlink(&parent, &parent.display().to_string())?;
+        let file_name = path.file_name().ok_or_else(|| GitError::UnsafePath {
+            path: path.display().to_string(),
+            reason: "mapping path must name a file".into(),
+        })?;
+        let clean_path = parent.join(file_name);
+        let label = clean_path.display().to_string();
+        let bytes = read_bounded_regular_file(&clean_path, &label, max_bytes)?;
         parse_and_validate_mapping(&bytes, &label)
     }
 
@@ -257,8 +264,9 @@ impl CommitMapping {
     }
 }
 
-/// Crash-recoverable publication intent written before moving a Git ref so a failure or
-/// interruption on either side of `git update-ref` can be cleanly reconciled on retry.
+/// Crash-recoverable publication intent written before moving a Git ref or switching the
+/// working tree checkout so a failure or interruption at any point can be cleanly
+/// reconciled on retry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingPublication {
@@ -266,8 +274,42 @@ struct PendingPublication {
     mapping_path: PathBuf,
     ref_name: String,
     old_ref_sha: Option<String>,
+    /// Commit that was checked out in HEAD / `.git/index` / worktree before this sync
+    /// started (may differ from `old_ref_sha` when switching from another branch, or be
+    /// `None` on an unborn checkout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prev_checkout_sha: Option<String>,
+    /// Symbolic `HEAD` ref before this sync started (if `HEAD` was symbolic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prev_head_ref: Option<String>,
     new_commit_sha: String,
-    mapping: CommitMapping,
+    /// Updated mapping to persist, or `None` for a journaled no-op branch switch where the
+    /// ref and mapping did not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mapping: Option<CommitMapping>,
+}
+
+fn max_pending_journal_bytes(max_mapping_bytes: u64) -> u64 {
+    max_mapping_bytes.saturating_add(64 * 1024)
+}
+
+fn serialize_pending_bounded(
+    pending: &PendingPublication,
+    max_mapping_bytes: u64,
+) -> GitResult<Vec<u8>> {
+    // Compact JSON guarantees an in-limit pretty-printed mapping never expands past the
+    // journal ceiling due to nested indentation.
+    let bytes = serde_json::to_vec(pending).map_err(|e| {
+        GitError::InvalidMapping(format!("failed to serialize pending record: {e}"))
+    })?;
+    let max_pending = max_pending_journal_bytes(max_mapping_bytes);
+    if bytes.len() as u64 > max_pending {
+        return Err(GitError::InvalidMapping(format!(
+            "pending publication journal ({} bytes) exceeds maximum journal size ({max_pending} bytes)",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Summary returned after exporting a Sparkles branch to Git.
@@ -474,6 +516,7 @@ pub fn export_branch_to_git(
     // Ensure `repo_dir` is a safe standalone non-bare Git repository root (never hijacking
     // an enclosing ancestor repo, linked worktree, bare repo, or symlink).
     let (clean_repo, git_dir) = ensure_standalone_git_repo(repo_dir, &git_branch)?;
+    let canon_repo = fs::canonicalize(&clean_repo).map_err(|e| GitError::io(&clean_repo, e))?;
 
     // Serialize concurrent exports to the same repository.
     let _repo_lock = acquire_export_lock(&git_dir)?;
@@ -482,11 +525,11 @@ pub fn export_branch_to_git(
     // pending recovery or refs.
     ensure_no_in_progress_git_op(&git_dir)?;
 
+    let ref_name = format!("refs/heads/{git_branch}");
+    let pending_path = pending_publication_path(&git_dir, &git_branch)?;
+
     let mapping_path = match &options.mapping_path {
-        Some(p) => {
-            prepare_mapping_path_safe(p)?;
-            p.clone()
-        }
+        Some(p) => prepare_mapping_path_safe(p)?,
         None => {
             let sparkles_dir = ensure_child_dir_no_symlink(&git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
             let mappings_dir = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_MAPPINGS_SUBDIR)?;
@@ -495,13 +538,14 @@ pub fn export_branch_to_git(
             mappings_dir.join(format!("{slug}-{}.json", &hash[..16]))
         }
     };
+    validate_mapping_destination_no_overlap(&mapping_path, &canon_repo, &git_dir, &pending_path)?;
 
-    let ref_name = format!("refs/heads/{git_branch}");
-    let pending_path = pending_publication_path(&git_dir, &git_branch)?;
+    // Refuse if another branch has an unreconciled interrupted publication pending.
+    ensure_no_other_pending_publications(&git_dir, &pending_path)?;
 
     // Reconcile any interrupted previous publication on this branch before checking clean
-    // repository state, so a failure on either side of `git update-ref` recovers cleanly
-    // without manual resets or duplicate commits.
+    // repository state, so a failure on either side of `git update-ref` or mid-checkout
+    // recovers cleanly without manual resets or duplicate commits.
     reconcile_pending_publication(
         &clean_repo,
         &git_dir,
@@ -607,6 +651,7 @@ pub fn export_branch_to_git(
 
                 let (new_sha, entry) = build_and_publish_commit(
                     &clean_repo,
+                    &canon_repo,
                     &git_dir,
                     &ref_name,
                     &git_branch,
@@ -666,6 +711,7 @@ pub fn export_branch_to_git(
 
                 let (_, entry) = build_and_publish_commit(
                     &clean_repo,
+                    &canon_repo,
                     &git_dir,
                     &ref_name,
                     &git_branch,
@@ -708,15 +754,44 @@ pub fn export_branch_to_git(
         .ok_or_else(|| GitError::HistoryUnavailable("no commits were exported".into()))?;
 
     // Even when up to date (0 new commits), ensure `HEAD`, `.git/index`, and the working
-    // tree are checked out to `git_branch` byte-exact without `.gitattributes` filters.
+    // tree are checked out to `git_branch` byte-exact without `.gitattributes` filters,
+    // using a crash-recoverable pending journal whenever a branch switch is needed.
     if exported_count == 0 {
         let prev_head = git_rev_parse_opt(&clean_repo, "HEAD")?;
-        sync_worktree_to_commit_no_filters(
-            &clean_repo,
-            &git_branch,
-            prev_head.as_deref(),
-            &head_git_sha,
-        )?;
+        let prev_head_ref = git_symbolic_ref_opt(&clean_repo);
+        let already_on_target = prev_head_ref.as_deref() == Some(ref_name.as_str())
+            && prev_head
+                .as_deref()
+                .is_some_and(|h| h.eq_ignore_ascii_case(&head_git_sha));
+        if !already_on_target {
+            ensure_clean_git_state(&clean_repo, &git_dir)?;
+            let pending = PendingPublication {
+                format_version: MAPPING_FORMAT_VERSION,
+                mapping_path: mapping_path.clone(),
+                ref_name: ref_name.clone(),
+                old_ref_sha: Some(head_git_sha.clone()),
+                prev_checkout_sha: prev_head.clone(),
+                prev_head_ref: prev_head_ref.clone(),
+                new_commit_sha: head_git_sha.clone(),
+                mapping: None,
+            };
+            let pending_bytes = serialize_pending_bounded(&pending, options.max_mapping_bytes)?;
+            write_atomic_safe(&pending_path, &pending_bytes)?;
+            #[cfg(test)]
+            test_hooks::during_worktree_sync(&clean_repo)?;
+            sync_worktree_to_commit_no_filters(
+                &clean_repo,
+                &git_dir,
+                &git_branch,
+                prev_head.as_deref(),
+                prev_head_ref.as_deref(),
+                &head_git_sha,
+                SyncMode::Normal,
+            )?;
+            #[cfg(test)]
+            test_hooks::before_remove_pending()?;
+            remove_pending_file(&pending_path)?;
+        }
     }
 
     let mapping = CommitMapping {
@@ -755,6 +830,7 @@ pub fn export_branch_to_git(
 #[allow(clippy::too_many_arguments)]
 fn build_and_publish_commit(
     clean_repo: &Path,
+    canon_repo: &Path,
     git_dir: &Path,
     ref_name: &str,
     git_branch: &str,
@@ -776,8 +852,9 @@ fn build_and_publish_commit(
     mapping_path: &Path,
     pending_path: &Path,
 ) -> GitResult<(String, CommitMappingEntry)> {
-    // 1. Write the canonical profile tree inside an isolated temporary staging directory so
-    //    any canonicalization, format, or size error leaves `clean_repo` untouched.
+    // 1. Write the canonical profile tree inside an isolated temporary staging directory
+    //    under canonical absolute `git_dir` so any canonicalization, format, or size error
+    //    leaves `clean_repo` untouched and `git -C` works for relative `repo_dir` paths.
     let sparkles_dir = ensure_child_dir_no_symlink(git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
     let staging_parent = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_STAGING_SUBDIR)?;
     let stage_dir = tempfile::Builder::new()
@@ -788,16 +865,28 @@ fn build_and_publish_commit(
     let (manifest, _) =
         write_snapshot_git_tree_tracked(snapshot, branch_prefixes, stage_dir.path(), write_opts)?;
 
-    // 2. Preflight the repository working tree BEFORE publishing any Git commit so an
-    //    unmanaged file in `clean_repo` is never overwritten or left colliding after ref
-    //    publication.
+    // 2. Preflight the repository working tree and verify `mapping_path` never overlaps
+    //    any published or previously tracked worktree path BEFORE publishing any Git commit.
     let mut new_paths: Vec<&str> = Vec::with_capacity(1 + manifest.graphs.len());
     new_paths.push(MANIFEST_REL_PATH);
     for entry in &manifest.graphs {
         new_paths.push(entry.path.as_str());
     }
     let prev_head_sha = git_rev_parse_opt(clean_repo, "HEAD")?;
+    let prev_head_ref = git_symbolic_ref_opt(clean_repo);
     let old_tracked = list_tracked_paths_in_commit(clean_repo, prev_head_sha.as_deref())?;
+    for rel in new_paths
+        .iter()
+        .copied()
+        .chain(old_tracked.iter().map(String::as_str))
+    {
+        if mapping_path == canon_repo.join(rel) {
+            return Err(GitError::UnsafePath {
+                path: mapping_path.display().to_string(),
+                reason: format!("mapping path must not alias repository tracked path {rel:?}"),
+            });
+        }
+    }
     preflight_worktree_collisions(clean_repo, &old_tracked, &new_paths)?;
 
     // 3. Hash every staged file directly into Git's object database without filters and
@@ -875,24 +964,24 @@ fn build_and_publish_commit(
         entries: next_entries,
     };
 
-    // 5. Serialize and size-check the updated mapping BEFORE writing the pending journal or
-    //    advancing the Git ref so an over-limit mapping never moves the ref.
+    // 5. Re-check repository clean state right before publication so any concurrent `git add`
+    //    or tracked-file edit made during canonicalization aborts cleanly without moving the
+    //    ref or clobbering local work, and size-check both the mapping and pending journal.
+    ensure_clean_git_state(clean_repo, git_dir)?;
     let next_mapping_bytes = next_mapping.serialize_bounded(max_mapping_bytes)?;
 
     // 6. Persist the crash-recoverable pending publication record BEFORE moving the ref.
-    let abs_mapping_path = resolve_absolute_mapping_path(mapping_path)?;
     let pending = PendingPublication {
         format_version: MAPPING_FORMAT_VERSION,
-        mapping_path: abs_mapping_path,
+        mapping_path: mapping_path.to_path_buf(),
         ref_name: ref_name.to_string(),
         old_ref_sha: old_ref_sha.map(str::to_string),
+        prev_checkout_sha: prev_head_sha.clone(),
+        prev_head_ref: prev_head_ref.clone(),
         new_commit_sha: new_commit_sha.clone(),
-        mapping: next_mapping,
+        mapping: Some(next_mapping),
     };
-    let mut pending_bytes = serde_json::to_vec_pretty(&pending).map_err(|e| {
-        GitError::InvalidMapping(format!("failed to serialize pending record: {e}"))
-    })?;
-    pending_bytes.push(b'\n');
+    let pending_bytes = serialize_pending_bounded(&pending, max_mapping_bytes)?;
     write_atomic_safe(pending_path, &pending_bytes)?;
 
     #[cfg(test)]
@@ -919,15 +1008,20 @@ fn build_and_publish_commit(
     write_atomic_safe(mapping_path, &next_mapping_bytes)?;
 
     // 9. Sync `HEAD`, `.git/index`, and the working tree byte-exact without `.gitattributes`
-    //    filters, then remove the pending journal.
+    //    filters under `.git/index.lock`, then remove the pending journal.
     #[cfg(test)]
-    test_hooks::during_worktree_sync()?;
+    test_hooks::during_worktree_sync(clean_repo)?;
     sync_worktree_to_commit_no_filters(
         clean_repo,
+        git_dir,
         git_branch,
         prev_head_sha.as_deref(),
+        prev_head_ref.as_deref(),
         &new_commit_sha,
+        SyncMode::Normal,
     )?;
+    #[cfg(test)]
+    test_hooks::before_remove_pending()?;
     remove_pending_file(pending_path)?;
 
     Ok((new_commit_sha, entry_template))
@@ -966,27 +1060,41 @@ fn reconcile_pending_publication(
     }
 
     let label = pending_path.display().to_string();
-    let max_pending = max_mapping_bytes.saturating_add(64 * 1024);
+    let max_pending = max_pending_journal_bytes(max_mapping_bytes);
     let raw = read_bounded_regular_file(pending_path, &label, max_pending)?;
     reject_duplicate_json_keys(&raw)
         .map_err(|e| GitError::InvalidMapping(format!("malformed pending record JSON: {e}")))?;
-    let pending: PendingPublication = serde_json::from_slice(&raw).map_err(|e| {
-        GitError::InvalidMapping(format!("invalid pending publication record: {e}"))
-    })?;
-    if pending.format_version != MAPPING_FORMAT_VERSION {
+    let raw_val: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| GitError::InvalidMapping(format!("malformed pending record JSON: {e}")))?;
+    let found_u64 = raw_val
+        .as_object()
+        .and_then(|o| o.get("format_version"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            GitError::InvalidMapping("pending publication record missing format_version".into())
+        })?;
+    let found = u32::try_from(found_u64).unwrap_or(u32::MAX);
+    if found != MAPPING_FORMAT_VERSION {
         return Err(GitError::UnsupportedFormatVersion {
             file: label,
-            found: pending.format_version,
+            found,
             supported: MAPPING_FORMAT_VERSION,
         });
     }
-    let abs_mapping = resolve_absolute_mapping_path(mapping_path)?;
-    if pending.ref_name != ref_name
-        || pending.mapping.dataset_id != dataset_id
-        || pending.mapping.branch_id != branch_id
-        || pending.mapping.git_branch != git_branch
-        || pending.mapping.syntax != syntax
-        || pending.mapping_path != abs_mapping
+    let pending: PendingPublication = serde_json::from_value(raw_val).map_err(|e| {
+        GitError::InvalidMapping(format!("invalid pending publication record: {e}"))
+    })?;
+    if pending.ref_name != ref_name || pending.mapping_path != mapping_path {
+        return Err(GitError::InvalidMapping(format!(
+            "unreconciled pending publication at {} does not match current export target",
+            pending_path.display()
+        )));
+    }
+    if let Some(ref pending_mapping) = pending.mapping
+        && (pending_mapping.dataset_id != dataset_id
+            || pending_mapping.branch_id != branch_id
+            || pending_mapping.git_branch != git_branch
+            || pending_mapping.syntax != syntax)
     {
         return Err(GitError::InvalidMapping(format!(
             "unreconciled pending publication at {} does not match current export target",
@@ -1000,8 +1108,9 @@ fn reconcile_pending_publication(
         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
         _ => false,
     };
-    if matches_old {
-        // Previous export failed before advancing `ref_name`; clear the stale pending file.
+    if pending.mapping.is_some() && matches_old {
+        // Previous commit publication failed before advancing `ref_name`; clear the stale
+        // pending file.
         remove_pending_file(pending_path)?;
         return Ok(());
     }
@@ -1016,147 +1125,99 @@ fn reconcile_pending_publication(
         )));
     }
 
-    // `ref_name` already advanced to `pending.new_commit_sha`. Verify no manual edits were
-    // made to tracked files or the index before finishing the checkpoint and worktree sync.
-    ensure_clean_for_pending_recovery(
-        clean_repo,
-        git_dir,
-        ref_name,
-        pending.old_ref_sha.as_deref(),
-        &pending.new_commit_sha,
-    )?;
-
-    // Check existing mapping consistency, then complete writing the pending mapping if not
-    // yet persisted.
-    let mut already_persisted = false;
-    match fs::symlink_metadata(mapping_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-                return Err(GitError::UnsafePath {
-                    path: mapping_path.display().to_string(),
-                    reason: "mapping path must be a non-symlink regular file".into(),
-                });
+    // Complete mapping persistence if this pending record carries a new mapping entry,
+    // verifying existing mapping consistency first.
+    let mut need_mapping_write = false;
+    if pending.mapping.is_some() {
+        let mut already_persisted = false;
+        match fs::symlink_metadata(mapping_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                    return Err(GitError::UnsafePath {
+                        path: mapping_path.display().to_string(),
+                        reason: "mapping path must be a non-symlink regular file".into(),
+                    });
+                }
+                let existing = CommitMapping::read_with_max_bytes(mapping_path, max_mapping_bytes)?;
+                let existing_tip = existing.entries.last().map(|e| e.git_sha.as_str());
+                if existing_tip.is_some_and(|t| t.eq_ignore_ascii_case(&pending.new_commit_sha)) {
+                    already_persisted = true;
+                } else {
+                    let tip_matches_old = match (existing_tip, pending.old_ref_sha.as_deref()) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        _ => false,
+                    };
+                    if !tip_matches_old {
+                        return Err(GitError::InvalidMapping(format!(
+                            "existing mapping {} tip {:?} does not match pending recovery base {:?}",
+                            mapping_path.display(),
+                            existing_tip,
+                            pending.old_ref_sha
+                        )));
+                    }
+                }
             }
-            let existing = CommitMapping::read_with_max_bytes(mapping_path, max_mapping_bytes)?;
-            let existing_tip = existing.entries.last().map(|e| e.git_sha.as_str());
-            if existing_tip.is_some_and(|t| t.eq_ignore_ascii_case(&pending.new_commit_sha)) {
-                already_persisted = true;
-            } else {
-                let tip_matches_old = match (existing_tip, pending.old_ref_sha.as_deref()) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                    _ => false,
-                };
-                if !tip_matches_old {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if pending.old_ref_sha.is_some() {
                     return Err(GitError::InvalidMapping(format!(
-                        "existing mapping {} tip {:?} does not match pending recovery base {:?}",
+                        "mapping {} is missing during pending recovery from {:?}",
                         mapping_path.display(),
-                        existing_tip,
                         pending.old_ref_sha
                     )));
                 }
             }
+            Err(e) => return Err(GitError::io(mapping_path, e)),
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if pending.old_ref_sha.is_some() {
-                return Err(GitError::InvalidMapping(format!(
-                    "mapping {} is missing during pending recovery from {:?}",
-                    mapping_path.display(),
-                    pending.old_ref_sha
-                )));
-            }
-        }
-        Err(e) => return Err(GitError::io(mapping_path, e)),
+        need_mapping_write = !already_persisted;
     }
 
-    if !already_persisted {
-        pending
-            .mapping
-            .write_with_max_bytes(mapping_path, max_mapping_bytes)?;
-    }
-
-    // Determine which commit's tree is currently materialized in the working tree so stale
-    // files deleted by `pending.new_commit_sha` are cleanly removed on recovery.
-    let head_sym = run_git(clean_repo, &["symbolic-ref", "-q", "HEAD"], &[])
-        .ok()
-        .map(|s| s.trim().to_string());
-    let prev_worktree_sha = if head_sym.as_deref() == Some(ref_name) {
-        pending.old_ref_sha.clone()
-    } else {
-        git_rev_parse_opt(clean_repo, "HEAD")?
-    };
-
+    // Replay or finish the checkout under `.git/index.lock` using the recorded prior
+    // checkout identity, accepting files matching either the prior or target blob while
+    // refusing any local edits, unmanaged collisions, or concurrent staging.
     sync_worktree_to_commit_no_filters(
         clean_repo,
+        git_dir,
         git_branch,
-        prev_worktree_sha.as_deref(),
+        pending.prev_checkout_sha.as_deref(),
+        pending.prev_head_ref.as_deref(),
         &pending.new_commit_sha,
+        SyncMode::Recovery,
     )?;
+
+    if need_mapping_write && let Some(ref pending_mapping) = pending.mapping {
+        pending_mapping.write_with_max_bytes(mapping_path, max_mapping_bytes)?;
+    }
+
     remove_pending_file(pending_path)?;
     Ok(())
 }
 
-fn ensure_clean_for_pending_recovery(
-    clean_repo: &Path,
-    git_dir: &Path,
-    ref_name: &str,
-    old_ref_sha: Option<&str>,
-    new_commit_sha: &str,
-) -> GitResult<()> {
-    ensure_no_in_progress_git_op(git_dir)?;
-
-    let head_sym = run_git(clean_repo, &["symbolic-ref", "-q", "HEAD"], &[])
-        .ok()
-        .map(|s| s.trim().to_string());
-    if head_sym.as_deref() != Some(ref_name) {
-        // HEAD is on a different branch (or detached), so normal clean-state checks apply.
-        return ensure_clean_git_state(clean_repo, git_dir);
-    }
-
-    // HEAD points to `ref_name`, which moved from `old_ref_sha` to `new_commit_sha`.
-    // Working tree must have no unstaged modifications relative to the index, and the index
-    // must match either `old_ref_sha` (pre-sync) or `new_commit_sha` (post-sync).
-    let unstaged = run_git(clean_repo, &["diff", "--name-only"], &[])?;
-    if !unstaged.trim().is_empty() {
-        return Err(GitError::InvalidMapping(
-            "refusing pending recovery with uncommitted modifications to tracked files".into(),
-        ));
-    }
-
-    let staged_files = run_git(clean_repo, &["ls-files", "--cached"], &[])?;
-    if staged_files.trim().is_empty() && old_ref_sha.is_none() {
-        return Ok(());
-    }
-    let idx_tree = run_git(clean_repo, &["write-tree"], &[])?
-        .trim()
-        .to_string();
-    let new_tree = run_git(
-        clean_repo,
-        &["rev-parse", &format!("{new_commit_sha}^{{tree}}")],
-        &[],
-    )?
-    .trim()
-    .to_string();
-    if idx_tree.eq_ignore_ascii_case(&new_tree) {
-        return Ok(());
-    }
-    if let Some(old_sha) = old_ref_sha {
-        let old_tree = run_git(
-            clean_repo,
-            &["rev-parse", &format!("{old_sha}^{{tree}}")],
-            &[],
-        )?
-        .trim()
-        .to_string();
-        if idx_tree.eq_ignore_ascii_case(&old_tree) {
-            return Ok(());
+fn ensure_no_other_pending_publications(git_dir: &Path, own_pending: &Path) -> GitResult<()> {
+    let pending_dir = git_dir
+        .join(DEFAULT_SPARKLES_GIT_SUBDIR)
+        .join(DEFAULT_PENDING_SUBDIR);
+    let rd = match fs::read_dir(&pending_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(GitError::io(&pending_dir, e)),
+    };
+    let own_name = own_pending.file_name();
+    for entry in rd {
+        let entry = entry.map_err(|e| GitError::io(&pending_dir, e))?;
+        let name = entry.file_name();
+        if Some(name.as_os_str()) == own_name {
+            continue;
+        }
+        if name.to_string_lossy().ends_with(".json") {
+            return Err(GitError::InvalidMapping(format!(
+                "refusing export while another branch has an unreconciled pending publication ({}); \
+                 retry that branch first",
+                entry.path().display()
+            )));
         }
     }
-    Err(GitError::InvalidMapping(
-        "refusing pending recovery because the Git index does not match either the pre-commit \
-         or post-commit tree"
-            .into(),
-    ))
+    Ok(())
 }
 
 fn pending_publication_path(git_dir: &Path, git_branch: &str) -> GitResult<PathBuf> {
@@ -1178,18 +1239,6 @@ fn remove_pending_file(pending_path: &Path) -> GitResult<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(GitError::io(pending_path, e)),
     }
-}
-
-fn resolve_absolute_mapping_path(mapping_path: &Path) -> GitResult<PathBuf> {
-    let parent = effective_parent(mapping_path)?;
-    let canon_parent = fs::canonicalize(&parent).map_err(|e| GitError::io(&parent, e))?;
-    let name = mapping_path
-        .file_name()
-        .ok_or_else(|| GitError::UnsafePath {
-            path: mapping_path.display().to_string(),
-            reason: "mapping path must name a file".into(),
-        })?;
-    Ok(canon_parent.join(name))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1910,11 +1959,62 @@ fn validate_git_branch_name(name: &str) -> GitResult<()> {
 }
 
 /// Validate and prepare the custom mapping path and its parent directory BEFORE publishing
-/// any Git commits, including bare relative paths such as `mapping.json`.
-fn prepare_mapping_path_safe(path: &Path) -> GitResult<()> {
+/// any Git commits, including bare relative paths such as `mapping.json`, returning one
+/// canonical absolute destination path used consistently for all reads, journals, and writes.
+fn prepare_mapping_path_safe(path: &Path) -> GitResult<PathBuf> {
     let parent = effective_parent(path)?;
     ensure_dir_no_symlink(&parent)?;
-    check_dest_file_not_symlink(path)?;
+    let file_name = path.file_name().ok_or_else(|| GitError::UnsafePath {
+        path: path.display().to_string(),
+        reason: "mapping path must name a file".into(),
+    })?;
+    let clean_path = parent.join(file_name);
+    check_dest_file_not_symlink(&clean_path)?;
+    let canon_parent = fs::canonicalize(&parent).map_err(|e| GitError::io(&parent, e))?;
+    Ok(canon_parent.join(file_name))
+}
+
+/// Refuse any custom mapping destination that aliases internal Git/pending metadata or
+/// published canonical tree directories (`.sparkles-git/`, `graphs/`).
+fn validate_mapping_destination_no_overlap(
+    mapping_path: &Path,
+    canon_repo: &Path,
+    git_dir: &Path,
+    pending_path: &Path,
+) -> GitResult<()> {
+    let sparkles_dir = git_dir.join(DEFAULT_SPARKLES_GIT_SUBDIR);
+    let pending_dir = sparkles_dir.join(DEFAULT_PENDING_SUBDIR);
+    let staging_dir = sparkles_dir.join(DEFAULT_STAGING_SUBDIR);
+    let lock_path = sparkles_dir.join("export.lock");
+    let forbidden_reason = if mapping_path == pending_path || mapping_path.starts_with(&pending_dir)
+    {
+        Some("mapping path must not alias Sparkles pending publication directory")
+    } else if mapping_path.starts_with(&staging_dir) {
+        Some("mapping path must not alias Sparkles staging directory")
+    } else if mapping_path == lock_path {
+        Some("mapping path must not alias Sparkles export lock")
+    } else if mapping_path == git_dir.join("index")
+        || mapping_path == git_dir.join("index.lock")
+        || mapping_path == git_dir.join("HEAD")
+        || mapping_path.starts_with(git_dir.join("refs"))
+        || mapping_path.starts_with(git_dir.join("objects"))
+    {
+        Some("mapping path must not alias internal Git repository metadata")
+    } else if mapping_path.starts_with(canon_repo.join(METADATA_DIR))
+        || mapping_path.starts_with(canon_repo.join(GRAPHS_DIR))
+    {
+        Some(
+            "mapping path must not lie inside published canonical tree paths (.sparkles-git/ or graphs/)",
+        )
+    } else {
+        None
+    };
+    if let Some(reason) = forbidden_reason {
+        return Err(GitError::UnsafePath {
+            path: mapping_path.display().to_string(),
+            reason: reason.into(),
+        });
+    }
     Ok(())
 }
 
@@ -2089,7 +2189,7 @@ fn resolve_exact_git_dir(repo_dir: &Path) -> GitResult<PathBuf> {
             canon_common.display()
         )));
     }
-    Ok(resolved)
+    Ok(canon_git)
 }
 
 struct ExportLock {
@@ -2141,32 +2241,341 @@ fn ensure_no_in_progress_git_op(git_dir: &Path) -> GitResult<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TreeBlobEntry {
+    mode: String,
+    oid: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncMode {
+    Normal,
+    Recovery,
+}
+
+/// Exclusive lock on `<git-dir>/index.lock` following Git's lockfile protocol so external
+/// `git add`/`git rm`/`git checkout` cannot race with index inspection, worktree sync, or
+/// the atomic swap of `.git/index`.
+struct GitIndexLock {
+    lock_path: PathBuf,
+    file: Option<File>,
+    committed: bool,
+}
+
+impl GitIndexLock {
+    fn acquire(git_dir: &Path) -> GitResult<Self> {
+        let lock_path = git_dir.join("index.lock");
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(&lock_path).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                GitError::InvalidMapping(format!(
+                    "refusing to modify Git index while {} exists (another Git operation is in \
+                     progress)",
+                    lock_path.display()
+                ))
+            } else {
+                GitError::io(&lock_path, e)
+            }
+        })?;
+        Ok(Self {
+            lock_path,
+            file: Some(file),
+            committed: false,
+        })
+    }
+
+    fn commit_index_bytes(mut self, git_dir: &Path, bytes: &[u8]) -> GitResult<()> {
+        let mut f = self.file.take().expect("index lock file held");
+        f.write_all(bytes)
+            .map_err(|e| GitError::io(&self.lock_path, e))?;
+        f.sync_all().map_err(|e| GitError::io(&self.lock_path, e))?;
+        drop(f);
+        let index_path = git_dir.join("index");
+        check_dest_file_not_symlink(&index_path)?;
+        fs::rename(&self.lock_path, &index_path).map_err(|e| GitError::io(&index_path, e))?;
+        self.committed = true;
+        crate::fsutil::sync_dir(git_dir).map_err(|e| GitError::io(git_dir, e))?;
+        Ok(())
+    }
+}
+
+impl Drop for GitIndexLock {
+    fn drop(&mut self) {
+        self.file.take();
+        if !self.committed {
+            let _ = fs::remove_file(&self.lock_path);
+        }
+    }
+}
+
+fn git_symbolic_ref_opt(repo_dir: &Path) -> Option<String> {
+    run_git(repo_dir, &["symbolic-ref", "-q", "HEAD"], &[])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn git_core_filemode(repo_dir: &Path) -> bool {
+    #[cfg(not(unix))]
+    {
+        let _ = repo_dir;
+        false
+    }
+    #[cfg(unix)]
+    {
+        match run_git(
+            repo_dir,
+            &["config", "--bool", "--get", "core.fileMode"],
+            &[],
+        ) {
+            Ok(v) => v.trim() != "false",
+            Err(_) => true,
+        }
+    }
+}
+
+fn read_commit_tree_entries(
+    clean_repo: &Path,
+    commit_sha: Option<&str>,
+) -> GitResult<BTreeMap<String, TreeBlobEntry>> {
+    let Some(sha) = commit_sha else {
+        return Ok(BTreeMap::new());
+    };
+    let raw = run_git_bytes(clean_repo, &["ls-tree", "-r", "-z", sha], &[])?;
+    let mut entries = BTreeMap::new();
+    for rec in raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
+            return Err(GitError::InvalidMapping(
+                "malformed git ls-tree output".into(),
+            ));
+        };
+        let header = std::str::from_utf8(&rec[..tab])
+            .map_err(|_| GitError::InvalidMapping("non-UTF-8 git ls-tree header".into()))?;
+        let rel = std::str::from_utf8(&rec[tab + 1..])
+            .map_err(|_| GitError::InvalidMapping("non-UTF-8 path in git tree".into()))?;
+        let mut parts = header.split_whitespace();
+        let mode = parts
+            .next()
+            .ok_or_else(|| GitError::InvalidMapping("missing mode in git ls-tree".into()))?;
+        let _kind = parts
+            .next()
+            .ok_or_else(|| GitError::InvalidMapping("missing kind in git ls-tree".into()))?;
+        let oid = parts
+            .next()
+            .ok_or_else(|| GitError::InvalidMapping("missing OID in git ls-tree".into()))?;
+        entries.insert(
+            rel.to_string(),
+            TreeBlobEntry {
+                mode: mode.to_string(),
+                oid: oid.to_ascii_lowercase(),
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn read_index_entries(clean_repo: &Path) -> GitResult<BTreeMap<String, TreeBlobEntry>> {
+    let raw = run_git_bytes(clean_repo, &["ls-files", "--stage", "-z"], &[])?;
+    let mut entries = BTreeMap::new();
+    for rec in raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
+            return Err(GitError::InvalidMapping(
+                "malformed git ls-files --stage output".into(),
+            ));
+        };
+        let header = std::str::from_utf8(&rec[..tab])
+            .map_err(|_| GitError::InvalidMapping("non-UTF-8 git ls-files header".into()))?;
+        let rel = std::str::from_utf8(&rec[tab + 1..])
+            .map_err(|_| GitError::InvalidMapping("non-UTF-8 path in git index".into()))?;
+        let mut parts = header.split_whitespace();
+        let mode = parts
+            .next()
+            .ok_or_else(|| GitError::InvalidMapping("missing mode in git index".into()))?;
+        let oid = parts
+            .next()
+            .ok_or_else(|| GitError::InvalidMapping("missing OID in git index".into()))?;
+        let stage = parts
+            .next()
+            .ok_or_else(|| GitError::InvalidMapping("missing stage in git index".into()))?;
+        if stage != "0" {
+            return Err(GitError::InvalidMapping(format!(
+                "refusing to export into a Git repository with unmerged index entry {rel:?}"
+            )));
+        }
+        entries.insert(
+            rel.to_string(),
+            TreeBlobEntry {
+                mode: mode.to_string(),
+                oid: oid.to_ascii_lowercase(),
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn git_cat_file_batch(clean_repo: &Path, oids: &[&str]) -> GitResult<HashMap<String, Vec<u8>>> {
+    let mut unique: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for oid in oids {
+        let lower = oid.to_ascii_lowercase();
+        if seen.insert(lower.clone()) {
+            unique.push(lower);
+        }
+    }
+    if unique.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut stdin = String::new();
+    for oid in &unique {
+        stdin.push_str(oid);
+        stdin.push('\n');
+    }
+    let raw =
+        run_git_bytes_with_stdin(clean_repo, &["cat-file", "--batch"], &[], stdin.as_bytes())?;
+    let mut out = HashMap::with_capacity(unique.len());
+    let mut cursor = 0usize;
+    for req_oid in unique {
+        let Some(nl_rel) = raw[cursor..].iter().position(|&b| b == b'\n') else {
+            return Err(GitError::InvalidMapping(format!(
+                "truncated git cat-file --batch header for {req_oid}"
+            )));
+        };
+        let header = std::str::from_utf8(&raw[cursor..cursor + nl_rel])
+            .map_err(|_| GitError::InvalidMapping("non-UTF-8 git cat-file header".into()))?;
+        cursor += nl_rel + 1;
+        let parts: Vec<&str> = header.split_whitespace().collect();
+        if parts.len() != 3 || parts[1] != "blob" {
+            return Err(GitError::InvalidMapping(format!(
+                "unexpected git cat-file --batch entry for {req_oid}: {header:?}"
+            )));
+        }
+        let size: usize = parts[2].parse().map_err(|_| {
+            GitError::InvalidMapping(format!(
+                "invalid git cat-file --batch size for {req_oid}: {:?}",
+                parts[2]
+            ))
+        })?;
+        let end = cursor.checked_add(size).ok_or_else(|| {
+            GitError::InvalidMapping(format!("git cat-file --batch size overflow for {req_oid}"))
+        })?;
+        if end > raw.len() {
+            return Err(GitError::InvalidMapping(format!(
+                "truncated git cat-file --batch body for {req_oid}"
+            )));
+        }
+        out.insert(req_oid, raw[cursor..end].to_vec());
+        cursor = end;
+        if raw.get(cursor) != Some(&b'\n') {
+            return Err(GitError::InvalidMapping(
+                "missing trailing newline in git cat-file --batch output".into(),
+            ));
+        }
+        cursor += 1;
+    }
+    Ok(out)
+}
+
+fn check_worktree_entry_raw(
+    clean_repo: &Path,
+    rel: &str,
+    expected: &TreeBlobEntry,
+    expected_bytes: &[u8],
+    check_filemode: bool,
+) -> GitResult<bool> {
+    let full = resolve_safe_path(clean_repo, rel)?;
+    let meta = match fs::symlink_metadata(&full) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(GitError::io(&full, e)),
+    };
+    if expected.mode == "120000" {
+        if !meta.file_type().is_symlink() {
+            return Ok(false);
+        }
+        let target = fs::read_link(&full).map_err(|e| GitError::io(&full, e))?;
+        return Ok(target.as_os_str().as_encoded_bytes() == expected_bytes);
+    }
+    if expected.mode != "100644" && expected.mode != "100755" {
+        return Ok(false);
+    }
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    if check_filemode {
+        use std::os::unix::fs::PermissionsExt;
+        let is_exec = (meta.permissions().mode() & 0o111) != 0;
+        let expect_exec = expected.mode == "100755";
+        if is_exec != expect_exec {
+            return Ok(false);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = check_filemode;
+
+    if meta.len() != expected_bytes.len() as u64 {
+        return Ok(false);
+    }
+    let (mut file, actual_len) = open_regular_file_no_symlink(&full, rel)?;
+    if actual_len != expected_bytes.len() as u64 {
+        return Ok(false);
+    }
+    let mut actual = Vec::with_capacity(expected_bytes.len());
+    file.read_to_end(&mut actual)
+        .map_err(|e| GitError::io(&full, e))?;
+    Ok(actual == expected_bytes)
+}
+
+/// Verify that the repository has no in-progress Git operation, that `.git/index` matches
+/// `HEAD` exactly (never running `.gitattributes` clean/smudge filters), and that every
+/// tracked working-tree file matches its raw `HEAD` blob bytes and mode.
 fn ensure_clean_git_state(repo_dir: &Path, git_dir: &Path) -> GitResult<()> {
     ensure_no_in_progress_git_op(git_dir)?;
-    let has_head = git_rev_parse_opt(repo_dir, "HEAD")?.is_some();
-    if has_head {
-        let staged = run_git(repo_dir, &["diff", "--cached", "--name-only"], &[])?;
-        if !staged.trim().is_empty() {
-            return Err(GitError::InvalidMapping(
-                "refusing to export into a Git repository with pre-existing staged changes in the \
-                 index"
-                    .into(),
-            ));
-        }
-        let unstaged = run_git(repo_dir, &["diff", "--name-only"], &[])?;
-        if !unstaged.trim().is_empty() {
-            return Err(GitError::InvalidMapping(
-                "refusing to export into a Git repository with uncommitted modifications to \
-                 tracked files"
-                    .into(),
-            ));
-        }
-    } else {
-        let staged = run_git(repo_dir, &["ls-files", "--cached"], &[])?;
-        if !staged.trim().is_empty() {
+    let head_sha = git_rev_parse_opt(repo_dir, "HEAD")?;
+    let expected_tree = read_commit_tree_entries(repo_dir, head_sha.as_deref())?;
+    let index_entries = read_index_entries(repo_dir)?;
+    if index_entries != expected_tree {
+        if head_sha.is_none() {
             return Err(GitError::InvalidMapping(
                 "refusing to export into an unborn Git repository with pre-existing staged files \
                  in the index"
+                    .into(),
+            ));
+        }
+        return Err(GitError::InvalidMapping(
+            "refusing to export into a Git repository with pre-existing staged changes in the \
+             index"
+                .into(),
+        ));
+    }
+    if expected_tree.is_empty() {
+        return Ok(());
+    }
+    let oids: Vec<&str> = expected_tree
+        .values()
+        .filter(|e| matches!(e.mode.as_str(), "100644" | "100755" | "120000"))
+        .map(|e| e.oid.as_str())
+        .collect();
+    let blobs = git_cat_file_batch(repo_dir, &oids)?;
+    let check_filemode = git_core_filemode(repo_dir);
+    for (rel, entry) in &expected_tree {
+        let Some(expected_bytes) = blobs.get(&entry.oid) else {
+            return Err(GitError::InvalidMapping(format!(
+                "refusing to export into a Git repository with unsupported tracked entry {rel:?} \
+                 (mode {})",
+                entry.mode
+            )));
+        };
+        if !check_worktree_entry_raw(repo_dir, rel, entry, expected_bytes, check_filemode)? {
+            return Err(GitError::InvalidMapping(
+                "refusing to export into a Git repository with uncommitted modifications to \
+                 tracked files"
                     .into(),
             ));
         }
@@ -2178,19 +2587,8 @@ fn list_tracked_paths_in_commit(
     clean_repo: &Path,
     commit_sha: Option<&str>,
 ) -> GitResult<HashSet<String>> {
-    let Some(sha) = commit_sha else {
-        return Ok(HashSet::new());
-    };
-    let raw = run_git_bytes(
-        clean_repo,
-        &["ls-tree", "-r", "--name-only", "-z", sha],
-        &[],
-    )?;
-    let mut set = HashSet::new();
-    for entry in raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-        set.insert(String::from_utf8_lossy(entry).into_owned());
-    }
-    Ok(set)
+    let entries = read_commit_tree_entries(clean_repo, commit_sha)?;
+    Ok(entries.into_keys().collect())
 }
 
 fn preflight_worktree_collisions(
@@ -2231,98 +2629,324 @@ fn preflight_worktree_collisions(
 }
 
 /// Synchronize `HEAD`, `.git/index`, and `clean_repo`'s working tree to `commit_sha` on
-/// `git_branch` by writing exact raw blob bytes (`git cat-file blob`, bypassing all
-/// `.gitattributes` / `.git/info/attributes` EOL and smudge filters) and resetting the
-/// index via `git read-tree --reset`.
+/// `git_branch` while holding `.git/index.lock`.
+///
+/// Verifies `.git/index` and every affected working-tree path against raw Git blobs (never
+/// running `.gitattributes` clean or smudge filters) before any write or removal, writes
+/// exact raw blob bytes, updates `HEAD`, and atomically swaps `.git/index` via `index.lock`.
+/// In [`SyncMode::Recovery`], individual old-to-new path transitions and post-sync states
+/// are replayable while any unexpected edit, unmanaged file, or staged index entry is
+/// refused.
+#[allow(clippy::too_many_arguments)]
 fn sync_worktree_to_commit_no_filters(
     clean_repo: &Path,
+    git_dir: &Path,
     git_branch: &str,
     previous_commit_sha: Option<&str>,
+    prev_head_ref: Option<&str>,
     commit_sha: &str,
+    mode: SyncMode,
 ) -> GitResult<()> {
-    let old_tracked = list_tracked_paths_in_commit(clean_repo, previous_commit_sha)?;
-    let raw_tree = run_git_bytes(clean_repo, &["ls-tree", "-r", "-z", commit_sha], &[])?;
+    ensure_no_in_progress_git_op(git_dir)?;
+    let index_lock = GitIndexLock::acquire(git_dir)?;
 
-    let mut target_entries: Vec<(String, String)> = Vec::new();
-    let mut target_paths: HashSet<String> = HashSet::new();
-    for rec in raw_tree.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-        let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
-            return Err(GitError::InvalidMapping(
-                "malformed git ls-tree output".into(),
-            ));
-        };
-        let header = std::str::from_utf8(&rec[..tab])
-            .map_err(|_| GitError::InvalidMapping("non-UTF-8 git ls-tree header".into()))?;
-        let rel = std::str::from_utf8(&rec[tab + 1..])
-            .map_err(|_| GitError::InvalidMapping("non-UTF-8 path in git tree".into()))?;
-        let mut parts = header.split_whitespace();
-        let _mode = parts.next();
-        let kind = parts.next().unwrap_or("");
-        let oid = parts
-            .next()
-            .ok_or_else(|| GitError::InvalidMapping("missing OID in git ls-tree".into()))?;
-        if kind != "blob" {
-            continue;
-        }
+    let old_tree = read_commit_tree_entries(clean_repo, previous_commit_sha)?;
+    let target_tree = read_commit_tree_entries(clean_repo, Some(commit_sha))?;
+    for (rel, entry) in &target_tree {
         validate_relative_path(rel)?;
-        target_paths.insert(rel.to_string());
-        target_entries.push((oid.to_string(), rel.to_string()));
+        if entry.mode != "100644" && entry.mode != "100755" {
+            return Err(GitError::UnsafePath {
+                path: rel.clone(),
+                reason: format!("unsupported file mode {} in exported Git tree", entry.mode),
+            });
+        }
     }
 
-    let path_refs: Vec<&str> = target_entries.iter().map(|(_, p)| p.as_str()).collect();
-    preflight_worktree_collisions(clean_repo, &old_tracked, &path_refs)?;
+    let ref_name = format!("refs/heads/{git_branch}");
+    let head_sym = git_symbolic_ref_opt(clean_repo);
+    let current_index = read_index_entries(clean_repo)?;
+    let index_matches_old = current_index == old_tree;
+    let index_matches_new = current_index == target_tree;
 
-    // Write every tracked blob byte-exact without running Git checkout/smudge filters.
-    for (oid, rel) in &target_entries {
-        let blob_bytes = run_git_bytes(clean_repo, &["cat-file", "blob", oid], &[])?;
+    match mode {
+        SyncMode::Normal => {
+            if !index_matches_old {
+                return Err(GitError::InvalidMapping(
+                    "refusing worktree sync because the Git index changed concurrently".into(),
+                ));
+            }
+        }
+        SyncMode::Recovery => {
+            let head_allowed = head_sym.as_deref() == Some(ref_name.as_str())
+                || (prev_head_ref.is_some() && head_sym.as_deref() == prev_head_ref)
+                || (prev_head_ref.is_none()
+                    && head_sym.is_none()
+                    && git_rev_parse_opt(clean_repo, "HEAD")?.as_deref() == previous_commit_sha);
+            if !head_allowed {
+                return Err(GitError::InvalidMapping(format!(
+                    "refusing pending recovery because HEAD ({head_sym:?}) moved away from \
+                     expected branch {ref_name:?} / {prev_head_ref:?}"
+                )));
+            }
+            if !index_matches_old && !index_matches_new {
+                return Err(GitError::InvalidMapping(
+                    "refusing pending recovery because the Git index does not match either the \
+                     pre-sync or post-sync tree"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    let mut all_oids: Vec<&str> = Vec::with_capacity(old_tree.len() + target_tree.len());
+    for entry in old_tree.values().chain(target_tree.values()) {
+        if matches!(entry.mode.as_str(), "100644" | "100755" | "120000") {
+            all_oids.push(entry.oid.as_str());
+        }
+    }
+    let blobs = git_cat_file_batch(clean_repo, &all_oids)?;
+    let check_filemode = git_core_filemode(clean_repo);
+
+    // Post-sync recovery: HEAD and index already point to `commit_sha`; verify every target
+    // file matches its raw blob bytes so local post-sync edits are never ignored, then
+    // finish without misclassifying new files as unmanaged collisions.
+    if mode == SyncMode::Recovery
+        && index_matches_new
+        && head_sym.as_deref() == Some(ref_name.as_str())
+    {
+        for (rel, target_entry) in &target_tree {
+            let new_bytes = blobs.get(&target_entry.oid).ok_or_else(|| {
+                GitError::InvalidMapping(format!("missing blob {} for {rel:?}", target_entry.oid))
+            })?;
+            if !check_worktree_entry_raw(clean_repo, rel, target_entry, new_bytes, check_filemode)?
+            {
+                return Err(GitError::InvalidMapping(
+                    "refusing pending recovery with uncommitted modifications to tracked files"
+                        .into(),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    // Read-only eligibility preflight for EVERY target path and EVERY stale old path under
+    // `.git/index.lock` BEFORE mutating any working-tree file.
+    let mut to_write: Vec<(&str, &[u8])> = Vec::new();
+    for (rel, target_entry) in &target_tree {
+        let new_bytes = blobs.get(&target_entry.oid).ok_or_else(|| {
+            GitError::InvalidMapping(format!("missing blob {} for {rel:?}", target_entry.oid))
+        })?;
         let full = resolve_safe_path(clean_repo, rel)?;
-        let parent = effective_parent(&full)?;
-        ensure_dir_no_symlink(&parent)?;
-        let needs_write = match fs::symlink_metadata(&full) {
-            Ok(meta) if meta.file_type().is_file() => match fs::read(&full) {
-                Ok(existing) => existing != blob_bytes,
-                Err(_) => true,
-            },
-            _ => true,
-        };
-        if needs_write {
-            write_atomic_safe(&full, &blob_bytes)?;
-        }
-    }
-
-    // Remove previously tracked files that are absent from the target commit (leaving
-    // unmanaged untracked files completely untouched).
-    for old_rel in &old_tracked {
-        if target_paths.contains(old_rel) {
-            continue;
-        }
-        if validate_relative_path(old_rel).is_err() {
-            continue;
-        }
-        let full = resolve_safe_path(clean_repo, old_rel)?;
         match fs::symlink_metadata(&full) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if old_tree.contains_key(rel) {
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing worktree sync: previously tracked file {rel:?} was locally \
+                         deleted"
+                    )));
+                }
+                to_write.push((rel.as_str(), new_bytes.as_slice()));
+            }
+            Err(e) => return Err(GitError::io(&full, e)),
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
+                    return Err(GitError::UnsafePath {
+                        path: rel.clone(),
+                        reason: "destination path in repository must not be a symlink".into(),
+                    });
+                }
+                if !meta.file_type().is_file() {
+                    return Err(GitError::UnsafePath {
+                        path: rel.clone(),
+                        reason: "destination path in repository is not a regular file".into(),
+                    });
+                }
+                let matches_new = check_worktree_entry_raw(
+                    clean_repo,
+                    rel,
+                    target_entry,
+                    new_bytes,
+                    check_filemode,
+                )?;
+                let matches_old = match old_tree.get(rel) {
+                    Some(old_entry) => {
+                        let old_bytes = blobs.get(&old_entry.oid).ok_or_else(|| {
+                            GitError::InvalidMapping(format!(
+                                "missing old blob {} for {rel:?}",
+                                old_entry.oid
+                            ))
+                        })?;
+                        check_worktree_entry_raw(
+                            clean_repo,
+                            rel,
+                            old_entry,
+                            old_bytes,
+                            check_filemode,
+                        )?
+                    }
+                    None => false,
+                };
+                match mode {
+                    SyncMode::Normal => {
+                        if !old_tree.contains_key(rel) {
+                            return Err(GitError::UnsafePath {
+                                path: rel.clone(),
+                                reason: format!(
+                                    "refusing to overwrite unmanaged file {rel:?} in repository \
+                                     working tree"
+                                ),
+                            });
+                        }
+                        if !matches_old {
+                            return Err(GitError::InvalidMapping(format!(
+                                "refusing to overwrite locally modified tracked file {rel:?}"
+                            )));
+                        }
+                        if !matches_new {
+                            to_write.push((rel.as_str(), new_bytes.as_slice()));
+                        }
+                    }
+                    SyncMode::Recovery => {
+                        if matches_new {
+                            // Already written by the interrupted sync (or unchanged).
+                        } else if matches_old {
+                            to_write.push((rel.as_str(), new_bytes.as_slice()));
+                        } else if !old_tree.contains_key(rel) {
+                            return Err(GitError::UnsafePath {
+                                path: rel.clone(),
+                                reason: format!(
+                                    "refusing to overwrite unmanaged file {rel:?} in repository \
+                                     working tree"
+                                ),
+                            });
+                        } else {
+                            return Err(GitError::InvalidMapping(format!(
+                                "refusing pending recovery: tracked file {rel:?} matches neither \
+                                 pre-sync nor post-sync state"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut to_remove: Vec<(&str, bool)> = Vec::new();
+    for (old_rel, old_entry) in &old_tree {
+        if target_tree.contains_key(old_rel) {
+            continue;
+        }
+        validate_relative_path(old_rel)?;
+        let full = resolve_safe_path(clean_repo, old_rel)?;
+        match fs::symlink_metadata(&full) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if mode == SyncMode::Normal {
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing worktree sync: previously tracked file {old_rel:?} was locally \
+                         deleted"
+                    )));
+                }
+                // In recovery mode, the interrupted sync may already have removed this file.
+            }
+            Err(e) => return Err(GitError::io(&full, e)),
+            Ok(meta) => {
+                let is_tracked_symlink = old_entry.mode == "120000";
+                if meta.file_type().is_symlink() && !is_tracked_symlink {
                     return Err(GitError::UnsafePath {
                         path: old_rel.clone(),
                         reason: "tracked path in repository must not be a symlink".into(),
                     });
                 }
-                if meta.file_type().is_file() {
+                let Some(old_bytes) = blobs.get(&old_entry.oid) else {
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to remove unsupported tracked entry {old_rel:?} (mode {})",
+                        old_entry.mode
+                    )));
+                };
+                if !check_worktree_entry_raw(
+                    clean_repo,
+                    old_rel,
+                    old_entry,
+                    old_bytes,
+                    check_filemode,
+                )? {
+                    return Err(GitError::InvalidMapping(format!(
+                        "refusing to remove locally modified tracked file {old_rel:?}"
+                    )));
+                }
+                to_remove.push((old_rel.as_str(), is_tracked_symlink));
+            }
+        }
+    }
+
+    // Write every changed tracked blob byte-exact without running Git checkout/smudge filters.
+    for (idx, (rel, blob_bytes)) in to_write.into_iter().enumerate() {
+        let full = resolve_safe_path(clean_repo, rel)?;
+        let parent = effective_parent(&full)?;
+        ensure_dir_no_symlink(&parent)?;
+        write_atomic_safe(&full, blob_bytes)?;
+        #[cfg(test)]
+        if idx == 0 {
+            test_hooks::after_first_worktree_blob_write()?;
+        }
+        #[cfg(not(test))]
+        let _ = idx;
+    }
+
+    // Remove verified previously tracked files absent from the target commit (leaving
+    // unmanaged untracked files completely untouched).
+    for (idx, (old_rel, is_tracked_symlink)) in to_remove.into_iter().enumerate() {
+        let full = resolve_safe_path(clean_repo, old_rel)?;
+        match fs::symlink_metadata(&full) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() && !is_tracked_symlink {
+                    return Err(GitError::UnsafePath {
+                        path: old_rel.to_string(),
+                        reason: "tracked path in repository must not be a symlink".into(),
+                    });
+                }
+                if meta.file_type().is_file()
+                    || (is_tracked_symlink && meta.file_type().is_symlink())
+                {
                     fs::remove_file(&full).map_err(|e| GitError::io(&full, e))?;
                     if let Some(p) = full.parent() {
                         let _ = crate::fsutil::sync_dir(p);
+                    }
+                    #[cfg(test)]
+                    if idx == 0 {
+                        test_hooks::after_first_worktree_removal()?;
                     }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(GitError::io(&full, e)),
         }
+        #[cfg(not(test))]
+        let _ = idx;
     }
 
-    let ref_name = format!("refs/heads/{git_branch}");
     run_git(clean_repo, &["symbolic-ref", "HEAD", &ref_name], &[])?;
-    run_git(clean_repo, &["read-tree", "--reset", commit_sha], &[])?;
+    #[cfg(test)]
+    test_hooks::after_symbolic_ref_before_index()?;
+
+    // Build the exact target index in an isolated temporary file from the object database
+    // (never running filters) and atomically swap it into `.git/index` through our held
+    // `.git/index.lock`.
+    let sparkles_dir = ensure_child_dir_no_symlink(git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
+    let staging_parent = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_STAGING_SUBDIR)?;
+    let tmp_index = tempfile::Builder::new()
+        .prefix("sync-index-")
+        .tempfile_in(&staging_parent)
+        .map_err(|e| GitError::io(&staging_parent, e))?;
+    let tmp_index_path = tmp_index.into_temp_path();
+    let _ = fs::remove_file(&tmp_index_path);
+    let tmp_index_str = tmp_index_path.to_string_lossy().into_owned();
+    let idx_env = [("GIT_INDEX_FILE", tmp_index_str.as_str())];
+    run_git(clean_repo, &["read-tree", commit_sha], &idx_env)?;
+    let new_index_bytes =
+        fs::read(&tmp_index_path).map_err(|e| GitError::io(&tmp_index_path, e))?;
+    drop(tmp_index_path);
+    index_lock.commit_index_bytes(git_dir, &new_index_bytes)?;
     Ok(())
 }
 
@@ -2377,6 +3001,16 @@ fn run_git_with_stdin(
     envs: &[(&str, &str)],
     stdin_bytes: &[u8],
 ) -> GitResult<String> {
+    let bytes = run_git_bytes_with_stdin(repo_dir, args, envs, stdin_bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn run_git_bytes_with_stdin(
+    repo_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin_bytes: &[u8],
+) -> GitResult<Vec<u8>> {
     let clean = normalize_dir_for_lstat(repo_dir)?;
     let mut cmd = git_command(&clean);
     cmd.args(args)
@@ -2412,7 +3046,7 @@ fn run_git_with_stdin(
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
 
 /// Convenience helper for building a [`CommitRef`] from a mapping entry.
@@ -2435,7 +3069,14 @@ mod test_hooks {
         pub fail_before_update_ref: bool,
         pub fail_mapping_write: bool,
         pub fail_worktree_sync: bool,
+        pub fail_after_first_blob_write: bool,
+        pub fail_after_first_removal: bool,
+        pub fail_after_symbolic_ref: bool,
+        pub fail_before_remove_pending: bool,
         pub inject_concurrent_stage: Option<(String, Vec<u8>)>,
+        pub inject_stage_before_sync: Option<(String, Vec<u8>)>,
+        pub inject_tracked_edit_after_clean: Option<(String, Vec<u8>)>,
+        pub inject_tracked_edit_before_sync: Option<(String, Vec<u8>)>,
     }
 
     thread_local! {
@@ -2483,23 +3124,17 @@ mod test_hooks {
         })
     }
 
-    pub(super) fn during_worktree_sync() -> GitResult<()> {
-        FAULTS.with(|f| {
+    pub(super) fn during_worktree_sync(repo_dir: &Path) -> GitResult<()> {
+        let (stage_inj, edit_inj, fail) = FAULTS.with(|f| {
             let mut s = f.borrow_mut();
-            if s.fail_worktree_sync {
-                s.fail_worktree_sync = false;
-                return Err(GitError::Io {
-                    path: None,
-                    source: io::Error::other("injected failure during worktree sync"),
-                });
-            }
-            Ok(())
-        })
-    }
-
-    pub(super) fn after_clean_check(repo_dir: &Path) {
-        let injected = FAULTS.with(|f| f.borrow_mut().inject_concurrent_stage.take());
-        if let Some((rel, bytes)) = injected {
+            let fail = std::mem::take(&mut s.fail_worktree_sync);
+            (
+                s.inject_stage_before_sync.take(),
+                s.inject_tracked_edit_before_sync.take(),
+                fail,
+            )
+        });
+        if let Some((rel, bytes)) = stage_inj {
             let p = repo_dir.join(&rel);
             fs::write(&p, bytes).unwrap();
             let status = Command::new("git")
@@ -2507,6 +3142,94 @@ mod test_hooks {
                 .status()
                 .unwrap();
             assert!(status.success());
+        }
+        if let Some((rel, bytes)) = edit_inj {
+            fs::write(repo_dir.join(&rel), bytes).unwrap();
+        }
+        if fail {
+            return Err(GitError::Io {
+                path: None,
+                source: io::Error::other("injected failure during worktree sync"),
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn after_first_worktree_blob_write() -> GitResult<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_after_first_blob_write {
+                s.fail_after_first_blob_write = false;
+                return Err(GitError::Io {
+                    path: None,
+                    source: io::Error::other("injected failure after first worktree blob write"),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn after_first_worktree_removal() -> GitResult<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_after_first_removal {
+                s.fail_after_first_removal = false;
+                return Err(GitError::Io {
+                    path: None,
+                    source: io::Error::other("injected failure after first worktree removal"),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn after_symbolic_ref_before_index() -> GitResult<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_after_symbolic_ref {
+                s.fail_after_symbolic_ref = false;
+                return Err(GitError::Io {
+                    path: None,
+                    source: io::Error::other("injected failure after symbolic-ref before index"),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn before_remove_pending() -> GitResult<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_before_remove_pending {
+                s.fail_before_remove_pending = false;
+                return Err(GitError::Io {
+                    path: None,
+                    source: io::Error::other("injected failure before removing pending journal"),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn after_clean_check(repo_dir: &Path) {
+        let (stage_inj, edit_inj) = FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            (
+                s.inject_concurrent_stage.take(),
+                s.inject_tracked_edit_after_clean.take(),
+            )
+        });
+        if let Some((rel, bytes)) = stage_inj {
+            let p = repo_dir.join(&rel);
+            fs::write(&p, bytes).unwrap();
+            let status = Command::new("git")
+                .args(["-C", repo_dir.to_str().unwrap(), "add", &rel])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        if let Some((rel, bytes)) = edit_inj {
+            fs::write(repo_dir.join(&rel), bytes).unwrap();
         }
     }
 }
@@ -2717,39 +3440,321 @@ mod tests {
     }
 
     #[test]
-    fn isolated_index_ignores_file_staged_after_clean_check() {
+    fn fault_injection_recovers_cleanly_across_mid_sync_post_sync_and_branch_switches() {
         let db_dir = tempfile::tempdir().unwrap();
         let ds = Dataset::open(db_dir.path().join("db")).unwrap();
-        ds.transaction(|tx| {
+        let insert_g = |g: Option<&str>, n: i64| {
+            ds.transaction(|tx| {
+                let gn = match g {
+                    Some(iri) => GraphName::NamedNode(NamedNode::new_unchecked(iri)),
+                    None => GraphName::DefaultGraph,
+                };
+                tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked(format!("http://example.org/s{n}")),
+                        NamedNode::new_unchecked("http://example.org/p"),
+                        Literal::from(n),
+                        gn,
+                    )
+                    .as_ref(),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        };
+        insert_g(None, 1);
+        insert_g(Some("http://example.org/temp-graph"), 10);
+
+        // 1. First (unborn) export fails mid-sync AFTER writing first blob -> retry succeeds.
+        let repo = tempfile::tempdir().unwrap();
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                fail_after_first_blob_write: true,
+                ..Default::default()
+            });
+            let err =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            assert!(
+                err.to_string().contains("first worktree blob write"),
+                "{err}"
+            );
+        }
+        let r1 = export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        assert_eq!(r1.commits_skipped, 1);
+        assert_eq!(r1.commits_exported, 1);
+        assert_eq!(r1.mapping.entries.len(), 2);
+        verify_git_tree(repo.path()).unwrap();
+
+        // 2. Post-sync crash (right before removing pending journal) on a commit that adds a
+        //    brand-new graph file -> retry succeeds without misclassifying the new file.
+        insert_g(Some("http://example.org/new-graph"), 20);
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                fail_before_remove_pending: true,
+                ..Default::default()
+            });
+            let err =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            assert!(
+                err.to_string().contains("removing pending journal"),
+                "{err}"
+            );
+        }
+        let r2 = export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        assert_eq!(r2.commits_exported, 0);
+        assert_eq!(r2.mapping.entries.len(), 3);
+        verify_git_tree(repo.path()).unwrap();
+
+        // 3. Commit that drops `temp-graph` fails mid-sync right AFTER removing the stale graph
+        //    file -> retry succeeds cleanly.
+        ds.update("DROP GRAPH <http://example.org/temp-graph>")
+            .unwrap();
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                fail_after_first_removal: true,
+                ..Default::default()
+            });
+            let err =
+                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap_err();
+            assert!(err.to_string().contains("first worktree removal"), "{err}");
+        }
+        let r3 = export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        assert_eq!(r3.commits_exported, 0);
+        assert_eq!(r3.mapping.entries.len(), 4);
+        verify_git_tree(repo.path()).unwrap();
+
+        // 4. Branch switch from `main` to `feat` fails AFTER `symbolic-ref HEAD` and BEFORE
+        //    swapping `.git/index` -> retry recovers prior checkout identity and finishes.
+        ds.create_branch("feat", &crate::branch::BranchOptions::default())
+            .unwrap();
+        let feat = ds.branch("feat").unwrap();
+        feat.transaction(|tx| {
             tx.insert(
                 Quad::new(
-                    NamedNode::new_unchecked("http://example.org/s"),
+                    NamedNode::new_unchecked("http://example.org/feat-s"),
                     NamedNode::new_unchecked("http://example.org/p"),
-                    Literal::from(1i64),
-                    GraphName::DefaultGraph,
+                    Literal::from(99i64),
+                    GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/feat-g")),
                 )
                 .as_ref(),
             )?;
             Ok(())
         })
         .unwrap();
+        let feat_opts = GitExportOptions {
+            branch: Some("feat".into()),
+            ..GitExportOptions::default()
+        };
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                fail_after_symbolic_ref: true,
+                ..Default::default()
+            });
+            let err = export_branch_to_git(&ds, repo.path(), &feat_opts).unwrap_err();
+            assert!(
+                err.to_string().contains("symbolic-ref before index"),
+                "{err}"
+            );
+        }
+        let r_feat = export_branch_to_git(&ds, repo.path(), &feat_opts).unwrap();
+        assert!(!r_feat.mapping.entries.is_empty());
+        verify_git_tree(repo.path()).unwrap();
+        assert_eq!(
+            git_symbolic_ref_opt(repo.path()).as_deref(),
+            Some("refs/heads/feat")
+        );
 
+        // 5. Journaled no-op branch switch back from `feat` to `main` (0 new commits) fails
+        //    mid-sync after first blob write, then fails after symbolic-ref -> retry recovers
+        //    cleanly and lands on `main`.
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                fail_after_first_blob_write: true,
+                ..Default::default()
+            });
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        }
+        // Exporting `feat` while `main` has an unreconciled pending journal must refuse.
+        assert!(export_branch_to_git(&ds, repo.path(), &feat_opts).is_err());
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                fail_after_symbolic_ref: true,
+                ..Default::default()
+            });
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        }
+        let r_back = export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        assert_eq!(r_back.commits_exported, 0);
+        assert_eq!(
+            git_symbolic_ref_opt(repo.path()).as_deref(),
+            Some("refs/heads/main")
+        );
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[test]
+    fn concurrent_staging_and_tracked_edits_are_preserved_before_and_after_ref_update() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+        let insert_n = |n: i64| {
+            ds.transaction(|tx| {
+                tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked(format!("http://example.org/s{n}")),
+                        NamedNode::new_unchecked("http://example.org/p"),
+                        Literal::from(n),
+                        GraphName::DefaultGraph,
+                    )
+                    .as_ref(),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        };
+        insert_n(1);
+
+        // 1. Concurrent `git add SNEAKY.txt` after initial clean check on unborn branch:
+        //    export aborts before moving ref AND `SNEAKY.txt` remains staged in `.git/index`.
         let repo = tempfile::tempdir().unwrap();
         {
             let _g = test_hooks::install(test_hooks::FaultState {
-                inject_concurrent_stage: Some(("SNEAKY.txt".into(), b"do not commit\n".to_vec())),
+                inject_concurrent_stage: Some(("SNEAKY.txt".into(), b"do not lose me\n".to_vec())),
                 ..Default::default()
             });
-            let report =
-                export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
-            assert_eq!(report.commits_exported, 1);
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
         }
-        let tree_files =
-            run_git(repo.path(), &["ls-tree", "-r", "--name-only", "HEAD"], &[]).unwrap();
+        let staged_after = run_git(repo.path(), &["ls-files", "--cached"], &[]).unwrap();
         assert!(
-            !tree_files.contains("SNEAKY.txt"),
-            "concurrently staged file leaked into Sparkles commit: {tree_files}"
+            staged_after.contains("SNEAKY.txt"),
+            "concurrently staged file must remain staged in .git/index: {staged_after:?}"
         );
+        assert!(
+            git_rev_parse_opt(repo.path(), "refs/heads/main")
+                .unwrap()
+                .is_none(),
+            "ref must not advance when index changed before update-ref"
+        );
+        // Unstage SNEAKY.txt and complete initial export cleanly.
+        run_git(repo.path(), &["rm", "--cached", "SNEAKY.txt"], &[]).unwrap();
+        fs::remove_file(repo.path().join("SNEAKY.txt")).unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+
+        // 2. Concurrent `git add SNEAKY2.txt` AFTER update-ref (right before worktree sync):
+        //    commit does NOT contain SNEAKY2.txt, sync refuses to wipe `.git/index`, and
+        //    `SNEAKY2.txt` remains staged until the caller clears it.
+        insert_n(2);
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                inject_stage_before_sync: Some((
+                    "SNEAKY2.txt".into(),
+                    b"staged after update-ref\n".to_vec(),
+                )),
+                ..Default::default()
+            });
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        }
+        let commit2_files = run_git(
+            repo.path(),
+            &["ls-tree", "-r", "--name-only", "refs/heads/main"],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !commit2_files.contains("SNEAKY2.txt"),
+            "concurrently staged file leaked into published commit: {commit2_files}"
+        );
+        let staged2 = run_git(repo.path(), &["ls-files", "--cached"], &[]).unwrap();
+        assert!(
+            staged2.contains("SNEAKY2.txt"),
+            "SNEAKY2.txt must remain staged in .git/index after sync refusal: {staged2:?}"
+        );
+        run_git(repo.path(), &["rm", "--cached", "SNEAKY2.txt"], &[]).unwrap();
+        fs::remove_file(repo.path().join("SNEAKY2.txt")).unwrap();
+        export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
         verify_git_tree(repo.path()).unwrap();
+
+        // 3. Concurrent unstaged edit to previously tracked `graphs/default.ttl` AFTER
+        //    update-ref (right before worktree sync): sync refuses and preserves local edit!
+        insert_n(3);
+        let original_ttl = fs::read(repo.path().join("graphs/default.ttl")).unwrap();
+        let local_edit = b"# user local edit in progress\n";
+        {
+            let _g = test_hooks::install(test_hooks::FaultState {
+                inject_tracked_edit_before_sync: Some((
+                    "graphs/default.ttl".into(),
+                    local_edit.to_vec(),
+                )),
+                ..Default::default()
+            });
+            assert!(export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).is_err());
+        }
+        assert_eq!(
+            fs::read(repo.path().join("graphs/default.ttl")).unwrap(),
+            local_edit,
+            "sync must NOT overwrite concurrent local edit to a tracked file"
+        );
+        // Restoring original tracked bytes lets pending recovery complete cleanly.
+        fs::write(repo.path().join("graphs/default.ttl"), original_ttl).unwrap();
+        let r3 = export_branch_to_git(&ds, repo.path(), &GitExportOptions::default()).unwrap();
+        assert_eq!(r3.mapping.entries.len(), 3);
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[test]
+    fn near_limit_mapping_recovers_cleanly_through_compact_pending_journal() {
+        // Construct a valid CommitMapping with enough entries that pretty-printing it inside
+        // PendingPublication (adding 2-space indentation per nested line) would exceed
+        // `standalone_len + 64 KiB`, while compact serialization stays well below the ceiling.
+        let ds_id = Uuid::new_v4();
+        let br_id = Uuid::new_v4();
+        let entries: Vec<CommitMappingEntry> = (1..=4500u64)
+            .map(|seq| CommitMappingEntry {
+                sparkles_branch_id: br_id,
+                sparkles_branch: Some("main".to_string()),
+                sparkles_seq: seq,
+                git_sha: format!("{seq:040x}"),
+                mode: GitExportMode::Commits,
+                timestamp_ms: 1_700_000_000_000 + seq as i64,
+                squashed_from: None,
+            })
+            .collect();
+        let mapping = CommitMapping {
+            format_version: MAPPING_FORMAT_VERSION,
+            profile: MAPPING_PROFILE_NAME.to_string(),
+            dataset_id: ds_id,
+            branch: "main".to_string(),
+            branch_id: br_id,
+            git_branch: "main".to_string(),
+            syntax: CanonicalSyntax::Turtle,
+            entries,
+        };
+        let standalone = mapping.serialize_bounded(u64::MAX).unwrap();
+        let exact_limit = standalone.len() as u64;
+        assert!(mapping.serialize_bounded(exact_limit).is_ok());
+
+        let pending = PendingPublication {
+            format_version: MAPPING_FORMAT_VERSION,
+            mapping_path: PathBuf::from("/tmp/mapping.json"),
+            ref_name: "refs/heads/main".to_string(),
+            old_ref_sha: Some(format!("{:040x}", 4499u64)),
+            prev_checkout_sha: Some(format!("{:040x}", 4499u64)),
+            prev_head_ref: Some("refs/heads/main".to_string()),
+            new_commit_sha: format!("{:040x}", 4500u64),
+            mapping: Some(mapping),
+        };
+        let pretty_nested = serde_json::to_vec_pretty(&pending).unwrap();
+        assert!(
+            pretty_nested.len() as u64 > max_pending_journal_bytes(exact_limit),
+            "test setup must exceed old pretty-printed journal ceiling"
+        );
+        let compact = serialize_pending_bounded(&pending, exact_limit).unwrap();
+        assert!(
+            compact.len() as u64 <= max_pending_journal_bytes(exact_limit),
+            "compact pending journal ({}) must fit within reader ceiling ({})",
+            compact.len(),
+            max_pending_journal_bytes(exact_limit)
+        );
+        let parsed: PendingPublication = serde_json::from_slice(&compact).unwrap();
+        assert_eq!(parsed.mapping.unwrap().entries.len(), 4500);
     }
 }

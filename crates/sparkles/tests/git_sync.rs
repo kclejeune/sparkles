@@ -2812,3 +2812,354 @@ fn strict_verify_rejects_noncanonical_blank_node_labels_in_graph_and_quads() {
         "expected c14n00 rejection, got: {err2:?}"
     );
 }
+
+// ================================================================================
+// Round 3 regression tests (D1–D12)
+// ================================================================================
+
+#[cfg(unix)]
+#[test]
+fn symlinked_ancestor_with_existing_or_missing_leaf_rejected_everywhere() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().unwrap();
+    let real_sub = outside.path().join("real-sub");
+    fs::create_dir(&real_sub).unwrap();
+    let real_tree = outside.path().join("real-tree");
+    let q = Quad::new(
+        nn("http://example.org/s"),
+        nn("http://example.org/p"),
+        Literal::from(1i64),
+        GraphName::DefaultGraph,
+    );
+    write_git_tree(
+        vec![q.clone()],
+        &BTreeMap::new(),
+        &real_tree,
+        &WriteOptions::default(),
+    )
+    .unwrap();
+
+    let holder = tempfile::tempdir().unwrap();
+    let link = holder.path().join("link-parent");
+    symlink(outside.path(), &link).unwrap();
+
+    // Existing leaf under symlinked ancestor (`link/real-sub`) AND missing leaf under
+    // existing subdir beneath symlinked ancestor (`link/real-sub/missing-leaf`).
+    for target in [link.join("real-sub"), link.join("real-sub/missing-leaf")] {
+        let err = write_git_tree(
+            vec![q.clone()],
+            &BTreeMap::new(),
+            &target,
+            &WriteOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GitError::UnsafePath { .. }),
+            "write_git_tree must reject symlinked ancestor {target:?}, got {err:?}"
+        );
+    }
+    assert!(!real_sub.join(".sparkles-git").exists());
+    assert!(!real_sub.join("missing-leaf").exists());
+
+    let err_v = verify_git_tree(&link.join("real-tree")).unwrap_err();
+    assert!(
+        matches!(err_v, GitError::UnsafePath { .. }),
+        "verify_git_tree must reject symlinked ancestor, got {err_v:?}"
+    );
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    for target in [link.join("real-sub"), link.join("real-sub/missing-repo")] {
+        let err_e = sparkles::git::export_branch_to_git(&ds, &target, &GitExportOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(err_e, GitError::UnsafePath { .. }),
+            "export_git must reject symlinked ancestor {target:?}, got {err_e:?}"
+        );
+    }
+    assert!(!real_sub.join(".git").exists());
+
+    // Custom mapping parent beneath a symlinked ancestor must also be rejected.
+    let valid_repo = tempfile::tempdir().unwrap();
+    for map_dest in [
+        link.join("real-sub/map.json"),
+        link.join("real-sub/missing-dir/map.json"),
+    ] {
+        let err_m = sparkles::git::export_branch_to_git(
+            &ds,
+            valid_repo.path(),
+            &GitExportOptions {
+                mapping_path: Some(map_dest.clone()),
+                ..GitExportOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err_m, GitError::UnsafePath { .. }),
+            "export_git must reject mapping under symlinked ancestor {map_dest:?}, got {err_m:?}"
+        );
+    }
+}
+
+#[test]
+fn custom_mapping_rejects_published_paths_pending_journal_and_missing_dotdot() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main", repo.path().to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let bad_destinations = [
+        repo.path().join(".sparkles-git/manifest.json"),
+        repo.path().join("graphs/default.ttl"),
+        repo.path().join(".git/sparkles/pending/custom.json"),
+        repo.path().join(".git/index"),
+        repo.path().join("missing-dir/../mapping.json"),
+    ];
+    for dest in bad_destinations {
+        let err = sparkles::git::export_branch_to_git(
+            &ds,
+            repo.path(),
+            &GitExportOptions {
+                mapping_path: Some(dest.clone()),
+                ..GitExportOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GitError::UnsafePath { .. }),
+            "expected UnsafePath for overlapping/invalid mapping {dest:?}, got {err:?}"
+        );
+        let head = Command::new("git")
+            .args([
+                "-C",
+                repo.path().to_str().unwrap(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !head.status.success(),
+            "rejected mapping {dest:?} must not publish any Git commit"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn required_clean_and_smudge_filters_never_run_while_raw_byte_edits_are_caught() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    let sentinel = repo.path().join("FILTER_RAN_SENTINEL");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main", repo.path().to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(
+        repo.path().join(".gitattributes"),
+        "*.ttl filter=sentinel\n",
+    )
+    .unwrap();
+    let hook_cmd = format!("sh -c 'touch {} && exit 1'", sentinel.display());
+    for (k, v) in [
+        ("filter.sentinel.required", "true"),
+        ("filter.sentinel.clean", hook_cmd.as_str()),
+        ("filter.sentinel.smudge", hook_cmd.as_str()),
+    ] {
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.path().to_str().unwrap(), "config", k, v])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    // Export 1 and incremental Export 2 must succeed without ever invoking the clean/smudge
+    // filter (which would create SENTINEL and exit 1).
+    ds.export_git(repo.path(), &GitExportOptions::default())
+        .unwrap();
+    assert!(!sentinel.exists(), "clean/smudge filter must never run");
+
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 2 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    ds.export_git(repo.path(), &GitExportOptions::default())
+        .unwrap();
+    assert!(
+        !sentinel.exists(),
+        "clean/smudge filter must never run on incremental export"
+    );
+    verify_git_tree(repo.path()).unwrap();
+
+    // Mutate raw line endings (`\n` -> `\r\n`) on `graphs/default.ttl`: our raw byte check
+    // must detect and refuse the local edit without calling the filter.
+    let ttl_path = repo.path().join("graphs/default.ttl");
+    let raw = fs::read_to_string(&ttl_path).unwrap();
+    let crlf = raw.replace('\n', "\r\n");
+    assert_ne!(raw, crlf);
+    fs::write(&ttl_path, crlf).unwrap();
+
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 3 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    let err = ds
+        .export_git(repo.path(), &GitExportOptions::default())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("uncommitted modifications"),
+        "expected raw-byte dirty worktree refusal, got: {err}"
+    );
+    assert!(
+        !sentinel.exists(),
+        "clean filter must not run even when worktree is dirty"
+    );
+}
+
+#[test]
+fn single_byte_valid_utf8_author_flip_in_flushed_changelog_fails_crc() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("db");
+    let ds = Dataset::open(&db_path).unwrap();
+    ds.transaction_receipt_with(
+        StoreWriteOptions {
+            author: Some(Arc::from("AliceExample <alice@example.org>")),
+            message: Some(Arc::from("Initial commit")),
+            ..Default::default()
+        },
+        |tx| {
+            tx.insert(
+                Quad::new(
+                    nn("http://example.org/s1"),
+                    nn("http://example.org/p"),
+                    Literal::from(1i64),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            )?;
+            Ok(())
+        },
+    )
+    .unwrap();
+    ds.store().flush_change_log().unwrap();
+
+    // Flip ONE ASCII byte inside the author name (`AliceExample` -> `ZliceExample`), keeping
+    // the frame length, UTF-8 validity, and sequence number completely intact so ONLY CRC
+    // verification catches the damage.
+    let cl_dir = db_path.join("changes");
+    let needle = b"AliceExample";
+    let mut flipped = false;
+    for entry in fs::read_dir(&cl_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|s| s.to_str()) == Some("log") {
+            let mut bytes = fs::read(&path).unwrap();
+            if let Some(pos) = bytes.windows(needle.len()).position(|w| w == needle) {
+                bytes[pos] = b'Z';
+                fs::write(&path, bytes).unwrap();
+                flipped = true;
+            }
+        }
+    }
+    assert!(
+        flipped,
+        "expected to find author bytes in flushed .log segment"
+    );
+
+    let repo = tempfile::tempdir().unwrap();
+    let err = ds
+        .export_git(repo.path(), &GitExportOptions::default())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("CRC") || err.to_string().contains("corrupt"),
+        "expected CRC corruption refusal on valid-UTF-8 author bit-flip, got: {err}"
+    );
+    let head = Command::new("git")
+        .args([
+            "-C",
+            repo.path().to_str().unwrap(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !head.status.success(),
+        "CRC-corrupted changelog must fail before publishing any Git commit"
+    );
+}
+
+#[test]
+fn duplicate_input_quads_cannot_bypass_canonicalization_budget() {
+    // Symmetric K_10 clique of blank nodes exceeds `max_ambiguous_group = 8`.
+    // Adding `i` duplicate copies of one incident edge per node `k_i` gives every node a
+    // distinct un-deduplicated 1-hop signature, which previously fooled preflight before
+    // `oxrdf::Dataset` deduplicated them back into a symmetric clique.
+    let mut quads = Vec::new();
+    let p = nn("http://example.org/p");
+    for i in 0..10usize {
+        for j in 0..10usize {
+            if i != j {
+                let q = Quad::new(
+                    BlankNode::new(format!("k{i}")).unwrap(),
+                    p.clone(),
+                    BlankNode::new(format!("k{j}")).unwrap(),
+                    GraphName::DefaultGraph,
+                );
+                quads.push(q.clone());
+                if j == (i + 1) % 10 {
+                    for _ in 0..i {
+                        quads.push(q.clone());
+                    }
+                }
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let err = write_git_tree(
+        quads,
+        &BTreeMap::new(),
+        dir.path(),
+        &WriteOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, GitError::Format(ref m) if m.contains("budget exceeded")),
+        "duplicate input quads must not bypass canonicalization budget, got: {err:?}"
+    );
+}

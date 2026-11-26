@@ -364,17 +364,44 @@ pub(crate) fn write_git_tree_tracked(
     dir: &Path,
     options: &WriteOptions,
 ) -> GitResult<(CanonicalManifest, Vec<String>)> {
-    // 1. Read-only preflight of root, managed subdirectories, and any prior manifest BEFORE
-    //    creating directories, canonicalizing, or mutating any files.
+    // 1. Read-only preflight of root, managed subdirectories, and any prior manifest or
+    //    interrupted write journal BEFORE creating directories, canonicalizing, or mutating
+    //    any files.
     let (clean_dir, dir_exists) = preflight_target_dir_no_symlink(dir)?;
-    let prior_owned = if dir_exists {
+    let (prior_owned, pending_prior) = if dir_exists {
         preflight_optional_child_dir_no_symlink(&clean_dir, METADATA_DIR)?;
         preflight_optional_child_dir_no_symlink(&clean_dir, GRAPHS_DIR)?;
         let manifest_path = resolve_safe_path(&clean_dir, MANIFEST_REL_PATH)?;
-        read_prior_owned_graph_paths(&manifest_path, options.max_manifest_bytes)?
+        let prior = read_prior_owned_graph_paths(&manifest_path, options.max_manifest_bytes)?;
+        let pending_path = resolve_safe_path(&clean_dir, PENDING_WRITE_REL_PATH)?;
+        let pending = read_pending_tree_write(&pending_path, options.max_manifest_bytes)?;
+        if let Some(ref p) = pending
+            && prior != p.prior_graphs
+            && prior != p.target_graphs
+        {
+            return Err(GitError::InvalidManifest(
+                "pending tree write record does not match current manifest".into(),
+            ));
+        }
+        (prior, pending)
     } else {
-        BTreeMap::new()
+        (BTreeMap::new(), None)
     };
+    let mut owned_candidates: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (rel, sha) in &prior_owned {
+        owned_candidates
+            .entry(rel.clone())
+            .or_default()
+            .push(sha.clone());
+    }
+    if let Some(ref p) = pending_prior {
+        for (rel, sha) in p.prior_graphs.iter().chain(p.target_graphs.iter()) {
+            let list = owned_candidates.entry(rel.clone()).or_default();
+            if !list.contains(sha) {
+                list.push(sha.clone());
+            }
+        }
+    }
 
     // 2. Bounded dataset-wide RDFC-1.0 canonicalization (preserving composite literal
     //    `cdt:List` / `cdt:Map` blank-node links).
@@ -417,16 +444,20 @@ pub(crate) fn write_git_tree_tracked(
     if dir_exists {
         for (_, rel_path, _) in &planned {
             let full_path = resolve_safe_path(&clean_dir, rel_path)?;
+            let expected = owned_candidates
+                .get(rel_path)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             preflight_owned_graph_file(
                 &full_path,
                 rel_path,
-                prior_owned.get(rel_path).map(String::as_str),
+                expected,
                 options.max_graph_file_bytes,
                 "overwrite",
             )?;
         }
         if options.prune_stale_graphs {
-            for (rel, expected_sha) in &prior_owned {
+            for (rel, expected_shas) in &owned_candidates {
                 if used_paths.contains(rel) {
                     continue;
                 }
@@ -434,7 +465,7 @@ pub(crate) fn write_git_tree_tracked(
                 if preflight_owned_graph_file(
                     &full_path,
                     rel,
-                    Some(expected_sha.as_str()),
+                    expected_shas,
                     options.max_graph_file_bytes,
                     "prune",
                 )? {
@@ -526,13 +557,50 @@ pub(crate) fn write_git_tree_tracked(
         },
     )?;
 
-    // 9. Commit staged graph files, prune verified stale files, and publish manifest.
+    // 8.5. Persist a versioned pending-write journal before mutating any graph files or
+    //      pruning stale files so an interruption mid-write remains cleanly recoverable on
+    //      retry without relaxing strict collision ownership checks.
+    let pending_path = resolve_safe_path(&clean_dir, PENDING_WRITE_REL_PATH)?;
+    let target_graphs: BTreeMap<String, String> = manifest
+        .graphs
+        .iter()
+        .map(|g| (g.path.clone(), g.sha256.clone()))
+        .collect();
+    let pending_prior_graphs = match &pending_prior {
+        Some(p) if prior_owned == p.prior_graphs => p.prior_graphs.clone(),
+        _ => prior_owned,
+    };
+    let pending_write = PendingTreeWrite {
+        format_version: MANIFEST_FORMAT_VERSION,
+        prior_graphs: pending_prior_graphs,
+        target_graphs,
+    };
+    let pending_bytes = serde_json::to_vec(&pending_write).map_err(|e| {
+        GitError::InvalidManifest(format!("failed to serialize pending write: {e}"))
+    })?;
+    let pending_cap = max_pending_write_bytes(options.max_manifest_bytes);
+    if pending_bytes.len() as u64 > pending_cap {
+        return Err(GitError::Format(format!(
+            "{PENDING_WRITE_REL_PATH} ({} bytes) exceeds maximum pending write size ({pending_cap} bytes)",
+            pending_bytes.len()
+        )));
+    }
+    write_atomic_safe(&pending_path, &pending_bytes)?;
+
+    // 9. Commit staged graph files, prune verified stale files, publish manifest, and clear
+    //    the pending-write journal.
     let wrote_graphs = !staged_graphs.is_empty();
-    for (temp_path, full_path) in staged_graphs {
+    for (idx, (temp_path, full_path)) in staged_graphs.into_iter().enumerate() {
         check_dest_file_not_symlink(&full_path)?;
         temp_path
             .persist(&full_path)
             .map_err(|e| GitError::io(&full_path, e.error))?;
+        #[cfg(test)]
+        if idx == 0 {
+            profile_test_hooks::after_first_graph_persist()?;
+        }
+        #[cfg(not(test))]
+        let _ = idx;
     }
 
     let mut pruned_paths = Vec::new();
@@ -551,6 +619,10 @@ pub(crate) fn write_git_tree_tracked(
                     if meta.file_type().is_file() {
                         fs::remove_file(&full).map_err(|e| GitError::io(&full, e))?;
                         pruned_paths.push(rel);
+                        #[cfg(test)]
+                        if pruned_paths.len() == 1 {
+                            profile_test_hooks::after_first_graph_prune()?;
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -568,8 +640,97 @@ pub(crate) fn write_git_tree_tracked(
         .persist(&manifest_path)
         .map_err(|e| GitError::io(&manifest_path, e.error))?;
     fsutil::sync_dir(&meta_dir).map_err(|e| GitError::io(&meta_dir, e))?;
+    #[cfg(test)]
+    profile_test_hooks::after_manifest_persist()?;
+    match fs::remove_file(&pending_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(GitError::io(&pending_path, e)),
+    }
+    fsutil::sync_dir(&meta_dir).map_err(|e| GitError::io(&meta_dir, e))?;
 
     Ok((manifest, pruned_paths))
+}
+
+const PENDING_WRITE_REL_PATH: &str = ".sparkles-git/pending-write.json";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingTreeWrite {
+    format_version: u32,
+    prior_graphs: BTreeMap<String, String>,
+    target_graphs: BTreeMap<String, String>,
+}
+
+fn max_pending_write_bytes(max_manifest_bytes: u64) -> u64 {
+    max_manifest_bytes
+        .saturating_mul(2)
+        .saturating_add(64 * 1024)
+}
+
+fn read_pending_tree_write(
+    pending_path: &Path,
+    max_manifest_bytes: u64,
+) -> GitResult<Option<PendingTreeWrite>> {
+    match fs::symlink_metadata(pending_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(GitError::UnsafePath {
+                    path: PENDING_WRITE_REL_PATH.to_string(),
+                    reason: "pending write file must not be a symlink".into(),
+                });
+            }
+            if !meta.file_type().is_file() {
+                return Err(GitError::UnsafePath {
+                    path: PENDING_WRITE_REL_PATH.to_string(),
+                    reason: "pending write path is not a regular file".into(),
+                });
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(GitError::io(pending_path, e)),
+    }
+    let bytes = read_bounded_regular_file(
+        pending_path,
+        PENDING_WRITE_REL_PATH,
+        max_pending_write_bytes(max_manifest_bytes),
+    )?;
+    reject_duplicate_json_keys(&bytes)
+        .map_err(|e| GitError::InvalidManifest(format!("malformed pending write JSON: {e}")))?;
+    let raw: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| GitError::InvalidManifest(format!("malformed pending write JSON: {e}")))?;
+    let version_val = raw
+        .as_object()
+        .and_then(|o| o.get("format_version"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            GitError::InvalidManifest(
+                "pending write record missing non-negative format_version".into(),
+            )
+        })?;
+    let found = u32::try_from(version_val).unwrap_or(u32::MAX);
+    if found != MANIFEST_FORMAT_VERSION {
+        return Err(GitError::UnsupportedFormatVersion {
+            file: PENDING_WRITE_REL_PATH.to_string(),
+            found,
+            supported: MANIFEST_FORMAT_VERSION,
+        });
+    }
+    let pending: PendingTreeWrite = serde_json::from_value(raw)
+        .map_err(|e| GitError::InvalidManifest(format!("invalid pending write fields: {e}")))?;
+    for (rel, sha) in pending
+        .prior_graphs
+        .iter()
+        .chain(pending.target_graphs.iter())
+    {
+        validate_relative_path(rel)?;
+        if !is_sha256_hex(sha) {
+            return Err(GitError::InvalidManifest(format!(
+                "invalid sha256 digest in pending write record for {rel:?}"
+            )));
+        }
+    }
+    Ok(Some(pending))
 }
 
 /// Read and strictly validate an existing `.sparkles-git/manifest.json` (if present),
@@ -608,13 +769,14 @@ fn read_prior_owned_graph_paths(
 
 /// Preflight a graph path on disk before overwriting or pruning it.
 ///
-/// Returns `Ok(true)` if the file exists and is verified to match `expected_sha`, `Ok(false)`
-/// if it does not exist, or an `UnsafePath` error if the path is a symlink, non-regular
-/// file, unmanaged (`expected_sha == None`), or modified relative to the prior manifest.
+/// Returns `Ok(true)` if the file exists and is verified to match one of `expected_shas`,
+/// `Ok(false)` if it does not exist, or an `UnsafePath` error if the path is a symlink,
+/// non-regular file, unmanaged (`expected_shas.is_empty()`), or modified relative to the
+/// verified manifest / pending write checksums.
 fn preflight_owned_graph_file(
     full_path: &Path,
     rel_path: &str,
-    expected_sha: Option<&str>,
+    expected_shas: &[String],
     max_graph_file_bytes: u64,
     verb: &str,
 ) -> GitResult<bool> {
@@ -636,12 +798,12 @@ fn preflight_owned_graph_file(
             }
         }
     }
-    let Some(expected) = expected_sha else {
+    if expected_shas.is_empty() {
         return Err(GitError::UnsafePath {
             path: rel_path.to_string(),
             reason: format!("refusing to {verb} unmanaged file {rel_path:?}"),
         });
-    };
+    }
     let (file, len) = open_regular_file_no_symlink(full_path, rel_path)?;
     if len > max_graph_file_bytes {
         return Err(GitError::UnsafePath {
@@ -655,7 +817,7 @@ fn preflight_owned_graph_file(
     let mut reader = BoundedHashingReader::new(file, max_graph_file_bytes, rel_path.to_string());
     reader.drain_to_eof()?;
     let (_, actual_sha) = reader.finish();
-    if actual_sha != expected {
+    if !expected_shas.iter().any(|s| s == &actual_sha) {
         return Err(GitError::UnsafePath {
             path: rel_path.to_string(),
             reason: format!(
@@ -1361,8 +1523,21 @@ pub(crate) fn normalize_dir_for_lstat(path: &Path) -> GitResult<PathBuf> {
                                 reason: "path traverses a symlink component before '..'".into(),
                             });
                         }
+                        Ok(meta) if !meta.file_type().is_dir() => {
+                            return Err(GitError::UnsafePath {
+                                path: path.display().to_string(),
+                                reason: "path traverses a non-directory component before '..'"
+                                    .into(),
+                            });
+                        }
                         Ok(_) => {}
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                            return Err(GitError::UnsafePath {
+                                path: path.display().to_string(),
+                                reason: "path traverses a non-existent component before '..'"
+                                    .into(),
+                            });
+                        }
                         Err(e) => return Err(GitError::io(&out, e)),
                     }
                     out.pop();
@@ -1434,21 +1609,75 @@ fn reject_trailing_sep_on_file_path(path: &Path) -> GitResult<()> {
     Ok(())
 }
 
+/// Walk every component of `clean` that exists on disk and verify none is a symlink or
+/// non-directory. Applies the symlink rule consistently across existing and missing
+/// destinations (including roots or mapping parents below a symlinked ancestor).
+pub(crate) fn verify_no_symlink_components(clean: &Path, label: &str) -> GitResult<()> {
+    let mut cur = PathBuf::new();
+    for comp in clean.components() {
+        match comp {
+            Component::Prefix(p) => cur.push(p.as_os_str()),
+            Component::RootDir => cur.push(comp.as_os_str()),
+            Component::CurDir => {
+                if cur.as_os_str().is_empty() {
+                    cur.push(".");
+                }
+            }
+            Component::ParentDir => cur.push(".."),
+            Component::Normal(seg) => {
+                cur.push(seg);
+                #[cfg(target_os = "macos")]
+                if cur == Path::new("/var") || cur == Path::new("/tmp") || cur == Path::new("/etc")
+                {
+                    continue;
+                }
+                match fs::symlink_metadata(&cur) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            return Err(GitError::UnsafePath {
+                                path: label.to_string(),
+                                reason: format!(
+                                    "path traverses symlink component {}",
+                                    cur.display()
+                                ),
+                            });
+                        }
+                        if !meta.file_type().is_dir() {
+                            return Err(GitError::UnsafePath {
+                                path: label.to_string(),
+                                reason: format!(
+                                    "ancestor path {} is not a directory",
+                                    cur.display()
+                                ),
+                            });
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                    Err(e) => return Err(GitError::io(&cur, e)),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Check `dir` (without creating it) and report whether it already exists. Refuses symlinks
-/// on `dir` (including trailing `/` or `/.`) or on its deepest existing ancestor.
+/// on `dir` (including trailing `/` or `/.`) or on any traversed ancestor component.
 fn preflight_target_dir_no_symlink(dir: &Path) -> GitResult<(PathBuf, bool)> {
     let clean = normalize_dir_for_lstat(dir)?;
+    let label = dir.display().to_string();
+    verify_no_symlink_components(&clean, &label)?;
     match fs::symlink_metadata(&clean) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
                 return Err(GitError::UnsafePath {
-                    path: dir.display().to_string(),
+                    path: label,
                     reason: "target directory must not be a symlink".into(),
                 });
             }
             if !meta.file_type().is_dir() {
                 return Err(GitError::UnsafePath {
-                    path: dir.display().to_string(),
+                    path: label,
                     reason: "target path is not a directory".into(),
                 });
             }
@@ -1526,6 +1755,7 @@ fn verify_deepest_existing_ancestor_no_symlink(clean: &Path) -> GitResult<PathBu
 /// normalized path.
 pub(crate) fn ensure_dir_no_symlink(dir: &Path) -> GitResult<PathBuf> {
     let clean = normalize_dir_for_lstat(dir)?;
+    verify_no_symlink_components(&clean, &dir.display().to_string())?;
     match fs::symlink_metadata(&clean) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -1600,6 +1830,7 @@ pub(crate) fn ensure_dir_no_symlink(dir: &Path) -> GitResult<PathBuf> {
 /// returning its normalized path.
 pub(crate) fn verify_existing_dir_no_symlink(dir: &Path, label: &str) -> GitResult<PathBuf> {
     let clean = normalize_dir_for_lstat(dir)?;
+    verify_no_symlink_components(&clean, label)?;
     let meta = fs::symlink_metadata(&clean).map_err(|e| GitError::io(&clean, e))?;
     if meta.file_type().is_symlink() {
         return Err(GitError::UnsafePath {
@@ -1738,14 +1969,24 @@ pub(crate) fn read_bounded_regular_file(
 /// directory, refusing symlinks on `path` and its parent directory.
 pub(crate) fn write_atomic_safe(path: &Path, bytes: &[u8]) -> GitResult<()> {
     let parent = effective_parent(path)?;
-    let (temp_path, _, _) =
-        stage_atomic_stream_hashed(path, &path.display().to_string(), u64::MAX, |w| {
-            w.write_all(bytes).map_err(|e| GitError::io(path, e))
-        })?;
-    check_dest_file_not_symlink(path)?;
+    let file_name = path.file_name().ok_or_else(|| GitError::UnsafePath {
+        path: path.display().to_string(),
+        reason: "destination path must name a file".into(),
+    })?;
+    let clean_target = parent.join(file_name);
+    let (temp_path, _, _) = stage_atomic_stream_hashed(
+        &clean_target,
+        &clean_target.display().to_string(),
+        u64::MAX,
+        |w| {
+            w.write_all(bytes)
+                .map_err(|e| GitError::io(&clean_target, e))
+        },
+    )?;
+    check_dest_file_not_symlink(&clean_target)?;
     temp_path
-        .persist(path)
-        .map_err(|e| GitError::io(path, e.error))?;
+        .persist(&clean_target)
+        .map_err(|e| GitError::io(&clean_target, e.error))?;
     fsutil::sync_dir(&parent).map_err(|e| GitError::io(&parent, e))?;
     Ok(())
 }
@@ -2036,10 +2277,10 @@ fn canonicalize_dataset_bounded(
     max_blank_nodes: usize,
     max_ambiguous_group: usize,
 ) -> GitResult<RdfDataset> {
-    let mut collected: Vec<Quad> = Vec::new();
+    let mut rdf_dataset = RdfDataset::new();
     let mut has_cdt_bnode = false;
-    for q in quads {
-        if collected.len() >= max_quads {
+    for (input_count, q) in quads.into_iter().enumerate() {
+        if input_count >= max_quads {
             return Err(GitError::Format(format!(
                 "dataset exceeds canonicalization quad limit ({max_quads})"
             )));
@@ -2047,17 +2288,22 @@ fn canonicalize_dataset_bounded(
         if term_has_cdt_bnode(&q.object) {
             has_cdt_bnode = true;
         }
-        collected.push(q);
+        rdf_dataset.insert(q.as_ref());
     }
 
+    // Run canonicalization admission on the exact deduplicated quad set that
+    // `oxrdf::Dataset::canonicalize(RDFC10)` receives so duplicate input quads cannot split
+    // first-degree blank-node signatures in preflight.
+    let distinct: Vec<Quad> = rdf_dataset.iter().map(|q| q.into_owned()).collect();
     if !has_cdt_bnode {
-        check_canonicalization_budget(&collected, max_blank_nodes, max_ambiguous_group)?;
-        let mut rdf_dataset: RdfDataset = collected.into_iter().collect();
+        check_canonicalization_budget(&distinct, max_blank_nodes, max_ambiguous_group)?;
+        drop(distinct);
         rdf_dataset.canonicalize(RDFC10);
         return Ok(rdf_dataset);
     }
 
-    canonicalize_with_cdt_links(collected, max_quads, max_blank_nodes, max_ambiguous_group)
+    drop(rdf_dataset);
+    canonicalize_with_cdt_links(distinct, max_quads, max_blank_nodes, max_ambiguous_group)
 }
 
 fn term_has_cdt_bnode(t: &Term) -> bool {
@@ -2308,8 +2554,10 @@ fn canonicalize_with_cdt_links(
 
     if enc.synth_quads.is_empty() {
         // Every candidate CDT literal was ill-formed, so no links exist.
-        check_canonicalization_budget(&augmented, max_blank_nodes, max_ambiguous_group)?;
         let mut rdf_dataset: RdfDataset = augmented.into_iter().collect();
+        let distinct: Vec<Quad> = rdf_dataset.iter().map(|q| q.into_owned()).collect();
+        check_canonicalization_budget(&distinct, max_blank_nodes, max_ambiguous_group)?;
+        drop(distinct);
         rdf_dataset.canonicalize(RDFC10);
         return Ok(rdf_dataset);
     }
@@ -2320,9 +2568,10 @@ fn canonicalize_with_cdt_links(
             "dataset exceeds canonicalization quad limit ({max_quads}) during composite literal expansion"
         )));
     }
-    check_canonicalization_budget(&augmented, max_blank_nodes, max_ambiguous_group)?;
-
     let mut rdf_dataset: RdfDataset = augmented.into_iter().collect();
+    let distinct: Vec<Quad> = rdf_dataset.iter().map(|q| q.into_owned()).collect();
+    check_canonicalization_budget(&distinct, max_blank_nodes, max_ambiguous_group)?;
+    drop(distinct);
     rdf_dataset.canonicalize(RDFC10);
 
     // Partition canonicalized quads back into real quads and synthetic CDT descriptors.
@@ -3210,6 +3459,78 @@ pub fn dataset_matches_tree(dataset: &Dataset, tree: &CanonicalTree) -> GitResul
 }
 
 #[cfg(test)]
+mod profile_test_hooks {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    pub(super) struct FaultState {
+        pub fail_after_first_graph_persist: bool,
+        pub fail_after_first_graph_prune: bool,
+        pub fail_after_manifest_persist: bool,
+    }
+
+    thread_local! {
+        static FAULTS: RefCell<FaultState> = RefCell::new(FaultState::default());
+    }
+
+    pub(super) struct FaultGuard;
+
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            FAULTS.with(|f| *f.borrow_mut() = FaultState::default());
+        }
+    }
+
+    pub(super) fn install(state: FaultState) -> FaultGuard {
+        FAULTS.with(|f| *f.borrow_mut() = state);
+        FaultGuard
+    }
+
+    pub(super) fn after_first_graph_persist() -> GitResult<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_after_first_graph_persist {
+                s.fail_after_first_graph_persist = false;
+                return Err(GitError::Io {
+                    path: None,
+                    source: io::Error::other("injected failure after first graph persist"),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn after_first_graph_prune() -> GitResult<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_after_first_graph_prune {
+                s.fail_after_first_graph_prune = false;
+                return Err(GitError::Io {
+                    path: None,
+                    source: io::Error::other("injected failure after first graph prune"),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn after_manifest_persist() -> GitResult<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_after_manifest_persist {
+                s.fail_after_manifest_persist = false;
+                return Err(GitError::Io {
+                    path: None,
+                    source: io::Error::other("injected failure after manifest persist"),
+                });
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3265,6 +3586,213 @@ mod tests {
         assert!(
             matches!(err, GitError::InvalidManifest(ref m) if m.contains("duplicate JSON key")),
             "expected duplicate JSON key error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn direct_write_recovers_after_mid_write_graph_persist_prune_and_manifest_interruptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let q_def1 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s1"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(1i64),
+            GraphName::DefaultGraph,
+        );
+        let q_g1 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/a"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from("g1"),
+            GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/g1")),
+        );
+
+        // 1. First write interrupted right after persisting the first graph file (before
+        //    manifest exists): retry must recover cleanly without classifying the written
+        //    graph file as unmanaged.
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                fail_after_first_graph_persist: true,
+                ..Default::default()
+            });
+            let err = write_git_tree(
+                vec![q_def1.clone(), q_g1.clone()],
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("first graph persist"), "{err}");
+        }
+        assert!(dir.path().join(PENDING_WRITE_REL_PATH).is_file());
+        assert!(!dir.path().join(MANIFEST_REL_PATH).exists());
+
+        write_git_tree(
+            vec![q_def1.clone(), q_g1.clone()],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(!dir.path().join(PENDING_WRITE_REL_PATH).exists());
+        let v1 = verify_git_tree(dir.path()).unwrap();
+        assert_eq!(v1.quad_count, 2);
+
+        // 2. Overwrite replacing default.ttl and pruning g1, interrupted after persisting the
+        //    first graph file -> retry succeeds and prunes stale g1 cleanly.
+        let q_def2 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s2"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(2i64),
+            GraphName::DefaultGraph,
+        );
+        let q_g2 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/b"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from("g2"),
+            GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/g2")),
+        );
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                fail_after_first_graph_persist: true,
+                ..Default::default()
+            });
+            assert!(
+                write_git_tree(
+                    vec![q_def2.clone(), q_g2.clone()],
+                    &BTreeMap::new(),
+                    dir.path(),
+                    &WriteOptions::default(),
+                )
+                .is_err()
+            );
+        }
+        write_git_tree(
+            vec![q_def2.clone(), q_g2.clone()],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(!dir.path().join(PENDING_WRITE_REL_PATH).exists());
+        assert_eq!(verify_git_tree(dir.path()).unwrap().quad_count, 2);
+
+        // 3. Overwrite interrupted right after pruning a stale graph file -> retry finishes
+        //    cleanly.
+        let q_def3 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s3"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(3i64),
+            GraphName::DefaultGraph,
+        );
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                fail_after_first_graph_prune: true,
+                ..Default::default()
+            });
+            let err = write_git_tree(
+                vec![q_def3.clone()],
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("first graph prune"), "{err}");
+        }
+        write_git_tree(
+            vec![q_def3.clone()],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(!dir.path().join(PENDING_WRITE_REL_PATH).exists());
+        assert_eq!(verify_git_tree(dir.path()).unwrap().quad_count, 1);
+
+        // 4. Overwrite interrupted after persisting manifest before removing pending journal ->
+        //    retry finishes cleanly.
+        let q_def4 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s4"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(4i64),
+            GraphName::DefaultGraph,
+        );
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                fail_after_manifest_persist: true,
+                ..Default::default()
+            });
+            let err = write_git_tree(
+                vec![q_def4.clone()],
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("manifest persist"), "{err}");
+        }
+        write_git_tree(
+            vec![q_def4.clone()],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(!dir.path().join(PENDING_WRITE_REL_PATH).exists());
+        assert_eq!(verify_git_tree(dir.path()).unwrap().quad_count, 1);
+
+        // 5. After an interrupted write, a foreign local edit matching neither prior nor target
+        //    checksums must STILL be rejected.
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                fail_after_first_graph_persist: true,
+                ..Default::default()
+            });
+            assert!(
+                write_git_tree(
+                    vec![q_def1.clone()],
+                    &BTreeMap::new(),
+                    dir.path(),
+                    &WriteOptions::default(),
+                )
+                .is_err()
+            );
+        }
+        fs::write(
+            dir.path().join("graphs/default.ttl"),
+            b"# user edit neither prior nor target\n",
+        )
+        .unwrap();
+        let err = write_git_tree(
+            vec![q_def1],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, GitError::UnsafePath { .. }), "{err:?}");
+
+        // 6. Unknown format_version in pending-write.json is refused cleanly.
+        fs::write(
+            dir.path().join(PENDING_WRITE_REL_PATH),
+            br#"{"format_version":99}"#,
+        )
+        .unwrap();
+        let err_ver = write_git_tree(
+            vec![q_def4],
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err_ver,
+                GitError::UnsupportedFormatVersion {
+                    found: 99,
+                    supported: 1,
+                    ..
+                }
+            ),
+            "{err_ver:?}"
         );
     }
 }
