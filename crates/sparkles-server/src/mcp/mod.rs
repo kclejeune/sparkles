@@ -447,6 +447,20 @@ impl McpServer {
         Self::new_with_tasks(state, cfg, tasks::Tasks::with_ttl(task_ttl))
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_task_ttl_and_clock(
+        state: Arc<AppState>,
+        cfg: McpConfig,
+        task_ttl: Duration,
+        clock: tasks::ManualClock,
+    ) -> McpServer {
+        Self::new_with_tasks(
+            state,
+            cfg,
+            tasks::Tasks::with_ttl_and_clock(task_ttl, clock),
+        )
+    }
+
     fn new_with_tasks(state: Arc<AppState>, cfg: McpConfig, tasks: tasks::Tasks) -> McpServer {
         let read_only = state.read_only;
         let tools = schemas::tools(&cfg)

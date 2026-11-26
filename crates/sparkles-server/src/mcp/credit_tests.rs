@@ -684,10 +684,12 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
         ..Default::default()
     };
     let (_dir, state, pool) = pooled_state(16 << 20, &ttl, cfg.clone(), 0);
-    // Keep `task_ttl` long enough that a loaded CI runner never times out the running task
-    // or evicts the completed entry before the two `tasks/get` assertions finish, while
-    // keeping total test runtime around ~2 s.
-    let server = McpServer::new_with_task_ttl(state, cfg, Duration::from_secs(2));
+    // Drive task TTL with a deterministic clock so query completion and both `tasks/get`
+    // reads can never race TTL expiry or eviction on loaded CI runners, while still exercising
+    // the real automatic eviction timer when the clock advances past the TTL.
+    let task_clock = super::tasks::ManualClock::new();
+    let task_ttl = Duration::from_secs(60);
+    let server = McpServer::new_with_task_ttl_and_clock(state, cfg, task_ttl, task_clock.clone());
 
     let (client, srv) = tokio::io::duplex(1 << 20);
     let (sr, sw) = tokio::io::split(srv);
@@ -695,25 +697,32 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
     let (cr, mut cw) = tokio::io::split(client);
     let mut lines = BufReader::new(cr).lines();
 
-    async fn send_recv(
+    async fn send_recv_until(
         cw: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
         lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
         msg: Value,
-    ) -> Value {
+        deadline: tokio::time::Instant,
+    ) -> Result<Value, String> {
         let mut s = serde_json::to_string(&msg).unwrap();
         s.push('\n');
-        cw.write_all(s.as_bytes()).await.unwrap();
-        cw.flush().await.unwrap();
-        let line = tokio::time::timeout(Duration::from_secs(20), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        serde_json::from_str::<Value>(&line).unwrap()
+        tokio::time::timeout_at(deadline, async {
+            cw.write_all(s.as_bytes())
+                .await
+                .map_err(|e| format!("write failed: {e}"))?;
+            cw.flush().await.map_err(|e| format!("flush failed: {e}"))?;
+            let line = lines
+                .next_line()
+                .await
+                .map_err(|e| format!("read failed: {e}"))?
+                .ok_or_else(|| "stdio closed before reply".to_string())?;
+            serde_json::from_str::<Value>(&line).map_err(|e| format!("invalid JSON reply: {e}"))
+        })
+        .await
+        .map_err(|_| "timed out waiting for stdio reply before deadline".to_string())?
     }
 
     // Start tool call that immediately becomes a background task (`task_after = 0`).
-    let start_reply = send_recv(
+    let start_reply = send_recv_until(
         &mut cw,
         &mut lines,
         json!({
@@ -726,8 +735,10 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
                 "arguments": large_query_args(512 << 10)
             }
         }),
+        tokio::time::Instant::now() + Duration::from_secs(20),
     )
-    .await;
+    .await
+    .unwrap_or_else(|e| panic!("tools/call failed: {e}"));
     let task_id = match start_reply["result"]["taskId"].as_str() {
         Some(id) => id.to_string(),
         None => {
@@ -738,10 +749,11 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
     // Poll `tasks/get` until completed.
     let mut completed = None;
     let mut last_reply = None;
-    let poll_deadline = Instant::now() + Duration::from_secs(20);
+    let mut poll_error = None;
+    let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut poll_id = 52u64;
-    while Instant::now() < poll_deadline {
-        let r = send_recv(
+    while tokio::time::Instant::now() < poll_deadline {
+        let r = match send_recv_until(
             &mut cw,
             &mut lines,
             json!({
@@ -753,8 +765,16 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
                     "taskId": task_id
                 }
             }),
+            poll_deadline,
         )
-        .await;
+        .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                poll_error = Some(err);
+                break;
+            }
+        };
         poll_id += 1;
         if r["result"]["status"] == "completed" {
             completed = Some(r);
@@ -766,12 +786,14 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
         if terminal_failure {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let next_poll =
+            (tokio::time::Instant::now() + Duration::from_millis(20)).min(poll_deadline);
+        tokio::time::sleep_until(next_poll).await;
     }
     let completed = completed.unwrap_or_else(|| {
         panic!(
-            "task {task_id} should complete before deadline; last reply: {:?}",
-            last_reply
+            "task {task_id} should complete before deadline (error: {:?}); last reply: {:?}",
+            poll_error, last_reply
         )
     });
     assert_eq!(
@@ -796,7 +818,7 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
     );
 
     // A second `tasks/get` poll on the 16 MiB pool must succeed without deadlocking.
-    let again = send_recv(
+    let again = send_recv_until(
         &mut cw,
         &mut lines,
         json!({
@@ -808,14 +830,26 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
                 "taskId": task_id
             }
         }),
+        tokio::time::Instant::now() + Duration::from_secs(20),
     )
-    .await;
+    .await
+    .unwrap_or_else(|e| panic!("second tasks/get failed: {e}"));
     assert_eq!(again["result"]["resultType"], "complete", "{again}");
     assert_eq!(again["result"]["status"], "completed", "{again}");
     assert_eq!(again["result"]["result"]["isError"], false);
 
-    // Wait past the 2 s task TTL: automatic eviction timer must drop the retained result
-    // and return QueryPool credit to 0 without any further client calls.
+    // Just before the TTL elapses, the retained result and its credit must still be held.
+    task_clock.advance(task_ttl - Duration::from_millis(1));
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pool.granted(),
+        held,
+        "completed task evicted before its TTL elapsed"
+    );
+
+    // Advance past the task TTL: automatic eviction timer must drop the retained result
+    // and return QueryPool credit to 0 with the connection open and no further client calls.
+    task_clock.advance(Duration::from_millis(1));
     assert!(
         wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "expired task leaked QueryPool credit: granted={}",
@@ -1764,36 +1798,60 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
     // Wait until the task finishes and is retained.
     let mut task_completed = false;
     let mut last_reply = None;
-    let poll_deadline = Instant::now() + Duration::from_secs(20);
+    let mut poll_error = None;
+    let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut poll = 0u64;
-    while Instant::now() < poll_deadline {
-        let poll_resp = app
-            .clone()
-            .oneshot(http_req(
-                "POST",
-                &[
-                    ACCEPT,
-                    JSON_CT,
-                    ("mcp-protocol-version", "2026-07-28"),
-                    ("mcp-method", "tasks/get"),
-                    ("mcp-name", task_id.as_str()),
-                ],
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 400 + poll,
-                    "method": "tasks/get",
-                    "params": { "_meta": modern_meta(true), "taskId": task_id }
-                })
-                .to_string(),
-            ))
-            .await
-            .unwrap();
+    while tokio::time::Instant::now() < poll_deadline {
+        let req_id = 400 + poll;
         poll += 1;
-        assert_eq!(poll_resp.status(), StatusCode::OK);
-        let raw = axum::body::to_bytes(poll_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let v: Value = serde_json::from_slice(&raw).unwrap();
+        let exchange = tokio::time::timeout_at(poll_deadline, async {
+            let poll_resp = app
+                .clone()
+                .oneshot(http_req(
+                    "POST",
+                    &[
+                        ACCEPT,
+                        JSON_CT,
+                        ("mcp-protocol-version", "2026-07-28"),
+                        ("mcp-method", "tasks/get"),
+                        ("mcp-name", task_id.as_str()),
+                    ],
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "tasks/get",
+                        "params": { "_meta": modern_meta(true), "taskId": task_id }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .map_err(|e| format!("HTTP tasks/get oneshot failed: {e}"))?;
+            let status = poll_resp.status();
+            let raw = axum::body::to_bytes(poll_resp.into_body(), usize::MAX)
+                .await
+                .map_err(|e| format!("HTTP tasks/get body read failed (status {status}): {e}"))?;
+            if status != StatusCode::OK {
+                return Err(format!(
+                    "HTTP tasks/get returned unexpected status {status}: {}",
+                    String::from_utf8_lossy(&raw)
+                ));
+            }
+            serde_json::from_slice::<Value>(&raw)
+                .map_err(|e| format!("HTTP tasks/get invalid JSON: {e}"))
+        })
+        .await;
+        let v = match exchange {
+            Ok(Ok(v)) => v,
+            Ok(Err(err)) => {
+                poll_error = Some(err);
+                break;
+            }
+            Err(_) => {
+                poll_error =
+                    Some("timed out waiting for HTTP tasks/get reply before deadline".to_string());
+                break;
+            }
+        };
         if v["result"]["status"] == "completed" {
             assert_eq!(v["result"]["resultType"], "complete", "{v}");
             task_completed = true;
@@ -1805,12 +1863,14 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
         if terminal_failure {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let next_poll =
+            (tokio::time::Instant::now() + Duration::from_millis(20)).min(poll_deadline);
+        tokio::time::sleep_until(next_poll).await;
     }
     assert!(
         task_completed,
-        "background task {task_id} did not reach completed state before shutdown check; last reply: {:?}",
-        last_reply
+        "background task {task_id} did not reach completed state before shutdown check (error: {:?}); last reply: {:?}",
+        poll_error, last_reply
     );
     assert!(
         pool.granted() > granted_with_sse,
