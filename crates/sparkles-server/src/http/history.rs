@@ -51,32 +51,65 @@ pub(super) fn reject_at(params: &Params) -> ApiResult<()> {
 }
 
 /// The snapshot a read uses: the live one, or the state `at` selects.
-pub(super) fn snapshot_for(
+pub(crate) fn snapshot_for(
     ds: &Dataset,
     at: Option<&At>,
     opts: &QueryOptions,
 ) -> sparkles::Result<(Arc<Snapshot>, Option<Resolved>)> {
+    let (snap, resolved, _) = snapshot_for_limited(ds, at, opts, None)?;
+    Ok((snap, resolved))
+}
+
+/// Like [`snapshot_for`], bounding historical replay memory to `max_memory_bytes` when
+/// given and returning the snapshot's retained byte charge (`0` for live or unbounded
+/// snapshots).
+pub(crate) fn snapshot_for_limited(
+    ds: &Dataset,
+    at: Option<&At>,
+    opts: &QueryOptions,
+    max_memory_bytes: Option<u64>,
+) -> sparkles::Result<(Arc<Snapshot>, Option<Resolved>, u64)> {
     let Some(at) = at else {
-        return Ok((ds.store.snapshot(), None));
+        return Ok((ds.store.snapshot(), None, 0));
     };
     let o = HistoryOptions {
         cancel: opts.cancel.clone(),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
     };
-    let (snap, r) = match ds.store.snapshot_at(at, &o) {
-        // a commit a branch shares with its upstream is read there
-        Err(e) if sparkles::branch::inherited_commit(&e).is_some() => match ds.main() {
-            Some(main) => main.store.branch_snapshot_at(&ds.branch_name(), at, &o)?,
-            None => return Err(e),
+    let (snap, r, retained) = match max_memory_bytes {
+        Some(cap) => match ds.store.snapshot_at_limited_bytes(at, &o, cap) {
+            // a commit a branch shares with its upstream is read there under the same cap
+            Err(e) if sparkles::branch::inherited_commit(&e).is_some() => match ds.main() {
+                Some(main) => {
+                    let (snap, r, _, retained) = main
+                        .store
+                        .snapshot_at_with_branch_limited_bytes(&ds.store, at, &o, cap)?;
+                    (snap, r, retained)
+                }
+                None => return Err(e),
+            },
+            r => r?,
         },
-        r => r?,
+        None => match ds.store.snapshot_at(at, &o) {
+            Err(e) if sparkles::branch::inherited_commit(&e).is_some() => match ds.main() {
+                Some(main) => {
+                    let (snap, r) = main.store.branch_snapshot_at(&ds.branch_name(), at, &o)?;
+                    (snap, r, 0)
+                }
+                None => return Err(e),
+            },
+            r => {
+                let (snap, r) = r?;
+                (snap, r, 0)
+            }
+        },
     };
-    Ok((snap, Some(r)))
+    Ok((snap, Some(r), retained))
 }
 
 /// `Sparkles-At`, `Sparkles-Head`, and for a past state the Memento headers:
 /// `Memento-Datetime` and `Link: <original>; rel="original"` (RFC 7089).
-pub(super) fn history_headers(mut resp: Response, r: Option<&Resolved>, uri: &Uri) -> Response {
+pub(crate) fn history_headers(mut resp: Response, r: Option<&Resolved>, uri: &Uri) -> Response {
     let Some(r) = r else { return resp };
     let h = resp.headers_mut();
     if let Ok(v) = header::HeaderValue::from_str(&r.at.to_string()) {

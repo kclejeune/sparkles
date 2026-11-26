@@ -3399,6 +3399,16 @@ impl Store {
         Ok((snap, resolved))
     }
 
+    /// Maximum memory capacity available for historical replay/cache entries on this store.
+    pub fn history_cache_capacity(&self) -> u64 {
+        self.opts
+            .shared
+            .as_ref()
+            .map_or(self.opts.history_cache_bytes, |scope| {
+                scope.caches.history().capacity()
+            })
+    }
+
     /// Resolve exactly the requested retained state within a per-read memory cap.
     /// Live snapshots and persistent history-cache hits pay the 4 KiB handle charge (plus
     /// any non-live sealed generation metadata), while in-memory historical snapshots and
@@ -3411,6 +3421,19 @@ impl Store {
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
         let (snap, resolved, _) = self.snapshot_at_inner(at, o, Some(max_memory_bytes))?;
         Ok((snap, resolved))
+    }
+
+    /// Like [`Self::snapshot_at_limited`], also returning the snapshot's retained byte
+    /// charge (delta/handle plus any non-live sealed generation bytes) so callers can keep
+    /// it accounted while the snapshot remains live.
+    pub fn snapshot_at_limited_bytes(
+        &self,
+        at: &crate::history::At,
+        o: &crate::history::HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved, u64)> {
+        let (snap, resolved, charge) = self.snapshot_at_inner(at, o, Some(max_memory_bytes))?;
+        Ok((snap, resolved, charge.total()))
     }
 
     fn snapshot_at_inner(

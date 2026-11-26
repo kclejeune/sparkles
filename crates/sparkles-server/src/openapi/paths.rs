@@ -664,12 +664,105 @@ fn resources(p: &mut Paths) {
             .errors(&[404, 409, 503]),
     );
     p.add(
+        op(GET, "/$/resources/{id}/recipes", "getVocabularyRecipes", tag, "Export PURL or w3id redirection recipes")
+            .doc("Generates Apache `.htaccess` rules (for `w3id.org` or a self-hosted domain) or PURL redirection recipes for a vocabulary resource's hosted namespaces and version IRIs. Representation negotiation is delegated to Sparkles. Returns `text/plain` by default or JSON on `Accept: application/json` or `format=json`. Needs server `admin`.")
+            .see("linked-data-publishing")
+            .query("kind", str_enum(&["w3id", "htaccess", "purl"]), "Recipe target (`w3id` by default).")
+            .query("base", s(), "Public `http(s)` base URL of this Sparkles server.")
+            .query("mount", s(), "Optional `.htaccess` directory mount to strip from `RewriteRule` patterns (defaults to the shared first path segment for `w3id`, or site root for `htaccess`).")
+            .query("format", str_enum(&["text", "json"]), "Response format (`text` by default).")
+            .resp_h("200", "The generated recipe.", Some(json!({
+                "text/plain": text(),
+                "application/json": { "schema": sref("RecipeExport") },
+            })), json!({
+                "Vary": { "description": "`Accept`.", "schema": s() },
+            }))
+            .errors(&[400, 404, 409, 503]),
+    );
+    p.add(
         op(POST, "/$/resources/{id}/install/{ds}", "installVocabularyPrefixes", tag, "Install a vocabulary's prefixes")
             .doc("Binds the namespaces of the vocabulary and of the vocabularies its current version imports as prefixes of the dataset in one settings write, which honours the operator's locks and the prefix limit. A prefix the dataset binds to another IRI is `409 prefix-conflict` unless `replace=true`. Needs `admin` on the dataset.")
             .see("vocabulary-resources")
             .query("replace", boolean(), "Rebind prefixes that the dataset binds to other IRIs.")
             .json("200", "What the write bound.", "PrefixInstall")
             .errors(&[400, 403, 404, 409, 503]),
+    );
+    let ld_content = || {
+        json!({
+            "text/html": text(),
+            "text/turtle": text(),
+            "application/ld+json": text(),
+            "application/rdf+xml": text(),
+            "application/n-triples": text(),
+        })
+    };
+    let ld_headers = json!({
+        "Vary": { "description": "`Accept`.", "schema": s() },
+        "Link": { "description": "Alternate representation links (and `rel=\"original\"` for historical snapshots of live IRIs).", "schema": s() },
+        "Sparkles-Describe-Truncated": { "description": "`true` when the bounded DESCRIBE reached its triple or term limit.", "schema": s() },
+        "Sparkles-At": { "description": "Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state.", "schema": s() },
+        "Sparkles-Head": { "description": "Current head commit sequence of the resolved dataset when reading a historical state.", "schema": s() },
+        "Memento-Datetime": { "description": "HTTP-date timestamp of the resolved historical commit (RFC 7089).", "schema": s() },
+        "Content-Security-Policy": { "description": "Script-free Content Security Policy sent on `text/html` responses.", "schema": s() },
+    });
+    let ld_redirect_headers = json!({
+        "Location": { "description": "The document URL for the negotiated representation.", "schema": s() },
+        "Vary": { "description": "`Accept`.", "schema": s() },
+    });
+    let ld_format = str_enum(&["html", "turtle", "jsonld", "rdfxml", "ntriples"]);
+    let ld_not_acceptable = json!({ "application/json": { "schema": sref("Error") } });
+    let ld_vary_header = json!({
+        "Vary": { "description": "`Accept`.", "schema": s() },
+    });
+    let ld_common = |o: Op| {
+        o.see("linked-data-publishing")
+            .query("format", ld_format.clone(), "Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`).")
+            .query("version", s(), "Catalog version name to resolve against its pinned snapshot.")
+            .param("at")
+            .param("describe")
+            .param("describeLabels")
+            .param("describeReifiers")
+            .param("describeMaxTriples")
+            .param("describeMaxDepth")
+            .resp_h("200", "The negotiated HTML or bounded DESCRIBE RDF representation.", Some(ld_content()), ld_headers.clone())
+            .resp_h("406", "No supported representation matches `Accept`.", Some(ld_not_acceptable.clone()), ld_vary_header.clone())
+            .errors(&[400, 404, 408, 410, 503, 507])
+    };
+    p.add(
+        ld_common(
+            op(GET, "/$/ld", "resolveLinkedData", tag, "Resolve a hosted IRI with content negotiation")
+                .doc("Resolves an IRI under a hosted vocabulary namespace or configured version IRI. Slash IRIs answer `303 See Other` with `Vary: Accept` to `/$/ld/doc`; hash IRIs answer `200 OK` directly. Shows only data the caller is permitted to read.")
+                .query_req("iri", s(), "The absolute IRI to resolve.")
+                .resp_h("303", "Redirect from a slash IRI to its negotiated document representation.", None, ld_redirect_headers.clone()),
+        ),
+    );
+    p.add(
+        ld_common(
+            op(GET, "/$/ld/doc", "getLinkedDataDocument", tag, "Get the document representation of a hosted IRI")
+                .doc("Returns the negotiated HTML or bounded `DESCRIBE` RDF representation of a hosted IRI directly with `200 OK` and `Vary: Accept`. Shows only data the caller is permitted to read.")
+                .query_req("iri", s(), "The absolute IRI to describe."),
+        ),
+    );
+    p.add(
+        ld_common(
+            op(GET, "/$/ld/ns/{prefix}", "resolveHostedNamespace", tag, "Resolve a hosted namespace root by prefix")
+                .doc("Resolves the namespace IRI owned by `prefix`. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.")
+                .resp_h("303", "Redirect from a slash namespace IRI to its negotiated document representation.", None, ld_redirect_headers.clone()),
+        ),
+    );
+    p.add(
+        ld_common(
+            op(GET, "/$/ld/ns/{prefix}/", "resolveHostedNamespaceSlash", tag, "Resolve a hosted namespace root by prefix with a trailing slash")
+                .doc("Resolves the namespace IRI owned by `prefix`, matching PURL partial redirects with an empty suffix. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.")
+                .resp_h("303", "Redirect from a slash namespace IRI to its negotiated document representation.", None, ld_redirect_headers.clone()),
+        ),
+    );
+    p.add(
+        ld_common(
+            op(GET, "/$/ld/ns/{prefix}/{*local}", "resolveHostedTerm", tag, "Resolve a term under a hosted namespace prefix")
+                .doc("Resolves `<namespace_iri><local>` for the hosted namespace owned by `prefix`. Slash IRIs answer `303 See Other` with `Vary: Accept`; hash IRIs answer `200 OK` directly.")
+                .resp_h("303", "Redirect from a slash IRI to its negotiated document representation.", None, ld_redirect_headers),
+        ),
     );
 }
 

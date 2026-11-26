@@ -236,6 +236,20 @@ impl Store {
         Ok((snapshot, resolved, origin))
     }
 
+    /// Like [`Self::snapshot_at_with_branch_limited`], also returning the snapshot's
+    /// retained byte charge.
+    pub fn snapshot_at_with_branch_limited_bytes(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, u64)> {
+        let (snapshot, resolved, origin, charge) =
+            self.snapshot_at_with_branch_limited_charged(store, at, options, max_memory_bytes)?;
+        Ok((snapshot, resolved, origin, charge.total()))
+    }
+
     pub(crate) fn snapshot_at_with_branch_limited_charged(
         &self,
         store: &Store,

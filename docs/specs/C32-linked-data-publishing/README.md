@@ -1,6 +1,6 @@
 # C32: Linked-data publishing
 
-> **Status:** specified
+> **Status:** implemented in part (Phase 1)
 
 This spec covers content negotiation for hosted namespaces, term and ontology pages with generated documentation, catalog-wide term search and an OLS API subset.
 [Roadmap item 461](../../ROADMAP.md) holds the work.

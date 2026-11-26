@@ -544,6 +544,17 @@ fn parameters() -> Map<String, J> {
     );
     put("task", path("task", "The id of the ingestion task."));
     put("version", path("version", "A version of the resource."));
+    put(
+        "prefix",
+        path("prefix", "A hosted vocabulary namespace prefix."),
+    );
+    put(
+        "local",
+        path(
+            "local",
+            "The local path appended to the hosted namespace IRI.",
+        ),
+    );
     put("repo", path("repo", "The backup repository."));
     put("backup", path("backup", "The backup's id."));
     put("policy", path("policy", "The backup policy."));

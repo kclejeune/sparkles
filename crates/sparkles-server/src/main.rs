@@ -55,6 +55,7 @@ mod migrate_cmd;
 mod model_store;
 mod views_cmd;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
+mod linked_data;
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
 mod models;
 mod models_cmd;

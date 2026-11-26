@@ -388,7 +388,7 @@ impl PoolGrant {
     /// [`PoolGrant::charge`]: whole granules of the pool's free capacity, capped by
     /// half the pool while requests wait. This is a sizing observation only, since
     /// other grants may take the free granules before a later charge.
-    pub(crate) fn growth_room(&self) -> u64 {
+    pub fn growth_room(&self) -> u64 {
         let capacity = self.pool.capacity;
         let cur = self.granted.load(Ordering::SeqCst);
         let used = self.used.load(Ordering::SeqCst);

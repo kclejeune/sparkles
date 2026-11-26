@@ -849,8 +849,8 @@ pub const SETTINGS: &[SettingsFile] = &[
     server("policies.json", 1),
     server("policy-state.json", 1),
     server("runs.json", 1),
-    // the resource catalog (spec C30)
-    server("resources.json", 1),
+    // the resource catalog (spec C30, format 2 adds versionIri and snapshot pins for C32)
+    server("resources.json", 2),
     server(".key-epoch.json", 1),
 ];
 
