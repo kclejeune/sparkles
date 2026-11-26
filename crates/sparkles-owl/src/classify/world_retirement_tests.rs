@@ -44,7 +44,7 @@ pub(super) struct Witness<'a> {
 }
 
 impl Witness<'_> {
-    pub(super) fn ready(&self, class: Ex, state: &State, found: &Found<'_, '_>, reported: usize) {
+    pub(super) fn ready(&self, class: Ex, state: &State, found: &Found, reported: usize) {
         let Subs::List(list) = &state.subs else {
             panic!("retirement fixture needs heap-backed private subsumers");
         };

@@ -1087,7 +1087,13 @@ fn cancellation_and_tight_memory_preserve_safe_recovery() {
     );
 
     // 5. Incremental edit on a wide real-parent forest under a bounded pool cap.
-    let mut wide = vec![is_a(ce("Root"), ind("root"))];
+    //    Include a Phase 2 trigger (`HasKey`) so Phase 2 actually builds the 64-leaf
+    //    `real_parent` forest and the incremental edit exercises its `real_broken`
+    //    invalidation across all 64 leaves.
+    let mut wide = vec![
+        is_a(ce("Root"), ind("root")),
+        has_key(ce("KeyClass"), [p("k")], []),
+    ];
     for i in 0..64 {
         wide.push(sub(ce("Root"), some(p("ch"), ce(&format!("Leaf{i}")))));
         wide.push(sub(ce(&format!("Leaf{i}")), ce(&format!("Tag{i}"))));
@@ -1095,7 +1101,7 @@ fn cancellation_and_tight_memory_preserve_safe_recovery() {
     let mut kw = Classifier::of(&wide);
     let w0 = kw.classify(&unrestricted).unwrap();
     assert_matches_fresh(&kw, &w0, &wide, &unrestricted, "wide forest base");
-    let drop_leaf = wide.remove(1);
+    let drop_leaf = wide.remove(2); // SubClassOf(:Root ObjectSomeValuesFrom(:ch :Leaf0))
     kw.remove([&drop_leaf]);
     let wide_charged = Arc::new(AtomicUsize::new(0));
     let wide_cap = w0.stats.peak_memory.saturating_mul(3);

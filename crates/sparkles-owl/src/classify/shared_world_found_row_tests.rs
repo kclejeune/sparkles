@@ -63,6 +63,7 @@ struct Report {
     id: Ex,
     bytes: usize,
     dep_bytes: usize,
+    deps_vec_bytes: usize,
     before: Marks,
 }
 
@@ -86,9 +87,13 @@ struct Trace {
     expected: BTreeMap<Ex, Vec<Ex>>,
     base: usize,
     independent: isize,
+    first_phase_independent: Option<isize>,
     workers: BTreeMap<usize, (ThreadId, Vec<Ex>)>,
     reports: BTreeMap<usize, Vec<Report>>,
     admitted: BTreeMap<usize, Vec<Ex>>,
+    chunk_deps_vec_bytes: BTreeMap<usize, usize>,
+    after_admit: BTreeMap<usize, Marks>,
+    phase_runs: usize,
     exited: Vec<usize>,
     collected: Option<(Result<usize, index::Halt>, Marks)>,
     exit: Option<Exit>,
@@ -231,6 +236,14 @@ impl Probe {
         });
         assert!(budget.tell(INDEPENDENT));
         let mut trace = self.trace.lock();
+        trace.phase_runs += 1;
+        if self.fault == Fault::Late(Late::Refuse) && trace.phase_runs == 2 {
+            // Attempt 1 already tripped the injected refusal and shed optional tracking;
+            // snapshot Attempt 1's independent debit and disarm for Attempt 2 so
+            // post-Phase-3 taxonomy construction completes.
+            trace.first_phase_independent = Some(trace.independent);
+            trace.armed = false;
+        }
         trace.expected = expected;
         trace.base = budget.base;
         trace.independent = INDEPENDENT;
@@ -297,15 +310,17 @@ impl Probe {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn before_report(
         &self,
         budget: &WorldBudget<'_>,
         offset: usize,
         id: Ex,
-        found: &world::Found<'_, '_>,
+        found: &world::Found,
+        dep_bytes: usize,
+        deps_vec_bytes: usize,
         bytes: usize,
     ) {
-        let dep_bytes = found.dep.as_ref().map_or(0, |d| d.dep.bytes());
         let position = {
             let mut trace = self.trace.lock();
             match self.fixture {
@@ -361,6 +376,7 @@ impl Probe {
                 id,
                 bytes,
                 dep_bytes,
+                deps_vec_bytes,
                 before: Marks::read(budget),
             });
     }
@@ -385,11 +401,23 @@ impl Probe {
         }
     }
 
-    pub(super) fn admitted(&self, offset: usize, id: Ex) {
+    pub(super) fn admitted(
+        &self,
+        budget: &WorldBudget<'_>,
+        offset: usize,
+        id: Ex,
+        deps_vec_bytes: usize,
+    ) {
+        let marks = Marks::read(budget);
         let mut trace = self.trace.lock();
-        let rows = trace.admitted.entry(offset).or_default();
-        rows.push(id);
-        if self.fault == Fault::Sibling && rows.len() == 1 {
+        let row_len = {
+            let rows = trace.admitted.entry(offset).or_default();
+            rows.push(id);
+            rows.len()
+        };
+        trace.chunk_deps_vec_bytes.insert(offset, deps_vec_bytes);
+        trace.after_admit.insert(offset, marks);
+        if self.fault == Fault::Sibling && row_len == 1 {
             if offset == 0 {
                 self.first_admitted.0.send(()).unwrap();
             } else {
@@ -616,15 +644,36 @@ fn late_stop(stop: Late) {
             run(&mut sat, &kinds, &observed_limits(&probe, 1), true)
         })
     }));
-    assert_abandoned(&sat);
     let trace = probe.trace.lock();
+    if stop == Late::Refuse {
+        // Optional EL tracking was active on Attempt 1, so refusing `second.bytes`
+        // retired Attempt 1 cleanly, shed optional tracking, and completed on Attempt 2
+        // within the already-paid pool headroom.
+        let (consistent, tax) = result.unwrap().unwrap();
+        assert!(consistent);
+        assert!(tax.is_some());
+        assert!(sat.entangled);
+        assert_eq!(sat.worlds.len(), trace.expected.len());
+        assert_eq!(trace.phase_runs, 2);
+        let first = trace.reports[&0][0];
+        let second = trace.reports[&0][1];
+        assert_eq!(trace.requests, [second.bytes]);
+        assert_eq!(
+            second.before.live,
+            trace.first_phase_independent.unwrap()
+                + (first.bytes + first.dep_bytes + second.deps_vec_bytes + second.dep_bytes)
+                    as isize
+        );
+        return;
+    }
+    assert_abandoned(&sat);
     let [first, second] = trace.reports[&0][..] else {
         panic!("expected two row reports");
     };
     assert_eq!(trace.admitted[&0], [first.id]);
     assert_eq!(trace.exited, [0]);
-    let expected_live =
-        trace.independent + (first.bytes + first.dep_bytes + second.dep_bytes) as isize;
+    let expected_live = trace.independent
+        + (first.bytes + first.dep_bytes + second.deps_vec_bytes + second.dep_bytes) as isize;
     let expected_paid = trace.base + expected_live as usize;
     let attempted = expected_paid + second.bytes;
     assert_eq!(second.before.live, expected_live);
@@ -776,7 +825,8 @@ fn report_unwind(fault: Fault, observations: usize) {
     assert_eq!(trace.admitted[&0], [first.id]);
     assert_eq!(
         second.before.live,
-        INDEPENDENT + (first.bytes + first.dep_bytes + second.dep_bytes) as isize
+        INDEPENDENT
+            + (first.bytes + first.dep_bytes + second.deps_vec_bytes + second.dep_bytes) as isize
     );
     assert_eq!(trace.exited, [0]);
     assert!(trace.collected.is_none());
@@ -837,23 +887,26 @@ fn insertion_unwind(fault: Fault) {
             let (collected, marks) = trace.collected.unwrap();
             assert_eq!(collected, Ok(3));
             let row_total = |r: Report| (r.bytes + r.dep_bytes) as isize;
+            let deps_vec = *trace.chunk_deps_vec_bytes.get(&0).unwrap_or(&0) as isize;
             assert_eq!(
                 marks.live,
-                INDEPENDENT + row_total(first) + row_total(second) + row_total(third)
+                INDEPENDENT + row_total(first) + row_total(second) + row_total(third) + deps_vec
             );
             let exit = trace.exit.as_ref().unwrap();
             assert_eq!(exit.stop, Ok(()));
+            // `chunk.deps` commits only after all rows in the chunk commit, so unwinding
+            // mid-chunk retires all uncommitted optional deps and leaves only `first.bytes`.
             assert_eq!(
                 exit.before_release,
                 Marks {
-                    live: INDEPENDENT + row_total(first),
+                    live: INDEPENDENT + first.bytes as isize,
                     ..marks
                 }
             );
             assert_eq!(
                 exit.after_release,
                 Marks {
-                    live: row_total(first),
+                    live: first.bytes as isize,
                     ..marks
                 }
             );
@@ -904,7 +957,12 @@ fn all_successful_chunks_retire_when_stop_wins_before_commit() {
         .values()
         .flat_map(|rs| rs.iter())
         .map(|r| r.dep_bytes as isize)
-        .sum();
+        .sum::<isize>()
+        + trace
+            .chunk_deps_vec_bytes
+            .values()
+            .map(|&b| b as isize)
+            .sum::<isize>();
     assert_eq!(
         marks.live,
         INDEPENDENT + 64 + 60 * CROSS_REACHERS as isize + dep_total
@@ -998,7 +1056,12 @@ fn committed_transfer(reachers: usize, threads: usize) {
         .values()
         .flat_map(|rs| rs.iter())
         .map(|r| r.dep_bytes as isize)
-        .sum();
+        .sum::<isize>()
+        + trace
+            .chunk_deps_vec_bytes
+            .values()
+            .map(|&b| b as isize)
+            .sum::<isize>();
     let total_bytes = bytes + dep_total;
     assert_eq!(marks.live, INDEPENDENT + total_bytes);
     assert_eq!(
@@ -1057,7 +1120,8 @@ fn checker_growth_survives_found_row_commit_and_discard() {
         let rows = reports
             .iter()
             .map(|report| report.bytes + report.dep_bytes)
-            .sum::<usize>();
+            .sum::<usize>()
+            + *trace.chunk_deps_vec_bytes.get(&0).unwrap_or(&0);
 
         // The checker accounts from its own tables. No row or world ledger
         // measurements enter this difference.
@@ -1135,9 +1199,10 @@ fn cross_chunk_discard(fault: Fault, success_offset: usize) {
         assert_eq!(trace.collected, Some((Err(LOCAL), exit.before_release)));
     }
     let last = trace.reports[&success_offset].last().unwrap();
+    let after_last = trace.after_admit[&success_offset];
     let attempted = trace.base + last.before.live as usize + last.bytes;
-    assert_eq!(exit.before_release.paid, last.before.paid.max(attempted));
-    assert_eq!(exit.before_release.peak, last.before.peak.max(attempted));
+    assert_eq!(exit.before_release.paid, after_last.paid.max(attempted));
+    assert_eq!(exit.before_release.peak, after_last.peak.max(attempted));
     assert_retired(&trace);
 }
 
@@ -1185,13 +1250,19 @@ fn cross_chunk_sibling_exact_headroom() {
     let sibling = trace.reports[&SECOND_CHUNK][0];
     assert_eq!(trace.admitted[&0], [first.id]);
     let (cap, _) = trace.cap.unwrap();
+    let first_deps_vec = *trace.chunk_deps_vec_bytes.get(&0).unwrap_or(&0);
     assert_eq!(
         cap,
         trace.base + trace.independent as usize + sibling.dep_bytes + sibling.bytes
     );
     assert_eq!(
         sibling.before.paid,
-        trace.base + trace.independent as usize + first.bytes + first.dep_bytes + sibling.dep_bytes
+        trace.base
+            + trace.independent as usize
+            + first.bytes
+            + first.dep_bytes
+            + first_deps_vec
+            + sibling.dep_bytes
     );
     let exit = trace.exit.as_ref().unwrap();
     assert_eq!(trace.collected.unwrap().0, Err(LOCAL));
@@ -1206,10 +1277,11 @@ fn cross_chunk_sibling_exact_headroom() {
     } else {
         // This is the exact Batch 55 failure signature. The cap is implemented
         // by the caller, so the typed error still names the configured limit.
-        let inflated = cap + first.bytes + first.dep_bytes;
+        let inflated = cap + first.bytes + first.dep_bytes + first_deps_vec;
         assert_eq!(
             sibling.before.live,
-            trace.independent + (first.bytes + first.dep_bytes + sibling.dep_bytes) as isize
+            trace.independent
+                + (first.bytes + first.dep_bytes + first_deps_vec + sibling.dep_bytes) as isize
         );
         assert_eq!(trace.requests, [sibling.bytes]);
         assert_eq!(
@@ -1225,7 +1297,11 @@ fn cross_chunk_sibling_exact_headroom() {
         assert_eq!(
             exit.before_release.live,
             trace.independent
-                + (first.bytes + first.dep_bytes + sibling.bytes + sibling.dep_bytes) as isize
+                + (first.bytes
+                    + first.dep_bytes
+                    + first_deps_vec
+                    + sibling.bytes
+                    + sibling.dep_bytes) as isize
         );
     }
     assert_eq!(
@@ -1238,4 +1314,48 @@ fn cross_chunk_sibling_exact_headroom() {
         trace.independent + sibling.dep_bytes as isize
     );
     assert_retired(&trace);
+}
+
+#[test]
+fn cross_chunk_optional_refusal_completes_parallel_classification() {
+    // Two active world chunks where optional `WorldDep` admission refuses mid-run
+    // because the numeric cap leaves room for all mandatory world rows but not for all
+    // optional `WorldDep` payloads. The parallel classification must still complete
+    // with exact worlds, zero leaked debits, and `sat.entangled == true`.
+    let axioms = ontology(CROSS_REACHERS);
+    let kinds: Vec<_> = axioms.iter().map(|a| &a.kind).collect();
+    let mut cal = Saturation::new();
+    let cal_out = cal.classify(&kinds, None, &limits(2)).unwrap();
+    let deps_bytes = cal.el_deps.bytes();
+    assert!(deps_bytes > 0);
+    assert_eq!(cal.worlds.len(), CROSS_REACHERS + 1);
+
+    let step = (deps_bytes / 8).max(256);
+    let mut cap = cal_out.stats.peak_memory.saturating_sub(step);
+    let floor = cal_out.stats.memory.saturating_sub(deps_bytes);
+    let mut saw_complete_shed = false;
+    while cap >= floor {
+        let mut sat = Saturation::new();
+        let lim = Limits {
+            max_memory: Some(cap),
+            ..limits(2)
+        };
+        if let Ok(out) = sat.classify(&kinds, None, &lim)
+            && sat.el_deps.is_empty()
+            && sat.entangled
+        {
+            assert!(out.complete);
+            assert!(out.incomplete.is_empty());
+            assert_eq!(sat.worlds.len(), CROSS_REACHERS + 1);
+            assert_eq!(out.taxonomy, cal_out.taxonomy);
+            assert!(out.stats.peak_memory <= cap);
+            saw_complete_shed = true;
+            break;
+        }
+        cap = cap.saturating_sub(step);
+    }
+    assert!(
+        saw_complete_shed,
+        "expected 2-worker parallel classification to shed optional deps and complete within cap"
+    );
 }
