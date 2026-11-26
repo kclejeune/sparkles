@@ -36,6 +36,22 @@ fn pooled_state(
     mcp_cfg: McpConfig,
     max_sessions: usize,
 ) -> (tempfile::TempDir, Arc<AppState>, Arc<QueryPool>) {
+    pooled_state_with_admission_wait(
+        pool_bytes,
+        ttl,
+        mcp_cfg,
+        max_sessions,
+        Duration::from_secs(2),
+    )
+}
+
+fn pooled_state_with_admission_wait(
+    pool_bytes: u64,
+    ttl: &str,
+    mcp_cfg: McpConfig,
+    max_sessions: usize,
+    admission_wait: Duration,
+) -> (tempfile::TempDir, Arc<AppState>, Arc<QueryPool>) {
     let dir = tempfile::tempdir().unwrap();
     let mut st = AppState::with_memory(
         dir.path(),
@@ -45,6 +61,7 @@ fn pooled_state(
     )
     .unwrap();
     st.read_only = true;
+    st.admission.wait = admission_wait;
     st.limits.query_memory_bytes = mcp_cfg.query_memory_bytes;
     st.limits.max_result_bytes = None;
     st.mcp = Some(Arc::new(HttpConf {
@@ -1237,7 +1254,8 @@ async fn stdio_cancelling_queued_task_creation_retires_detached_task() {
 
     let (client, srv) = tokio::io::duplex(4096);
     let (sr, sw) = tokio::io::split(srv);
-    let serve_handle = tokio::spawn(super::adapter::serve(Adapter::new(server.clone()), sr, sw));
+    let (writer_probe, serve_handle) =
+        super::adapter::spawn_serve_with_probe(Adapter::new(server.clone()), sr, sw);
     let (cr, mut cw) = tokio::io::split(client);
 
     // 1. Block the 4 KiB stdout pipe with a synchronous (~180 KiB) tool response.
@@ -1282,16 +1300,22 @@ async fn stdio_cancelling_queued_task_creation_retires_detached_task() {
         .await
         .unwrap();
     cw.flush().await.unwrap();
-    // Wait until the detached task is registered, finishes executing, and trims its
-    // retained result (< 4 MiB above `held_by_one`), ensuring `CreateTaskResult` has
-    // already been handed to `CreditedStdioTransport::send` and queued behind req 501.
+    // Wait until `CreateTaskResult` for request 502 is observably queued inside
+    // `StdioQueue` behind blocked req 501 AND the detached task has finished and trimmed
+    // its retained result, ensuring `notifications/cancelled` exercises queued writer
+    // cancellation rather than `pending` slot cancellation.
+    let req_502_id = rmcp::model::RequestId::Number(502);
     assert!(
         wait_for(Duration::from_secs(10), || {
             let g = pool.granted();
-            server.shared.tasks.len() == 1 && g > held_by_one && g < held_by_one + (4 << 20)
+            writer_probe.is_queued(&req_502_id)
+                && server.shared.tasks.len() == 1
+                && g > held_by_one
+                && g < held_by_one + (4 << 20)
         })
         .await,
-        "detached task did not complete behind blocked req 501: tasks={}, granted={}, held_by_one={held_by_one}",
+        "detached task reply 502 did not enqueue behind blocked req 501: queued={}, tasks={}, granted={}, held_by_one={held_by_one}",
+        writer_probe.is_queued(&req_502_id),
         server.shared.tasks.len(),
         pool.granted()
     );
@@ -1375,9 +1399,11 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
         max_bytes: 1 << 20,
         http: true,
         task_after: Duration::ZERO,
+        max_timeout: Duration::from_secs(60),
         ..Default::default()
     };
-    let (_dir, state, pool) = pooled_state(64 << 20, &ttl, cfg, 16);
+    let (_dir, state, pool) =
+        pooled_state_with_admission_wait(64 << 20, &ttl, cfg, 16, Duration::from_secs(30));
     let mut session_cfg = SessionConfig::default();
     session_cfg.completed_cache_ttl = Duration::from_secs(60);
     let app = mcp_http_router(state.clone(), session_cfg, Some(Duration::from_secs(60)));
@@ -1588,24 +1614,31 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
         let gate_grant = pool
             .try_grant(64 << 20)
             .expect("pool idle before gated duplicate subcase");
-        // First POST returns the SSE response as soon as the session worker registers id 305,
-        // while `gate_grant` blocks `Adapter::get_prompt` inside `admit_call`.
-        let orig_resp = app
-            .clone()
-            .oneshot(http_req("POST", &headers, &gated_body.to_string()))
-            .await
-            .unwrap();
-        assert_eq!(orig_resp.status(), StatusCode::OK);
-        let dup_resp = app
-            .clone()
-            .oneshot(http_req("POST", &headers, &dup_body.to_string()))
-            .await
-            .unwrap();
-        assert_eq!(dup_resp.status(), StatusCode::OK);
-
-        let dup_bytes = axum::body::to_bytes(dup_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        // Bound the duplicate exchange to 5 s, well inside the 30 s admission wait and 60 s
+        // call deadline, so the original request cannot time out admission before the
+        // duplicate POST is processed.
+        let (orig_resp, dup_bytes) = tokio::time::timeout(Duration::from_secs(5), async {
+            // First POST returns the SSE response as soon as the session worker registers id 305,
+            // while `gate_grant` blocks `Adapter::get_prompt` inside `admit_call`.
+            let orig_resp = app
+                .clone()
+                .oneshot(http_req("POST", &headers, &gated_body.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(orig_resp.status(), StatusCode::OK);
+            let dup_resp = app
+                .clone()
+                .oneshot(http_req("POST", &headers, &dup_body.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(dup_resp.status(), StatusCode::OK);
+            let dup_bytes = axum::body::to_bytes(dup_resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (orig_resp, dup_bytes)
+        })
+        .await
+        .expect("duplicate HTTP exchange must finish well before the 30s admission deadline");
         let dup_text = String::from_utf8_lossy(&dup_bytes);
         let dup_payload = dup_text
             .lines()

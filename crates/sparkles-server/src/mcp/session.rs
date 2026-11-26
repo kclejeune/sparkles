@@ -95,6 +95,10 @@ impl CreditedSseEvent {
 
 struct SseQueueInner {
     items: VecDeque<CreditedSseEvent>,
+    /// Number of leading events in `items` preloaded as priming/replay. Live overflow
+    /// bounds only live events queued after this prefix and discards only that live suffix
+    /// so an unread replay prefix remains deliverable before EOF.
+    replay_len: usize,
     capacity: usize,
     closed: bool,
     waker: Option<Waker>,
@@ -119,6 +123,7 @@ impl SharedSseQueue {
         Self {
             inner: Arc::new(Mutex::new(SseQueueInner {
                 items: VecDeque::with_capacity(cap.min(16)),
+                replay_len: 0,
                 capacity: cap,
                 closed: false,
                 waker: None,
@@ -130,6 +135,7 @@ impl SharedSseQueue {
         Self {
             inner: Arc::new(Mutex::new(SseQueueInner {
                 items: VecDeque::new(),
+                replay_len: 0,
                 capacity: 1,
                 closed: true,
                 waker: None,
@@ -141,9 +147,11 @@ impl SharedSseQueue {
         self.inner.lock().closed
     }
 
-    /// Push `event` without blocking. If the client has fallen behind (`items.len() >= capacity`),
-    /// closes and discards the stalled live queue so the worker stays responsive and the client
-    /// can reconnect via `Last-Event-ID`.
+    /// Push a live `event` without blocking. If the client has fallen behind
+    /// (`live_len >= capacity`), closes the queue and discards unread live events after any
+    /// still-unread replay prefix so the worker stays responsive, the client still receives
+    /// its valid replay window before EOF, and reconnecting via `Last-Event-ID` stays
+    /// gap-free against the `C + 1` replay ring.
     fn try_push(&self, event: CreditedSseEvent) -> bool {
         let (waker, dropped) = {
             let mut q = self.inner.lock();
@@ -152,11 +160,13 @@ impl SharedSseQueue {
                 drop(event);
                 return false;
             }
-            if q.items.len() >= q.capacity {
+            let replay_len = q.replay_len;
+            let live_len = q.items.len().saturating_sub(replay_len);
+            if live_len >= q.capacity {
                 q.closed = true;
-                let dropped = std::mem::take(&mut q.items);
+                let dropped_live = q.items.split_off(replay_len);
                 let waker = q.waker.take();
-                (waker, Some((dropped, event)))
+                (waker, Some((dropped_live, event)))
             } else {
                 q.items.push_back(event);
                 let waker = q.waker.take();
@@ -172,8 +182,9 @@ impl SharedSseQueue {
     }
 
     /// Preload a priming or cached replay event into a freshly established queue without
-    /// enforcing the live-overflow bound, so live `try_push` can stay aligned with
-    /// `SessionConfig::channel_capacity` and the replay ring.
+    /// counting against the live-overflow bound, so live `try_push` stays aligned with
+    /// `SessionConfig::channel_capacity` and the `C + 1` replay ring while keeping the
+    /// replay prefix deliverable if live overflow closes the queue before the client reads it.
     fn push_replay(&self, event: CreditedSseEvent) -> bool {
         let waker = {
             let mut q = self.inner.lock();
@@ -182,7 +193,13 @@ impl SharedSseQueue {
                 drop(event);
                 return false;
             }
+            debug_assert_eq!(
+                q.replay_len,
+                q.items.len(),
+                "push_replay must only preload leading replay/priming events"
+            );
             q.items.push_back(event);
+            q.replay_len += 1;
             q.waker.take()
         };
         if let Some(w) = waker {
@@ -209,6 +226,7 @@ impl SharedSseQueue {
         let (dropped, waker) = {
             let mut q = self.inner.lock();
             q.closed = true;
+            q.replay_len = 0;
             (std::mem::take(&mut q.items), q.waker.take())
         };
         drop(dropped);
@@ -220,6 +238,7 @@ impl SharedSseQueue {
     fn poll_pop(&self, cx: &mut Context<'_>) -> Poll<Option<CreditedSseEvent>> {
         let mut q = self.inner.lock();
         if let Some(event) = q.items.pop_front() {
+            q.replay_len = q.replay_len.saturating_sub(1);
             return Poll::Ready(Some(event));
         }
         if q.closed {
@@ -227,6 +246,14 @@ impl SharedSseQueue {
         }
         q.waker = Some(cx.waker().clone());
         Poll::Pending
+    }
+
+    #[cfg(test)]
+    fn pop_one(&self) -> Option<CreditedSseEvent> {
+        let mut q = self.inner.lock();
+        let event = q.items.pop_front()?;
+        q.replay_len = q.replay_len.saturating_sub(1);
+        Some(event)
     }
 }
 
@@ -460,7 +487,11 @@ impl CachedChannel {
     fn send_priming(&mut self, retry: Duration) {
         let (index, event_id) = self.alloc_index();
         let event = CreditedSseEvent::priming(index, &event_id, retry);
-        self.cache_and_send(event);
+        if self.cache.len() >= self.capacity {
+            self.cache.pop_front();
+        }
+        self.cache.push_back(event.clone());
+        let _ = self.tx.push_replay(event);
     }
 
     fn send_event(&mut self, event: CreditedSseEvent) -> bool {
@@ -1633,8 +1664,7 @@ mod tests {
 
     fn drain_queue_strings(queue: &SharedSseQueue) -> Vec<String> {
         let mut out = Vec::new();
-        let mut q = queue.inner.lock();
-        while let Some(ev) = q.items.pop_front() {
+        while let Some(ev) = queue.pop_one() {
             out.push(String::from_utf8_lossy(&ev.bytes).into_owned());
         }
         out
@@ -1996,5 +2026,206 @@ mod tests {
         assert!(got2[0].contains(&format!("id: 4/{http_id}\n")), "{got2:?}");
         assert!(got2[2].contains(&format!("id: 6/{http_id}\n")), "{got2:?}");
         drop(req_resumed2);
+    }
+
+    #[test]
+    fn replacement_sse_preserves_replay_when_live_events_arrive_before_or_mid_read() {
+        let mut cfg = SessionConfig::default();
+        cfg.channel_capacity = 2; // live queue capacity = 2, replay ring capacity = 3
+        cfg.sse_retry = Some(Duration::from_secs(3));
+        let (_handle, mut worker) =
+            create_credited_session("s6".into(), cfg, 30.0, CancellationToken::new());
+
+        let notif = || {
+            ServerJsonRpcMessage::notification(ServerNotification::ToolListChangedNotification(
+                Default::default(),
+            ))
+        };
+
+        // --- Case 1a: Common stream, live event arrives BEFORE the first replay read ---
+        // Fill ring with [4, 5, 6] by pushing 6 notifications while primary is closed.
+        for _ in 0..6 {
+            worker.handle_server_message(notif()).unwrap();
+        }
+        let (_, resumed_before_read) = worker
+            .resume("3".parse().unwrap())
+            .expect("resume from 3 with ring [4, 5, 6] must succeed");
+        let q = resumed_before_read.queue.as_ref().unwrap();
+        // Live event 7 arrives before the body is first polled (ring evicts 4 -> [5, 6, 7]):
+        // must NOT discard [4, 5, 6] or prematurely close the replacement!
+        worker.handle_server_message(notif()).unwrap();
+        assert!(
+            !q.is_closed(),
+            "first live event before replay read must be admitted without closing replacement"
+        );
+        // Live event 8 (ring [6, 7, 8]): still fits within live capacity 2.
+        worker.handle_server_message(notif()).unwrap();
+        assert!(!q.is_closed());
+        // Live event 9 (ring [7, 8, 9]): overflows live capacity 2 -> closes queue, discards
+        // live [7, 8] + 9, and KEEPS unread replay prefix [4, 5, 6] deliverable before EOF!
+        worker.handle_server_message(notif()).unwrap();
+        assert!(q.is_closed());
+        let delivered = drain_queue_strings(q);
+        assert_eq!(
+            delivered.len(),
+            3,
+            "unread replay prefix [4, 5, 6] must remain deliverable on live overflow: {delivered:?}"
+        );
+        assert!(delivered[0].contains("id: 4\n"), "{delivered:?}");
+        assert!(delivered[2].contains("id: 6\n"), "{delivered:?}");
+        drop(resumed_before_read);
+
+        // Client advanced to 6; reconnecting from 6 replays [7, 8, 9] with zero gap!
+        let (_, resumed_mid_read) = worker
+            .resume("6".parse().unwrap())
+            .expect("reconnect from 6 after replay-prefix delivery must succeed");
+        let q_mid = resumed_mid_read.queue.as_ref().unwrap();
+
+        // --- Case 1b: Common stream, live traffic arrives MIDWAY through replay backlog ---
+        // Read only event 7 (leaving [8, 9] unread in the replay prefix).
+        let ev7 = String::from_utf8_lossy(&q_mid.pop_one().unwrap().bytes).into_owned();
+        assert!(ev7.contains("id: 7\n"), "{ev7:?}");
+        // Emit live 10 and 11 (admitted), then 12 (overflows live capacity 2).
+        worker.handle_server_message(notif()).unwrap(); // 10
+        assert!(!q_mid.is_closed());
+        worker.handle_server_message(notif()).unwrap(); // 11
+        assert!(!q_mid.is_closed());
+        worker.handle_server_message(notif()).unwrap(); // 12 -> overflow
+        assert!(q_mid.is_closed());
+        // Remaining replay prefix [8, 9] is still delivered cleanly before EOF.
+        let rest = drain_queue_strings(q_mid);
+        assert_eq!(rest.len(), 2, "expected remaining replay [8, 9]: {rest:?}");
+        assert!(rest[0].contains("id: 8\n"), "{rest:?}");
+        assert!(rest[1].contains("id: 9\n"), "{rest:?}");
+        drop(resumed_mid_read);
+
+        // Reconnect from 9 -> replays [10, 11, 12] gap-free!
+        // Also verify non-overflowing live arrival before first read delivers [10, 11, 12, 13].
+        let (_, resumed_seamless) = worker
+            .resume("9".parse().unwrap())
+            .expect("reconnect from 9 must succeed");
+        worker.handle_server_message(notif()).unwrap(); // 13 (live, non-overflowing)
+        assert!(!resumed_seamless.queue.as_ref().unwrap().is_closed());
+        let seamless = drain_queue_strings(resumed_seamless.queue.as_ref().unwrap());
+        assert_eq!(seamless.len(), 4, "expected [10, 11, 12, 13]: {seamless:?}");
+        assert!(seamless[0].contains("id: 10\n"), "{seamless:?}");
+        assert!(seamless[3].contains("id: 13\n"), "{seamless:?}");
+        drop(resumed_seamless);
+
+        // --- Case 2a: In-flight request stream, live traffic BEFORE first replay read ---
+        let (http_id, live_rx) = worker.alloc_request_wise_channel();
+        let req_id = RequestId::Number(88);
+        let req = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: req_id.clone(),
+            request: ClientRequest::PingRequest(Default::default()),
+        };
+        worker.register_request(&req, Some(http_id));
+        let _ = drain_queue_strings(live_rx.queue.as_ref().unwrap()); // priming 0
+        for step in 1..=3usize {
+            let ch = worker.tx_router.get_mut(&http_id).unwrap();
+            let (idx, eid) = ch.channel.alloc_index();
+            assert_eq!(idx, step);
+            let pushed = ch.channel.send_event(CreditedSseEvent {
+                index: idx,
+                bytes: Bytes::from(format!("data: {{\"step\":{step}}}\nid: {eid}\n\n")),
+                terminal: false,
+            });
+            assert_eq!(pushed, step < 3);
+        }
+        drop(live_rx);
+
+        let (_, req_before_read) = worker
+            .resume(format!("0/{http_id}").parse().unwrap())
+            .expect("in-flight resume from 0 with [1, 2, 3] must succeed");
+        let rq = req_before_read.queue.as_ref().unwrap();
+        // Before first replay read, emit live 4, 5 (admitted), then 6 (overflows live cap 2).
+        for step in 4..=6usize {
+            let ch = worker.tx_router.get_mut(&http_id).unwrap();
+            let (idx, eid) = ch.channel.alloc_index();
+            assert_eq!(idx, step);
+            let pushed = ch.channel.send_event(CreditedSseEvent {
+                index: idx,
+                bytes: Bytes::from(format!("data: {{\"step\":{step}}}\nid: {eid}\n\n")),
+                terminal: false,
+            });
+            assert_eq!(pushed, step < 6);
+        }
+        assert!(rq.is_closed());
+        let req_delivered = drain_queue_strings(rq);
+        assert_eq!(
+            req_delivered.len(),
+            3,
+            "in-flight unread replay [1, 2, 3] must survive live overflow: {req_delivered:?}"
+        );
+        assert!(
+            req_delivered[0].contains(&format!("id: 1/{http_id}\n")),
+            "{req_delivered:?}"
+        );
+        assert!(
+            req_delivered[2].contains(&format!("id: 3/{http_id}\n")),
+            "{req_delivered:?}"
+        );
+        drop(req_before_read);
+
+        // --- Case 2b: In-flight request stream, live traffic MIDWAY through replay ---
+        let (_, req_mid_read) = worker
+            .resume(format!("3/{http_id}").parse().unwrap())
+            .expect("in-flight reconnect from 3 must succeed");
+        let rq_mid = req_mid_read.queue.as_ref().unwrap();
+        // Client reads event 4 (leaving replay [5, 6] unread).
+        let ev4 = String::from_utf8_lossy(&rq_mid.pop_one().unwrap().bytes).into_owned();
+        assert!(ev4.contains(&format!("id: 4/{http_id}\n")), "{ev4:?}");
+        // Emit live 7, 8 (admitted), then terminal response 9 (overflows live capacity 2).
+        for step in 7..=8usize {
+            let ch = worker.tx_router.get_mut(&http_id).unwrap();
+            let (idx, eid) = ch.channel.alloc_index();
+            assert_eq!(idx, step);
+            assert!(ch.channel.send_event(CreditedSseEvent {
+                index: idx,
+                bytes: Bytes::from(format!("data: {{\"step\":{step}}}\nid: {eid}\n\n")),
+                terminal: false,
+            }));
+        }
+        assert!(!rq_mid.is_closed());
+        worker
+            .handle_server_message(ServerJsonRpcMessage::response(
+                rmcp::model::ServerResult::empty(()),
+                req_id,
+            ))
+            .unwrap();
+        assert!(rq_mid.is_closed());
+        let mid_rest = drain_queue_strings(rq_mid);
+        assert_eq!(
+            mid_rest.len(),
+            2,
+            "remaining replay [5, 6] must still deliver before EOF: {mid_rest:?}"
+        );
+        assert!(
+            mid_rest[0].contains(&format!("id: 5/{http_id}\n")),
+            "{mid_rest:?}"
+        );
+        assert!(
+            mid_rest[1].contains(&format!("id: 6/{http_id}\n")),
+            "{mid_rest:?}"
+        );
+        drop(req_mid_read);
+
+        // Final reconnect from 6 recovers [7, 8, terminal 9] gap-free!
+        let (_, req_final) = worker
+            .resume(format!("6/{http_id}").parse().unwrap())
+            .expect("final reconnect from 6 must recover [7, 8, terminal 9]");
+        let final_events = drain_queue_strings(req_final.queue.as_ref().unwrap());
+        assert_eq!(
+            final_events.len(),
+            3,
+            "expected [7, 8, terminal 9]: {final_events:?}"
+        );
+        assert!(
+            final_events[0].contains(&format!("id: 7/{http_id}\n")),
+            "{final_events:?}"
+        );
+        assert!(final_events[2].contains("\"id\":88"), "{final_events:?}");
+        drop(req_final);
     }
 }

@@ -378,3 +378,81 @@ fn stdio_tool_profiles() {
         assert!(e.contains("cannot be used with"), "{flags:?}: {e}");
     }
 }
+
+/// Production stdout path (`sparkles mcp`): immediately reusing the same JSON-RPC request
+/// ID after observing each response's terminating newline must never trigger a spurious
+/// `-32600` duplicate-in-flight error.
+#[test]
+fn stdio_rapid_sequential_id_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("fixture.ttl");
+    std::fs::write(&data, FIXTURE).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+        .args(["mcp", "--data"])
+        .arg(&data)
+        .args(["--name", "t"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "reuse-e2e", "version": "1"}
+        }
+    });
+    writeln!(stdin, "{init}").unwrap();
+    stdin.flush().unwrap();
+    let line = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let v: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["id"], 1);
+    assert!(v.get("result").is_some(), "{v}");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    for round in 0..50usize {
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        let line = rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("round {round}: no response: {e}"));
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["id"], 1, "round {round}: {v}");
+        assert!(
+            v.get("result").is_some() && v.get("error").is_none(),
+            "round {round}: sequential reuse of id 1 after newline failed: {v}"
+        );
+    }
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status}");
+}
