@@ -24,6 +24,7 @@ mod backups;
 mod branches;
 mod catalog;
 mod documents;
+mod evidence;
 mod helpers;
 #[cfg(feature = "ontology")]
 mod ontology;
