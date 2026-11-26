@@ -7758,6 +7758,13 @@ export interface components {
                 }[];
                 /** @description The upstream version identifier. */
                 upstreamVersion?: string;
+                /** @description The predecessor source revision this revision supersedes, written as `prov:wasRevisionOf`. */
+                wasRevisionOf?: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
             }[];
             /** @description The source-record graph, needed when the settings name more than one. */
             sourceGraph?: string;

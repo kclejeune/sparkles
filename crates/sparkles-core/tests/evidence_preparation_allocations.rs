@@ -122,6 +122,7 @@ fn input(kind: &str) -> EvidenceInput {
                 metadata: SourceMetadata::default(),
                 times,
                 lineage: SourceLineage::default(),
+                was_revision_of: None,
             });
         }
         "confidence" => input.claims.push(ClaimInput {

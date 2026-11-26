@@ -843,6 +843,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                             "reportedAvailableAt": date_time("An attributed allegation of earlier availability."),
                             "upstreamRevisions": array(record_ref("An upstream revision.")),
                             "families": array(string()),
+                            "wasRevisionOf": record_ref("The predecessor source revision this revision supersedes, written as `prov:wasRevisionOf`."),
                         }),
                     )),
                     "renditions": array(closed(

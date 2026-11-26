@@ -20,12 +20,12 @@ use oxrdf::{GraphName, Literal, NamedNode, Quad, Term, Triple};
 use serde_json::{Map, Value, json};
 use sparkles::evidence::{
     ClaimInput, ClaimKind, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
-    EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, MethodRef, OrdinaryChanges,
-    PassageInput, Polarity, RecordKey, RecordRef, RecordVersion, RenditionContent, RenditionInput,
-    Sha256Digest, SourceContent, SourceRevisionInput,
+    EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, IdentityNamespace, MethodRef,
+    OrdinaryChanges, PassageInput, Polarity, RecordKey, RecordKind, RecordRef, RecordVersion,
+    RenditionContent, RenditionInput, Sha256Digest, SourceContent, SourceRevisionInput,
 };
 use sparkles::task::Control;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// How many times a moved head is planned again.
@@ -355,6 +355,211 @@ fn already(t: &Target, principal: &NamedNode, key: &str) -> Result<Option<NamedN
     Ok(found.then_some(op))
 }
 
+/// Run a SELECT query on `t.logical` under `access`, returning empty when the caller
+/// has no read permission on a referenced graph.
+fn select_as(
+    t: &Target,
+    access: &Arc<sparkles::access::GraphAccess>,
+    query: &str,
+) -> Result<Vec<Vec<Option<Term>>>, Failed> {
+    let opts = sparkles::sparql::QueryOptions {
+        graphs: Some(access.clone()),
+        ..Default::default()
+    };
+    match t.logical.dataset.query_with(query, &opts) {
+        Ok(r) => r
+            .rows()
+            .map(|rows| rows.iter().map(|row| row.values().to_vec()).collect())
+            .map_err(|e| api(e.into())),
+        Err(sparkles::Error::NotPermitted(_)) => Ok(Vec::new()),
+        Err(e) => Err(api(e.into())),
+    }
+}
+
+/// The immediate `prov:wasRevisionOf` predecessor of `rendition` in `c18_graph`, if
+/// any and readable by the caller.
+fn c18_previous_rendition(
+    r: &Run,
+    t: &Target,
+    c18_graph: &str,
+    rendition: &str,
+) -> Result<Option<String>, Failed> {
+    let Some(access) = crate::evidence::policy(
+        &r.ctx.server.state,
+        r.ctx.principal,
+        &t.main.dataset,
+        &t.branch,
+    ) else {
+        return Ok(None);
+    };
+    let (Ok(g), Ok(rend)) = (NamedNode::new(c18_graph), NamedNode::new(rendition)) else {
+        return Ok(None);
+    };
+    let q = format!(
+        "SELECT ?prev WHERE {{ GRAPH {g} {{ {rend} <http://www.w3.org/ns/prov#wasRevisionOf> ?prev }} }} LIMIT 1"
+    );
+    let rows = select_as(t, &access, &q)?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|v| match v {
+            Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
+            _ => None,
+        }))
+}
+
+/// The predecessor evidence `SourceRevision` for a claims ingestion of `source` in
+/// `c18_graph`, if an authenticated, caller-readable one exists in `t.source_graph`.
+///
+/// When the revision IRI this batch will mint already exists as an authenticated
+/// revision in `t.source_graph`, its recorded `prov:wasRevisionOf` (if any) is kept so
+/// that re-ingesting the same revision under another profile preserves its record
+/// digest. Otherwise the C18 `prov:wasRevisionOf` chain starting at `prev_rendition` is
+/// walked (up to 64 hops) until an authenticated, caller-readable `SourceRevision` in
+/// `t.source_graph` with the same source and source key matches that C18 rendition.
+#[allow(clippy::too_many_arguments)]
+fn predecessor_revision(
+    r: &Run,
+    t: &Target,
+    principal: &NamedNode,
+    source: &NamedNode,
+    source_key: &str,
+    revision_digest: Sha256Digest,
+    c18_graph: &str,
+    prev_rendition: Option<&str>,
+) -> Result<Option<NamedNode>, Failed> {
+    const MAX_HOPS: usize = 64;
+    let Some(access) = crate::evidence::policy(
+        &r.ctx.server.state,
+        r.ctx.principal,
+        &t.main.dataset,
+        &t.branch,
+    ) else {
+        return Ok(None);
+    };
+    let dataset_id = t.main.dataset.dataset_id();
+    let control = control_of(r);
+    let ns = IdentityNamespace::new(dataset_id, principal.clone())
+        .map_err(|e| failed("error", 500, e.to_string()))?;
+    let new_rev_iri = ns
+        .record_id(
+            RecordKind::SourceRevision,
+            &key(source_key),
+            &key(revision_digest.to_string()),
+            &control,
+        )
+        .map_err(|e| failed("error", 500, e.to_string()))?;
+    let mut resolution =
+        sparkles::evidence::resolve::Resolution::new(control.clone()).map_err(|e| api(e.into()))?;
+    let verify = |res: &mut sparkles::evidence::resolve::Resolution, iri: &NamedNode| -> bool {
+        res.record(
+            "predecessor",
+            &t.main.dataset,
+            &t.logical.dataset,
+            Some(access.clone()),
+            &sparkles::evidence::resolve::RecordRequest {
+                iri: iri.clone(),
+                kinds: vec![RecordKind::SourceRevision],
+                content_digest: None,
+            },
+        )
+        .is_ok_and(|v| v.graph == t.source_graph)
+    };
+    // Preserve the recorded predecessor if this exact revision already exists, so
+    // re-ingesting it under another profile keeps its record digest.
+    if verify(&mut resolution, &new_rev_iri) {
+        let sg = &t.source_graph;
+        let q = format!(
+            "SELECT ?prev WHERE {{ GRAPH {sg} {{ {new_rev_iri} <http://www.w3.org/ns/prov#wasRevisionOf> ?prev }} }} LIMIT 1"
+        );
+        let rows = select_as(t, &access, &q)?;
+        if let Some(Some(Term::NamedNode(prev))) = rows.first().and_then(|row| row.first())
+            && *prev != new_rev_iri
+            && verify(&mut resolution, prev)
+        {
+            return Ok(Some(prev.clone()));
+        }
+        return Ok(None);
+    }
+    let Some(first_prev) = prev_rendition.and_then(|s| NamedNode::new(s).ok()) else {
+        return Ok(None);
+    };
+    let Ok(c18_g) = NamedNode::new(c18_graph) else {
+        return Ok(None);
+    };
+    let sg = &t.source_graph;
+    let sk_lit = Literal::new_simple_literal(source_key);
+    let q = format!(
+        "SELECT ?rev ?evRend ?who ?commit WHERE {{ GRAPH {sg} {{ \
+         ?rev a <urn:x-sparkles:evidence:SourceRevision> ; \
+              <http://www.w3.org/ns/prov#specializationOf> {source} ; \
+              <urn:x-sparkles:evidence:sourceKey> {sk_lit} ; \
+              <urn:x-sparkles:evidence:availabilityReceipt> ?op . \
+         ?op <http://www.w3.org/ns/prov#wasAssociatedWith> ?who ; \
+             <urn:x-sparkles:evidence:commit> ?commit . \
+         ?evRend a <urn:x-sparkles:evidence:Rendition> ; \
+                 <http://www.w3.org/ns/prov#wasDerivedFrom> ?rev . \
+         }} }}"
+    );
+    let rows = select_as(t, &access, &q)?;
+    let mut candidates: Vec<(NamedNode, NamedNode, NamedNode, u64)> = Vec::new();
+    for row in &rows {
+        if let [
+            Some(Term::NamedNode(rev)),
+            Some(Term::NamedNode(ev_rend)),
+            Some(Term::NamedNode(who)),
+            Some(Term::Literal(commit_lit)),
+        ] = row.as_slice()
+            && *rev != new_rev_iri
+        {
+            let commit = commit_lit.value().parse::<u64>().unwrap_or(0);
+            candidates.push((rev.clone(), ev_rend.clone(), who.clone(), commit));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut cur_rend = first_prev;
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..MAX_HOPS {
+        r.check()?;
+        if !visited.insert(cur_rend.as_str().to_string()) {
+            break;
+        }
+        let Ok(rend_key) = RecordKey::new(cur_rend.as_str()) else {
+            break;
+        };
+        let mut matched: Vec<(bool, std::cmp::Reverse<u64>, NamedNode)> = Vec::new();
+        for (rev, ev_rend, who, commit) in &candidates {
+            let Ok(rev_key) = RecordKey::new(rev.as_str()) else {
+                continue;
+            };
+            let expected = IdentityNamespace::new(dataset_id, who.clone())
+                .ok()
+                .and_then(|n| {
+                    n.record_id(RecordKind::Rendition, &rev_key, &rend_key, &control)
+                        .ok()
+                });
+            if expected.as_ref() == Some(ev_rend) && verify(&mut resolution, rev) {
+                matched.push((*who != *principal, std::cmp::Reverse(*commit), rev.clone()));
+            }
+        }
+        if !matched.is_empty() {
+            matched.sort();
+            return Ok(Some(matched.remove(0).2));
+        }
+        let next_q = format!(
+            "SELECT ?prev WHERE {{ GRAPH {c18_g} {{ {cur_rend} <http://www.w3.org/ns/prov#wasRevisionOf> ?prev }} }} LIMIT 1"
+        );
+        let next_rows = select_as(t, &access, &next_q)?;
+        match next_rows.first().and_then(|row| row.first()) {
+            Some(Some(Term::NamedNode(next))) => cur_rend = next.clone(),
+            _ => break,
+        }
+    }
+    Ok(None)
+}
+
 /// A model or converter as an IRI.
 fn agent_iri(prefix: &str, name: &str) -> NamedNode {
     let enc =
@@ -378,6 +583,7 @@ struct Source<'a> {
     source: NamedNode,
     source_key: String,
     revision_digest: Sha256Digest,
+    was_revision_of: Option<NamedNode>,
     locator: Option<NamedNode>,
     rendition_key: String,
     media_type: &'a str,
@@ -618,6 +824,7 @@ fn batch(src: &Source, c: Claims, control: &Control) -> Result<Batch, Failed> {
         },
         times: Default::default(),
         lineage: Default::default(),
+        was_revision_of: src.was_revision_of.clone().map(RecordRef::Existing),
     });
     input.renditions.push(RenditionInput {
         version: RecordVersion::V1,
@@ -755,14 +962,26 @@ fn merged(a: &Value, b: &Value) -> Value {
     out
 }
 
+/// Context for refreshing the revision's `prov:wasRevisionOf` link when a moved head
+/// forces the C18 registration to be planned again.
+struct Replan<'a> {
+    principal: &'a NamedNode,
+    source: &'a NamedNode,
+    source_key: &'a str,
+    revision_digest: Sha256Digest,
+    c18_graph: &'a str,
+}
+
 /// Publish the batch with the registration planned at `planned.head`, planning again
 /// when the head moved.
+#[allow(clippy::too_many_arguments)]
 fn publish(
     r: &Run,
     t: &Target,
-    input: &EvidenceInput,
+    input: &mut EvidenceInput,
     reg: Option<&Map<String, Value>>,
     mut planned: Option<Planned>,
+    replan: Option<&Replan<'_>>,
     idempotency_key: &str,
     message: String,
 ) -> Result<(sparkles::evidence::Proposed, Option<Value>), Failed> {
@@ -811,7 +1030,26 @@ fn publish(
                     && let Some(reg) = reg
                 {
                     attempt += 1;
-                    planned = Some(plan(r, reg, t)?);
+                    let replanned = plan(r, reg, t)?;
+                    if let (Some(rp), Some(rev)) = (replan, input.revisions.first_mut()) {
+                        let prev_rend = replanned
+                            .registered
+                            .get("previousRendition")
+                            .and_then(Value::as_str)
+                            .map(|s| expand_iri(s, &replanned.registered["prefixes"]));
+                        rev.was_revision_of = predecessor_revision(
+                            r,
+                            t,
+                            rp.principal,
+                            rp.source,
+                            rp.source_key,
+                            rp.revision_digest,
+                            rp.c18_graph,
+                            prev_rend.as_deref(),
+                        )?
+                        .map(RecordRef::Existing);
+                    }
+                    planned = Some(replanned);
                     continue;
                 }
                 return Err(f);
@@ -1047,10 +1285,28 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         &revision_digest,
     )?;
     ctx.progress.status(Status::Writing, 0.9, None);
-    let src = Source {
-        source: NamedNode::new(source.clone()).map_err(|e| failed("error", 500, e.to_string()))?,
-        source_key: source_key(&t, &source, &graph)?,
+    let source_node =
+        NamedNode::new(source.clone()).map_err(|e| failed("error", 500, e.to_string()))?;
+    let sk = source_key(&t, &source, &graph)?;
+    let prev_rend = registered
+        .get("previousRendition")
+        .and_then(Value::as_str)
+        .map(|s| expand_iri(s, &prefixes));
+    let was_revision_of = predecessor_revision(
+        r,
+        &t,
+        &principal,
+        &source_node,
+        &sk,
         revision_digest,
+        &graph,
+        prev_rend.as_deref(),
+    )?;
+    let src = Source {
+        source: source_node.clone(),
+        source_key: sk.clone(),
+        revision_digest,
+        was_revision_of,
         locator: req
             .url
             .as_deref()
@@ -1069,19 +1325,42 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         &revision_digest,
         ex.failed.clone(),
     )?;
-    let b = batch(&src, c, &control_of(r))?;
+    let mut b = batch(&src, c, &control_of(r))?;
     let message = format!(
         "Ingest claims from {}",
         title.as_deref().unwrap_or(source.as_str())
     );
-    let (proposed, registered) =
-        publish(r, &t, &b.input, Some(&reg), Some(planned), &key, message)?;
+    let replan = Replan {
+        principal: &principal,
+        source: &source_node,
+        source_key: &sk,
+        revision_digest,
+        c18_graph: &graph,
+    };
+    let (proposed, registered) = publish(
+        r,
+        &t,
+        &mut b.input,
+        Some(&reg),
+        Some(planned),
+        Some(&replan),
+        &key,
+        message,
+    )?;
     if let Some(reg) = registered {
         out["alreadyRegistered"] = reg["alreadyRegistered"].clone();
         out["chunks"] = json!(reg["chunks"].as_array().map_or(0, Vec::len));
         if let Some(p) = reg.get("previousRendition") {
             out["previousRendition"] = p.clone();
         }
+    }
+    if let Some(RecordRef::Existing(prev)) = b
+        .input
+        .revisions
+        .first()
+        .and_then(|rev| rev.was_revision_of.as_ref())
+    {
+        out["previousRevision"] = prev.as_str().into();
     }
     finish(&mut out, &proposed, &b, &ex);
     Ok(out)
@@ -1201,11 +1480,25 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
         .as_str()
         .unwrap_or("text/markdown")
         .to_string();
-    let src = Source {
-        source: NamedNode::new(source_iri.clone())
-            .map_err(|e| failed("error", 500, e.to_string()))?,
-        source_key: source_key(&t, &source_iri, &read.graph)?,
+    let source_node =
+        NamedNode::new(source_iri.clone()).map_err(|e| failed("error", 500, e.to_string()))?;
+    let sk = source_key(&t, &source_iri, &read.graph)?;
+    let prev_rend = c18_previous_rendition(r, &t, &read.graph, &read.rendition)?;
+    let was_revision_of = predecessor_revision(
+        r,
+        &t,
+        &principal,
+        &source_node,
+        &sk,
         revision_digest,
+        &read.graph,
+        prev_rend.as_deref(),
+    )?;
+    let src = Source {
+        source: source_node,
+        source_key: sk,
+        revision_digest,
+        was_revision_of,
         locator: None,
         rendition_key: read.rendition.clone(),
         media_type: &media_type,
@@ -1220,9 +1513,17 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
         &revision_digest,
         ex.failed.clone(),
     )?;
-    let b = batch(&src, c, &control_of(r))?;
+    let mut b = batch(&src, c, &control_of(r))?;
     let message = format!("Ingest claims from {source_iri}");
-    let (proposed, _) = publish(r, &t, &b.input, None, None, &key, message)?;
+    let (proposed, _) = publish(r, &t, &mut b.input, None, None, None, &key, message)?;
+    if let Some(RecordRef::Existing(prev)) = b
+        .input
+        .revisions
+        .first()
+        .and_then(|rev| rev.was_revision_of.as_ref())
+    {
+        out["previousRevision"] = prev.as_str().into();
+    }
     finish(&mut out, &proposed, &b, &ex);
     Ok(out)
 }
@@ -1257,6 +1558,7 @@ mod tests {
             source: NamedNode::new_unchecked("urn:source"),
             source_key: "k".into(),
             revision_digest: super::sha(text.as_bytes()).ok().unwrap(),
+            was_revision_of: None,
             locator: None,
             rendition_key: "urn:rendition".into(),
             media_type: "text/markdown",

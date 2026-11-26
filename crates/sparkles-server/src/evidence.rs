@@ -693,7 +693,7 @@ fn resolve_now(
 
 /// What `p` may read on branch `branch` of `ds` through the query endpoint, by their
 /// current names: `None` when it may read nothing there.
-fn policy(
+pub(crate) fn policy(
     st: &AppState,
     p: &Principal,
     ds: &sparkles::Dataset,

@@ -115,6 +115,7 @@ fn batch(ds: &Dataset, fact_commit: u64) -> EvidenceInput {
             metadata: Default::default(),
             times: Default::default(),
             lineage: Default::default(),
+            was_revision_of: None,
         }],
         renditions: vec![RenditionInput {
             version: RecordVersion::V1,
@@ -223,6 +224,7 @@ fn small(occurrence: &str, proposition: Triple) -> EvidenceInput {
             metadata: Default::default(),
             times: Default::default(),
             lineage: Default::default(),
+            was_revision_of: None,
         }],
         claims: vec![claim("claim", occurrence, proposition)],
         ..Default::default()
@@ -1127,4 +1129,167 @@ mod crashes {
         assert_eq!(ds.store().head_commit().seq, head);
         let _ = OwnerKind::Evidence;
     }
+}
+
+#[test]
+fn source_revision_was_revision_of_authenticates_and_refuses_invalid_predecessors() {
+    let ds = Dataset::memory();
+    configured(&ds);
+
+    // First revision without predecessor.
+    let first_input = small("c1", proposition());
+    let first = propose(&ds, &first_input, &options()).unwrap();
+    let rev1 = iri_of(&first, "rev");
+    let claim1 = iri_of(&first, "claim");
+
+    // Second revision links to the existing authenticated predecessor.
+    let mut second_input = small("c2", proposition());
+    second_input.revisions[0].content = SourceContent::MetadataOnly {
+        digest: sha("Release 1.2 updated text."),
+    };
+    second_input.revisions[0].was_revision_of = Some(RecordRef::Existing(rev1.clone()));
+    let second = propose(&ds, &second_input, &options()).unwrap();
+    let rev2 = iri_of(&second, "rev");
+    assert_ne!(rev2, rev1);
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{SOURCES}> {{ <{}> <http://www.w3.org/ns/prov#wasRevisionOf> <{}> }} }}",
+            rev2.as_str(),
+            rev1.as_str()
+        ))
+        .unwrap()
+    );
+    let verified = record(&ds, &rev2, RecordKind::SourceRevision).unwrap();
+    assert_eq!(verified.record_digest, Some(second.records[0].digest));
+
+    // Re-proposing rev1 with a predecessor conflicts because prov:wasRevisionOf changes its
+    // immutable record digest.
+    let mut mutate_first = first_input.clone();
+    mutate_first.revisions[0].was_revision_of = Some(RecordRef::Existing(rev2.clone()));
+    assert_eq!(
+        code(propose(&ds, &mutate_first, &options())),
+        "immutable-record-conflict"
+    );
+
+    // Batch-local predecessor link writes both revisions and prov:wasRevisionOf in one commit.
+    let mut local_chain = EvidenceInput {
+        revisions: vec![
+            SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("ra"),
+                source: iri("urn:chain"),
+                source_key: key("chain"),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly { digest: sha("a") },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+                was_revision_of: None,
+            },
+            SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("rb"),
+                source: iri("urn:chain"),
+                source_key: key("chain"),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly { digest: sha("b") },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+                was_revision_of: Some(local("ra")),
+            },
+        ],
+        ..Default::default()
+    };
+    let chained = propose(&ds, &local_chain, &options()).unwrap();
+    let ra = iri_of(&chained, "ra");
+    let rb = iri_of(&chained, "rb");
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{SOURCES}> {{ <{}> <http://www.w3.org/ns/prov#wasRevisionOf> <{}> }} }}",
+            rb.as_str(),
+            ra.as_str()
+        ))
+        .unwrap()
+    );
+    assert!(record(&ds, &ra, RecordKind::SourceRevision).is_ok());
+    assert!(record(&ds, &rb, RecordKind::SourceRevision).is_ok());
+
+    // Missing predecessor refuses as evidence-unavailable and writes nothing.
+    let head = ds.store().head_commit().seq;
+    let mut missing = small("c3", proposition());
+    missing.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v3") };
+    missing.revisions[0].was_revision_of = Some(RecordRef::Existing(iri(
+        "urn:uuid:00000000-0000-4000-8000-000000000000",
+    )));
+    assert_eq!(
+        code(propose(&ds, &missing, &options())),
+        "evidence-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Unauthorized caller (cannot read source graph) gets the same non-disclosing
+    // evidence-unavailable error as a missing predecessor.
+    let deny_sources = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new([CLAIMS], &[])),
+        Graphs::All,
+    ));
+    let mut hidden_input = small("c3", proposition());
+    hidden_input.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v3") };
+    hidden_input.revisions[0].was_revision_of = Some(RecordRef::Existing(rev1.clone()));
+    let hidden = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &hidden_input,
+        &options(),
+        &mut |_, _| Some(deny_sources.clone()),
+        &Control::none(),
+    );
+    assert_eq!(code(hidden), "evidence-unavailable");
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Wrong-kind predecessor (a Claim instead of a SourceRevision) is refused.
+    let mut wrong_kind = small("c3", proposition());
+    wrong_kind.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v3") };
+    wrong_kind.revisions[0].was_revision_of = Some(RecordRef::Existing(claim1));
+    assert_eq!(
+        code(propose(&ds, &wrong_kind, &options())),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Existing-IRI self-link is refused before resolution.
+    let mut self_iri = small("c1", proposition());
+    self_iri.revisions[0].was_revision_of = Some(RecordRef::Existing(rev1.clone()));
+    assert!(matches!(
+        propose(&ds, &self_iri, &options()),
+        Err(sparkles::Error::Invalid(_))
+    ));
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Local self-link is refused.
+    local_chain.revisions[0].was_revision_of = Some(local("ra"));
+    assert!(matches!(
+        propose(&ds, &local_chain, &options()),
+        Err(sparkles::Error::Invalid(_))
+    ));
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // An unauthenticated predecessor planted while the source graph was detached is refused.
+    evidence::detach(&ds, SOURCES).unwrap();
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{SOURCES}> {{ <urn:fake-rev> a <urn:x-sparkles:evidence:SourceRevision> ; <http://www.w3.org/ns/prov#specializationOf> <urn:bulletin> . }} }}"
+    ))
+    .unwrap();
+    configured(&ds);
+    let head = ds.store().head_commit().seq;
+    let mut planted = small("c4", proposition());
+    planted.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v4") };
+    planted.revisions[0].was_revision_of = Some(RecordRef::Existing(iri("urn:fake-rev")));
+    assert_eq!(
+        code(propose(&ds, &planted, &options())),
+        "origin-not-reproduced"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
 }

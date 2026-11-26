@@ -9642,6 +9642,23 @@
                   "maxLength": 256,
                   "minLength": 1,
                   "type": "string"
+                },
+                "wasRevisionOf": {
+                  "additionalProperties": false,
+                  "description": "The predecessor source revision this revision supersedes, written as `prov:wasRevisionOf`.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "iri": {
+                      "description": "An existing authenticated record, by its IRI.",
+                      "type": "string"
+                    },
+                    "key": {
+                      "description": "A record of this batch, by its key.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
                 }
               },
               "required": [

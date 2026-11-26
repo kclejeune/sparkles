@@ -2414,3 +2414,160 @@ async fn declared_drift_refuses_claims_ingestion_before_model_calls() {
     assert!(m.requests().is_empty());
     assert_eq!(head(&st), before);
 }
+
+#[tokio::test]
+async fn claims_ingestion_of_a_changed_source_links_source_revisions_with_was_revision_of() {
+    let m = proposals_mock();
+    let (_st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    let g = "https://example.org/notes/revisions";
+
+    // First revision has no predecessor.
+    let v1 = ingest(
+        &app,
+        claims(json!({ "text": NOTES, "format": "text/markdown", "graph": g, "iri": g })),
+    )
+    .await;
+    assert_eq!(v1["status"], "done", "{v1}");
+    assert_eq!(v1["result"]["outcome"], "proposed", "{v1}");
+    let rev1 = v1["result"]["revision"].as_str().unwrap().to_string();
+    assert!(v1["result"].get("previousRevision").is_none(), "{v1}");
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev1}> <http://www.w3.org/ns/prov#wasRevisionOf> ?p }} }}"
+            )
+        )
+        .await
+    );
+
+    // Second revision (changed text) links to the first via prov:wasRevisionOf and keeps
+    // earlier claim occurrences intact.
+    let notes_v2 = format!("{NOTES}\nKai Berg leads the platform team.\n");
+    let v2 = ingest(
+        &app,
+        claims(json!({ "text": notes_v2, "format": "text/markdown", "graph": g, "iri": g })),
+    )
+    .await;
+    assert_eq!(v2["status"], "done", "{v2}");
+    assert_eq!(v2["result"]["outcome"], "proposed", "{v2}");
+    let rev2 = v2["result"]["revision"].as_str().unwrap().to_string();
+    assert_ne!(rev2, rev1);
+    assert_eq!(v2["result"]["previousRevision"], rev1, "{v2}");
+    assert!(v2["result"]["previousRendition"].is_string(), "{v2}");
+    assert!(
+        ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rev1}> }} }}"
+            )
+        )
+        .await,
+        "rev2 must record prov:wasRevisionOf rev1"
+    );
+    // Rev2 authenticates via /claims/resolve and its recordDigest matches the proposal receipt.
+    let rev2_digest = v2["result"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "rev")
+        .unwrap()["recordDigest"]
+        .clone();
+    let (s, resolved) = send(
+        &app,
+        req(
+            "POST",
+            "/org/claims/resolve",
+            json!({ "references": [{ "key": "rev", "record": { "iri": rev2, "kinds": ["SourceRevision"] } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{resolved}");
+    assert_eq!(
+        resolved["resolved"][0]["record"]["recordDigest"],
+        rev2_digest
+    );
+
+    // Third revision chains to rev2, not rev1.
+    let notes_v3 = format!("{notes_v2}\nUpdated schedule.\n");
+    let v3 = ingest(
+        &app,
+        claims(json!({ "text": notes_v3, "format": "text/markdown", "graph": g, "iri": g })),
+    )
+    .await;
+    assert_eq!(v3["status"], "done", "{v3}");
+    let rev3 = v3["result"]["revision"].as_str().unwrap().to_string();
+    assert_eq!(v3["result"]["previousRevision"], rev2, "{v3}");
+    assert!(
+        ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev3}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rev2}> }} }}"
+            )
+        )
+        .await
+    );
+
+    // A changed source registered via POST /sources (asserted C18) and then ingested via
+    // source-mode claims ingestion also links to rev3.
+    let notes_v4 = format!("{notes_v3}\nFourth update.\n");
+    let (s, reg) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": g, "format": "text/markdown", "text": notes_v4 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg}");
+    let v4 = ingest(&app, claims(json!({ "source": g }))).await;
+    assert_eq!(v4["status"], "done", "{v4}");
+    let rev4 = v4["result"]["revision"].as_str().unwrap().to_string();
+    assert_eq!(v4["result"]["previousRevision"], rev3, "{v4}");
+    assert!(
+        ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev4}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rev3}> }} }}"
+            )
+        )
+        .await
+    );
+
+    // A source whose first version was only registered without claims ingestion gets no
+    // predecessor link on its first claims ingestion of a changed version.
+    let g2 = "https://example.org/notes/asserted-first";
+    let (s, reg) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g2, "iri": g2, "format": "text/markdown", "text": NOTES }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg}");
+    let first_claims = ingest(
+        &app,
+        claims(json!({ "text": notes_v2, "format": "text/markdown", "graph": g2, "iri": g2 })),
+    )
+    .await;
+    assert_eq!(first_claims["status"], "done", "{first_claims}");
+    assert!(
+        first_claims["result"].get("previousRevision").is_none(),
+        "{first_claims}"
+    );
+    let first_rev = first_claims["result"]["revision"].as_str().unwrap();
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{first_rev}> <http://www.w3.org/ns/prov#wasRevisionOf> ?p }} }}"
+            )
+        )
+        .await
+    );
+}

@@ -120,7 +120,7 @@ pub use sparkles_core::evidence::{
 };
 pub use sparkles_core::evidence::{
     AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
-    EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, JSON_LEXICAL_UTF8_V1,
+    EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, IdentityNamespace, JSON_LEXICAL_UTF8_V1,
     JSON_LEXICAL_UTF8_VERSION, MethodRef, PassageInput, Polarity, RecordKey, RecordRef,
     RecordVersion, RenditionContent, RenditionInput, Scope, SourceContent, SourceLineage,
     SourceMetadata, SourceRevisionInput, SourceTimes,
