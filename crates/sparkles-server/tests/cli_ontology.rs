@@ -576,17 +576,352 @@ fn classify_answers_in_part_under_a_deadline() {
     );
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadlineProbe {
+    TimedOut,
+    Partial,
+    Complete,
+}
+
+struct PartialDeadlineSearch<F> {
+    limit: u64,
+    trace: Vec<(u64, DeadlineProbe)>,
+    run_probe: F,
+}
+
+impl<F: FnMut(u64) -> DeadlineProbe> PartialDeadlineSearch<F> {
+    fn probe(&mut self, ms: u64) -> DeadlineProbe {
+        let outcome = (self.run_probe)(ms);
+        self.trace.push((ms, outcome));
+        outcome
+    }
+
+    fn grow_from(&mut self, start_ms: u64) -> (bool, Option<u64>) {
+        let mut ms = start_ms.max(1);
+        while ms < self.limit {
+            ms = ms.saturating_add((ms / 2).max(1)).min(self.limit);
+            match self.probe(ms) {
+                DeadlineProbe::Partial => return (true, None),
+                DeadlineProbe::Complete => return (false, Some(ms)),
+                DeadlineProbe::TimedOut => {}
+            }
+        }
+        (false, None)
+    }
+
+    // Sweep `(lo_bound, hi_bound)` by halving down toward `lo_bound` without stopping
+    // on timeouts (so a post-saturation taxonomy timeout cannot trap the search above
+    // the saturation window), then probe in dyadic order, refine near `hi`, and retry
+    // the boundary against transient jitter.
+    fn sweep_bracket(&mut self, lo_bound: u64, hi_bound: u64, pass_start: usize) -> (bool, u64) {
+        let mut hi = hi_bound;
+        let mut offset = hi.saturating_sub(lo_bound);
+        while offset > 1 {
+            offset /= 2;
+            let ms = lo_bound + offset;
+            if ms >= hi
+                || self.trace[pass_start..]
+                    .iter()
+                    .any(|&(tried, _)| tried == ms)
+            {
+                continue;
+            }
+            match self.probe(ms) {
+                DeadlineProbe::Partial => return (true, hi),
+                DeadlineProbe::Complete => hi = hi.min(ms),
+                DeadlineProbe::TimedOut => {}
+            }
+        }
+        let span = hi.saturating_sub(lo_bound);
+        let mut denom = 2u64;
+        while denom <= 32 && denom < span.saturating_mul(2) {
+            let mut num = 1u64;
+            while num < denom {
+                let ms = lo_bound + ((span as u128 * num as u128) / denom as u128) as u64;
+                num += 2;
+                if ms <= lo_bound
+                    || ms >= hi
+                    || self.trace[pass_start..]
+                        .iter()
+                        .any(|&(tried, _)| tried == ms)
+                {
+                    continue;
+                }
+                match self.probe(ms) {
+                    DeadlineProbe::Partial => return (true, hi),
+                    DeadlineProbe::Complete => hi = hi.min(ms),
+                    DeadlineProbe::TimedOut => {}
+                }
+            }
+            denom *= 2;
+        }
+        let mut lo = self.trace[pass_start..]
+            .iter()
+            .filter(|&&(tried, outcome)| {
+                outcome == DeadlineProbe::TimedOut && tried >= lo_bound && tried < hi
+            })
+            .map(|&(tried, _)| tried)
+            .max()
+            .unwrap_or(lo_bound);
+        while hi > lo + 1 {
+            let mid = lo + (hi - lo) / 2;
+            match self.probe(mid) {
+                DeadlineProbe::Partial => return (true, hi),
+                DeadlineProbe::Complete => hi = mid,
+                DeadlineProbe::TimedOut => lo = mid,
+            }
+        }
+        for retry in [hi.saturating_sub(1).max(lo_bound.max(1)), hi.max(1)] {
+            if self.probe(retry) == DeadlineProbe::Partial {
+                return (true, hi);
+            }
+        }
+        (false, hi)
+    }
+
+    // Sweep `(lo_bound, hi_bound)`, allowing one bounded revisit of
+    // `(refined_hi, hi_bound)` if a fast outlier tightened the cap below `hi_bound`
+    // and then timed out on its boundary retry.
+    fn sweep_range(
+        &mut self,
+        lo_bound: u64,
+        hi_bound: u64,
+        first_pass_start: usize,
+    ) -> (bool, u64) {
+        let mut cur_lo = lo_bound;
+        let mut pass_start = first_pass_start;
+        let mut last_hi = hi_bound;
+        for _ in 0..2 {
+            let (found, refined_hi) = self.sweep_bracket(cur_lo, hi_bound, pass_start);
+            if found {
+                return (true, refined_hi);
+            }
+            last_hi = refined_hi;
+            let boundary_timed_out = self
+                .trace
+                .last()
+                .is_some_and(|&(_, outcome)| outcome == DeadlineProbe::TimedOut);
+            if !boundary_timed_out || refined_hi <= cur_lo || refined_hi >= hi_bound {
+                break;
+            }
+            cur_lo = refined_hi;
+            pass_start = self.trace.len();
+        }
+        (false, last_hi)
+    }
+
+    // Advance the upward growth cursor monotonically past the completed bracket
+    // endpoint; when growth timed out all the way to `limit`, advance to any
+    // strictly higher sweep cap below `limit` so recovery can continue toward `limit`.
+    fn next_growth_hi(&self, prev_hi: u64, complete_hi: Option<u64>, refined_hi: u64) -> u64 {
+        if let Some(hi) = complete_hi {
+            hi
+        } else if refined_hi > prev_hi && refined_hi < self.limit {
+            refined_hi
+        } else {
+            self.limit
+        }
+    }
+
+    fn run(mut self, index_ms: f64, sat_ms: f64) -> (bool, Vec<(u64, DeadlineProbe)>) {
+        let mut saw_partial = false;
+        let mut hi_complete: Option<u64> = None;
+
+        // Seed probes directly inside the measured saturation window. A deadline that
+        // expires during post-saturation taxonomy also returns `DeadlineProbe::TimedOut`, so
+        // timeouts never prune smaller deadlines. Keep trying remaining calibrated seeds
+        // even after `DeadlineProbe::Complete`, since a single unusually fast process invocation
+        // can complete below the ordinary partial window.
+        for frac in [0.25, 0.50, 0.12, 0.70, 0.06] {
+            let ms = (index_ms + sat_ms * frac).round().max(1.0) as u64;
+            if self.trace.iter().any(|&(tried, _)| tried == ms) {
+                continue;
+            }
+            match self.probe(ms) {
+                DeadlineProbe::Partial => {
+                    saw_partial = true;
+                    break;
+                }
+                DeadlineProbe::Complete => {
+                    hi_complete = Some(hi_complete.map_or(ms, |h| h.min(ms)));
+                }
+                DeadlineProbe::TimedOut => {}
+            }
+        }
+
+        // Adaptive fallback if machine speed shifted sharply relative to calibration.
+        // First bracket an upper bound if every seed timed out.
+        if !saw_partial && hi_complete.is_none() {
+            let start = self
+                .trace
+                .iter()
+                .map(|&(tried, _)| tried)
+                .max()
+                .unwrap_or(1);
+            let (found, complete_at) = self.grow_from(start);
+            saw_partial = found;
+            hi_complete = complete_at;
+        }
+        let mut phase3_hi = hi_complete.unwrap_or(self.limit);
+        if !saw_partial {
+            let (found, refined_hi) = self.sweep_range(0, phase3_hi, 0);
+            saw_partial = found;
+            phase3_hi = refined_hi;
+        }
+        if !saw_partial {
+            let cal_retry = (index_ms + sat_ms * 0.35).round().max(1.0) as u64;
+            if self.probe(cal_retry) == DeadlineProbe::Partial {
+                saw_partial = true;
+            }
+        }
+        // If a fast outlier completion capped the downward/dyadic search below a shifted
+        // partial window, allow bounded upward recovery probes past that refined cap up
+        // to `limit` and sweep each newly bracketed upper range.
+        if !saw_partial {
+            let mut growth_hi = phase3_hi;
+            for _ in 0..3 {
+                if growth_hi >= self.limit {
+                    break;
+                }
+                let pass_start = self.trace.len();
+                let (found, next_complete) = self.grow_from(growth_hi);
+                if found {
+                    saw_partial = true;
+                    break;
+                }
+                let upper = next_complete.unwrap_or(self.limit);
+                let (found, refined_hi) = self.sweep_range(growth_hi, upper, pass_start);
+                if found {
+                    saw_partial = true;
+                    break;
+                }
+                growth_hi = self.next_growth_hi(growth_hi, next_complete, refined_hi);
+            }
+        }
+        (saw_partial, self.trace)
+    }
+}
+
+fn search_partial_deadline(
+    index_ms: f64,
+    sat_ms: f64,
+    tax_ms: f64,
+    run_probe: impl FnMut(u64) -> DeadlineProbe,
+) -> (bool, Vec<(u64, DeadlineProbe)>) {
+    let limit = (((index_ms + sat_ms + tax_ms) * 20.0) as u64).max(2000);
+    PartialDeadlineSearch {
+        limit,
+        trace: Vec::new(),
+        run_probe,
+    }
+    .run(index_ms, sat_ms)
+}
+
+#[test]
+fn partial_deadline_search_recovers_from_fast_outlier_caps() {
+    // Initial sweep tightens from 70 ms to 35 ms during a brief faster period (both
+    // 35 ms probes complete, so sweep_range does not revisit (35, 70)). Upward recovery
+    // must start at the refined cap (35 ms) rather than the original seed cap (70 ms).
+    let mut fast_35_left = 2usize;
+    let (found, trace) = search_partial_deadline(10.0, 120.0, 5.0, |ms| {
+        if ms == 35 && fast_35_left > 0 {
+            fast_35_left -= 1;
+            return DeadlineProbe::Complete;
+        }
+        match ms {
+            ..55 => DeadlineProbe::TimedOut,
+            55..=65 => DeadlineProbe::Partial,
+            _ => DeadlineProbe::Complete,
+        }
+    });
+    assert!(found, "trace={trace:?}");
+    assert_eq!(fast_35_left, 0, "trace={trace:?}");
+    assert_eq!(trace.last(), Some(&(56, DeadlineProbe::Partial)));
+
+    // Upward growth completes at 30 ms, a temporary cap at 21 ms times out on its
+    // boundary retry, and the revisit also hits a temporary cap at 25 ms; the next
+    // upward pass still advances monotonically from 30 ms to 45 ms and finds 67 ms.
+    let mut fast_20 = true;
+    let mut fast_30 = true;
+    let mut fast_21 = true;
+    let mut fast_25_calls = 0usize;
+    let (found, trace) = search_partial_deadline(10.0, 20.0, 1.0, |ms| match ms {
+        20 if fast_20 => {
+            fast_20 = false;
+            DeadlineProbe::Complete
+        }
+        30 if fast_30 => {
+            fast_30 = false;
+            DeadlineProbe::Complete
+        }
+        21 if fast_21 => {
+            fast_21 = false;
+            DeadlineProbe::Complete
+        }
+        25 => {
+            fast_25_calls += 1;
+            if fast_25_calls == 2 {
+                DeadlineProbe::Complete
+            } else {
+                DeadlineProbe::TimedOut
+            }
+        }
+        65..=70 => DeadlineProbe::Partial,
+        _ => DeadlineProbe::TimedOut,
+    });
+    assert!(found, "trace={trace:?}");
+    assert_eq!(trace.last(), Some(&(67, DeadlineProbe::Partial)));
+
+    // Growth times out all the way to limit (2700 ms), then the sweep caps at 1385 ms
+    // with a completing boundary retry; recovery advances to 1385 ms and reaches 2077 ms.
+    let mut fast_70 = true;
+    let mut fast_1385_left = 2usize;
+    let (found, trace) = search_partial_deadline(10.0, 120.0, 5.0, |ms| {
+        if ms == 70 && fast_70 {
+            fast_70 = false;
+            return DeadlineProbe::Complete;
+        }
+        if ms == 1385 && fast_1385_left > 0 {
+            fast_1385_left -= 1;
+            return DeadlineProbe::Complete;
+        }
+        match ms {
+            2050..=2100 => DeadlineProbe::Partial,
+            _ => DeadlineProbe::TimedOut,
+        }
+    });
+    assert!(found, "trace={trace:?}");
+    assert_eq!(fast_1385_left, 0, "trace={trace:?}");
+    assert_eq!(trace.last(), Some(&(2077, DeadlineProbe::Partial)));
+}
+
 #[test]
 fn classify_el_and_horn_partial_under_deadline() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
 
+    // Declare every entity explicitly so `OntologyFile::read` takes the direct OFN fast
+    // path instead of falling back to an in-memory RDF store round-trip under `--timeout`,
+    // and size both fixtures so saturation comfortably dominates indexing and process jitter.
     let mut el_ofn = String::from(
         "Prefix(:=<http://ex.org/>)\nOntology(\n\
+         Declaration(ObjectProperty(:part))\n\
+         Declaration(ObjectProperty(:r1))\n\
+         Declaration(ObjectProperty(:r2))\n\
+         Declaration(ObjectProperty(:s))\n\
          TransitiveObjectProperty(:part)\n\
          SubObjectPropertyOf(ObjectPropertyChain(:r1 :r2) :s)\n",
     );
-    let en = if cfg!(debug_assertions) { 100 } else { 300 };
+    let en = if cfg!(debug_assertions) { 250 } else { 800 };
+    for i in 0..en {
+        el_ofn.push_str(&format!(
+            "Declaration(Class(:A{i}))\n\
+             Declaration(Class(:B{i}))\n\
+             Declaration(Class(:C{i}))\n\
+             Declaration(Class(:D{i}))\n\
+             Declaration(Class(:P{i}))\n",
+        ));
+    }
     for i in 0..en {
         let next = (i + 1) % en;
         el_ofn.push_str(&format!(
@@ -602,18 +937,37 @@ fn classify_el_and_horn_partial_under_deadline() {
 
     let mut horn_ofn = String::from(
         "Prefix(:=<http://ex.org/>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n\
-         InverseObjectProperties(:r :rinv)\n",
+         Declaration(ObjectProperty(:r))\n\
+         Declaration(ObjectProperty(:rinv))\n\
+         Declaration(ObjectProperty(:part))\n\
+         InverseObjectProperties(:r :rinv)\n\
+         TransitiveObjectProperty(:part)\n",
     );
-    let hn = if cfg!(debug_assertions) { 90 } else { 300 };
+    // Coprime to 7 and 11 so the modular indices visit every class uniformly.
+    let hn = if cfg!(debug_assertions) { 128 } else { 360 };
     for i in 0..hn {
+        horn_ofn.push_str(&format!(
+            "Declaration(Class(:H{i}))\n\
+             Declaration(Class(:M{i}))\n\
+             Declaration(Class(:F{i}))\n\
+             Declaration(Class(:G{i}))\n\
+             Declaration(Class(:Back{i}))\n\
+             Declaration(Class(:P{i}))\n",
+        ));
+    }
+    for i in 0..hn {
+        let next = (i + 1) % hn;
         let b = (7 * i + 3) % hn;
         let d_idx = (11 * i + 5) % hn;
         horn_ofn.push_str(&format!(
-            "SubClassOf(:H{i} ObjectSomeValuesFrom(:r :M{i}))\n\
+            "SubClassOf(:H{i} :H{next})\n\
+             SubClassOf(:H{i} ObjectSomeValuesFrom(:r :M{i}))\n\
              SubClassOf(:H{i} ObjectAllValuesFrom(:r :F{b}))\n\
              SubClassOf(:H{i} ObjectMaxCardinality(1 :r owl:Thing))\n\
              SubClassOf(:H{i} ObjectSomeValuesFrom(:r :G{d_idx}))\n\
-             SubClassOf(:M{i} ObjectAllValuesFrom(:rinv :Back{i}))\n",
+             SubClassOf(:M{i} ObjectAllValuesFrom(:rinv :Back{i}))\n\
+             SubClassOf(:F{i} ObjectSomeValuesFrom(:part :P{next}))\n\
+             SubClassOf(:P{i} ObjectSomeValuesFrom(:part :P{next}))\n",
         ));
     }
     horn_ofn.push_str(")\n");
@@ -635,52 +989,45 @@ fn classify_el_and_horn_partial_under_deadline() {
         assert_eq!(full["tier"], tier, "{tier}: {full}");
         assert_eq!(full["partial"], false, "{tier}: {full}");
         let s = &full["stats"];
-        let took = (s["indexMs"].as_f64().unwrap()
-            + s["saturationMs"].as_f64().unwrap()
-            + s["taxonomyMs"].as_f64().unwrap())
-            / 1000.0;
-        let limit = ((took * 20000.0) as u64).max(2000);
-        let saw_partial = std::cell::Cell::new(false);
-        let answered = std::cell::Cell::new(0usize);
-        let run = |ms: u64| -> bool {
+        let index_ms = s["indexMs"].as_f64().unwrap();
+        let sat_ms = s["saturationMs"].as_f64().unwrap();
+        let tax_ms = s["taxonomyMs"].as_f64().unwrap();
+        let (saw_partial, trace) = search_partial_deadline(index_ms, sat_ms, tax_ms, |ms| {
             let t = format!("{}", ms as f64 / 1000.0);
             let o = sparkles(dir, &[&args[..], &["--partial", "--timeout", &t]].concat());
             let Ok(j) = serde_json::from_slice::<serde_json::Value>(&o.stdout) else {
-                assert_eq!(o.status.code(), Some(1), "{tier}: {}", err(&o));
-                return false;
+                let stderr = err(&o);
+                let stdout = out(&o);
+                let lower = stderr.to_ascii_lowercase();
+                assert!(
+                    o.status.code() == Some(1)
+                        && (lower.contains("timed out") || lower.contains("deadline")),
+                    "{tier}: unexpected non-JSON result at {ms}ms (status={:?}, stdout={stdout:?}, stderr={stderr:?})",
+                    o.status.code(),
+                );
+                return DeadlineProbe::TimedOut;
             };
-            answered.set(answered.get() + 1);
             assert_eq!(j["tier"], tier, "{tier}: {j}");
+            assert_eq!(j["classes"], full["classes"], "{tier}: {j}");
             if j["partial"] == true {
                 assert_eq!(j["complete"], false, "{tier}: {j}");
                 assert_eq!(o.status.code(), Some(2), "{tier}: {}", err(&o));
                 assert!(err(&o).contains("partial answer"), "{tier}: {}", err(&o));
-                saw_partial.set(true);
-            }
-            true
-        };
-        let after = |ms: u64| ms + (ms * 8 / 100).max(1);
-        let (mut lo, mut ms) = (0, 2);
-        while ms < limit && !run(ms) {
-            lo = ms;
-            ms = after(ms);
-        }
-        let mut hi = ms;
-        while hi - lo > 1 && !saw_partial.get() {
-            let mid = (lo + hi) / 2;
-            if run(mid) {
-                hi = mid;
+                assert_eq!(
+                    j["incompleteCount"].as_u64(),
+                    Some(j["incomplete"].as_array().unwrap().len() as u64),
+                    "{tier}: {j}"
+                );
+                DeadlineProbe::Partial
             } else {
-                lo = mid;
+                assert_eq!(j["complete"], true, "{tier}: {j}");
+                assert_eq!(o.status.code(), Some(0), "{tier}: {}", err(&o));
+                DeadlineProbe::Complete
             }
-        }
-        while !saw_partial.get() && answered.get() < 20 && ms < limit {
-            ms = after(ms);
-            run(ms);
-        }
+        });
         assert!(
-            saw_partial.get(),
-            "{tier}: no deadline gave a partial CLI answer"
+            saw_partial,
+            "{tier}: no deadline gave a partial CLI answer (indexMs={index_ms:.2}, saturationMs={sat_ms:.2}, taxonomyMs={tax_ms:.2}, trace={trace:?})"
         );
     }
 }
