@@ -2462,10 +2462,156 @@ fn verify_structured_reference(
     }
 }
 
-/// Build `(deletes, inserts)` for one re-authentication commit in `graph` under
-/// `current_nonce`.
+/// Per-quad allocator alignment/metadata margin across the four owned heap terms.
+const QUAD_ALLOC_OVERHEAD: u64 = 64;
+/// Upper bound for constant predicate, literal and datatype IRI strings across the 11
+/// (or 12 with `idempotencyKey`) fixed audit operation quads plus local `new_nonce` and
+/// `time` values (exact byte sum is under 1,000 bytes).
+const AUDIT_FIXED_STRINGS_BYTES: u64 = 1280;
+/// Conservative B-tree node bytes per entry in `BTreeMap<&NamedNode, Uuid>`.
+const RECEIPT_MAP_ENTRY_BYTES: u64 = 128;
+/// Conservative B-tree node bytes per entry in `BTreeSet<&NamedNode>`.
+const RECEIPT_SET_ENTRY_BYTES: u64 = 64;
+
+struct QuadIndex<'a> {
+    ops_to_update: BTreeMap<&'a NamedNode, Uuid>,
+    informed_by: BTreeSet<&'a NamedNode>,
+    renewed_count: usize,
+    already_count: usize,
+}
+
+fn index_verified_receipts<'a>(
+    verified: &'a [VerifiedCandidate],
+    current_nonce: Uuid,
+) -> QuadIndex<'a> {
+    let mut ops_to_update: BTreeMap<&'a NamedNode, Uuid> = BTreeMap::new();
+    let mut informed_by: BTreeSet<&'a NamedNode> = BTreeSet::new();
+    let mut renewed_count = 0usize;
+    let mut already_count = 0usize;
+    for item in verified {
+        if item.already_authenticated {
+            already_count += 1;
+        } else {
+            renewed_count += 1;
+            informed_by.insert(&item.receipt);
+            if item.operation_nonce != current_nonce {
+                ops_to_update
+                    .entry(&item.receipt)
+                    .or_insert(item.operation_nonce);
+            }
+        }
+    }
+    QuadIndex {
+        ops_to_update,
+        informed_by,
+        renewed_count,
+        already_count,
+    }
+}
+
+fn estimate_quad_index_bytes(verified: &[VerifiedCandidate], current_nonce: Uuid) -> u64 {
+    let mut total = 0u64;
+    for item in verified {
+        if !item.already_authenticated {
+            total = total.saturating_add(RECEIPT_SET_ENTRY_BYTES);
+            if item.operation_nonce != current_nonce {
+                total = total.saturating_add(RECEIPT_MAP_ENTRY_BYTES);
+            }
+        }
+    }
+    total
+}
+
+fn estimate_quad_output_bytes(
+    operation_iri: &NamedNode,
+    principal: &NamedNode,
+    idempotency_key: Option<&str>,
+    graph: &NamedNode,
+    verified: &[VerifiedCandidate],
+    index: &QuadIndex<'_>,
+) -> u64 {
+    let quad_slot = std::mem::size_of::<Quad>() as u64;
+    let g_len = graph.as_str().len() as u64;
+    let op_len = operation_iri.as_str().len() as u64;
+    let audit_quads = 11usize + usize::from(idempotency_key.is_some());
+    let delete_len = index.renewed_count + index.ops_to_update.len();
+    let insert_len = audit_quads
+        + index.already_count
+        + 2 * index.renewed_count
+        + index.ops_to_update.len()
+        + index.informed_by.len();
+
+    // Backing `Vec<Quad>` arrays (pre-allocated to exact capacities) plus fixed audit
+    // quads, the extra graph IRI object on `ev:reauthenticatedGraph`, local `gn`,
+    // `principal`, optional `idempotency_key`, and constant predicate/literal IRIs.
+    let mut total = ((delete_len + insert_len) as u64).saturating_mul(quad_slot);
+    total = total
+        .saturating_add(
+            (audit_quads as u64).saturating_mul(
+                op_len
+                    .saturating_add(g_len)
+                    .saturating_add(QUAD_ALLOC_OVERHEAD),
+            ),
+        )
+        .saturating_add(g_len.saturating_mul(2))
+        .saturating_add(principal.as_str().len() as u64)
+        .saturating_add(idempotency_key.map_or(0, |k| k.len() as u64))
+        .saturating_add(AUDIT_FIXED_STRINGS_BYTES);
+
+    // Per-candidate quads: 1 insert for already-authenticated records, or 3 quads
+    // (nonce delete, nonce insert, `prov:used` insert) for renewed records.
+    let ev_already_len = EV_ALREADY_AUTHENTICATED.len() as u64;
+    let record_fixed_bytes = 39u64 + 36 + 39 + 36 + 31 + 3 * QUAD_ALLOC_OVERHEAD;
+    for item in verified {
+        let iri_len = item.iri.as_str().len() as u64;
+        if item.already_authenticated {
+            total = total.saturating_add(
+                op_len
+                    .saturating_add(ev_already_len)
+                    .saturating_add(iri_len)
+                    .saturating_add(g_len)
+                    .saturating_add(QUAD_ALLOC_OVERHEAD),
+            );
+        } else {
+            total = total.saturating_add(
+                iri_len
+                    .saturating_mul(3)
+                    .saturating_add(op_len)
+                    .saturating_add(g_len.saturating_mul(3))
+                    .saturating_add(record_fixed_bytes),
+            );
+        }
+    }
+
+    // Distinct stale receipts: 2 quads each (nonce delete + nonce insert).
+    let receipt_nonce_fixed_bytes = 39u64 + 36 + 39 + 36 + 2 * QUAD_ALLOC_OVERHEAD;
+    for op in index.ops_to_update.keys() {
+        let r_len = op.as_str().len() as u64;
+        total = total.saturating_add(
+            r_len
+                .saturating_mul(2)
+                .saturating_add(g_len.saturating_mul(2))
+                .saturating_add(receipt_nonce_fixed_bytes),
+        );
+    }
+
+    // Distinct informed receipts: 1 `prov:wasInformedBy` insert each.
+    let informed_fixed_bytes = 40u64 + QUAD_ALLOC_OVERHEAD;
+    for op in &index.informed_by {
+        let r_len = op.as_str().len() as u64;
+        total = total.saturating_add(
+            op_len
+                .saturating_add(r_len)
+                .saturating_add(g_len)
+                .saturating_add(informed_fixed_bytes),
+        );
+    }
+
+    total
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn build_quads(
+fn emit_quads(
     operation_iri: &NamedNode,
     principal: &NamedNode,
     payload_digest: Sha256Digest,
@@ -2474,13 +2620,24 @@ pub fn build_quads(
     current_nonce: Uuid,
     stamp: &Stamp,
     verified: &[VerifiedCandidate],
+    index: QuadIndex<'_>,
 ) -> (Vec<Quad>, Vec<Quad>) {
     let gn = GraphName::NamedNode(graph.clone());
     let new_nonce = string(&current_nonce.to_string());
     let time = date_time(stamp.time_ms);
-    let mut deletes = Vec::new();
+    let audit_quads = 11usize + usize::from(idempotency_key.is_some());
+    let delete_len = index.renewed_count + index.ops_to_update.len();
+    let insert_len = audit_quads
+        + index.already_count
+        + 2 * index.renewed_count
+        + index.ops_to_update.len()
+        + index.informed_by.len();
+
+    let mut deletes = Vec::with_capacity(delete_len);
+    let mut inserts = Vec::with_capacity(insert_len);
+
     // Audit operation record in `graph`, explicitly marked as a reconciliation of `graph`.
-    let mut inserts = vec![
+    inserts.extend([
         Quad::new(
             operation_iri.clone(),
             rdf_type(),
@@ -2545,7 +2702,7 @@ pub fn build_quads(
             new_nonce.clone(),
             gn.clone(),
         ),
-    ];
+    ]);
     if let Some(k) = idempotency_key {
         inserts.push(Quad::new(
             operation_iri.clone(),
@@ -2555,10 +2712,6 @@ pub fn build_quads(
         ));
     }
 
-    // Track distinct original receipt operations whose nonce needs updating, and all
-    // original receipt operations informed by this reconciliation.
-    let mut ops_to_update: BTreeMap<NamedNode, Uuid> = BTreeMap::new();
-    let mut informed_by: BTreeSet<NamedNode> = BTreeSet::new();
     for item in verified {
         if item.already_authenticated {
             // Record already-authenticated candidates separately so a keyed whole-graph
@@ -2589,14 +2742,8 @@ pub fn build_quads(
             item.iri.clone(),
             gn.clone(),
         ));
-        informed_by.insert(item.receipt.clone());
-        if item.operation_nonce != current_nonce {
-            ops_to_update
-                .entry(item.receipt.clone())
-                .or_insert(item.operation_nonce);
-        }
     }
-    for (op, old_nonce) in ops_to_update {
+    for (op, old_nonce) in index.ops_to_update {
         deletes.push(Quad::new(
             op.clone(),
             ev("graphProtection"),
@@ -2604,21 +2751,95 @@ pub fn build_quads(
             gn.clone(),
         ));
         inserts.push(Quad::new(
-            op,
+            op.clone(),
             ev("graphProtection"),
             new_nonce.clone(),
             gn.clone(),
         ));
     }
-    for op in informed_by {
+    for op in index.informed_by {
         inserts.push(Quad::new(
             operation_iri.clone(),
             prov("wasInformedBy"),
-            op,
+            op.clone(),
             gn.clone(),
         ));
     }
+    debug_assert_eq!(deletes.len(), delete_len);
+    debug_assert_eq!(inserts.len(), insert_len);
     (deletes, inserts)
+}
+
+/// Charge `preparation` for the retained receipt indexes, `Vec<Quad>` backing buffers and
+/// all owned quad terms before allocating them, then build `(deletes, inserts)` for one
+/// re-authentication commit in `graph` under `current_nonce`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_quads_charged(
+    preparation: &Preparation,
+    label: &str,
+    operation_iri: &NamedNode,
+    principal: &NamedNode,
+    payload_digest: Sha256Digest,
+    idempotency_key: Option<&str>,
+    graph: &NamedNode,
+    current_nonce: Uuid,
+    stamp: &Stamp,
+    verified: &[VerifiedCandidate],
+) -> Result<(Vec<Quad>, Vec<Quad>, Reservation)> {
+    let index_bytes = estimate_quad_index_bytes(verified, current_nonce);
+    let mut held = preparation
+        .reserve(index_bytes)
+        .map_err(|e| classify_error(label, e))?;
+    let index = index_verified_receipts(verified, current_nonce);
+    let output_bytes = estimate_quad_output_bytes(
+        operation_iri,
+        principal,
+        idempotency_key,
+        graph,
+        verified,
+        &index,
+    );
+    held.grow_by(output_bytes)
+        .map_err(|e| classify_error(label, e))?;
+    let (deletes, inserts) = emit_quads(
+        operation_iri,
+        principal,
+        payload_digest,
+        idempotency_key,
+        graph,
+        current_nonce,
+        stamp,
+        verified,
+        index,
+    );
+    Ok((deletes, inserts, held))
+}
+
+/// Build `(deletes, inserts)` for one re-authentication commit in `graph` under
+/// `current_nonce`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_quads(
+    operation_iri: &NamedNode,
+    principal: &NamedNode,
+    payload_digest: Sha256Digest,
+    idempotency_key: Option<&str>,
+    graph: &NamedNode,
+    current_nonce: Uuid,
+    stamp: &Stamp,
+    verified: &[VerifiedCandidate],
+) -> (Vec<Quad>, Vec<Quad>) {
+    let index = index_verified_receipts(verified, current_nonce);
+    emit_quads(
+        operation_iri,
+        principal,
+        payload_digest,
+        idempotency_key,
+        graph,
+        current_nonce,
+        stamp,
+        verified,
+        index,
+    )
 }
 
 #[cfg(test)]
@@ -2822,5 +3043,147 @@ mod tests {
                 assert!(!more);
             }
         }
+    }
+
+    fn measured_quad_vec_bytes(quads: &[Quad], capacity: usize) -> u64 {
+        let mut total = (capacity * std::mem::size_of::<Quad>()) as u64;
+        for q in quads {
+            total += match &q.subject {
+                NamedOrBlankNode::NamedNode(n) => n.as_str().len() as u64,
+                NamedOrBlankNode::BlankNode(b) => b.as_str().len() as u64,
+            };
+            total += q.predicate.as_str().len() as u64;
+            total += match &q.object {
+                Term::NamedNode(n) => n.as_str().len() as u64,
+                Term::BlankNode(b) => b.as_str().len() as u64,
+                Term::Literal(l) => {
+                    l.value().len() as u64
+                        + l.language().map_or(0, |s| s.len() as u64)
+                        + if l.datatype().as_str() == XSD_STRING {
+                            0
+                        } else {
+                            l.datatype().as_str().len() as u64
+                        }
+                }
+                Term::Triple(_) => 0,
+            };
+            total += match &q.graph_name {
+                GraphName::NamedNode(n) => n.as_str().len() as u64,
+                GraphName::BlankNode(b) => b.as_str().len() as u64,
+                GraphName::DefaultGraph => 0,
+            };
+        }
+        total
+    }
+
+    #[test]
+    fn build_quads_charged_bounds_long_graph_iri_with_distinct_receipts_within_64mib() {
+        let long_graph = NamedNode::new_unchecked(format!("urn:ev:claims:{}", "g".repeat(4082)));
+        assert_eq!(long_graph.as_str().len(), 4096);
+        let op_iri = NamedNode::new_unchecked(format!("urn:uuid:{}", Uuid::new_v4()));
+        let principal = NamedNode::new_unchecked("urn:x-sparkles:principal:admin");
+        let digest = Sha256Digest::of_bytes(b"payload", &Control::none()).unwrap();
+        let current_nonce = Uuid::new_v4();
+        let stamp = Stamp {
+            dataset: Uuid::new_v4(),
+            branch: Uuid::new_v4(),
+            commit: 42,
+            time_ms: 1_700_000_000_000,
+        };
+
+        // 2,800 renewed records with distinct stale receipts and a 4,096-byte graph IRI:
+        // six output quads per record own 68.8+ MiB of graph IRI strings alone, so the
+        // shared 64 MiB preparation allowance MUST refuse before allocating output quads.
+        let verified: Vec<VerifiedCandidate> = (0..2800)
+            .map(|i| VerifiedCandidate {
+                iri: NamedNode::new_unchecked(format!("urn:ev:claim:{i:04}")),
+                kind: RecordKind::Claim,
+                digest,
+                receipt: NamedNode::new_unchecked(format!("urn:uuid:{}", Uuid::new_v4())),
+                record_nonce: Uuid::new_v4(),
+                operation_nonce: Uuid::new_v4(),
+                already_authenticated: false,
+            })
+            .collect();
+        let prep_64m =
+            Preparation::new(Control::none(), super::super::resolve::MEMORY_BYTES).unwrap();
+        let err = match build_quads_charged(
+            &prep_64m,
+            "graph",
+            &op_iri,
+            &principal,
+            digest,
+            Some("idempotency-key-1"),
+            &long_graph,
+            current_nonce,
+            &stamp,
+            &verified,
+        ) {
+            Err(e) => e,
+            Ok((d, i, _)) => panic!(
+                "expected incomplete-evidence, got {} deletes and {} inserts",
+                d.len(),
+                i.len()
+            ),
+        };
+        assert!(
+            matches!(
+                err,
+                Error::Managed(ref m) if m.kind == ManagedErrorKind::IncompleteEvidence
+            ),
+            "expected incomplete-evidence for 2,800 distinct stale receipts x 4 KiB graph IRI, got {err:?}"
+        );
+
+        // On a smaller mixed batch (distinct stale receipts, shared receipt, and an
+        // already-authenticated record), the charged reservation must strictly cover both
+        // pre-sized output vectors and every owned term string inside them.
+        let shared_receipt = NamedNode::new_unchecked(format!("urn:uuid:{}", Uuid::new_v4()));
+        let shared_old_nonce = Uuid::new_v4();
+        let mut small = verified[..20].to_vec();
+        for i in 20..25 {
+            small.push(VerifiedCandidate {
+                iri: NamedNode::new_unchecked(format!("urn:ev:shared:{i:04}")),
+                kind: RecordKind::Claim,
+                digest,
+                receipt: shared_receipt.clone(),
+                record_nonce: shared_old_nonce,
+                operation_nonce: shared_old_nonce,
+                already_authenticated: false,
+            });
+        }
+        small.push(VerifiedCandidate {
+            iri: NamedNode::new_unchecked("urn:ev:already:0001"),
+            kind: RecordKind::Claim,
+            digest,
+            receipt: NamedNode::new_unchecked(format!("urn:uuid:{}", Uuid::new_v4())),
+            record_nonce: current_nonce,
+            operation_nonce: current_nonce,
+            already_authenticated: true,
+        });
+        let prep_roomy =
+            Preparation::new(Control::none(), super::super::resolve::MEMORY_BYTES).unwrap();
+        let (deletes, inserts, held) = build_quads_charged(
+            &prep_roomy,
+            "graph",
+            &op_iri,
+            &principal,
+            digest,
+            Some("idempotency-key-small"),
+            &long_graph,
+            current_nonce,
+            &stamp,
+            &small,
+        )
+        .unwrap();
+        assert_eq!(deletes.len(), deletes.capacity());
+        assert_eq!(inserts.len(), inserts.capacity());
+        let actual_bytes = measured_quad_vec_bytes(&deletes, deletes.capacity())
+            + measured_quad_vec_bytes(&inserts, inserts.capacity());
+        assert!(
+            held.bytes() >= actual_bytes,
+            "charged {} bytes < actual {} bytes",
+            held.bytes(),
+            actual_bytes
+        );
     }
 }

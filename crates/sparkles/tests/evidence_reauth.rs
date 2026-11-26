@@ -3062,32 +3062,39 @@ fn reauthenticate_refuses_duplicate_isomorphic_blank_expected_triple_in_both_dig
         assert_eq!(ds.store().head_commit().seq, head);
     }
 
-    // 3. Planting a bare blank node directly as `ev:expectedTriple` object -> refused.
+    // 3. Planting a bare blank node directly as `ev:expectedTriple` object on an
+    //    `EvidenceRef` -> refused by the `EvidenceRef`-specific non-triple guard.
     {
         let ds = memory_ds();
         configure(&ds);
-        let p = propose(&ds, &small_batch("bare-b", "r-bare-b"), &propose_options()).unwrap();
-        let claim = iri_of(&p, "claim");
+        let p = propose(&ds, &rich_batch("bare-b"), &propose_options()).unwrap();
+        let pref = iri_of(&p, "pref");
         evidence::detach(&ds, CLAIMS).unwrap();
         ds.update(&format!(
             "PREFIX ev: <{EV}>
              INSERT DATA {{ GRAPH <{CLAIMS}> {{
-                 <{c}> ev:expectedTriple _:bare .
+                 <{r}> ev:expectedTriple _:bare .
              }} }}",
-            c = claim.as_str(),
+            r = pref.as_str(),
         ))
         .unwrap();
         configure(&ds);
-        assert_eq!(
-            code(evidence::reauthenticate(
-                &ds,
-                &ds,
-                &iri(CLAIMS),
-                &reauth_options(),
-                &Control::none(),
-            )),
-            "immutable-record-conflict"
-        );
+        let head = ds.store().head_commit().seq;
+        let err =
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &reauth_options(), &Control::none())
+                .unwrap_err();
+        match err {
+            Error::Managed(m) => {
+                assert_eq!(m.code, "immutable-record-conflict", "{m:?}");
+                assert!(
+                    m.message.contains("non-triple ev:expectedTriple"),
+                    "expected non-triple ev:expectedTriple message, got: {}",
+                    m.message
+                );
+            }
+            other => panic!("expected immutable-record-conflict, got {other:?}"),
+        }
+        assert_eq!(ds.store().head_commit().seq, head);
     }
 }
 

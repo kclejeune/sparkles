@@ -18,7 +18,7 @@ use crate::{Dataset, Error, Result};
 use oxrdf::{NamedNode, Term};
 use sparkles_core::evidence::reauth::{
     self, EV_ALREADY_AUTHENTICATED, MAX_REAUTHENTICATE, PublicationViews, RecordCheck,
-    VerifiedCandidate, build_quads, classify_error, discover_records, payload_digest,
+    VerifiedCandidate, build_quads_charged, classify_error, discover_records, payload_digest,
     require_configuration_history, verify_audit_operation, verify_candidate,
 };
 use sparkles_core::evidence::resolve::{MEMORY_BYTES, kind_iri};
@@ -148,47 +148,6 @@ fn into_records(verified: Vec<VerifiedCandidate>) -> Vec<ReauthenticatedRecord> 
             already_authenticated: v.already_authenticated,
         })
         .collect()
-}
-
-fn estimate_build_quads_bytes(
-    op_iri: &NamedNode,
-    principal: &NamedNode,
-    graph: &NamedNode,
-    verified: &[VerifiedCandidate],
-) -> u64 {
-    let g_len = graph.as_str().len() as u64;
-    let op_len = op_iri.as_str().len() as u64;
-    let mut total = (op_len
-        .saturating_add(principal.as_str().len() as u64)
-        .saturating_add(g_len)
-        .saturating_add(256))
-    .saturating_mul(12);
-    for v in verified {
-        let iri_len = v.iri.as_str().len() as u64;
-        if v.already_authenticated {
-            total = total.saturating_add(
-                op_len
-                    .saturating_add(iri_len)
-                    .saturating_add(g_len)
-                    .saturating_add(192),
-            );
-        } else {
-            let r_len = v.receipt.as_str().len() as u64;
-            let record_quads = iri_len
-                .saturating_add(g_len)
-                .saturating_add(160)
-                .saturating_mul(3);
-            let receipt_quads = r_len
-                .saturating_add(g_len)
-                .saturating_add(160)
-                .saturating_mul(2);
-            total = total
-                .saturating_add(record_quads)
-                .saturating_add(receipt_quads)
-                .saturating_add(op_len);
-        }
-    }
-    total
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -832,6 +791,9 @@ fn reauthenticate_with_budget(
             before_publish: Some(before_publish),
             ..Default::default()
         };
+        #[cfg(test)]
+        fire_test_hook("before_writer_lock");
+
         let mut t = store.try_write_with(crate::commit::CommitKind::Transaction, opts)?;
         t.set_managed(capability)?;
         if !store.managed_writer_current(t.managed().expect("capability set")) {
@@ -923,11 +885,9 @@ fn reauthenticate_with_budget(
             commit: seq,
             time_ms,
         };
-        let quads_bytes = estimate_build_quads_bytes(&op_iri, &options.principal, graph, &verified);
-        let quads_held = preparation
-            .reserve(quads_bytes)
-            .map_err(|e| classify_error(&op_label, e))?;
-        let (deletes, inserts) = build_quads(
+        let (deletes, inserts, quads_held) = build_quads_charged(
+            &preparation,
+            &op_label,
             &op_iri,
             &options.principal,
             p_digest,
@@ -936,7 +896,7 @@ fn reauthenticate_with_budget(
             current_nonce,
             &stamp,
             &verified,
-        );
+        )?;
 
         let mut labels = std::collections::HashMap::new();
         for q in &deletes {
@@ -1192,6 +1152,142 @@ mod tests {
                 "expected immutable-record-conflict after registry change, got {err:?}"
             );
         }
+
+        // 4. Fast-path keyed replay where detach + re-protect occurs AFTER replay lookup
+        //    succeeds, right before returning `Ok(res)` (`before_fast_replay_return`).
+        //    Must not return the stale replay result; it retries and refuses with
+        //    `immutable-record-conflict`.
+        {
+            let (ds, settings, _claim) = setup_ds();
+            evidence::detach(&ds, CLAIMS).unwrap();
+            evidence::configure(&ds, &settings, &Control::none()).unwrap();
+            let mut opts = ReauthenticateOptions::new(admin.clone());
+            opts.idempotency_key = Some("reauth-race-fast-return".into());
+            let first = reauthenticate(&ds, &ds, &graph, &opts, &Control::none()).unwrap();
+            assert!(first.committed);
+
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired_c = fired.clone();
+            let ds_c = ds.clone();
+            let settings_c = settings.clone();
+            let _guard = set_hook(move |point| {
+                if point == "before_fast_replay_return" && !fired_c.swap(true, Ordering::SeqCst) {
+                    evidence::detach(&ds_c, CLAIMS).unwrap();
+                    evidence::configure(&ds_c, &settings_c, &Control::none()).unwrap();
+                }
+            });
+            let err = reauthenticate(&ds, &ds, &graph, &opts, &Control::none()).unwrap_err();
+            assert!(
+                fired.load(Ordering::SeqCst),
+                "expected before_fast_replay_return hook to fire"
+            );
+            assert!(
+                matches!(
+                    err,
+                    Error::Managed(ref m) if m.kind == ManagedErrorKind::ImmutableRecordConflict
+                ),
+                "expected immutable-record-conflict after fast replay registry change, got {err:?}"
+            );
+        }
+
+        // 5. Locked-path keyed replay on a non-main branch: an intervening peer commit
+        //    lands the keyed operation before we acquire the branch writer lock so we
+        //    enter locked-path replay, and then detach mutates the registry through
+        //    `main` on a concurrent thread right at `before_locked_replay_return` (waiting
+        //    until the new registry is installed before returning from the hook, so
+        //    `managed_barrier` releases as soon as the retry drops `t`). Must not return
+        //    the stale locked replay; it retries and refuses under the updated registry.
+        {
+            let (ds, settings, _claim) = setup_ds();
+            evidence::detach(&ds, CLAIMS).unwrap();
+            evidence::configure(&ds, &settings, &Control::none()).unwrap();
+            ds.create_branch("dev", &Default::default()).unwrap();
+            let dev = ds.branch("dev").unwrap();
+
+            let mut opts = ReauthenticateOptions::new(admin.clone());
+            opts.idempotency_key = Some("reauth-race-locked-return".into());
+
+            let peer_fired = Arc::new(AtomicBool::new(false));
+            let locked_fired = Arc::new(AtomicBool::new(false));
+            let detach_handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let peer_fired_c = peer_fired.clone();
+            let locked_fired_c = locked_fired.clone();
+            let detach_handle_c = detach_handle.clone();
+            let ds_c = ds.clone();
+            let dev_c = dev.clone();
+            let graph_c = graph.clone();
+            let opts_c = opts.clone();
+            let _guard = set_hook(move |point| {
+                if point == "before_writer_lock" && !peer_fired_c.swap(true, Ordering::SeqCst) {
+                    let main_t = ds_c.clone();
+                    let dev_t = dev_c.clone();
+                    let graph_t = graph_c.clone();
+                    let opts_t = opts_c.clone();
+                    let peer = std::thread::spawn(move || {
+                        reauthenticate(&main_t, &dev_t, &graph_t, &opts_t, &Control::none())
+                            .unwrap()
+                    })
+                    .join()
+                    .unwrap();
+                    assert!(peer.committed);
+                } else if point == "before_locked_replay_return"
+                    && !locked_fired_c.swap(true, Ordering::SeqCst)
+                {
+                    let rev_before = ds_c
+                        .store()
+                        .managed_snapshot()
+                        .unwrap()
+                        .unwrap()
+                        .graphs
+                        .revision;
+                    let main_t = ds_c.clone();
+                    let handle = std::thread::spawn(move || {
+                        evidence::detach(&main_t, CLAIMS).unwrap();
+                    });
+                    *detach_handle_c.lock().unwrap() = Some(handle);
+                    // `change_managed` publishes the new registry into `family.managed`
+                    // before entering `managed_barrier()` to wait for `t` to drop.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    loop {
+                        let rev_now = ds_c
+                            .store()
+                            .managed_snapshot()
+                            .unwrap()
+                            .unwrap()
+                            .graphs
+                            .revision;
+                        if rev_now > rev_before {
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "timed out waiting for detached registry to install"
+                        );
+                        std::thread::yield_now();
+                    }
+                }
+            });
+            let err = reauthenticate(&ds, &dev, &graph, &opts, &Control::none()).unwrap_err();
+            if let Some(handle) = detach_handle.lock().unwrap().take() {
+                handle.join().unwrap();
+            }
+            assert!(
+                peer_fired.load(Ordering::SeqCst),
+                "expected before_writer_lock hook to fire"
+            );
+            assert!(
+                locked_fired.load(Ordering::SeqCst),
+                "expected before_locked_replay_return hook to fire"
+            );
+            assert!(
+                matches!(
+                    err,
+                    Error::Managed(ref m) if m.kind == ManagedErrorKind::UnsupportedProfile
+                ),
+                "expected unprotected-graph refusal after locked replay registry change, got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1250,5 +1346,170 @@ mod tests {
             ),
             "expected incomplete-evidence for tight replay budget, got {err:?}"
         );
+    }
+
+    #[test]
+    fn reauthenticate_long_graph_iri_distinct_receipts_exhausts_at_quad_planning() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let init = Dataset::open(dir.path()).unwrap();
+            drop(init);
+            let prep = crate::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+            sparkles_core::migrate::activate_configuration_history(dir.path(), false, &prep)
+                .unwrap();
+        }
+        let ds = Dataset::from_store(
+            sparkles_core::store::Store::open(
+                dir.path(),
+                sparkles_core::store::StoreOptions {
+                    history_max_generations: 80,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        ds.store()
+            .set_retention(sparkles_core::history::Retention {
+                keep_commits: Some(512),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let long_claims = format!("urn:ev:claims:{}", "g".repeat(3986));
+        assert_eq!(long_claims.len(), 4000);
+        let settings = Settings {
+            enabled: true,
+            source_records: vec![SOURCES.into()],
+            proposals: vec![long_claims.clone()],
+            ..Settings::default()
+        };
+        evidence::configure(&ds, &settings, &Control::none()).unwrap();
+
+        let popts = ProposeOptions::new(NamedNode::new_unchecked("urn:x-sparkles:principal:imp"));
+        let mut rev_batch = EvidenceInput::default();
+        rev_batch.revisions.push(SourceRevisionInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("rev-shared").unwrap(),
+            source: NamedNode::new_unchecked("https://example.org/src/shared"),
+            source_key: RecordKey::new("src-shared").unwrap(),
+            upstream_version: None,
+            content: SourceContent::MetadataOnly {
+                digest: Sha256Digest::of_bytes(b"rev-shared", &Control::none()).unwrap(),
+            },
+            metadata: SourceMetadata::default(),
+            times: SourceTimes::default(),
+            lineage: SourceLineage::default(),
+        });
+        let rev_prop = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &rev_batch,
+            &popts,
+            &mut |_, _| Some(Arc::new(GraphAccess::all())),
+            &Control::none(),
+        )
+        .unwrap();
+        let rev_iri = rev_prop.records[0].iri.clone();
+
+        // Publish 300 claims in 300 distinct operations (compacting every 6 commits so
+        // WAL replay stays bounded while all 50 generations remain retained) so each
+        // renewed record has its own stale receipt and contributes 6 output quads owning
+        // clones of `long_claims`.
+        for i in 0..300 {
+            let mut batch = EvidenceInput::default();
+            let claim_key = RecordKey::new(format!("c-{i}")).unwrap();
+            batch.claims.push(ClaimInput {
+                version: RecordVersion::V1,
+                key: claim_key.clone(),
+                occurrence_key: claim_key,
+                revision: sparkles_core::evidence::RecordRef::Existing(rev_iri.clone()),
+                proposition: Triple::new(
+                    NamedNode::new_unchecked(format!("https://example.org/s/{i}")),
+                    NamedNode::new_unchecked("https://example.org/p"),
+                    Literal::new_simple_literal(format!("v-{i}")),
+                ),
+                kind: sparkles_core::evidence::ClaimKind::Reported,
+                polarity: Polarity::Positive,
+                attributed_author: NamedNode::new_unchecked("https://example.org/author"),
+                scope: Scope::new(),
+                confidence: ConfidenceFacets::default(),
+                validity: None,
+            });
+            evidence::propose(
+                None,
+                &ds,
+                &ds,
+                &batch,
+                &popts,
+                &mut |_, _| Some(Arc::new(GraphAccess::all())),
+                &Control::none(),
+            )
+            .unwrap();
+            if (i + 1) % 6 == 0 {
+                ds.store().compact().unwrap();
+            }
+        }
+
+        evidence::detach(&ds, &long_claims).unwrap();
+        evidence::configure(&ds, &settings, &Control::none()).unwrap();
+
+        let admin = NamedNode::new_unchecked("urn:x-sparkles:principal:admin");
+        let graph = NamedNode::new_unchecked(long_claims);
+        let head_before = ds.store().head_commit().seq;
+
+        // 7,100 KiB clears discovery and verification of all 300 records (bounded by
+        // `MAX_CACHED_VIEWS = 8`), exceeds the old under-counted 5-graph-copy estimate
+        // (~6,380 KiB), and falls below the actual 6-quad-per-record + Vec<Quad> +
+        // receipt-index requirement (~7,940 KiB). It must reach quad planning, return
+        // `422 incomplete-evidence`, and leave head unchanged.
+        let reached_quad_planning = Arc::new(AtomicBool::new(false));
+        let reached_c = reached_quad_planning.clone();
+        let guard = set_hook(move |point| {
+            if point == "before_writer_lock" {
+                reached_c.store(true, Ordering::SeqCst);
+            }
+        });
+        let err = reauthenticate_with_budget(
+            &ds,
+            &ds,
+            &graph,
+            &ReauthenticateOptions::new(admin.clone()),
+            &Control::none(),
+            7100 << 10,
+        )
+        .unwrap_err();
+        drop(guard);
+        assert!(
+            reached_quad_planning.load(Ordering::SeqCst),
+            "expected discovery and verification to finish and reach quad planning, got early error: {err:?}"
+        );
+        assert!(
+            matches!(
+                err,
+                Error::Managed(ref m) if m.kind == ManagedErrorKind::IncompleteEvidence
+            ),
+            "expected incomplete-evidence at quad planning, got {err:?}"
+        );
+        assert_eq!(
+            ds.store().head_commit().seq,
+            head_before,
+            "quad-planning exhaustion must leave branch head unchanged"
+        );
+
+        // With enough allowance to cover all 6 quads per record and backing allocations,
+        // the same reconciliation succeeds and commits all 300 records.
+        let res = reauthenticate_with_budget(
+            &ds,
+            &ds,
+            &graph,
+            &ReauthenticateOptions::new(admin),
+            &Control::none(),
+            9000 << 10,
+        )
+        .unwrap();
+        assert!(res.committed);
+        assert_eq!(res.records.len(), 300);
+        assert!(res.records.iter().all(|r| !r.already_authenticated));
     }
 }
