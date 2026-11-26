@@ -511,6 +511,222 @@ impl Resolver {
         })
     }
 
+    /// Prepare or reuse the live controlled view of `logical` under `access` for `graph`,
+    /// returning `Ok(None)` when the caller cannot read `graph` or the store pair does
+    /// not match.
+    fn graph_view(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+    ) -> Result<Option<(ViewKey, usize)>> {
+        self.preparation.check()?;
+        if main.is_branch()
+            || logical.owner_dataset_id() != main.dataset_id()
+            || logical.owner_dataset_id() != main.owner_dataset_id()
+        {
+            return Ok(None);
+        }
+        let graph_term = Term::NamedNode(graph.clone());
+        if !access.may_read(Some(&graph_term)) {
+            return Ok(None);
+        }
+        let live = logical.snapshot();
+        let view_key = ViewKey {
+            dataset: main.dataset_id(),
+            branch: logical.branch_id(),
+            commit: live.commit,
+        };
+        let (_, index) = self
+            .view(view_key, access, |_| {
+                Ok((live.clone(), logical.branch_id(), SnapshotCharge::shared()))
+            })
+            .map_err(|e| classify(key, e))?;
+        let cached = &self.views[&view_key][index];
+        if !cached.view.access().readable(Some(&graph_term)) {
+            return Ok(None);
+        }
+        Ok(Some((view_key, index)))
+    }
+
+    /// Whether `s p o` is visible in `graph` at the current state of `logical` under
+    /// `access`, bounded by this resolver's preparation allowance and controls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_triple(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+        s: &NamedNode,
+        p: &NamedNode,
+        o: &Term,
+    ) -> Result<bool> {
+        let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
+            return Ok(false);
+        };
+        let snap = self.views[&view_key][index].view.snapshot();
+        let (Some(g), Some(s), Some(p), Some(o)) = (
+            self.preparation
+                .lookup_iri(snap, graph.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, s.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, p.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_term(snap, o)
+                .map_err(|e| classify(key, e))?,
+        ) else {
+            return Ok(false);
+        };
+        snap.contains(&[s, p, o, g]).map_err(|e| classify(key, e))
+    }
+
+    /// Named-node objects of `s p ?o` visible in `graph` at the current state of
+    /// `logical`, collecting at most `limit` results and decrementing `remaining_scans`
+    /// for each scanned quad. Returns `(objects, truncated)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn objects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+        s: &NamedNode,
+        p: &NamedNode,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
+            return Ok((Vec::new(), false));
+        };
+        let snap = self.views[&view_key][index].view.snapshot();
+        let (Some(g), Some(s), Some(p)) = (
+            self.preparation
+                .lookup_iri(snap, graph.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, s.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, p.as_str())
+                .map_err(|e| classify(key, e))?,
+        ) else {
+            return Ok((Vec::new(), false));
+        };
+        let mut held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        let mut ids: Vec<Id> = Vec::new();
+        let mut truncated = false;
+        self.preparation
+            .scan(snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                self.preparation.check()?;
+                if *remaining_scans == 0 {
+                    return Err(incomplete(key));
+                }
+                *remaining_scans -= 1;
+                if ids.len() >= limit {
+                    truncated = true;
+                    return Ok(false);
+                }
+                held.grow_by(8)?;
+                ids.push(q[2]);
+                Ok(true)
+            })
+            .map_err(|e| classify(key, e))?;
+        let mut out = Vec::new();
+        for id in ids {
+            self.preparation.check()?;
+            if let Some(Term::NamedNode(n)) = self
+                .preparation
+                .with_term(snap, id, |t| Ok(t.cloned()))
+                .map_err(|e| classify(key, e))?
+            {
+                held.grow_by((n.as_str().len() as u64).saturating_add(64))
+                    .map_err(|e| classify(key, e))?;
+                out.push(n);
+            }
+        }
+        Ok((out, truncated))
+    }
+
+    /// Named-node subjects of `?s p o` visible in `graph` at the current state of
+    /// `logical`, collecting at most `limit` results and decrementing `remaining_scans`
+    /// for each scanned quad. Returns `(subjects, truncated)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subjects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+        p: &NamedNode,
+        o: &Term,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
+            return Ok((Vec::new(), false));
+        };
+        let snap = self.views[&view_key][index].view.snapshot();
+        let (Some(g), Some(p), Some(o)) = (
+            self.preparation
+                .lookup_iri(snap, graph.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, p.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_term(snap, o)
+                .map_err(|e| classify(key, e))?,
+        ) else {
+            return Ok((Vec::new(), false));
+        };
+        let mut held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        let mut ids: Vec<Id> = Vec::new();
+        let mut truncated = false;
+        self.preparation
+            .scan(snap, Perm::Pos, &[p.0, o.0], |q| {
+                self.preparation.check()?;
+                if *remaining_scans == 0 {
+                    return Err(incomplete(key));
+                }
+                *remaining_scans -= 1;
+                if q[3] != g {
+                    return Ok(true);
+                }
+                if ids.len() >= limit {
+                    truncated = true;
+                    return Ok(false);
+                }
+                held.grow_by(8)?;
+                ids.push(q[0]);
+                Ok(true)
+            })
+            .map_err(|e| classify(key, e))?;
+        let mut out = Vec::new();
+        for id in ids {
+            self.preparation.check()?;
+            if let Some(Term::NamedNode(n)) = self
+                .preparation
+                .with_term(snap, id, |t| Ok(t.cloned()))
+                .map_err(|e| classify(key, e))?
+            {
+                held.grow_by((n.as_str().len() as u64).saturating_add(64))
+                    .map_err(|e| classify(key, e))?;
+                out.push(n);
+            }
+        }
+        Ok((out, truncated))
+    }
+
     /// Prepare, or reuse, the controlled view of `key` under `access`, and return the
     /// serving branch and the view's index among the views of `key`.
     fn view(

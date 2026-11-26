@@ -443,7 +443,8 @@ pub(super) fn record_digest(
 /// passages go to the source-record graph, and evidence references, claims, evidence
 /// links and assessments to the proposal graph. Refuses a batch without records, a
 /// graph the settings do not give the role, blank nodes in record content other than
-/// a stored fact's expected triple, and an assessment cycle.
+/// a stored fact's expected triple, source-revision self-links or cycles, and an
+/// assessment cycle.
 pub fn plan<'i>(
     prepared: &PreparedInput<'i>,
     dataset: Uuid,

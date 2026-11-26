@@ -125,6 +125,11 @@ impl Resolution {
         self.resolver.stored_fact(key, main, granted.as_ref(), fact)
     }
 
+    /// The operation's shared preparation context.
+    pub fn preparation(&self) -> &crate::access::Preparation {
+        self.resolver.preparation()
+    }
+
     /// Verify a record reference at the current state of `logical`, which is `main` or
     /// one of its branches, under `access`, what the caller may read there (`None`:
     /// nothing). The record must be an authenticated profile record of the evidence
@@ -139,6 +144,80 @@ impl Resolution {
     ) -> Result<VerifiedRecord> {
         self.resolver
             .record(key, main.store(), logical.store(), access.as_ref(), request)
+    }
+
+    /// Whether `s p o` is visible in `graph` at the current state of `logical` under
+    /// `access`, bounded by this resolution's preparation allowance and controls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_triple(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        o: &oxrdf::Term,
+    ) -> Result<bool> {
+        self.resolver
+            .has_triple(key, main.store(), logical.store(), access, graph, s, p, o)
+    }
+
+    /// Named-node objects of `s p ?o` visible in `graph`, collecting at most `limit`
+    /// results and decrementing `remaining_scans` for each scanned quad.
+    #[allow(clippy::too_many_arguments)]
+    pub fn objects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<(Vec<oxrdf::NamedNode>, bool)> {
+        self.resolver.objects_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            s,
+            p,
+            limit,
+            remaining_scans,
+        )
+    }
+
+    /// Named-node subjects of `?s p o` visible in `graph`, collecting at most `limit`
+    /// results and decrementing `remaining_scans` for each scanned quad.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subjects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        o: &oxrdf::Term,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<(Vec<oxrdf::NamedNode>, bool)> {
+        self.resolver.subjects_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            p,
+            o,
+            limit,
+            remaining_scans,
+        )
     }
 
     /// Verify each reference in order, stopping at the first that does not verify.

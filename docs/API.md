@@ -13158,7 +13158,12 @@ A `preview` task ends in `awaiting-approval` with the proposals in its result.
 caller, and fails with `409` when `main` changed since the preview. An `auto` task
 merges its branch when no fact failed, no entity is ambiguous, the guard reported
 nothing, every fact's confidence is at least `autoConfidence` and the merge preview has
-no conflict. Otherwise it keeps the branch and gives the reason as `autoFallback`.
+no conflict. Otherwise it keeps the branch and gives the reason as `autoFallback`. A
+`claims` task publishes an evidence batch and reports the evidence `operation`,
+`revision`, `evidenceRendition`, `records`, `recordCounts` and `previousRevision` (the
+linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`,
+and omitted when no predecessor evidence revision is linked or when `outcome` is
+`already-proposed`).
 
 The review page's sources carry `pages` with each page's number and start, and
 `ocrPages` and `omittedPages`, so the UI shows the page of each fact.
