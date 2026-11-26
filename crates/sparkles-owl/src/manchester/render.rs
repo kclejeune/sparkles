@@ -45,6 +45,10 @@ pub struct Renderer<'a> {
     vocabulary: Option<&'a Vocabulary>,
 }
 
+/// Error returned by [`Renderer::axiom_bounded`] when rendering would exceed `max_bytes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderBudgetExceeded;
+
 impl<'a> Renderer<'a> {
     /// A renderer that writes prefixed names with `prefixes` and the standard ones.
     pub fn new<P: Into<String>, N: Into<String>>(
@@ -424,6 +428,587 @@ impl<'a> Renderer<'a> {
             ),
             _ => return None,
         })
+    }
+
+    /// Render `ax` in Manchester syntax if it has one and fits within `max_bytes`.
+    /// Returns `Ok(None)` when the axiom has no Manchester form, `Ok(Some(s))` when it
+    /// fits within `max_bytes`, and `Err(RenderBudgetExceeded)` immediately upon exceeding
+    /// `max_bytes` without allocating unbounded intermediate strings (even for very long labels).
+    pub fn axiom_bounded(
+        &self,
+        ax: &Axiom,
+        max_bytes: usize,
+    ) -> Result<Option<String>, RenderBudgetExceeded> {
+        let mut out = BoundedBuf::new(max_bytes);
+        let has_form = self
+            .write_axiom_bounded(ax, &mut out)
+            .map_err(|()| RenderBudgetExceeded)?;
+        Ok(has_form.then_some(out.buf))
+    }
+
+    fn write_quote_name_bounded(s: &str, out: &mut BoundedBuf) -> Result<(), ()> {
+        let bare = !s.is_empty()
+            && !s.contains(ends_word)
+            && !s.contains([':', '^', '@'])
+            && !number_like(s)
+            && !KEYWORDS.contains(&s)
+            && !AXIOM_KEYWORDS.contains(&s)
+            && !CHARACTERISTICS.contains(&s)
+            && s != "o";
+        if bare {
+            return out.push_str(s);
+        }
+        out.push_char('\'')?;
+        for c in s.chars() {
+            if c == '\'' || c == '\\' {
+                out.push_char('\\')?;
+            }
+            out.push_char(c)?;
+        }
+        out.push_char('\'')
+    }
+
+    fn write_iri_bounded(&self, iri: &str, out: &mut BoundedBuf) -> Result<(), ()> {
+        let rem = out.remaining();
+        let Some(rendered) = self
+            .iris
+            .entity_bounded(&Entity::Class(Class::new(iri)), rem.saturating_add(8))
+        else {
+            return Err(());
+        };
+        // `entity_bounded` formats `Class(<iri_or_curie>)`
+        let inner = rendered
+            .strip_prefix("Class(")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(&rendered);
+        out.push_str(inner)
+    }
+
+    fn write_name_bounded(&self, e: &Entity, out: &mut BoundedBuf) -> Result<(), ()> {
+        let iri = e.iri().as_str();
+        if let Some(v) = self.vocabulary
+            && let Some(label) = v.label(iri)
+            && v.label_unique_for(iri, label, e.kind())
+        {
+            return Self::write_quote_name_bounded(label, out);
+        }
+        self.write_iri_bounded(iri, out)
+    }
+
+    fn write_ope_bounded(&self, p: &Ope, out: &mut BoundedBuf) -> Result<(), ()> {
+        match p {
+            Ope::Property(p) => self.write_name_bounded(&Entity::ObjectProperty(p.clone()), out),
+            Ope::InverseOf(p) => {
+                out.push_str("inverse ")?;
+                self.write_name_bounded(&Entity::ObjectProperty(p.clone()), out)
+            }
+        }
+    }
+
+    fn write_individual_bounded(&self, i: &Individual, out: &mut BoundedBuf) -> Result<(), ()> {
+        match i {
+            Individual::Named(n) => {
+                self.write_name_bounded(&Entity::NamedIndividual(n.clone()), out)
+            }
+            Individual::Anonymous(a) => {
+                out.push_str("_:")?;
+                out.push_str(a.label())
+            }
+        }
+    }
+
+    fn write_json_quoted_bounded(s: &str, out: &mut BoundedBuf) -> Result<(), ()> {
+        out.push_char('"')?;
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\"")?,
+                '\\' => out.push_str("\\\\")?,
+                '\u{08}' => out.push_str("\\b")?,
+                '\u{0C}' => out.push_str("\\f")?,
+                '\n' => out.push_str("\\n")?,
+                '\r' => out.push_str("\\r")?,
+                '\t' => out.push_str("\\t")?,
+                c if (c as u32) < 0x20 => {
+                    let mut buf = [0u8; 6];
+                    let hex = b"0123456789abcdef";
+                    let v = c as u32;
+                    buf[0] = b'\\';
+                    buf[1] = b'u';
+                    buf[2] = b'0';
+                    buf[3] = b'0';
+                    buf[4] = hex[((v >> 4) & 0xf) as usize];
+                    buf[5] = hex[(v & 0xf) as usize];
+                    out.push_str(std::str::from_utf8(&buf).expect("ascii"))?;
+                }
+                c => out.push_char(c)?,
+            }
+        }
+        out.push_char('"')
+    }
+
+    fn write_literal_bounded(&self, l: &Literal, out: &mut BoundedBuf) -> Result<(), ()> {
+        if let Some(lang) = l.language() {
+            Self::write_json_quoted_bounded(l.value(), out)?;
+            out.push_char('@')?;
+            return out.push_str(lang);
+        }
+        let dt = l.datatype();
+        if dt == vocab::XSD_STRING {
+            return Self::write_json_quoted_bounded(l.value(), out);
+        }
+        if bare_literal(l.value(), dt) {
+            return out.push_str(l.value());
+        }
+        Self::write_json_quoted_bounded(l.value(), out)?;
+        out.push_str("^^")?;
+        self.write_name_bounded(&Entity::Datatype(Datatype::new(dt)), out)
+    }
+
+    fn write_dr_bounded(
+        &self,
+        r: &DataRange,
+        nested: bool,
+        out: &mut BoundedBuf,
+    ) -> Result<(), ()> {
+        match r {
+            DataRange::Datatype(d) => self.write_name_bounded(&Entity::Datatype(d.clone()), out),
+            DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => {
+                if nested {
+                    out.push_char('(')?;
+                }
+                let joiner = if matches!(r, DataRange::IntersectionOf(_)) {
+                    " and "
+                } else {
+                    " or "
+                };
+                for (i, inner) in rs.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(joiner)?;
+                    }
+                    self.write_dr_bounded(inner, true, out)?;
+                }
+                if nested {
+                    out.push_char(')')?;
+                }
+                Ok(())
+            }
+            DataRange::ComplementOf(inner) => {
+                out.push_str("not ")?;
+                self.write_dr_bounded(inner, true, out)
+            }
+            DataRange::OneOf(ls) => {
+                out.push_char('{')?;
+                for (i, l) in ls.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ")?;
+                    }
+                    self.write_literal_bounded(l, out)?;
+                }
+                out.push_char('}')
+            }
+            DataRange::DatatypeRestriction(d, fs) => {
+                self.write_name_bounded(&Entity::Datatype(d.clone()), out)?;
+                out.push_char('[')?;
+                for (i, f) in fs.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ")?;
+                    }
+                    out.push_str(facet_word(f.facet.as_str()))?;
+                    out.push_char(' ')?;
+                    self.write_literal_bounded(&f.value, out)?;
+                }
+                out.push_char(']')
+            }
+        }
+    }
+
+    fn write_ce_bounded(&self, c: &Ce, nested: bool, out: &mut BoundedBuf) -> Result<(), ()> {
+        match c {
+            Ce::Class(c) => self.write_name_bounded(&Entity::Class(c.clone()), out),
+            Ce::ObjectIntersectionOf(cs) | Ce::ObjectUnionOf(cs) => {
+                if nested {
+                    out.push_char('(')?;
+                }
+                let joiner = if matches!(c, Ce::ObjectIntersectionOf(_)) {
+                    " and "
+                } else {
+                    " or "
+                };
+                for (i, inner) in cs.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(joiner)?;
+                    }
+                    self.write_ce_bounded(inner, true, out)?;
+                }
+                if nested {
+                    out.push_char(')')?;
+                }
+                Ok(())
+            }
+            Ce::ObjectComplementOf(inner) => {
+                out.push_str("not ")?;
+                self.write_ce_bounded(inner, true, out)
+            }
+            Ce::ObjectOneOf(is) => {
+                out.push_char('{')?;
+                for (i, ind) in is.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ")?;
+                    }
+                    self.write_individual_bounded(ind, out)?;
+                }
+                out.push_char('}')
+            }
+            Ce::ObjectSomeValuesFrom(p, f) | Ce::ObjectAllValuesFrom(p, f) => {
+                if nested {
+                    out.push_char('(')?;
+                }
+                self.write_ope_bounded(p, out)?;
+                out.push_str(if matches!(c, Ce::ObjectSomeValuesFrom(..)) {
+                    " some "
+                } else {
+                    " only "
+                })?;
+                self.write_ce_bounded(f, true, out)?;
+                if nested {
+                    out.push_char(')')?;
+                }
+                Ok(())
+            }
+            Ce::ObjectHasValue(p, i) => {
+                if nested {
+                    out.push_char('(')?;
+                }
+                self.write_ope_bounded(p, out)?;
+                out.push_str(" value ")?;
+                self.write_individual_bounded(i, out)?;
+                if nested {
+                    out.push_char(')')?;
+                }
+                Ok(())
+            }
+            Ce::ObjectHasSelf(p) => {
+                if nested {
+                    out.push_char('(')?;
+                }
+                self.write_ope_bounded(p, out)?;
+                out.push_str(" Self")?;
+                if nested {
+                    out.push_char(')')?;
+                }
+                Ok(())
+            }
+            Ce::ObjectMinCardinality(n, p, f)
+            | Ce::ObjectMaxCardinality(n, p, f)
+            | Ce::ObjectExactCardinality(n, p, f) => {
+                let word = match c {
+                    Ce::ObjectMinCardinality(..) => " min ",
+                    Ce::ObjectMaxCardinality(..) => " max ",
+                    Ce::ObjectExactCardinality(..) => " exactly ",
+                    _ => unreachable!(),
+                };
+                if nested {
+                    out.push_char('(')?;
+                }
+                self.write_ope_bounded(p, out)?;
+                out.push_str(word)?;
+                out.push_u32(*n)?;
+                if let Some(f) = f {
+                    out.push_char(' ')?;
+                    self.write_ce_bounded(f, true, out)?;
+                }
+                if nested {
+                    out.push_char(')')?;
+                }
+                Ok(())
+            }
+            Ce::DataSomeValuesFrom(ps, r) | Ce::DataAllValuesFrom(ps, r) => {
+                if nested {
+                    out.push_char('(')?;
+                }
+                if let Some(p) = ps.first() {
+                    self.write_name_bounded(&Entity::DataProperty(p.clone()), out)?;
+                }
+                out.push_str(if matches!(c, Ce::DataSomeValuesFrom(..)) {
+                    " some "
+                } else {
+                    " only "
+                })?;
+                self.write_dr_bounded(r, true, out)?;
+                if nested {
+                    out.push_char(')')?;
+                }
+                Ok(())
+            }
+            Ce::DataHasValue(p, l) => {
+                if nested {
+                    out.push_char('(')?;
+                }
+                self.write_name_bounded(&Entity::DataProperty(p.clone()), out)?;
+                out.push_str(" value ")?;
+                self.write_literal_bounded(l, out)?;
+                if nested {
+                    out.push_char(')')?;
+                }
+                Ok(())
+            }
+            Ce::DataMinCardinality(n, p, r)
+            | Ce::DataMaxCardinality(n, p, r)
+            | Ce::DataExactCardinality(n, p, r) => {
+                let word = match c {
+                    Ce::DataMinCardinality(..) => " min ",
+                    Ce::DataMaxCardinality(..) => " max ",
+                    Ce::DataExactCardinality(..) => " exactly ",
+                    _ => unreachable!(),
+                };
+                if nested {
+                    out.push_char('(')?;
+                }
+                self.write_name_bounded(&Entity::DataProperty(p.clone()), out)?;
+                out.push_str(word)?;
+                out.push_u32(*n)?;
+                if let Some(r) = r {
+                    out.push_char(' ')?;
+                    self.write_dr_bounded(r, true, out)?;
+                }
+                if nested {
+                    out.push_char(')')?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn write_axiom_bounded(&self, ax: &Axiom, out: &mut BoundedBuf) -> Result<bool, ()> {
+        use AxiomKind as A;
+        let two = |n: usize| n == 2;
+        match &ax.kind {
+            A::SubClassOf(a, b) => {
+                self.write_ce_bounded(a, false, out)?;
+                out.push_str(" SubClassOf ")?;
+                self.write_ce_bounded(b, false, out)?;
+            }
+            A::EquivalentClasses(cs) if two(cs.len()) => {
+                let mut it = cs.iter();
+                self.write_ce_bounded(it.next().unwrap(), false, out)?;
+                out.push_str(" EquivalentTo ")?;
+                self.write_ce_bounded(it.next().unwrap(), false, out)?;
+            }
+            A::DisjointClasses(cs) if two(cs.len()) => {
+                let mut it = cs.iter();
+                self.write_ce_bounded(it.next().unwrap(), false, out)?;
+                out.push_str(" DisjointWith ")?;
+                self.write_ce_bounded(it.next().unwrap(), false, out)?;
+            }
+            A::SubObjectPropertyOf(SubObjectPropertyExpression::Expression(a), b) => {
+                self.write_ope_bounded(a, out)?;
+                out.push_str(" SubPropertyOf ")?;
+                self.write_ope_bounded(b, out)?;
+            }
+            A::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), b) => {
+                for (i, p) in ps.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(" o ")?;
+                    }
+                    self.write_ope_bounded(p, out)?;
+                }
+                out.push_str(" SubPropertyOf ")?;
+                self.write_ope_bounded(b, out)?;
+            }
+            A::EquivalentObjectProperties(ps) if two(ps.len()) => {
+                let mut it = ps.iter();
+                self.write_ope_bounded(it.next().unwrap(), out)?;
+                out.push_str(" EquivalentTo ")?;
+                self.write_ope_bounded(it.next().unwrap(), out)?;
+            }
+            A::DisjointObjectProperties(ps) if two(ps.len()) => {
+                let mut it = ps.iter();
+                self.write_ope_bounded(it.next().unwrap(), out)?;
+                out.push_str(" DisjointWith ")?;
+                self.write_ope_bounded(it.next().unwrap(), out)?;
+            }
+            A::InverseObjectProperties(a, b) => {
+                self.write_ope_bounded(a, out)?;
+                out.push_str(" InverseOf ")?;
+                self.write_ope_bounded(b, out)?;
+            }
+            A::ObjectPropertyDomain(p, c) => {
+                self.write_ope_bounded(p, out)?;
+                out.push_str(" Domain ")?;
+                self.write_ce_bounded(c, false, out)?;
+            }
+            A::ObjectPropertyRange(p, c) => {
+                self.write_ope_bounded(p, out)?;
+                out.push_str(" Range ")?;
+                self.write_ce_bounded(c, false, out)?;
+            }
+            A::FunctionalObjectProperty(p) => {
+                out.push_str("Functional ")?;
+                self.write_ope_bounded(p, out)?;
+            }
+            A::InverseFunctionalObjectProperty(p) => {
+                out.push_str("InverseFunctional ")?;
+                self.write_ope_bounded(p, out)?;
+            }
+            A::ReflexiveObjectProperty(p) => {
+                out.push_str("Reflexive ")?;
+                self.write_ope_bounded(p, out)?;
+            }
+            A::IrreflexiveObjectProperty(p) => {
+                out.push_str("Irreflexive ")?;
+                self.write_ope_bounded(p, out)?;
+            }
+            A::SymmetricObjectProperty(p) => {
+                out.push_str("Symmetric ")?;
+                self.write_ope_bounded(p, out)?;
+            }
+            A::AsymmetricObjectProperty(p) => {
+                out.push_str("Asymmetric ")?;
+                self.write_ope_bounded(p, out)?;
+            }
+            A::TransitiveObjectProperty(p) => {
+                out.push_str("Transitive ")?;
+                self.write_ope_bounded(p, out)?;
+            }
+            A::SubDataPropertyOf(a, b) => {
+                self.write_name_bounded(&Entity::DataProperty(a.clone()), out)?;
+                out.push_str(" SubPropertyOf ")?;
+                self.write_name_bounded(&Entity::DataProperty(b.clone()), out)?;
+            }
+            A::EquivalentDataProperties(ps) if two(ps.len()) => {
+                let mut it = ps.iter();
+                self.write_name_bounded(&Entity::DataProperty(it.next().unwrap().clone()), out)?;
+                out.push_str(" EquivalentTo ")?;
+                self.write_name_bounded(&Entity::DataProperty(it.next().unwrap().clone()), out)?;
+            }
+            A::DisjointDataProperties(ps) if two(ps.len()) => {
+                let mut it = ps.iter();
+                self.write_name_bounded(&Entity::DataProperty(it.next().unwrap().clone()), out)?;
+                out.push_str(" DisjointWith ")?;
+                self.write_name_bounded(&Entity::DataProperty(it.next().unwrap().clone()), out)?;
+            }
+            A::DataPropertyDomain(p, c) => {
+                self.write_name_bounded(&Entity::DataProperty(p.clone()), out)?;
+                out.push_str(" Domain ")?;
+                self.write_ce_bounded(c, false, out)?;
+            }
+            A::DataPropertyRange(p, r) => {
+                self.write_name_bounded(&Entity::DataProperty(p.clone()), out)?;
+                out.push_str(" Range ")?;
+                self.write_dr_bounded(r, false, out)?;
+            }
+            A::FunctionalDataProperty(p) => {
+                out.push_str("Functional ")?;
+                self.write_name_bounded(&Entity::DataProperty(p.clone()), out)?;
+            }
+            A::SameIndividual(is) if two(is.len()) => {
+                let mut it = is.iter();
+                self.write_individual_bounded(it.next().unwrap(), out)?;
+                out.push_str(" SameAs ")?;
+                self.write_individual_bounded(it.next().unwrap(), out)?;
+            }
+            A::DifferentIndividuals(is) if two(is.len()) => {
+                let mut it = is.iter();
+                self.write_individual_bounded(it.next().unwrap(), out)?;
+                out.push_str(" DifferentFrom ")?;
+                self.write_individual_bounded(it.next().unwrap(), out)?;
+            }
+            A::ClassAssertion(c, i) => {
+                self.write_individual_bounded(i, out)?;
+                out.push_str(" Type ")?;
+                self.write_ce_bounded(c, false, out)?;
+            }
+            A::ObjectPropertyAssertion(p, a, b) => {
+                self.write_individual_bounded(a, out)?;
+                out.push_char(' ')?;
+                self.write_ope_bounded(p, out)?;
+                out.push_char(' ')?;
+                self.write_individual_bounded(b, out)?;
+            }
+            A::NegativeObjectPropertyAssertion(p, a, b) => {
+                self.write_individual_bounded(a, out)?;
+                out.push_str(" not ")?;
+                self.write_ope_bounded(p, out)?;
+                out.push_char(' ')?;
+                self.write_individual_bounded(b, out)?;
+            }
+            A::DataPropertyAssertion(p, a, l) => {
+                self.write_individual_bounded(a, out)?;
+                out.push_char(' ')?;
+                self.write_name_bounded(&Entity::DataProperty(p.clone()), out)?;
+                out.push_char(' ')?;
+                self.write_literal_bounded(l, out)?;
+            }
+            A::NegativeDataPropertyAssertion(p, a, l) => {
+                self.write_individual_bounded(a, out)?;
+                out.push_str(" not ")?;
+                self.write_name_bounded(&Entity::DataProperty(p.clone()), out)?;
+                out.push_char(' ')?;
+                self.write_literal_bounded(l, out)?;
+            }
+            A::SubAnnotationPropertyOf(a, b) => {
+                self.write_name_bounded(&Entity::AnnotationProperty(a.clone()), out)?;
+                out.push_str(" SubPropertyOf ")?;
+                self.write_name_bounded(&Entity::AnnotationProperty(b.clone()), out)?;
+            }
+            A::AnnotationPropertyDomain(p, i) => {
+                self.write_name_bounded(&Entity::AnnotationProperty(p.clone()), out)?;
+                out.push_str(" Domain ")?;
+                self.write_iri_bounded(i.as_str(), out)?;
+            }
+            A::AnnotationPropertyRange(p, i) => {
+                self.write_name_bounded(&Entity::AnnotationProperty(p.clone()), out)?;
+                out.push_str(" Range ")?;
+                self.write_iri_bounded(i.as_str(), out)?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+struct BoundedBuf {
+    buf: String,
+    limit: usize,
+}
+
+impl BoundedBuf {
+    fn new(limit: usize) -> Self {
+        Self {
+            buf: String::new(),
+            limit,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.buf.len())
+    }
+
+    fn push_str(&mut self, s: &str) -> Result<(), ()> {
+        if self.buf.len().saturating_add(s.len()) > self.limit {
+            return Err(());
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
+
+    fn push_char(&mut self, c: char) -> Result<(), ()> {
+        let mut tmp = [0u8; 4];
+        self.push_str(c.encode_utf8(&mut tmp))
+    }
+
+    fn push_u32(&mut self, mut n: u32) -> Result<(), ()> {
+        let mut buf = [0u8; 10];
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.push_str(std::str::from_utf8(&buf[i..]).expect("ascii"))
     }
 }
 

@@ -3,14 +3,15 @@
 //! `AI <prop>`, `SPLIT=<sep>`, and axiom annotations `>A`, `>AL`, `>AT`, `>AI`).
 
 use super::{
-    CancelReason, Context, Emitter, EvalError, Limits, MAX_VOCAB_ROUNDS, PatternSpec, ResolveError,
-    RowCommit, RowDiagnostic, Severity, Table, TableRow, annotation_bytes,
+    CancelReason, Context, ConvergenceStep, Emitter, EvalError, Limits, MAX_VOCAB_ROUNDS,
+    PatternSpec, ResolveError, RowCommit, RowDiagnostic, Severity, StructuralDiags, Table,
+    TableRow, VocabConvergence, annotation_bytes, bounded_col, parse_cell_literal_charged,
     parse_class_expr_fallback_charged, resolve_iri_charged,
 };
 use crate::manchester::Vocabulary;
 use crate::model::*;
 use crate::vocab;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::collections::BTreeSet;
 
 /// Explicit mapping from a column name to a ROBOT directive string.
@@ -281,7 +282,7 @@ pub(crate) fn evaluate_robot(
         first_header_idx.entry(h.as_str()).or_insert(i);
     }
 
-    let mut structural_diags: Vec<RowDiagnostic> = Vec::new();
+    let mut structural_diags = StructuralDiags::new(limits);
     let (template_cells, data_rows): (Vec<TemplateCell>, &[TableRow]) = if header_template_row {
         let Some((first, rest)) = table.rows.split_first() else {
             emitter.structural_error(RowDiagnostic {
@@ -304,15 +305,11 @@ pub(crate) fn evaluate_robot(
         for cd in explicit_columns {
             match header_counts.get(cd.column.as_str()).copied().unwrap_or(0) {
                 0 => {
-                    structural_diags.push(RowDiagnostic {
-                        row: 1,
-                        column: Some(cd.column.clone()),
-                        severity: Severity::Error,
-                        code: "unknown-column".to_string(),
-                        message: format!(
-                            "template column '{}' does not match any header in the table",
-                            cd.column
-                        ),
+                    let col_snip = bounded_col(&cd.column);
+                    structural_diags.push(1, Some(&col_snip), "unknown-column", || {
+                        format!(
+                            "template column '{col_snip}' does not match any header in the table"
+                        )
                     });
                 }
                 1 => {
@@ -322,15 +319,9 @@ pub(crate) fn evaluate_robot(
                     }
                 }
                 _ => {
-                    structural_diags.push(RowDiagnostic {
-                        row: 1,
-                        column: Some(cd.column.clone()),
-                        severity: Severity::Error,
-                        code: "ambiguous-column".to_string(),
-                        message: format!(
-                            "template column '{}' matches multiple duplicate headers",
-                            cd.column
-                        ),
+                    let col_snip = bounded_col(&cd.column);
+                    structural_diags.push(1, Some(&col_snip), "ambiguous-column", || {
+                        format!("template column '{col_snip}' matches multiple duplicate headers")
                     });
                 }
             }
@@ -341,15 +332,11 @@ pub(crate) fn evaluate_robot(
         for cd in explicit_columns {
             match header_counts.get(cd.column.as_str()).copied().unwrap_or(0) {
                 0 => {
-                    structural_diags.push(RowDiagnostic {
-                        row: 1,
-                        column: Some(cd.column.clone()),
-                        severity: Severity::Error,
-                        code: "unknown-column".to_string(),
-                        message: format!(
-                            "template column '{}' does not match any header in the table",
-                            cd.column
-                        ),
+                    let col_snip = bounded_col(&cd.column);
+                    structural_diags.push(1, Some(&col_snip), "unknown-column", || {
+                        format!(
+                            "template column '{col_snip}' does not match any header in the table"
+                        )
                     });
                 }
                 1 => {
@@ -357,15 +344,9 @@ pub(crate) fn evaluate_robot(
                     cols.push((idx, cd.directive.clone(), cd.split.clone(), 1));
                 }
                 _ => {
-                    structural_diags.push(RowDiagnostic {
-                        row: 1,
-                        column: Some(cd.column.clone()),
-                        severity: Severity::Error,
-                        code: "ambiguous-column".to_string(),
-                        message: format!(
-                            "template column '{}' matches multiple duplicate headers",
-                            cd.column
-                        ),
+                    let col_snip = bounded_col(&cd.column);
+                    structural_diags.push(1, Some(&col_snip), "ambiguous-column", || {
+                        format!("template column '{col_snip}' matches multiple duplicate headers")
                     });
                 }
             }
@@ -383,9 +364,7 @@ pub(crate) fn evaluate_robot(
     };
 
     if data_rows.len() > limits.max_rows {
-        for d in structural_diags {
-            emitter.structural_error(d);
-        }
+        structural_diags.replay_into(emitter);
         emitter.structural_error(RowDiagnostic {
             row: data_rows[limits.max_rows].line,
             column: None,
@@ -410,7 +389,7 @@ pub(crate) fn evaluate_robot(
         let col_name = table
             .headers
             .get(idx)
-            .cloned()
+            .map(|h| bounded_col(h))
             .unwrap_or_else(|| format!("column_{}", idx + 1));
         match parse_directive(&dir_str) {
             Ok((kind, inline_split)) => {
@@ -435,21 +414,13 @@ pub(crate) fn evaluate_robot(
                 });
             }
             Err(msg) => {
-                structural_diags.push(RowDiagnostic {
-                    row: dir_line,
-                    column: Some(col_name),
-                    severity: Severity::Error,
-                    code: "invalid-directive".to_string(),
-                    message: msg,
-                });
+                structural_diags.push(dir_line, Some(&col_name), "invalid-directive", || msg);
             }
         }
     }
 
     let Some(id_idx) = id_col else {
-        for d in structural_diags {
-            emitter.structural_error(d);
-        }
+        structural_diags.replay_into(emitter);
         emitter.structural_error(RowDiagnostic {
             row: 1,
             column: None,
@@ -460,20 +431,15 @@ pub(crate) fn evaluate_robot(
         return Ok(());
     };
 
+    let id_diag_col: Option<String> = table.headers.get(id_idx).map(|h| bounded_col(h));
     let n = data_rows.len();
-    let mut vocab_eligible: Vec<bool> = vec![true; n];
-    let mut monotonic_excluded: Vec<bool> = vec![false; n];
-    let mut monotonic_mode = false;
-    let mut seen_states: FxHashSet<Vec<bool>> = FxHashSet::default();
-    seen_states.insert(vocab_eligible.clone());
+    let mut convergence = VocabConvergence::new(n);
 
     for round in 0..MAX_VOCAB_ROUNDS {
         if round > 0 {
             emitter.reset_for_retry(initial_diagnostics, initial_truncated);
         }
-        for d in &structural_diags {
-            emitter.structural_error(d.clone());
-        }
+        structural_diags.replay_into(emitter);
 
         let mut ctx = Context::build(base_vocab, spec);
         let mut round_contributed = vec![false; n];
@@ -489,7 +455,7 @@ pub(crate) fn evaluate_robot(
 
         let mut row_subjects: Vec<Option<RowSubject>> = Vec::with_capacity(n);
         let mut row_pass1_ok: Vec<bool> = vec![true; n];
-        let id_col_name = table.headers.get(id_idx).map(String::as_str);
+        let id_col_name = id_diag_col.as_deref();
 
         for (row_i, row) in data_rows.iter().enumerate() {
             if row_i.is_multiple_of(64) {
@@ -584,7 +550,7 @@ pub(crate) fn evaluate_robot(
 
             // Register labels for eligible, Pass-1-clean rows now so Pass 1b can resolve
             // class type tokens across rows.
-            if vocab_eligible[row_i] && row_pass1_ok[row_i] {
+            if convergence.vocab_eligible[row_i] && row_pass1_ok[row_i] {
                 for val in label_vals {
                     let vocab_bytes = subject_iri
                         .as_str()
@@ -619,7 +585,7 @@ pub(crate) fn evaluate_robot(
             if row_i.is_multiple_of(64) {
                 check_cancel()?;
             }
-            if subj.is_none() || !vocab_eligible[row_i] || !row_pass1_ok[row_i] {
+            if subj.is_none() || !convergence.vocab_eligible[row_i] || !row_pass1_ok[row_i] {
                 continue;
             }
             for (t_idx, split) in &type_cols {
@@ -666,7 +632,7 @@ pub(crate) fn evaluate_robot(
                     emitter.mark_row_error(row.line);
                     emitter.diag(RowDiagnostic {
                         row: row.line,
-                        column: table.headers.get(id_idx).cloned(),
+                        column: id_diag_col.clone(),
                         severity: Severity::Error,
                         code: "missing-id".to_string(),
                         message: "row has values but its ID cell is empty".to_string(),
@@ -692,7 +658,7 @@ pub(crate) fn evaluate_robot(
                 };
                 emitter.diag(RowDiagnostic {
                     row: row.line,
-                    column: table.headers.get(id_idx).cloned(),
+                    column: id_diag_col.clone(),
                     severity: Severity::Error,
                     code: "invalid-iri".to_string(),
                     message: msg,
@@ -720,13 +686,17 @@ pub(crate) fn evaluate_robot(
 
             // Stage entity declaration and all axioms for this row; nothing enters `emitter`
             // until the entire row finishes without errors.
+            let subj_len = subject_iri.as_str().len();
+            if !emitter.charge_expanded_bytes(subj_len.saturating_mul(2), row.line, id_col_name) {
+                return Ok(());
+            }
             let entity = make_entity(subject_iri.clone(), entity_kind);
             let mut row_declarations: Vec<Entity> = vec![entity.clone()];
-            let mut row_axioms: Vec<(Axiom, Option<String>)> =
+            let mut row_axioms: Vec<(Axiom, Option<&str>)> =
                 vec![(Axiom::declaration(entity), None)];
             let mut ec_exprs: Vec<ClassExpression> = Vec::new();
             let mut ec_annotations: BTreeSet<Annotation> = BTreeSet::new();
-            let mut ec_col_name: Option<String> = None;
+            let mut ec_col_name: Option<&str> = None;
             let mut last_col_target = LastColTarget::None;
 
             if !emitter.charge_attempt(1, row.line, None) {
@@ -737,6 +707,7 @@ pub(crate) fn evaluate_robot(
                 if matches!(col.kind, DirectiveKind::Ignore | DirectiveKind::Id) {
                     continue;
                 }
+                let col_str = col.col_name.as_str();
                 let raw_cell = row.cells.get(col.col_index).map(|s| s.trim()).unwrap_or("");
                 if raw_cell.is_empty() {
                     if !matches!(col.kind, DirectiveKind::AxiomAnnotation { .. }) {
@@ -758,8 +729,8 @@ pub(crate) fn evaluate_robot(
                         severity: Severity::Error,
                         code: "expansion-limit".to_string(),
                         message: format!(
-                            "cell split in column '{}' exceeds the limit of {} values",
-                            col.col_name, limits.max_split_values_per_cell
+                            "cell split in column '{col_str}' exceeds the limit of {} values",
+                            limits.max_split_values_per_cell
                         ),
                     });
                     if !matches!(col.kind, DirectiveKind::AxiomAnnotation { .. }) {
@@ -788,41 +759,38 @@ pub(crate) fn evaluate_robot(
 
                     // Charge total annotation work BEFORE looping to prevent quadratic blowup.
                     let work = target_count.saturating_mul(values.len());
-                    if !emitter.charge_attempt(work, row.line, Some(col.col_name.clone())) {
+                    if !emitter.charge_attempt(work, row.line, Some(col_str)) {
                         return Ok(());
                     }
 
-                    let prop_iri = match resolve_iri_charged(
-                        property,
-                        &ctx,
-                        emitter,
-                        row.line,
-                        Some(&col.col_name),
-                    ) {
-                        Ok(p) => p,
-                        Err(ResolveError::Budget) => return Ok(()),
-                        Err(ResolveError::Invalid(msg)) => {
-                            row_has_error = true;
-                            emitter.diag(RowDiagnostic {
-                                row: row.line,
-                                column: Some(col.col_name.clone()),
-                                severity: Severity::Error,
-                                code: "invalid-iri".to_string(),
-                                message: msg,
-                            });
-                            continue;
-                        }
-                    };
+                    let prop_iri =
+                        match resolve_iri_charged(property, &ctx, emitter, row.line, Some(col_str))
+                        {
+                            Ok(p) => p,
+                            Err(ResolveError::Budget) => return Ok(()),
+                            Err(ResolveError::Invalid(msg)) => {
+                                row_has_error = true;
+                                emitter.diag(RowDiagnostic {
+                                    row: row.line,
+                                    column: Some(col.col_name.clone()),
+                                    severity: Severity::Error,
+                                    code: "invalid-iri".to_string(),
+                                    message: msg,
+                                });
+                                continue;
+                            }
+                        };
+
+                    // Charge the per-value property IRI clones BEFORE building `built_anns`.
+                    let prop_clone_bytes = prop_iri.as_str().len().saturating_mul(values.len());
+                    if !emitter.charge_expanded_bytes(prop_clone_bytes, row.line, Some(col_str)) {
+                        return Ok(());
+                    }
 
                     let mut built_anns: Vec<Annotation> = Vec::with_capacity(values.len());
                     for val in values {
                         match build_annotation_value_charged(
-                            val,
-                            format,
-                            &ctx,
-                            emitter,
-                            row.line,
-                            &col.col_name,
+                            val, format, &ctx, emitter, row.line, col_str,
                         ) {
                             Ok(ann_val) => {
                                 built_anns.push(Annotation {
@@ -851,11 +819,7 @@ pub(crate) fn evaluate_robot(
                         .map(annotation_bytes)
                         .fold(0usize, usize::saturating_add);
                     let replicated_bytes = total_ann_bytes.saturating_mul(target_count);
-                    if !emitter.charge_expanded_bytes(
-                        replicated_bytes,
-                        row.line,
-                        Some(col.col_name.clone()),
-                    ) {
+                    if !emitter.charge_expanded_bytes(replicated_bytes, row.line, Some(col_str)) {
                         return Ok(());
                     }
 
@@ -921,7 +885,7 @@ pub(crate) fn evaluate_robot(
                         if val_i.is_multiple_of(64) {
                             check_cancel()?;
                         }
-                        if !emitter.charge_attempt(1, row.line, Some(col.col_name.clone())) {
+                        if !emitter.charge_attempt(1, row.line, Some(col_str)) {
                             return Ok(());
                         }
                         let Some(expanded) = expand_percent_bounded(
@@ -930,7 +894,7 @@ pub(crate) fn evaluate_robot(
                             limits.max_expanded_bytes_per_template,
                             emitter,
                             row.line,
-                            &col.col_name,
+                            col_str,
                             &mut row_has_error,
                         ) else {
                             if emitter.budget_exceeded {
@@ -943,12 +907,12 @@ pub(crate) fn evaluate_robot(
                             &ctx,
                             emitter,
                             row.line,
-                            Some(&col.col_name),
+                            Some(col_str),
                         ) {
                             Ok(other) => {
                                 ec_exprs.push(other);
                                 if ec_col_name.is_none() {
-                                    ec_col_name = Some(col.col_name.clone());
+                                    ec_col_name = Some(col_str);
                                 }
                             }
                             Err(ResolveError::Budget) => return Ok(()),
@@ -977,7 +941,7 @@ pub(crate) fn evaluate_robot(
                     if val_i.is_multiple_of(64) {
                         check_cancel()?;
                     }
-                    if !emitter.charge_attempt(1, row.line, Some(col.col_name.clone())) {
+                    if !emitter.charge_attempt(1, row.line, Some(col_str)) {
                         return Ok(());
                     }
                     if row_axioms.len() >= emitter.remaining_axiom_capacity().saturating_add(1)
@@ -985,7 +949,7 @@ pub(crate) fn evaluate_robot(
                     {
                         emitter.budget_error(
                             row.line,
-                            Some(col.col_name.clone()),
+                            Some(col_str),
                             "axiom-limit",
                             format!(
                                 "generated axioms exceeded the limit of {}",
@@ -1000,12 +964,8 @@ pub(crate) fn evaluate_robot(
                             let bytes = val
                                 .len()
                                 .saturating_add(lang.as_deref().map_or(0, str::len))
-                                .saturating_add(subject_iri.as_str().len());
-                            if !emitter.charge_expanded_bytes(
-                                bytes,
-                                row.line,
-                                Some(col.col_name.clone()),
-                            ) {
+                                .saturating_add(subj_len);
+                            if !emitter.charge_expanded_bytes(bytes, row.line, Some(col_str)) {
                                 return Ok(());
                             }
                             let lit = match lang {
@@ -1031,7 +991,7 @@ pub(crate) fn evaluate_robot(
                                     AnnotationSubject::Iri(subject_iri.clone()),
                                     AnnotationValue::Literal(lit),
                                 )),
-                                Some(col.col_name.clone()),
+                                Some(col_str),
                             ));
                         }
                         DirectiveKind::Type => {
@@ -1043,9 +1003,16 @@ pub(crate) fn evaluate_robot(
                                     &ctx,
                                     emitter,
                                     row.line,
-                                    Some(&col.col_name),
+                                    Some(col_str),
                                 ) {
                                     Ok(ce) => {
+                                        if !emitter.charge_expanded_bytes(
+                                            subj_len,
+                                            row.line,
+                                            Some(col_str),
+                                        ) {
+                                            return Ok(());
+                                        }
                                         row_axioms.push((
                                             Axiom::class_assertion(
                                                 ce,
@@ -1053,7 +1020,7 @@ pub(crate) fn evaluate_robot(
                                                     subject_iri.clone(),
                                                 )),
                                             ),
-                                            Some(col.col_name.clone()),
+                                            Some(col_str),
                                         ));
                                     }
                                     Err(ResolveError::Budget) => return Ok(()),
@@ -1077,7 +1044,7 @@ pub(crate) fn evaluate_robot(
                                 limits.max_expanded_bytes_per_template,
                                 emitter,
                                 row.line,
-                                &col.col_name,
+                                col_str,
                                 &mut row_has_error,
                             ) else {
                                 if emitter.budget_exceeded {
@@ -1090,12 +1057,19 @@ pub(crate) fn evaluate_robot(
                                 &ctx,
                                 emitter,
                                 row.line,
-                                Some(&col.col_name),
+                                Some(col_str),
                             ) {
                                 Ok(sup) => {
+                                    if !emitter.charge_expanded_bytes(
+                                        subj_len,
+                                        row.line,
+                                        Some(col_str),
+                                    ) {
+                                        return Ok(());
+                                    }
                                     row_axioms.push((
                                         Axiom::sub_class_of(Class(subject_iri.clone()), sup),
-                                        Some(col.col_name.clone()),
+                                        Some(col_str),
                                     ));
                                 }
                                 Err(ResolveError::Budget) => return Ok(()),
@@ -1118,7 +1092,7 @@ pub(crate) fn evaluate_robot(
                                 limits.max_expanded_bytes_per_template,
                                 emitter,
                                 row.line,
-                                &col.col_name,
+                                col_str,
                                 &mut row_has_error,
                             ) else {
                                 if emitter.budget_exceeded {
@@ -1131,15 +1105,22 @@ pub(crate) fn evaluate_robot(
                                 &ctx,
                                 emitter,
                                 row.line,
-                                Some(&col.col_name),
+                                Some(col_str),
                             ) {
                                 Ok(other) => {
+                                    if !emitter.charge_expanded_bytes(
+                                        subj_len,
+                                        row.line,
+                                        Some(col_str),
+                                    ) {
+                                        return Ok(());
+                                    }
                                     row_axioms.push((
                                         Axiom::disjoint_classes([
                                             ClassExpression::Class(Class(subject_iri.clone())),
                                             other,
                                         ]),
-                                        Some(col.col_name.clone()),
+                                        Some(col_str),
                                     ));
                                 }
                                 Err(ResolveError::Budget) => return Ok(()),
@@ -1162,7 +1143,7 @@ pub(crate) fn evaluate_robot(
                                 limits.max_expanded_bytes_per_template,
                                 emitter,
                                 row.line,
-                                &col.col_name,
+                                col_str,
                                 &mut row_has_error,
                             ) else {
                                 if emitter.budget_exceeded {
@@ -1175,9 +1156,16 @@ pub(crate) fn evaluate_robot(
                                 &ctx,
                                 emitter,
                                 row.line,
-                                Some(&col.col_name),
+                                Some(col_str),
                             ) {
                                 Ok(sup_iri) => {
+                                    if !emitter.charge_expanded_bytes(
+                                        subj_len,
+                                        row.line,
+                                        Some(col_str),
+                                    ) {
+                                        return Ok(());
+                                    }
                                     let ax = match entity_kind {
                                         EntityKind::DataProperty => {
                                             Axiom::new(AxiomKind::SubDataPropertyOf(
@@ -1202,7 +1190,7 @@ pub(crate) fn evaluate_robot(
                                             )),
                                         )),
                                     };
-                                    row_axioms.push((ax, Some(col.col_name.clone())));
+                                    row_axioms.push((ax, Some(col_str)));
                                 }
                                 Err(ResolveError::Budget) => return Ok(()),
                                 Err(ResolveError::Invalid(msg)) => {
@@ -1224,7 +1212,7 @@ pub(crate) fn evaluate_robot(
                                 limits.max_expanded_bytes_per_template,
                                 emitter,
                                 row.line,
-                                &col.col_name,
+                                col_str,
                                 &mut row_has_error,
                             ) else {
                                 if emitter.budget_exceeded {
@@ -1237,9 +1225,16 @@ pub(crate) fn evaluate_robot(
                                 &ctx,
                                 emitter,
                                 row.line,
-                                Some(&col.col_name),
+                                Some(col_str),
                             ) {
                                 Ok(ce) => {
+                                    if !emitter.charge_expanded_bytes(
+                                        subj_len,
+                                        row.line,
+                                        Some(col_str),
+                                    ) {
+                                        return Ok(());
+                                    }
                                     if entity_kind == EntityKind::NamedIndividual {
                                         row_axioms.push((
                                             Axiom::class_assertion(
@@ -1248,12 +1243,12 @@ pub(crate) fn evaluate_robot(
                                                     subject_iri.clone(),
                                                 )),
                                             ),
-                                            Some(col.col_name.clone()),
+                                            Some(col_str),
                                         ));
                                     } else {
                                         row_axioms.push((
                                             Axiom::sub_class_of(Class(subject_iri.clone()), ce),
-                                            Some(col.col_name.clone()),
+                                            Some(col_str),
                                         ));
                                     }
                                 }
@@ -1277,7 +1272,7 @@ pub(crate) fn evaluate_robot(
                                 limits.max_expanded_bytes_per_template,
                                 emitter,
                                 row.line,
-                                &col.col_name,
+                                col_str,
                                 &mut row_has_error,
                             ) else {
                                 if emitter.budget_exceeded {
@@ -1290,15 +1285,22 @@ pub(crate) fn evaluate_robot(
                                 &ctx,
                                 emitter,
                                 row.line,
-                                Some(&col.col_name),
+                                Some(col_str),
                             ) {
                                 Ok(ce) => {
+                                    if !emitter.charge_expanded_bytes(
+                                        subj_len,
+                                        row.line,
+                                        Some(col_str),
+                                    ) {
+                                        return Ok(());
+                                    }
                                     row_axioms.push((
                                         Axiom::class_assertion(
                                             ce,
                                             Individual::Named(NamedIndividual(subject_iri.clone())),
                                         ),
-                                        Some(col.col_name.clone()),
+                                        Some(col_str),
                                     ));
                                 }
                                 Err(ResolveError::Budget) => return Ok(()),
@@ -1322,16 +1324,32 @@ pub(crate) fn evaluate_robot(
                                     &ctx,
                                     emitter,
                                     row.line,
-                                    Some(&col.col_name),
+                                    Some(col_str),
                                 ) {
                                     Ok(ind_iri) => {
+                                        let clone_bytes = ind_iri
+                                            .as_str()
+                                            .len()
+                                            .saturating_mul(2)
+                                            .saturating_add(if entity_kind == EntityKind::Class {
+                                                subj_len
+                                            } else {
+                                                0
+                                            });
+                                        if !emitter.charge_expanded_bytes(
+                                            clone_bytes,
+                                            row.line,
+                                            Some(col_str),
+                                        ) {
+                                            return Ok(());
+                                        }
                                         let ind = NamedIndividual(ind_iri);
                                         row_declarations.push(Entity::NamedIndividual(ind.clone()));
                                         row_axioms.push((
                                             Axiom::declaration(Entity::NamedIndividual(
                                                 ind.clone(),
                                             )),
-                                            Some(col.col_name.clone()),
+                                            Some(col_str),
                                         ));
                                         if entity_kind == EntityKind::Class {
                                             row_axioms.push((
@@ -1339,7 +1357,7 @@ pub(crate) fn evaluate_robot(
                                                     Class(subject_iri.clone()),
                                                     Individual::Named(ind),
                                                 ),
-                                                Some(col.col_name.clone()),
+                                                Some(col_str),
                                             ));
                                         }
                                     }
@@ -1362,7 +1380,7 @@ pub(crate) fn evaluate_robot(
                                     &ctx,
                                     emitter,
                                     row.line,
-                                    Some(&col.col_name),
+                                    Some(col_str),
                                 ) {
                                     Ok(prop_iri) => {
                                         let is_data_prop = ctx
@@ -1371,13 +1389,33 @@ pub(crate) fn evaluate_robot(
                                             .contains(&EntityKind::DataProperty);
                                         if is_data_prop {
                                             if !emitter.charge_expanded_bytes(
-                                                val.len(),
+                                                val.len().saturating_add(subj_len),
                                                 row.line,
-                                                Some(col.col_name.clone()),
+                                                Some(col_str),
                                             ) {
                                                 return Ok(());
                                             }
-                                            let lit = parse_cell_literal(val, &ctx);
+                                            let lit = match parse_cell_literal_charged(
+                                                val,
+                                                &ctx,
+                                                emitter,
+                                                row.line,
+                                                Some(col_str),
+                                            ) {
+                                                Ok(l) => l,
+                                                Err(ResolveError::Budget) => return Ok(()),
+                                                Err(ResolveError::Invalid(msg)) => {
+                                                    row_has_error = true;
+                                                    emitter.diag(RowDiagnostic {
+                                                        row: row.line,
+                                                        column: Some(col.col_name.clone()),
+                                                        severity: Severity::Error,
+                                                        code: "expansion-bytes-limit".to_string(),
+                                                        message: msg,
+                                                    });
+                                                    continue;
+                                                }
+                                            };
                                             row_axioms.push((
                                                 Axiom::new(AxiomKind::DataPropertyAssertion(
                                                     DataProperty(prop_iri),
@@ -1386,7 +1424,7 @@ pub(crate) fn evaluate_robot(
                                                     )),
                                                     lit,
                                                 )),
-                                                Some(col.col_name.clone()),
+                                                Some(col_str),
                                             ));
                                         } else {
                                             match resolve_iri_charged(
@@ -1394,9 +1432,16 @@ pub(crate) fn evaluate_robot(
                                                 &ctx,
                                                 emitter,
                                                 row.line,
-                                                Some(&col.col_name),
+                                                Some(col_str),
                                             ) {
                                                 Ok(obj_iri) => {
+                                                    if !emitter.charge_expanded_bytes(
+                                                        subj_len,
+                                                        row.line,
+                                                        Some(col_str),
+                                                    ) {
+                                                        return Ok(());
+                                                    }
                                                     row_axioms.push((
                                                         Axiom::new(
                                                             AxiomKind::ObjectPropertyAssertion(
@@ -1411,7 +1456,7 @@ pub(crate) fn evaluate_robot(
                                                                 )),
                                                             ),
                                                         ),
-                                                        Some(col.col_name.clone()),
+                                                        Some(col_str),
                                                     ));
                                                 }
                                                 Err(ResolveError::Budget) => return Ok(()),
@@ -1448,24 +1493,26 @@ pub(crate) fn evaluate_robot(
                                 &ctx,
                                 emitter,
                                 row.line,
-                                Some(&col.col_name),
+                                Some(col_str),
                             ) {
                                 Ok(prop_iri) => match build_annotation_value_charged(
-                                    val,
-                                    format,
-                                    &ctx,
-                                    emitter,
-                                    row.line,
-                                    &col.col_name,
+                                    val, format, &ctx, emitter, row.line, col_str,
                                 ) {
                                     Ok(ann_val) => {
+                                        if !emitter.charge_expanded_bytes(
+                                            subj_len,
+                                            row.line,
+                                            Some(col_str),
+                                        ) {
+                                            return Ok(());
+                                        }
                                         row_axioms.push((
                                             Axiom::new(AxiomKind::AnnotationAssertion(
                                                 AnnotationProperty(prop_iri),
                                                 AnnotationSubject::Iri(subject_iri.clone()),
                                                 ann_val,
                                             )),
-                                            Some(col.col_name.clone()),
+                                            Some(col_str),
                                         ));
                                     }
                                     Err(ResolveError::Budget) => return Ok(()),
@@ -1509,6 +1556,9 @@ pub(crate) fn evaluate_robot(
             // Combine all `EC` expressions on this row into one EquivalentClasses axiom
             // (using ObjectIntersectionOf when two or more distinct expressions are present).
             if !ec_exprs.is_empty() {
+                if !emitter.charge_expanded_bytes(subj_len, row.line, ec_col_name) {
+                    return Ok(());
+                }
                 let unique: BTreeSet<ClassExpression> = ec_exprs.into_iter().collect();
                 let rhs = if unique.len() == 1 {
                     unique.into_iter().next().unwrap()
@@ -1537,51 +1587,20 @@ pub(crate) fn evaluate_robot(
             }
         }
 
-        let failed_contributor = (0..n).any(|i| round_contributed[i] && round_failed[i]);
-        let recovered_row = (0..n).any(|i| {
-            !vocab_eligible[i] && row_pass1_ok[i] && !round_failed[i] && !monotonic_excluded[i]
-        });
-        if !failed_contributor && !recovered_row {
-            return Ok(());
-        }
-
-        let next_eligible: Vec<bool> = if monotonic_mode {
-            for i in 0..n {
-                if round_failed[i] {
-                    monotonic_excluded[i] = true;
-                }
+        match convergence.advance(round, &round_contributed, &round_failed, &row_pass1_ok) {
+            ConvergenceStep::Done => return Ok(()),
+            ConvergenceStep::Continue => {}
+            ConvergenceStep::LimitExceeded => {
+                emitter.budget_error(
+                    1,
+                    None,
+                    "vocab-dependency-limit",
+                    format!(
+                        "failed-row vocabulary dependency chain did not converge within {MAX_VOCAB_ROUNDS} passes"
+                    ),
+                );
+                return Ok(());
             }
-            (0..n).map(|i| !monotonic_excluded[i]).collect()
-        } else {
-            (0..n).map(|i| !round_failed[i]).collect()
-        };
-
-        if next_eligible == vocab_eligible {
-            return Ok(());
-        }
-
-        if round + 1 == MAX_VOCAB_ROUNDS {
-            emitter.budget_error(
-                1,
-                None,
-                "vocab-dependency-limit",
-                format!(
-                    "failed-row vocabulary dependency chain did not converge within {MAX_VOCAB_ROUNDS} passes"
-                ),
-            );
-            return Ok(());
-        }
-
-        if !seen_states.insert(next_eligible.clone()) {
-            monotonic_mode = true;
-            for i in 0..n {
-                if round_failed[i] || !vocab_eligible[i] {
-                    monotonic_excluded[i] = true;
-                }
-            }
-            vocab_eligible = (0..n).map(|i| !monotonic_excluded[i]).collect();
-        } else {
-            vocab_eligible = next_eligible;
         }
     }
     Ok(())
@@ -1611,7 +1630,7 @@ fn expand_percent_bounded(
         *row_has_error = true;
         emitter.diag(RowDiagnostic {
             row,
-            column: Some(col_name.to_string()),
+            column: Some(bounded_col(col_name)),
             severity: Severity::Error,
             code: "expansion-bytes-limit".to_string(),
             message: format!(
@@ -1620,7 +1639,7 @@ fn expand_percent_bounded(
         });
         return None;
     }
-    if !emitter.charge_expanded_bytes(expected_len, row, Some(col_name.to_string())) {
+    if !emitter.charge_expanded_bytes(expected_len, row, Some(col_name)) {
         return None;
     }
     if pct_count > 0 {
@@ -1736,7 +1755,7 @@ fn build_annotation_value_charged(
                 let iri = resolve_iri_charged(val, ctx, emitter, row, Some(col_name))?;
                 Ok(AnnotationValue::Iri(iri))
             } else {
-                if !emitter.charge_expanded_bytes(val.len(), row, Some(col_name.to_string())) {
+                if !emitter.charge_expanded_bytes(val.len(), row, Some(col_name)) {
                     return Err(ResolveError::Budget);
                 }
                 Ok(AnnotationValue::Literal(Literal::simple(val)))
@@ -1746,7 +1765,7 @@ fn build_annotation_value_charged(
             if !emitter.charge_expanded_bytes(
                 val.len().saturating_add(lang.len()),
                 row,
-                Some(col_name.to_string()),
+                Some(col_name),
             ) {
                 return Err(ResolveError::Budget);
             }
@@ -1755,7 +1774,7 @@ fn build_annotation_value_charged(
         }
         AnnotationFormat::Typed(dt) => {
             let dt_iri = resolve_iri_charged(dt, ctx, emitter, row, Some(col_name))?;
-            if !emitter.charge_expanded_bytes(val.len(), row, Some(col_name.to_string())) {
+            if !emitter.charge_expanded_bytes(val.len(), row, Some(col_name)) {
                 return Err(ResolveError::Budget);
             }
             Ok(AnnotationValue::Literal(Literal::typed(
@@ -1768,11 +1787,4 @@ fn build_annotation_value_charged(
             Ok(AnnotationValue::Iri(iri))
         }
     }
-}
-
-fn parse_cell_literal(val: &str, ctx: &Context) -> Literal {
-    if let Ok(lit) = crate::manchester::literal(val, &ctx.vocab) {
-        return lit;
-    }
-    Literal::simple(val)
 }

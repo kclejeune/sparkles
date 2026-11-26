@@ -186,6 +186,14 @@ fn line_start(text: &str, at: usize) -> Option<usize> {
     None
 }
 
+/// Error returned by [`parse_axiom_bounded`] when parsing fails or resolved term bytes
+/// exceed the caller's budget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundedParseError {
+    Parse(ParseError),
+    Budget { attempted: usize },
+}
+
 /// Read one axiom, such as `SubClassOf(ex:A ex:B)`, with `prefixes` and the predefined
 /// ones (a prefix of `prefixes` wins over a predefined one of the same name).
 pub fn parse_axiom(text: &str, prefixes: &[(String, String)]) -> Result<Axiom, ParseError> {
@@ -193,6 +201,29 @@ pub fn parse_axiom(text: &str, prefixes: &[(String, String)]) -> Result<Axiom, P
     let ax = r.axiom()?;
     r.end("axiom")?;
     Ok(ax)
+}
+
+/// Read one axiom while charging every resolved IRI and prefixed-name expansion before
+/// allocating its owned string, returning `(axiom, resolved_bytes)` on success.
+pub fn parse_axiom_bounded(
+    text: &str,
+    prefixes: &[(String, String)],
+    max_bytes: usize,
+) -> Result<(Axiom, usize), BoundedParseError> {
+    let mut r = Reader::one(text, prefixes);
+    r.byte_budget = Some(max_bytes);
+    match r.axiom().and_then(|ax| r.end("axiom").map(|()| ax)) {
+        Ok(ax) => Ok((ax, r.bytes_used)),
+        Err(e) => {
+            if r.budget_exceeded {
+                Err(BoundedParseError::Budget {
+                    attempted: r.bytes_used,
+                })
+            } else {
+                Err(BoundedParseError::Parse(e))
+            }
+        }
+    }
 }
 
 /// Read one class expression, such as `ObjectSomeValuesFrom(ex:p ex:A)`, with
@@ -226,6 +257,9 @@ impl<'a> Reader<'a> {
             done: false,
             options: Options::default(),
             rules: 0,
+            byte_budget: None,
+            bytes_used: 0,
+            budget_exceeded: false,
         }
     }
 
@@ -301,6 +335,10 @@ pub struct Reader<'a> {
     options: Options,
     /// the SWRL rules passed over
     rules: usize,
+    /// optional cumulative byte budget for resolved IRIs during single-axiom parsing
+    byte_budget: Option<usize>,
+    bytes_used: usize,
+    budget_exceeded: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -322,6 +360,9 @@ impl<'a> Reader<'a> {
             done: false,
             options: Options::default(),
             rules: 0,
+            byte_budget: None,
+            bytes_used: 0,
+            budget_exceeded: false,
         };
         r.preamble()?;
         Ok(r)
@@ -349,6 +390,9 @@ impl<'a> Reader<'a> {
             done: false,
             options: self.options,
             rules: 0,
+            byte_budget: None,
+            bytes_used: 0,
+            budget_exceeded: false,
         };
         let mut out = Vec::new();
         if last {
@@ -605,19 +649,36 @@ impl<'a> Reader<'a> {
 
     // ---- IRIs
 
-    fn full_iri(&self, s: &str) -> Result<Iri, ParseError> {
+    fn charge_bytes(&mut self, bytes: usize) -> Result<(), ParseError> {
+        if let Some(limit) = self.byte_budget {
+            self.bytes_used = self.bytes_used.saturating_add(bytes);
+            if self.bytes_used > limit {
+                self.budget_exceeded = true;
+                return Err(self.error(format!(
+                    "resolved term bytes exceeded the {limit} byte budget"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn full_iri(&mut self, s: &str) -> Result<Iri, ParseError> {
+        self.charge_bytes(s.len())?;
         parse_iri(s).map_err(|e| self.error(e.0))
     }
 
     /// The IRI of a prefixed name.
-    fn expand(&self, name: &str) -> Result<Iri, ParseError> {
+    fn expand(&mut self, name: &str) -> Result<Iri, ParseError> {
         let Some((prefix, local)) = name.split_once(':') else {
             return Err(self.error(format!("expected an IRI, found the keyword '{name}'")));
         };
-        let Some((_, ns)) = self.names.iter().rev().find(|(p, _)| p == prefix) else {
+        let Some(ns_idx) = self.names.iter().rposition(|(p, _)| p == prefix) else {
             return Err(self.error(format!("the prefix '{prefix}:' is not declared")));
         };
-        let mut s = String::with_capacity(ns.len() + local.len());
+        let est_len = self.names[ns_idx].1.len().saturating_add(local.len());
+        self.charge_bytes(est_len)?;
+        let ns = &self.names[ns_idx].1;
+        let mut s = String::with_capacity(est_len);
         s.push_str(ns);
         // the escapes of a local name (PN_LOCAL_ESC) stand for the character
         let mut chars = local.chars();

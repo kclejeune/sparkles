@@ -30,8 +30,9 @@ use crate::manchester::{self, Vocabulary};
 use crate::model::*;
 use crate::write;
 use oxrdf::Triple;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 
 /// Common vocabulary prefixes available as fallbacks when neither the dataset nor the
 /// pattern specification binds them.
@@ -363,11 +364,18 @@ impl Context {
     }
 }
 
+fn hash_axiom(ax: &Axiom) -> u64 {
+    let mut h = FxHasher::default();
+    ax.hash(&mut h);
+    h.finish()
+}
+
 /// Deterministic deduplicating accumulator for generated axioms and diagnostics.
 pub(crate) struct Emitter {
     limits: Limits,
     axioms: Vec<GeneratedAxiom>,
-    index: FxHashMap<Axiom, usize>,
+    /// Hash-bucket index into `self.axioms`, avoiding cloning every retained [`Axiom`].
+    index: FxHashMap<u64, Vec<usize>>,
     declarations: BTreeSet<Entity>,
     diagnostics: Vec<RowDiagnostic>,
     diagnostics_truncated: bool,
@@ -405,6 +413,15 @@ impl Emitter {
         }
     }
 
+    fn lookup_index(&self, ax: &Axiom, hash: u64) -> Option<usize> {
+        self.index.get(&hash).and_then(|bucket| {
+            bucket
+                .iter()
+                .copied()
+                .find(|&pos| self.axioms[pos].axiom == *ax)
+        })
+    }
+
     /// Clear per-round outputs and diagnostics before a vocabulary-exclusion retry while
     /// keeping cumulative work, expanded-byte, and vocabulary budgets intact.
     pub(crate) fn reset_for_retry(
@@ -435,11 +452,11 @@ impl Emitter {
         if diag.severity == Severity::Error {
             self.total_errors = self.total_errors.saturating_add(1);
         }
-        if let Some(col) = diag.column.as_mut() {
-            truncate_utf8(col, MAX_DIAGNOSTIC_COLUMN_BYTES);
-        }
-        truncate_utf8(&mut diag.message, self.limits.max_diagnostic_message_bytes);
         if self.diagnostics.len() < self.limits.max_diagnostics {
+            if let Some(col) = diag.column.as_mut() {
+                truncate_utf8(col, MAX_DIAGNOSTIC_COLUMN_BYTES);
+            }
+            truncate_utf8(&mut diag.message, self.limits.max_diagnostic_message_bytes);
             self.diagnostics.push(diag);
         } else {
             self.diagnostics_truncated = true;
@@ -451,10 +468,18 @@ impl Emitter {
         self.diag(diag);
     }
 
+    pub(crate) fn record_omitted_structural_errors(&mut self, omitted: usize) {
+        if omitted > 0 {
+            self.structural_errors = self.structural_errors.saturating_add(omitted);
+            self.total_errors = self.total_errors.saturating_add(omitted);
+            self.diagnostics_truncated = true;
+        }
+    }
+
     pub(crate) fn budget_error(
         &mut self,
         row: usize,
-        column: Option<String>,
+        column: Option<&str>,
         code: &'static str,
         message: String,
     ) {
@@ -463,7 +488,7 @@ impl Emitter {
             self.limit_reported = true;
             self.diag(RowDiagnostic {
                 row,
-                column,
+                column: bounded_opt_col(column),
                 severity: Severity::Error,
                 code: code.to_string(),
                 message,
@@ -475,7 +500,7 @@ impl Emitter {
         &mut self,
         count: usize,
         row: usize,
-        column: Option<String>,
+        column: Option<&str>,
     ) -> bool {
         self.attempts = self.attempts.saturating_add(count);
         if self.attempts > self.limits.max_axiom_attempts {
@@ -493,11 +518,17 @@ impl Emitter {
         true
     }
 
+    pub(crate) fn remaining_expanded_bytes(&self) -> usize {
+        self.limits
+            .max_total_expanded_bytes
+            .saturating_sub(self.total_expanded_bytes)
+    }
+
     pub(crate) fn charge_expanded_bytes(
         &mut self,
         bytes: usize,
         row: usize,
-        column: Option<String>,
+        column: Option<&str>,
     ) -> bool {
         self.total_expanded_bytes = self.total_expanded_bytes.saturating_add(bytes);
         if self.total_expanded_bytes > self.limits.max_total_expanded_bytes {
@@ -544,7 +575,7 @@ impl Emitter {
         &mut self,
         row: usize,
         declarations: Vec<Entity>,
-        axioms: Vec<(Axiom, Option<String>)>,
+        axioms: Vec<(Axiom, Option<&str>)>,
     ) -> RowCommit {
         let mut any_invalid = false;
         for (ax, col) in &axioms {
@@ -553,7 +584,7 @@ impl Emitter {
                 self.mark_row_error(row);
                 self.diag(RowDiagnostic {
                     row,
-                    column: col.clone(),
+                    column: bounded_opt_col(*col),
                     severity: Severity::Error,
                     code: "annotation-limit".to_string(),
                     message: format!(
@@ -568,7 +599,7 @@ impl Emitter {
                 self.mark_row_error(row);
                 self.diag(RowDiagnostic {
                     row,
-                    column: col.clone(),
+                    column: bounded_opt_col(*col),
                     severity: Severity::Error,
                     code: "invalid-axiom".to_string(),
                     message: e.0,
@@ -583,12 +614,13 @@ impl Emitter {
         // before mutating state so a partially committed row never leaks on limit overflow.
         let mut new_unique: FxHashSet<&Axiom> = FxHashSet::default();
         for (ax, _) in &axioms {
-            if !self.index.contains_key(ax) {
+            let h = hash_axiom(ax);
+            if self.lookup_index(ax, h).is_none() {
                 new_unique.insert(ax);
             }
         }
         if self.axioms.len().saturating_add(new_unique.len()) > self.limits.max_axioms {
-            let col = axioms.first().and_then(|(_, c)| c.clone());
+            let col = axioms.first().and_then(|(_, c)| *c);
             self.budget_error(
                 row,
                 col,
@@ -605,14 +637,15 @@ impl Emitter {
             self.declarations.insert(entity);
         }
         for (axiom, _) in axioms {
-            if let Some(&pos) = self.index.get(&axiom) {
+            let h = hash_axiom(&axiom);
+            if let Some(pos) = self.lookup_index(&axiom, h) {
                 let entry = &mut self.axioms[pos];
                 if entry.rows.last() != Some(&row) && !entry.rows.contains(&row) {
                     entry.rows.push(row);
                 }
             } else {
                 let pos = self.axioms.len();
-                self.index.insert(axiom.clone(), pos);
+                self.index.entry(h).or_default().push(pos);
                 self.axioms.push(GeneratedAxiom {
                     axiom,
                     rows: vec![row],
@@ -661,6 +694,7 @@ pub(crate) fn truncate_utf8(s: &mut String, max_bytes: usize) {
     if max_bytes >= suffix.len() {
         s.push_str(suffix);
     }
+    s.shrink_to_fit();
 }
 
 pub(crate) fn truncated_snippet(s: &str, max_bytes: usize) -> String {
@@ -679,6 +713,169 @@ pub(crate) fn truncated_snippet(s: &str, max_bytes: usize) -> String {
         out.push_str(suffix);
     }
     out
+}
+
+pub(crate) fn bounded_col(col: &str) -> String {
+    truncated_snippet(col, MAX_DIAGNOSTIC_COLUMN_BYTES)
+}
+
+pub(crate) fn bounded_opt_col(col: Option<&str>) -> Option<String> {
+    col.map(bounded_col)
+}
+
+/// Bounded staging buffer for spec/structural diagnostics collected before evaluation
+/// rounds begin. Enforces `max_diagnostics`, `MAX_DIAGNOSTIC_COLUMN_BYTES`, and
+/// `max_diagnostic_message_bytes` as items are staged so oversized spec labels cannot
+/// accumulate unbounded heap memory before replay.
+pub(crate) struct StructuralDiags {
+    diags: Vec<RowDiagnostic>,
+    total: usize,
+    max_diags: usize,
+    max_msg_bytes: usize,
+}
+
+impl StructuralDiags {
+    pub(crate) fn new(limits: &Limits) -> Self {
+        Self {
+            diags: Vec::new(),
+            total: 0,
+            max_diags: limits.max_diagnostics,
+            max_msg_bytes: limits.max_diagnostic_message_bytes,
+        }
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        row: usize,
+        column: Option<&str>,
+        code: &'static str,
+        message: impl FnOnce() -> String,
+    ) {
+        self.total = self.total.saturating_add(1);
+        if self.diags.len() < self.max_diags {
+            let mut msg = message();
+            truncate_utf8(&mut msg, self.max_msg_bytes);
+            self.diags.push(RowDiagnostic {
+                row,
+                column: bounded_opt_col(column),
+                severity: Severity::Error,
+                code: code.to_string(),
+                message: msg,
+            });
+        }
+    }
+
+    pub(crate) fn replay_into(&self, emitter: &mut Emitter) {
+        for d in &self.diags {
+            emitter.structural_error(d.clone());
+        }
+        let omitted = self.total.saturating_sub(self.diags.len());
+        emitter.record_omitted_structural_errors(omitted);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConvergenceStep {
+    Done,
+    Continue,
+    LimitExceeded,
+}
+
+/// Bounded fixpoint state machine for excluding failing rows from Pass 1 vocabulary.
+/// When mutually dependent clean rows oscillate after a failing duplicate-label row is
+/// dropped, attempts the union of rows eligible across the cycle before falling back to
+/// monotonic exclusion.
+pub(crate) struct VocabConvergence {
+    n: usize,
+    pub vocab_eligible: Vec<bool>,
+    monotonic_excluded: Vec<bool>,
+    monotonic_mode: bool,
+    state_history: Vec<Vec<bool>>,
+    seen_states: FxHashMap<Vec<bool>, usize>,
+}
+
+impl VocabConvergence {
+    pub(crate) fn new(n: usize) -> Self {
+        let initial = vec![true; n];
+        let mut seen_states = FxHashMap::default();
+        seen_states.insert(initial.clone(), 0);
+        Self {
+            n,
+            vocab_eligible: initial.clone(),
+            monotonic_excluded: vec![false; n],
+            monotonic_mode: false,
+            state_history: vec![initial],
+            seen_states,
+        }
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        round: usize,
+        round_contributed: &[bool],
+        round_failed: &[bool],
+        row_pass1_ok: &[bool],
+    ) -> ConvergenceStep {
+        let failed_contributor = (0..self.n).any(|i| round_contributed[i] && round_failed[i]);
+        let recovered_row = (0..self.n).any(|i| {
+            !self.vocab_eligible[i]
+                && row_pass1_ok[i]
+                && !round_failed[i]
+                && !self.monotonic_excluded[i]
+        });
+        if !failed_contributor && !recovered_row {
+            return ConvergenceStep::Done;
+        }
+
+        let next_eligible: Vec<bool> = if self.monotonic_mode {
+            for (i, &failed) in round_failed.iter().enumerate().take(self.n) {
+                if failed {
+                    self.monotonic_excluded[i] = true;
+                }
+            }
+            (0..self.n).map(|i| !self.monotonic_excluded[i]).collect()
+        } else {
+            (0..self.n).map(|i| !round_failed[i]).collect()
+        };
+
+        if next_eligible == self.vocab_eligible {
+            return ConvergenceStep::Done;
+        }
+
+        if round + 1 == MAX_VOCAB_ROUNDS {
+            return ConvergenceStep::LimitExceeded;
+        }
+
+        if let Some(&cycle_start) = self.seen_states.get(&next_eligible) {
+            if !self.monotonic_mode {
+                let cycle_union: Vec<bool> = (0..self.n)
+                    .map(|i| self.state_history[cycle_start..].iter().any(|s| s[i]))
+                    .collect();
+                if cycle_union != self.vocab_eligible
+                    && !self.seen_states.contains_key(&cycle_union)
+                {
+                    let idx = self.state_history.len();
+                    self.seen_states.insert(cycle_union.clone(), idx);
+                    self.state_history.push(cycle_union.clone());
+                    self.vocab_eligible = cycle_union;
+                    return ConvergenceStep::Continue;
+                }
+            }
+            self.monotonic_mode = true;
+            for i in 0..self.n {
+                if round_failed[i] || self.state_history[cycle_start..].iter().any(|s| !s[i]) {
+                    self.monotonic_excluded[i] = true;
+                }
+            }
+            self.vocab_eligible = (0..self.n).map(|i| !self.monotonic_excluded[i]).collect();
+        } else {
+            let idx = self.state_history.len();
+            self.seen_states.insert(next_eligible.clone(), idx);
+            self.state_history.push(next_eligible.clone());
+            self.vocab_eligible = next_eligible;
+        }
+        ConvergenceStep::Continue
+    }
 }
 
 /// Recursively count all annotations (including nested annotations) in `anns`.
@@ -926,6 +1123,23 @@ fn check_spec_limits(spec: &PatternSpec, limits: &Limits, emitter: &mut Emitter)
         );
         return false;
     }
+    for (raw_key, raw_ns) in &spec.prefixes {
+        let ns = raw_ns.trim();
+        if ns.len() > limits.max_expanded_bytes_per_template {
+            emitter.budget_error(
+                1,
+                None,
+                "spec-limit",
+                format!(
+                    "namespace for prefix '{}' ({} bytes) exceeds the {} byte limit",
+                    truncated_snippet(raw_key, 64),
+                    ns.len(),
+                    limits.max_expanded_bytes_per_template
+                ),
+            );
+            return false;
+        }
+    }
     match &spec.mode {
         TemplateMode::Robot { columns, .. } => {
             if columns.len() > limits.max_columns_spec {
@@ -974,11 +1188,11 @@ fn check_spec_limits(spec: &PatternSpec, limits: &Limits, emitter: &mut Emitter)
             }
             for (idx, rule) in rules.iter().enumerate() {
                 if rule.annotations.len() > limits.max_annotations_per_rule {
+                    let fallback = format!("rule_{}", idx + 1);
+                    let col = rule.name.as_deref().unwrap_or(&fallback);
                     emitter.budget_error(
                         1,
-                        rule.name
-                            .clone()
-                            .or_else(|| Some(format!("rule_{}", idx + 1))),
+                        Some(col),
                         "spec-limit",
                         format!(
                             "rule defines {} annotations, exceeding the limit of {}",
@@ -1036,7 +1250,7 @@ pub(crate) fn resolve_iri_charged(
                 "resolved IRI ({len} bytes) exceeds the {max_per_template} byte limit"
             )));
         }
-        if !emitter.charge_expanded_bytes(len, row, column.map(str::to_string)) {
+        if !emitter.charge_expanded_bytes(len, row, column) {
             return Err(ResolveError::Budget);
         }
         Ok(())
@@ -1124,14 +1338,18 @@ pub(crate) fn resolve_iri_charged(
 }
 
 /// Charge estimated namespace expansion bytes for prefixed names appearing in a Manchester
-/// or Functional-Style expression BEFORE invoking the parser.
+/// or Functional-Style expression BEFORE invoking the parser, honoring each syntax's
+/// comment and quote rules. Returns the number of extra bytes charged so bounded parsers
+/// can charge only any additional resolved bytes (labels, bare names, empty-prefix
+/// fallbacks, full IRIs, or escaped OFN names).
 pub(crate) fn charge_prefixed_expansions(
     text: &str,
+    syntax: PatternSyntax,
     ctx: &Context,
     emitter: &mut Emitter,
     row: usize,
     column: Option<&str>,
-) -> Result<(), ResolveError> {
+) -> Result<usize, ResolveError> {
     let bytes = text.as_bytes();
     let mut extra_bytes = 0usize;
     let mut i = 0usize;
@@ -1139,6 +1357,8 @@ pub(crate) fn charge_prefixed_expansions(
     let mut in_single_quote = false;
     let mut in_angle = false;
     let mut escaped = false;
+    let single_quotes = syntax == PatternSyntax::Manchester;
+    let hash_comments = syntax == PatternSyntax::Functional;
 
     while i < bytes.len() {
         let b = bytes[i];
@@ -1171,9 +1391,15 @@ pub(crate) fn charge_prefixed_expansions(
             i += 1;
             continue;
         }
+        if hash_comments && b == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
         match b {
             b'"' => in_double_quote = true,
-            b'\'' => in_single_quote = true,
+            b'\'' if single_quotes => in_single_quote = true,
             b'<' => in_angle = true,
             b':' if bytes.get(i + 1..i + 3) != Some(b"//") => {
                 // Skip hierarchical URI schemes (`scheme://...`).
@@ -1199,7 +1425,7 @@ pub(crate) fn charge_prefixed_expansions(
     }
 
     if extra_bytes == 0 {
-        return Ok(());
+        return Ok(0);
     }
     let max_per_template = emitter.limits.max_expanded_bytes_per_template;
     let total_est = text.len().saturating_add(extra_bytes);
@@ -1208,15 +1434,58 @@ pub(crate) fn charge_prefixed_expansions(
             "expanded prefixed terms ({total_est} bytes) exceed the {max_per_template} byte limit"
         )));
     }
-    if !emitter.charge_expanded_bytes(extra_bytes, row, column.map(str::to_string)) {
+    if !emitter.charge_expanded_bytes(extra_bytes, row, column) {
+        return Err(ResolveError::Budget);
+    }
+    Ok(extra_bytes)
+}
+
+fn finalize_parser_budget(
+    used_bytes: usize,
+    precharged: usize,
+    emitter: &mut Emitter,
+    row: usize,
+    column: Option<&str>,
+) -> Result<(), ResolveError> {
+    let extra = used_bytes.saturating_sub(precharged);
+    if extra > 0 && !emitter.charge_expanded_bytes(extra, row, column) {
         return Err(ResolveError::Budget);
     }
     Ok(())
 }
 
-/// Parse a Manchester class expression after charging prefixed-name expansions, falling
-/// back to resolving a simple class IRI/CURIE when the class is not yet declared in
-/// `ctx.vocab`.
+fn handle_parser_budget_exceeded(
+    attempted: usize,
+    precharged: usize,
+    emitter: &mut Emitter,
+    row: usize,
+    column: Option<&str>,
+) -> ResolveError {
+    let per_template = emitter.limits.max_expanded_bytes_per_template;
+    let total_rem = emitter.remaining_expanded_bytes();
+    let extra = attempted.saturating_sub(precharged);
+    if extra > total_rem {
+        let _ = emitter.charge_expanded_bytes(extra, row, column);
+        return ResolveError::Budget;
+    }
+    if attempted > per_template {
+        return ResolveError::Invalid(format!(
+            "resolved terms ({attempted} bytes) exceed the {per_template} byte limit"
+        ));
+    }
+    let _ = emitter.charge_expanded_bytes(extra.max(1), row, column);
+    ResolveError::Budget
+}
+
+fn parser_byte_cap(precharged: usize, emitter: &Emitter) -> usize {
+    let per_template = emitter.limits.max_expanded_bytes_per_template;
+    let total_avail = precharged.saturating_add(emitter.remaining_expanded_bytes());
+    per_template.min(total_avail)
+}
+
+/// Parse a Manchester class expression after charging prefixed-name expansions and
+/// vocabulary-resolved term bytes, falling back to resolving a simple class IRI/CURIE
+/// when the class is not yet declared in `ctx.vocab`.
 pub(crate) fn parse_class_expr_fallback_charged(
     text: &str,
     ctx: &Context,
@@ -1228,10 +1497,24 @@ pub(crate) fn parse_class_expr_fallback_charged(
     if trimmed.is_empty() {
         return Err(ResolveError::Invalid("empty class expression".to_string()));
     }
-    charge_prefixed_expansions(trimmed, ctx, emitter, row, column)?;
-    match manchester::class_expression(trimmed, &ctx.vocab) {
-        Ok(ce) => Ok(ce),
-        Err(err) => {
+    let precharged = charge_prefixed_expansions(
+        trimmed,
+        PatternSyntax::Manchester,
+        ctx,
+        emitter,
+        row,
+        column,
+    )?;
+    let cap = parser_byte_cap(precharged, emitter);
+    match manchester::class_expression_bounded(trimmed, &ctx.vocab, cap) {
+        Ok((ce, used)) => {
+            finalize_parser_budget(used, precharged, emitter, row, column)?;
+            Ok(ce)
+        }
+        Err(manchester::BoundedError::Budget { attempted }) => Err(handle_parser_budget_exceeded(
+            attempted, precharged, emitter, row, column,
+        )),
+        Err(manchester::BoundedError::Parse(err)) => {
             // If the expression is a single token (IRI or CURIE) not yet in vocab, accept it
             // as a named Class so spreadsheets can reference external or undeclared superclasses.
             if !trimmed.contains(char::is_whitespace) && !trimmed.contains(['(', ')', '{', '}']) {
@@ -1243,6 +1526,71 @@ pub(crate) fn parse_class_expr_fallback_charged(
             }
             Err(ResolveError::Invalid(err.message))
         }
+    }
+}
+
+/// Parse one Manchester or Functional-Style axiom with pre-lexing and parser-level byte
+/// charging so prefixed names, labels, bare names, empty-prefix fallbacks, and OFN
+/// comments/escapes are all accounted for before allocation.
+pub(crate) fn parse_axiom_charged(
+    text: &str,
+    syntax: PatternSyntax,
+    ctx: &Context,
+    emitter: &mut Emitter,
+    row: usize,
+    column: Option<&str>,
+) -> Result<Axiom, ResolveError> {
+    let precharged = charge_prefixed_expansions(text, syntax, ctx, emitter, row, column)?;
+    let cap = parser_byte_cap(precharged, emitter);
+    match syntax {
+        PatternSyntax::Manchester => match manchester::axiom_bounded(text, &ctx.vocab, cap) {
+            Ok((ax, used)) => {
+                finalize_parser_budget(used, precharged, emitter, row, column)?;
+                Ok(ax)
+            }
+            Err(manchester::BoundedError::Budget { attempted }) => Err(
+                handle_parser_budget_exceeded(attempted, precharged, emitter, row, column),
+            ),
+            Err(manchester::BoundedError::Parse(e)) => Err(ResolveError::Invalid(e.message)),
+        },
+        PatternSyntax::Functional => {
+            match crate::ofn_read::parse_axiom_bounded(text, ctx.vocab.prefixes(), cap) {
+                Ok((ax, used)) => {
+                    finalize_parser_budget(used, precharged, emitter, row, column)?;
+                    Ok(ax)
+                }
+                Err(crate::ofn_read::BoundedParseError::Budget { attempted }) => Err(
+                    handle_parser_budget_exceeded(attempted, precharged, emitter, row, column),
+                ),
+                Err(crate::ofn_read::BoundedParseError::Parse(e)) => {
+                    Err(ResolveError::Invalid(e.message))
+                }
+            }
+        }
+    }
+}
+
+/// Parse a ROBOT `I <data-prop>` literal cell with pre-lexing and parser-level datatype
+/// IRI byte charging, falling back to `Literal::simple(val)` on ordinary syntax misses.
+pub(crate) fn parse_cell_literal_charged(
+    val: &str,
+    ctx: &Context,
+    emitter: &mut Emitter,
+    row: usize,
+    column: Option<&str>,
+) -> Result<Literal, ResolveError> {
+    let precharged =
+        charge_prefixed_expansions(val, PatternSyntax::Manchester, ctx, emitter, row, column)?;
+    let cap = parser_byte_cap(precharged, emitter);
+    match manchester::literal_bounded(val, &ctx.vocab, cap) {
+        Ok((lit, used)) => {
+            finalize_parser_budget(used, precharged, emitter, row, column)?;
+            Ok(lit)
+        }
+        Err(manchester::BoundedError::Budget { attempted }) => Err(handle_parser_budget_exceeded(
+            attempted, precharged, emitter, row, column,
+        )),
+        Err(manchester::BoundedError::Parse(_)) => Ok(Literal::simple(val)),
     }
 }
 

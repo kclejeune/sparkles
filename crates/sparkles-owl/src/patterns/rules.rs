@@ -2,13 +2,14 @@
 //! placeholder substitution across Manchester and Functional-style OWL 2 syntax.
 
 use super::{
-    CancelReason, Context, Emitter, EvalError, Limits, MAX_VOCAB_ROUNDS, PatternSpec, ResolveError,
-    RowCommit, RowDiagnostic, Severity, Table, charge_prefixed_expansions, count_annotations,
-    resolve_iri_charged, truncated_snippet,
+    CancelReason, Context, ConvergenceStep, Emitter, EvalError, Limits, MAX_VOCAB_ROUNDS,
+    PatternSpec, ResolveError, RowCommit, RowDiagnostic, Severity, StructuralDiags, Table,
+    VocabConvergence, bounded_col, count_annotations, parse_axiom_charged, resolve_iri_charged,
+    truncated_snippet,
 };
 use crate::manchester::Vocabulary;
 use crate::model::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 
 /// Syntax used by a parameterized axiom rule template.
@@ -259,29 +260,23 @@ pub(crate) fn evaluate_rules(
         header_idx.entry(h.as_str()).or_insert(i);
     }
 
-    let mut structural_diags: Vec<RowDiagnostic> = Vec::new();
-    let check_column = |col: &str, context: &str, out: &mut Vec<RowDiagnostic>| -> bool {
+    let mut structural_diags = StructuralDiags::new(limits);
+    let check_column = |col: &str, context: &str, out: &mut StructuralDiags| -> bool {
         match header_counts.get(col).copied().unwrap_or(0) {
             0 => {
-                out.push(RowDiagnostic {
-                    row: 1,
-                    column: Some(col.to_string()),
-                    severity: Severity::Error,
-                    code: "unknown-column".to_string(),
-                    message: format!(
-                        "{context} references column '{col}', which is not in the table header"
-                    ),
+                let col_snip = bounded_col(col);
+                out.push(1, Some(&col_snip), "unknown-column", || {
+                    format!(
+                        "{context} references column '{col_snip}', which is not in the table header"
+                    )
                 });
                 false
             }
             1 => true,
             _ => {
-                out.push(RowDiagnostic {
-                    row: 1,
-                    column: Some(col.to_string()),
-                    severity: Severity::Error,
-                    code: "ambiguous-column".to_string(),
-                    message: format!("{context} references duplicate column header '{col}'"),
+                let col_snip = bounded_col(col);
+                out.push(1, Some(&col_snip), "ambiguous-column", || {
+                    format!("{context} references duplicate column header '{col_snip}'")
                 });
                 false
             }
@@ -292,105 +287,89 @@ pub(crate) fn evaluate_rules(
         spec: &'a RuleAnnotation,
         segments: Vec<Segment>,
         /// Annotation-only placeholder columns (not bound by the rule template).
-        extra_cols: Vec<String>,
+        extra_cols: Vec<(String, String)>,
     }
 
     struct CompiledRule<'a> {
         rule: &'a PatternRule,
+        diag_name: Option<String>,
         segments: Vec<Segment>,
-        referenced: Vec<String>,
+        referenced: Vec<(String, String)>,
+        required_cols: Vec<(String, String)>,
         annotations: Vec<CompiledAnn<'a>>,
     }
 
     let mut compiled = Vec::with_capacity(rules.len());
     for (r_idx, rule) in rules.iter().enumerate() {
-        let label = rule
-            .name
+        let diag_name = rule.name.as_deref().map(bounded_col);
+        let label = diag_name
             .clone()
             .unwrap_or_else(|| format!("rule_{}", r_idx + 1));
         let segments = match parse_template(&rule.template) {
             Ok(segs) => segs,
             Err(msg) => {
-                structural_diags.push(RowDiagnostic {
-                    row: 1,
-                    column: Some(label),
-                    severity: Severity::Error,
-                    code: "invalid-template".to_string(),
-                    message: msg,
-                });
+                structural_diags.push(1, Some(&label), "invalid-template", || msg);
                 continue;
             }
         };
-        let mut referenced = Vec::new();
+        let mut referenced: Vec<(String, String)> = Vec::new();
         let mut rule_invalid = false;
+        let rule_ctx = format!("rule '{label}'");
         for seg in &segments {
             if let Segment::Placeholder { column, .. } = seg {
-                if !check_column(column, &format!("rule '{label}'"), &mut structural_diags) {
+                if !check_column(column, &rule_ctx, &mut structural_diags) {
                     rule_invalid = true;
-                } else if !referenced.contains(column) {
-                    referenced.push(column.clone());
+                } else if !referenced.iter().any(|(c, _)| c == column) {
+                    referenced.push((column.clone(), bounded_col(column)));
                 }
             }
         }
+        let req_ctx = format!("rule '{label}' requiredColumns");
+        let mut required_cols: Vec<(String, String)> =
+            Vec::with_capacity(rule.required_columns.len());
         for req in &rule.required_columns {
-            if !check_column(
-                req,
-                &format!("rule '{label}' requiredColumns"),
-                &mut structural_diags,
-            ) {
+            if !check_column(req, &req_ctx, &mut structural_diags) {
                 rule_invalid = true;
+            } else {
+                required_cols.push((req.clone(), bounded_col(req)));
             }
         }
+        let split_ctx = format!("rule '{label}' split");
         for split_col in rule.split.keys() {
-            if !check_column(
-                split_col,
-                &format!("rule '{label}' split"),
-                &mut structural_diags,
-            ) {
+            if !check_column(split_col, &split_ctx, &mut structural_diags) {
                 rule_invalid = true;
             }
         }
+        let ann_ctx = format!("annotation template in rule '{label}'");
         let mut compiled_anns = Vec::with_capacity(rule.annotations.len());
         for ann in &rule.annotations {
             if ann.iri && (ann.lang.is_some() || ann.datatype.is_some()) {
                 rule_invalid = true;
-                structural_diags.push(RowDiagnostic {
-                    row: 1,
-                    column: Some(label.clone()),
-                    severity: Severity::Error,
-                    code: "invalid-annotation".to_string(),
-                    message: format!(
+                structural_diags.push(1, Some(&label), "invalid-annotation", || {
+                    format!(
                         "annotation in rule '{label}' cannot combine iri=true with lang or datatype"
-                    ),
+                    )
                 });
                 continue;
             }
             if ann.lang.is_some() && ann.datatype.is_some() {
                 rule_invalid = true;
-                structural_diags.push(RowDiagnostic {
-                    row: 1,
-                    column: Some(label.clone()),
-                    severity: Severity::Error,
-                    code: "invalid-annotation".to_string(),
-                    message: format!(
-                        "annotation in rule '{label}' cannot specify both lang and datatype"
-                    ),
+                structural_diags.push(1, Some(&label), "invalid-annotation", || {
+                    format!("annotation in rule '{label}' cannot specify both lang and datatype")
                 });
                 continue;
             }
             match parse_template(&ann.value) {
                 Ok(ann_segs) => {
-                    let mut extra_cols = Vec::new();
+                    let mut extra_cols: Vec<(String, String)> = Vec::new();
                     for seg in &ann_segs {
                         if let Segment::Placeholder { column, .. } = seg {
-                            if !check_column(
-                                column,
-                                &format!("annotation template in rule '{label}'"),
-                                &mut structural_diags,
-                            ) {
+                            if !check_column(column, &ann_ctx, &mut structural_diags) {
                                 rule_invalid = true;
-                            } else if !referenced.contains(column) && !extra_cols.contains(column) {
-                                extra_cols.push(column.clone());
+                            } else if !referenced.iter().any(|(c, _)| c == column)
+                                && !extra_cols.iter().any(|(c, _)| c == column)
+                            {
+                                extra_cols.push((column.clone(), bounded_col(column)));
                             }
                         }
                     }
@@ -402,48 +381,42 @@ pub(crate) fn evaluate_rules(
                 }
                 Err(msg) => {
                     rule_invalid = true;
-                    structural_diags.push(RowDiagnostic {
-                        row: 1,
-                        column: Some(label.clone()),
-                        severity: Severity::Error,
-                        code: "invalid-template".to_string(),
-                        message: msg,
-                    });
+                    structural_diags.push(1, Some(&label), "invalid-template", || msg);
                 }
             }
         }
         if !rule_invalid {
             compiled.push(CompiledRule {
                 rule,
+                diag_name,
                 segments,
                 referenced,
+                required_cols,
                 annotations: compiled_anns,
             });
         }
     }
 
     // Validate declaration columns.
-    let mut resolved_decls: Vec<(usize, &ColumnDeclaration)> = Vec::new();
+    let mut resolved_decls: Vec<(usize, &ColumnDeclaration, String)> = Vec::new();
     for decl in declarations {
         if check_column(&decl.column, "declaration", &mut structural_diags) {
-            resolved_decls.push((header_idx[decl.column.as_str()], decl));
+            resolved_decls.push((
+                header_idx[decl.column.as_str()],
+                decl,
+                bounded_col(&decl.column),
+            ));
         }
     }
 
     let n = table.rows.len();
-    let mut vocab_eligible: Vec<bool> = vec![true; n];
-    let mut monotonic_excluded: Vec<bool> = vec![false; n];
-    let mut monotonic_mode = false;
-    let mut seen_states: FxHashSet<Vec<bool>> = FxHashSet::default();
-    seen_states.insert(vocab_eligible.clone());
+    let mut convergence = VocabConvergence::new(n);
 
     for round in 0..MAX_VOCAB_ROUNDS {
         if round > 0 {
             emitter.reset_for_retry(initial_diagnostics, initial_truncated);
         }
-        for d in &structural_diags {
-            emitter.structural_error(d.clone());
-        }
+        structural_diags.replay_into(emitter);
 
         let mut ctx = Context::build(base_vocab, spec);
         let mut round_contributed = vec![false; n];
@@ -456,12 +429,12 @@ pub(crate) fn evaluate_rules(
             if row_i.is_multiple_of(64) {
                 check_cancel()?;
             }
-            if !vocab_eligible[row_i] {
+            if !convergence.vocab_eligible[row_i] {
                 continue;
             }
             let mut staged_decls: Vec<(Iri, EntityKind)> = Vec::new();
             let mut decls_ok = true;
-            for &(col_idx, decl) in &resolved_decls {
+            for &(col_idx, decl, ref diag_col) in &resolved_decls {
                 let cell = row.cells.get(col_idx).map(|s| s.trim()).unwrap_or("");
                 if cell.is_empty() {
                     continue;
@@ -476,7 +449,13 @@ pub(crate) fn evaluate_rules(
                     break;
                 }
                 for item in items {
-                    match resolve_iri_charged(item, &ctx, emitter, row.line, Some(&decl.column)) {
+                    match resolve_iri_charged(
+                        item,
+                        &ctx,
+                        emitter,
+                        row.line,
+                        Some(diag_col.as_str()),
+                    ) {
                         Ok(iri) => staged_decls.push((iri, decl.kind)),
                         Err(ResolveError::Budget) => return Ok(()),
                         Err(ResolveError::Invalid(_)) => {
@@ -514,9 +493,9 @@ pub(crate) fn evaluate_rules(
 
             let mut row_has_error = false;
             let mut row_declarations: Vec<Entity> = Vec::new();
-            let mut row_axioms: Vec<(Axiom, Option<String>)> = Vec::new();
+            let mut row_axioms: Vec<(Axiom, Option<&str>)> = Vec::new();
 
-            for &(col_idx, decl) in &resolved_decls {
+            for &(col_idx, decl, ref diag_col) in &resolved_decls {
                 let cell = row.cells.get(col_idx).map(|s| s.trim()).unwrap_or("");
                 if cell.is_empty() {
                     continue;
@@ -530,33 +509,45 @@ pub(crate) fn evaluate_rules(
                     row_has_error = true;
                     emitter.diag(RowDiagnostic {
                         row: row.line,
-                        column: Some(decl.column.clone()),
+                        column: Some(diag_col.clone()),
                         severity: Severity::Error,
                         code: "expansion-limit".to_string(),
                         message: format!(
-                            "declaration column '{}' split exceeds the limit of {} values",
-                            decl.column, limits.max_split_values_per_cell
+                            "declaration column '{diag_col}' split exceeds the limit of {} values",
+                            limits.max_split_values_per_cell
                         ),
                     });
                     continue;
                 }
                 for item in items {
-                    if !emitter.charge_attempt(1, row.line, Some(decl.column.clone())) {
+                    if !emitter.charge_attempt(1, row.line, Some(diag_col.as_str())) {
                         return Ok(());
                     }
-                    match resolve_iri_charged(item, &ctx, emitter, row.line, Some(&decl.column)) {
+                    match resolve_iri_charged(
+                        item,
+                        &ctx,
+                        emitter,
+                        row.line,
+                        Some(diag_col.as_str()),
+                    ) {
                         Ok(iri) => {
+                            if !emitter.charge_expanded_bytes(
+                                iri.as_str().len(),
+                                row.line,
+                                Some(diag_col.as_str()),
+                            ) {
+                                return Ok(());
+                            }
                             let entity = make_entity(iri, decl.kind);
                             row_declarations.push(entity.clone());
-                            row_axioms
-                                .push((Axiom::declaration(entity), Some(decl.column.clone())));
+                            row_axioms.push((Axiom::declaration(entity), Some(diag_col.as_str())));
                         }
                         Err(ResolveError::Budget) => return Ok(()),
                         Err(ResolveError::Invalid(msg)) => {
                             row_has_error = true;
                             emitter.diag(RowDiagnostic {
                                 row: row.line,
-                                column: Some(decl.column.clone()),
+                                column: Some(diag_col.clone()),
                                 severity: Severity::Error,
                                 code: "invalid-iri".to_string(),
                                 message: msg,
@@ -567,9 +558,10 @@ pub(crate) fn evaluate_rules(
             }
 
             for cr in &compiled {
+                let rule_col = cr.diag_name.as_deref();
                 // Check explicitly required columns first.
                 let mut missing_req = false;
-                for req in &cr.rule.required_columns {
+                for (req, req_diag) in &cr.required_cols {
                     let idx = header_idx[req.as_str()];
                     let val = row.cells.get(idx).map(|s| s.trim()).unwrap_or("");
                     if val.is_empty() {
@@ -577,10 +569,10 @@ pub(crate) fn evaluate_rules(
                         row_has_error = true;
                         emitter.diag(RowDiagnostic {
                             row: row.line,
-                            column: Some(req.clone()),
+                            column: Some(req_diag.clone()),
                             severity: Severity::Error,
                             code: "missing-required-column".to_string(),
-                            message: format!("required column '{req}' is empty"),
+                            message: format!("required column '{req_diag}' is empty"),
                         });
                     }
                 }
@@ -591,7 +583,7 @@ pub(crate) fn evaluate_rules(
                 // Collect per-column value lists (applying configured split delimiters).
                 let mut col_lists: Vec<(&str, Vec<&str>)> = Vec::with_capacity(cr.referenced.len());
                 let mut skip = false;
-                for col_name in &cr.referenced {
+                for (col_name, col_diag) in &cr.referenced {
                     let idx = header_idx[col_name.as_str()];
                     let raw = row.cells.get(idx).map(|s| s.trim()).unwrap_or("");
                     let (vals, truncated) = split_values_bounded(
@@ -603,11 +595,11 @@ pub(crate) fn evaluate_rules(
                         row_has_error = true;
                         emitter.diag(RowDiagnostic {
                             row: row.line,
-                            column: Some(col_name.clone()),
+                            column: Some(col_diag.clone()),
                             severity: Severity::Error,
                             code: "expansion-limit".to_string(),
                             message: format!(
-                                "column '{col_name}' split exceeds the limit of {} values",
+                                "column '{col_diag}' split exceeds the limit of {} values",
                                 limits.max_split_values_per_cell
                             ),
                         });
@@ -622,10 +614,10 @@ pub(crate) fn evaluate_rules(
                             row_has_error = true;
                             emitter.diag(RowDiagnostic {
                                 row: row.line,
-                                column: Some(col_name.clone()),
+                                column: Some(col_diag.clone()),
                                 severity: Severity::Error,
                                 code: "empty-placeholder".to_string(),
-                                message: format!("column '{col_name}' is empty"),
+                                message: format!("column '{col_diag}' is empty"),
                             });
                             skip = true;
                             break;
@@ -645,7 +637,7 @@ pub(crate) fn evaluate_rules(
                     row_has_error = true;
                     emitter.diag(RowDiagnostic {
                         row: row.line,
-                        column: cr.rule.name.clone(),
+                        column: cr.diag_name.clone(),
                         severity: Severity::Error,
                         code: "expansion-limit".to_string(),
                         message: format!(
@@ -674,7 +666,7 @@ pub(crate) fn evaluate_rules(
                     if combo_i.is_multiple_of(64) {
                         check_cancel()?;
                     }
-                    if !emitter.charge_attempt(1, row.line, cr.rule.name.clone()) {
+                    if !emitter.charge_attempt(1, row.line, rule_col) {
                         return Ok(());
                     }
 
@@ -688,7 +680,7 @@ pub(crate) fn evaluate_rules(
                         limits.max_expanded_bytes_per_template,
                         emitter,
                         row.line,
-                        cr.rule.name.as_deref(),
+                        rule_col,
                     ) {
                         Ok(s) => s,
                         Err(RenderError::Budget) => return Ok(()),
@@ -696,7 +688,7 @@ pub(crate) fn evaluate_rules(
                             row_has_error = true;
                             emitter.diag(RowDiagnostic {
                                 row: row.line,
-                                column: cr.rule.name.clone(),
+                                column: cr.diag_name.clone(),
                                 severity: Severity::Error,
                                 code: "template-substitution".to_string(),
                                 message: msg,
@@ -705,52 +697,34 @@ pub(crate) fn evaluate_rules(
                         }
                     };
 
-                    // Charge prefixed-name namespace expansion bytes BEFORE parsing.
-                    match charge_prefixed_expansions(
+                    let mut ax = match parse_axiom_charged(
                         &expanded,
+                        cr.rule.syntax,
                         &ctx,
                         emitter,
                         row.line,
-                        cr.rule.name.as_deref(),
+                        rule_col,
                     ) {
-                        Ok(()) => {}
+                        Ok(a) => a,
                         Err(ResolveError::Budget) => return Ok(()),
                         Err(ResolveError::Invalid(msg)) => {
                             row_has_error = true;
+                            let code = if msg.contains("byte limit") {
+                                "expansion-bytes-limit"
+                            } else {
+                                "invalid-axiom-syntax"
+                            };
+                            let message = if code == "expansion-bytes-limit" {
+                                msg
+                            } else {
+                                format!("{msg} (in '{}')", truncated_snippet(&expanded, 256))
+                            };
                             emitter.diag(RowDiagnostic {
                                 row: row.line,
-                                column: cr.rule.name.clone(),
+                                column: cr.diag_name.clone(),
                                 severity: Severity::Error,
-                                code: "expansion-bytes-limit".to_string(),
-                                message: msg,
-                            });
-                            continue;
-                        }
-                    }
-
-                    let parsed_axiom = match cr.rule.syntax {
-                        PatternSyntax::Manchester => {
-                            crate::manchester::axiom(&expanded, &ctx.vocab).map_err(|e| e.message)
-                        }
-                        PatternSyntax::Functional => {
-                            crate::ofn_read::parse_axiom(&expanded, ctx.vocab.prefixes())
-                                .map_err(|e| e.message)
-                        }
-                    };
-
-                    let mut ax = match parsed_axiom {
-                        Ok(a) => a,
-                        Err(msg) => {
-                            row_has_error = true;
-                            emitter.diag(RowDiagnostic {
-                                row: row.line,
-                                column: cr.rule.name.clone(),
-                                severity: Severity::Error,
-                                code: "invalid-axiom-syntax".to_string(),
-                                message: format!(
-                                    "{msg} (in '{}')",
-                                    truncated_snippet(&expanded, 256)
-                                ),
+                                code: code.to_string(),
+                                message,
                             });
                             continue;
                         }
@@ -762,7 +736,7 @@ pub(crate) fn evaluate_rules(
                         row_has_error = true;
                         emitter.diag(RowDiagnostic {
                             row: row.line,
-                            column: cr.rule.name.clone(),
+                            column: cr.diag_name.clone(),
                             severity: Severity::Error,
                             code: "annotation-limit".to_string(),
                             message: format!(
@@ -793,7 +767,7 @@ pub(crate) fn evaluate_rules(
                         if ann_skip {
                             continue;
                         }
-                        for col_name in &ann.extra_cols {
+                        for (col_name, col_diag) in &ann.extra_cols {
                             let idx = header_idx[col_name.as_str()];
                             let raw = row.cells.get(idx).map(|s| s.trim()).unwrap_or("");
                             let (vals, truncated) = split_values_bounded(
@@ -806,11 +780,11 @@ pub(crate) fn evaluate_rules(
                                 row_has_error = true;
                                 emitter.diag(RowDiagnostic {
                                     row: row.line,
-                                    column: Some(col_name.clone()),
+                                    column: Some(col_diag.clone()),
                                     severity: Severity::Error,
                                     code: "expansion-limit".to_string(),
                                     message: format!(
-                                        "annotation column '{col_name}' split exceeds the limit of {} values",
+                                        "annotation column '{col_diag}' split exceeds the limit of {} values",
                                         limits.max_split_values_per_cell
                                     ),
                                 });
@@ -838,7 +812,7 @@ pub(crate) fn evaluate_rules(
                             row_has_error = true;
                             emitter.diag(RowDiagnostic {
                                 row: row.line,
-                                column: cr.rule.name.clone(),
+                                column: cr.diag_name.clone(),
                                 severity: Severity::Error,
                                 code: "annotation-limit".to_string(),
                                 message: format!(
@@ -849,8 +823,7 @@ pub(crate) fn evaluate_rules(
                             continue;
                         };
 
-                        if !emitter.charge_attempt(ann_combo_count, row.line, cr.rule.name.clone())
-                        {
+                        if !emitter.charge_attempt(ann_combo_count, row.line, rule_col) {
                             return Ok(());
                         }
 
@@ -859,7 +832,7 @@ pub(crate) fn evaluate_rules(
                             &ctx,
                             emitter,
                             row.line,
-                            cr.rule.name.as_deref(),
+                            rule_col,
                         ) {
                             Ok(i) => i,
                             Err(ResolveError::Budget) => return Ok(()),
@@ -868,7 +841,7 @@ pub(crate) fn evaluate_rules(
                                 row_has_error = true;
                                 emitter.diag(RowDiagnostic {
                                     row: row.line,
-                                    column: cr.rule.name.clone(),
+                                    column: cr.diag_name.clone(),
                                     severity: Severity::Error,
                                     code: "invalid-iri".to_string(),
                                     message: msg,
@@ -880,11 +853,8 @@ pub(crate) fn evaluate_rules(
                         if ann_combo_count > 1 {
                             let extra_prop_bytes =
                                 prop_iri.as_str().len().saturating_mul(ann_combo_count - 1);
-                            if !emitter.charge_expanded_bytes(
-                                extra_prop_bytes,
-                                row.line,
-                                cr.rule.name.clone(),
-                            ) {
+                            if !emitter.charge_expanded_bytes(extra_prop_bytes, row.line, rule_col)
+                            {
                                 return Ok(());
                             }
                         }
@@ -913,7 +883,7 @@ pub(crate) fn evaluate_rules(
                                 limits.max_expanded_bytes_per_template,
                                 emitter,
                                 row.line,
-                                cr.rule.name.as_deref(),
+                                rule_col,
                             ) {
                                 Ok(s) => s,
                                 Err(RenderError::Budget) => return Ok(()),
@@ -922,7 +892,7 @@ pub(crate) fn evaluate_rules(
                                     row_has_error = true;
                                     emitter.diag(RowDiagnostic {
                                         row: row.line,
-                                        column: cr.rule.name.clone(),
+                                        column: cr.diag_name.clone(),
                                         severity: Severity::Error,
                                         code: "template-substitution".to_string(),
                                         message: msg,
@@ -932,11 +902,7 @@ pub(crate) fn evaluate_rules(
                             };
                             let ann_val = if ann.spec.iri {
                                 match resolve_iri_charged(
-                                    &val_str,
-                                    &ctx,
-                                    emitter,
-                                    row.line,
-                                    cr.rule.name.as_deref(),
+                                    &val_str, &ctx, emitter, row.line, rule_col,
                                 ) {
                                     Ok(iri) => AnnotationValue::Iri(iri),
                                     Err(ResolveError::Budget) => return Ok(()),
@@ -945,7 +911,7 @@ pub(crate) fn evaluate_rules(
                                         row_has_error = true;
                                         emitter.diag(RowDiagnostic {
                                             row: row.line,
-                                            column: cr.rule.name.clone(),
+                                            column: cr.diag_name.clone(),
                                             severity: Severity::Error,
                                             code: "invalid-iri".to_string(),
                                             message: msg,
@@ -954,6 +920,9 @@ pub(crate) fn evaluate_rules(
                                     }
                                 }
                             } else if let Some(lang) = &ann.spec.lang {
+                                if !emitter.charge_expanded_bytes(lang.len(), row.line, rule_col) {
+                                    return Ok(());
+                                }
                                 match Literal::lang(val_str, lang) {
                                     Ok(lit) => AnnotationValue::Literal(lit),
                                     Err(e) => {
@@ -961,7 +930,7 @@ pub(crate) fn evaluate_rules(
                                         row_has_error = true;
                                         emitter.diag(RowDiagnostic {
                                             row: row.line,
-                                            column: cr.rule.name.clone(),
+                                            column: cr.diag_name.clone(),
                                             severity: Severity::Error,
                                             code: "invalid-language-tag".to_string(),
                                             message: e.0,
@@ -970,13 +939,7 @@ pub(crate) fn evaluate_rules(
                                     }
                                 }
                             } else if let Some(dt) = &ann.spec.datatype {
-                                match resolve_iri_charged(
-                                    dt,
-                                    &ctx,
-                                    emitter,
-                                    row.line,
-                                    cr.rule.name.as_deref(),
-                                ) {
+                                match resolve_iri_charged(dt, &ctx, emitter, row.line, rule_col) {
                                     Ok(dt_iri) => AnnotationValue::Literal(Literal::typed(
                                         val_str,
                                         dt_iri.as_str(),
@@ -987,7 +950,7 @@ pub(crate) fn evaluate_rules(
                                         row_has_error = true;
                                         emitter.diag(RowDiagnostic {
                                             row: row.line,
-                                            column: cr.rule.name.clone(),
+                                            column: cr.diag_name.clone(),
                                             severity: Severity::Error,
                                             code: "invalid-iri".to_string(),
                                             message: msg,
@@ -1007,7 +970,7 @@ pub(crate) fn evaluate_rules(
                     }
 
                     if !ann_failed {
-                        row_axioms.push((ax, cr.rule.name.clone()));
+                        row_axioms.push((ax, rule_col));
                     }
                 }
             }
@@ -1026,51 +989,20 @@ pub(crate) fn evaluate_rules(
             }
         }
 
-        let failed_contributor = (0..n).any(|i| round_contributed[i] && round_failed[i]);
-        let recovered_row = (0..n).any(|i| {
-            !vocab_eligible[i] && row_pass1_ok[i] && !round_failed[i] && !monotonic_excluded[i]
-        });
-        if !failed_contributor && !recovered_row {
-            return Ok(());
-        }
-
-        let next_eligible: Vec<bool> = if monotonic_mode {
-            for i in 0..n {
-                if round_failed[i] {
-                    monotonic_excluded[i] = true;
-                }
+        match convergence.advance(round, &round_contributed, &round_failed, &row_pass1_ok) {
+            ConvergenceStep::Done => return Ok(()),
+            ConvergenceStep::Continue => {}
+            ConvergenceStep::LimitExceeded => {
+                emitter.budget_error(
+                    1,
+                    None,
+                    "vocab-dependency-limit",
+                    format!(
+                        "failed-row vocabulary dependency chain did not converge within {MAX_VOCAB_ROUNDS} passes"
+                    ),
+                );
+                return Ok(());
             }
-            (0..n).map(|i| !monotonic_excluded[i]).collect()
-        } else {
-            (0..n).map(|i| !round_failed[i]).collect()
-        };
-
-        if next_eligible == vocab_eligible {
-            return Ok(());
-        }
-
-        if round + 1 == MAX_VOCAB_ROUNDS {
-            emitter.budget_error(
-                1,
-                None,
-                "vocab-dependency-limit",
-                format!(
-                    "failed-row vocabulary dependency chain did not converge within {MAX_VOCAB_ROUNDS} passes"
-                ),
-            );
-            return Ok(());
-        }
-
-        if !seen_states.insert(next_eligible.clone()) {
-            monotonic_mode = true;
-            for i in 0..n {
-                if round_failed[i] || !vocab_eligible[i] {
-                    monotonic_excluded[i] = true;
-                }
-            }
-            vocab_eligible = (0..n).map(|i| !monotonic_excluded[i]).collect();
-        } else {
-            vocab_eligible = next_eligible;
         }
     }
     Ok(())
@@ -1186,7 +1118,7 @@ fn render_segments_bounded(
             }
         }
     }
-    if !emitter.charge_expanded_bytes(out.len(), line, col_name.map(str::to_string)) {
+    if !emitter.charge_expanded_bytes(out.len(), line, col_name) {
         return Err(RenderError::Budget);
     }
     Ok(out)

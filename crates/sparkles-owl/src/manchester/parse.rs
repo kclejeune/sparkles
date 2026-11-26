@@ -1,7 +1,7 @@
 //! A recursive-descent reader of the Manchester syntax over the tokens of [`super::lex`].
 
 use super::lex::{self, Name, Tok};
-use super::{Error, ErrorKind, Found, Span, Vocabulary};
+use super::{BoundedError, ByteBudget, Error, ErrorKind, Found, Span, Vocabulary};
 use crate::model::*;
 use crate::vocab;
 use std::collections::BTreeSet;
@@ -65,6 +65,7 @@ pub struct Parser<'v> {
     len: usize,
     v: &'v Vocabulary,
     depth: usize,
+    budget: Option<ByteBudget>,
 }
 
 impl<'v> Parser<'v> {
@@ -77,7 +78,13 @@ impl<'v> Parser<'v> {
             len: text.len(),
             v,
             depth: 0,
+            budget: None,
         })
+    }
+
+    pub fn with_budget(mut self, max_bytes: usize) -> Self {
+        self.budget = Some(ByteBudget::new(max_bytes));
+        self
     }
 
     /// Reads with `f` and checks that nothing is left.
@@ -88,6 +95,30 @@ impl<'v> Parser<'v> {
         let out = f(&mut self)?;
         self.done()?;
         Ok(out)
+    }
+
+    pub fn whole_bounded<T>(
+        mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<(T, usize), BoundedError> {
+        if self.end == 0 {
+            return Err(BoundedError::Parse(Error::syntax(
+                Span::new(0, self.len),
+                "the text is empty",
+            )));
+        }
+        match f(&mut self).and_then(|out| self.done().map(|()| out)) {
+            Ok(out) => Ok((out, self.budget.map_or(0, |b| b.used))),
+            Err(err) => {
+                if let Some(b) = self.budget
+                    && b.exceeded
+                {
+                    Err(BoundedError::Budget { attempted: b.used })
+                } else {
+                    Err(BoundedError::Parse(err))
+                }
+            }
+        }
     }
 
     fn done(&self) -> Result<(), Error> {
@@ -216,8 +247,23 @@ impl<'v> Parser<'v> {
 
     /// The entities of the kinds `want` that `n` names, all with one IRI, in the order
     /// of `want`. An IRI the vocabulary does not know is taken as the first kind.
-    fn resolve(&self, n: &Name, span: Span, want: &[K], what: &str) -> Result<Vec<Entity>, Error> {
-        match self.v.lookup(n, want) {
+    fn resolve(
+        &mut self,
+        n: &Name,
+        span: Span,
+        want: &[K],
+        what: &str,
+    ) -> Result<Vec<Entity>, Error> {
+        let found = match self.v.lookup_bounded(n, want, &mut self.budget) {
+            Ok(f) => f,
+            Err(()) => {
+                return Err(Error::syntax(
+                    span,
+                    "resolved term bytes exceeded the expression budget",
+                ));
+            }
+        };
+        match found {
             Found::Entities(es) => {
                 let iris: BTreeSet<&str> = es.iter().map(|e| e.iri().as_str()).collect();
                 if iris.len() > 1 {
@@ -472,9 +518,10 @@ impl<'v> Parser<'v> {
             Some(Tok::Name(Name::Word(w))) if w == "true" || w == "false" => true,
             Some(Tok::LBrace) => self.literal_ahead(k + 1),
             Some(Tok::Name(n)) => {
+                let max_exp = self.budget.map(|b| b.limit);
                 self.tok(k + 1) == Some(&Tok::LBracket)
-                    || matches!(self.v.lookup(n, &[K::Datatype]), Found::Entities(_))
-                        && !matches!(self.v.lookup(n, &[K::Class]), Found::Entities(_))
+                    || self.v.has_entity_kind(n, K::Datatype, max_exp)
+                        && !self.v.has_entity_kind(n, K::Class, max_exp)
             }
             _ => false,
         }
@@ -682,7 +729,9 @@ impl<'v> Parser<'v> {
                     .map(|f| f.to_string())
                     .or_else(|| {
                         self.v
-                            .expand(w)
+                            .expanded_len(w)
+                            .filter(|&len| len <= 256)
+                            .and_then(|_| self.v.expand(w))
                             .filter(|i| vocab::FACETS.contains(&i.as_str()))
                     });
                 match found {
@@ -961,16 +1010,16 @@ impl<'v> Parser<'v> {
                 return Left::of(e.clone());
             }
         }
-        if let Some(Tok::Name(n)) = self.tok(self.pos)
-            && let Found::Entities(right) = self.v.lookup(
-                n,
-                &[K::ObjectProperty, K::DataProperty, K::AnnotationProperty],
-            )
-            && let Some(e) = es
-                .iter()
-                .find(|e| right.iter().any(|r| r.kind() == e.kind()))
-        {
-            return Left::of(e.clone());
+        if let Some(Tok::Name(n)) = self.tok(self.pos) {
+            let max_exp = self.budget.map(|b| b.limit);
+            if let Some(e) = es.iter().find(|e| {
+                matches!(
+                    e.kind(),
+                    K::ObjectProperty | K::DataProperty | K::AnnotationProperty
+                ) && self.v.has_entity_kind(n, e.kind(), max_exp)
+            }) {
+                return Left::of(e.clone());
+            }
         }
         Left::of(es[0].clone())
     }
@@ -993,9 +1042,31 @@ impl<'v> Parser<'v> {
     fn iri(&mut self) -> Result<Iri, Error> {
         let span = self.here();
         let iri = match self.peek() {
-            Some(Tok::Name(Name::Iri(i))) => i.clone(),
-            Some(Tok::Name(Name::Word(w))) if self.v.expand(w).is_some() => {
-                self.v.expand(w).expect("checked")
+            Some(Tok::Name(Name::Iri(i))) => {
+                let len = i.len();
+                let owned = i.clone();
+                if let Some(b) = self.budget.as_mut()
+                    && b.charge(len).is_err()
+                {
+                    return Err(Error::syntax(
+                        span,
+                        "resolved term bytes exceeded the expression budget",
+                    ));
+                }
+                owned
+            }
+            Some(Tok::Name(Name::Word(w))) if self.v.expanded_len(w).is_some() => {
+                let exp_len = self.v.expanded_len(w).expect("checked");
+                let w = w.clone();
+                if let Some(b) = self.budget.as_mut()
+                    && b.charge(exp_len).is_err()
+                {
+                    return Err(Error::syntax(
+                        span,
+                        "resolved term bytes exceeded the expression budget",
+                    ));
+                }
+                self.v.expand(&w).expect("checked")
             }
             Some(Tok::Name(n)) => {
                 let n = n.clone();

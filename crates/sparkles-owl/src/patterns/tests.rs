@@ -1277,3 +1277,391 @@ fn malformed_prefixes_and_qualified_names_never_fall_through_to_base_iri() {
         "malformed qualified name must not fall through to baseIri: {ofns:?}"
     );
 }
+
+#[test]
+fn tight_budgets_catch_repeated_robot_subject_annotation_prop_and_data_prop_literal() {
+    // 1. Repeated ROBOT subject cloning across split values is charged before allocation.
+    let long_subj = format!("http://ex.org/{}", "S".repeat(600));
+    let csv_subj = format!(
+        "ID,Parents\nID,SC % SPLIT=|\n<{long_subj}>,ex:A|ex:B|ex:C|ex:D|ex:E|ex:F|ex:G|ex:H\n"
+    );
+    let robot_spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let tight_subj = Limits {
+        max_total_expanded_bytes: 3_000,
+        ..Limits::default()
+    };
+    let res_subj = evaluate(
+        &csv_subj,
+        Delimiter::Comma,
+        &robot_spec,
+        &ex_vocab(),
+        &tight_subj,
+    )
+    .unwrap();
+    assert!(
+        res_subj.budget_exceeded,
+        "repeated ROBOT subject clones must hit expansion-bytes-limit: {res_subj:?}"
+    );
+    assert!(res_subj.axioms.is_empty());
+
+    // 2. ROBOT `>A` per-value property cloning is charged before building annotations.
+    let long_prop = format!("http://ex.org/{}", "P".repeat(700));
+    let csv_prop = format!(
+        "ID,Parent,Notes\nID,SC %,>A <{long_prop}> SPLIT=|\nex:Heart,ex:Organ,a|b|c|d|e|f|g|h\n"
+    );
+    let tight_prop = Limits {
+        max_total_expanded_bytes: 3_500,
+        ..Limits::default()
+    };
+    let res_prop = evaluate(
+        &csv_prop,
+        Delimiter::Comma,
+        &robot_spec,
+        &ex_vocab(),
+        &tight_prop,
+    )
+    .unwrap();
+    assert!(
+        res_prop.budget_exceeded,
+        "per-value >A property clones must hit expansion-bytes-limit: {res_prop:?}"
+    );
+    assert!(res_prop.axioms.is_empty());
+
+    // 3. ROBOT `I <data-prop>` typed literal datatype prefix expansion is charged before parsing.
+    let mut vocab = ex_vocab();
+    vocab.add_entity(Entity::DataProperty(DataProperty::new(
+        "http://ex.org/hasVal",
+    )));
+    let mut prefixes = BTreeMap::new();
+    prefixes.insert(
+        "p".to_string(),
+        format!("http://ex.org/{}/", "d".repeat(600)),
+    );
+    let dp_spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes,
+    };
+    let csv_dp = "\
+ID,Val
+ID,I ex:hasVal
+ex:i1,\"\"\"1\"\"^^p:t\"
+ex:i2,\"\"\"2\"\"^^p:t\"
+ex:i3,\"\"\"3\"\"^^p:t\"
+ex:i4,\"\"\"4\"\"^^p:t\"
+";
+    let tight_dp = Limits {
+        max_total_expanded_bytes: 1_500,
+        ..Limits::default()
+    };
+    let res_dp = evaluate(csv_dp, Delimiter::Comma, &dp_spec, &vocab, &tight_dp).unwrap();
+    assert!(
+        res_dp.budget_exceeded,
+        "ROBOT I <data-prop> typed literal prefix expansion must hit budget: {res_dp:?}"
+    );
+    assert!(res_dp.has_fatal_error());
+    assert!(
+        res_dp.axioms.len() < 8,
+        "budget must stop evaluation before all 4 rows emit axioms: {:?}",
+        res_dp.axioms
+    );
+
+    // 4. Spec prefix namespace longer than max_expanded_bytes_per_template is rejected up front.
+    let mut huge_prefixes = BTreeMap::new();
+    huge_prefixes.insert(
+        "p".to_string(),
+        format!("http://ex.org/{}/", "x".repeat(2_000)),
+    );
+    let huge_ns_spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes: huge_prefixes,
+    };
+    let tight_ns = Limits {
+        max_expanded_bytes_per_template: 512,
+        ..Limits::default()
+    };
+    let res_ns = evaluate(
+        "ID,Label\nID,LABEL\nex:A,A\n",
+        Delimiter::Comma,
+        &huge_ns_spec,
+        &ex_vocab(),
+        &tight_ns,
+    )
+    .unwrap();
+    assert!(
+        res_ns.budget_exceeded,
+        "oversized prefix namespace must be refused: {res_ns:?}"
+    );
+}
+
+#[test]
+fn tight_budgets_catch_ofn_comments_apostrophes_escapes_and_manchester_vocab_lookups() {
+    let mut prefixes = BTreeMap::new();
+    prefixes.insert(
+        "p".to_string(),
+        format!("http://ex.org/{}/", "n".repeat(400)),
+    );
+    let tight = Limits {
+        max_total_expanded_bytes: 1_200,
+        ..Limits::default()
+    };
+
+    // 1. OFN `# "` and `# '` line comments and `'` inside PN_LOCAL cannot bypass charging.
+    for tmpl in [
+        "# \"\nSubClassOf(p:${a} ObjectIntersectionOf(p:1 p:2 p:3 p:4))",
+        "# '\nSubClassOf(p:${a} ObjectIntersectionOf(p:1 p:2 p:3 p:4))",
+        "SubClassOf(p:a' ObjectIntersectionOf(p:${a} p:1 p:2 p:3 p:4))",
+        "SubClassOf(p:a\\-b ObjectIntersectionOf(p:${a} p:1 p:2 p:3 p:4))",
+    ] {
+        let spec = PatternSpec {
+            mode: TemplateMode::Pattern {
+                declarations: Vec::new(),
+                rules: vec![PatternRule::functional(tmpl)],
+            },
+            base_iri: None,
+            prefixes: prefixes.clone(),
+        };
+        let res = evaluate("a\nx\n", Delimiter::Comma, &spec, &ex_vocab(), &tight).unwrap();
+        assert!(
+            res.budget_exceeded,
+            "OFN template {tmpl:?} bypassed byte budget: {res:?}"
+        );
+        assert!(res.axioms.is_empty());
+    }
+
+    // 2. Manchester vocabulary lookups (quoted label, bare local name, empty-prefix fallback)
+    //    resolving short tokens to long IRIs must be charged before allocation.
+    let long_iri_a = format!("http://ex.org/{}/LongClassA", "a".repeat(500));
+    let long_iri_b = format!("http://ex.org/{}/LongClassB", "b".repeat(500));
+    let long_empty_ns = format!("http://ex.org/{}/", "e".repeat(500));
+    let mut vocab = Vocabulary::new([("", long_empty_ns.as_str())]);
+    vocab.add_entity(Entity::Class(Class::new(&long_iri_a)));
+    vocab.add_label(&long_iri_a, "short a");
+    vocab.add_entity(Entity::Class(Class::new(&long_iri_b)));
+    vocab.add_entity(Entity::Class(Class::new(format!("{long_empty_ns}C1"))));
+
+    // 2a. Quoted label resolving to long IRI repeatedly.
+    let quoted_spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::manchester(
+                "${x} SubClassOf 'short a' and 'short a' and 'short a'",
+            )],
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let res_quoted = evaluate(
+        "x\n'short a'\n",
+        Delimiter::Comma,
+        &quoted_spec,
+        &vocab,
+        &tight,
+    )
+    .unwrap();
+    assert!(
+        res_quoted.budget_exceeded,
+        "quoted Manchester label resolution must hit budget: {res_quoted:?}"
+    );
+
+    // 2b. Bare local name resolving to long IRI repeatedly.
+    let bare_spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::manchester(
+                "LongClassB SubClassOf LongClassB and LongClassB and LongClassB",
+            )],
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let res_bare = evaluate("x\n1\n", Delimiter::Comma, &bare_spec, &vocab, &tight).unwrap();
+    assert!(
+        res_bare.budget_exceeded,
+        "bare Manchester local-name resolution must hit budget: {res_bare:?}"
+    );
+
+    // 2c. Empty-prefix fallback resolving bare word `C1` against `""` namespace.
+    let empty_spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::manchester("C1 SubClassOf C1 and C1 and C1")],
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let res_empty = evaluate("x\n1\n", Delimiter::Comma, &empty_spec, &vocab, &tight).unwrap();
+    assert!(
+        res_empty.budget_exceeded,
+        "empty-prefix Manchester fallback must hit budget: {res_empty:?}"
+    );
+}
+
+#[test]
+fn diagnostic_strings_bound_capacity_and_structural_staging_count() {
+    let huge_header = "H".repeat(20_000);
+    // 1. ROBOT missing-ID path with a huge ID header bounds both len and capacity.
+    let csv = format!("{huge_header},Parent\nID,SC %\n,ex:Organ\n,ex:Organ\n");
+    let robot_spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let res = evaluate(
+        &csv,
+        Delimiter::Comma,
+        &robot_spec,
+        &ex_vocab(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(res.rows_with_errors, 2);
+    for d in &res.diagnostics {
+        if let Some(col) = &d.column {
+            assert!(col.len() <= MAX_DIAGNOSTIC_COLUMN_BYTES);
+            assert!(
+                col.capacity() <= MAX_DIAGNOSTIC_COLUMN_BYTES + 64,
+                "retained diagnostic column capacity too large: {}",
+                col.capacity()
+            );
+        }
+        assert!(d.message.capacity() <= Limits::default().max_diagnostic_message_bytes + 64);
+    }
+
+    // 2. Pattern mode with huge rule name and many unknown columns enforces max_diagnostics
+    //    and bounds staged structural diagnostic capacity.
+    let huge_rule_name = "R".repeat(20_000);
+    let mut rules = Vec::new();
+    for i in 0..10 {
+        let mut r = PatternRule::manchester(format!("${{missing_{i}}} SubClassOf ex:Organ"));
+        r.name = Some(huge_rule_name.clone());
+        rules.push(r);
+    }
+    let pat_spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules,
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let tight_diags = Limits {
+        max_diagnostics: 3,
+        max_diagnostic_message_bytes: 200,
+        ..Limits::default()
+    };
+    let res_pat = evaluate(
+        "a\n1\n",
+        Delimiter::Comma,
+        &pat_spec,
+        &ex_vocab(),
+        &tight_diags,
+    )
+    .unwrap();
+    assert!(res_pat.diagnostics_truncated);
+    assert_eq!(res_pat.diagnostics.len(), 3);
+    assert_eq!(res_pat.structural_error_count, 10);
+    for d in &res_pat.diagnostics {
+        if let Some(col) = &d.column {
+            assert!(col.len() <= MAX_DIAGNOSTIC_COLUMN_BYTES);
+            assert!(col.capacity() <= MAX_DIAGNOSTIC_COLUMN_BYTES + 64);
+        }
+        assert!(d.message.len() <= 200);
+        assert!(d.message.capacity() <= 264);
+    }
+}
+
+#[test]
+fn mutually_dependent_rows_recover_when_failed_row_introduced_ambiguity() {
+    // Row A declares Alpha and uses Beta; Row B declares Beta and uses Alpha;
+    // Row C also declares Beta and fails independently on an invalid annotation IRI.
+    // Under skip, removing C must let BOTH A and B recover cleanly together.
+    let csv = "\
+ID,Label,Parent,Source
+ID,LABEL,SC %,>AI dcterms:source
+ex:RowA,Alpha,'Beta',ex:RefA
+ex:RowB,Beta,'Alpha',ex:RefB
+ex:RowC,Beta,ex:Organ,unknownprefix:BadRef
+";
+    let robot_spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let res = evaluate(
+        csv,
+        Delimiter::Comma,
+        &robot_spec,
+        &ex_vocab(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        res.rows_with_errors, 1,
+        "only failing RowC should have errors; got {:?}",
+        res.diagnostics
+    );
+    assert!(!res.budget_exceeded);
+    let r = Renderer::new([("ex", "http://ex.org/")]);
+    let ofns: Vec<String> = res.axioms.iter().map(|g| r.axiom(&g.axiom)).collect();
+    assert!(
+        ofns.iter()
+            .any(|s| s.contains("SubClassOf") && s.contains("ex:RowA") && s.contains("ex:RowB")),
+        "RowA SubClassOf RowB should recover: {ofns:?}"
+    );
+    assert!(
+        ofns.iter()
+            .any(|s| s.contains("SubClassOf") && s.contains("ex:RowB") && s.contains("ex:RowA")),
+        "RowB SubClassOf RowA should recover: {ofns:?}"
+    );
+    assert!(
+        !ofns.iter().any(|s| s.contains("ex:RowC")),
+        "failing RowC must remain excluded: {ofns:?}"
+    );
+}
+
+#[test]
+fn bounded_renderers_stop_early_for_long_labels_and_prefixes() {
+    let mut vocab = Vocabulary::new([("ex", "http://ex.org/")]);
+    let big_label = "L".repeat(10_000);
+    vocab.add_entity(Entity::Class(Class::new("http://ex.org/A")));
+    vocab.add_label("http://ex.org/A", &big_label);
+    vocab.add_entity(Entity::Class(Class::new("http://ex.org/B")));
+
+    let ax = Axiom::sub_class_of(Class::new("http://ex.org/A"), Class::new("http://ex.org/B"));
+    let manch_r = crate::manchester::Renderer::of_vocabulary(&vocab);
+    assert!(
+        manch_r.axiom_bounded(&ax, 256).is_err(),
+        "Manchester bounded renderer must bail out when label exceeds limit"
+    );
+    assert_eq!(
+        manch_r.axiom_bounded(&ax, 20_000).unwrap(),
+        manch_r.axiom(&ax)
+    );
+
+    let ofn_r = Renderer::new([("ex", "http://ex.org/")]);
+    assert_eq!(ofn_r.axiom_bounded(&ax, 256), Some(ofn_r.axiom(&ax)));
+    assert_eq!(ofn_r.axiom_bounded(&ax, 8), None);
+    assert!(crate::json::axiom_fits_bytes(&ax, 512));
+    assert!(!crate::json::axiom_fits_bytes(&ax, 20));
+}

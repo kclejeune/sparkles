@@ -216,16 +216,17 @@ pub(crate) fn parse_table_with_options(
     let mut seen_headers = rustc_hash::FxHashSet::default();
     for h in &headers {
         if !h.is_empty() && !seen_headers.insert(h.as_str()) {
+            let col_snippet = super::bounded_col(h);
             push_diag(
                 diagnostics,
-                limits.max_diagnostics,
+                limits,
                 diagnostics_truncated,
                 RowDiagnostic {
                     row: header_line,
-                    column: Some(h.clone()),
+                    column: Some(col_snippet.clone()),
                     severity: Severity::Warning,
                     code: "duplicate-header".to_string(),
-                    message: format!("duplicate column header '{h}'"),
+                    message: format!("duplicate column header '{col_snippet}'"),
                 },
             );
         }
@@ -251,7 +252,7 @@ pub(crate) fn parse_table_with_options(
             let extra = cells.len() - col_count;
             push_diag(
                 diagnostics,
-                limits.max_diagnostics,
+                limits,
                 diagnostics_truncated,
                 RowDiagnostic {
                     row: line,
@@ -285,14 +286,15 @@ pub(crate) fn parse_table_with_options(
 
 fn push_diag(
     out: &mut Vec<RowDiagnostic>,
-    max: usize,
+    limits: &Limits,
     truncated: &mut bool,
     mut diag: RowDiagnostic,
 ) {
-    if let Some(col) = diag.column.as_mut() {
-        super::truncate_utf8(col, super::MAX_DIAGNOSTIC_COLUMN_BYTES);
-    }
-    if out.len() < max {
+    if out.len() < limits.max_diagnostics {
+        if let Some(col) = diag.column.as_mut() {
+            super::truncate_utf8(col, super::MAX_DIAGNOSTIC_COLUMN_BYTES);
+        }
+        super::truncate_utf8(&mut diag.message, limits.max_diagnostic_message_bytes);
         out.push(diag);
     } else {
         *truncated = true;
