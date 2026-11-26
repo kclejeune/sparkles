@@ -2468,39 +2468,71 @@ const QUAD_ALLOC_OVERHEAD: u64 = 64;
 /// (or 12 with `idempotencyKey`) fixed audit operation quads plus local `new_nonce` and
 /// `time` values (exact byte sum is under 1,000 bytes).
 const AUDIT_FIXED_STRINGS_BYTES: u64 = 1280;
-/// Conservative B-tree node bytes per entry in `BTreeMap<&NamedNode, Uuid>`.
-const RECEIPT_MAP_ENTRY_BYTES: u64 = 128;
-/// Conservative B-tree node bytes per entry in `BTreeSet<&NamedNode>`.
-const RECEIPT_SET_ENTRY_BYTES: u64 = 64;
+/// Per-allocation allocator header and size-class rounding margin for pre-sized index
+/// vectors.
+const INDEX_VEC_ALLOC_OVERHEAD: u64 = 64;
+
+type StaleReceiptEntry<'a> = (&'a NamedNode, usize, Uuid);
 
 struct QuadIndex<'a> {
-    ops_to_update: BTreeMap<&'a NamedNode, Uuid>,
-    informed_by: BTreeSet<&'a NamedNode>,
+    ops_to_update: Vec<StaleReceiptEntry<'a>>,
+    informed_by: Vec<&'a NamedNode>,
     renewed_count: usize,
     already_count: usize,
+}
+
+fn count_quad_index_entries(verified: &[VerifiedCandidate], current_nonce: Uuid) -> (usize, usize) {
+    let mut renewed = 0usize;
+    let mut stale_receipts = 0usize;
+    for item in verified {
+        if !item.already_authenticated {
+            renewed += 1;
+            if item.operation_nonce != current_nonce {
+                stale_receipts += 1;
+            }
+        }
+    }
+    (renewed, stale_receipts)
+}
+
+fn vec_index_bytes<T>(count: usize) -> u64 {
+    if count == 0 {
+        0
+    } else {
+        let raw = (count as u64).saturating_mul(std::mem::size_of::<T>() as u64);
+        // Add a 25% + 64-byte allocator header and size-class rounding margin so every
+        // non-empty pre-sized buffer (including n = 1) stays strictly within its charge.
+        raw.saturating_add(raw / 4)
+            .saturating_add(INDEX_VEC_ALLOC_OVERHEAD)
+    }
 }
 
 fn index_verified_receipts<'a>(
     verified: &'a [VerifiedCandidate],
     current_nonce: Uuid,
 ) -> QuadIndex<'a> {
-    let mut ops_to_update: BTreeMap<&'a NamedNode, Uuid> = BTreeMap::new();
-    let mut informed_by: BTreeSet<&'a NamedNode> = BTreeSet::new();
-    let mut renewed_count = 0usize;
+    let (renewed_count, stale_receipt_count) = count_quad_index_entries(verified, current_nonce);
+    let mut ops_to_update: Vec<StaleReceiptEntry<'a>> = Vec::with_capacity(stale_receipt_count);
+    let mut informed_by: Vec<&'a NamedNode> = Vec::with_capacity(renewed_count);
     let mut already_count = 0usize;
-    for item in verified {
+    for (idx, item) in verified.iter().enumerate() {
         if item.already_authenticated {
             already_count += 1;
         } else {
-            renewed_count += 1;
-            informed_by.insert(&item.receipt);
+            informed_by.push(&item.receipt);
             if item.operation_nonce != current_nonce {
-                ops_to_update
-                    .entry(&item.receipt)
-                    .or_insert(item.operation_nonce);
+                ops_to_update.push((&item.receipt, idx, item.operation_nonce));
             }
         }
     }
+    // `sort_unstable*` (in `core`) and `dedup*` operate strictly in place with zero heap
+    // allocation, so `capacity()` stays pinned to the pre-charged upper bounds.
+    informed_by.sort_unstable();
+    informed_by.dedup();
+    ops_to_update.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(&b.1)));
+    ops_to_update.dedup_by(|a, b| a.0 == b.0);
+    debug_assert_eq!(informed_by.capacity(), renewed_count);
+    debug_assert_eq!(ops_to_update.capacity(), stale_receipt_count);
     QuadIndex {
         ops_to_update,
         informed_by,
@@ -2510,16 +2542,10 @@ fn index_verified_receipts<'a>(
 }
 
 fn estimate_quad_index_bytes(verified: &[VerifiedCandidate], current_nonce: Uuid) -> u64 {
-    let mut total = 0u64;
-    for item in verified {
-        if !item.already_authenticated {
-            total = total.saturating_add(RECEIPT_SET_ENTRY_BYTES);
-            if item.operation_nonce != current_nonce {
-                total = total.saturating_add(RECEIPT_MAP_ENTRY_BYTES);
-            }
-        }
-    }
-    total
+    let (renewed_count, stale_receipt_count) = count_quad_index_entries(verified, current_nonce);
+    let informed_bytes = vec_index_bytes::<&NamedNode>(renewed_count);
+    let stale_bytes = vec_index_bytes::<StaleReceiptEntry<'_>>(stale_receipt_count);
+    informed_bytes.saturating_add(stale_bytes)
 }
 
 fn estimate_quad_output_bytes(
@@ -2585,7 +2611,7 @@ fn estimate_quad_output_bytes(
 
     // Distinct stale receipts: 2 quads each (nonce delete + nonce insert).
     let receipt_nonce_fixed_bytes = 39u64 + 36 + 39 + 36 + 2 * QUAD_ALLOC_OVERHEAD;
-    for op in index.ops_to_update.keys() {
+    for (op, _, _) in &index.ops_to_update {
         let r_len = op.as_str().len() as u64;
         total = total.saturating_add(
             r_len
@@ -2743,7 +2769,7 @@ fn emit_quads(
             gn.clone(),
         ));
     }
-    for (op, old_nonce) in index.ops_to_update {
+    for (op, _, old_nonce) in index.ops_to_update {
         deletes.push(Quad::new(
             op.clone(),
             ev("graphProtection"),
@@ -3184,6 +3210,207 @@ mod tests {
             "charged {} bytes < actual {} bytes",
             held.bytes(),
             actual_bytes
+        );
+    }
+
+    #[test]
+    fn build_quads_charged_index_reservation_covers_single_candidate_buffers() {
+        let graph = NamedNode::new_unchecked("urn:ev:claims");
+        let op_iri = NamedNode::new_unchecked(format!("urn:uuid:{}", Uuid::new_v4()));
+        let principal = NamedNode::new_unchecked("urn:x-sparkles:principal:admin");
+        let digest = Sha256Digest::of_bytes(b"payload", &Control::none()).unwrap();
+        let current_nonce = Uuid::new_v4();
+        let old_nonce = Uuid::new_v4();
+        let stamp = Stamp {
+            dataset: Uuid::new_v4(),
+            branch: Uuid::new_v4(),
+            commit: 7,
+            time_ms: 1_700_000_000_000,
+        };
+        let base_used = Preparation::new(Control::none(), 1 << 20)
+            .unwrap()
+            .inner_used();
+
+        // Case 1: n = 1 renewed candidate with 1 stale receipt.
+        let one_stale = vec![VerifiedCandidate {
+            iri: NamedNode::new_unchecked("urn:ev:claim:one-stale"),
+            kind: RecordKind::Claim,
+            digest,
+            receipt: NamedNode::new_unchecked(format!("urn:uuid:{}", Uuid::new_v4())),
+            record_nonce: old_nonce,
+            operation_nonce: old_nonce,
+            already_authenticated: false,
+        }];
+        let stale_index_bytes = estimate_quad_index_bytes(&one_stale, current_nonce);
+        let stale_index = index_verified_receipts(&one_stale, current_nonce);
+        assert_eq!(stale_index.informed_by.capacity(), 1);
+        assert_eq!(stale_index.ops_to_update.capacity(), 1);
+        assert_eq!(stale_index.informed_by.len(), 1);
+        assert_eq!(stale_index.ops_to_update.len(), 1);
+        let stale_backing = (stale_index.informed_by.capacity() * std::mem::size_of::<&NamedNode>()
+            + stale_index.ops_to_update.capacity() * std::mem::size_of::<StaleReceiptEntry<'_>>())
+            as u64;
+        assert!(
+            stale_index_bytes >= stale_backing + 2 * INDEX_VEC_ALLOC_OVERHEAD,
+            "index charge {stale_index_bytes} < backing {stale_backing} + overhead"
+        );
+        let stale_output_bytes =
+            estimate_quad_output_bytes(&op_iri, &principal, None, &graph, &one_stale, &stale_index);
+
+        // One byte shy of the index charge must refuse before allocating either index buffer.
+        let prep_short_index =
+            Preparation::new(Control::none(), base_used + stale_index_bytes - 1).unwrap();
+        let err = match build_quads_charged(
+            &prep_short_index,
+            "graph",
+            &op_iri,
+            &principal,
+            digest,
+            None,
+            &graph,
+            current_nonce,
+            &stamp,
+            &one_stale,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected incomplete-evidence when short of index reservation"),
+        };
+        assert!(
+            matches!(
+                err,
+                Error::Managed(ref m) if m.kind == ManagedErrorKind::IncompleteEvidence
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(prep_short_index.inner_used(), base_used);
+
+        // Exact combined budget admits both index and output reservations cleanly.
+        let prep_exact = Preparation::new(
+            Control::none(),
+            base_used + stale_index_bytes + stale_output_bytes,
+        )
+        .unwrap();
+        let (deletes, inserts, held) = build_quads_charged(
+            &prep_exact,
+            "graph",
+            &op_iri,
+            &principal,
+            digest,
+            None,
+            &graph,
+            current_nonce,
+            &stamp,
+            &one_stale,
+        )
+        .unwrap();
+        assert_eq!(held.bytes(), stale_index_bytes + stale_output_bytes);
+        assert_eq!(deletes.len(), deletes.capacity());
+        assert_eq!(inserts.len(), inserts.capacity());
+
+        // Case 2: n = 1 renewed candidate whose receipt nonce is already current.
+        let one_current_receipt = vec![VerifiedCandidate {
+            iri: NamedNode::new_unchecked("urn:ev:claim:one-current-receipt"),
+            kind: RecordKind::Claim,
+            digest,
+            receipt: NamedNode::new_unchecked(format!("urn:uuid:{}", Uuid::new_v4())),
+            record_nonce: old_nonce,
+            operation_nonce: current_nonce,
+            already_authenticated: false,
+        }];
+        let cur_index_bytes = estimate_quad_index_bytes(&one_current_receipt, current_nonce);
+        let cur_index = index_verified_receipts(&one_current_receipt, current_nonce);
+        assert_eq!(cur_index.informed_by.capacity(), 1);
+        assert_eq!(cur_index.ops_to_update.capacity(), 0);
+        assert!(
+            cur_index_bytes
+                >= (std::mem::size_of::<&NamedNode>() as u64) + INDEX_VEC_ALLOC_OVERHEAD
+        );
+        let prep_short_cur =
+            Preparation::new(Control::none(), base_used + cur_index_bytes - 1).unwrap();
+        let err = match build_quads_charged(
+            &prep_short_cur,
+            "graph",
+            &op_iri,
+            &principal,
+            digest,
+            None,
+            &graph,
+            current_nonce,
+            &stamp,
+            &one_current_receipt,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected incomplete-evidence for single informed-receipt buffer"),
+        };
+        assert!(
+            matches!(
+                err,
+                Error::Managed(ref m) if m.kind == ManagedErrorKind::IncompleteEvidence
+            ),
+            "got {err:?}"
+        );
+
+        // Case 3: n = 1 already-authenticated candidate allocates zero index buffers.
+        let one_already = vec![VerifiedCandidate {
+            iri: NamedNode::new_unchecked("urn:ev:claim:already"),
+            kind: RecordKind::Claim,
+            digest,
+            receipt: NamedNode::new_unchecked(format!("urn:uuid:{}", Uuid::new_v4())),
+            record_nonce: current_nonce,
+            operation_nonce: current_nonce,
+            already_authenticated: true,
+        }];
+        assert_eq!(estimate_quad_index_bytes(&one_already, current_nonce), 0);
+        let already_index = index_verified_receipts(&one_already, current_nonce);
+        assert_eq!(already_index.informed_by.capacity(), 0);
+        assert_eq!(already_index.ops_to_update.capacity(), 0);
+
+        // Case 4: Unsorted duplicate receipts sort ascending and keep first-seen nonces
+        // in place without growing capacity.
+        let r_a = NamedNode::new_unchecked("urn:receipt:a");
+        let r_b = NamedNode::new_unchecked("urn:receipt:b");
+        let first_b_nonce = Uuid::new_v4();
+        let second_b_nonce = Uuid::new_v4();
+        let multi = vec![
+            VerifiedCandidate {
+                iri: NamedNode::new_unchecked("urn:ev:claim:m1"),
+                kind: RecordKind::Claim,
+                digest,
+                receipt: r_b.clone(),
+                record_nonce: first_b_nonce,
+                operation_nonce: first_b_nonce,
+                already_authenticated: false,
+            },
+            VerifiedCandidate {
+                iri: NamedNode::new_unchecked("urn:ev:claim:m2"),
+                kind: RecordKind::Claim,
+                digest,
+                receipt: r_a.clone(),
+                record_nonce: old_nonce,
+                operation_nonce: old_nonce,
+                already_authenticated: false,
+            },
+            VerifiedCandidate {
+                iri: NamedNode::new_unchecked("urn:ev:claim:m3"),
+                kind: RecordKind::Claim,
+                digest,
+                receipt: r_b.clone(),
+                record_nonce: second_b_nonce,
+                operation_nonce: second_b_nonce,
+                already_authenticated: false,
+            },
+        ];
+        let multi_index = index_verified_receipts(&multi, current_nonce);
+        assert_eq!(multi_index.informed_by.capacity(), 3);
+        assert_eq!(multi_index.ops_to_update.capacity(), 3);
+        assert_eq!(multi_index.informed_by, vec![&r_a, &r_b]);
+        assert_eq!(
+            multi_index
+                .ops_to_update
+                .iter()
+                .map(|(op, _, nonce)| (*op, *nonce))
+                .collect::<Vec<_>>(),
+            vec![(&r_a, old_nonce), (&r_b, first_b_nonce)]
         );
     }
 }
