@@ -1846,10 +1846,15 @@ struct StagedPrefixesFileV1 {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StagedPrefixesFile {
+struct StagedPrefixesFileV2 {
     format_version: u32,
     commit_seq: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_seq: u64,
+    prefixes: BTreeMap<String, String>,
+}
+
+struct StagedPrefixesRecord {
+    commit_seq: u64,
     control_seq: Option<u64>,
     prefixes: BTreeMap<String, String>,
 }
@@ -5169,10 +5174,10 @@ impl Store {
                 // so older binaries encounter the compatibility fence before WAL repair or
                 // catalog open.
                 commit::require_reader(root, STAGED_PREFIXES_V2_READER)?;
-                let staged = StagedPrefixesFile {
+                let staged = StagedPrefixesFileV2 {
                     format_version: STAGED_PREFIXES_FORMAT_VERSION,
                     commit_seq,
-                    control_seq: Some(cseq),
+                    control_seq: cseq,
                     prefixes: next.clone(),
                 };
                 serde_json::to_vec_pretty(&staged).unwrap()
@@ -5368,6 +5373,9 @@ impl Store {
     }
 
     fn save_prefixes(&self, p: &BTreeMap<String, String>) -> Result<()> {
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
         if let Some(root) = &self.root {
             write_atomic(
                 &root.join("prefixes.json"),
@@ -8566,7 +8574,7 @@ fn guard_required_by(root: &Path) -> bool {
 ///
 /// Called early during [`Store::open_inner`] so an unknown `format_version` or corrupt
 /// sidecar refuses cleanly before WAL tail truncation or catalog changes occur.
-fn parse_staged_prefixes_file(root: &Path) -> Result<Option<StagedPrefixesFile>> {
+fn parse_staged_prefixes_file(root: &Path) -> Result<Option<StagedPrefixesRecord>> {
     let staged_path = root.join(STAGED_PREFIXES_FILE);
     let bytes = match std::fs::read(&staged_path) {
         Ok(b) => b,
@@ -8597,21 +8605,24 @@ fn parse_staged_prefixes_file(root: &Path) -> Result<Option<StagedPrefixesFile>>
                     staged_path.display()
                 ))
             })?;
-            Ok(Some(StagedPrefixesFile {
-                format_version: v1.format_version,
+            Ok(Some(StagedPrefixesRecord {
                 commit_seq: v1.commit_seq,
                 control_seq: None,
                 prefixes: v1.prefixes,
             }))
         }
         STAGED_PREFIXES_FORMAT_VERSION => {
-            let staged: StagedPrefixesFile = serde_json::from_value(raw).map_err(|e| {
+            let v2: StagedPrefixesFileV2 = serde_json::from_value(raw).map_err(|e| {
                 Error::Corrupt(format!(
                     "{}: invalid v2 staged prefixes payload: {e}",
                     staged_path.display()
                 ))
             })?;
-            Ok(Some(staged))
+            Ok(Some(StagedPrefixesRecord {
+                commit_seq: v2.commit_seq,
+                control_seq: Some(v2.control_seq),
+                prefixes: v2.prefixes,
+            }))
         }
         _ => Err(Error::Unsupported(format!(
             "{}: unsupported staged prefixes format_version {found}; supported versions are {STAGED_PREFIXES_FORMAT_VERSION_V1} and {STAGED_PREFIXES_FORMAT_VERSION}",
@@ -12432,6 +12443,40 @@ mod ordinary_sync_tests {
             Err(Error::Corrupt(_))
         ));
 
+        // A v2 sidecar missing `control_seq` or carrying `"control_seq": null` must be
+        // rejected as corrupt during preflight BEFORE WAL repair and must never replay
+        // an uncommitted prefix map as a quad commit.
+        let wal_path = dir.path().join("wal.log");
+        let orig_wal = std::fs::read(&wal_path).unwrap_or_default();
+        let mut torn_wal = orig_wal.clone();
+        torn_wal.extend_from_slice(b"torn-tail-bytes");
+        std::fs::write(&wal_path, &torn_wal).unwrap();
+        let orig_prefixes = std::fs::read(dir.path().join("prefixes.json")).unwrap();
+        for bad_v2 in [
+            br#"{"format_version":2,"commit_seq":0,"prefixes":{"uncommitted":"http://example.org/u/"}}"#.as_slice(),
+            br#"{"format_version":2,"commit_seq":0,"control_seq":null,"prefixes":{"uncommitted":"http://example.org/u/"}}"#.as_slice(),
+        ] {
+            std::fs::write(dir.path().join(STAGED_PREFIXES_FILE), bad_v2).unwrap();
+            assert!(
+                matches!(
+                    Store::open(dir.path(), Default::default()),
+                    Err(Error::Corrupt(_))
+                ),
+                "v2 sidecar without integer control_seq must be rejected as corrupt"
+            );
+            assert_eq!(
+                std::fs::read(&wal_path).unwrap(),
+                torn_wal,
+                "corrupt v2 sidecar must fail preflight before WAL repair"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("prefixes.json")).unwrap(),
+                orig_prefixes,
+                "corrupt v2 sidecar must never replace prefixes.json"
+            );
+        }
+        std::fs::write(&wal_path, &orig_wal).unwrap();
+
         // A valid v1 sidecar (without `control_seq`) remains readable and reconciles cleanly.
         std::fs::write(
             dir.path().join(STAGED_PREFIXES_FILE),
@@ -12444,6 +12489,44 @@ mod ordinary_sync_tests {
             Some("http://example.org/v1p/")
         );
         assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+    }
+
+    #[test]
+    fn fold_prefixes_refuses_when_prefixes_poisoned_after_caught_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        store.enable_control().unwrap();
+
+        store.set_failpoint(
+            "prefixes-before-install",
+            Some(Arc::new(|_| {
+                panic!("simulated panic during prefix install")
+            })),
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/panic", Arc::from(&b"ok"[..]))
+                .unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "p1".into(),
+                "http://example.org/p1/".into(),
+            )]));
+            let _ = tx.commit();
+        }));
+        assert!(panicked.is_err());
+
+        let patch = b"TX .\nPA \"late\" <http://example.org/late/> .\nTC .\n";
+        let res = store.apply_patch(patch.as_slice(), &Default::default());
+        assert!(
+            matches!(res, Err(Error::Poisoned)),
+            "expected Err(Error::Poisoned) from apply_patch after prefixes_poisoned, got {res:?}"
+        );
+        assert!(
+            !store.prefixes().contains_key("late"),
+            "apply_patch / fold_prefixes must not mutate prefixes after prefixes_poisoned is set"
+        );
     }
 
     #[test]
