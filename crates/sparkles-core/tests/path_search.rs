@@ -2803,3 +2803,206 @@ fn weighted_bounded_variable_source_wide_weight_unique_routes_visit_budget() {
         assert_eq!(row_far["l"], chain_len.to_string());
     }
 }
+
+/// Regression for Sol r4 P2: self-loops, 2-cycle backtracks, and suffixes longer than an
+/// upstream source's remaining length budget must not falsely mark unique simple routes in
+/// `direct_multi` or send them through forward search, while genuine competing routes
+/// (including a 2-cycle whose child has an alternative exit) still rank in source order.
+#[test]
+fn weighted_bounded_variable_source_self_loop_and_remaining_budget() {
+    // 1. Self-loop `a -> a` added to the two-source fixture (`a -> t` weight 1, `b -> t`
+    //    weight 1e12), maxLength 2, maxVisited 3: both unlimited and limited queries must
+    //    stay within `maxVisited 3` without entering forward search.
+    let self_loop = store_of(
+        "ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:a ex:p ex:a {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .",
+    );
+    for (lim, expected_count) in [
+        ("", 2usize),
+        (" ; path:limit 1", 1),
+        (" ; path:limit 10", 2),
+    ] {
+        let r = rows(
+            &self_loop,
+            &format!(
+                "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+                 path:maxLength 2 ; path:maxVisited 3{lim} ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        );
+        assert_eq!(
+            r.len(),
+            expected_count,
+            "self-loop two-edge visit budget ({lim}): {r:?}"
+        );
+        if expected_count == 1 {
+            assert_eq!(r[0]["src"], "a");
+            assert_eq!(r[0]["c"].parse::<f64>().unwrap(), 1.0);
+        }
+    }
+
+    // 2. Sol r4 P2 base-regression case: three leaves `u1..u3 -> a` plus `a -> a`, `a -> t`
+    //    (weight 1), `b -> t` (weight 1e12), maxLength 2, maxVisited 6, limit 1.
+    let self_loop_leaves = store_of(
+        "ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:a ex:p ex:a {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} . \
+         ex:u1 ex:p ex:a {| ex:w 1.0e0 |} . \
+         ex:u2 ex:p ex:a {| ex:w 1.0e0 |} . \
+         ex:u3 ex:p ex:a {| ex:w 1.0e0 |} .",
+    );
+    for (lim, expected_count) in [("", 5usize), (" ; path:limit 1", 1)] {
+        let r = rows(
+            &self_loop_leaves,
+            &format!(
+                "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+                 path:maxLength 2 ; path:maxVisited 6{lim} ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        );
+        assert_eq!(
+            r.len(),
+            expected_count,
+            "self-loop three-leaf visit budget ({lim}): {r:?}"
+        );
+    }
+
+    // 3. Self-loop at `c1 -> c1` on a 500-edge chain ending in `c1 -> t` at 1e12 must still
+    //    stay within `maxVisited 501`.
+    let chain_len = 500usize;
+    let mut chain_ttl = String::from(
+        "ex:c1 ex:p ex:t {| ex:w 1.0e12 |} .\n\
+         ex:c1 ex:p ex:c1 {| ex:w 1.0e0 |} .\n",
+    );
+    for i in 2..=chain_len {
+        chain_ttl += &format!("ex:c{i} ex:p ex:c{} {{| ex:w 1.0e0 |}} .\n", i - 1);
+    }
+    let chain_store = store_of(&chain_ttl);
+    for lim in ["", " ; path:limit 600"] {
+        let r = rows(
+            &chain_store,
+            &format!(
+                "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+                 path:maxLength {chain_len} ; path:maxVisited {} {lim} ; \
+                 path:cost ?c ; path:length ?l }} }}",
+                chain_len + 1
+            ),
+        );
+        assert_eq!(r.len(), chain_len, "self-loop chain visit budget ({lim})");
+    }
+
+    // 4. Pure 2-cycle `a <-> c` on `a -> t` (weight 1) and `b -> t` (weight 1e12) with
+    //    maxLength 3, maxVisited 4: `a -> c -> a -> t` is not simple, so all three sources
+    //    have unique simple routes and stay within `maxVisited 4`.
+    let two_cycle = store_of(
+        "ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} . \
+         ex:c ex:p ex:a {| ex:w 1.0e0 |} . \
+         ex:a ex:p ex:c {| ex:w 1.0e0 |} .",
+    );
+    for (lim, expected_count) in [("", 3usize), (" ; path:limit 1", 1)] {
+        let r = rows(
+            &two_cycle,
+            &format!(
+                "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+                 path:maxLength 3 ; path:maxVisited 4{lim} ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        );
+        assert_eq!(
+            r.len(),
+            expected_count,
+            "pure 2-cycle visit budget ({lim}): {r:?}"
+        );
+    }
+
+    // 5. Remaining-length budget: in the wide-weight diamond `s -> pnode -> v -> {t, x1 -> x2 -> t}`
+    //    with `maxLength 5`, `v`, `pnode`, and `s` can reach the 3-edge suffix within 5 edges
+    //    and must still rank in source order (`s` takes length 5). Upstream leaves `u1..u20 -> s`
+    //    have only 2 edges of budget left at `v` (`5 - 3 = 2 < 3`), so they have a unique
+    //    simple route `u_i -> s -> pnode -> v -> t` (length 4) and must reconstruct directly
+    //    without spending forward-search visits.
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let mut rem_ttl = format!(
+        "ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p2 ex:t {{| ex:w {} |}} .\n\
+         ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} .\n\
+         ex:x2 ex:p ex:t {{| ex:w {} |}} .\n",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    let leaf_count = 20usize;
+    for i in 1..=leaf_count {
+        rem_ttl += &format!("ex:u{i} ex:p ex:s {{| ex:w 1.0e0 |}} .\n");
+    }
+    let rem_store = store_of(&rem_ttl);
+    // Reverse visits: t, v, x2, x1, pnode, s, plus 20 u_i = 26 visits (plus at most 3 more
+    // settled labels on the diamond). Forward searches only for v, pnode, s take ~15 visits
+    // total; if the 20 upstream leaves also ran forward searches they would add >= 100 visits.
+    for lim in ["", " ; path:limit 50"] {
+        let r = rows(
+            &rem_store,
+            &format!(
+                "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+                 path:maxLength 5 ; path:maxVisited 55{lim} ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        );
+        assert_eq!(r.len(), 5 + leaf_count, "remaining-budget sources ({lim})");
+        let row_s = r.iter().find(|row| row["src"] == "s").unwrap();
+        assert_eq!(
+            row_s["l"], "5",
+            "remaining-budget ({lim}): ex:s must still take 5-edge source-order route"
+        );
+        let row_u1 = r.iter().find(|row| row["src"] == "u1").unwrap();
+        assert_eq!(
+            row_u1["l"], "4",
+            "remaining-budget ({lim}): ex:u1 must take unique 4-edge route"
+        );
+    }
+
+    // 6. Soundness of 2-cycle backtrack propagation: `v -> x1` is a reverse backtrack of
+    //    `x1 -> v -> t` (when `x1 -> v -> t` is cheaper than `x1 -> x2 -> t`), yet `x1` has
+    //    the alternative exit `x1 -> x2 -> t`, so `v -> x1 -> x2 -> t` IS a valid simple path
+    //    and `s -> pnode -> v` must still re-solve in source order and select the 5-edge path.
+    let backtrack_exit_ttl = format!(
+        "ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p2 ex:t {{| ex:w {} |}} .\n\
+         ex:x1 ex:p2 ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} .\n\
+         ex:x2 ex:p ex:t {{| ex:w {} |}} .\n",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(0.0),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    let backtrack_exit_store = store_of(&backtrack_exit_ttl);
+    for lim in ["", " ; path:limit 20"] {
+        let r = rows(
+            &backtrack_exit_store,
+            &format!(
+                "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+                 path:maxLength 5{lim} ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        );
+        let row_s = r.iter().find(|row| row["src"] == "s").unwrap();
+        assert_eq!(
+            row_s["l"], "5",
+            "backtrack-with-exit ({lim}): ex:s must still re-solve to 5-edge route"
+        );
+        assert_eq!(row_s["c"].parse::<f64>().unwrap(), 1.0);
+    }
+}

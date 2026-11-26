@@ -1344,16 +1344,16 @@ impl PrefixCost {
 /// Outcome of a one-ended length-bounded weighted search: either a Pareto-pruned parent
 /// tree or, for a reverse search where wide weights or overflow occurred alongside at least
 /// one multi-route node, the reverse tree together with exact minimum backward edge
-/// distances (`bwd_dist`) and the nodes reached by multiple reverse relaxations
-/// (`direct_multi`) so unique-route sources still reconstruct directly while multi-route
-/// sources (and sources whose reverse tree path passes through one) re-solve in source order.
+/// distances (`bwd_dist`) and the shortest length at which each multi-route node has a
+/// second non-backtracking route (`direct_multi`) so unique-route sources still reconstruct
+/// directly while sources with a competing route within `max_len` re-solve in source order.
 enum BoundedTreeOutcome {
     Tree(ChargedBoundedTree),
     ReverseWide {
         order: Vec<(u64, u32)>,
         parent: HbMap<(u64, u32), Parent>,
         bwd_dist: HbMap<u64, u32>,
-        direct_multi: HbSet<u64>,
+        direct_multi: HbMap<u64, u32>,
     },
 }
 
@@ -1368,30 +1368,148 @@ fn bounded_weights_too_wide(max_len: u32, wmin: f64, wmax: f64) -> bool {
     ratio > WIDE_WEIGHTS || (max_len as f64) * ratio > ((1u64 << 51) as f64)
 }
 
+/// Record a non-self-loop reverse relaxation reaching `y` at length `nl` from `(u, l)`.
+/// Direct 1-hop backtracks to `(u, l)`'s own reverse parent `y` cannot extend into a
+/// simple path unless `u` itself has another route to the target; defer them in
+/// `backtrack_parent` (at most one entry per settled node `u`) and propagate after the
+/// reverse search only if `u` becomes multi-route.
+#[allow(clippy::too_many_arguments)]
+fn record_reverse_multi_relax<C: ByteCharge>(
+    u: u64,
+    l: u32,
+    y: u64,
+    nl: u32,
+    parent: &HbMap<(u64, u32), Parent>,
+    dist: &HbMap<u64, Vec<(u32, Cost)>>,
+    virt_first_len: &mut Option<u32>,
+    direct_multi: &mut HbMap<u64, u32>,
+    backtrack_parent: &mut HbMap<u64, u64>,
+    charge: &mut C,
+    base: u64,
+) -> Result<u64> {
+    debug_assert_ne!(y, u);
+    if l > 0 && parent.get(&(u, l)).is_some_and(|p| p.node == y) {
+        match backtrack_parent.get(&u).copied() {
+            Some(prev_y) if prev_y == y => return Ok(base),
+            None => {
+                let (_, next_base) = insert_hb_map(backtrack_parent, u, y, charge, base)?;
+                return Ok(next_base);
+            }
+            Some(_) => {
+                // `u` was settled at two different lengths with distinct parents, so `u`
+                // already has multiple routes; fall through to record `y` conservatively.
+            }
+        }
+    }
+    let first_len = if y == VIRT {
+        match *virt_first_len {
+            None => {
+                *virt_first_len = Some(nl);
+                return Ok(base);
+            }
+            Some(fl) => {
+                if nl < fl {
+                    *virt_first_len = Some(nl);
+                }
+                fl
+            }
+        }
+    } else {
+        let Some(fl) = dist.get(&y).and_then(|v| v.first()).map(|&(fl, _)| fl) else {
+            return Ok(base);
+        };
+        fl
+    };
+    let alt_len = first_len.max(nl);
+    if direct_multi.get(&y).is_some_and(|&prev| prev <= alt_len) {
+        return Ok(base);
+    }
+    let (_, next_base) = insert_hb_map(direct_multi, y, alt_len, charge, base)?;
+    Ok(next_base)
+}
+
+/// Propagate `direct_multi` across deferred 1-hop backtrack edges (`u -> parent(u)`) when
+/// `u` gained an alternative route to the target. Because `backtrack_parent` has out-degree
+/// at most one and `next_alt` strictly increases up to `max_len`, each seed walk terminates
+/// in at most `max_len` steps.
+#[allow(clippy::too_many_arguments)]
+fn propagate_reverse_backtracks<C: ByteCharge>(
+    ctx: &Ctx,
+    max_len: u32,
+    best_len: &HbMap<u64, u32>,
+    backtrack_parent: &HbMap<u64, u64>,
+    direct_multi: &mut HbMap<u64, u32>,
+    charge: &mut C,
+    base: u64,
+) -> Result<u64> {
+    if direct_multi.is_empty() || backtrack_parent.is_empty() {
+        return Ok(base);
+    }
+    let seeds_bytes = vec_bytes::<(u64, u32)>(direct_multi.len());
+    charge.resize(base.saturating_add(seeds_bytes))?;
+    let mut seeds = Vec::with_capacity(direct_multi.len());
+    seeds.extend(direct_multi.iter().map(|(&k, &v)| (k, v)));
+    let actual_seeds_bytes = vec_bytes::<(u64, u32)>(seeds.capacity());
+    let mut cur_base = base.saturating_add(actual_seeds_bytes);
+    charge.resize(cur_base)?;
+    for (mut cur, mut alt) in seeds {
+        let mut steps = 0usize;
+        while let Some(&y) = backtrack_parent.get(&cur) {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            let next_alt = alt
+                .saturating_add(1)
+                .max(best_len.get(&y).copied().unwrap_or(0));
+            if next_alt > max_len {
+                break;
+            }
+            if direct_multi.get(&y).is_some_and(|&prev| prev <= next_alt) {
+                break;
+            }
+            (_, cur_base) = insert_hb_map(direct_multi, y, next_alt, charge, cur_base)?;
+            cur = y;
+            alt = next_alt;
+        }
+    }
+    let final_base = cur_base.saturating_sub(actual_seeds_bytes);
+    charge.resize(final_base)?;
+    Ok(final_base)
+}
+
 /// Whether any node along the reverse parent chain from `(m, len)` back to `(root, 0)`
-/// (excluding `root`) was reached by more than one reverse relaxation. When this returns
-/// `false`, `m` has a unique route of length `<= max_len` to `root` and needs no
-/// source-order re-ranking.
+/// (excluding `root`) has an alternative route to `root` short enough to fit within the
+/// remaining edge budget `max_len - prefix` from `m`. When this returns `false`, `m` has a
+/// unique simple route of length `<= max_len` to `root` and needs no source-order
+/// re-ranking.
 fn bounded_chain_has_multi(
     ctx: &Ctx,
     parent: &HbMap<(u64, u32), Parent>,
-    direct_multi: &HbSet<u64>,
+    direct_multi: &HbMap<u64, u32>,
     m: u64,
     len: u32,
+    max_len: u32,
 ) -> Result<bool> {
     let mut cur = m;
     let mut l = len;
+    let mut prefix = 0u32;
     let mut steps = 0usize;
     while l > 0 {
         steps += 1;
         if steps.is_multiple_of(4096) {
             ctx.check()?;
         }
-        if direct_multi.contains(&cur) {
+        let rem_budget = max_len.saturating_sub(prefix);
+        if direct_multi
+            .get(&cur)
+            .is_some_and(|&alt_len| alt_len <= rem_budget)
+        {
             return Ok(true);
         }
         cur = parent[&(cur, l)].node;
         l -= 1;
+        prefix += 1;
     }
     Ok(false)
 }
@@ -3177,25 +3295,30 @@ impl<'a> Engine<'a> {
         let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
         let mut order: Vec<(u64, u32)> = Vec::new();
         let mut heap: BoundedHeap = BinaryHeap::new();
-        let mut direct_multi: HbSet<u64> = HbSet::default();
+        let mut direct_multi: HbMap<u64, u32> = HbMap::default();
+        let mut backtrack_parent: HbMap<u64, u64> = HbMap::default();
+        let mut virt_first_len: Option<u32> = None;
         let mut best_virt: Option<(Cost, u32)> = None;
         let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
         let mut wide = false;
         let track_reverse_wide = !forward && max_len > 1;
+        #[allow(clippy::too_many_arguments)]
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
                            parent: &HbMap<(u64, u32), Parent>,
                            order: &Vec<(u64, u32)>,
                            heap: &BoundedHeap,
-                           direct_multi: &HbSet<u64>| {
+                           direct_multi: &HbMap<u64, u32>,
+                           backtrack_parent: &HbMap<u64, u64>| {
             map_bytes(best_len)
                 .saturating_add(map_bytes(dist))
                 .saturating_add(dist_vec_bytes)
                 .saturating_add(map_bytes(parent))
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
-                .saturating_add(set_bytes(direct_multi))
+                .saturating_add(map_bytes(direct_multi))
+                .saturating_add(map_bytes(backtrack_parent))
         };
         let mut base = 0u64;
         (_, base) = pareto_insert_charged(
@@ -3225,6 +3348,7 @@ impl<'a> Engine<'a> {
                 &order,
                 &heap,
                 &direct_multi,
+                &backtrack_parent,
             );
             let (prev, next_base) = insert_hb_map(&mut best_len, u, l, &mut work, cur_base)?;
             if prev.is_none() && u != root {
@@ -3242,6 +3366,7 @@ impl<'a> Engine<'a> {
                 &order,
                 &heap,
                 &direct_multi,
+                &backtrack_parent,
             );
             let mut out_steps = Vec::new();
             self.expand_one_charged(u, forward, &mut out_steps, &mut work, loc)?;
@@ -3254,25 +3379,34 @@ impl<'a> Engine<'a> {
                     self.ctx.check()?;
                 }
                 let y = if st.node == root { VIRT } else { st.node };
+                if y == u {
+                    continue;
+                }
                 if track_reverse_wide {
-                    let already_seen = if y == VIRT {
-                        best_virt.is_some()
-                    } else {
-                        dist.contains_key(&y)
-                    };
-                    if already_seen && !direct_multi.contains(&y) {
-                        let cur_base = local_bytes(
-                            &best_len,
-                            &dist,
-                            dist_vec_bytes,
-                            &parent,
-                            &order,
-                            &heap,
-                            &direct_multi,
-                        )
-                        .saturating_add(out_bytes);
-                        let _ = insert_hb_set(&mut direct_multi, y, &mut work, cur_base)?;
-                    }
+                    let cur_base = local_bytes(
+                        &best_len,
+                        &dist,
+                        dist_vec_bytes,
+                        &parent,
+                        &order,
+                        &heap,
+                        &direct_multi,
+                        &backtrack_parent,
+                    )
+                    .saturating_add(out_bytes);
+                    let _ = record_reverse_multi_relax(
+                        u,
+                        l,
+                        y,
+                        nl,
+                        &parent,
+                        &dist,
+                        &mut virt_first_len,
+                        &mut direct_multi,
+                        &mut backtrack_parent,
+                        &mut work,
+                        cur_base,
+                    )?;
                 }
                 if best_len.get(&y).is_some_and(|&bl| y == VIRT || nl >= bl) {
                     continue;
@@ -3312,6 +3446,7 @@ impl<'a> Engine<'a> {
                     &order,
                     &heap,
                     &direct_multi,
+                    &backtrack_parent,
                 )
                 .saturating_add(out_bytes);
                 if y == VIRT {
@@ -3356,16 +3491,32 @@ impl<'a> Engine<'a> {
                 &order,
                 &heap,
                 &direct_multi,
+                &backtrack_parent,
             ))?;
         }
         drop(dist);
         drop(heap);
         if wide && !direct_multi.is_empty() {
+            let prop_base = map_bytes(&parent)
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                .saturating_add(map_bytes(&best_len))
+                .saturating_add(map_bytes(&direct_multi))
+                .saturating_add(map_bytes(&backtrack_parent));
+            let _ = propagate_reverse_backtracks(
+                self.ctx,
+                max_len,
+                &best_len,
+                &backtrack_parent,
+                &mut direct_multi,
+                &mut work,
+                prop_base,
+            )?;
+            drop(backtrack_parent);
             work.resize(
                 map_bytes(&parent)
                     .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                     .saturating_add(map_bytes(&best_len))
-                    .saturating_add(set_bytes(&direct_multi)),
+                    .saturating_add(map_bytes(&direct_multi)),
             )?;
             return Ok((
                 BoundedTreeOutcome::ReverseWide {
@@ -3379,6 +3530,7 @@ impl<'a> Engine<'a> {
         }
         drop(best_len);
         drop(direct_multi);
+        drop(backtrack_parent);
         work.resize(map_bytes(&parent).saturating_add(vec_bytes::<(u64, u32)>(order.capacity())))?;
         Ok((BoundedTreeOutcome::Tree((order, parent)), work))
     }
@@ -4327,7 +4479,8 @@ pub fn run(
                    end: u64,
                    edges: Vec<Edge>,
                    len: Option<usize>,
-                   fwd: bool|
+                   fwd: bool,
+                   mut edge_charge: Option<Charge<'_>>|
      -> Result<bool> {
         if !eng.take() {
             return Ok(false);
@@ -4336,7 +4489,13 @@ pub fn run(
         let i = found.len() as u32;
         let len = len.unwrap_or(edges.len());
         let edges = if need_edges { edges } else { Vec::new() };
-        eng.charge.add(edges.len() as u64 * 32 + 64)?;
+        let need = (edges.len() as u64).saturating_mul(32).saturating_add(64);
+        if let Some(ref ec) = edge_charge {
+            ec.resize(need)?;
+            eng.charge.adopt_charge(&mut edge_charge)?;
+        } else {
+            eng.charge.add(need)?;
+        }
         found.push(Found {
             start,
             end,
@@ -4376,7 +4535,7 @@ pub fn run(
                 let max = spec.max_len.unwrap();
                 if targets.any {
                     eng.begin();
-                    if spec.min_len == 0 && !add(&mut found, s, s, Vec::new(), None, true)? {
+                    if spec.min_len == 0 && !add(&mut found, s, s, Vec::new(), None, true, None)? {
                         break 'sources;
                     }
                     if eng.full() {
@@ -4387,8 +4546,6 @@ pub fn run(
                         unreachable!("forward bounded Dijkstra never takes reverse wide fallback");
                     };
                     let _tree_charge = tree_charge;
-                    let tree_bytes = map_bytes(&parent)
-                        .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()));
                     for (m, l) in order {
                         if eng.full() {
                             break 'sources;
@@ -4397,12 +4554,10 @@ pub fn run(
                             continue;
                         }
                         let end = if m == VIRT { s } else { m };
-                        _tree_charge
-                            .resize(tree_bytes.saturating_add(vec_bytes::<Edge>(l as usize)))?;
+                        let edge_charge = eng.charge.part();
+                        edge_charge.resize(vec_bytes::<Edge>(l as usize))?;
                         let p = reconstruct_bounded(eng.ctx, s, true, &parent, m, l)?;
-                        let added = add(&mut found, s, end, p, None, true)?;
-                        _tree_charge.resize(tree_bytes)?;
-                        if !added {
+                        if !add(&mut found, s, end, p, None, true, Some(edge_charge))? {
                             break 'sources;
                         }
                     }
@@ -4413,7 +4568,7 @@ pub fn run(
                         }
                         eng.begin();
                         if spec.min_len == 0 && s == t {
-                            if !add(&mut found, s, t, Vec::new(), None, true)? {
+                            if !add(&mut found, s, t, Vec::new(), None, true, None)? {
                                 break 'sources;
                             }
                             continue;
@@ -4432,9 +4587,7 @@ pub fn run(
                             for e in &mut p {
                                 *e = e.map(real);
                             }
-                            let added = add(&mut found, s, t, p, None, true)?;
-                            drop(path_charge);
-                            if !added {
+                            if !add(&mut found, s, t, p, None, true, Some(path_charge))? {
                                 break 'sources;
                             }
                         }
@@ -4453,7 +4606,7 @@ pub fn run(
                     }
                     eng.begin();
                     if spec.min_len == 0 && s == t {
-                        if !add(&mut found, s, t, Vec::new(), None, true)? {
+                        if !add(&mut found, s, t, Vec::new(), None, true, None)? {
                             break 'sources;
                         }
                         continue;
@@ -4477,7 +4630,7 @@ pub fn run(
                         Ok(out.len() < cap(&eng))
                     })?;
                     for p in out {
-                        if !add(&mut found, s, t, p, None, true)? {
+                        if !add(&mut found, s, t, p, None, true, None)? {
                             break 'sources;
                         }
                     }
@@ -4489,11 +4642,11 @@ pub fn run(
                     let t = *targets.set.first().unwrap();
                     eng.begin();
                     if spec.min_len == 0 && s == t {
-                        add(&mut found, s, t, Vec::new(), None, true)?;
+                        add(&mut found, s, t, Vec::new(), None, true, None)?;
                         continue;
                     }
                     for p in eng.bidirectional(s, t, all, if all { cap(&eng) } else { 1 })? {
-                        if !add(&mut found, s, t, p, None, true)? {
+                        if !add(&mut found, s, t, p, None, true, None)? {
                             break 'sources;
                         }
                     }
@@ -4507,14 +4660,14 @@ pub fn run(
                     let t = t0.unwrap();
                     eng.begin();
                     if spec.min_len == 0 && s == t {
-                        if !add(&mut found, s, t, Vec::new(), None, true)? {
+                        if !add(&mut found, s, t, Vec::new(), None, true, None)? {
                             break 'sources;
                         }
                         continue;
                     }
                     let mut stop = false;
                     let answered = eng.dijkstra_pair_all(s, t, all, &mut |p| {
-                        let more = add(&mut found, s, t, p, None, true)?;
+                        let more = add(&mut found, s, t, p, None, true, None)?;
                         stop = !more;
                         // path:shortest keeps the first cheapest cycle
                         Ok(more && all)
@@ -4533,7 +4686,7 @@ pub fn run(
                     let t = t0.unwrap();
                     eng.begin();
                     if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)?
-                        && !add(&mut found, s, t, p, None, true)?
+                        && !add(&mut found, s, t, p, None, true, None)?
                     {
                         break 'sources;
                     }
@@ -4574,7 +4727,7 @@ pub fn run(
                 // the empty one, not a cycle
                 if spec.min_len == 0 && close {
                     ends.retain(|&m| m != VIRT);
-                    if !add(&mut found, s, s, Vec::new(), None, true)? {
+                    if !add(&mut found, s, s, Vec::new(), None, true, None)? {
                         break 'sources;
                     }
                 }
@@ -4582,7 +4735,15 @@ pub fn run(
                     let end = if m == VIRT { s } else { m };
                     if by_level && !weighted {
                         if let Some(&(_, level)) = tree.first.get(&m)
-                            && !add(&mut found, s, end, Vec::new(), Some(level as usize), true)?
+                            && !add(
+                                &mut found,
+                                s,
+                                end,
+                                Vec::new(),
+                                Some(level as usize),
+                                true,
+                                None,
+                            )?
                         {
                             break 'sources;
                         }
@@ -4594,7 +4755,7 @@ pub fn run(
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { s } else { x }))
                             .collect();
-                        if !add(&mut found, s, end, p, None, true)? {
+                        if !add(&mut found, s, end, p, None, true, None)? {
                             break 'sources;
                         }
                     }
@@ -4611,7 +4772,7 @@ pub fn run(
                     eng.begin();
                     let mut n = 0usize;
                     if spec.min_len == 0 && s == t {
-                        if !add(&mut found, s, t, Vec::new(), None, true)? {
+                        if !add(&mut found, s, t, Vec::new(), None, true, None)? {
                             break 'sources;
                         }
                         n += 1;
@@ -4633,7 +4794,7 @@ pub fn run(
                         Ok(n < spec.k && out.len() < cap(&eng))
                     })?;
                     for p in out {
-                        if !add(&mut found, s, t, p, None, true)? {
+                        if !add(&mut found, s, t, p, None, true, None)? {
                             break 'sources;
                         }
                     }
@@ -4643,7 +4804,7 @@ pub fn run(
                 eng.begin();
                 let mut stop = false;
                 eng.all_paths(s, true, (!targets.any).then_some(&tset), &mut |p, end| {
-                    if !add(&mut found, s, end, p.to_vec(), None, true)? {
+                    if !add(&mut found, s, end, p.to_vec(), None, true, None)? {
                         stop = true;
                         return Ok(false);
                     }
@@ -4669,7 +4830,7 @@ pub fn run(
                     ));
                 }
                 if bounded_weighted_shortest {
-                    if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
+                    if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false, None)? {
                         break 'targets;
                     }
                     if eng.full() {
@@ -4679,9 +4840,6 @@ pub fn run(
                     match eng.dijkstra_bounded(t, false, max)? {
                         (BoundedTreeOutcome::Tree((order, parent)), tree_charge) => {
                             let _tree_charge = tree_charge;
-                            let tree_bytes =
-                                map_bytes(&parent)
-                                    .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()));
                             for (m, l) in order {
                                 if eng.full() {
                                     break 'targets;
@@ -4690,13 +4848,10 @@ pub fn run(
                                     continue;
                                 }
                                 let start = if m == VIRT { t } else { m };
-                                _tree_charge.resize(
-                                    tree_bytes.saturating_add(vec_bytes::<Edge>(l as usize)),
-                                )?;
+                                let edge_charge = eng.charge.part();
+                                edge_charge.resize(vec_bytes::<Edge>(l as usize))?;
                                 let p = reconstruct_bounded(eng.ctx, t, false, &parent, m, l)?;
-                                let added = add(&mut found, start, t, p, None, false)?;
-                                _tree_charge.resize(tree_bytes)?;
-                                if !added {
+                                if !add(&mut found, start, t, p, None, false, Some(edge_charge))? {
                                     break 'targets;
                                 }
                             }
@@ -4711,10 +4866,6 @@ pub fn run(
                             tree_charge,
                         ) => {
                             let _tree_charge = tree_charge;
-                            let tree_bytes = map_bytes(&parent)
-                                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
-                                .saturating_add(map_bytes(&bwd_dist))
-                                .saturating_add(set_bytes(&direct_multi));
                             for (m, l) in order {
                                 if eng.full() {
                                     break 'targets;
@@ -4723,14 +4874,26 @@ pub fn run(
                                     continue;
                                 }
                                 let start = if m == VIRT { t } else { m };
-                                if !bounded_chain_has_multi(eng.ctx, &parent, &direct_multi, m, l)?
-                                {
-                                    let edge_bytes = vec_bytes::<Edge>(l as usize);
-                                    _tree_charge.resize(tree_bytes.saturating_add(edge_bytes))?;
+                                if !bounded_chain_has_multi(
+                                    eng.ctx,
+                                    &parent,
+                                    &direct_multi,
+                                    m,
+                                    l,
+                                    max,
+                                )? {
+                                    let edge_charge = eng.charge.part();
+                                    edge_charge.resize(vec_bytes::<Edge>(l as usize))?;
                                     let p = reconstruct_bounded(eng.ctx, t, false, &parent, m, l)?;
-                                    let added = add(&mut found, start, t, p, None, false)?;
-                                    _tree_charge.resize(tree_bytes)?;
-                                    if !added {
+                                    if !add(
+                                        &mut found,
+                                        start,
+                                        t,
+                                        p,
+                                        None,
+                                        false,
+                                        Some(edge_charge),
+                                    )? {
                                         break 'targets;
                                     }
                                     continue;
@@ -4752,9 +4915,15 @@ pub fn run(
                                     for e in &mut p {
                                         *e = e.map(real);
                                     }
-                                    let added = add(&mut found, start, t, p, None, false)?;
-                                    drop(path_charge);
-                                    if !added {
+                                    if !add(
+                                        &mut found,
+                                        start,
+                                        t,
+                                        p,
+                                        None,
+                                        false,
+                                        Some(path_charge),
+                                    )? {
                                         break 'targets;
                                     }
                                 }
@@ -4771,7 +4940,7 @@ pub fn run(
                     (tree, None)
                 };
                 let prune = eng.prune(&tree, cost.as_ref(), all)?;
-                if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
+                if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false, None)? {
                     break 'targets;
                 }
                 let mut starts: Vec<u64> = tree.order.iter().map(|e| e.0).collect();
@@ -4789,6 +4958,7 @@ pub fn run(
                                 Vec::new(),
                                 Some(level as usize),
                                 false,
+                                None,
                             )?
                         {
                             break 'targets;
@@ -4801,7 +4971,7 @@ pub fn run(
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { t } else { x }))
                             .collect();
-                        if !add(&mut found, start, t, p, None, false)? {
+                        if !add(&mut found, start, t, p, None, false, None)? {
                             break 'targets;
                         }
                     }
@@ -4810,7 +4980,7 @@ pub fn run(
             Algorithm::All => {
                 let mut stop = false;
                 eng.all_paths(t, false, None, &mut |p, start| {
-                    if !add(&mut found, start, t, p.to_vec(), None, false)? {
+                    if !add(&mut found, start, t, p.to_vec(), None, false, None)? {
                         stop = true;
                         return Ok(false);
                     }
@@ -7957,25 +8127,30 @@ impl SearchContext {
         let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
         let mut order: Vec<(u64, u32)> = Vec::new();
         let mut heap: BoundedHeap = BinaryHeap::new();
-        let mut direct_multi: HbSet<u64> = HbSet::default();
+        let mut direct_multi: HbMap<u64, u32> = HbMap::default();
+        let mut backtrack_parent: HbMap<u64, u64> = HbMap::default();
+        let mut virt_first_len: Option<u32> = None;
         let mut best_virt: Option<(Cost, u32)> = None;
         let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
         let mut wide = false;
         let track_reverse_wide = !forward && max_len > 1;
+        #[allow(clippy::too_many_arguments)]
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
                            parent: &HbMap<(u64, u32), Parent>,
                            order: &Vec<(u64, u32)>,
                            heap: &BoundedHeap,
-                           direct_multi: &HbSet<u64>| {
+                           direct_multi: &HbMap<u64, u32>,
+                           backtrack_parent: &HbMap<u64, u64>| {
             map_bytes(best_len)
                 .saturating_add(map_bytes(dist))
                 .saturating_add(dist_vec_bytes)
                 .saturating_add(map_bytes(parent))
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
-                .saturating_add(set_bytes(direct_multi))
+                .saturating_add(map_bytes(direct_multi))
+                .saturating_add(map_bytes(backtrack_parent))
         };
         let mut base = self.retained_bytes().saturating_add(outer_bytes);
         (_, base) = pareto_insert_charged(
@@ -8008,6 +8183,7 @@ impl SearchContext {
                     &order,
                     &heap,
                     &direct_multi,
+                    &backtrack_parent,
                 ));
             let (prev, next_base) = insert_hb_map(&mut best_len, u, l, charge, cur_base)?;
             if prev.is_none() && u != root {
@@ -8025,6 +8201,7 @@ impl SearchContext {
                 &order,
                 &heap,
                 &direct_multi,
+                &backtrack_parent,
             ));
             let mut out_steps: Vec<(u64, Step)> = Vec::new();
             self.expand(ctx, spec, &[u], forward, &mut out_steps, charge, loc)?;
@@ -8037,28 +8214,37 @@ impl SearchContext {
                     ctx.check()?;
                 }
                 let y = if st.node == root { VIRT } else { st.node };
+                if y == u {
+                    continue;
+                }
                 if track_reverse_wide {
-                    let already_seen = if y == VIRT {
-                        best_virt.is_some()
-                    } else {
-                        dist.contains_key(&y)
-                    };
-                    if already_seen && !direct_multi.contains(&y) {
-                        let cur_base = self
-                            .retained_bytes()
-                            .saturating_add(outer_bytes)
-                            .saturating_add(local_bytes(
-                                &best_len,
-                                &dist,
-                                dist_vec_bytes,
-                                &parent,
-                                &order,
-                                &heap,
-                                &direct_multi,
-                            ))
-                            .saturating_add(out_bytes);
-                        let _ = insert_hb_set(&mut direct_multi, y, charge, cur_base)?;
-                    }
+                    let cur_base = self
+                        .retained_bytes()
+                        .saturating_add(outer_bytes)
+                        .saturating_add(local_bytes(
+                            &best_len,
+                            &dist,
+                            dist_vec_bytes,
+                            &parent,
+                            &order,
+                            &heap,
+                            &direct_multi,
+                            &backtrack_parent,
+                        ))
+                        .saturating_add(out_bytes);
+                    let _ = record_reverse_multi_relax(
+                        u,
+                        l,
+                        y,
+                        nl,
+                        &parent,
+                        &dist,
+                        &mut virt_first_len,
+                        &mut direct_multi,
+                        &mut backtrack_parent,
+                        charge,
+                        cur_base,
+                    )?;
                 }
                 if best_len.get(&y).is_some_and(|&bl| y == VIRT || nl >= bl) {
                     continue;
@@ -8087,6 +8273,7 @@ impl SearchContext {
                         &order,
                         &heap,
                         &direct_multi,
+                        &backtrack_parent,
                     ))
                     .saturating_add(out_bytes);
                 let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
@@ -8147,19 +8334,38 @@ impl SearchContext {
                         &order,
                         &heap,
                         &direct_multi,
+                        &backtrack_parent,
                     )),
             )?;
         }
         drop(dist);
         drop(heap);
         if wide && !direct_multi.is_empty() {
+            let prop_base = self
+                .retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(map_bytes(&parent))
+                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                .saturating_add(map_bytes(&best_len))
+                .saturating_add(map_bytes(&direct_multi))
+                .saturating_add(map_bytes(&backtrack_parent));
+            let _ = propagate_reverse_backtracks(
+                ctx,
+                max_len,
+                &best_len,
+                &backtrack_parent,
+                &mut direct_multi,
+                charge,
+                prop_base,
+            )?;
+            drop(backtrack_parent);
             charge.resize(
                 self.retained_bytes()
                     .saturating_add(outer_bytes)
                     .saturating_add(map_bytes(&parent))
                     .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                     .saturating_add(map_bytes(&best_len))
-                    .saturating_add(set_bytes(&direct_multi)),
+                    .saturating_add(map_bytes(&direct_multi)),
             )?;
             return Ok(BoundedTreeOutcome::ReverseWide {
                 order,
@@ -8170,6 +8376,7 @@ impl SearchContext {
         }
         drop(best_len);
         drop(direct_multi);
+        drop(backtrack_parent);
         charge.resize(
             self.retained_bytes()
                 .saturating_add(outer_bytes)
@@ -10645,7 +10852,7 @@ enum BoundedShortestState {
         parent: HbMap<(u64, u32), Parent>,
         order: Vec<(u64, u32)>,
         bwd_dist: HbMap<u64, u32>,
-        direct_multi: HbSet<u64>,
+        direct_multi: HbMap<u64, u32>,
         idx: usize,
         max_len: u32,
     },
@@ -10654,8 +10861,9 @@ enum BoundedShortestState {
 /// Resumable job for length-bounded weighted `path:shortest` with an unbound end
 /// (ROADMAP item 275): runs one Pareto-pruned search (and, for reverse wide weights with
 /// multi-route nodes, re-solves only multi-route sources and sources whose reverse tree
-/// path passes through one in source order pruned by the reverse search's minimum edge
-/// distances) and emits each reached node's optimal path within `max_len` on demand.
+/// path passes through one within the remaining length budget in source order pruned by
+/// the reverse search's minimum edge distances) and emits each reached node's optimal path
+/// within `max_len` on demand.
 struct BoundedShortestJob {
     root: u64,
     forward: bool,
@@ -10731,7 +10939,7 @@ impl BoundedShortestJob {
             } => map_bytes(parent)
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                 .saturating_add(map_bytes(bwd_dist))
-                .saturating_add(set_bytes(direct_multi)),
+                .saturating_add(map_bytes(direct_multi)),
         }
     }
 
@@ -10845,7 +11053,7 @@ impl BoundedShortestJob {
                     }
                     let start = if m == VIRT { self.root } else { m };
                     let (edges, len) =
-                        if !bounded_chain_has_multi(ctx, parent, direct_multi, m, len)? {
+                        if !bounded_chain_has_multi(ctx, parent, direct_multi, m, len, *max_len)? {
                             let base = search.retained_bytes().saturating_add(job_outer);
                             charge.resize(base.saturating_add(vec_bytes::<Edge>(len as usize)))?;
                             let edges = reconstruct_bounded(ctx, self.root, false, parent, m, len)?;
@@ -14065,5 +14273,132 @@ mod tree_tests {
             opt_cost_min(Some(Cost::INFINITE), Some(Cost::of(5.0))),
             Some(Cost::of(5.0))
         );
+    }
+
+    /// Regression for Sol r4 P3: eager direct reconstruction in `ReverseWide` must transfer
+    /// the edge buffer credit into `eng.charge` instead of charging `len * size_of::<Edge>()`
+    /// on both the tree charge and `eng.charge` at the same time.
+    #[test]
+    fn eager_reverse_wide_direct_reconstruction_does_not_double_charge_edge_buffer() {
+        use crate::io::Source;
+        use crate::sparql::pool::QueryPool;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+
+        let chain_len = 400usize;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:c1 ex:p ex:t {| ex:w 1.0e-12 |} .\n\
+             ex:b ex:p ex:t {| ex:w 1.0e0 |} .\n\
+             ex:b ex:p ex:x {| ex:w 5.0e-1 |} .\n\
+             ex:x ex:p ex:t {| ex:w 5.0e-1 |} .\n",
+        );
+        for i in 2..=chain_len {
+            ttl += &format!("ex:c{i} ex:p ex:c{} {{| ex:w 0.0e0 |}} .\n", i - 1);
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+
+        let p = snap.lookup_iri("http://example.org/p").unwrap();
+        let w = snap.lookup_iri("http://example.org/w").unwrap();
+        let t = snap.lookup_iri("http://example.org/t").unwrap();
+        let reifies = snap
+            .lookup_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies")
+            .map(|id| id.0);
+        let spec = PathSearchSpec {
+            algorithm: Algorithm::Shortest,
+            source: PathEnd::Var(0),
+            target: PathEnd::Const(t),
+            predicates: Some(vec![p.0]),
+            directions: vec![Direction::Forward],
+            direction: Direction::Forward,
+            exclude: Vec::new(),
+            max_degree: None,
+            edge_pattern: None,
+            min_len: 1,
+            max_len: Some(chain_len as u32),
+            k: 1,
+            limit: Some(chain_len),
+            max_visited: 100_000,
+            weight: Some(Some(w.0)),
+            default_weight: 1.0,
+            reifies,
+            path_index: None,
+            edge_index: None,
+            edge_s: None,
+            edge_p: None,
+            edge_o: None,
+            edge: None,
+            length: None,
+            cost: None,
+            graph: GraphFilter::Default,
+        };
+
+        // Measure the exact retained tree charge and weight cache charge directly so the
+        // tight budget below depends on no magic constants.
+        let measure_ctx = Ctx::new(snap.clone());
+        let eng = Engine::new(&measure_ctx, &spec, None).unwrap();
+        let (outcome, tree_charge) = eng.dijkstra_bounded(t.0, false, chain_len as u32).unwrap();
+        assert!(
+            matches!(outcome, BoundedTreeOutcome::ReverseWide { .. }),
+            "fixture must exercise the ReverseWide direct-reconstruction arm"
+        );
+        let retained_tree = tree_charge.bytes();
+        let weight_cache = eng.charge.bytes();
+        let retained_results: u64 = (1..=chain_len as u64)
+            .map(|k| k * (size_of::<Edge>() as u64) + 64)
+            .sum();
+        drop(tree_charge);
+        drop(eng);
+        drop(measure_ctx);
+
+        // Allow retained tree + weight cache + all 400 retained results + 4 KiB headroom.
+        // The 400th path's edge buffer is `400 * 32 = 12_800` bytes, so double-charging it
+        // overflows this budget while single-charging via credit transfer fits cleanly.
+        let tight_limit = retained_tree
+            .saturating_add(weight_cache)
+            .saturating_add(retained_results)
+            .saturating_add(4 * 1024);
+
+        let mut fast_ctx = Ctx::new(snap.clone());
+        fast_ctx.mem_limit = tight_limit;
+        let (tbl, _) = super::run(&fast_ctx, &spec, None, None, &[0])
+            .expect("eager ReverseWide direct reconstruction must fit without double-charging");
+        assert_eq!(tbl.len(), chain_len);
+        assert!(
+            fast_ctx.mem_peak() <= tight_limit,
+            "fast peak {} exceeded tight limit {tight_limit}",
+            fast_ctx.mem_peak()
+        );
+        drop(tbl);
+        drop(fast_ctx);
+
+        // Also exercise the pooled ledger path end-to-end through `query`.
+        let q = format!(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX path: <urn:x-sparkles:path#>\n\
+             SELECT ?src WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+              path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+              path:maxLength {chain_len} ; path:limit {chain_len} }} }}"
+        );
+        let pool = QueryPool::new(tight_limit.saturating_add(256 * 1024));
+        let pooled_opts = QueryOptions {
+            max_memory_bytes: Some(tight_limit.saturating_add(64 * 1024)),
+            pool: Some(pool.clone()),
+            no_cache: true,
+            ..Default::default()
+        };
+        let pooled_res = query(snap, &q, &pooled_opts)
+            .expect("pooled eager ReverseWide direct reconstruction must succeed");
+        drop(pooled_res);
+        assert_eq!(pool.granted(), 0);
     }
 }

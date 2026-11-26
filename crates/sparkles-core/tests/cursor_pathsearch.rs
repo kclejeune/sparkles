@@ -1682,3 +1682,104 @@ fn bounded_weighted_reverse_wide_unique_routes_visit_budget() {
     drop(meter);
     assert_eq!(pool.granted(), 0);
 }
+
+/// Regression for Sol r4 P2 in the streaming cursor entry point: self-loops, pure 2-cycles,
+/// and longer suffixes outside an upstream source's remaining length budget stay within
+/// tight `path:maxVisited` budgets and preserve eager/streaming parity.
+#[test]
+fn bounded_weighted_reverse_wide_self_loop_and_remaining_budget() {
+    let opts = QueryOptions::default();
+
+    // 1. Two-source wide-weight fixture with self-loop `a -> a`, maxLength 2, maxVisited 3.
+    let self_loop_store = Store::in_memory(StoreOptions::default());
+    load(
+        &self_loop_store,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} .\n\
+         ex:a ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .\n",
+        RdfFormat::Turtle,
+    );
+    let self_loop_snap = self_loop_store.snapshot();
+    for (lim, expected) in [("", 2usize), (" ; path:limit 1", 1)] {
+        let q = format!(
+            "SELECT ?src ?c ?l {{ SERVICE path:search {{ [] path:source ?src ; \
+             path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+             path:maxLength 2 ; path:maxVisited 3{lim} ; path:cost ?c ; path:length ?l }} }}"
+        );
+        assert_parity(&self_loop_snap, &q, &opts, true);
+        let (rows, _, _) = drain_strict(&self_loop_snap, &format!("{P}{q}"), &opts, 16);
+        assert_eq!(rows.len(), expected);
+    }
+
+    // 2. Three leaves + self-loop `a -> a`, maxLength 2, maxVisited 6, limit 1.
+    let leaves_store = Store::in_memory(StoreOptions::default());
+    load(
+        &leaves_store,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} .\n\
+         ex:a ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .\n\
+         ex:u1 ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:u2 ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:u3 ex:p ex:a {| ex:w 1.0e0 |} .\n",
+        RdfFormat::Turtle,
+    );
+    let leaves_snap = leaves_store.snapshot();
+    let q_leaves = "SELECT ?src ?c ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+        path:maxLength 2 ; path:maxVisited 6 ; path:limit 1 ; path:cost ?c ; path:length ?l } }";
+    assert_parity(&leaves_snap, q_leaves, &opts, true);
+    let (rows_leaves, _, _) = drain_strict(&leaves_snap, &format!("{P}{q_leaves}"), &opts, 16);
+    assert_eq!(rows_leaves.len(), 1);
+
+    // 3. Pure 2-cycle `a <-> c`, maxLength 3, maxVisited 4.
+    let cycle_store = Store::in_memory(StoreOptions::default());
+    load(
+        &cycle_store,
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} .\n\
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} .\n\
+         ex:c ex:p ex:a {| ex:w 1.0e0 |} .\n\
+         ex:a ex:p ex:c {| ex:w 1.0e0 |} .\n",
+        RdfFormat::Turtle,
+    );
+    let cycle_snap = cycle_store.snapshot();
+    let q_cycle = "SELECT ?src ?c ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; \
+        path:maxLength 3 ; path:maxVisited 4 ; path:cost ?c ; path:length ?l } }";
+    assert_parity(&cycle_snap, q_cycle, &opts, true);
+    let (rows_cycle, _, _) = drain_strict(&cycle_snap, &format!("{P}{q_cycle}"), &opts, 16);
+    assert_eq!(rows_cycle.len(), 3);
+
+    // 4. Diamond + upstream leaves outside remaining budget, maxLength 5, maxVisited 55.
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let mut rem_ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p2 ex:t {{| ex:w {} |}} .\n\
+         ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} .\n\
+         ex:x2 ex:p ex:t {{| ex:w {} |}} .\n",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    for i in 1..=20 {
+        rem_ttl += &format!("ex:u{i} ex:p ex:s {{| ex:w 1.0e0 |}} .\n");
+    }
+    let rem_store = Store::in_memory(StoreOptions::default());
+    load(&rem_store, &rem_ttl, RdfFormat::Turtle);
+    let rem_snap = rem_store.snapshot();
+    let q_rem = "SELECT ?src ?c ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+        path:maxLength 5 ; path:maxVisited 55 ; path:cost ?c ; path:length ?l } }";
+    assert_parity(&rem_snap, q_rem, &opts, true);
+    let (rows_rem, _, _) = drain_strict(&rem_snap, &format!("{P}{q_rem}"), &opts, 16);
+    assert_eq!(rows_rem.len(), 25);
+}

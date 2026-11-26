@@ -278,9 +278,10 @@ ranking, with Yen's spurs carrying their accumulated prefix cost and weight rang
 check and fallback. Unbound ends in weighted `path:shortest` with `path:maxLength` run a
 one-ended Pareto-pruned search. When a reverse search for an unbound source encounters wide
 weights or overflow, it finishes the reverse search to record each node's minimum backward
-edge distance and which nodes were reached by multiple reverse relaxations, reconstructs
-unique-route sources directly, and re-solves only multi-route sources and sources whose
-reverse tree path passes through one in source order pruned by those backward edge
+edge distance and the shortest alternative reverse route length for nodes with multiple
+non-backtracking routes, reconstructs sources with a unique simple route within
+`path:maxLength` directly, and re-solves only sources whose reverse tree path hits an
+alternative within the remaining edge budget in source order pruned by those backward edge
 distances. Weighted `path:allShortest` with `path:maxLength` requires both ends bound because
 it enumerates tied short paths through Yen's algorithm. Lengths still count edges.
 
