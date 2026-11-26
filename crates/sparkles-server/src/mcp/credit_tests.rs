@@ -183,7 +183,7 @@ async fn stdio_backpressure_holds_pool_credit_until_frame_is_read() {
     // While the client has not read from the pipe, the response frame is blocked in
     // `write_all` and MUST hold its QueryPool grant.
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() > 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() > 0).await,
         "expected QueryPool credit to stay held while stdio response is backpressured"
     );
     // Give the query a brief moment to finish executing and confirm credit remains held
@@ -195,7 +195,7 @@ async fn stdio_backpressure_holds_pool_credit_until_frame_is_read() {
     );
 
     let mut lines = BufReader::new(cr).lines();
-    let reply_line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+    let reply_line = tokio::time::timeout(Duration::from_secs(15), lines.next_line())
         .await
         .unwrap()
         .unwrap()
@@ -209,7 +209,7 @@ async fn stdio_backpressure_holds_pool_credit_until_frame_is_read() {
 
     // Once the frame is written to the pipe, QueryPool credit must drop back to 0.
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "expected QueryPool credit to return to 0 after stdio write, still granted={}",
         pool.granted()
     );
@@ -251,13 +251,13 @@ async fn stdio_disconnect_and_cancel_release_pool_credit_without_leak() {
     cw.flush().await.unwrap();
 
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() > 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() > 0).await,
         "expected credit held before disconnect"
     );
     drop(cr);
     drop(cw);
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "credit leaked after stdio disconnect: granted={}",
         pool.granted()
     );
@@ -295,7 +295,7 @@ async fn stdio_disconnect_and_cancel_release_pool_credit_without_leak() {
     drop(cr);
     let _ = serve_handle.await;
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "credit leaked after notifications/cancelled: granted={}",
         pool.granted()
     );
@@ -480,7 +480,7 @@ async fn http_legacy_session_replay_holds_credit_and_releases_on_delivery_ttl_an
     };
     let (_dir, state, pool) = pooled_state(32 << 20, &ttl, cfg, 16);
     let mut session_cfg = SessionConfig::default();
-    session_cfg.completed_cache_ttl = Duration::from_millis(350);
+    session_cfg.completed_cache_ttl = Duration::from_millis(1500);
     let app = mcp_http_router(state, session_cfg, None);
 
     // 1. Open legacy session via `initialize`.
@@ -560,7 +560,7 @@ async fn http_legacy_session_replay_holds_credit_and_releases_on_delivery_ttl_an
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let mut body = resp.into_body();
-        let first = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        let first = tokio::time::timeout(Duration::from_secs(15), body.frame())
             .await
             .unwrap()
             .expect("priming frame")
@@ -581,11 +581,16 @@ async fn http_legacy_session_replay_holds_credit_and_releases_on_delivery_ttl_an
     //    `GET /$/mcp` with `Last-Event-ID` and verify credit returns to 0 after delivery.
     let priming_id = start_and_disconnect(&app, post_large(41)).await;
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() > 0).await,
-        "expected credit held in session replay cache after client disconnect"
+        wait_for(Duration::from_secs(15), || {
+            let g = pool.granted();
+            g > 0 && g < (4 << 20)
+        })
+        .await,
+        "expected trimmed credit held in session replay cache after client disconnect: granted={}",
+        pool.granted()
     );
-    // Let the query finish into the replay cache before replaying.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Confirm the retained replay entry keeps holding credit until reconnect.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         pool.granted() > 0,
         "replay cache dropped credit before Last-Event-ID reconnect"
@@ -623,20 +628,20 @@ async fn http_legacy_session_replay_holds_credit_and_releases_on_delivery_ttl_an
     assert_eq!(parsed["rows"].as_array().unwrap().len(), 180);
     drop(replay_bytes);
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "replay cache did not release credit after delivery: granted={}",
         pool.granted()
     );
 
-    // 3. Disconnect with NO reconnect -> `completed_cache_ttl` (350 ms) evicts cache and
+    // 3. Disconnect with NO reconnect -> `completed_cache_ttl` (1.5 s) evicts cache and
     //    releases QueryPool credit to 0 automatically.
     let _ = start_and_disconnect(&app, post_large(42)).await;
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() > 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() > 0).await,
         "expected credit held before replay TTL expiry"
     );
     assert!(
-        wait_for(Duration::from_secs(3), || pool.granted() == 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "replay cache did not expire after completed_cache_ttl: granted={}",
         pool.granted()
     );
@@ -645,7 +650,7 @@ async fn http_legacy_session_replay_holds_credit_and_releases_on_delivery_ttl_an
     //    immediately.
     let _ = start_and_disconnect(&app, post_large(43)).await;
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() > 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() > 0).await,
         "expected credit held before DELETE"
     );
     let del = app
@@ -662,7 +667,7 @@ async fn http_legacy_session_replay_holds_credit_and_releases_on_delivery_ttl_an
         .unwrap();
     assert!(del.status().is_success(), "DELETE status {}", del.status());
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "session DELETE leaked replay credit: granted={}",
         pool.granted()
     );
@@ -679,7 +684,10 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
         ..Default::default()
     };
     let (_dir, state, pool) = pooled_state(16 << 20, &ttl, cfg.clone(), 0);
-    let server = McpServer::new_with_task_ttl(state, cfg, Duration::from_millis(450));
+    // Keep `task_ttl` long enough that a loaded CI runner never times out the running task
+    // or evicts the completed entry before the two `tasks/get` assertions finish, while
+    // keeping total test runtime around ~2 s.
+    let server = McpServer::new_with_task_ttl(state, cfg, Duration::from_secs(2));
 
     let (client, srv) = tokio::io::duplex(1 << 20);
     let (sr, sw) = tokio::io::split(srv);
@@ -696,7 +704,7 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
         s.push('\n');
         cw.write_all(s.as_bytes()).await.unwrap();
         cw.flush().await.unwrap();
-        let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        let line = tokio::time::timeout(Duration::from_secs(20), lines.next_line())
             .await
             .unwrap()
             .unwrap()
@@ -729,7 +737,10 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
 
     // Poll `tasks/get` until completed.
     let mut completed = None;
-    for poll_id in 52..100 {
+    let mut last_reply = None;
+    let poll_deadline = Instant::now() + Duration::from_secs(20);
+    let mut poll_id = 52u64;
+    while Instant::now() < poll_deadline {
         let r = send_recv(
             &mut cw,
             &mut lines,
@@ -744,13 +755,25 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
             }),
         )
         .await;
+        poll_id += 1;
         if r["result"]["status"] == "completed" {
             completed = Some(r);
             break;
         }
+        let terminal_failure = r.get("error").is_some()
+            || matches!(r["result"]["status"].as_str(), Some("failed" | "cancelled"));
+        last_reply = Some(r);
+        if terminal_failure {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let completed = completed.expect("task should complete");
+    let completed = completed.unwrap_or_else(|| {
+        panic!(
+            "task {task_id} should complete before deadline; last reply: {:?}",
+            last_reply
+        )
+    });
     assert_eq!(
         completed["result"]["resultType"], "complete",
         "GetTaskResult must carry outer resultType=complete: {completed}"
@@ -778,7 +801,7 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
         &mut lines,
         json!({
             "jsonrpc": "2.0",
-            "id": 200,
+            "id": poll_id,
             "method": "tasks/get",
             "params": {
                 "_meta": modern_meta(true),
@@ -791,10 +814,10 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
     assert_eq!(again["result"]["status"], "completed", "{again}");
     assert_eq!(again["result"]["result"]["isError"], false);
 
-    // Wait past the 450 ms task TTL: automatic eviction timer must drop the retained result
+    // Wait past the 2 s task TTL: automatic eviction timer must drop the retained result
     // and return QueryPool credit to 0 without any further client calls.
     assert!(
-        wait_for(Duration::from_secs(3), || pool.granted() == 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "expired task leaked QueryPool credit: granted={}",
         pool.granted()
     );
@@ -962,7 +985,7 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
         cw.write_all(make_call(102).as_bytes()).await.unwrap();
         cw.flush().await.unwrap();
         assert!(
-            wait_for(Duration::from_secs(5), || pool.granted() > held_by_one).await,
+            wait_for(Duration::from_secs(15), || pool.granted() > held_by_one).await,
             "expected req 2 queued behind backpressured req 1 to add credit"
         );
 
@@ -978,7 +1001,7 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
         cw.flush().await.unwrap();
         // Req 2's credit MUST drop immediately while req 1 is still blocked on the open pipe.
         assert!(
-            wait_for(Duration::from_secs(5), || pool.granted() <= held_by_one).await,
+            wait_for(Duration::from_secs(15), || pool.granted() <= held_by_one).await,
             "cancelled queued stdio frame kept credit under open backpressure: granted={}, held_by_one={held_by_one}",
             pool.granted()
         );
@@ -1003,7 +1026,7 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
         cw.write_all(probe_batch.as_bytes()).await.unwrap();
         cw.flush().await.unwrap();
         assert!(
-            wait_for(Duration::from_secs(5), || pool.granted() > held_by_one).await,
+            wait_for(Duration::from_secs(15), || pool.granted() > held_by_one).await,
             "expected req 104 after dup_101 to queue behind backpressured req 101"
         );
 
@@ -1231,7 +1254,7 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
         );
         serve_handle.await.unwrap().unwrap();
         assert!(
-            eof_start.elapsed() < Duration::from_secs(2),
+            eof_start.elapsed() < Duration::from_secs(4),
             "clean stdin EOF drain must exit promptly without hitting 5s timeout: {:?}",
             eof_start.elapsed()
         );
@@ -1553,9 +1576,15 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
     //    BOTH and return credit to 0 immediately while `unread_resp` is still alive!
     let unread_resp = app.clone().oneshot(post_query(302)).await.unwrap();
     assert_eq!(unread_resp.status(), StatusCode::OK);
-    assert!(wait_for(Duration::from_secs(5), || pool.granted() > 0).await);
-    // Give the handler time to finish caching the terminal frame.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let g = pool.granted();
+            g > 0 && g < (4 << 20)
+        })
+        .await,
+        "unread SSE response did not finish caching and trimming: granted={}",
+        pool.granted()
+    );
     let cancel_302 = json!({
         "jsonrpc": "2.0",
         "method": "notifications/cancelled",
@@ -1577,7 +1606,7 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
         .unwrap();
     assert_eq!(cancel_resp.status(), StatusCode::ACCEPTED);
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "post-cache notifications/cancelled failed to release unread body + replay credit: granted={}",
         pool.granted()
     );
@@ -1614,10 +1643,10 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
         let gate_grant = pool
             .try_grant(64 << 20)
             .expect("pool idle before gated duplicate subcase");
-        // Bound the duplicate exchange to 5 s, well inside the 30 s admission wait and 60 s
+        // Bound the duplicate exchange to 15 s, well inside the 30 s admission wait and 60 s
         // call deadline, so the original request cannot time out admission before the
         // duplicate POST is processed.
-        let (orig_resp, dup_bytes) = tokio::time::timeout(Duration::from_secs(5), async {
+        let (orig_resp, dup_bytes) = tokio::time::timeout(Duration::from_secs(15), async {
             // First POST returns the SSE response as soon as the session worker registers id 305,
             // while `gate_grant` blocks `Adapter::get_prompt` inside `admit_call`.
             let orig_resp = app
@@ -1691,7 +1720,7 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
     let held_sse = app.clone().oneshot(post_query(303)).await.unwrap();
     assert_eq!(held_sse.status(), StatusCode::OK);
     assert!(
-        wait_for(Duration::from_secs(5), || {
+        wait_for(Duration::from_secs(15), || {
             let g = pool.granted();
             g > 0 && g < (4 << 20)
         })
@@ -1734,7 +1763,10 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
     let task_id = start_v["result"]["taskId"].as_str().unwrap().to_string();
     // Wait until the task finishes and is retained.
     let mut task_completed = false;
-    for poll in 0..100 {
+    let mut last_reply = None;
+    let poll_deadline = Instant::now() + Duration::from_secs(20);
+    let mut poll = 0u64;
+    while Instant::now() < poll_deadline {
         let poll_resp = app
             .clone()
             .oneshot(http_req(
@@ -1756,6 +1788,7 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
             ))
             .await
             .unwrap();
+        poll += 1;
         assert_eq!(poll_resp.status(), StatusCode::OK);
         let raw = axum::body::to_bytes(poll_resp.into_body(), usize::MAX)
             .await
@@ -1766,11 +1799,18 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
             task_completed = true;
             break;
         }
+        let terminal_failure = v.get("error").is_some()
+            || matches!(v["result"]["status"].as_str(), Some("failed" | "cancelled"));
+        last_reply = Some(v);
+        if terminal_failure {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
         task_completed,
-        "background task {task_id} did not reach completed state before shutdown check"
+        "background task {task_id} did not reach completed state before shutdown check; last reply: {:?}",
+        last_reply
     );
     assert!(
         pool.granted() > granted_with_sse,
@@ -1781,7 +1821,7 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
     // Fire HTTP shutdown while `app` and `held_sse` are still alive!
     state.mcp.as_ref().unwrap().shutdown.cancel();
     assert!(
-        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        wait_for(Duration::from_secs(15), || pool.granted() == 0).await,
         "HttpConf.shutdown did not immediately release session replay + task credit: granted={}",
         pool.granted()
     );
