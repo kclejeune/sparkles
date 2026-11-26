@@ -265,30 +265,128 @@ fn latest(
     }
     // Every identity graph the map was built from must still be in the boundary under
     // the same protection, or matches the map follows would no longer be read. A graph
-    // added to the boundary since holds no proposal the policy accepted.
-    let current: BTreeSet<String> = m
-        .boundary_protections()
+    // added to the boundary is accepted only when it holds no authenticated proposal
+    // with a current accepted decision under this policy (re-adding a previously removed
+    // graph with live accepted decisions requires a rebuild).
+    let current_entries: Vec<(G, String)> = m
+        .proposals
         .iter()
-        .map(|(g, n)| rv::boundary_protection(g, *n))
+        .filter_map(|(g, n)| n.map(|n| ((g.clone(), Some(n)), rv::boundary_protection(g, n))))
         .collect();
+    let current: BTreeSet<&str> = current_entries.iter().map(|(_, s)| s.as_str()).collect();
     let (built, more) = state.reads.objects_up_to(
         lo_iri.as_str(),
         BOUNDARY_PROTECTION,
         m.maps.0.as_str(),
         MAX_BOUNDARY,
     )?;
-    if more
-        || !built.iter().all(|t| match t {
-            Term::Literal(l) => current.contains(l.value()),
-            _ => false,
-        })
-    {
+    if more {
+        return Err(projection_unavailable(&m.name));
+    }
+    let mut built_set: BTreeSet<String> = BTreeSet::new();
+    for t in built {
+        match t {
+            Term::Literal(l) if current.contains(l.value()) => {
+                built_set.insert(l.value().to_string());
+            }
+            _ => return Err(projection_unavailable(&m.name)),
+        }
+    }
+    let added: Vec<G> = current_entries
+        .into_iter()
+        .filter(|(_, entry)| !built_set.contains(entry))
+        .map(|(g, _)| g)
+        .collect();
+    if !added.is_empty() && has_live_accepted_in_graphs(state, m, &added, control)? {
         return Err(projection_unavailable(&m.name));
     }
     Ok(Some(Latest {
         iri: lo_iri,
         number: lo,
     }))
+}
+
+/// Whether any identity graph in `graphs` holds an authenticated `ev:IdentityProposal`
+/// with a current authenticated `Accepted` decision under `m` (or bounds prevent ruling
+/// one out).
+fn has_live_accepted_in_graphs(
+    state: &mut State<'_>,
+    m: &MapGraphs,
+    graphs: &[G],
+    control: &Control,
+) -> Result<bool> {
+    let class = Term::NamedNode(NamedNode::new_unchecked(ev("IdentityProposal")));
+    let policy = Term::NamedNode(m.policy_iri.clone());
+    let mut overflow: Vec<&G> = Vec::new();
+    for g in graphs {
+        control.check()?;
+        let (proposals, more) =
+            state
+                .reads
+                .subjects_up_to(super::RDF_TYPE, &class, g.0.as_str(), MAX_EVIDENCE)?;
+        for p in proposals {
+            control.check()?;
+            if !state.reads.authenticated(p.as_str(), g.0.as_str(), g.1)? {
+                continue;
+            }
+            let (decs, more_d) = state.reads.subjects_up_to(
+                &ev("target"),
+                &Term::NamedNode(p),
+                m.decisions.0.as_str(),
+                MAX_EVIDENCE,
+            )?;
+            if more_d {
+                return Ok(true);
+            }
+            for d in decs {
+                control.check()?;
+                if state.typed(&d, &m.decisions, RecordKind::ReviewDecision)?
+                    && state.reads.contains(
+                        d.as_str(),
+                        &ev("reviewPolicy"),
+                        &policy,
+                        m.decisions.0.as_str(),
+                    )?
+                    && !state.is_superseded(&d, &m.decisions)?
+                    && state.disposition(&d, &m.decisions)? == Some(Disposition::Accepted)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        if more {
+            overflow.push(g);
+        }
+    }
+    if !overflow.is_empty() {
+        let (decs, more_d) = state.reads.subjects_up_to(
+            &ev("reviewPolicy"),
+            &policy,
+            m.decisions.0.as_str(),
+            MAX_EVIDENCE,
+        )?;
+        if more_d {
+            return Ok(true);
+        }
+        for d in decs {
+            control.check()?;
+            if !state.typed(&d, &m.decisions, RecordKind::ReviewDecision)?
+                || state.is_superseded(&d, &m.decisions)?
+                || state.disposition(&d, &m.decisions)? != Some(Disposition::Accepted)
+            {
+                continue;
+            }
+            let Some(target) = state.iri(&d, &ev("target"), &m.decisions)? else {
+                continue;
+            };
+            for g in &overflow {
+                if state.typed(&target, g, RecordKind::IdentityProposal)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// What an authenticated identity proposal records.
@@ -1039,7 +1137,16 @@ pub(super) fn review(
     check_identities(&mut state, &batch, &records, &skip)?;
     drop(state);
     let committed = publish(
-        main, logical, capability, r.if_head, &batch, &skip, &changes, options, control,
+        main,
+        logical,
+        capability,
+        r.if_head,
+        &batch,
+        &skip,
+        &[],
+        &changes,
+        options,
+        control,
     )?;
     Ok(Reviewed {
         operation: batch.operation_iri.clone(),
@@ -1121,6 +1228,205 @@ pub struct RebuiltMap {
     pub preview: Option<Box<crate::preview::Preview>>,
 }
 
+/// Map local preparation memory exhaustion to `incomplete-evidence` (HTTP 422), while
+/// preserving server-pool exhaustion, cancellation, timeout and all other errors.
+fn map_local_budget<T>(result: Result<T>, what: &str) -> Result<T> {
+    match result {
+        Err(Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Memory => {
+            Err(incomplete(what))
+        }
+        other => other,
+    }
+}
+
+/// Zero-allocation deterministic ordering over `oxrdf::Triple` values.
+fn cmp_triple(a: &Triple, b: &Triple) -> std::cmp::Ordering {
+    fn cmp_subject(a: &NamedOrBlankNode, b: &NamedOrBlankNode) -> std::cmp::Ordering {
+        match (a, b) {
+            (NamedOrBlankNode::NamedNode(x), NamedOrBlankNode::NamedNode(y)) => {
+                x.as_str().cmp(y.as_str())
+            }
+            (NamedOrBlankNode::BlankNode(x), NamedOrBlankNode::BlankNode(y)) => {
+                x.as_str().cmp(y.as_str())
+            }
+            (NamedOrBlankNode::NamedNode(_), NamedOrBlankNode::BlankNode(_)) => {
+                std::cmp::Ordering::Less
+            }
+            (NamedOrBlankNode::BlankNode(_), NamedOrBlankNode::NamedNode(_)) => {
+                std::cmp::Ordering::Greater
+            }
+        }
+    }
+    fn cmp_term(a: &Term, b: &Term) -> std::cmp::Ordering {
+        fn rank(t: &Term) -> u8 {
+            match t {
+                Term::NamedNode(_) => 0,
+                Term::BlankNode(_) => 1,
+                Term::Literal(_) => 2,
+                Term::Triple(_) => 3,
+            }
+        }
+        match (a, b) {
+            (Term::NamedNode(x), Term::NamedNode(y)) => x.as_str().cmp(y.as_str()),
+            (Term::BlankNode(x), Term::BlankNode(y)) => x.as_str().cmp(y.as_str()),
+            (Term::Literal(x), Term::Literal(y)) => x
+                .value()
+                .cmp(y.value())
+                .then_with(|| x.datatype().as_str().cmp(y.datatype().as_str()))
+                .then_with(|| x.language().cmp(&y.language())),
+            (Term::Triple(x), Term::Triple(y)) => cmp_triple(x, y),
+            _ => rank(a).cmp(&rank(b)),
+        }
+    }
+    cmp_subject(&a.subject, &b.subject)
+        .then_with(|| a.predicate.as_str().cmp(b.predicate.as_str()))
+        .then_with(|| cmp_term(&a.object, &b.object))
+}
+
+/// Verify that `m.maps` has no numbering gap in `1..=max` when recovering from an absent
+/// or unauthenticated/untyped head, and that no minted slot `latest_present` will probe
+/// after publishing `next_number` holds a stray or partial subject.
+fn verify_maps_for_rebuild(
+    state: &mut State<'_>,
+    dataset: Uuid,
+    m: &MapGraphs,
+    prev_number: u64,
+    prev_auth_typed: bool,
+    next_number: u64,
+    control: &Control,
+) -> Result<()> {
+    if !prev_auth_typed {
+        let (revs, more) = state.reads.subjects_up_to(
+            &ev("reviewPolicy"),
+            &Term::NamedNode(m.policy_iri.clone()),
+            m.maps.0.as_str(),
+            MAX_EVIDENCE,
+        )?;
+        if more {
+            return Err(incomplete("resolution map revisions"));
+        }
+        let class = Term::NamedNode(NamedNode::new_unchecked(ev("ResolutionMap")));
+        let mut max_rev = prev_number;
+        let mut revision_subjects = Vec::new();
+        for r in revs {
+            control.check()?;
+            let is_map_type =
+                state
+                    .reads
+                    .contains(r.as_str(), super::RDF_TYPE, &class, m.maps.0.as_str())?;
+            let rev_num_raw = state.text(&r, &ev("mapRevision"), &m.maps)?;
+            if !is_map_type && rev_num_raw.is_none() {
+                continue;
+            }
+            if let Some(raw) = &rev_num_raw {
+                let Some(n) = raw.parse::<u64>().ok().filter(|&n| n >= 1) else {
+                    return Err(managed(
+                        ManagedErrorKind::ImmutableRecordConflict,
+                        format!(
+                            "policy {}: maps graph holds an invalid revision number on <{}>",
+                            m.name,
+                            r.as_str()
+                        ),
+                    ));
+                };
+                max_rev = max_rev.max(n);
+            }
+            revision_subjects.push(r);
+        }
+        if max_rev > MAX_EVIDENCE as u64 {
+            // `!more` means at most MAX_EVIDENCE subjects exist, so 1..=max_rev has a gap.
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "policy {}: maps graph holds revision {max_rev} past a numbering gap",
+                    m.name
+                ),
+            ));
+        }
+        let mut canonical_iris = HashSet::with_capacity(max_rev as usize);
+        for k in 1..=max_rev {
+            control.check()?;
+            let iri = rv::map_iri(dataset, &m.name, k, control)?;
+            match state.reads.record(&iri, std::slice::from_ref(&m.maps))? {
+                ExistingRecord::Present { .. } => {
+                    canonical_iris.insert(iri);
+                }
+                ExistingRecord::Absent => {
+                    return Err(managed(
+                        ManagedErrorKind::ImmutableRecordConflict,
+                        format!(
+                            "policy {}: maps graph has a numbering gap at revision {k} before revision {max_rev}",
+                            m.name
+                        ),
+                    ));
+                }
+                ExistingRecord::Many => {
+                    return Err(managed(
+                        ManagedErrorKind::ImmutableRecordConflict,
+                        format!(
+                            "policy {}: maps graph has conflicting records at revision {k}",
+                            m.name
+                        ),
+                    ));
+                }
+            }
+        }
+        for r in revision_subjects {
+            if !canonical_iris.contains(&r) {
+                return Err(managed(
+                    ManagedErrorKind::ImmutableRecordConflict,
+                    format!(
+                        "policy {}: maps graph holds revision record <{}> outside contiguous range 1..={max_rev}",
+                        m.name,
+                        r.as_str()
+                    ),
+                ));
+            }
+        }
+    }
+    // Check `next_number + 1` and every minted slot `latest_present` will probe after
+    // writing `next_number`, so no stray or partial subject can break `latest()`.
+    let mut probe_slots: BTreeSet<u64> = BTreeSet::new();
+    if let Some(after_next) = next_number.checked_add(1) {
+        probe_slots.insert(after_next);
+        let mut hi = 2u64;
+        while hi <= next_number {
+            hi = hi
+                .checked_mul(2)
+                .ok_or_else(|| projection_unavailable(&m.name))?;
+        }
+        probe_slots.insert(hi);
+        let mut lo = hi / 2;
+        let mut cur_hi = hi;
+        while cur_hi - lo > 1 {
+            let mid = lo + (cur_hi - lo) / 2;
+            if mid > next_number {
+                probe_slots.insert(mid);
+                cur_hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+    }
+    for slot in probe_slots {
+        control.check()?;
+        let iri = rv::map_iri(dataset, &m.name, slot, control)?;
+        if !matches!(
+            state.reads.record(&iri, std::slice::from_ref(&m.maps))?,
+            ExistingRecord::Absent
+        ) {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "policy {}: maps graph holds a record at revision slot {slot} past revision {prev_number}",
+                    m.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Fold the authenticated revision chain ending at `head_rev` to obtain the set of
 /// accepted decisions effective at `head_rev`.
 fn fold_previous_effective(
@@ -1128,8 +1434,10 @@ fn fold_previous_effective(
     m: &MapGraphs,
     head_rev: &NamedNode,
     retained: &mut usize,
+    retained_limit: usize,
     control: &Control,
 ) -> Result<BTreeSet<NamedNode>> {
+    const MAX_FOLD_ENTRIES: usize = MAX_EVIDENCE * 10;
     let mut chain = Vec::new();
     let mut visited = BTreeSet::new();
     let mut cursor = Some(head_rev.clone());
@@ -1151,13 +1459,14 @@ fn fold_previous_effective(
         if chain.len() == MAX_EVIDENCE {
             return Err(incomplete("resolution map revisions"));
         }
+        retain(retained, retained_limit, rev.as_str().len())?;
         let next = state.iri(&rev, &format!("{PROV}wasRevisionOf"), &m.maps)?;
         chain.push(rev);
         cursor = next;
     }
     chain.reverse();
     let mut effective = BTreeSet::new();
-    let mut counted = 0usize;
+    let mut scanned = 0usize;
     for rev in &chain {
         control.check()?;
         let (adds, more_a) = state.reads.objects_up_to(
@@ -1180,25 +1489,30 @@ fn fold_previous_effective(
         }
         for t in adds {
             if let Term::NamedNode(d) = t {
-                counted += 1;
-                if counted > MAX_EVIDENCE {
+                scanned += 1;
+                if scanned > MAX_FOLD_ENTRIES {
                     return Err(incomplete("resolution map decisions"));
                 }
-                effective.insert(d);
+                if !effective.contains(&d) {
+                    if effective.len() == MAX_EVIDENCE {
+                        return Err(incomplete("resolution map decisions"));
+                    }
+                    retain(retained, retained_limit, d.as_str().len())?;
+                    effective.insert(d);
+                }
             }
         }
         for t in ends {
             if let Term::NamedNode(d) = t {
-                counted += 1;
-                if counted > MAX_EVIDENCE {
+                scanned += 1;
+                if scanned > MAX_FOLD_ENTRIES {
                     return Err(incomplete("resolution map decisions"));
                 }
-                effective.remove(&d);
+                if effective.remove(&d) {
+                    *retained = retained.saturating_sub(d.as_str().len());
+                }
             }
         }
-    }
-    for d in &effective {
-        retain(retained, RETAINED_BYTES, d.as_str().len())?;
     }
     Ok(effective)
 }
@@ -1215,11 +1529,11 @@ fn fold_previous_effective(
 ///
 /// Refusals, which write nothing: invalid input or unknown matching policy,
 /// `unsupported-profile` when the evidence profile is disabled or a policy graph is
-/// detached, `policy-changed` when `policy_version` does not match, `head-changed`,
-/// `identity-conflict` when an effective separation joins one cluster,
+/// detached, `policy-changed` when `policy_version` does not match on first execution,
+/// `head-changed`, `identity-conflict` when an effective separation joins one cluster,
 /// `immutable-record-conflict`, `idempotency-conflict`, `incomplete-evidence` beyond the
-/// operation's record or memory bounds, `NotPermitted` when `options.write` lacks access
-/// or masks triples, and `authority-changed`.
+/// operation's record or local memory bounds, `NotPermitted` when `options.write` lacks
+/// access or masks triples, and `authority-changed`.
 pub fn rebuild(
     main: &Dataset,
     logical: &Dataset,
@@ -1227,6 +1541,29 @@ pub fn rebuild(
     policy_version: Option<u32>,
     options: &Options,
     control: &Control,
+) -> Result<RebuiltMap> {
+    rebuild_bounded(
+        main,
+        logical,
+        policy_name,
+        policy_version,
+        options,
+        control,
+        READS_BYTES,
+        RETAINED_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_bounded(
+    main: &Dataset,
+    logical: &Dataset,
+    policy_name: &str,
+    policy_version: Option<u32>,
+    options: &Options,
+    control: &Control,
+    reads_bytes: u64,
+    retained_limit: usize,
 ) -> Result<RebuiltMap> {
     control.check()?;
     check_store(main, logical)?;
@@ -1242,17 +1579,6 @@ pub fn rebuild(
             "policy: the evidence settings name no matching policy {policy_name}"
         )));
     };
-    if let Some(expected) = policy_version
-        && policy.version != expected
-    {
-        return Err(managed(
-            ManagedErrorKind::PolicyChanged,
-            format!(
-                "policyVersion: policy {policy_name} is at version {}, not {expected}",
-                policy.version
-            ),
-        ));
-    }
     let operation = operation(main, options)?;
     let payload = rv::rebuild_map_payload_digest(policy_name, policy_version, control)?;
     if let Some(access) = options.write.as_ref() {
@@ -1279,7 +1605,11 @@ pub fn rebuild(
     let store = logical.store();
     let branch = store.branch_id();
     let head = store.snapshot();
-    let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
+    let preparation = map_local_budget(
+        crate::access::Preparation::new(control.clone(), reads_bytes),
+        "the rebuild's memory allowance",
+    )?;
+    let records = record_graph_nonces(&settings, &capability);
     let mut state = State {
         reads: Reads::new(&preparation, &head),
         seen: None,
@@ -1287,20 +1617,26 @@ pub fn rebuild(
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
     };
-    let records = record_graph_nonces(&settings, &capability);
-    // A repeated idempotency key answers the first receipt before anything else is read.
-    if options.idempotency_key.is_some() {
-        let probe = Batch {
-            operation,
-            operation_iri: operation_iri(operation),
-            payload_digest: payload,
-            principal: options.principal.clone(),
-            idempotency_key: options.idempotency_key.clone(),
-            graphs: Vec::new(),
-            records: Vec::new(),
-        };
-        let found = state.reads.operation(&probe.operation_iri, &records)?;
-        if let Some((commit, recorded_branch)) = replayed(found, &probe)? {
+    // A repeated idempotency key answers the first receipt before checking current
+    // execution preconditions such as policyVersion or ifHead.
+    let replayed_receipt = map_local_budget(
+        (|| -> Result<Option<RebuiltMap>> {
+            if options.idempotency_key.is_none() {
+                return Ok(None);
+            }
+            let probe = Batch {
+                operation,
+                operation_iri: operation_iri(operation),
+                payload_digest: payload,
+                principal: options.principal.clone(),
+                idempotency_key: options.idempotency_key.clone(),
+                graphs: Vec::new(),
+                records: Vec::new(),
+            };
+            let found = state.reads.operation(&probe.operation_iri, &records)?;
+            let Some((commit, recorded_branch)) = replayed(found, &probe)? else {
+                return Ok(None);
+            };
             let (published, _) = state.reads.subjects_up_to(
                 &ev("availabilityReceipt"),
                 &Term::NamedNode(probe.operation_iri.clone()),
@@ -1358,13 +1694,13 @@ pub fn rebuild(
                 .collect();
             boundary.sort();
             boundary.dedup();
-            return Ok(RebuiltMap {
+            Ok(Some(RebuiltMap {
                 operation: probe.operation_iri,
                 committed: false,
                 replayed: true,
                 commit,
                 branch: recorded_branch.unwrap_or(branch),
-                policy: m.policy_iri,
+                policy: m.policy_iri.clone(),
                 policy_version: recorded_version,
                 revision,
                 number,
@@ -1372,8 +1708,23 @@ pub fn rebuild(
                 boundary,
                 changed: Changed::default(),
                 preview: None,
-            });
-        }
+            }))
+        })(),
+        "the rebuild's memory allowance",
+    )?;
+    if let Some(receipt) = replayed_receipt {
+        return Ok(receipt);
+    }
+    if let Some(expected) = policy_version
+        && policy.version != expected
+    {
+        return Err(managed(
+            ManagedErrorKind::PolicyChanged,
+            format!(
+                "policyVersion: policy {policy_name} is at version {}, not {expected}",
+                policy.version
+            ),
+        ));
     }
     if let Some(expected) = options.if_head
         && head.commit != expected
@@ -1386,334 +1737,408 @@ pub fn rebuild(
             ),
         ));
     }
-    let prev_present = latest_present(&mut state, main.dataset_id(), &m, control)?;
-    let prev_number = prev_present.as_ref().map_or(0, |(_, n, _)| *n);
-    // When `maps` has no revisions or its latest revision does not authenticate (as after
-    // a detach), verify no revision exists past a numbering gap before minting the next.
-    if prev_present.as_ref().is_none_or(|(_, _, auth)| !*auth) {
-        let (revs, more) = state.reads.subjects_up_to(
-            &ev("reviewPolicy"),
-            &Term::NamedNode(m.policy_iri.clone()),
-            m.maps.0.as_str(),
-            MAX_EVIDENCE,
-        )?;
-        if more {
-            return Err(incomplete("resolution map revisions"));
-        }
-        let class = Term::NamedNode(NamedNode::new_unchecked(ev("ResolutionMap")));
-        for r in revs {
-            control.check()?;
-            if !state
-                .reads
-                .contains(r.as_str(), super::RDF_TYPE, &class, m.maps.0.as_str())?
-            {
-                continue;
-            }
-            if let Some(n) = state
-                .text(&r, &ev("mapRevision"), &m.maps)?
-                .and_then(|v| v.parse::<u64>().ok())
-                && n > prev_number
-            {
-                return Err(managed(
-                    ManagedErrorKind::ImmutableRecordConflict,
-                    format!(
-                        "policy {}: maps graph holds revision {n} past a gap after revision {prev_number}",
-                        m.name
-                    ),
-                ));
-            }
-        }
+    struct RebuildPlan {
+        batch: Batch,
+        raw_deletes: Vec<[sparkles_core::id::Id; 4]>,
+        changes: Vec<(Quad, bool)>,
+        changed: Changed,
+        revision: NamedNode,
+        number: u64,
+        previous: Option<NamedNode>,
+        boundary: Vec<NamedNode>,
+        output_held: sparkles_core::access::Reservation,
     }
-    let next_number = prev_number
-        .checked_add(1)
-        .ok_or_else(|| projection_unavailable(&m.name))?;
-    let previous = prev_present
-        .as_ref()
-        .and_then(|(iri, _, auth)| auth.then(|| iri.clone()));
-    let mut retained = 0usize;
-    let prev_effective = match &previous {
-        Some(prev_iri) => {
-            fold_previous_effective(&mut state, &m, prev_iri, &mut retained, control)?
-        }
-        None => BTreeSet::new(),
-    };
-    // Collect all current authenticated accepted decisions under this matching policy
-    // whose targets are authenticated identity proposals in the current protected
-    // identity graphs of the boundary.
-    let (decision_candidates, more) = state.reads.subjects_up_to(
-        &ev("reviewPolicy"),
-        &Term::NamedNode(m.policy_iri.clone()),
-        m.decisions.0.as_str(),
-        MAX_EVIDENCE,
-    )?;
-    if more {
-        return Err(incomplete("decisions of the matching policy"));
-    }
-    let mut seen_current_target: BTreeSet<NamedNode> = BTreeSet::new();
-    let mut effective_decisions: BTreeSet<NamedNode> = BTreeSet::new();
-    let mut matches: Vec<(NamedNode, Facts)> = Vec::new();
-    let mut distincts: Vec<(NamedNode, Facts)> = Vec::new();
-    for d in decision_candidates {
-        control.check()?;
-        if !state.typed(&d, &m.decisions, RecordKind::ReviewDecision)? {
-            continue;
-        }
-        if state.is_superseded(&d, &m.decisions)? {
-            continue;
-        }
-        let Some(target) = state.iri(&d, &ev("target"), &m.decisions)? else {
-            continue;
-        };
-        let Some(disp) = state.disposition(&d, &m.decisions)? else {
-            continue;
-        };
-        if !seen_current_target.insert(target.clone()) {
-            return Err(managed(
-                ManagedErrorKind::ImmutableRecordConflict,
-                format!(
-                    "<{}> has more than one current decision under policy {}",
-                    target.as_str(),
-                    m.name
-                ),
-            ));
-        }
-        if disp != Disposition::Accepted {
-            continue;
-        }
-        let mut found_graph: Option<G> = None;
-        for g in &m.proposals {
-            if g.1.is_none() {
-                continue;
+    let plan = map_local_budget(
+        (|| -> Result<RebuildPlan> {
+            let prev_present = latest_present(&mut state, main.dataset_id(), &m, control)?;
+            let prev_number = prev_present.as_ref().map_or(0, |(_, n, _)| *n);
+            let prev_auth_typed = match &prev_present {
+                Some((iri, _, true)) => state.typed(iri, &m.maps, RecordKind::ResolutionMap)?,
+                _ => false,
+            };
+            let next_number = prev_number
+                .checked_add(1)
+                .ok_or_else(|| projection_unavailable(&m.name))?;
+            verify_maps_for_rebuild(
+                &mut state,
+                main.dataset_id(),
+                &m,
+                prev_number,
+                prev_auth_typed,
+                next_number,
+                control,
+            )?;
+            let previous =
+                prev_auth_typed.then(|| prev_present.as_ref().expect("prev_present").0.clone());
+            let mut retained = 0usize;
+            let prev_effective = match &previous {
+                Some(prev_iri) => fold_previous_effective(
+                    &mut state,
+                    &m,
+                    prev_iri,
+                    &mut retained,
+                    retained_limit,
+                    control,
+                )?,
+                None => BTreeSet::new(),
+            };
+            // Collect all current authenticated accepted decisions under this matching policy
+            // whose targets are authenticated identity proposals in the current protected
+            // identity graphs of the boundary.
+            let (decision_candidates, more) = state.reads.subjects_up_to(
+                &ev("reviewPolicy"),
+                &Term::NamedNode(m.policy_iri.clone()),
+                m.decisions.0.as_str(),
+                MAX_EVIDENCE,
+            )?;
+            if more {
+                return Err(incomplete("decisions of the matching policy"));
             }
-            if state.typed(&target, g, RecordKind::IdentityProposal)? {
-                if found_graph.is_some() {
+            let mut seen_current_target: BTreeSet<NamedNode> = BTreeSet::new();
+            let mut effective_decisions: BTreeSet<NamedNode> = BTreeSet::new();
+            let mut matches: Vec<(NamedNode, Facts)> = Vec::new();
+            let mut distincts: Vec<(NamedNode, Facts)> = Vec::new();
+            for d in decision_candidates {
+                control.check()?;
+                if !state.typed(&d, &m.decisions, RecordKind::ReviewDecision)? {
+                    continue;
+                }
+                if state.is_superseded(&d, &m.decisions)? {
+                    continue;
+                }
+                let Some(target) = state.iri(&d, &ev("target"), &m.decisions)? else {
+                    continue;
+                };
+                let Some(disp) = state.disposition(&d, &m.decisions)? else {
+                    continue;
+                };
+                if seen_current_target.contains(&target) {
                     return Err(managed(
                         ManagedErrorKind::ImmutableRecordConflict,
                         format!(
-                            "<{}> is recorded in more than one identity graph of policy {}",
+                            "<{}> has more than one current decision under policy {}",
                             target.as_str(),
                             m.name
                         ),
                     ));
                 }
-                found_graph = Some(g.clone());
-            }
-        }
-        let Some(tg) = found_graph else {
-            // Target left the boundary or its identity graph was detached/re-protected.
-            continue;
-        };
-        let f = facts(&mut state, &target, &tg)?;
-        let Some(relation) = f.relation else {
-            continue;
-        };
-        retain(
-            &mut retained,
-            RETAINED_BYTES,
-            d.as_str().len() + target.as_str().len() + fact_bytes(&f),
-        )?;
-        effective_decisions.insert(d);
-        match relation {
-            IdentityRelation::PossibleMatch => matches.push((target, f)),
-            IdentityRelation::DistinctEntities => distincts.push((target, f)),
-        }
-    }
-    // Recompute connected components from all effective PossibleMatch proposals.
-    let mut entity_to_matches: BTreeMap<NamedNode, Vec<usize>> = BTreeMap::new();
-    for (idx, (_, f)) in matches.iter().enumerate() {
-        control.check()?;
-        for e in &f.entities {
-            entity_to_matches.entry(e.clone()).or_default().push(idx);
-        }
-    }
-    let mut visited: BTreeSet<NamedNode> = BTreeSet::new();
-    let mut desired: BTreeMap<NamedNode, NamedNode> = BTreeMap::new();
-    for seed in entity_to_matches.keys() {
-        if visited.contains(seed) {
-            continue;
-        }
-        let mut cluster = Cluster::default();
-        cluster.entities.insert(seed.clone());
-        visited.insert(seed.clone());
-        let mut queue = VecDeque::from([seed.clone()]);
-        while let Some(e) = queue.pop_front() {
-            control.check()?;
-            if let Some(indices) = entity_to_matches.get(&e) {
-                for &idx in indices {
-                    let (_, f) = &matches[idx];
-                    if let Some(pref) = &f.preferred {
-                        cluster.preferred.insert(pref.clone());
+                retain(&mut retained, retained_limit, target.as_str().len())?;
+                seen_current_target.insert(target.clone());
+                if disp != Disposition::Accepted {
+                    continue;
+                }
+                let mut found_graph: Option<G> = None;
+                for g in &m.proposals {
+                    if g.1.is_none() {
+                        continue;
                     }
-                    for x in &f.entities {
-                        if cluster.entities.insert(x.clone()) {
-                            visited.insert(x.clone());
-                            queue.push_back(x.clone());
+                    if state.typed(&target, g, RecordKind::IdentityProposal)? {
+                        if found_graph.is_some() {
+                            return Err(managed(
+                                ManagedErrorKind::ImmutableRecordConflict,
+                                format!(
+                                    "<{}> is recorded in more than one identity graph of policy {}",
+                                    target.as_str(),
+                                    m.name
+                                ),
+                            ));
+                        }
+                        found_graph = Some(g.clone());
+                    }
+                }
+                let Some(tg) = found_graph else {
+                    // Target left the boundary or its identity graph was detached/re-protected.
+                    continue;
+                };
+                let f = facts(&mut state, &target, &tg)?;
+                let Some(relation) = f.relation else {
+                    continue;
+                };
+                retain(
+                    &mut retained,
+                    retained_limit,
+                    d.as_str().len() + target.as_str().len() + fact_bytes(&f),
+                )?;
+                effective_decisions.insert(d);
+                match relation {
+                    IdentityRelation::PossibleMatch => matches.push((target, f)),
+                    IdentityRelation::DistinctEntities => distincts.push((target, f)),
+                }
+            }
+            // Recompute connected components from all effective PossibleMatch proposals.
+            let mut entity_to_matches: BTreeMap<NamedNode, Vec<usize>> = BTreeMap::new();
+            for (idx, (_, f)) in matches.iter().enumerate() {
+                control.check()?;
+                for e in &f.entities {
+                    entity_to_matches.entry(e.clone()).or_default().push(idx);
+                }
+            }
+            let mut visited: BTreeSet<NamedNode> = BTreeSet::new();
+            let mut desired: BTreeMap<NamedNode, NamedNode> = BTreeMap::new();
+            for seed in entity_to_matches.keys() {
+                if visited.contains(seed) {
+                    continue;
+                }
+                let mut cluster = Cluster::default();
+                cluster.entities.insert(seed.clone());
+                visited.insert(seed.clone());
+                let mut queue = VecDeque::from([seed.clone()]);
+                while let Some(e) = queue.pop_front() {
+                    control.check()?;
+                    if let Some(indices) = entity_to_matches.get(&e) {
+                        for &idx in indices {
+                            let (_, f) = &matches[idx];
+                            if let Some(pref) = &f.preferred {
+                                cluster.preferred.insert(pref.clone());
+                            }
+                            for x in &f.entities {
+                                if cluster.entities.insert(x.clone()) {
+                                    visited.insert(x.clone());
+                                    queue.push_back(x.clone());
+                                }
+                            }
                         }
                     }
                 }
+                if let Some(rep) = cluster.representative().cloned() {
+                    for x in cluster.entities {
+                        retain(
+                            &mut retained,
+                            retained_limit,
+                            x.as_str().len() + rep.as_str().len(),
+                        )?;
+                        desired.insert(x, rep.clone());
+                    }
+                }
             }
-        }
-        if let Some(rep) = cluster.representative().cloned() {
-            for x in cluster.entities {
-                retain(
-                    &mut retained,
-                    RETAINED_BYTES,
-                    x.as_str().len() + rep.as_str().len(),
-                )?;
-                desired.insert(x, rep.clone());
+            // Validate all effective DistinctEntities constraints against the recomputed clusters.
+            for (_, f) in &distincts {
+                control.check()?;
+                let mut seen_reps: BTreeSet<&NamedNode> = BTreeSet::new();
+                for e in &f.entities {
+                    if let Some(rep) = desired.get(e)
+                        && !seen_reps.insert(rep)
+                    {
+                        return Err(managed(
+                            ManagedErrorKind::IdentityConflict,
+                            format!(
+                                "policy {}: an accepted separation keeps two entities of one cluster apart; reverse the match or the separation",
+                                m.name
+                            ),
+                        ));
+                    }
+                }
             }
-        }
-    }
-    // Validate all effective DistinctEntities constraints against the recomputed clusters.
-    for (_, f) in &distincts {
-        control.check()?;
-        let mut seen_reps: BTreeSet<&NamedNode> = BTreeSet::new();
-        for e in &f.entities {
-            if let Some(rep) = desired.get(e)
-                && !seen_reps.insert(rep)
-            {
-                return Err(managed(
-                    ManagedErrorKind::IdentityConflict,
-                    format!(
-                        "policy {}: an accepted separation keeps two entities of one cluster apart; reverse the match or the separation",
-                        m.name
-                    ),
-                ));
+            // Diff the desired resolvesTo triples against ALL existing quads in the output graph
+            // using physical term IDs so blank-node and detached-epoch quads are stripped cleanly
+            // under the shared preparation budget without decoding unchanged output triples.
+            let mut output_held = state.reads.preparation().reserve(0)?;
+            let mut keep: HashSet<[sparkles_core::id::Id; 3]> = HashSet::new();
+            let mut desired_ids: Vec<(&NamedNode, &NamedNode, Option<[sparkles_core::id::Id; 3]>)> =
+                Vec::new();
+            let resolves_to_id = state.reads.iri_id(RESOLVES_TO)?;
+            if !desired.is_empty() {
+                let slot_bytes = desired.len() as u64
+                    * std::mem::size_of::<(
+                        &NamedNode,
+                        &NamedNode,
+                        Option<[sparkles_core::id::Id; 3]>,
+                    )>() as u64;
+                output_held.grow_by(slot_bytes)?;
+                desired_ids.reserve_exact(desired.len());
+                if let Some(p_id) = resolves_to_id {
+                    let keep_bytes = desired.len() as u64
+                        * (std::mem::size_of::<[sparkles_core::id::Id; 3]>() as u64 + 8)
+                        * 2;
+                    output_held.grow_by(keep_bytes)?;
+                    keep.reserve(desired.len());
+                    for (e, rep) in &desired {
+                        control.check()?;
+                        let triple_id = match (
+                            state.reads.iri_id(e.as_str())?,
+                            state.reads.iri_id(rep.as_str())?,
+                        ) {
+                            (Some(s_id), Some(o_id)) => {
+                                let id = [s_id, p_id, o_id];
+                                keep.insert(id);
+                                Some(id)
+                            }
+                            _ => None,
+                        };
+                        desired_ids.push((e, rep, triple_id));
+                    }
+                } else {
+                    for (e, rep) in &desired {
+                        control.check()?;
+                        desired_ids.push((e, rep, None));
+                    }
+                }
             }
-        }
-    }
-    // Diff the desired resolvesTo triples against ALL existing quads in the output graph
-    // so stale or detached-epoch triples are removed atomically.
-    let mut output_held = state.reads.preparation().reserve(0)?;
-    let (existing, more) = state.reads.graph_triples_up_to(
-        m.output.0.as_str(),
-        MAX_OUTPUT_TRIPLES,
-        &mut output_held,
-    )?;
-    if more {
-        return Err(incomplete("triples of the output graph"));
-    }
-    let mut present_rep: BTreeMap<NamedNode, Vec<NamedNode>> = BTreeMap::new();
-    for t in &existing {
-        if t.predicate.as_str() == RESOLVES_TO
-            && let (NamedOrBlankNode::NamedNode(s), Term::NamedNode(o)) = (&t.subject, &t.object)
-        {
-            present_rep.entry(s.clone()).or_default().push(o.clone());
-        }
-    }
-    let desired_set: HashSet<Triple> = desired.iter().map(|(e, rep)| resolves(e, rep)).collect();
-    let existing_set: HashSet<Triple> = existing.iter().cloned().collect();
-    let mut changes: Vec<(Quad, bool)> = Vec::new();
-    let mut changed = Changed::default();
-    let mut to_remove: Vec<Triple> = existing
-        .into_iter()
-        .filter(|t| !desired_set.contains(t))
-        .collect();
-    to_remove.sort_by_cached_key(|t| t.to_string());
-    for t in to_remove {
-        changes.push((quad(&t, &m.output.0), false));
-        changed.removed.push(ProjectionChange {
-            output: m.output.0.clone(),
-            triple: t,
-        });
-    }
-    for (e, rep) in &desired {
-        let t = resolves(e, rep);
-        if !existing_set.contains(&t) {
-            changes.push((quad(&t, &m.output.0), true));
-            changed.inserted.push(ProjectionChange {
-                output: m.output.0.clone(),
-                triple: t,
+            let diff = state.reads.graph_quads_diff_up_to(
+                m.output.0.as_str(),
+                &keep,
+                MAX_OUTPUT_TRIPLES,
+                &mut output_held,
+            )?;
+            let mut removed = diff.removed;
+            let present = diff.present;
+            if diff.more {
+                return Err(incomplete("triples of the output graph"));
+            }
+            drop(keep);
+            control.check()?;
+            removed.sort_by(|a, b| cmp_triple(&a.1, &b.1));
+            control.check()?;
+            let mut raw_deletes: Vec<[sparkles_core::id::Id; 4]> = Vec::new();
+            let mut changes: Vec<(Quad, bool)> = Vec::new();
+            let mut changed = Changed::default();
+            let mut moved_set: BTreeSet<NamedNode> = BTreeSet::new();
+            if !removed.is_empty() {
+                let del_bytes = removed.len() as u64
+                    * (std::mem::size_of::<[sparkles_core::id::Id; 4]>() as u64
+                        + std::mem::size_of::<ProjectionChange>() as u64
+                        + m.output.0.as_str().len() as u64);
+                output_held.grow_by(del_bytes)?;
+                raw_deletes.reserve_exact(removed.len());
+                changed.removed.reserve_exact(removed.len());
+                for (ids, t) in removed {
+                    control.check()?;
+                    if t.predicate.as_str() == RESOLVES_TO
+                        && let (NamedOrBlankNode::NamedNode(s), Term::NamedNode(_)) =
+                            (&t.subject, &t.object)
+                        && !moved_set.contains(s)
+                    {
+                        output_held.grow_by(
+                            std::mem::size_of::<NamedNode>() as u64 + s.as_str().len() as u64,
+                        )?;
+                        moved_set.insert(s.clone());
+                    }
+                    raw_deletes.push(ids);
+                    changed.removed.push(ProjectionChange {
+                        output: m.output.0.clone(),
+                        triple: t,
+                    });
+                }
+            }
+            for (e, rep, triple_id) in desired_ids {
+                control.check()?;
+                if triple_id.is_some_and(|id| present.contains(&id)) {
+                    continue;
+                }
+                let ins_bytes = std::mem::size_of::<(Quad, bool)>() as u64
+                    + std::mem::size_of::<ProjectionChange>() as u64
+                    + (e.as_str().len()
+                        + RESOLVES_TO.len()
+                        + rep.as_str().len()
+                        + m.output.0.as_str().len()) as u64
+                        * 2;
+                output_held.grow_by(ins_bytes)?;
+                let t = resolves(e, rep);
+                changes.push((quad(&t, &m.output.0), true));
+                changed.inserted.push(ProjectionChange {
+                    output: m.output.0.clone(),
+                    triple: t,
+                });
+                if !moved_set.contains(e) {
+                    output_held.grow_by(
+                        std::mem::size_of::<NamedNode>() as u64 + e.as_str().len() as u64,
+                    )?;
+                    moved_set.insert(e.clone());
+                }
+            }
+            drop(present);
+            let moved: Vec<NamedNode> = moved_set.into_iter().collect();
+            let adds: Vec<NamedNode> = effective_decisions
+                .difference(&prev_effective)
+                .cloned()
+                .collect();
+            let ends: Vec<NamedNode> = prev_effective
+                .difference(&effective_decisions)
+                .cloned()
+                .collect();
+            let boundary_protections = m.boundary_protections();
+            let record = rv::map_record(
+                main.dataset_id(),
+                &MapRevision {
+                    policy: policy_name,
+                    version: m.version,
+                    number: next_number,
+                    previous: previous.as_ref(),
+                    output: &m.output.0,
+                    adds: &adds,
+                    ends: &ends,
+                    nonces,
+                    boundary: &boundary_protections,
+                },
+                &m.maps.0,
+                control,
+            )?;
+            let revision = record.iri.clone();
+            changed.map = Some(MapChange {
+                policy: m.policy_iri.clone(),
+                revision: revision.clone(),
+                number: next_number,
+                previous: previous.clone(),
+                decisions_added: adds,
+                decisions_ended: ends,
+                entities: moved,
             });
-        }
-    }
-    let all_entities: BTreeSet<&NamedNode> = present_rep.keys().chain(desired.keys()).collect();
-    let mut moved = Vec::new();
-    for e in all_entities {
-        let want = desired.get(e);
-        let have = present_rep.get(e);
-        let same = match (have, want) {
-            (None, None) => true,
-            (Some(v), Some(r)) => v.len() == 1 && &v[0] == r,
-            _ => false,
-        };
-        if !same {
-            moved.push(e.clone());
-        }
-    }
-    let adds: Vec<NamedNode> = effective_decisions
-        .difference(&prev_effective)
-        .cloned()
-        .collect();
-    let ends: Vec<NamedNode> = prev_effective
-        .difference(&effective_decisions)
-        .cloned()
-        .collect();
-    let boundary_protections = m.boundary_protections();
-    let record = rv::map_record(
-        main.dataset_id(),
-        &MapRevision {
-            policy: policy_name,
-            version: m.version,
-            number: next_number,
-            previous: previous.as_ref(),
-            output: &m.output.0,
-            adds: &adds,
-            ends: &ends,
-            nonces,
-            boundary: &boundary_protections,
-        },
-        &m.maps.0,
-        control,
+            let batch = Batch {
+                operation,
+                operation_iri: operation_iri(operation),
+                payload_digest: payload,
+                principal: options.principal.clone(),
+                idempotency_key: options.idempotency_key.clone(),
+                graphs: vec![m.maps.0.clone()],
+                records: vec![record],
+            };
+            let skip = vec![false];
+            check_identities(&mut state, &batch, &records, &skip)?;
+            let boundary = boundary_protections.into_iter().map(|(g, _)| g).collect();
+            Ok(RebuildPlan {
+                batch,
+                raw_deletes,
+                changes,
+                changed,
+                revision,
+                number: next_number,
+                previous,
+                boundary,
+                output_held,
+            })
+        })(),
+        "the rebuild's memory allowance",
     )?;
-    let revision = record.iri.clone();
-    changed.map = Some(MapChange {
-        policy: m.policy_iri.clone(),
-        revision: revision.clone(),
-        number: next_number,
-        previous: previous.clone(),
-        decisions_added: adds,
-        decisions_ended: ends,
-        entities: moved,
-    });
-    let batch = Batch {
-        operation,
-        operation_iri: operation_iri(operation),
-        payload_digest: payload,
-        principal: options.principal.clone(),
-        idempotency_key: options.idempotency_key.clone(),
-        graphs: vec![m.maps.0.clone()],
-        records: vec![record],
-    };
-    let skip = vec![false];
-    check_identities(&mut state, &batch, &records, &skip)?;
-    drop(output_held);
     drop(state);
+    let skip = vec![false];
     let committed = publish(
         main,
         logical,
         capability,
         head.commit,
-        &batch,
+        &plan.batch,
         &skip,
-        &changes,
+        &plan.raw_deletes,
+        &plan.changes,
         options,
         control,
     )?;
-    let boundary = boundary_protections.into_iter().map(|(g, _)| g).collect();
+    drop(plan.raw_deletes);
+    drop(plan.changes);
+    drop(plan.output_held);
     Ok(RebuiltMap {
-        operation: batch.operation_iri,
+        operation: plan.batch.operation_iri,
         committed: committed.committed,
         replayed: false,
         commit: committed.commit,
         branch,
         policy: m.policy_iri,
         policy_version: m.version,
-        revision,
-        number: next_number,
-        previous,
-        boundary,
-        changed,
+        revision: plan.revision,
+        number: plan.number,
+        previous: plan.previous,
+        boundary: plan.boundary,
+        changed: plan.changed,
         preview: committed.preview,
     })
 }
@@ -2343,5 +2768,104 @@ mod tests {
             preferred: Some(NamedNode::new_unchecked("urn:a")),
         };
         assert_eq!(fact_bytes(&f), 5 + 6 + 5);
+    }
+
+    #[test]
+    fn rebuild_local_budget_maps_to_incomplete_evidence_and_preserves_other_errors() {
+        // Local preparation memory exhaustion maps to `incomplete-evidence` (HTTP 422),
+        // while server-pool exhaustion, cancellation and timeout stay distinct.
+        let local_err: Result<()> = Err(Error::BudgetExceeded(sparkles_core::Budget {
+            kind: sparkles_core::BudgetKind::Memory,
+            limit: 1024,
+            requested: 2048,
+        }));
+        let mapped = map_local_budget(local_err, "the rebuild's memory allowance").unwrap_err();
+        assert_eq!(mapped.code(), "incomplete-evidence");
+        assert!(matches!(
+            mapped,
+            Error::Managed(ref m) if m.kind == ManagedErrorKind::IncompleteEvidence && m.status() == 422
+        ));
+
+        let server_err: Result<()> = Err(Error::BudgetExceeded(sparkles_core::Budget {
+            kind: sparkles_core::BudgetKind::ServerMemory,
+            limit: 1024,
+            requested: 2048,
+        }));
+        assert!(matches!(
+            map_local_budget(server_err, "the rebuild's memory allowance"),
+            Err(Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::ServerMemory
+        ));
+        assert!(matches!(
+            map_local_budget::<()>(Err(Error::Cancelled), "the rebuild's memory allowance"),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            map_local_budget::<()>(Err(Error::Timeout), "the rebuild's memory allowance"),
+            Err(Error::Timeout)
+        ));
+
+        // Detached output graph with a large literal that exceeds a small local preparation
+        // allowance must refuse with `incomplete-evidence` without committing.
+        let ds = configured();
+        let ab = propose(&ds, IDENTITY, "ab", &["urn:a", "urn:b"]);
+        decide(&ds, &ab, Disposition::Accepted, None);
+        crate::evidence::detach(&ds, "urn:ev:map").unwrap();
+        let big = "x".repeat(32 * 1024);
+        ds.update(&format!(
+            "INSERT DATA {{ GRAPH <urn:ev:map> {{ <urn:z> <urn:big> \"{big}\" }} }}"
+        ))
+        .unwrap();
+        let (settings, _) = settings_of(&ds).unwrap();
+        crate::evidence::configure(&ds, &settings, &Control::none()).unwrap();
+        let head = ds.store().head_commit().seq;
+        let admin = Options::new(n("urn:principal:admin"));
+
+        // Under a 16 KiB local preparation cap, decoding the 32 KiB literal refuses before
+        // retaining it, returning `incomplete-evidence` (HTTP 422) and writing nothing.
+        let err = rebuild_bounded(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &admin,
+            &Control::none(),
+            16 * 1024,
+            RETAINED_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "incomplete-evidence", "{err}");
+        assert_eq!(ds.store().head_commit().seq, head);
+
+        // Cancellation during planning returns Error::Cancelled with no commit.
+        let cancelled = Control::none();
+        cancelled.cancel.cancel();
+        let err = rebuild_bounded(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &admin,
+            &cancelled,
+            READS_BYTES,
+            RETAINED_BYTES,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert_eq!(ds.store().head_commit().seq, head);
+
+        // Under the normal allowance the rebuild succeeds and strips the large literal.
+        let ok = rebuild_bounded(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &admin,
+            &Control::none(),
+            READS_BYTES,
+            RETAINED_BYTES,
+        )
+        .unwrap();
+        assert!(ok.committed);
+        assert_eq!(ok.changed.removed.len(), 1);
     }
 }

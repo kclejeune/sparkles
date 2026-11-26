@@ -60,7 +60,7 @@ use crate::{Error, Result};
 use base64::Engine as _;
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use sha1::{Digest as _, Sha1};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use uuid::Uuid;
 
 const EV: &str = "urn:x-sparkles:evidence:";
@@ -1199,6 +1199,16 @@ const CACHE_START: u64 = 1024;
 /// coexist while the identities move into the set. The charge rounds up.
 const IDENTITY_START: u64 = 512;
 
+/// The result of [`Reads::graph_quads_diff_up_to`].
+pub struct GraphQuadsDiff {
+    /// Non-matching quads `([s, p, o, g], Triple)` not present in `keep`.
+    pub removed: Vec<([Id; 4], Triple)>,
+    /// Subset of `keep` that is already present in the graph.
+    pub present: HashSet<[Id; 3]>,
+    /// Whether the graph holds more than `limit` quads.
+    pub more: bool,
+}
+
 impl<'a> Reads<'a> {
     /// The preparation the reads are charged to.
     pub fn preparation(&self) -> &'a Preparation {
@@ -1383,35 +1393,69 @@ impl<'a> Reads<'a> {
         Ok(found)
     }
 
-    /// All triples in `g`, up to `limit`, and whether more exist. Raw rows are charged to
-    /// the preparation during the scan, and each decoded triple is charged to `held`
-    /// before it is retained so the caller keeps it charged for as long as it keeps `held`.
-    pub fn graph_triples_up_to(
+    /// Look up the stored term ID of `iri` in this snapshot, caching the result under the
+    /// reader's preparation.
+    pub fn iri_id(&mut self, iri: &str) -> Result<Option<Id>> {
+        self.id(iri)
+    }
+
+    /// Scan all quads in `g`, up to `limit`, returning:
+    /// - the non-matching quads `([s, p, o, g], Triple)` whose `[s, p, o]` is not in `keep`,
+    /// - the subset of `keep` that is present in `g`, and
+    /// - whether `g` holds more than `limit` quads.
+    ///
+    /// Raw rows are charged to the preparation while the scan runs. Retained entries in
+    /// `present` and each decoded removal (its vector slot and every cloned term) are
+    /// charged to `held` before allocation so the caller keeps them charged for as long
+    /// as it keeps `held`.
+    pub fn graph_quads_diff_up_to(
         &mut self,
         g: &str,
+        keep: &HashSet<[Id; 3]>,
         limit: usize,
         held: &mut Reservation,
-    ) -> Result<(Vec<Triple>, bool)> {
-        let Some(g) = self.id(g)? else {
-            return Ok((Vec::new(), false));
+    ) -> Result<GraphQuadsDiff> {
+        let Some(g_id) = self.id(g)? else {
+            return Ok(GraphQuadsDiff {
+                removed: Vec::new(),
+                present: HashSet::new(),
+                more: false,
+            });
         };
         const ROW: u64 = std::mem::size_of::<[Id; 3]>() as u64;
+        const PRESENT_ENTRY: u64 = (std::mem::size_of::<[Id; 3]>() as u64 + 8) * 2;
+        const OUT_ENTRY: u64 = std::mem::size_of::<([Id; 4], Triple)>() as u64;
         const CHUNK: usize = 4096;
         let mut rows_held = self.preparation.reserve(0)?;
-        let mut rows: Vec<[Id; 3]> = Vec::new();
+        let mut remove_rows: Vec<[Id; 3]> = Vec::new();
+        let mut present: HashSet<[Id; 3]> = HashSet::new();
+        let mut scanned = 0usize;
         let mut more = false;
-        self.preparation.scan(self.snap, Perm::Gspo, &[g.0], |q| {
-            if rows.len() == limit {
-                more = true;
-                return Ok(false);
-            }
-            if rows.len() == rows.capacity() {
-                rows_held.grow_by(CHUNK as u64 * ROW)?;
-                rows.reserve_exact(CHUNK);
-            }
-            rows.push([q[0], q[1], q[2]]);
-            Ok(true)
-        })?;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g_id.0], |q| {
+                if scanned == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                scanned += 1;
+                let row = [q[0], q[1], q[2]];
+                if keep.contains(&row) {
+                    if present.len() == present.capacity() {
+                        let grow = present.capacity().clamp(16, CHUNK);
+                        held.grow_by(grow as u64 * PRESENT_ENTRY)?;
+                        present.reserve(grow);
+                    }
+                    present.insert(row);
+                } else {
+                    if remove_rows.len() == remove_rows.capacity() {
+                        let grow = remove_rows.capacity().clamp(16, CHUNK);
+                        rows_held.grow_by(grow as u64 * ROW)?;
+                        remove_rows.reserve_exact(grow);
+                    }
+                    remove_rows.push(row);
+                }
+                Ok(true)
+            })?;
         fn term_bytes(t: &Term) -> u64 {
             match t {
                 Term::NamedNode(n) => n.as_str().len() as u64,
@@ -1433,41 +1477,59 @@ impl<'a> Reads<'a> {
                 }
             }
         }
-        let mut out = Vec::with_capacity(rows.len());
-        for [s, p, o] in rows {
-            let subject = match self
-                .preparation
-                .with_term(self.snap, s, |t| Ok(t.cloned()))?
-            {
-                Some(Term::NamedNode(n)) => NamedOrBlankNode::NamedNode(n),
-                Some(Term::BlankNode(b)) => NamedOrBlankNode::BlankNode(b),
-                _ => continue,
-            };
-            let Some(Term::NamedNode(predicate)) =
-                self.preparation
-                    .with_term(self.snap, p, |t| Ok(t.cloned()))?
+        let mut out: Vec<([Id; 4], Triple)> = Vec::new();
+        for [s, p, o] in remove_rows {
+            if out.len() == out.capacity() {
+                let grow = if out.is_empty() {
+                    1
+                } else {
+                    out.capacity().min(256)
+                };
+                held.grow_by(grow as u64 * OUT_ENTRY)?;
+                out.reserve_exact(grow);
+            }
+            let Some(subject) = self.preparation.with_term(self.snap, s, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by(n.as_str().len() as u64)?;
+                    Ok(Some(NamedOrBlankNode::NamedNode(n.clone())))
+                }
+                Some(Term::BlankNode(b)) => {
+                    held.grow_by(b.as_str().len() as u64)?;
+                    Ok(Some(NamedOrBlankNode::BlankNode(b.clone())))
+                }
+                _ => Ok(None),
+            })?
             else {
                 continue;
             };
-            let Some(object) = self
-                .preparation
-                .with_term(self.snap, o, |t| Ok(t.cloned()))?
+            let Some(predicate) = self.preparation.with_term(self.snap, p, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by(n.as_str().len() as u64)?;
+                    Ok(Some(n.clone()))
+                }
+                _ => Ok(None),
+            })?
             else {
                 continue;
             };
-            let subj_bytes = match &subject {
-                NamedOrBlankNode::NamedNode(n) => n.as_str().len() as u64,
-                NamedOrBlankNode::BlankNode(b) => b.as_str().len() as u64,
+            let Some(object) = self.preparation.with_term(self.snap, o, |t| match t {
+                Some(t) => {
+                    held.grow_by(term_bytes(t))?;
+                    Ok(Some(t.clone()))
+                }
+                None => Ok(None),
+            })?
+            else {
+                continue;
             };
-            let triple_bytes = std::mem::size_of::<Triple>() as u64
-                + subj_bytes
-                + predicate.as_str().len() as u64
-                + term_bytes(&object)
-                + IDENTITY_ENTRY;
-            held.grow_by(triple_bytes)?;
-            out.push(Triple::new(subject, predicate, object));
+            out.push(([s, p, o, g_id], Triple::new(subject, predicate, object)));
         }
-        Ok((out, more))
+        drop(rows_held);
+        Ok(GraphQuadsDiff {
+            removed: out,
+            present,
+            more,
+        })
     }
 
     /// Whether the quad `s p o g` is in the snapshot. `o` is a ground term.

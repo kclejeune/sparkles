@@ -881,8 +881,9 @@ struct Commit {
     preview: Option<Box<crate::preview::Preview>>,
 }
 
-/// Publish `batch` and the output changes as one commit of the evidence owner, from
-/// the head `expected` that the operation read.
+/// Publish `batch`, `raw_deletes` (physical quad IDs from the snapshot at `expected`) and
+/// `changes` as one commit of the evidence owner, from the head `expected` that the
+/// operation read.
 #[allow(clippy::too_many_arguments)]
 fn publish(
     main: &Dataset,
@@ -891,6 +892,7 @@ fn publish(
     expected: u64,
     batch: &Batch,
     skip: &[bool],
+    raw_deletes: &[[sparkles_core::id::Id; 4]],
     changes: &[(Quad, bool)],
     options: &Options,
     control: &Control,
@@ -938,6 +940,11 @@ fn publish(
     for q in &quads {
         let ids = t.encode_quad(q, &mut labels)?;
         t.insert(ids)?;
+    }
+    // Physical-ID deletions target exact stored quads from `expected` without re-interning,
+    // so blank nodes, triple terms and composite literals containing blank nodes are removed.
+    for ids in raw_deletes {
+        t.delete(*ids)?;
     }
     for (q, insert) in changes {
         let ids = t.encode_quad(q, &mut labels)?;
@@ -1574,7 +1581,16 @@ pub fn review(
     check_identities(&mut state, &batch, &records, &skip)?;
     drop(state);
     let committed = publish(
-        main, logical, capability, if_head, &batch, &skip, &changes, options, control,
+        main,
+        logical,
+        capability,
+        if_head,
+        &batch,
+        &skip,
+        &[],
+        &changes,
+        options,
+        control,
     )?;
     drop(held);
     Ok(Reviewed {
@@ -1984,6 +2000,7 @@ pub fn withdraw(
         head.commit,
         &batch,
         &skip,
+        &[],
         &changes,
         options,
         control,
