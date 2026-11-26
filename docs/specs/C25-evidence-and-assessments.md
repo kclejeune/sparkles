@@ -2346,6 +2346,24 @@ also covers a withdrawal behind a cited claim and a state left behind the report
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
 
+### Evidence operations in the bindings
+
+Roadmap item 509 exposes the twelve typed evidence operations in Python
+(`Dataset.evidence`), Node.js (`Dataset.evidence`) and the JVM
+(`DatasetGraphSparkles.evidence()`). Each binding delegates to the shared
+JSON codec in `sparkles::evidence::binding` over the same Rust operations that
+the HTTP server uses, covering settings reads, configuration, graph detachment,
+source hold listing, acquisition and release, exact stored-fact and record
+resolution, claim and identity proposals, reviews, withdrawals, matching-policy
+entity resolution and dependent assessment lookups.
+
+Managed-boundary refusals map to the bindings' typed exception classes and carry
+the stable machine code (`e.code` in Python and the JVM, `e.details.code` in
+Node.js). Closed-dataset and active-transaction guards refuse operations before
+taking the store writer lock. All twelve `evidence.*` entries in
+`crates/sparkles/bindings.toml` name their concrete binding paths, and the
+Python parity test no longer defers any evidence operation.
+
 ### Scope changes
 
 **Probabilistic reasoning through external engines.** The scope statement in §1 excluded probabilistic reasoning. Probabilistic reasoning through external engines, as integration only, is now planned under [ROADMAP](../ROADMAP.md) item 463 and [F28](F28-ml-and-probabilistic-integration/README.md). Sparkles still defines no probabilistic reasoner of its own.
