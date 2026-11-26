@@ -874,10 +874,22 @@ impl GraphLocalStagingGuard {
     }
 
     fn finish(mut self) -> GitResult<bool> {
-        let Some(dir) = self.staging_dir.take() else {
-            return Ok(false);
-        };
-        remove_empty_graph_staging_dir(&dir)
+        let dir = self
+            .staging_dir
+            .take()
+            .unwrap_or_else(|| self.graphs_dir.join(GRAPH_STAGING_SUBDIR));
+        match fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(GitError::io(&dir, e)),
+            Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_dir() => {
+                Err(GitError::UnsafePath {
+                    path: format!("{GRAPHS_DIR}/{GRAPH_STAGING_SUBDIR}"),
+                    reason: "reserved graph staging path is occupied by a non-directory entry"
+                        .into(),
+                })
+            }
+            Ok(_) => remove_empty_graph_staging_dir(&dir),
+        }
     }
 }
 
@@ -4724,7 +4736,7 @@ mod tests {
                 ..Default::default()
             };
             let err = write_git_tree(
-                vec![q1, q2, q3, q4_big],
+                vec![q1.clone(), q2.clone(), q3.clone(), q4_big],
                 &BTreeMap::new(),
                 dir.path(),
                 &tight_opts,
@@ -4738,6 +4750,71 @@ mod tests {
         assert!(
             !local_staging.exists(),
             "pre-publication refusal on split mount must not leave empty graphs/.sparkles-staging/"
+        );
+        verify_git_tree(dir.path()).unwrap();
+
+        // 6. R7-6: Same-filesystem write without EXDEV fallback must still run the final
+        //    reserved-directory check. An obstructed `graphs/.sparkles-staging/` that reappears
+        //    during an ordinary write must block manifest publication and pending removal while
+        //    preserving unrecognized entries, and an empty reappearing directory must be cleaned
+        //    up cleanly before manifest publication.
+        let q5 = Quad::new(
+            NamedNode::new_unchecked("http://example.org/s5"),
+            NamedNode::new_unchecked("http://example.org/p"),
+            Literal::from(5i64),
+            GraphName::DefaultGraph,
+        );
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                before_remove_graph_local_staging_action: Some(Box::new(|graphs_dir| {
+                    let staging = graphs_dir.join(GRAPH_STAGING_SUBDIR);
+                    fs::create_dir(&staging).unwrap();
+                    fs::write(staging.join("same-fs-note.txt"), b"keep-same-fs").unwrap();
+                })),
+                ..Default::default()
+            });
+            let err = write_git_tree(
+                vec![q1.clone(), q2.clone(), q3.clone(), q5.clone()],
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GitError::InvalidManifest(_)),
+                "obstructed same-fs final staging check must refuse, got {err:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(local_staging.join("same-fs-note.txt")).unwrap(),
+            b"keep-same-fs",
+            "unrecognized entry inside reappearing graphs/.sparkles-staging must be preserved"
+        );
+        assert!(
+            dir.path().join(PENDING_WRITE_REL_PATH).exists(),
+            "pending journal must remain on disk when same-fs final staging check fails"
+        );
+        fs::remove_file(local_staging.join("same-fs-note.txt")).unwrap();
+        fs::remove_dir(&local_staging).unwrap();
+
+        {
+            let _g = profile_test_hooks::install(profile_test_hooks::FaultState {
+                before_remove_graph_local_staging_action: Some(Box::new(|graphs_dir| {
+                    fs::create_dir(graphs_dir.join(GRAPH_STAGING_SUBDIR)).unwrap();
+                })),
+                ..Default::default()
+            });
+            write_git_tree(
+                vec![q1, q2, q3, q5],
+                &BTreeMap::new(),
+                dir.path(),
+                &WriteOptions::default(),
+            )
+            .unwrap();
+        }
+        assert!(
+            !local_staging.exists(),
+            "empty reappearing graphs/.sparkles-staging must be removed on same-fs path"
         );
         verify_git_tree(dir.path()).unwrap();
     }
