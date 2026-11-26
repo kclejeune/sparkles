@@ -49,6 +49,8 @@ use crate::engine::{Atom, CBuiltin, CHead, CRule, Slot, Step};
 use crate::graph::Triple;
 use crate::terms::Terms;
 use rustc_hash::{FxHashMap, FxHashSet};
+use sparkles_core::id::Id;
+use sparkles_core::incr::footprint::Resolved as FootprintResolved;
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -810,6 +812,20 @@ pub(crate) struct Vocab {
 }
 
 impl Vocab {
+    /// The schema vocabulary as a shared incremental [`FootprintResolved`]: every
+    /// schema predicate `(None, Some(p), None)` and every meta-class typing
+    /// `(None, Some(rdf_type), Some(c))`.
+    pub(crate) fn resolved_footprint(&self, rdf_type: u64) -> FootprintResolved {
+        let mut fp = FootprintResolved::default();
+        for &p in &self.schema {
+            fp.add_triple_pattern(None, Some(Id(p)), None);
+        }
+        for &c in &self.meta {
+            fp.add_triple_pattern(None, Some(Id(rdf_type)), Some(Id(c)));
+        }
+        fp
+    }
+
     #[cfg(test)]
     pub(crate) fn of(rules: &[CRule], terms: &Terms) -> Vocab {
         Self::of_controlled(rules, terms, || Ok(())).expect("uncontrolled vocab classification")
@@ -910,7 +926,7 @@ impl Vocab {
 struct StageBuilder<'a> {
     est: Estimate<'a>,
     rdf_type: u64,
-    vocab: &'a Vocab,
+    schema_fp: FootprintResolved,
     rules: &'a [CRule],
     heads: Vec<(Slot, Slot, Slot)>,
     /// the rules with a head of each constant predicate, and those with a head whose
@@ -949,7 +965,7 @@ impl StageBuilder<'_> {
     /// Only the preliminary schema pass suppresses derived instance premises.
     /// Ordinary demand must follow them even when its head is a schema fact.
     fn asks(&self, a: &Atom, schema_copy: bool) -> bool {
-        self.intensional(a) && (!schema_copy || schema_reads(a, self.vocab, self.rdf_type))
+        self.intensional(a) && (!schema_copy || schema_reads(a, &self.schema_fp, self.rdf_type))
     }
 
     fn intensional(&self, a: &Atom) -> bool {
@@ -1502,6 +1518,18 @@ pub(crate) struct Closed {
 }
 
 impl Closed {
+    /// The closed schema relations as a shared incremental [`FootprintResolved`].
+    pub(crate) fn resolved_footprint(&self) -> FootprintResolved {
+        let mut fp = FootprintResolved::default();
+        for &p in &self.preds {
+            fp.add_triple_pattern(None, Some(Id(p)), None);
+        }
+        for &c in &self.classes {
+            fp.add_triple_pattern(None, Some(Id(self.rdf_type)), Some(Id(c)));
+        }
+        fp
+    }
+
     pub(crate) fn closes(&self, a: &Atom) -> bool {
         match a.p {
             Slot::Const(p) if self.preds.contains(&p) => true,
@@ -1518,12 +1546,13 @@ impl Closed {
     }
 }
 
-/// Body relations the preliminary schema pass follows beyond their stored facts.
-fn schema_reads(a: &Atom, vocab: &Vocab, rdf_type: u64) -> bool {
+/// Body relations the preliminary schema pass follows beyond their stored facts, tested
+/// through the shared incremental [`FootprintResolved`] of `vocab`.
+fn schema_reads(a: &Atom, fp: &FootprintResolved, rdf_type: u64) -> bool {
     match a.p {
-        Slot::Const(p) if vocab.schema.contains(&p) => true,
+        Slot::Const(p) if fp.matches_predicate(Id(p)) => true,
         Slot::Const(p) if p == rdf_type => match a.o {
-            Slot::Const(c) => vocab.meta.contains(&c),
+            Slot::Const(c) => fp.matches_triple(&[Id::UNDEF, Id(p), Id(c)]),
             Slot::Var(_) => true,
             Slot::Any => false,
         },
@@ -1635,6 +1664,7 @@ pub(crate) fn complete_schema(
     };
     // The preliminary pass reads equality as stored and omits equality-only
     // producers. Its equality and every dependent relation must remain open.
+    let schema_fp = vocab.resolved_footprint(rdf_type);
     let omitted_equality = equality(rules, same_as);
     for (ri, r) in rules.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -1647,7 +1677,7 @@ pub(crate) fn complete_schema(
         let blocked = r
             .atoms
             .iter()
-            .any(|a| !schema_reads(a, vocab, rdf_type) && can_derive(a))
+            .any(|a| !schema_reads(a, &schema_fp, rdf_type) && can_derive(a))
             // These positive reads are demanded, but their schema-pass copies
             // can still miss transitive instance premises. Decline a static
             // completeness proof; the bounded abstract model may prove coverage.
@@ -1659,7 +1689,7 @@ pub(crate) fn complete_schema(
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
-                if schema_reads(a, vocab, rdf_type) && can_derive(a) {
+                if schema_reads(a, &schema_fp, rdf_type) && can_derive(a) {
                     waiting
                         .entry(Relation::of(a.p, a.o, rdf_type))
                         .or_default()
@@ -2534,7 +2564,7 @@ fn transform_in(
         let mut b = StageBuilder {
             est,
             rdf_type,
-            vocab: &vocab,
+            schema_fp: vocab.resolved_footprint(rdf_type),
             rules: stage_rules,
             heads: heads.to_vec(),
             by_pred,

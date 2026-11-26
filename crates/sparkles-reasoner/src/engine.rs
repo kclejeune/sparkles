@@ -993,6 +993,11 @@ pub(crate) const VISIT_BATCH: u64 = 1 << 10;
 pub(crate) enum Mode<'s> {
     /// heads not in the graph yet (forward chaining)
     New,
+    /// heads not in the graph yet, streamed directly to a caller-supplied admission sink
+    /// (used for cross-rule deduplication and exact `max_inferred` accounting)
+    NewSink {
+        sink: &'s mut (dyn FnMut(Triple) -> anyhow::Result<()> + 's),
+    },
     /// heads in the graph, each once (the consequences of deleted facts), with what is
     /// told of the instances matched
     Existing { visit: Option<&'s Visit<'s>> },
@@ -1052,7 +1057,12 @@ pub(crate) struct Eval<'a> {
     /// the base-tier blocks builtins read last
     bmemo: Memo,
     /// the members of the RDF lists builtins read
-    lists: FxHashMap<u64, Option<std::rc::Rc<[u64]>>>,
+    lists: FxHashMap<u64, Option<Arc<[u64]>>>,
+    /// when set, read RDF lists only from explicit (`base` and flagged) rows
+    explicit_lists: bool,
+    /// when set, override the members of listed heads (used to share precomputed explicit
+    /// list views across preparation, backward proof, and replay)
+    list_override: Option<&'a FxHashMap<u64, Option<Arc<[u64]>>>>,
     /// stop at this plan step and keep the bindings instead, up to this many
     pub collect_at: Option<(usize, usize)>,
     pub collected: Vec<Vec<u64>>,
@@ -1138,6 +1148,8 @@ impl<'a> Eval<'a> {
             scratch: Vec::new(),
             bmemo: Memo::default(),
             lists: FxHashMap::default(),
+            explicit_lists: false,
+            list_override: None,
             collect_at: None,
             collected: Vec::new(),
             deadline: None,
@@ -1148,6 +1160,20 @@ impl<'a> Eval<'a> {
     /// with the abort flag, every 1,024 steps.
     pub(crate) fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
         self.deadline = deadline;
+    }
+
+    /// Read RDF lists only from explicit (`base` and flagged) rows, ignoring unflagged
+    /// derived list rows (such as removed list triples held as deletion candidates).
+    pub(crate) fn set_explicit_lists(&mut self, explicit: bool) {
+        self.explicit_lists = explicit;
+    }
+
+    /// Override the members of RDF list heads present in `map`.
+    pub(crate) fn set_list_override(
+        &mut self,
+        map: Option<&'a FxHashMap<u64, Option<Arc<[u64]>>>>,
+    ) {
+        self.list_override = map;
     }
 
     /// Read the base tier's remembered lookups through `memo`, the blocks a caller's
@@ -1168,13 +1194,20 @@ impl<'a> Eval<'a> {
 
     /// The members of the RDF list at `head` among the visible rows, or `None` when it
     /// is not a well-formed list.
-    pub fn list(&mut self, head: u64) -> Option<std::rc::Rc<[u64]>> {
+    pub fn list(&mut self, head: u64) -> Option<Arc<[u64]>> {
+        if let Some(ov) = self.list_override
+            && let Some(l) = ov.get(&head)
+        {
+            #[cfg(test)]
+            self.g.list_probe.record_list_override_hit();
+            return l.clone();
+        }
         if let Some(l) = self.lists.get(&head) {
             return l.clone();
         }
         let (g, t) = (self.g, self.terms);
-        let l = g
-            .list(
+        let l = if self.explicit_lists {
+            g.list_explicit(
                 &mut self.bmemo,
                 head,
                 t.rdf_first,
@@ -1182,7 +1215,17 @@ impl<'a> Eval<'a> {
                 t.rdf_nil,
                 self.end,
             )
-            .map(std::rc::Rc::<[u64]>::from);
+        } else {
+            g.list(
+                &mut self.bmemo,
+                head,
+                t.rdf_first,
+                t.rdf_rest,
+                t.rdf_nil,
+                self.end,
+            )
+        }
+        .map(Arc::<[u64]>::from);
         if self.lists.len() >= REMEMBER_LOOKUPS {
             self.forget();
         }
@@ -1242,6 +1285,15 @@ impl<'a> Eval<'a> {
     /// allocation while the old one is alive); false when it does not fit, and the
     /// evaluation stops.
     pub fn push_out(&mut self, t: Triple) -> bool {
+        if let Mode::NewSink { sink } = &mut self.mode {
+            if let Err(e) = sink(t) {
+                self.err.get_or_insert(e);
+                self.stop = true;
+                self.abort.store(true, Ordering::Relaxed);
+                return false;
+            }
+            return true;
+        }
         let cap = self.out.capacity();
         if self.out.len() == cap {
             let next = (cap * 2).max(64);
@@ -1906,6 +1958,7 @@ impl<'a> Eval<'a> {
             return;
         }
         let existing = matches!(self.mode, Mode::Existing { .. });
+        let to_sink = matches!(self.mode, Mode::NewSink { .. });
         if existing && !self.visited() {
             return;
         }
@@ -1922,6 +1975,8 @@ impl<'a> Eval<'a> {
                             }
                     } else if self.known_head(&t) {
                         false
+                    } else if to_sink {
+                        true
                     } else {
                         match self.see(t) {
                             Some(new) => new,
@@ -2606,8 +2661,22 @@ pub(crate) fn run_from(
     terms: &Terms,
     limits: &Limits,
     start: Option<u32>,
+    boundary: Option<&mut dyn FnMut(u32)>,
+    origin: Origin,
+) -> anyhow::Result<Outcome> {
+    run_from_with_dirty(g, rules, terms, limits, start, boundary, origin, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_from_with_dirty(
+    g: &mut Graph,
+    rules: &[CRule],
+    terms: &Terms,
+    limits: &Limits,
+    start: Option<u32>,
     mut boundary: Option<&mut dyn FnMut(u32)>,
     origin: Origin,
+    mut dirty_preds: Option<(FxHashSet<u64>, Held)>,
 ) -> anyhow::Result<Outcome> {
     let here = g.len();
     let base_len = origin.base_len.unwrap_or(here).min(here);
@@ -2634,6 +2703,15 @@ pub(crate) fn run_from(
     } else {
         None
     };
+    if let Some((dirty, dirty_held)) = dirty_preds.take() {
+        if let Some(c) = closures.as_mut()
+            && !dirty.is_empty()
+        {
+            c.reset_predicates(&dirty);
+        }
+        drop(dirty);
+        drop(dirty_held);
+    }
     if let Some(c) = &closures {
         tracing::debug!(operators = ?c.describe(rules), "closure operators");
     }

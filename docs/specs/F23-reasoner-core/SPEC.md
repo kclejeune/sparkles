@@ -132,12 +132,16 @@ The quick-fixes phase is built. Roadmap items 485 and 486 shipped. The planner o
 was measured and not adopted, and item 939 orders rule bodies from sampled bindings
 instead. The reasoner also records witnesses for F18 under item 416.
 The columnar derived tier, the first phase of the core, is built under item 835. The
-SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with its maintenance in
-item 958 and SPIN's RDF syntax in item 959. The rule IR of the n-ary core is built under
-item 839, with its evaluation by strata, maintenance, explanations, witnesses, demand and
-the rule frontend, and its restricted chase and planner over relations remain. Phase 2,
-closure operators in demand programs, is built as the first half of item 521. The other core and
-convergence phases remain under [item 456](../../ROADMAP.md).
+shared maintenance core of Phase 4 is built in exact mode under item 837, including the
+second half of item 521 for incremental closure operators, while derivation records remain
+for item 836 and stratified maintenance for `noValue` and negated atoms waits on item 839's
+strata. The SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with its
+maintenance in item 958 and SPIN's RDF syntax in item 959. The rule IR of the n-ary core
+is built under item 839, with its evaluation by strata, maintenance, explanations,
+witnesses, demand and the rule frontend, and its restricted chase and planner over
+relations remain. Phase 2, closure operators in demand programs, is built as the first
+half of item 521. The other core and convergence phases remain under
+[item 456](../../ROADMAP.md).
 
 ### Columnar derived tier
 
@@ -585,6 +589,56 @@ closure equal to Nemo's, where a full run takes 1.7 to 4.0 s and 556 to 641 MiB
 
 Item 815 brings the witnesses' preparation for a deletion under the bound, and item 816
 reports the peak of an update that falls back.
+
+### Shared maintenance core
+
+Item 837 unifies incremental rule maintenance with the view engine's fixed-point operator
+and footprint representation in exact mode. `crates/sparkles-core/src/incr/fixpoint.rs`
+adds batched `consequences` and `prove` methods with per-fact defaults, program-owned fact
+storage through `FactStore` so the reasoner keeps its columnar derived tier in place of a
+hash map while path closures keep their own store, and signed Z-set change emission.
+`crates/sparkles-reasoner/src/incremental.rs` implements `TierProgram` and `TierStore`
+over `FixedPoint::advance`, and `lib.rs::update_closure` drives incremental updates
+through it and returns the tier's signed delta in `inferred_change` for incremental views.
+
+The incremental core maintains transitive and equivalence closure relations through
+operators inside `TierProgram`, completing the incremental half of item 521. During
+deletion, `closure::DeletionOps` proves operator-owned predicates directly over confirmed
+explicit edges rather than running the quadratic transitive and equivalence rules as
+backward joins, while pairs supported by derived edges from other rules are handled
+through `Search`, `dirty_preds`, `engine::run_from_with_dirty` and `revive_overdeleted`
+during saturation. Undirected equivalences and symmetric transitive properties check
+reachability by union-find components, while directed transitive properties check
+reachability by Tarjan SCC condensation with bounded SCC reachability and pruned search.
+When a guard triple such as `owl:TransitiveProperty` is deleted and unprovable, the
+operator deletes all derived pairs for that predicate without scanning rule instances,
+and when a clique loses edges, deleting 24 edges of a 600-member clique stays incremental
+instead of falling back to a full run. Forward saturation then resets dirty closure
+predicates and runs the closure operators through `engine::run_from_with_dirty`, reviving
+any facts that remain derivable.
+
+`crates/sparkles-core/src/incr/footprint.rs` is the single footprint representation across
+views and reasoning. `Footprint` and `Resolved` support graph patterns, wildcards and
+triple patterns with constant-time predicate lookup, replacing `InferredFootprint` in
+`crates/sparkles-core/src/incr/inference.rs` and `circuit.rs` as well as the separate
+watched-graph and schema-read tracking in `inputs.rs`, `demand.rs`, `query.rs` and
+`reuse.rs`.
+
+Two full-run fallbacks are narrowed or removed. Ordinary edits to explicit RDF lists no
+longer trigger a full re-materialization because `incremental.rs` tracks the heads of
+lists whose `rdf:first` or `rdf:rest` cells changed, evaluates list-reading rules against
+the old and new explicit lists, and feeds the difference through `FixedPoint::advance`.
+Derived list cells, list triples moved across input graphs, and branching list cells whose
+competing objects change across multiple input graphs without a recoverable prior order
+still trigger a full run. The fixed 5% `LARGE_DELETION` ratio in `lib.rs` is replaced by a
+pre-deletion visit estimate from F16 §7.3 that compares the estimated backward rule
+instances of the removed triples against `Bound::max_visits_for`, while the runtime visit
+and memory bounds of item 798 continue to guard skewed closures during execution.
+
+Derivation records over `FixedPoint` remain for item 836, which builds on this exact-mode
+program. Incremental maintenance by strata for `noValue` and negated atoms remains open
+under item 837 until item 839's strata are wired into stratified maintenance, and
+union-find closure for `eq-sym` in query-time demand remains under item 521.
 
 ### OWL 2 RL rules
 

@@ -28,6 +28,7 @@
 //! reached has a proof, and they are all remembered as unprovable.
 
 use crate::budget::{Budget, BudgetFailure, Held, table_bytes, table_capacity, table_grown};
+use crate::closure::{DeletionOps, ReachScratch};
 use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step, VISIT_BATCH};
 use crate::facts::{Base, Memo};
 use crate::graph::{Cands, Graph, Triple};
@@ -114,14 +115,34 @@ pub(crate) struct Bound {
 }
 
 impl Bound {
+    /// The maximum rule-instance visits allowed for a deletion on `c`.
+    pub(crate) fn max_visits_for(c: &Closure) -> u64 {
+        let facts = c.graph.offset() as u64 + c.graph.live() as u64;
+        facts.saturating_mul(VISITS_PER_FACT).max(MIN_VISITS)
+    }
+
     /// The bound for the deletion of an update of `c`, charged to `budget`, as it starts.
     pub(crate) fn for_closure(c: &Closure, budget: &Arc<Budget>) -> Bound {
-        let facts = c.graph.offset() as u64 + c.graph.live() as u64;
-        Bound::new(
+        Self::for_closure_carrying(c, budget, 0, 0)
+    }
+
+    /// The bound for the deletion of an update of `c`, carrying forward `prior_visits`
+    /// and `prior_peak_held` from metered preparation while anchoring the memory baseline
+    /// at the current `budget.used()`.
+    pub(crate) fn for_closure_carrying(
+        c: &Closure,
+        budget: &Arc<Budget>,
+        prior_visits: u64,
+        prior_peak_held: usize,
+    ) -> Bound {
+        let mut b = Bound::new(
             budget,
-            facts.saturating_mul(VISITS_PER_FACT).max(MIN_VISITS),
+            Bound::max_visits_for(c),
             held_bound(c.heap_bytes().max(MIN_HELD)),
-        )
+        );
+        b.visits = AtomicU64::new(prior_visits);
+        b.peak_held = AtomicUsize::new(prior_peak_held);
+        b
     }
 
     pub(crate) fn new(budget: &Arc<Budget>, max_visits: u64, max_held: usize) -> Bound {
@@ -695,12 +716,42 @@ pub(crate) fn update_with<'a>(
     before_delete: Option<BeforeDelete<'a>>,
     rebuild: Option<&'a crate::ir::Program>,
 ) -> anyhow::Result<Update> {
+    update_with_moved(
+        c,
+        rules,
+        limits,
+        inserted,
+        removed,
+        &[],
+        false,
+        before_delete,
+        rebuild,
+    )
+}
+
+/// [`update_with`], also carrying `moved` (triples whose graph membership changed across
+/// multiple input graphs without changing the triple union) and `multi_graph` (whether
+/// the run reads more than one configured input graph, even if some are now empty).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_with_moved<'a>(
+    c: &mut Closure,
+    rules: &'a [CRule],
+    limits: &'a Limits,
+    inserted: &'a [Triple],
+    removed: &'a [Triple],
+    moved: &'a [Triple],
+    multi_graph: bool,
+    before_delete: Option<BeforeDelete<'a>>,
+    rebuild: Option<&'a crate::ir::Program>,
+) -> anyhow::Result<Update> {
     let budget = &limits.budget;
     let mut cx = TierCx {
         rules,
         limits,
         inserted,
         removed,
+        moved,
+        multi_graph,
         before_delete,
         rebuild,
         out: Update::default(),
@@ -716,12 +767,21 @@ pub(crate) fn update_with<'a>(
     // allocated until the removed facts are copied out of them
     let change_bytes = changes.capacity() * size_of::<Change<Triple>>();
     let mut held = Held::try_new(budget, change_bytes)?;
-    // the removed facts stay with the update, charged before their buffer is allocated
-    let n = changes.iter().filter(|ch| ch.weight < 0).count();
+    // the removed facts stay with the update, charged before their buffer is allocated;
+    // a fact over-deleted during operator maintenance and re-derived in saturation stays
+    // alive in `c` and is not reported as deleted
+    let n = changes
+        .iter()
+        .filter(|ch| ch.weight < 0 && c.graph.position(&ch.fact).is_none())
+        .count();
     held.try_grow(n * size_of::<Triple>())?;
     out.deleted.reserve_exact(n);
-    out.deleted
-        .extend(changes.iter().filter(|ch| ch.weight < 0).map(|ch| ch.fact));
+    out.deleted.extend(
+        changes
+            .iter()
+            .filter(|ch| ch.weight < 0 && c.graph.position(&ch.fact).is_none())
+            .map(|ch| ch.fact),
+    );
     drop(changes);
     held.shrink(change_bytes);
     out.held = Some(held);
@@ -735,6 +795,10 @@ pub(crate) struct TierCx<'a> {
     limits: &'a Limits,
     inserted: &'a [Triple],
     removed: &'a [Triple],
+    /// triples that moved between multiple input graphs while staying in the union
+    moved: &'a [Triple],
+    /// whether the run reads more than one configured input graph
+    multi_graph: bool,
     before_delete: Option<BeforeDelete<'a>>,
     /// the relation part of a program whose closure lacks its relation facts (item 839),
     /// which the update rebuilds first
@@ -871,6 +935,23 @@ pub(crate) struct TierProgram<'a> {
     lists: bool,
     /// whether the deletion removed an RDF list fact
     list_deleted: bool,
+    /// indexed explicit RDF list triples removed by this update, for O(1) membership
+    /// checks in `consequences_batch`
+    removed_lists: FxHashSet<Triple>,
+    /// budget charge for `removed_lists`
+    removed_lists_held: Option<Held>,
+    /// explicit RDF lists whose members changed in this update (F16 §7.3)
+    changed_lists: Option<ChangedLists>,
+    /// live derived facts produced by list-reading rules over old list members before a
+    /// list change, added to the first deletion frontier
+    list_frontier: Vec<Triple>,
+    /// budget charge for `list_frontier`
+    list_frontier_held: Option<Held>,
+    /// facts deleted during Phase 1 whose proof search encountered an unproved live fact
+    /// of an operator-governed predicate, checked for 1-step revival after saturation
+    overdeleted_touching_op: Vec<Triple>,
+    /// budget charge for `overdeleted_touching_op`
+    overdeleted_held: Option<Held>,
     _store: PhantomData<TierStore<'a>>,
 }
 
@@ -879,10 +960,40 @@ struct Deletion {
     plans: Plans,
     /// the plans' charge
     _plans_held: Held,
-    /// made by the first round, once the first frontier is held
+    /// operator-maintained transitive and equivalence relations for this deletion
+    ops: Option<DeletionOps>,
+    /// made by the first round, once the plans and first frontier are held
     bound: Option<Bound>,
+    /// visits counted during metered preparation (list tracking and operator detection),
+    /// carried forward into `bound` when the proof phase starts
+    prep_visits: u64,
+    /// peak memory held above the preparation baseline during metered preparation
+    prep_peak_held: usize,
     search: Search,
     abort: AtomicBool,
+}
+
+/// Explicit RDF list heads whose member sequences changed between the old and new
+/// snapshots, with their old and new member lists and indexed removed list triples
+/// (F16 §7.3).
+struct ChangedLists {
+    heads: Vec<u64>,
+    old_members: FxHashMap<u64, Option<Arc<[u64]>>>,
+    old_held: Held,
+    new_members: FxHashMap<u64, Option<Arc<[u64]>>>,
+    _new_held: Held,
+    removed_lists: FxHashSet<Triple>,
+    removed_lists_held: Held,
+}
+
+impl ChangedLists {
+    /// Drop `old_members` and release its budget charge once `eval_list_rules_old`
+    /// has built the deletion frontier.
+    fn drop_old(&mut self) {
+        self.old_members = FxHashMap::default();
+        let n = self.old_held.bytes();
+        self.old_held.shrink(n);
+    }
 }
 
 impl TierProgram<'_> {
@@ -951,7 +1062,17 @@ impl<'a> Program for TierProgram<'a> {
         }
         let c: &Closure = store.c;
         let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
-        if self.lists && facts.iter().any(|t| t[1] == first || t[1] == rest) {
+        let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+        if self.lists
+            && facts.iter().any(|t| {
+                if !is_list(t) {
+                    return false;
+                }
+                #[cfg(test)]
+                c.graph.list_probe.record_removed_list_check();
+                !self.removed_lists.contains(t)
+            })
+        {
             self.list_deleted = true;
         }
         let d = self.deletion()?;
@@ -967,6 +1088,18 @@ impl<'a> Program for TierProgram<'a> {
             Some(bound),
             &mut |t| out.push((t, ())),
         )?;
+        if let Some(ops) = d.ops.as_mut() {
+            let mut visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
+            ops.consequences(
+                facts,
+                &c.graph,
+                &c.terms,
+                &cx.limits.budget,
+                cx.limits.cancel.as_deref(),
+                &mut visit,
+                &mut |t| out.push((t, ())),
+            )?;
+        }
         Ok(())
     }
 
@@ -991,25 +1124,87 @@ impl<'a> Program for TierProgram<'a> {
         out: &mut Vec<Option<()>>,
     ) -> anyhow::Result<()> {
         let c: &Closure = store.c;
+        #[cfg(test)]
+        let _probe_guard = c
+            .graph
+            .list_probe
+            .enter_phase(crate::graph::ListProbePhase::Proof);
         let limits = cx.limits;
         let budget = &limits.budget;
-        let Deletion {
+        let explicit_lists = self.lists;
+        let list_override = self.changed_lists.as_ref().map(|cl| &cl.new_members);
+        let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
+        let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+        let Some(Deletion {
             plans,
+            ops,
             bound,
+            prep_visits,
+            prep_peak_held,
             search,
             abort,
             ..
-        } = self.deletion()?;
+        }) = self.del.as_mut()
+        else {
+            anyhow::bail!("a deletion round of an update that removed nothing");
+        };
+        let overdeleted = &mut self.overdeleted_touching_op;
+        let overdeleted_held = self
+            .overdeleted_held
+            .get_or_insert_with(|| Held::new(budget));
         // after the plans and the first frontier, as the deletion starts
-        let bound = &*bound.get_or_insert_with(|| Bound::for_closure(c, budget));
+        let bound = &*bound.get_or_insert_with(|| {
+            Bound::for_closure_carrying(c, budget, *prep_visits, *prep_peak_held)
+        });
+        // Materialize confirmed explicit-edge reachability graphs for any operator
+        // predicates in this round before parallel search starts.
+        if let Some(ops) = ops.as_mut() {
+            let mut preds_held = Held::new(budget);
+            let mut preds: Vec<u64> = Vec::new();
+            for t in facts {
+                if ops.is_governed(t[1], &c.graph) && !preds.contains(&t[1]) {
+                    push_charged(&mut preds, t[1], &mut preds_held)?;
+                }
+            }
+            let mut visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
+            for q in preds {
+                ops.ensure_pred(
+                    q,
+                    &c.graph,
+                    &c.terms,
+                    budget,
+                    limits.cancel.as_deref(),
+                    &mut visit,
+                )?;
+            }
+            drop(preds_held);
+        }
+        let out_start = out.len();
+        let ops_ref = ops.as_ref();
         if rayon::current_num_threads() > 1 && facts.len() >= PAR_SEARCH {
             // the searches of a round are independent: see `prove_all`
-            prove_all(c, cx.rules, plans, abort, limits, bound, search, facts, out)?;
+            prove_all(
+                c,
+                cx.rules,
+                plans,
+                ops_ref,
+                explicit_lists,
+                list_override,
+                abort,
+                limits,
+                bound,
+                search,
+                facts,
+                out,
+            )?;
         } else {
             let scx = Cx {
                 c,
                 rules: cx.rules,
                 plans,
+                ops: ops_ref,
+                explicit_lists,
+                list_override,
                 abort,
                 cancel: limits.cancel.as_deref(),
                 budget,
@@ -1025,6 +1220,15 @@ impl<'a> Program for TierProgram<'a> {
             }
             // the round's blocks are not kept until the next round
             search.memo = Memo::default();
+        }
+        for (&t, v) in facts.iter().zip(&out[out_start..]) {
+            if v.is_none() && search.unprovable_touched_op.contains(&t) {
+                push_charged(overdeleted, t, overdeleted_held)?;
+                bound.add(0)?;
+            }
+            if explicit_lists && v.is_some() && is_list(&t) && !c.explicit_held(&t) {
+                return Err(Fallback("the rules read RDF lists that are derived".into()).into());
+            }
         }
         Ok(())
     }
@@ -1056,9 +1260,6 @@ impl<'a> Program for TierProgram<'a> {
         let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
         let is_list = |t: &Triple| t[1] == first || t[1] == rest;
         if self.lists {
-            if cx.inserted.iter().chain(cx.removed).any(is_list) {
-                return Err(Fallback("an RDF list changed and the rules read lists".into()).into());
-            }
             let g = &c.graph;
             for p in [first, rest] {
                 let rows = g.cands(None, Some(p), None, 0, g.len());
@@ -1116,13 +1317,86 @@ impl<'a> Program for TierProgram<'a> {
         if let Some(f) = cx.before_delete.as_mut() {
             (*f)(c)?;
         }
-        if !cx.removed.is_empty() {
-            let plans = Plans::new(&mut c.graph, rules)?;
+        // Per-list tracking (F16 §7.3): when explicit RDF list triples changed, find every
+        // list head whose member sequence changed and seed the first deletion frontier
+        // with the live derived heads that list-reading rules produced over the old lists.
+        let mut prep_bound: Option<Bound> = None;
+        if self.lists && any_checked(cx.moved, cx.limits, is_list)? {
+            return Err(Fallback("an RDF list moved across input graphs".into()).into());
+        }
+        if self.lists
+            && (any_checked(cx.inserted, cx.limits, is_list)?
+                || any_checked(cx.removed, cx.limits, is_list)?)
+        {
+            #[cfg(test)]
+            let _probe_guard = c
+                .graph
+                .list_probe
+                .enter_phase(crate::graph::ListProbePhase::Prepare);
+            let b = prep_bound.get_or_insert_with(|| Bound::for_closure(c, budget));
+            let mut changed =
+                changed_lists(c, cx.inserted, cx.removed, cx.multi_graph, cx.limits, b)?;
+            if !changed.removed_lists.is_empty() {
+                self.removed_lists = std::mem::take(&mut changed.removed_lists);
+                let mut held = Held::new(budget);
+                std::mem::swap(&mut held, &mut changed.removed_lists_held);
+                self.removed_lists_held = Some(held);
+            }
+            if !changed.heads.is_empty() {
+                let (frontier, frontier_held) =
+                    eval_list_rules_old(c, rules, &changed, cx.limits, b)?;
+                self.list_frontier = frontier;
+                self.list_frontier_held = Some(frontier_held);
+            }
+            changed.drop_old();
+            if !changed.new_members.is_empty() {
+                self.changed_lists = Some(changed);
+            }
+        }
+        if !cx.removed.is_empty() || !self.list_frontier.is_empty() {
+            let ops = if cx.limits.closures {
+                let b = prep_bound.get_or_insert_with(|| Bound::for_closure(c, budget));
+                let mut visit = |n: u64| b.add(n).map_err(anyhow::Error::from);
+                DeletionOps::detect(
+                    rules,
+                    &c.graph,
+                    &c.terms,
+                    budget,
+                    cx.limits.cancel.as_deref(),
+                    &mut visit,
+                )?
+            } else {
+                None
+            };
+            let plans = Plans::new_without(&mut c.graph, rules, |ri| {
+                ops.as_ref().is_some_and(|o| o.replaces(ri))
+            })?;
             let plans_held = Held::try_new(budget, plans.bytes)?;
+            // F16 §7.3 cost estimate against item 798's visit bound (replaces
+            // LARGE_DELETION): estimate non-operator join visits from removed predicates
+            // and closure fan-out before running backward searches, while `plans_held`
+            // remains charged for the live `Plans` allocation.
+            if !cx.removed.is_empty() {
+                let max_visits = Bound::max_visits_for(c);
+                let est = estimate_deletion_visits(c, rules, &plans, cx.removed, cx.limits)?;
+                if est > max_visits {
+                    return Err(Fallback(format!(
+                        "the deletion is estimated to visit {est} rule instances, past the \
+                         bound of {max_visits} for the closure, which costs more than a full run"
+                    ))
+                    .into());
+                }
+            }
+            let (prep_visits, prep_peak_held) = prep_bound
+                .as_ref()
+                .map_or((0, 0), |b| (b.visits(), b.peak_held()));
             self.del = Some(Deletion {
                 plans,
                 _plans_held: plans_held,
+                ops,
                 bound: None,
+                prep_visits,
+                prep_peak_held,
                 search: Search::new(budget),
                 abort: AtomicBool::new(false),
             });
@@ -1139,6 +1413,9 @@ impl<'a> Program for TierProgram<'a> {
         for t in cx.removed {
             out.push(*t)?;
         }
+        for t in &self.list_frontier {
+            out.push(*t)?;
+        }
         Ok(())
     }
 
@@ -1146,13 +1423,34 @@ impl<'a> Program for TierProgram<'a> {
         let c = &mut *store.c;
         let limits = cx.limits;
         let (rules, budget) = (cx.rules, &limits.budget);
+        let mut dirty_preds: Option<(FxHashSet<u64>, Held)> = None;
+        let mut saved_plans: Option<(Plans, Held)> = None;
         if let Some(d) = self.del.take() {
             cx.out.checked = d.search.checked;
             if let Some(b) = &d.bound {
                 cx.out.visited = b.visits();
                 cx.out.held_beside = b.peak_held();
+            } else {
+                cx.out.visited = d.prep_visits;
+                cx.out.held_beside = d.prep_peak_held;
             }
-            drop(d);
+            if let Some(ops) = d.ops {
+                dirty_preds = Some(ops.take_dirty_preds());
+            }
+            // Only keep plans for `revive_overdeleted` if at least one unproved
+            // operator-governed fact touched during Phase 1 actually survived deletion at
+            // a row `< start` (otherwise `engine::run_from_with_dirty` handles everything).
+            let needs_revive = !self.overdeleted_touching_op.is_empty()
+                && d.search
+                    .op_facts_touched
+                    .iter()
+                    .any(|w| c.graph.position(w).is_some());
+            if needs_revive {
+                saved_plans = Some((d.plans, d._plans_held));
+            } else {
+                self.overdeleted_touching_op = Vec::new();
+                self.overdeleted_held = None;
+            }
             if cancelled(limits) {
                 anyhow::bail!("reasoning cancelled");
             }
@@ -1160,6 +1458,8 @@ impl<'a> Program for TierProgram<'a> {
                 return Err(Fallback("a derived RDF list fact was removed".into()).into());
             }
         }
+        self.removed_lists = FxHashSet::default();
+        self.removed_lists_held = None;
         let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
         let is_list = |t: &Triple| t[1] == first || t[1] == rest;
         // ---- insertion
@@ -1179,36 +1479,111 @@ impl<'a> Program for TierProgram<'a> {
         for r in start..c.graph.len() {
             c.set_flag_with(r, true, true)?;
         }
+        // Every derived fact admitted after the explicit inserted rows (list replay,
+        // semi-naive saturation, and over-deleted revival) counts against one shared
+        // `max_inferred` allowance from `inferred_origin`.
+        let inferred_origin = c.graph.len();
+        let narrowed;
+        let eff_limits = match self.rebuilt {
+            None => limits,
+            Some((_, facts)) => {
+                narrowed = Limits {
+                    max_iterations: limits.max_iterations,
+                    max_inferred: limits.max_inferred.saturating_sub(facts),
+                    cancel: limits.cancel.clone(),
+                    deadline: limits.deadline,
+                    progress: limits.progress.clone(),
+                    budget: limits.budget.clone(),
+                    closures: limits.closures,
+                    magic: None,
+                    sampled_planning: limits.sampled_planning,
+                };
+                &narrowed
+            }
+        };
+        // Per-list tracking (F16 §7.3): evaluate list-reading rules for changed explicit
+        // lists using their new member sequences so newly enabled instances enter `start..`.
+        if let Some(changed) = self.changed_lists.take()
+            && !changed.heads.is_empty()
+        {
+            let reuse_new_members =
+                replay_new_members_valid(c, start, inferred_origin, eff_limits)?;
+            eval_list_rules_new(
+                c,
+                rules,
+                &changed,
+                reuse_new_members,
+                eff_limits,
+                inferred_origin,
+            )?;
+        }
         budget.check()?;
         // after a rebuild, the relation facts are new to the rules too, and the rebuilt
         // facts count against the limit of inferred facts with the insertion's
         let from = self.rebuilt.map_or(start, |(lo, ..)| lo.min(start));
-        if c.graph.len() > from {
-            let narrowed;
-            // the limit of iterations bounds the rebuild and the insertion each, and the
-            // explicit rows the insertion appended count against neither limit
-            let limits = match self.rebuilt {
-                None => limits,
-                Some((_, facts)) => {
-                    narrowed = Limits {
-                        max_iterations: limits.max_iterations,
-                        max_inferred: limits.max_inferred.saturating_sub(facts),
-                        cancel: limits.cancel.clone(),
-                        deadline: limits.deadline,
-                        progress: limits.progress.clone(),
-                        budget: limits.budget.clone(),
-                        closures: limits.closures,
-                        magic: None,
-                        sampled_planning: limits.sampled_planning,
-                    };
-                    &narrowed
+        let has_dirty = dirty_preds.as_ref().is_some_and(|(s, _)| !s.is_empty());
+        if c.graph.len() > from || has_dirty {
+            let run_res = engine::run_from_with_dirty(
+                &mut c.graph,
+                rules,
+                &c.terms,
+                eff_limits,
+                Some(from),
+                None,
+                engine::Origin {
+                    base_len: Some(inferred_origin),
+                    iterations: 0,
+                    lists: None,
+                },
+                dirty_preds.take(),
+            );
+            let o = match run_res {
+                Ok(o) => o,
+                Err(e) if e.is::<crate::closure::Restart>() => {
+                    return Err(Fallback("an RDF list fact was derived".into()).into());
                 }
+                Err(e) => return Err(e),
             };
-            let o = engine::run(&mut c.graph, rules, &c.terms, limits, Some(from))?;
             cx.out.iterations = o.iterations;
+            // If any Phase-1 deleted fact failed its proof after encountering a surviving
+            // unproved operator-governed fact (mixed R_other + operator derivation), check
+            // 1-step revival over the now-reclosed closure and saturate until quiescent.
+            if let Some((plans, _plans_held)) = saved_plans.take() {
+                revive_overdeleted(
+                    c,
+                    rules,
+                    &plans,
+                    eff_limits,
+                    inferred_origin,
+                    &mut self.overdeleted_touching_op,
+                    &mut cx.out.iterations,
+                )?;
+                self.overdeleted_touching_op = Vec::new();
+                self.overdeleted_held = None;
+            }
             if self.lists && cx.out.added(c).any(|t| is_list(&t) && !c.explicit_held(&t)) {
                 return Err(Fallback("an RDF list fact was derived".into()).into());
             }
+        } else if let Some((plans, _plans_held)) = saved_plans.take() {
+            if let Some((dirty, dirty_held)) = dirty_preds.take() {
+                drop(dirty);
+                drop(dirty_held);
+            }
+            revive_overdeleted(
+                c,
+                rules,
+                &plans,
+                eff_limits,
+                inferred_origin,
+                &mut self.overdeleted_touching_op,
+                &mut cx.out.iterations,
+            )?;
+            if self.lists && cx.out.added(c).any(|t| is_list(&t) && !c.explicit_held(&t)) {
+                return Err(Fallback("an RDF list fact was derived".into()).into());
+            }
+        } else if let Some((dirty, dirty_held)) = dirty_preds.take() {
+            drop(dirty);
+            drop(dirty_held);
         }
         // the inserted facts that the base tier holds leave the derived tier, found with
         // one sorted pass over the base tier
@@ -1249,6 +1624,13 @@ impl<'a> Program for TierProgram<'a> {
 
     fn pass_end(&mut self, _cx: &mut TierCx<'_>) -> anyhow::Result<()> {
         self.del = None;
+        self.removed_lists = FxHashSet::default();
+        self.removed_lists_held = None;
+        self.changed_lists = None;
+        self.list_frontier.clear();
+        self.list_frontier_held = None;
+        self.overdeleted_touching_op.clear();
+        self.overdeleted_held = None;
         Ok(())
     }
 
@@ -1341,6 +1723,15 @@ pub(crate) struct Plans {
 
 impl Plans {
     pub(crate) fn new(g: &mut Graph, rules: &[CRule]) -> Result<Plans, BudgetFailure> {
+        Self::new_without(g, rules, |_| false)
+    }
+
+    /// Build forward and backward plans for every rule for which `skip(ri)` is false.
+    pub(crate) fn new_without(
+        g: &mut Graph,
+        rules: &[CRule],
+        skip: impl Fn(usize) -> bool,
+    ) -> Result<Plans, BudgetFailure> {
         let mut p = Plans {
             back: Vec::with_capacity(rules.len()),
             by_pred: FxHashMap::default(),
@@ -1350,6 +1741,11 @@ impl Plans {
         };
         let all = |r: &CRule| vec![(0, g.len()); r.atoms.len()];
         for (ri, r) in rules.iter().enumerate() {
+            if skip(ri) {
+                p.back.push(Vec::new());
+                p.forward.push(Vec::new());
+                continue;
+            }
             let ranges = all(r);
             let mut in_atoms = vec![false; r.nvars];
             for a in &r.atoms {
@@ -1475,6 +1871,9 @@ fn consequences_into(
     let rows: Vec<u32> = dead.iter().filter_map(|t| g.position(t)).collect();
     let mut work: Vec<(usize, usize, Vec<u32>)> = Vec::new();
     for (ri, r) in rules.iter().enumerate() {
+        if plans.forward[ri].is_empty() {
+            continue;
+        }
         for (d, a) in r.atoms.iter().enumerate() {
             if plans.forward[ri][d].is_none() {
                 continue;
@@ -1600,6 +1999,9 @@ fn prove_all(
     c: &Closure,
     rules: &[CRule],
     plans: &Plans,
+    ops: Option<&DeletionOps>,
+    explicit_lists: bool,
+    list_override: Option<&FxHashMap<u64, Option<Arc<[u64]>>>>,
     abort: &AtomicBool,
     limits: &Limits,
     bound: &Bound,
@@ -1617,6 +2019,9 @@ fn prove_all(
             c,
             rules,
             plans,
+            ops,
+            explicit_lists,
+            list_override,
             abort,
             cancel: limits.cancel.as_deref(),
             budget,
@@ -1696,6 +2101,12 @@ struct Cx<'a> {
     c: &'a Closure,
     rules: &'a [CRule],
     plans: &'a Plans,
+    /// operator-maintained closure relations for fast explicit-edge reachability proofs
+    ops: Option<&'a DeletionOps>,
+    /// read RDF lists only from explicit (`base` and flagged) rows
+    explicit_lists: bool,
+    /// precomputed new-snapshot explicit list members for affected heads
+    list_override: Option<&'a FxHashMap<u64, Option<Arc<[u64]>>>>,
     abort: &'a AtomicBool,
     cancel: Option<&'a AtomicBool>,
     budget: &'a Arc<Budget>,
@@ -1712,6 +2123,18 @@ struct Cx<'a> {
 struct Search {
     proved: FxHashSet<Triple>,
     unprovable: FxHashSet<Triple>,
+    /// subset of `unprovable` whose failed proof encountered a live unproved fact of an
+    /// operator-governed predicate (eligible for 1-step revival after saturation)
+    unprovable_touched_op: FxHashSet<Triple>,
+    /// live unproved operator-governed facts actually touched by failed proofs (used at
+    /// saturation to skip `revive_overdeleted` when none survived Phase 1)
+    op_facts_touched: FxHashSet<Triple>,
+    /// operator-governed facts touched during the current search
+    op_touched_now: Vec<Triple>,
+    /// whether the search currently running encountered a live unproved operator fact
+    touched_op_now: bool,
+    /// reusable charged scratch workspace for directed explicit-edge reachability probes
+    reach_scratch: ReachScratch,
     checked: u64,
     nodes: Vec<Node>,
     node_of: FxHashMap<Triple, u32>,
@@ -1757,6 +2180,11 @@ impl Search {
         Search {
             proved: FxHashSet::default(),
             unprovable: FxHashSet::default(),
+            unprovable_touched_op: FxHashSet::default(),
+            op_facts_touched: FxHashSet::default(),
+            op_touched_now: Vec::new(),
+            touched_op_now: false,
+            reach_scratch: ReachScratch::new(budget),
             checked: 0,
             nodes: Vec::new(),
             node_of: FxHashMap::default(),
@@ -1782,6 +2210,35 @@ impl Search {
         }
     }
 
+    /// Whether `t` is proved by an operator's confirmed explicit edges; records any
+    /// budget, bound, or cancellation error into `self.err`.
+    fn proved_by_base(&mut self, cx: &Cx<'_>, t: &Triple) -> bool {
+        let Some(ops) = cx.ops else {
+            return false;
+        };
+        let bound = cx.bound;
+        let mut visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
+        match ops.proved_by_base(t, &mut self.reach_scratch, cx.cancel, &mut visit) {
+            Ok(v) => v,
+            Err(e) => {
+                self.err.get_or_insert(e);
+                false
+            }
+        }
+    }
+
+    /// Record an operator-governed fact touched during the current search, charging
+    /// growth before pushing.
+    fn record_op_touched(&mut self, t: Triple) -> bool {
+        let (cap, len) = (self.op_touched_now.capacity(), self.op_touched_now.len());
+        let Some(old) = self.vec_growth(cap, len, 1, size_of::<Triple>()) else {
+            return false;
+        };
+        self.op_touched_now.push(t);
+        self.held.shrink(old);
+        true
+    }
+
     /// Whether this search, or the searches of earlier rounds, proved `t`.
     #[inline]
     fn is_proved(&self, cx: &Cx<'_>, t: &Triple) -> bool {
@@ -1794,6 +2251,14 @@ impl Search {
         self.unprovable.contains(t) || cx.known.is_some_and(|k| k.unprovable.contains(t))
     }
 
+    #[inline]
+    fn is_unprovable_touched_op(&self, cx: &Cx<'_>, t: &Triple) -> bool {
+        self.unprovable_touched_op.contains(t)
+            || cx
+                .known
+                .is_some_and(|k| k.unprovable_touched_op.contains(t))
+    }
+
     /// Take in what another search of the same round learned, charging the growth of
     /// the sets before it is allocated.
     fn absorb(&mut self, other: Search) -> Result<(), BudgetFailure> {
@@ -1801,6 +2266,11 @@ impl Search {
         for (mine, theirs) in [
             (&mut self.proved, &other.proved),
             (&mut self.unprovable, &other.unprovable),
+            (
+                &mut self.unprovable_touched_op,
+                &other.unprovable_touched_op,
+            ),
+            (&mut self.op_facts_touched, &other.op_facts_touched),
         ] {
             let (cap, len) = (mine.capacity(), mine.len());
             let to = table_grown(cap, len, theirs.len());
@@ -1866,7 +2336,11 @@ impl Search {
             return false;
         };
         let fact = size_of::<Triple>();
-        if cx.c.flagged(row) {
+        let fast = cx.c.flagged(row) || self.proved_by_base(cx, &t);
+        if self.err.is_some() {
+            return false;
+        }
+        if fast {
             let (cap, len) = (self.proved.capacity(), self.proved.len());
             let Some(old) = self.table_growth(cap, len, 1, fact) else {
                 return false;
@@ -1876,6 +2350,8 @@ impl Search {
             return true;
         }
         self.checked += 1;
+        self.touched_op_now = false;
+        self.op_touched_now.clear();
         self.nodes.clear();
         self.node_of.clear();
         self.insts.clear();
@@ -1907,18 +2383,57 @@ impl Search {
             .filter(|n| n.state == State::Proved)
             .count();
         let lost = if proved { 0 } else { self.nodes.len() - gained };
+        let touched = !proved && self.touched_op_now;
+        let op_touched_n = if touched {
+            self.op_touched_now.len()
+        } else {
+            0
+        };
         let (pc, pl) = (self.proved.capacity(), self.proved.len());
         let (uc, ul) = (self.unprovable.capacity(), self.unprovable.len());
-        let (pt, ut) = (table_grown(pc, pl, gained), table_grown(uc, ul, lost));
+        let (tc, tl) = (
+            self.unprovable_touched_op.capacity(),
+            self.unprovable_touched_op.len(),
+        );
+        let (oc, ol) = (
+            self.op_facts_touched.capacity(),
+            self.op_facts_touched.len(),
+        );
+        let (pt, ut, tt, ot) = (
+            table_grown(pc, pl, gained),
+            table_grown(uc, ul, lost),
+            if touched {
+                table_grown(tc, tl, lost)
+            } else {
+                tc
+            },
+            if op_touched_n > 0 {
+                table_grown(oc, ol, op_touched_n)
+            } else {
+                oc
+            },
+        );
         let new = if pt == pc { 0 } else { table_bytes(pt, fact) }
-            + if ut == uc { 0 } else { table_bytes(ut, fact) };
+            + if ut == uc { 0 } else { table_bytes(ut, fact) }
+            + if tt == tc { 0 } else { table_bytes(tt, fact) }
+            + if ot == oc { 0 } else { table_bytes(ot, fact) };
         let old = if pt == pc { 0 } else { table_bytes(pc, fact) }
-            + if ut == uc { 0 } else { table_bytes(uc, fact) };
+            + if ut == uc { 0 } else { table_bytes(uc, fact) }
+            + if tt == tc { 0 } else { table_bytes(tc, fact) }
+            + if ot == oc { 0 } else { table_bytes(oc, fact) };
         if !self.charge(new) {
             return false;
         }
         self.proved.reserve(gained);
         self.unprovable.reserve(lost);
+        if touched {
+            self.unprovable_touched_op.reserve(lost);
+            if op_touched_n > 0 {
+                self.op_facts_touched.reserve(op_touched_n);
+                self.op_facts_touched
+                    .extend(self.op_touched_now.iter().copied());
+            }
+        }
         self.held.shrink(old);
         for n in &self.nodes {
             match n.state {
@@ -1928,6 +2443,9 @@ impl Search {
                 // with no proof of the root, the search explored everything it reached
                 _ if !proved => {
                     self.unprovable.insert(n.t);
+                    if touched {
+                        self.unprovable_touched_op.insert(n.t);
+                    }
                 }
                 _ => {}
             }
@@ -2016,6 +2534,12 @@ impl Search {
         self.nodes[n as usize].state = State::Open;
         let t = self.nodes[n as usize].t;
         let g = &cx.c.graph;
+        if cx.ops.is_some_and(|ops| ops.is_governed(t[1], g)) {
+            self.touched_op_now = true;
+            if !self.record_op_touched(t) {
+                return;
+            }
+        }
         for (ri, hi) in cx.plans.heads(t[1]) {
             let Some((steps, pre)) = &cx.plans.back[ri][hi] else {
                 continue;
@@ -2046,6 +2570,8 @@ impl Search {
                     },
                     cx.budget,
                 );
+                ev.set_explicit_lists(cx.explicit_lists);
+                ev.set_list_override(cx.list_override);
                 ev.lend_memo(memo);
                 ev.run(0, &mut b, None);
                 (ev.err.take(), ev.take_memo())
@@ -2089,11 +2615,30 @@ impl Search {
         let mut facts: smallvec::SmallVec<[Triple; 4]> = smallvec::SmallVec::new();
         for u in body {
             // an instance that uses its own head or an unprovable fact proves nothing
-            if u == t || self.is_unprovable(cx, &u) {
+            if u == t {
+                return true;
+            }
+            if self.is_unprovable(cx, &u) {
+                if self.is_unprovable_touched_op(cx, &u) {
+                    self.touched_op_now = true;
+                }
+                if cx.ops.is_some_and(|ops| ops.is_governed(u[1], &cx.c.graph)) {
+                    self.touched_op_now = true;
+                    if !self.record_op_touched(u) {
+                        return false;
+                    }
+                }
                 return true;
             }
             // a body fact the derived tier does not hold is from the base tier
             if self.is_proved(cx, &u) || cx.c.explicit_held(&u) {
+                continue;
+            }
+            let by_base = self.proved_by_base(cx, &u);
+            if self.err.is_some() {
+                return false;
+            }
+            if by_base {
                 continue;
             }
             facts.push(u);
@@ -2138,6 +2683,1401 @@ impl Search {
         }
         true
     }
+}
+
+// ---------------------------------------------------- per-list & cost helpers ----
+
+/// Push `x` onto `v`, charging any reallocation to `held` before it occurs.
+fn push_charged<T>(v: &mut Vec<T>, x: T, held: &mut Held) -> Result<(), BudgetFailure> {
+    let (cap, len) = (v.capacity(), v.len());
+    let grown = vec_grown(cap, len, 1, size_of::<T>());
+    if grown > 0 {
+        held.try_grow(grown)?;
+        v.reserve_exact((grown / size_of::<T>()) - len);
+        held.shrink(cap * size_of::<T>());
+    }
+    v.push(x);
+    Ok(())
+}
+
+/// Insert `x` into `set`, charging any table growth to `held` before it occurs.
+fn insert_set_charged<T: Eq + std::hash::Hash>(
+    set: &mut FxHashSet<T>,
+    x: T,
+    held: &mut Held,
+) -> Result<bool, BudgetFailure> {
+    if set.contains(&x) {
+        return Ok(false);
+    }
+    let (cap, len) = (set.capacity(), set.len());
+    let to = table_grown(cap, len, 1);
+    if to != cap {
+        held.try_grow(table_bytes(to, size_of::<T>()))?;
+        set.reserve(1);
+        held.shrink(table_bytes(cap, size_of::<T>()));
+    }
+    Ok(set.insert(x))
+}
+
+/// Reserve room in `map` for key `k` if absent, charging any table growth before it occurs.
+fn reserve_map_charged<K: Eq + std::hash::Hash, V>(
+    map: &mut FxHashMap<K, V>,
+    k: &K,
+    held: &mut Held,
+) -> Result<(), BudgetFailure> {
+    if map.contains_key(k) {
+        return Ok(());
+    }
+    let (cap, len) = (map.capacity(), map.len());
+    let to = table_grown(cap, len, 1);
+    if to != cap {
+        held.try_grow(table_bytes(to, size_of::<(K, V)>()))?;
+        map.reserve(1);
+        held.shrink(table_bytes(cap, size_of::<(K, V)>()));
+    }
+    Ok(())
+}
+
+/// Like `slice.iter().any(pred)`, polling cancellation every [`VISIT_BATCH`] elements so
+/// a long prefix without matches cannot delay cancellation.
+fn any_checked<T>(
+    slice: &[T],
+    limits: &Limits,
+    mut pred: impl FnMut(&T) -> bool,
+) -> anyhow::Result<bool> {
+    const MASK: usize = (VISIT_BATCH as usize) - 1;
+    for (i, item) in slice.iter().enumerate() {
+        if i & MASK == 0 && cancelled(limits) {
+            anyhow::bail!("reasoning cancelled");
+        }
+        if pred(item) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `changed.new_members` (computed in `prepare` against `base` plus flagged rows
+/// before `fresh` was appended in `saturate`) remains exact for list-rule replay over
+/// `start..end`. Polls [`Limits::stopped`] at bounded intervals so a long fresh insertion
+/// or bulk list edit cannot delay cancellation or deadlines.
+fn replay_new_members_valid(
+    c: &Closure,
+    start: u32,
+    end: u32,
+    limits: &Limits,
+) -> anyhow::Result<bool> {
+    replay_new_members_valid_with(c, start, end, limits, |_| {})
+}
+
+fn replay_new_members_valid_with(
+    c: &Closure,
+    start: u32,
+    end: u32,
+    limits: &Limits,
+    mut on_row: impl FnMut(u32),
+) -> anyhow::Result<bool> {
+    const MASK: usize = (VISIT_BATCH as usize) - 1;
+    const BASE_PROBE_POLL: usize = 64;
+    let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
+    let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+    match c.graph.base() {
+        Some(base) => {
+            let mut valid = true;
+            let mut bmemo = Memo::default();
+            let mut err: Option<anyhow::Error> = None;
+            let mut probes = 0usize;
+            for (i, r) in (start..end).enumerate() {
+                if i & MASK == 0 && limits.stopped() {
+                    err = Some(limits.stop_error());
+                    break;
+                }
+                on_row(r);
+                let t = c.graph.triple(r);
+                if is_list(&t) {
+                    probes += 1;
+                    if probes >= BASE_PROBE_POLL {
+                        probes = 0;
+                        if limits.stopped() {
+                            err = Some(limits.stop_error());
+                            break;
+                        }
+                    }
+                    match base.contains_with(&mut bmemo, &t) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            valid = false;
+                            break;
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            base.add_scans(bmemo.scans);
+            if let Some(e) = err {
+                return Err(e);
+            }
+            Ok(valid)
+        }
+        None => {
+            for (i, r) in (start..end).enumerate() {
+                if i & MASK == 0 && limits.stopped() {
+                    return Err(limits.stop_error());
+                }
+                on_row(r);
+                if is_list(&c.graph.triple(r)) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// List-head slots (`args[0]`) read by list builtins in `r`.
+fn list_head_slots(r: &CRule) -> Vec<Slot> {
+    use crate::builtins::BuiltinKind as B;
+    let mut out = Vec::new();
+    for b in &r.builtins {
+        if matches!(
+            b.kind,
+            B::ListMember
+                | B::ListContains
+                | B::ListNotContains
+                | B::ListLength
+                | B::ListEntry
+                | B::ListForAll
+        ) && let Some(&s) = b.args.first()
+            && !out.contains(&s)
+        {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Summary of removed `rdf:first` or `rdf:rest` objects for one list cell: the lowest
+/// removed object id and whether more than one distinct object was removed.
+#[derive(Clone, Copy)]
+struct RemovedObj {
+    min: u64,
+    multi: bool,
+}
+
+fn record_removed_obj(
+    map: &mut FxHashMap<u64, RemovedObj>,
+    cell: u64,
+    obj: u64,
+    held: &mut Held,
+) -> Result<(), BudgetFailure> {
+    reserve_map_charged(map, &cell, held)?;
+    map.entry(cell)
+        .and_modify(|e| {
+            if obj != e.min {
+                e.multi = true;
+                if obj < e.min {
+                    e.min = obj;
+                }
+            }
+        })
+        .or_insert(RemovedObj {
+            min: obj,
+            multi: false,
+        });
+    Ok(())
+}
+
+/// Per-cell lookup caches shared across affected heads during `changed_lists` so a
+/// shared list tail (including one whose `rdf:first`/`rdf:rest` values were all removed
+/// and now sit as unflagged rows in `c.graph`) is scanned at most once per snapshot.
+#[derive(Default)]
+struct ListCellCache {
+    new_first: FxHashMap<u64, Option<u64>>,
+    new_rest: FxHashMap<u64, Option<u64>>,
+    old_first: FxHashMap<u64, Option<u64>>,
+    old_rest: FxHashMap<u64, Option<u64>>,
+}
+
+/// Walk an explicit RDF list at `head` in the current snapshot with memory charging,
+/// cancellation polling, per-cell caching, and visit counting against `visit`.
+#[allow(clippy::too_many_arguments)]
+fn new_explicit_list(
+    g: &Graph,
+    memo: &mut Memo,
+    head: u64,
+    first: u64,
+    rest: u64,
+    nil: u64,
+    cache: &mut ListCellCache,
+    cache_held: &mut Held,
+    limits: &Limits,
+    visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+) -> anyhow::Result<Option<Vec<u64>>> {
+    const MAX_LEN: usize = 1 << 20;
+    let mut held = Held::new(&limits.budget);
+    let mut out: Vec<u64> = Vec::new();
+    let mut seen: FxHashSet<u64> = FxHashSet::default();
+    let mut cur = head;
+    let mut pending: u64 = 0;
+    let first_obj = |memo: &mut Memo,
+                     s: u64,
+                     p: u64,
+                     cell_cache: &mut FxHashMap<u64, Option<u64>>,
+                     cache_held: &mut Held,
+                     pending: &mut u64,
+                     visit: &mut dyn FnMut(u64) -> anyhow::Result<()>|
+     -> anyhow::Result<Option<u64>> {
+        if let Some(&cached) = cell_cache.get(&s) {
+            return Ok(cached);
+        }
+        if let Some(b) = g.base() {
+            let mut found = None;
+            let mut base_meter = |n: u64| -> anyhow::Result<()> {
+                visit(n)?;
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                Ok(())
+            };
+            b.for_each_with_metered(memo, Some(s), Some(p), None, &mut base_meter, |t| {
+                found = Some(t[2]);
+                false
+            })?;
+            if found.is_some() {
+                reserve_map_charged(cell_cache, &s, cache_held)?;
+                cell_cache.insert(s, found);
+                return Ok(found);
+            }
+        }
+        let mut best: Option<(u32, u64)> = None;
+        for i in g.cands(Some(s), Some(p), None, g.offset(), g.len()).iter() {
+            *pending += 1;
+            if *pending >= VISIT_BATCH {
+                visit(std::mem::take(pending))?;
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            if g.alive(i) && g.flagged(i) {
+                let t = g.triple(i);
+                if t[0] == s && t[1] == p && best.is_none_or(|(bi, _)| i < bi) {
+                    best = Some((i, t[2]));
+                }
+            }
+        }
+        let res = best.map(|(_, o)| o);
+        reserve_map_charged(cell_cache, &s, cache_held)?;
+        cell_cache.insert(s, res);
+        Ok(res)
+    };
+    while cur != nil {
+        pending += 1;
+        if pending >= VISIT_BATCH {
+            visit(std::mem::take(&mut pending))?;
+            if cancelled(limits) {
+                anyhow::bail!("reasoning cancelled");
+            }
+        }
+        if !insert_set_charged(&mut seen, cur, &mut held)? || out.len() > MAX_LEN {
+            if pending > 0 {
+                visit(pending)?;
+            }
+            return Ok(None);
+        }
+        let Some(f) = first_obj(
+            memo,
+            cur,
+            first,
+            &mut cache.new_first,
+            cache_held,
+            &mut pending,
+            visit,
+        )?
+        else {
+            if pending > 0 {
+                visit(pending)?;
+            }
+            return Ok(None);
+        };
+        push_charged(&mut out, f, &mut held)?;
+        let Some(r) = first_obj(
+            memo,
+            cur,
+            rest,
+            &mut cache.new_rest,
+            cache_held,
+            &mut pending,
+            visit,
+        )?
+        else {
+            if pending > 0 {
+                visit(pending)?;
+            }
+            return Ok(None);
+        };
+        cur = r;
+    }
+    if pending > 0 {
+        visit(pending)?;
+    }
+    Ok(Some(out))
+}
+
+/// Read an explicit RDF list at `head` as it existed BEFORE the update: `base` + flagged
+/// rows, minus `inserted_list`, plus `removed_first`/`removed_rest`. Returns `Err(Fallback)`
+/// if a branching list cell changed across multiple input graphs where the old graph
+/// rank of competing objects cannot be determined from union deltas alone.
+#[allow(clippy::too_many_arguments)]
+fn old_explicit_list(
+    g: &Graph,
+    memo: &mut Memo,
+    head: u64,
+    first: u64,
+    rest: u64,
+    nil: u64,
+    inserted_list: &FxHashSet<Triple>,
+    removed_first: &FxHashMap<u64, RemovedObj>,
+    removed_rest: &FxHashMap<u64, RemovedObj>,
+    multi_graph: bool,
+    cache: &mut ListCellCache,
+    cache_held: &mut Held,
+    limits: &Limits,
+    visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+) -> anyhow::Result<Option<Vec<u64>>> {
+    const MAX_LEN: usize = 1 << 20;
+    let find_obj = |memo: &mut Memo,
+                    s: u64,
+                    p: u64,
+                    rem: &FxHashMap<u64, RemovedObj>,
+                    cell_cache: &mut FxHashMap<u64, Option<u64>>,
+                    cache_held: &mut Held,
+                    pending: &mut u64,
+                    visit: &mut dyn FnMut(u64) -> anyhow::Result<()>|
+     -> anyhow::Result<Option<u64>> {
+        if let Some(&cached) = cell_cache.get(&s) {
+            return Ok(cached);
+        }
+        let rem_entry = rem.get(&s).copied();
+        let rem_o = rem_entry.map(|r| r.min);
+        if let Some(b) = g.base() {
+            let is_multi = multi_graph || b.passes() > 1;
+            if is_multi && rem_entry.is_some_and(|r| r.multi) {
+                return Err(Fallback(
+                    "a branching RDF list changed across multiple input graphs".into(),
+                )
+                .into());
+            }
+            let mut base_o = None;
+            let mut base_meter = |n: u64| -> anyhow::Result<()> {
+                visit(n)?;
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                Ok(())
+            };
+            b.for_each_with_metered(memo, Some(s), Some(p), None, &mut base_meter, |t| {
+                if !inserted_list.contains(&t) {
+                    base_o = Some(t[2]);
+                    return false;
+                }
+                true
+            })?;
+            let resolved = match (base_o, rem_o) {
+                (Some(bo), Some(ro)) => {
+                    if is_multi {
+                        return Err(Fallback(
+                            "a branching RDF list changed across multiple input graphs".into(),
+                        )
+                        .into());
+                    }
+                    // For a single input graph, `Base::for_each_with(Some(s), Some(p), None)`
+                    // scans `Perm::Gspo`, yielding objects in ascending id order.
+                    Some(bo.min(ro))
+                }
+                (Some(bo), None) => Some(bo),
+                (None, Some(ro)) => Some(ro),
+                (None, None) => None,
+            };
+            if resolved.is_some() {
+                reserve_map_charged(cell_cache, &s, cache_held)?;
+                cell_cache.insert(s, resolved);
+                return Ok(resolved);
+            }
+        }
+        let mut best: Option<(u32, u64)> = None;
+        for i in g.cands(Some(s), Some(p), None, g.offset(), g.len()).iter() {
+            *pending += 1;
+            if *pending >= VISIT_BATCH {
+                visit(std::mem::take(pending))?;
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            if g.alive(i) && g.flagged(i) {
+                let t = g.triple(i);
+                if t[0] == s
+                    && t[1] == p
+                    && !inserted_list.contains(&t)
+                    && best.is_none_or(|(bi, _)| i < bi)
+                {
+                    best = Some((i, t[2]));
+                }
+            }
+        }
+        let res = best.map(|(_, o)| o).or(rem_o);
+        reserve_map_charged(cell_cache, &s, cache_held)?;
+        cell_cache.insert(s, res);
+        Ok(res)
+    };
+    let mut held = Held::new(&limits.budget);
+    let mut out: Vec<u64> = Vec::new();
+    let mut cur = head;
+    let mut seen: FxHashSet<u64> = FxHashSet::default();
+    let mut pending: u64 = 0;
+    while cur != nil {
+        pending += 1;
+        if pending >= VISIT_BATCH {
+            visit(std::mem::take(&mut pending))?;
+            if cancelled(limits) {
+                anyhow::bail!("reasoning cancelled");
+            }
+        }
+        if !insert_set_charged(&mut seen, cur, &mut held)? || out.len() > MAX_LEN {
+            if pending > 0 {
+                visit(pending)?;
+            }
+            return Ok(None);
+        }
+        let Some(f) = find_obj(
+            memo,
+            cur,
+            first,
+            removed_first,
+            &mut cache.old_first,
+            cache_held,
+            &mut pending,
+            visit,
+        )?
+        else {
+            if pending > 0 {
+                visit(pending)?;
+            }
+            return Ok(None);
+        };
+        push_charged(&mut out, f, &mut held)?;
+        let Some(r) = find_obj(
+            memo,
+            cur,
+            rest,
+            removed_rest,
+            &mut cache.old_rest,
+            cache_held,
+            &mut pending,
+            visit,
+        )?
+        else {
+            if pending > 0 {
+                visit(pending)?;
+            }
+            return Ok(None);
+        };
+        cur = r;
+    }
+    if pending > 0 {
+        visit(pending)?;
+    }
+    Ok(Some(out))
+}
+
+/// Find every explicit RDF list head whose member sequence changed between the old and
+/// new snapshots, walking backward along `rdf:rest` in both snapshots (F16 §7.3).
+fn changed_lists(
+    c: &Closure,
+    inserted: &[Triple],
+    removed: &[Triple],
+    multi_graph: bool,
+    limits: &Limits,
+    bound: &Bound,
+) -> anyhow::Result<ChangedLists> {
+    let mut visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
+    changed_lists_metered(c, inserted, removed, multi_graph, limits, &mut visit)
+}
+
+fn changed_lists_metered(
+    c: &Closure,
+    inserted: &[Triple],
+    removed: &[Triple],
+    multi_graph: bool,
+    limits: &Limits,
+    visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+) -> anyhow::Result<ChangedLists> {
+    if cancelled(limits) {
+        anyhow::bail!("reasoning cancelled");
+    }
+    let budget = &limits.budget;
+    let (first, rest, nil) = (c.terms.rdf_first, c.terms.rdf_rest, c.terms.rdf_nil);
+    let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+    let mut work_held = Held::new(budget);
+    let mut old_held = Held::new(budget);
+    let mut new_held = Held::new(budget);
+    let mut removed_lists_held = Held::new(budget);
+    let mut heads: Vec<u64> = Vec::new();
+    let mut old_members: FxHashMap<u64, Option<Arc<[u64]>>> = FxHashMap::default();
+    let mut new_members: FxHashMap<u64, Option<Arc<[u64]>>> = FxHashMap::default();
+    let mut removed_lists: FxHashSet<Triple> = FxHashSet::default();
+    let g = &c.graph;
+    let mut memo = Memo::default();
+    {
+        let mut inserted_list: FxHashSet<Triple> = FxHashSet::default();
+        let mut removed_first: FxHashMap<u64, RemovedObj> = FxHashMap::default();
+        let mut removed_rest: FxHashMap<u64, RemovedObj> = FxHashMap::default();
+        let mut removed_rev_rest: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        let mut affected: FxHashSet<u64> = FxHashSet::default();
+        let mut queue: Vec<u64> = Vec::new();
+        let mut cell_cache = ListCellCache::default();
+        let mut pending: u64 = 0;
+        for &t in inserted {
+            pending += 1;
+            if pending >= VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            if !is_list(&t) {
+                continue;
+            }
+            insert_set_charged(&mut inserted_list, t, &mut work_held)?;
+            if insert_set_charged(&mut affected, t[0], &mut work_held)? {
+                push_charged(&mut queue, t[0], &mut work_held)?;
+            }
+        }
+        for &t in removed {
+            pending += 1;
+            if pending >= VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            if !is_list(&t) {
+                continue;
+            }
+            insert_set_charged(&mut removed_lists, t, &mut removed_lists_held)?;
+            if t[1] == first {
+                record_removed_obj(&mut removed_first, t[0], t[2], &mut work_held)?;
+            } else {
+                record_removed_obj(&mut removed_rest, t[0], t[2], &mut work_held)?;
+                reserve_map_charged(&mut removed_rev_rest, &t[2], &mut work_held)?;
+                push_charged(
+                    removed_rev_rest.entry(t[2]).or_default(),
+                    t[0],
+                    &mut work_held,
+                )?;
+            }
+            if insert_set_charged(&mut affected, t[0], &mut work_held)? {
+                push_charged(&mut queue, t[0], &mut work_held)?;
+            }
+        }
+        visit(std::mem::take(&mut pending))?;
+        if cancelled(limits) {
+            anyhow::bail!("reasoning cancelled");
+        }
+        while let Some(cell) = queue.pop() {
+            pending += 1;
+            if pending >= VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
+            if let Some(base) = g.base() {
+                let mut err: Option<anyhow::Error> = None;
+                let mut base_meter = |n: u64| -> anyhow::Result<()> {
+                    visit(n)?;
+                    if cancelled(limits) {
+                        anyhow::bail!("reasoning cancelled");
+                    }
+                    Ok(())
+                };
+                base.for_each_with_metered(
+                    &mut memo,
+                    None,
+                    Some(rest),
+                    Some(cell),
+                    &mut base_meter,
+                    |t| match insert_set_charged(&mut affected, t[0], &mut work_held) {
+                        Ok(true) => match push_charged(&mut queue, t[0], &mut work_held) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                err = Some(e.into());
+                                false
+                            }
+                        },
+                        Ok(false) => true,
+                        Err(e) => {
+                            err = Some(e.into());
+                            false
+                        }
+                    },
+                )?;
+                if let Some(e) = err {
+                    return Err(e);
+                }
+            }
+            for r in g
+                .cands(None, Some(rest), Some(cell), g.offset(), g.len())
+                .iter()
+            {
+                pending += 1;
+                if pending >= VISIT_BATCH {
+                    visit(std::mem::take(&mut pending))?;
+                    if cancelled(limits) {
+                        anyhow::bail!("reasoning cancelled");
+                    }
+                }
+                if g.alive(r) && g.flagged(r) {
+                    let t = g.triple(r);
+                    if t[1] == rest
+                        && t[2] == cell
+                        && insert_set_charged(&mut affected, t[0], &mut work_held)?
+                    {
+                        push_charged(&mut queue, t[0], &mut work_held)?;
+                    }
+                }
+            }
+            if let Some(prevs) = removed_rev_rest.get(&cell) {
+                for &p in prevs {
+                    pending += 1;
+                    if pending >= VISIT_BATCH {
+                        visit(std::mem::take(&mut pending))?;
+                        if cancelled(limits) {
+                            anyhow::bail!("reasoning cancelled");
+                        }
+                    }
+                    if insert_set_charged(&mut affected, p, &mut work_held)? {
+                        push_charged(&mut queue, p, &mut work_held)?;
+                    }
+                }
+            }
+        }
+        if pending > 0 {
+            visit(std::mem::take(&mut pending))?;
+        }
+        for &h in &affected {
+            if cancelled(limits) {
+                anyhow::bail!("reasoning cancelled");
+            }
+            let new_m = new_explicit_list(
+                g,
+                &mut memo,
+                h,
+                first,
+                rest,
+                nil,
+                &mut cell_cache,
+                &mut work_held,
+                limits,
+                visit,
+            )?;
+            let old_m = old_explicit_list(
+                g,
+                &mut memo,
+                h,
+                first,
+                rest,
+                nil,
+                &inserted_list,
+                &removed_first,
+                &removed_rest,
+                multi_graph,
+                &mut cell_cache,
+                &mut work_held,
+                limits,
+                visit,
+            )?;
+            let same = old_m == new_m;
+            if !same {
+                push_charged(&mut heads, h, &mut new_held)?;
+            }
+            let new_bytes = new_m
+                .as_ref()
+                .map_or(0, |v| v.len() * size_of::<u64>() + 16);
+            new_held.try_grow(new_bytes)?;
+            reserve_map_charged(&mut new_members, &h, &mut new_held)?;
+            let new_rc = new_m.map(Arc::<[u64]>::from);
+            reserve_map_charged(&mut old_members, &h, &mut old_held)?;
+            let old_rc = if same {
+                new_rc.clone()
+            } else {
+                let old_bytes = old_m
+                    .as_ref()
+                    .map_or(0, |v| v.len() * size_of::<u64>() + 16);
+                old_held.try_grow(old_bytes)?;
+                old_m.map(Arc::<[u64]>::from)
+            };
+            new_members.insert(h, new_rc);
+            old_members.insert(h, old_rc);
+            visit(0)?;
+        }
+    }
+    if let Some(base) = g.base() {
+        base.add_scans(memo.scans);
+    }
+    drop(work_held);
+    heads.sort_unstable();
+    heads.dedup();
+    Ok(ChangedLists {
+        heads,
+        old_members,
+        old_held,
+        new_members,
+        _new_held: new_held,
+        removed_lists,
+        removed_lists_held,
+    })
+}
+
+/// Evaluate list-reading rules over `changed.old_members` to find live derived heads that
+/// depended on a changed explicit RDF list and must enter the first deletion frontier.
+fn eval_list_rules_old(
+    c: &Closure,
+    rules: &[CRule],
+    changed: &ChangedLists,
+    limits: &Limits,
+    bound: &Bound,
+) -> anyhow::Result<(Vec<Triple>, Held)> {
+    let g = &c.graph;
+    let abort = AtomicBool::new(false);
+    let mut out_held = Held::new(&limits.budget);
+    let mut seen_held = Held::new(&limits.budget);
+    let mut out: Vec<Triple> = Vec::new();
+    let mut seen: FxHashSet<Triple> = FxHashSet::default();
+    let visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
+    let visit: &engine::Visit<'_> = &visit;
+    for r in rules {
+        if !engine::reads_lists(r) {
+            continue;
+        }
+        let ranges = vec![(0, g.len()); r.atoms.len()];
+        for slot in list_head_slots(r) {
+            match slot {
+                Slot::Var(lv) => {
+                    let Some(steps) = engine::plan_with(r, &ranges, Some(g), None, &[lv]) else {
+                        continue;
+                    };
+                    let mut ev = Eval::new(
+                        g,
+                        &c.terms,
+                        r,
+                        &steps,
+                        g.len(),
+                        &abort,
+                        limits.cancel.as_deref(),
+                        usize::MAX,
+                        Mode::Existing { visit: Some(visit) },
+                        &limits.budget,
+                    );
+                    ev.set_explicit_lists(true);
+                    ev.set_list_override(Some(&changed.old_members));
+                    let mut b = vec![0u64; r.nvars];
+                    for &h in &changed.heads {
+                        if cancelled(limits) {
+                            anyhow::bail!("reasoning cancelled");
+                        }
+                        b[lv] = h;
+                        ev.run(0, &mut b, None);
+                        if let Some(e) = ev.err.take() {
+                            return Err(e);
+                        }
+                        if ev.visits > 0 {
+                            bound.add(std::mem::take(&mut ev.visits))?;
+                        }
+                    }
+                    let (found, _h) = ev.take_out();
+                    for t in found {
+                        if g.position(&t).is_some_and(|row| !c.flagged(row))
+                            && insert_set_charged(&mut seen, t, &mut seen_held)?
+                        {
+                            push_charged(&mut out, t, &mut out_held)?;
+                        }
+                    }
+                    bound.add(0)?;
+                }
+                Slot::Const(h) if changed.heads.binary_search(&h).is_ok() => {
+                    let Some(steps) = engine::plan_with(r, &ranges, Some(g), None, &[]) else {
+                        continue;
+                    };
+                    let mut ev = Eval::new(
+                        g,
+                        &c.terms,
+                        r,
+                        &steps,
+                        g.len(),
+                        &abort,
+                        limits.cancel.as_deref(),
+                        usize::MAX,
+                        Mode::Existing { visit: Some(visit) },
+                        &limits.budget,
+                    );
+                    ev.set_explicit_lists(true);
+                    ev.set_list_override(Some(&changed.old_members));
+                    let mut b = vec![0u64; r.nvars];
+                    ev.run(0, &mut b, None);
+                    if let Some(e) = ev.err.take() {
+                        return Err(e);
+                    }
+                    if ev.visits > 0 {
+                        bound.add(std::mem::take(&mut ev.visits))?;
+                    }
+                    let (found, _h) = ev.take_out();
+                    for t in found {
+                        if g.position(&t).is_some_and(|row| !c.flagged(row))
+                            && insert_set_charged(&mut seen, t, &mut seen_held)?
+                        {
+                            push_charged(&mut out, t, &mut out_held)?;
+                        }
+                    }
+                    bound.add(0)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    drop(seen);
+    drop(seen_held);
+    Ok((out, out_held))
+}
+
+/// Evaluate list-reading rules for `changed.heads` using the new explicit RDF lists and
+/// merge any newly derived facts into `c.graph`, deduplicating across rules before
+/// counting distinct new rows against `limits.max_inferred` from `inferred_origin`.
+fn eval_list_rules_new(
+    c: &mut Closure,
+    rules: &[CRule],
+    changed: &ChangedLists,
+    reuse_new_members: bool,
+    limits: &Limits,
+    inferred_origin: u32,
+) -> anyhow::Result<()> {
+    let abort = AtomicBool::new(false);
+    let mut fresh_held = Held::new(&limits.budget);
+    let mut fresh: Vec<Triple> = Vec::new();
+    {
+        let g = &c.graph;
+        #[cfg(test)]
+        let _probe_guard = g
+            .list_probe
+            .enter_phase(crate::graph::ListProbePhase::Replay);
+        let already = g.inferred_since(inferred_origin);
+        let mut seen_held = Held::new(&limits.budget);
+        let mut seen: FxHashSet<Triple> = FxHashSet::default();
+        let mut memo = Memo::default();
+        for r in rules {
+            if !engine::reads_lists(r) {
+                continue;
+            }
+            let ranges = vec![(0, g.len()); r.atoms.len()];
+            for slot in list_head_slots(r) {
+                let rule_name = &r.name;
+                let mut admit = |t: Triple| -> anyhow::Result<()> {
+                    if g.position(&t).is_some() {
+                        return Ok(());
+                    }
+                    if let Some(base) = g.base()
+                        && base.contains_with(&mut memo, &t)?
+                    {
+                        return Ok(());
+                    }
+                    if !insert_set_charged(&mut seen, t, &mut seen_held)? {
+                        return Ok(());
+                    }
+                    if already.saturating_add(fresh.len()) >= limits.max_inferred {
+                        return Err(crate::InferredLimitExceeded {
+                            limit: limits.max_inferred,
+                            context: format!(" (in rule '{rule_name}')"),
+                        }
+                        .into());
+                    }
+                    push_charged(&mut fresh, t, &mut fresh_held)?;
+                    Ok(())
+                };
+                match slot {
+                    Slot::Var(lv) => {
+                        let Some(steps) = engine::plan_with(r, &ranges, Some(g), None, &[lv])
+                        else {
+                            continue;
+                        };
+                        let mut ev = Eval::new(
+                            g,
+                            &c.terms,
+                            r,
+                            &steps,
+                            g.len(),
+                            &abort,
+                            limits.cancel.as_deref(),
+                            usize::MAX,
+                            Mode::NewSink { sink: &mut admit },
+                            &limits.budget,
+                        );
+                        ev.set_explicit_lists(true);
+                        if reuse_new_members {
+                            ev.set_list_override(Some(&changed.new_members));
+                        }
+                        ev.set_deadline(limits.deadline);
+                        let mut b = vec![0u64; r.nvars];
+                        for &h in &changed.heads {
+                            if limits.stopped() {
+                                return Err(limits.stop_error());
+                            }
+                            b[lv] = h;
+                            ev.run(0, &mut b, None);
+                            if let Some(e) = ev.err.take() {
+                                return Err(e);
+                            }
+                            if limits.stopped() {
+                                return Err(limits.stop_error());
+                            }
+                        }
+                    }
+                    Slot::Const(h) if changed.heads.binary_search(&h).is_ok() => {
+                        let Some(steps) = engine::plan_with(r, &ranges, Some(g), None, &[]) else {
+                            continue;
+                        };
+                        let mut ev = Eval::new(
+                            g,
+                            &c.terms,
+                            r,
+                            &steps,
+                            g.len(),
+                            &abort,
+                            limits.cancel.as_deref(),
+                            usize::MAX,
+                            Mode::NewSink { sink: &mut admit },
+                            &limits.budget,
+                        );
+                        ev.set_explicit_lists(true);
+                        if reuse_new_members {
+                            ev.set_list_override(Some(&changed.new_members));
+                        }
+                        ev.set_deadline(limits.deadline);
+                        let mut b = vec![0u64; r.nvars];
+                        ev.run(0, &mut b, None);
+                        if let Some(e) = ev.err.take() {
+                            return Err(e);
+                        }
+                        if limits.stopped() {
+                            return Err(limits.stop_error());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(base) = g.base() {
+            base.add_scans(memo.scans);
+        }
+    }
+    if !fresh.is_empty() {
+        c.graph.try_add_batch(fresh)?;
+    }
+    drop(fresh_held);
+    Ok(())
+}
+
+/// Estimate rule-instance visits for a deletion from the removed triples matching each
+/// non-operator rule's constant `(s, p, o)` slots and the closure's fan-out (`plans`),
+/// to compare against item 798's visit bound (F16 §7.3, replacing `LARGE_DELETION`).
+/// Only keys required by active compiled patterns are indexed, and all projection tables
+/// are charged to `limits.budget` before growth.
+fn estimate_deletion_visits(
+    c: &Closure,
+    rules: &[CRule],
+    plans: &Plans,
+    removed: &[Triple],
+    limits: &Limits,
+) -> anyhow::Result<u64> {
+    let g = &c.graph;
+    let hi = g.len();
+    let total_facts = g.offset() as u64 + g.live() as u64;
+    if total_facts == 0 || removed.is_empty() {
+        return Ok(0);
+    }
+    let mut held = Held::new(&limits.budget);
+    let mut by_p: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut by_ps: FxHashMap<(u64, u64), u64> = FxHashMap::default();
+    let mut by_po: FxHashMap<(u64, u64), u64> = FxHashMap::default();
+    let mut by_pso: FxHashMap<Triple, u64> = FxHashMap::default();
+    let mut by_s: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut by_o: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut by_so: FxHashMap<(u64, u64), u64> = FxHashMap::default();
+    let mut register_pattern = |s: Slot, p: Slot, o: Slot| -> Result<(), BudgetFailure> {
+        match (s, p, o) {
+            (Slot::Const(ks), Slot::Const(kp), Slot::Const(ko)) => {
+                let k = [ks, kp, ko];
+                reserve_map_charged(&mut by_pso, &k, &mut held)?;
+                by_pso.entry(k).or_insert(0);
+            }
+            (Slot::Const(ks), Slot::Const(kp), _) => {
+                let k = (kp, ks);
+                reserve_map_charged(&mut by_ps, &k, &mut held)?;
+                by_ps.entry(k).or_insert(0);
+            }
+            (_, Slot::Const(kp), Slot::Const(ko)) => {
+                let k = (kp, ko);
+                reserve_map_charged(&mut by_po, &k, &mut held)?;
+                by_po.entry(k).or_insert(0);
+            }
+            (_, Slot::Const(kp), _) => {
+                reserve_map_charged(&mut by_p, &kp, &mut held)?;
+                by_p.entry(kp).or_insert(0);
+            }
+            (Slot::Const(ks), _, Slot::Const(ko)) => {
+                let k = (ks, ko);
+                reserve_map_charged(&mut by_so, &k, &mut held)?;
+                by_so.entry(k).or_insert(0);
+            }
+            (Slot::Const(ks), _, _) => {
+                reserve_map_charged(&mut by_s, &ks, &mut held)?;
+                by_s.entry(ks).or_insert(0);
+            }
+            (_, _, Slot::Const(ko)) => {
+                reserve_map_charged(&mut by_o, &ko, &mut held)?;
+                by_o.entry(ko).or_insert(0);
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    for (ri, r) in rules.iter().enumerate() {
+        if !plans.forward[ri].is_empty() {
+            for (d, a) in r.atoms.iter().enumerate() {
+                if plans.forward[ri][d].is_some() {
+                    register_pattern(a.s, a.p, a.o)?;
+                }
+            }
+        }
+        for (hi_head, h) in r.head.iter().enumerate() {
+            if plans.back[ri].get(hi_head).is_some_and(Option::is_some)
+                && let CHead::Triple(s, p, o) = *h
+            {
+                register_pattern(s, p, o)?;
+            }
+        }
+    }
+    for (idx, &t) in removed.iter().enumerate() {
+        if (idx & (VISIT_BATCH as usize - 1)) == 0 && cancelled(limits) {
+            anyhow::bail!("reasoning cancelled");
+        }
+        let [s, p, o] = t;
+        if !by_p.is_empty()
+            && let Some(cnt) = by_p.get_mut(&p)
+        {
+            *cnt += 1;
+        }
+        if !by_ps.is_empty()
+            && let Some(cnt) = by_ps.get_mut(&(p, s))
+        {
+            *cnt += 1;
+        }
+        if !by_po.is_empty()
+            && let Some(cnt) = by_po.get_mut(&(p, o))
+        {
+            *cnt += 1;
+        }
+        if !by_pso.is_empty()
+            && let Some(cnt) = by_pso.get_mut(&t)
+        {
+            *cnt += 1;
+        }
+        if !by_s.is_empty()
+            && let Some(cnt) = by_s.get_mut(&s)
+        {
+            *cnt += 1;
+        }
+        if !by_o.is_empty()
+            && let Some(cnt) = by_o.get_mut(&o)
+        {
+            *cnt += 1;
+        }
+        if !by_so.is_empty()
+            && let Some(cnt) = by_so.get_mut(&(s, o))
+        {
+            *cnt += 1;
+        }
+    }
+    let total_removed = removed.len() as u64;
+    let count_matching = |s: Slot, p: Slot, o: Slot| -> u64 {
+        match (s, p, o) {
+            (Slot::Const(ks), Slot::Const(kp), Slot::Const(ko)) => {
+                by_pso.get(&[ks, kp, ko]).copied().unwrap_or(0)
+            }
+            (Slot::Const(ks), Slot::Const(kp), _) => by_ps.get(&(kp, ks)).copied().unwrap_or(0),
+            (_, Slot::Const(kp), Slot::Const(ko)) => by_po.get(&(kp, ko)).copied().unwrap_or(0),
+            (_, Slot::Const(kp), _) => by_p.get(&kp).copied().unwrap_or(0),
+            (Slot::Const(ks), _, Slot::Const(ko)) => by_so.get(&(ks, ko)).copied().unwrap_or(0),
+            (Slot::Const(ks), _, _) => by_s.get(&ks).copied().unwrap_or(0),
+            (_, _, Slot::Const(ko)) => by_o.get(&ko).copied().unwrap_or(0),
+            _ => total_removed,
+        }
+    };
+    let dist_p = g.distinct_predicates().max(1) as u64;
+    let dist_s = g.distinct_subjects().max(1) as u64;
+    let dist_o = g.distinct_objects().max(1) as u64;
+    let avg_p = total_facts.div_ceil(dist_p).max(1);
+
+    let max_nvars = rules.iter().map(|r| r.nvars).max().unwrap_or(0);
+    if max_nvars > 16 {
+        held.try_grow(max_nvars * size_of::<bool>())?;
+    }
+    let mut var_bound: smallvec::SmallVec<[bool; 16]> = smallvec::smallvec![false; max_nvars];
+    if var_bound.spilled() && var_bound.capacity() > max_nvars {
+        held.try_grow((var_bound.capacity() - max_nvars) * size_of::<bool>())?;
+    }
+
+    let plan_fanout = |var_bound: &mut [bool],
+                       r: &CRule,
+                       steps: &[Step],
+                       skip_atom: Option<usize>,
+                       pre: &[usize]|
+     -> u64 {
+        let bound = &mut var_bound[..r.nvars];
+        bound.fill(false);
+        let bind = |s: Slot, b: &mut [bool]| {
+            if let Slot::Var(v) = s {
+                b[v] = true;
+            }
+        };
+        if let Some(d) = skip_atom {
+            let a = &r.atoms[d];
+            bind(a.s, bound);
+            bind(a.p, bound);
+            bind(a.o, bound);
+        }
+        for &v in pre {
+            bound[v] = true;
+        }
+        let is_bound = |s: Slot, b: &[bool]| match s {
+            Slot::Const(_) => true,
+            Slot::Var(v) => b[v],
+            Slot::Any => false,
+        };
+        let mut fanout = 1u64;
+        for step in steps {
+            let atom = match *step {
+                Step::Atom { atom, .. } => atom,
+                Step::Builtin(bi) => {
+                    for &v in &r.builtins[bi].outputs {
+                        bound[v] = true;
+                    }
+                    continue;
+                }
+            };
+            if skip_atom == Some(atom) {
+                continue;
+            }
+            let a = &r.atoms[atom];
+            let sb = is_bound(a.s, bound);
+            let ob = is_bound(a.o, bound);
+            let est = match a.p {
+                Slot::Const(p) => {
+                    let n = g.count_p(p, 0, hi) as u64;
+                    if n == 0 {
+                        return 0;
+                    }
+                    let (ds, do_) = g.pstats(p);
+                    match (sb, ob) {
+                        (true, true) => 1,
+                        (true, false) => n.div_ceil(ds.max(1) as u64).max(1),
+                        (false, true) => n.div_ceil(do_.max(1) as u64).max(1),
+                        (false, false) => n,
+                    }
+                }
+                Slot::Var(vp) if bound[vp] => match (sb, ob) {
+                    (true, true) => 1,
+                    (true, false) => avg_p.div_ceil(dist_s).max(1),
+                    (false, true) => avg_p.div_ceil(dist_o).max(1),
+                    (false, false) => avg_p,
+                },
+                _ => match (sb, ob) {
+                    (true, true) => 1,
+                    (true, false) => total_facts.div_ceil(dist_s).max(1),
+                    (false, true) => total_facts.div_ceil(dist_o).max(1),
+                    (false, false) => total_facts,
+                },
+            };
+            fanout = fanout.saturating_mul(est);
+            bind(a.s, bound);
+            bind(a.p, bound);
+            bind(a.o, bound);
+        }
+        fanout
+    };
+
+    let mut total = 0u64;
+    // 1. Forward consequence fan-out for non-operator rules matching removed triples.
+    for (ri, r) in rules.iter().enumerate() {
+        if plans.forward[ri].is_empty() {
+            continue;
+        }
+        for (d, a) in r.atoms.iter().enumerate() {
+            let Some(steps) = plans.forward[ri][d].as_deref() else {
+                continue;
+            };
+            let count = count_matching(a.s, a.p, a.o);
+            if count == 0 {
+                continue;
+            }
+            let f = plan_fanout(&mut var_bound, r, steps, Some(d), &[]);
+            total = total.saturating_add(count.saturating_mul(f));
+        }
+    }
+    // 2. Backward proof fan-out for non-operator rule heads matching removed triples.
+    let mut add_head = |ri: usize, hi_head: usize| {
+        let Some((steps, pre)) = plans.back[ri][hi_head].as_ref() else {
+            return;
+        };
+        let CHead::Triple(hs, hp, ho) = rules[ri].head[hi_head] else {
+            return;
+        };
+        let count = count_matching(hs, hp, ho);
+        if count == 0 {
+            return;
+        }
+        let f = plan_fanout(&mut var_bound, &rules[ri], steps, None, pre);
+        total = total.saturating_add(count.saturating_mul(f));
+    };
+    for list in plans.by_pred.values() {
+        for &(ri, hi_head) in list {
+            add_head(ri, hi_head);
+        }
+    }
+    for &(ri, hi_head) in &plans.any_pred {
+        add_head(ri, hi_head);
+    }
+    Ok(total)
+}
+
+/// Re-derive any fact deleted during Phase 1 after its proof search touched a surviving
+/// unproved fact of an operator-governed predicate, once saturation has re-closed the
+/// operator relations. Repeats until quiescent, respecting `limits.max_inferred` from
+/// `inferred_origin` and cumulative `limits.max_iterations`.
+#[allow(clippy::too_many_arguments)]
+fn revive_overdeleted(
+    c: &mut Closure,
+    rules: &[CRule],
+    plans: &Plans,
+    limits: &Limits,
+    inferred_origin: u32,
+    candidates: &mut Vec<Triple>,
+    iterations: &mut usize,
+) -> anyhow::Result<()> {
+    candidates.sort_unstable();
+    candidates.dedup();
+    let abort = AtomicBool::new(false);
+    loop {
+        candidates.retain(|t| {
+            c.graph.position(t).is_none()
+                && !c
+                    .graph
+                    .base()
+                    .is_some_and(|b| b.contains(t).unwrap_or(false))
+        });
+        if candidates.is_empty() {
+            break;
+        }
+        let mut revived_held = Held::new(&limits.budget);
+        let mut revived: Vec<Triple> = Vec::new();
+        {
+            let g = &c.graph;
+            let already = g.inferred_since(inferred_origin);
+            for &t in candidates.iter() {
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                let mut found = false;
+                for (ri, hi) in plans.heads(t[1]) {
+                    let Some((steps, pre)) = &plans.back[ri][hi] else {
+                        continue;
+                    };
+                    let rule = &rules[ri];
+                    let Some(mut b) = bind_head(rule, hi, pre, t) else {
+                        continue;
+                    };
+                    let failed = {
+                        let mut sink = |_: &[Triple], _: &[Triple], _: &[u64]| -> bool {
+                            found = true;
+                            false
+                        };
+                        let mut ev = Eval::new(
+                            g,
+                            &c.terms,
+                            rule,
+                            steps,
+                            g.len(),
+                            &abort,
+                            limits.cancel.as_deref(),
+                            usize::MAX,
+                            Mode::Instances {
+                                head: hi,
+                                target: t,
+                                sink: &mut sink,
+                            },
+                            &limits.budget,
+                        );
+                        ev.run(0, &mut b, None);
+                        ev.err.take()
+                    };
+                    if let Some(e) = failed {
+                        return Err(e);
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                if found {
+                    if already.saturating_add(revived.len()) >= limits.max_inferred {
+                        return Err(crate::InferredLimitExceeded {
+                            limit: limits.max_inferred,
+                            context: " (reviving over-deleted facts)".into(),
+                        }
+                        .into());
+                    }
+                    push_charged(&mut revived, t, &mut revived_held)?;
+                }
+            }
+        }
+        if revived.is_empty() {
+            break;
+        }
+        let start = c.graph.len();
+        c.graph.try_add_batch(revived)?;
+        drop(revived_held);
+        let o = match engine::run_from(
+            &mut c.graph,
+            rules,
+            &c.terms,
+            limits,
+            Some(start),
+            None,
+            engine::Origin {
+                base_len: Some(inferred_origin),
+                iterations: *iterations,
+                lists: None,
+            },
+        ) {
+            Ok(o) => o,
+            Err(e) if e.is::<crate::closure::Restart>() => {
+                return Err(Fallback("an RDF list fact was derived".into()).into());
+            }
+            Err(e) => return Err(e),
+        };
+        *iterations = o.iterations;
+    }
+    Ok(())
 }
 
 /// Bindings of rule `ri`'s head `hi` unified with `t` (only the variables in `pre`), or
@@ -2237,6 +4177,1724 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// Directed closure reachability (`BaseReach::Directed`) and shared-tail changed-list
+    /// preparation both respect the deletion memory bound and release all charges on
+    /// fallback.
+    #[test]
+    fn directed_closure_and_changed_lists_respect_memory_bound() {
+        let v = Vocab::new();
+        let id = |s: &str| v.iri[s];
+        let sub = id(&format!("{RDFS}subClassOf"));
+        let mut base: FxHashSet<Triple> = FxHashSet::default();
+        for i in 0..5 {
+            base.insert([v.classes[i], sub, v.classes[i + 1]]);
+        }
+        let text = crate::RDFS_RULES;
+        let mut c = full(&v, text, &base);
+        let mut now = base.clone();
+        let removed = vec![[v.classes[2], sub, v.classes[3]]];
+        now.remove(&removed[0]);
+        let snap = set_default_graph(&v, &now);
+        let moved = c.terms.rebase(snap.clone()).unwrap();
+        c.remap(&moved).unwrap();
+        if let Some(mut l) = c.set_inputs(snap, &[Id::DEFAULT_GRAPH]).unwrap() {
+            l.update(&[], &removed, crate::facts::rank);
+            c.put_lookups(l);
+        }
+        let rules = compiled(text, &c.terms);
+        let lim = limits();
+        let used = lim.budget.used();
+        HELD_BOUND.with(|b| b.set(Some(0)));
+        let r = update(&mut c, &rules, &lim, &[], &removed, None);
+        HELD_BOUND.with(|b| b.set(None));
+        let e = r.expect_err("directed closure build must respect held bound");
+        assert!(e.downcast_ref::<Fallback>().is_some(), "{e:#}");
+        drop(c);
+        assert!(lim.budget.used() <= used, "{} > {used}", lim.budget.used());
+
+        // Shared-tail explicit list preparation under HELD_BOUND = 0
+        let first = id(&format!("{RDF}first"));
+        let rest = id(&format!("{RDF}rest"));
+        let nil = id(&format!("{RDF}nil"));
+        let items = v.props[0];
+        let mut lbase: FxHashSet<Triple> = FxHashSet::default();
+        lbase.insert([v.inds[0], items, v.list_nodes[0]]);
+        for i in 0..3 {
+            lbase.insert([v.list_nodes[i], first, v.classes[i]]);
+            lbase.insert([
+                v.list_nodes[i],
+                rest,
+                if i + 1 < 3 { v.list_nodes[i + 1] } else { nil },
+            ]);
+        }
+        let ltext = "@prefix ex: <http://ex.org/>.\n\
+                     [m: (?c ex:p0 ?l), listMember(?l, ?x) -> (?c ex:p1 ?x)]";
+        let mut lc = full(&v, ltext, &lbase);
+        let mut lnow = lbase.clone();
+        let lrem = vec![[v.list_nodes[2], first, v.classes[2]]];
+        let lins = vec![[v.list_nodes[2], first, v.classes[5]]];
+        lnow.remove(&lrem[0]);
+        lnow.insert(lins[0]);
+        let lsnap = set_default_graph(&v, &lnow);
+        let lmoved = lc.terms.rebase(lsnap.clone()).unwrap();
+        lc.remap(&lmoved).unwrap();
+        if let Some(mut l) = lc.set_inputs(lsnap, &[Id::DEFAULT_GRAPH]).unwrap() {
+            l.update(&lins, &lrem, crate::facts::rank);
+            lc.put_lookups(l);
+        }
+        let lrules = compiled(ltext, &lc.terms);
+        let llim = limits();
+        let lused = llim.budget.used();
+        HELD_BOUND.with(|b| b.set(Some(0)));
+        let lr = update(&mut lc, &lrules, &llim, &lins, &lrem, None);
+        HELD_BOUND.with(|b| b.set(None));
+        let le = lr.expect_err("changed_lists preparation must respect held bound");
+        assert!(le.downcast_ref::<Fallback>().is_some(), "{le:#}");
+        drop(lc);
+        assert!(
+            llim.budget.used() <= lused,
+            "{} > {lused}",
+            llim.budget.used()
+        );
+    }
+
+    /// `estimate_deletion_visits` only indexes constant keys appearing in compiled rules
+    /// and admits its projection tables against `limits.budget` before growth.
+    #[test]
+    fn estimate_deletion_visits_charges_and_ignores_unmatched_removed_objects() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let terms = Terms::new(snap);
+        let text = "@prefix ex: <http://ex.org/>.\n\
+                    [r: (?s ex:p ex:c) -> (?s ex:q ex:ok)]";
+        let rules = compiled(text, &terms);
+        let p = terms
+            .id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                "http://ex.org/p",
+            )))
+            .unwrap();
+        let mut g = Graph::default();
+        // Seed one fact so total_facts > 0.
+        g.try_add_batch(vec![[10_000, p, 20_000]]).unwrap();
+        let mut c = Closure::new(g, terms).unwrap();
+        let plans = Plans::new(&mut c.graph, &rules).unwrap();
+
+        // 5,000 removed `ex:p` triples with distinct non-matching objects.
+        let removed: Vec<Triple> = (0..5_000u64)
+            .map(|i| [100_000 + i, p, 200_000 + i])
+            .collect();
+
+        // A tight 8 KiB budget fits the single compiled `(ex:p, ex:c)` key in `by_po`
+        // (whereas indexing all 5,000 removed `(p, o)` pairs would need >120 KiB).
+        let tight = Limits {
+            budget: Budget::new(Some(8 * 1024)),
+            ..limits()
+        };
+        let est = estimate_deletion_visits(&c, &rules, &plans, &removed, &tight)
+            .expect("unmatched removed objects must not grow projection tables");
+        assert_eq!(est, 0);
+        assert_eq!(tight.budget.used(), 0);
+        assert!(tight.budget.peak() > 0 && tight.budget.peak() <= 8 * 1024);
+
+        // A 1-byte budget must refuse before allocating the compiled pattern table.
+        let tiny = Limits {
+            budget: Budget::new(Some(1)),
+            ..limits()
+        };
+        let err = estimate_deletion_visits(&c, &rules, &plans, &removed, &tiny)
+            .expect_err("1-byte budget must reject estimator table allocation");
+        assert!(
+            crate::budget::BudgetFailure::from_anyhow(&err).is_some(),
+            "{err:#}"
+        );
+        assert_eq!(tiny.budget.used(), 0);
+    }
+
+    /// With a nonzero memory allowance, operator candidate scans (`build_undirected`,
+    /// `build_directed`, and guarded symmetric `pred_has_explicit_literal_obj`) count
+    /// rejected unflagged derived rows against `Bound` and poll cancellation.
+    #[test]
+    fn operator_candidate_scans_respect_visit_bound_and_cancel() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let terms = Terms::new(snap);
+        let iri = |u: &str| {
+            terms
+                .id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(u)))
+                .unwrap()
+        };
+        let eq_p = iri(&format!("{OWL}sameAs"));
+        let sub_p = iri(&format!("{RDFS}subClassOf"));
+        let rdf_type = iri(&format!("{RDF}type"));
+        let owl_transitive = iri(&format!("{OWL}TransitiveProperty"));
+        let owl_symmetric = iri(&format!("{OWL}SymmetricProperty"));
+        let sym_tr_p = 50_000u64;
+        let rules_text = "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.\n\
+                          @prefix owl: <http://www.w3.org/2002/07/owl#>.\n\
+                          @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>.\n\
+                          [eq-sym: (?x owl:sameAs ?y) -> (?y owl:sameAs ?x)]\n\
+                          [eq-trans: (?x owl:sameAs ?y), (?y owl:sameAs ?z) -> (?x owl:sameAs ?z)]\n\
+                          [sub: (?x rdfs:subClassOf ?y), (?y rdfs:subClassOf ?z) -> (?x rdfs:subClassOf ?z)]\n\
+                          [trp: (?p rdf:type owl:TransitiveProperty), (?x ?p ?y), (?y ?p ?z) -> (?x ?p ?z)]\n\
+                          [symp: (?p rdf:type owl:SymmetricProperty), (?x ?p ?y), notLiteral(?y) -> (?y ?p ?x)]";
+        let rules = compiled(rules_text, &terms);
+
+        // Build a derived tier with 2,500 unflagged derived rows per predicate and only 1
+        // flagged explicit edge, so scanning only flagged matches would visit 1 row while
+        // scanning all candidates visits > 2,500 rows.
+        let mut g = Graph::default();
+        let mut rows: Vec<Triple> = Vec::new();
+        rows.push([sym_tr_p, rdf_type, owl_transitive]);
+        rows.push([sym_tr_p, rdf_type, owl_symmetric]);
+        let guard_end = rows.len() as u32;
+        for &p in &[eq_p, sub_p, sym_tr_p] {
+            rows.push([100_001, p, 100_002]);
+            for i in 0..2_500u64 {
+                rows.push([200_000 + i, p, 300_000 + i]);
+            }
+        }
+        g.try_add_batch(rows).unwrap();
+        for r in 0..guard_end {
+            g.set_flag_with(r, true, false).unwrap();
+        }
+        // Flag only the single explicit edge for each predicate.
+        for idx in 0..3u32 {
+            g.set_flag_with(guard_end + idx * 2_501, true, false)
+                .unwrap();
+        }
+
+        let budget = Budget::new(Some(64 << 20));
+        let mut noop_visit = |_: u64| Ok(());
+        // 0. `DeletionOps::detect` itself meters `pred_has_ambiguous_literals`,
+        //    `pred_has_literal_subject`, and `guarded_has_literal_subject` against `Bound`
+        //    and polls cancellation mid-scan.
+        let irref_rules_text = "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.\n\
+                                @prefix owl: <http://www.w3.org/2002/07/owl#>.\n\
+                                @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>.\n\
+                                [sub-irref: (?x rdfs:subClassOf ?y), (?y rdfs:subClassOf ?z), notEqual(?x, ?z) -> (?x rdfs:subClassOf ?z)]";
+        let irref_guarded_text = "@prefix owl: <http://www.w3.org/2002/07/owl#>.\n\
+                                  @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>.\n\
+                                  [trp-irref: (?p rdf:type owl:TransitiveProperty), (?x ?p ?y), (?y ?p ?z), notEqual(?x, ?z) -> (?x ?p ?z)]";
+        let irref_rules = compiled(irref_rules_text, &terms);
+        let irref_guarded_rules = compiled(irref_guarded_text, &terms);
+        for (label, det_rules) in [
+            ("detect equivalence ambiguity", &rules),
+            ("detect fixed irreflexive literal subject", &irref_rules),
+            (
+                "detect guarded irreflexive literal subject",
+                &irref_guarded_rules,
+            ),
+        ] {
+            let bound = Bound::new(&budget, 1_500, 64 << 20);
+            let mut visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
+            let err = match crate::closure::DeletionOps::detect(
+                det_rules, &g, &terms, &budget, None, &mut visit,
+            ) {
+                Ok(_) => panic!("{label}: detection scan must hit visit bound"),
+                Err(e) => e,
+            };
+            assert!(
+                err.downcast_ref::<Fallback>()
+                    .is_some_and(|f| f.0.contains("visited more than 1500")),
+                "{label}: unexpected error: {err:#}"
+            );
+            assert!(bound.visits() > 1_500, "{label}: {}", bound.visits());
+
+            let cancel = AtomicBool::new(false);
+            let seen_batch = AtomicBool::new(false);
+            let mut total_visits = 0u64;
+            let mut visit_c = |n: u64| {
+                total_visits += n;
+                if n >= 1_024 {
+                    seen_batch.store(true, Ordering::Relaxed);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            };
+            let cerr = match crate::closure::DeletionOps::detect(
+                det_rules,
+                &g,
+                &terms,
+                &budget,
+                Some(&cancel),
+                &mut visit_c,
+            ) {
+                Ok(_) => panic!("{label}: cancellation must stop detection scan"),
+                Err(e) => e,
+            };
+            assert!(
+                seen_batch.load(Ordering::Relaxed),
+                "{label}: must trigger on a full detection scan batch"
+            );
+            assert!(
+                (1_024..2_500).contains(&total_visits),
+                "{label}: expected mid-scan stop in [1024, 2500), got {total_visits}"
+            );
+            assert!(
+                cerr.to_string().contains("cancelled"),
+                "{label}: unexpected cancel error: {cerr:#}"
+            );
+        }
+
+        // Dedicated guarded-declaration fixture with 2,500 `rdf:type owl:TransitiveProperty`
+        // declarations so the guard scan loop itself is exercised for both visit-bound
+        // fallback and mid-loop cancellation (not just the nested per-predicate scan).
+        {
+            let mut g_guards = Graph::default();
+            let guard_rows: Vec<Triple> = (0..2_500u64)
+                .map(|i| [600_000 + i, rdf_type, owl_transitive])
+                .collect();
+            g_guards.try_add_batch(guard_rows).unwrap();
+            let bound = Bound::new(&budget, 1_500, 64 << 20);
+            let mut visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
+            let err = match crate::closure::DeletionOps::detect(
+                &irref_guarded_rules,
+                &g_guards,
+                &terms,
+                &budget,
+                None,
+                &mut visit,
+            ) {
+                Ok(_) => panic!("guard scan loop must hit visit bound"),
+                Err(e) => e,
+            };
+            assert!(
+                err.downcast_ref::<Fallback>()
+                    .is_some_and(|f| f.0.contains("visited more than 1500")),
+                "guard scan loop: unexpected error: {err:#}"
+            );
+            assert!(bound.visits() > 1_500 && bound.visits() < 2_500);
+
+            let cancel = AtomicBool::new(false);
+            let seen_batch = AtomicBool::new(false);
+            let mut total_visits = 0u64;
+            let mut visit_c = |n: u64| {
+                total_visits += n;
+                if n >= 1_024 {
+                    seen_batch.store(true, Ordering::Relaxed);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            };
+            let cerr = match crate::closure::DeletionOps::detect(
+                &irref_guarded_rules,
+                &g_guards,
+                &terms,
+                &budget,
+                Some(&cancel),
+                &mut visit_c,
+            ) {
+                Ok(_) => panic!("guard scan loop must cancel mid-scan"),
+                Err(e) => e,
+            };
+            assert!(seen_batch.load(Ordering::Relaxed));
+            assert!(
+                (1_024..2_500).contains(&total_visits),
+                "guard scan loop: expected mid-scan stop in [1024, 2500), got {total_visits}"
+            );
+            assert!(cerr.to_string().contains("cancelled"), "{cerr:#}");
+        }
+
+        for (label, pred) in [
+            ("undirected equivalence", eq_p),
+            ("directed transitive", sub_p),
+            ("guarded symmetric literal precheck", sym_tr_p),
+        ] {
+            // 1. Tight visit bound with generous nonzero memory allowance triggers Fallback.
+            let mut ops = crate::closure::DeletionOps::detect(
+                &rules,
+                &g,
+                &terms,
+                &budget,
+                None,
+                &mut noop_visit,
+            )
+            .unwrap()
+            .expect("closure ops");
+            let bound = Bound::new(&budget, 1_500, 64 << 20);
+            let mut visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
+            let err = ops
+                .ensure_pred(pred, &g, &terms, &budget, None, &mut visit)
+                .expect_err(&format!(
+                    "{label}: large unflagged scan must hit visit bound"
+                ));
+            assert!(
+                err.downcast_ref::<Fallback>()
+                    .is_some_and(|f| f.0.contains("visited more than 1500")),
+                "{label}: unexpected error: {err:#}"
+            );
+            assert!(
+                bound.visits() > 1_500,
+                "{label}: expected >1500 visits, got {}",
+                bound.visits()
+            );
+
+            // 2. Cancellation during candidate scan with nonzero memory allowance stops cleanly.
+            let mut ops_c = crate::closure::DeletionOps::detect(
+                &rules,
+                &g,
+                &terms,
+                &budget,
+                None,
+                &mut noop_visit,
+            )
+            .unwrap()
+            .expect("closure ops");
+            let cancel = AtomicBool::new(false);
+            let seen_batch = AtomicBool::new(false);
+            let mut total_visits = 0u64;
+            let mut visit_c = |n: u64| {
+                total_visits += n;
+                if n >= 1_024 {
+                    seen_batch.store(true, Ordering::Relaxed);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            };
+            let cerr = ops_c
+                .ensure_pred(pred, &g, &terms, &budget, Some(&cancel), &mut visit_c)
+                .expect_err(&format!("{label}: cancellation must stop candidate scan"));
+            assert!(
+                seen_batch.load(Ordering::Relaxed),
+                "{label}: must trigger on a full candidate scan batch"
+            );
+            assert!(
+                (1_024..2_500).contains(&total_visits),
+                "{label}: expected mid-scan stop in [1024, 2500), got {total_visits}"
+            );
+            assert!(
+                cerr.to_string().contains("cancelled"),
+                "{label}: unexpected cancel error: {cerr:#}"
+            );
+        }
+    }
+
+    /// Base-tier scans with few or no accepted facts and a large rejected range in an
+    /// unselected graph (or across multi-graph passes) meter raw rows before filtering and
+    /// stop on both `Bound` and mid-scan cancellation in detection, reachability building,
+    /// and ordered list lookups.
+    #[test]
+    fn metered_base_scans_count_rejected_rows_in_detection_reachability_and_lists() {
+        let store = Store::in_memory(StoreOptions::default());
+        let unselected = "http://ex.org/unselected";
+        let input_g1 = "http://ex.org/g1";
+        let input_g2 = "http://ex.org/g2";
+        let same_as = format!("{OWL}sameAs");
+        let sub_class = format!("{RDFS}subClassOf");
+        let rdf_first = format!("{RDF}first");
+        let rdf_rest = format!("{RDF}rest");
+        let rdf_nil = format!("{RDF}nil");
+        let cell = "http://ex.org/cell";
+
+        let mut nq = String::new();
+        // 2,500 rejected rows in `unselected` for each scanned pattern, and 0 accepted rows
+        // in `input_g1` for `owl:sameAs` / `rdfs:subClassOf`.
+        for i in 0..2_500usize {
+            let s = format!("http://ex.org/s{i}");
+            let o = format!("http://ex.org/o{i}");
+            nq.push_str(&format!("<{s}> <{same_as}> <{o}> <{unselected}> .\n"));
+            nq.push_str(&format!("<{s}> <{sub_class}> <{o}> <{unselected}> .\n"));
+            nq.push_str(&format!("<{cell}> <{rdf_first}> <{o}> <{unselected}> .\n"));
+            nq.push_str(&format!("<{s}> <{rdf_rest}> <{cell}> <{unselected}> .\n"));
+        }
+        // Seed `input_g1` and `input_g2` so their graph ids exist in the snapshot.
+        nq.push_str(&format!(
+            "<http://ex.org/keep_s> <http://ex.org/other> <http://ex.org/keep_o> <{input_g1}> .\n"
+        ));
+        nq.push_str(&format!(
+            "<http://ex.org/keep_s> <http://ex.org/other> <http://ex.org/keep_o> <{input_g2}> .\n"
+        ));
+        nq.push_str(&format!(
+            "<{cell}> <{rdf_rest}> <{rdf_nil}> <{input_g1}> .\n"
+        ));
+        store
+            .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+
+        let snap = store.snapshot();
+        let terms = Terms::new(snap.clone());
+        let id = |iri: &str| snap.lookup_iri(iri).unwrap().0;
+        let g1_id = Id(id(input_g1));
+        let g2_id = Id(id(input_g2));
+        let sub_p = id(&sub_class);
+        let cell_id = id(cell);
+        let first_p = id(&rdf_first);
+
+        let rules = compiled(
+            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.\n\
+             @prefix owl: <http://www.w3.org/2002/07/owl#>.\n\
+             [eq-sym: (?x owl:sameAs ?y) -> (?y owl:sameAs ?x)]\n\
+             [eq-trans: (?x owl:sameAs ?y), (?y owl:sameAs ?z) -> (?x owl:sameAs ?z)]\n\
+             [sub: (?x rdfs:subClassOf ?y), (?y rdfs:subClassOf ?z) -> (?x rdfs:subClassOf ?z)]",
+            &terms,
+        );
+        let budget = Budget::new(Some(64 << 20));
+        let g_single = Graph::with_base(Arc::new(Base::new(snap.clone(), &[g1_id]).unwrap()));
+
+        // 1. `DeletionOps::detect` scans rejected `owl:sameAs` base rows and hits Bound/cancel.
+        let b_det = Bound::new(&budget, 1_500, 64 << 20);
+        let mut v_det = |n: u64| b_det.add(n).map_err(anyhow::Error::from);
+        let err = match crate::closure::DeletionOps::detect(
+            &rules, &g_single, &terms, &budget, None, &mut v_det,
+        ) {
+            Ok(_) => panic!("detect over rejected base range must hit visit bound"),
+            Err(e) => e,
+        };
+        assert!(
+            err.downcast_ref::<Fallback>()
+                .is_some_and(|f| f.0.contains("visited more than 1500")),
+            "{err:#}"
+        );
+        assert!(b_det.visits() > 1_500);
+
+        let cancel_det = AtomicBool::new(false);
+        let seen_det = AtomicBool::new(false);
+        let mut total_det = 0u64;
+        let mut vc_det = |n: u64| {
+            total_det += n;
+            if n >= 1_024 {
+                seen_det.store(true, Ordering::Relaxed);
+                cancel_det.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        };
+        let cerr = match crate::closure::DeletionOps::detect(
+            &rules,
+            &g_single,
+            &terms,
+            &budget,
+            Some(&cancel_det),
+            &mut vc_det,
+        ) {
+            Ok(_) => panic!("detect over rejected base range must cancel mid-scan"),
+            Err(e) => e,
+        };
+        assert!(seen_det.load(Ordering::Relaxed));
+        assert!(
+            (1_024..2_500).contains(&total_det),
+            "detect cancel must stop mid-scan, got {total_det}"
+        );
+        assert!(cerr.to_string().contains("cancelled"), "{cerr:#}");
+
+        // 2. `DeletionOps::ensure_pred` on `rdfs:subClassOf` scans rejected base rows with 0
+        //    accepted facts and hits Bound + mid-scan cancel.
+        let sub_rules = compiled(
+            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.\n\
+             [sub: (?x rdfs:subClassOf ?y), (?y rdfs:subClassOf ?z) -> (?x rdfs:subClassOf ?z)]",
+            &terms,
+        );
+        let mut noop = |_: u64| Ok(());
+        let mut ops = crate::closure::DeletionOps::detect(
+            &sub_rules, &g_single, &terms, &budget, None, &mut noop,
+        )
+        .unwrap()
+        .expect("sub op");
+        let b_reach = Bound::new(&budget, 1_500, 64 << 20);
+        let mut v_reach = |n: u64| b_reach.add(n).map_err(anyhow::Error::from);
+        let err = ops
+            .ensure_pred(sub_p, &g_single, &terms, &budget, None, &mut v_reach)
+            .expect_err("ensure_pred over rejected base range must hit visit bound");
+        assert!(
+            err.downcast_ref::<Fallback>()
+                .is_some_and(|f| f.0.contains("visited more than 1500")),
+            "{err:#}"
+        );
+        assert!(b_reach.visits() > 1_500);
+
+        let cancel_r = AtomicBool::new(false);
+        let seen_r = AtomicBool::new(false);
+        let mut total_r = 0u64;
+        let mut vc_r = |n: u64| {
+            total_r += n;
+            if n >= 1_024 {
+                seen_r.store(true, Ordering::Relaxed);
+                cancel_r.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        };
+        let cerr = ops
+            .ensure_pred(
+                sub_p,
+                &g_single,
+                &terms,
+                &budget,
+                Some(&cancel_r),
+                &mut vc_r,
+            )
+            .expect_err("ensure_pred over rejected base range must cancel mid-scan");
+        assert!(seen_r.load(Ordering::Relaxed));
+        assert!(
+            (1_024..2_500).contains(&total_r),
+            "ensure_pred cancel must stop mid-scan, got {total_r}"
+        );
+        assert!(cerr.to_string().contains("cancelled"), "{cerr:#}");
+
+        // 3. Multi-graph ordered list lookup (`changed_lists`) scans rejected base rows
+        //    across passes and hits Bound + mid-scan cancel inside the base scan (not on
+        //    the 1-row indexing flush).
+        let g_multi = Graph::with_base(Arc::new(Base::new(snap.clone(), &[g1_id, g2_id]).unwrap()));
+        let c_multi = Closure::new(g_multi, Terms::new(snap)).unwrap();
+        let lim = Limits {
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let rem = vec![[cell_id, first_p, 999_999]];
+        let b_list = Bound::new(&lim.budget, 1_500, 64 << 20);
+        let Err(err) = changed_lists(&c_multi, &[], &rem, true, &lim, &b_list) else {
+            panic!("multi-graph changed_lists over rejected base range must hit visit bound");
+        };
+        assert!(
+            err.downcast_ref::<Fallback>()
+                .is_some_and(|f| f.0.contains("visited more than 1500")),
+            "{err:#}"
+        );
+        assert!(b_list.visits() > 1_500);
+
+        let cancel_l = Arc::new(AtomicBool::new(false));
+        let seen_l = AtomicBool::new(false);
+        let mut total_l = 0u64;
+        let lim_l = Limits {
+            cancel: Some(cancel_l.clone()),
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let mut vc_l = |n: u64| {
+            total_l += n;
+            if n >= 1_024 {
+                seen_l.store(true, Ordering::Relaxed);
+                cancel_l.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        };
+        let Err(cerr) = changed_lists_metered(&c_multi, &[], &rem, true, &lim_l, &mut vc_l) else {
+            panic!("multi-graph changed_lists over rejected base range must cancel mid-scan");
+        };
+        assert!(seen_l.load(Ordering::Relaxed));
+        assert!(
+            (1_024..2_500).contains(&total_l),
+            "list cancel must stop on first base-scan batch, got {total_l}"
+        );
+        assert!(cerr.to_string().contains("cancelled"), "{cerr:#}");
+    }
+
+    /// When a committed predicate range has all of its rows suppressed by deletions in the
+    /// snapshot's delta (so zero rows reach `Base::scan_impl`'s row callback), the snapshot
+    /// merge itself still meters deleted-key work and polls cancellation across detection,
+    /// reachability building, and multi-graph list tracking.
+    #[test]
+    fn metered_base_scans_count_delta_deleted_rows_in_detection_reachability_and_lists() {
+        let store = Store::in_memory(StoreOptions::default());
+        let unselected = "http://ex.org/unselected";
+        let input_g1 = "http://ex.org/g1";
+        let input_g2 = "http://ex.org/g2";
+        let same_as = format!("{OWL}sameAs");
+        let sub_class = format!("{RDFS}subClassOf");
+        let rdf_first = format!("{RDF}first");
+        let rdf_rest = format!("{RDF}rest");
+        let rdf_nil = format!("{RDF}nil");
+        let cell = "http://ex.org/cell";
+
+        let mut nq = String::new();
+        for i in 0..2_500usize {
+            let s = format!("http://ex.org/ds{i}");
+            let o = format!("http://ex.org/do{i}");
+            nq.push_str(&format!("<{s}> <{same_as}> <{o}> <{unselected}> .\n"));
+            nq.push_str(&format!("<{s}> <{sub_class}> <{o}> <{unselected}> .\n"));
+            nq.push_str(&format!("<{cell}> <{rdf_first}> <{o}> <{unselected}> .\n"));
+            nq.push_str(&format!("<{s}> <{rdf_rest}> <{cell}> <{unselected}> .\n"));
+        }
+        nq.push_str(&format!(
+            "<http://ex.org/keep_s> <http://ex.org/other> <http://ex.org/keep_o> <{input_g1}> .\n"
+        ));
+        nq.push_str(&format!(
+            "<http://ex.org/keep_s> <http://ex.org/other> <http://ex.org/keep_o> <{input_g2}> .\n"
+        ));
+        nq.push_str(&format!(
+            "<{cell}> <{rdf_rest}> <{rdf_nil}> <{input_g1}> .\n"
+        ));
+        store
+            .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        // Compact into committed base blocks, then delete every row in `unselected` via a
+        // write transaction so `snap.delta.del` masks all 2,500 committed rows per pattern.
+        store.compact().unwrap();
+        let snap0 = store.snapshot();
+        let id0 = |iri: &str| snap0.lookup_iri(iri).unwrap();
+        let g_unsel = id0(unselected);
+        let p_same = id0(&same_as);
+        let p_sub = id0(&sub_class);
+        let p_first = id0(&rdf_first);
+        let p_rest = id0(&rdf_rest);
+        let cell_id0 = id0(cell);
+        let mut txn = store.write();
+        for i in 0..2_500usize {
+            let s = id0(&format!("http://ex.org/ds{i}"));
+            let o = id0(&format!("http://ex.org/do{i}"));
+            txn.delete([s, p_same, o, g_unsel]).unwrap();
+            txn.delete([s, p_sub, o, g_unsel]).unwrap();
+            txn.delete([cell_id0, p_first, o, g_unsel]).unwrap();
+            txn.delete([s, p_rest, cell_id0, g_unsel]).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let snap = store.snapshot();
+        let terms = Terms::new(snap.clone());
+        let id = |iri: &str| snap.lookup_iri(iri).unwrap().0;
+        let g1_id = Id(id(input_g1));
+        let g2_id = Id(id(input_g2));
+        let sub_p = id(&sub_class);
+        let cell_id = id(cell);
+        let first_p = id(&rdf_first);
+
+        // Confirm zero visible rows exist for `owl:sameAs` and `rdfs:subClassOf` across the
+        // entire snapshot (all 2,500 committed rows are suppressed in the merge).
+        let mut visible = 0usize;
+        snap.scan(sparkles_core::index::Perm::Pso, &[id(&same_as)], |c| {
+            visible += match c {
+                sparkles_core::store::Chunk::Block(_, s, e) => e - s,
+                sparkles_core::store::Chunk::Row(_) => 1,
+            };
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(visible, 0);
+
+        let rules = compiled(
+            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.\n\
+             @prefix owl: <http://www.w3.org/2002/07/owl#>.\n\
+             [eq-sym: (?x owl:sameAs ?y) -> (?y owl:sameAs ?x)]\n\
+             [eq-trans: (?x owl:sameAs ?y), (?y owl:sameAs ?z) -> (?x owl:sameAs ?z)]\n\
+             [sub: (?x rdfs:subClassOf ?y), (?y rdfs:subClassOf ?z) -> (?x rdfs:subClassOf ?z)]",
+            &terms,
+        );
+        let budget = Budget::new(Some(64 << 20));
+        let g_single = Graph::with_base(Arc::new(Base::new(snap.clone(), &[g1_id]).unwrap()));
+
+        // 1. `DeletionOps::detect` over delta-deleted `owl:sameAs` range hits Bound & cancel.
+        let b_det = Bound::new(&budget, 1_500, 64 << 20);
+        let mut v_det = |n: u64| b_det.add(n).map_err(anyhow::Error::from);
+        let err = match crate::closure::DeletionOps::detect(
+            &rules, &g_single, &terms, &budget, None, &mut v_det,
+        ) {
+            Ok(_) => panic!("detect over delta-deleted range must hit visit bound"),
+            Err(e) => e,
+        };
+        assert!(
+            err.downcast_ref::<Fallback>()
+                .is_some_and(|f| f.0.contains("visited more than 1500")),
+            "{err:#}"
+        );
+        assert!(b_det.visits() > 1_500);
+
+        let cancel_det = AtomicBool::new(false);
+        let seen_det = AtomicBool::new(false);
+        let mut total_det = 0u64;
+        let mut vc_det = |n: u64| {
+            total_det += n;
+            if n >= 1_024 {
+                seen_det.store(true, Ordering::Relaxed);
+                cancel_det.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        };
+        let cerr = match crate::closure::DeletionOps::detect(
+            &rules,
+            &g_single,
+            &terms,
+            &budget,
+            Some(&cancel_det),
+            &mut vc_det,
+        ) {
+            Ok(_) => panic!("detect over delta-deleted range must cancel mid-merge"),
+            Err(e) => e,
+        };
+        assert!(seen_det.load(Ordering::Relaxed));
+        assert!((1_024..2_500).contains(&total_det), "total_det={total_det}");
+        assert!(cerr.to_string().contains("cancelled"), "{cerr:#}");
+
+        // 2. `DeletionOps::ensure_pred` over delta-deleted `rdfs:subClassOf` range hits Bound & cancel.
+        let sub_rules = compiled(
+            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.\n\
+             [sub: (?x rdfs:subClassOf ?y), (?y rdfs:subClassOf ?z) -> (?x rdfs:subClassOf ?z)]",
+            &terms,
+        );
+        let mut noop = |_: u64| Ok(());
+        let mut ops = crate::closure::DeletionOps::detect(
+            &sub_rules, &g_single, &terms, &budget, None, &mut noop,
+        )
+        .unwrap()
+        .expect("sub op");
+        let b_reach = Bound::new(&budget, 1_500, 64 << 20);
+        let mut v_reach = |n: u64| b_reach.add(n).map_err(anyhow::Error::from);
+        let err = ops
+            .ensure_pred(sub_p, &g_single, &terms, &budget, None, &mut v_reach)
+            .expect_err("ensure_pred over delta-deleted range must hit visit bound");
+        assert!(
+            err.downcast_ref::<Fallback>()
+                .is_some_and(|f| f.0.contains("visited more than 1500")),
+            "{err:#}"
+        );
+        assert!(b_reach.visits() > 1_500);
+
+        let cancel_r = AtomicBool::new(false);
+        let seen_r = AtomicBool::new(false);
+        let mut total_r = 0u64;
+        let mut vc_r = |n: u64| {
+            total_r += n;
+            if n >= 1_024 {
+                seen_r.store(true, Ordering::Relaxed);
+                cancel_r.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        };
+        let cerr = ops
+            .ensure_pred(
+                sub_p,
+                &g_single,
+                &terms,
+                &budget,
+                Some(&cancel_r),
+                &mut vc_r,
+            )
+            .expect_err("ensure_pred over delta-deleted range must cancel mid-merge");
+        assert!(seen_r.load(Ordering::Relaxed));
+        assert!((1_024..2_500).contains(&total_r), "total_r={total_r}");
+        assert!(cerr.to_string().contains("cancelled"), "{cerr:#}");
+
+        // 3. Multi-graph `changed_lists` over delta-deleted `rdf:rest` range hits Bound & cancel.
+        let g_multi = Graph::with_base(Arc::new(Base::new(snap.clone(), &[g1_id, g2_id]).unwrap()));
+        let c_multi = Closure::new(g_multi, Terms::new(snap)).unwrap();
+        let lim = Limits {
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let rem = vec![[cell_id, first_p, 999_999]];
+        let b_list = Bound::new(&lim.budget, 1_500, 64 << 20);
+        let Err(err) = changed_lists(&c_multi, &[], &rem, true, &lim, &b_list) else {
+            panic!("multi-graph changed_lists over delta-deleted range must hit visit bound");
+        };
+        assert!(
+            err.downcast_ref::<Fallback>()
+                .is_some_and(|f| f.0.contains("visited more than 1500")),
+            "{err:#}"
+        );
+        assert!(b_list.visits() > 1_500);
+
+        let cancel_l = Arc::new(AtomicBool::new(false));
+        let seen_l = AtomicBool::new(false);
+        let mut total_l = 0u64;
+        let lim_l = Limits {
+            cancel: Some(cancel_l.clone()),
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let mut vc_l = |n: u64| {
+            total_l += n;
+            if n >= 1_024 {
+                seen_l.store(true, Ordering::Relaxed);
+                cancel_l.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        };
+        let Err(cerr) = changed_lists_metered(&c_multi, &[], &rem, true, &lim_l, &mut vc_l) else {
+            panic!("multi-graph changed_lists over delta-deleted range must cancel mid-merge");
+        };
+        assert!(seen_l.load(Ordering::Relaxed));
+        assert!((1_024..2_500).contains(&total_l), "total_l={total_l}");
+        assert!(cerr.to_string().contains("cancelled"), "{cerr:#}");
+    }
+
+    /// Shared-tail `changed_lists` with nonzero memory allowance scales linearly with
+    /// removed objects `M` independently of head count `N` even when all `M` `rdf:first`
+    /// values are removed from the tail (leaving unflagged rows in `c.graph` with no
+    /// replacement), and ticks visit-bound and mid-loop cancellation before `is_list` on
+    /// large mixed updates.
+    #[test]
+    fn shared_tail_changed_lists_scales_linearly_and_respects_bound_and_cancel() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let terms = Terms::new(snap.clone());
+        let (first, rest, nil) = (terms.rdf_first, terms.rdf_rest, terms.rdf_nil);
+
+        // Seed the `M` removed `rdf:first` rows on `tail` as unflagged derived candidates,
+        // matching what `TierProgram::prepare` puts in `c.graph` before calling
+        // `changed_lists`, with NO surviving `rdf:first` on `tail` (removal-only).
+        let build_closure = |n_heads: u64, m_removed: u64| -> (Closure, u64, Vec<Triple>) {
+            let tail = 900_000u64;
+            let mut g = Graph::default();
+            let mut rows: Vec<Triple> = Vec::new();
+            rows.push([tail, rest, nil]);
+            for i in 0..n_heads {
+                let h = 100_000 + i;
+                rows.push([h, first, 200_000 + i]);
+                rows.push([h, rest, tail]);
+            }
+            let explicit_n = rows.len() as u32;
+            let rem: Vec<Triple> = (0..m_removed).map(|j| [tail, first, 500_000 + j]).collect();
+            rows.extend_from_slice(&rem);
+            g.try_add_batch(rows).unwrap();
+            for r in 0..explicit_n {
+                g.set_flag_with(r, true, false).unwrap();
+            }
+            (
+                Closure::new(g, Terms::new(snap.clone())).unwrap(),
+                tail,
+                rem,
+            )
+        };
+
+        let n_heads = 40u64;
+        let (c_small, _tail, rem_small) = build_closure(n_heads, 2);
+        let lim = Limits {
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let b_small = Bound::new(&lim.budget, u64::MAX, 64 << 20);
+        let ch_small = changed_lists(&c_small, &[], &rem_small, false, &lim, &b_small).unwrap();
+        assert_eq!(ch_small.heads.len(), (n_heads + 1) as usize);
+
+        // Increase M from 2 to 1,500 while keeping N = 40 fixed and removing ALL `rdf:first`
+        // values on `tail` (unflagged rows present in `c.graph`): visits must grow by
+        // O(M) (not Θ(N * M) = 60,000).
+        let (c_large, tail, rem_large) = build_closure(n_heads, 1_500);
+        let b_large = Bound::new(&lim.budget, u64::MAX, 64 << 20);
+        let ch_large = changed_lists(&c_large, &[], &rem_large, false, &lim, &b_large).unwrap();
+        assert_eq!(ch_large.heads.len(), (n_heads + 1) as usize);
+        let delta_visits = b_large.visits() - b_small.visits();
+        assert!(
+            (1_400..=5_000).contains(&delta_visits),
+            "expected O(M) delta visits for removal-only shared tail, got {delta_visits} (small={}, large={})",
+            b_small.visits(),
+            b_large.visits()
+        );
+
+        // Also exercise the live `TierProgram::prepare` / `prove_batch` / `saturate` path
+        // for removal-only and replacement shared-tail edits across explicit 1-thread and
+        // multi-thread Rayon pools and multiple removal sizes, using per-graph atomic
+        // probes to capture worker activity and verify exact triple-set equivalence with
+        // full materialization.
+        let live_derived_terms = |c: &Closure| -> Vec<(String, String, String)> {
+            let mut out: Vec<(String, String, String)> = (c.graph.offset()..c.graph.len())
+                .filter(|&r| c.graph.alive(r))
+                .map(|r| {
+                    let [s, p, o] = c.graph.triple(r);
+                    (
+                        c.terms.term(s).unwrap().to_string(),
+                        c.terms.term(p).unwrap().to_string(),
+                        c.terms.term(o).unwrap().to_string(),
+                    )
+                })
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        let full_derived_terms =
+            |snap: &Arc<Snapshot>, rule_text: &str| -> Vec<(String, String, String)> {
+                let tf = Terms::new(snap.clone());
+                let rf = compiled(rule_text, &tf);
+                let gf = Graph::with_base(Arc::new(
+                    Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+                ));
+                let mut cf = Closure::new(gf, tf).unwrap();
+                engine::run(&mut cf.graph, &rf, &cf.terms, &limits(), None).unwrap();
+                live_derived_terms(&cf)
+            };
+
+        let run_live_shared_tail = |threads: usize, m_removed: usize| {
+            use crate::graph::ListProbePhase;
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let live_store = Store::in_memory(StoreOptions::default());
+                let items = "http://ex.org/items";
+                let out_p = "http://ex.org/hasMember";
+                let rdf_first = format!("{RDF}first");
+                let rdf_rest = format!("{RDF}rest");
+                let rdf_nil = format!("{RDF}nil");
+                let tail_iri = "http://ex.org/tail";
+                let mut nq = format!("<{tail_iri}> <{rdf_rest}> <{rdf_nil}> .\n");
+                for i in 0..20usize {
+                    nq.push_str(&format!(
+                        "<http://ex.org/owner{i}> <{items}> <http://ex.org/head{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/head{i}> <{rdf_first}> <http://ex.org/val{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/head{i}> <{rdf_rest}> <{tail_iri}> .\n"
+                    ));
+                }
+                for j in 0..m_removed {
+                    nq.push_str(&format!(
+                        "<{tail_iri}> <{rdf_first}> <http://ex.org/mv{j}> .\n"
+                    ));
+                }
+                live_store
+                    .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+                    .unwrap();
+                let snap0 = live_store.snapshot();
+                let t0 = Terms::new(snap0.clone());
+                let ltext = "@prefix ex: <http://ex.org/>.\n\
+                             [m: (?c ex:items ?l), listMember(?l, ?x) -> (?c ex:hasMember ?x)]";
+                let lrules0 = compiled(ltext, &t0);
+                let g0 = Graph::with_base(Arc::new(
+                    Base::new(snap0.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+                ));
+                let mut c0 = Closure::new(g0, t0).unwrap();
+                engine::run(&mut c0.graph, &lrules0, &c0.terms, &limits(), None).unwrap();
+                let tail_id = snap0.lookup_iri(tail_iri).unwrap().0;
+                let first_id = snap0.lookup_iri(&rdf_first).unwrap().0;
+                let rem_ids: Vec<Triple> = (0..m_removed)
+                    .map(|j| {
+                        [
+                            tail_id,
+                            first_id,
+                            snap0.lookup_iri(&format!("http://ex.org/mv{j}")).unwrap().0,
+                        ]
+                    })
+                    .collect();
+                let mut txn = live_store.write();
+                for &[s, p, o] in &rem_ids {
+                    txn.delete([Id(s), Id(p), Id(o), Id::DEFAULT_GRAPH])
+                        .unwrap();
+                }
+                txn.commit().unwrap();
+                let snap1 = live_store.snapshot();
+                let moved = c0.terms.rebase(snap1.clone()).unwrap();
+                c0.remap(&moved).unwrap();
+                c0.set_inputs(snap1.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+                let lrules1 = compiled(ltext, &c0.terms);
+                c0.graph.list_probe.reset();
+                let up = update(&mut c0, &lrules1, &lim, &[], &rem_ids, None).unwrap();
+                let proof_cands = c0.graph.list_probe.first_object_cands(ListProbePhase::Proof);
+                let proof_walks = c0
+                    .graph
+                    .list_probe
+                    .explicit_list_walks(ListProbePhase::Proof);
+                let proof_hits = c0
+                    .graph
+                    .list_probe
+                    .list_override_hits(ListProbePhase::Proof);
+                let replay_cands = c0
+                    .graph
+                    .list_probe
+                    .first_object_cands(ListProbePhase::Replay);
+                let replay_walks = c0
+                    .graph
+                    .list_probe
+                    .explicit_list_walks(ListProbePhase::Replay);
+                let replay_hits = c0
+                    .graph
+                    .list_probe
+                    .list_override_hits(ListProbePhase::Replay);
+                let rem_checks = c0.graph.list_probe.removed_list_checks();
+                // Without per-cell caching, 20 heads * m_removed unflagged rows would add
+                // Θ(N * M) visits; with caching, visits stay O(M).
+                let visit_cap = (m_removed as u64) * 5 + 2_000;
+                assert!(
+                    up.visited < visit_cap,
+                    "threads={threads} M={m_removed}: live removal-only shared tail rescanned unflagged rows: visits={} (cap={visit_cap})",
+                    up.visited
+                );
+                // Both backward proof (across all Rayon workers) and forward replay must
+                // reuse `changed.new_members` with zero candidate scans or fallback walks.
+                assert_eq!(
+                    proof_cands, 0,
+                    "threads={threads} M={m_removed}: backward proof rescanned dead tail rows: proof_cands={proof_cands}"
+                );
+                assert_eq!(
+                    proof_walks, 0,
+                    "threads={threads} M={m_removed}: backward proof fell back to list_explicit: proof_walks={proof_walks}"
+                );
+                assert!(
+                    proof_hits >= 40,
+                    "threads={threads} M={m_removed}: expected >= 40 override hits in backward proof, got {proof_hits}"
+                );
+                assert_eq!(
+                    replay_cands, 0,
+                    "threads={threads} M={m_removed}: live replay rescanned dead derived list rows: replay_cands={replay_cands}"
+                );
+                assert_eq!(
+                    replay_walks, 0,
+                    "threads={threads} M={m_removed}: live replay fell back to list_explicit: replay_walks={replay_walks}"
+                );
+                assert!(
+                    replay_hits >= 20,
+                    "threads={threads} M={m_removed}: expected >= 20 override hits in removal replay, got {replay_hits}"
+                );
+                // `consequences_batch` checks each dead list triple against the indexed
+                // `removed_lists` set once instead of scanning `cx.removed` linearly.
+                assert_eq!(
+                    rem_checks, m_removed as u64,
+                    "threads={threads} M={m_removed}: expected {m_removed} indexed removed-list checks, got {rem_checks}"
+                );
+                let got_removed = live_derived_terms(&c0);
+                let expected_removed = full_derived_terms(&snap1, ltext);
+                assert_eq!(got_removed, expected_removed);
+                assert!(got_removed.is_empty());
+
+                // Also verify live shared-tail replacement (non-empty `new_members`
+                // override) proves cache reuse via override hits (not merely base-first
+                // short-circuiting) and matches exact full-materialization triples.
+                let rep_iri = "http://ex.org/replacement";
+                let mut txn2 = live_store.write();
+                let rep_id = txn2
+                    .intern(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                        rep_iri,
+                    )))
+                    .unwrap();
+                let tail_id2 = snap1.lookup_iri(tail_iri).unwrap();
+                let first_id2 = snap1.lookup_iri(&rdf_first).unwrap();
+                txn2.insert([tail_id2, first_id2, rep_id, Id::DEFAULT_GRAPH])
+                    .unwrap();
+                txn2.commit().unwrap();
+                let snap2 = live_store.snapshot();
+                let moved2 = c0.terms.rebase(snap2.clone()).unwrap();
+                c0.remap(&moved2).unwrap();
+                c0.set_inputs(snap2.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+                let lrules2 = compiled(ltext, &c0.terms);
+                let ins_rep = [[
+                    snap2.lookup_iri(tail_iri).unwrap().0,
+                    snap2.lookup_iri(&rdf_first).unwrap().0,
+                    snap2.lookup_iri(rep_iri).unwrap().0,
+                ]];
+                c0.graph.list_probe.reset();
+                let _up2 = update(&mut c0, &lrules2, &lim, &ins_rep, &[], None).unwrap();
+                assert_eq!(
+                    c0.graph.list_probe.first_object_cands(ListProbePhase::Replay),
+                    0,
+                    "threads={threads} M={m_removed}: replacement replay scanned candidate rows"
+                );
+                assert_eq!(
+                    c0.graph.list_probe.explicit_list_walks(ListProbePhase::Replay),
+                    0,
+                    "threads={threads} M={m_removed}: replacement replay fell back to list_explicit"
+                );
+                assert!(
+                    c0.graph.list_probe.list_override_hits(ListProbePhase::Replay) >= 20,
+                    "threads={threads} M={m_removed}: replacement replay did not hit cached new_members override"
+                );
+                let got_replaced = live_derived_terms(&c0);
+                let full_replaced = full_derived_terms(&snap2, ltext);
+                assert_eq!(got_replaced, full_replaced);
+                let mut expected_replaced: Vec<(String, String, String)> = Vec::with_capacity(40);
+                for i in 0..20usize {
+                    expected_replaced.push((
+                        format!("<http://ex.org/owner{i}>"),
+                        format!("<{out_p}>"),
+                        format!("<http://ex.org/val{i}>"),
+                    ));
+                    expected_replaced.push((
+                        format!("<http://ex.org/owner{i}>"),
+                        format!("<{out_p}>"),
+                        format!("<{rep_iri}>"),
+                    ));
+                }
+                expected_replaced.sort_unstable();
+                assert_eq!(got_replaced, expected_replaced);
+            });
+        };
+
+        run_live_shared_tail(1, 400);
+        run_live_shared_tail(4, 400);
+        run_live_shared_tail(4, 1_500);
+
+        // Broken shared tail with `changed.heads.is_empty()` (`old_m == None == new_m`):
+        // an unrelated deletion triggers backward proof over the affected heads, which
+        // must still reuse `changed.new_members` instead of rescanning the 400 removed
+        // unflagged `rdf:first` rows on both 1-thread and 4-thread pools.
+        for threads in [1usize, 4] {
+            use crate::graph::ListProbePhase;
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let live_store = Store::in_memory(StoreOptions::default());
+                let items = "http://ex.org/items";
+                let alt_p = "http://ex.org/alt";
+                let rdf_first = format!("{RDF}first");
+                let rdf_rest = format!("{RDF}rest");
+                let tail_iri = "http://ex.org/brokenTail";
+                let mut nq = String::new();
+                for i in 0..10usize {
+                    nq.push_str(&format!(
+                        "<http://ex.org/owner{i}> <{items}> <http://ex.org/head{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/owner{i}> <{alt_p}> <http://ex.org/val{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/head{i}> <{rdf_first}> <http://ex.org/val{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/head{i}> <{rdf_rest}> <{tail_iri}> .\n"
+                    ));
+                }
+                for j in 0..400usize {
+                    nq.push_str(&format!(
+                        "<{tail_iri}> <{rdf_first}> <http://ex.org/mv{j}> .\n"
+                    ));
+                }
+                live_store
+                    .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+                    .unwrap();
+                let snap0 = live_store.snapshot();
+                let t0 = Terms::new(snap0.clone());
+                let rtext = "@prefix ex: <http://ex.org/>.\n\
+                             [m: (?c ex:items ?l), listMember(?l, ?x) -> (?c ex:hasMember ?x)]\n\
+                             [a: (?c ex:alt ?x) -> (?c ex:hasMember ?x)]";
+                let r0 = compiled(rtext, &t0);
+                let g0 = Graph::with_base(Arc::new(
+                    Base::new(snap0.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+                ));
+                let mut c0 = Closure::new(g0, t0).unwrap();
+                engine::run(&mut c0.graph, &r0, &c0.terms, &limits(), None).unwrap();
+                let tail_id = snap0.lookup_iri(tail_iri).unwrap().0;
+                let first_id = snap0.lookup_iri(&rdf_first).unwrap().0;
+                let alt_id = snap0.lookup_iri(alt_p).unwrap().0;
+                let mut rem_ids: Vec<Triple> = (0..400usize)
+                    .map(|j| {
+                        [
+                            tail_id,
+                            first_id,
+                            snap0.lookup_iri(&format!("http://ex.org/mv{j}")).unwrap().0,
+                        ]
+                    })
+                    .collect();
+                for i in 0..10usize {
+                    rem_ids.push([
+                        snap0
+                            .lookup_iri(&format!("http://ex.org/owner{i}"))
+                            .unwrap()
+                            .0,
+                        alt_id,
+                        snap0
+                            .lookup_iri(&format!("http://ex.org/val{i}"))
+                            .unwrap()
+                            .0,
+                    ]);
+                }
+                let mut txn = live_store.write();
+                for &[s, p, o] in &rem_ids {
+                    txn.delete([Id(s), Id(p), Id(o), Id::DEFAULT_GRAPH])
+                        .unwrap();
+                }
+                txn.commit().unwrap();
+                let snap1 = live_store.snapshot();
+                let moved = c0.terms.rebase(snap1.clone()).unwrap();
+                c0.remap(&moved).unwrap();
+                c0.set_inputs(snap1.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+                let r1 = compiled(rtext, &c0.terms);
+                c0.graph.list_probe.reset();
+                let _up = update(&mut c0, &r1, &lim, &[], &rem_ids, None).unwrap();
+                assert_eq!(
+                    c0.graph
+                        .list_probe
+                        .first_object_cands(ListProbePhase::Proof),
+                    0,
+                    "threads={threads}: empty-heads backward proof rescanned dead tail rows"
+                );
+                assert_eq!(
+                    c0.graph
+                        .list_probe
+                        .explicit_list_walks(ListProbePhase::Proof),
+                    0,
+                    "threads={threads}: empty-heads backward proof fell back to list_explicit"
+                );
+                assert!(
+                    c0.graph
+                        .list_probe
+                        .list_override_hits(ListProbePhase::Proof)
+                        >= 10,
+                    "threads={threads}: empty-heads backward proof missed new_members override"
+                );
+                assert_eq!(c0.graph.list_probe.removed_list_checks(), 400);
+                assert_eq!(live_derived_terms(&c0), full_derived_terms(&snap1, rtext));
+                assert!(live_derived_terms(&c0).is_empty());
+            });
+        }
+
+        // Replay visibility guard (`replay_new_members_valid`) polls cancellation and
+        // deadlines mid-scan across both store-backed (`Some(base)`) and in-memory
+        // (`None`) fresh ranges, including bulk list inserts.
+        {
+            // (a) Store-backed non-list fresh range: cancel at row 500 stops at VISIT_BATCH.
+            let vis_store = Store::in_memory(StoreOptions::default());
+            let mut nq = String::new();
+            let rdf_first = format!("{RDF}first");
+            for j in 0..2_500usize {
+                nq.push_str(&format!(
+                    "<http://ex.org/l{j}> <{rdf_first}> <http://ex.org/v{j}> .\n"
+                ));
+            }
+            vis_store
+                .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+                .unwrap();
+            let vsnap = vis_store.snapshot();
+            let vfirst = vsnap.lookup_iri(&rdf_first).unwrap().0;
+            let mut vg_nonlist = Graph::with_base(Arc::new(
+                Base::new(vsnap.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+            ));
+            let start_nl = vg_nonlist.len();
+            let nonlist_rows: Vec<Triple> = (0..2_500u64)
+                .map(|j| [10_000 + j, 888_888, 20_000 + j])
+                .collect();
+            vg_nonlist.try_add_batch(nonlist_rows).unwrap();
+            let end_nl = vg_nonlist.len();
+            let vc_nl = Closure::new(vg_nonlist, Terms::new(vsnap.clone())).unwrap();
+
+            let cancel_nl = Arc::new(AtomicBool::new(false));
+            let lim_nl = Limits {
+                cancel: Some(cancel_nl.clone()),
+                budget: Budget::new(Some(64 << 20)),
+                ..limits()
+            };
+            let mut seen_nl = 0usize;
+            let err_nl = replay_new_members_valid_with(&vc_nl, start_nl, end_nl, &lim_nl, |_| {
+                seen_nl += 1;
+                if seen_nl == 500 {
+                    cancel_nl.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect_err("store-backed visibility guard must poll cancel mid-scan");
+            assert!(err_nl.to_string().contains("cancelled"), "{err_nl:#}");
+            assert_eq!(seen_nl, VISIT_BATCH as usize);
+
+            // (b) Store-backed bulk list range: cancel at row 20 stops at BASE_PROBE_POLL (64).
+            let mut vg_list = Graph::with_base(Arc::new(
+                Base::new(vsnap.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+            ));
+            let start_l = vg_list.len();
+            let bulk_list_rows: Vec<Triple> = (0..2_500usize)
+                .map(|j| {
+                    [
+                        vsnap.lookup_iri(&format!("http://ex.org/l{j}")).unwrap().0,
+                        vfirst,
+                        vsnap.lookup_iri(&format!("http://ex.org/v{j}")).unwrap().0,
+                    ]
+                })
+                .collect();
+            vg_list.try_add_batch(bulk_list_rows).unwrap();
+            let end_l = vg_list.len();
+            let vc_l = Closure::new(vg_list, Terms::new(vsnap.clone())).unwrap();
+
+            let cancel_bl = Arc::new(AtomicBool::new(false));
+            let lim_bl = Limits {
+                cancel: Some(cancel_bl.clone()),
+                budget: Budget::new(Some(64 << 20)),
+                ..limits()
+            };
+            let mut seen_bl = 0usize;
+            let err_bl = replay_new_members_valid_with(&vc_l, start_l, end_l, &lim_bl, |_| {
+                seen_bl += 1;
+                if seen_bl == 20 {
+                    cancel_bl.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect_err("bulk list visibility guard must poll cancel across base probes");
+            assert!(err_bl.to_string().contains("cancelled"), "{err_bl:#}");
+            assert_eq!(seen_bl, 64);
+
+            // (c) In-memory (`None`) non-list fresh range: cancel at row 500 stops at VISIT_BATCH.
+            let mut mg = Graph::default();
+            let start_m = mg.len();
+            let mem_rows: Vec<Triple> = (0..2_500u64)
+                .map(|j| [10_000 + j, 888_888, 20_000 + j])
+                .collect();
+            mg.try_add_batch(mem_rows).unwrap();
+            let end_m = mg.len();
+            let mc = Closure::new(mg, Terms::new(vsnap.clone())).unwrap();
+
+            let cancel_m = Arc::new(AtomicBool::new(false));
+            let lim_m = Limits {
+                cancel: Some(cancel_m.clone()),
+                budget: Budget::new(Some(64 << 20)),
+                ..limits()
+            };
+            let mut seen_m = 0usize;
+            let err_m = replay_new_members_valid_with(&mc, start_m, end_m, &lim_m, |_| {
+                seen_m += 1;
+                if seen_m == 500 {
+                    cancel_m.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect_err("in-memory visibility guard must poll cancel mid-scan");
+            assert!(err_m.to_string().contains("cancelled"), "{err_m:#}");
+            assert_eq!(seen_m, VISIT_BATCH as usize);
+
+            // (d) Expired deadline stops immediately at row 0 in both branches.
+            let expired = Limits {
+                deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+                budget: Budget::new(Some(64 << 20)),
+                ..limits()
+            };
+            let mut seen_d1 = 0usize;
+            let err_d1 = replay_new_members_valid_with(&vc_nl, start_nl, end_nl, &expired, |_| {
+                seen_d1 += 1;
+            })
+            .expect_err("expired deadline must stop store-backed visibility guard");
+            assert!(err_d1.to_string().contains("deadline"), "{err_d1:#}");
+            assert_eq!(seen_d1, 0);
+
+            let mut seen_d2 = 0usize;
+            let err_d2 = replay_new_members_valid_with(&mc, start_m, end_m, &expired, |_| {
+                seen_d2 += 1;
+            })
+            .expect_err("expired deadline must stop in-memory visibility guard");
+            assert!(err_d2.to_string().contains("deadline"), "{err_d2:#}");
+            assert_eq!(seen_d2, 0);
+        }
+
+        // Large mixed update with 2,500 ordinary non-list triples before 1 list triple
+        // ticks visit-bound and mid-loop cancellation BEFORE `is_list`.
+        let (c_bound, _, _) = build_closure(2, 0);
+        let non_list_p = 777_777u64;
+        let mut mixed_ins: Vec<Triple> = (0..2_500u64)
+            .map(|j| [10_000 + j, non_list_p, 20_000 + j])
+            .collect();
+        mixed_ins.push([tail, first, 800_000]);
+        let b_tight = Bound::new(&lim.budget, 1_200, 64 << 20);
+        let Err(err) = changed_lists(&c_bound, &mixed_ins, &[], false, &lim, &b_tight) else {
+            panic!("large non-list prefix in inserted must hit visit bound");
+        };
+        assert!(
+            err.downcast_ref::<Fallback>()
+                .is_some_and(|f| f.0.contains("visited more than 1200")),
+            "unexpected error: {err:#}"
+        );
+        assert!(b_tight.visits() > 1_200 && b_tight.visits() < 2_500);
+
+        // `any_checked` precheck polls cancellation mid-prefix over long non-list slices.
+        {
+            let cancel_pre = Arc::new(AtomicBool::new(false));
+            let lim_pre = Limits {
+                cancel: Some(cancel_pre.clone()),
+                budget: Budget::new(Some(64 << 20)),
+                ..limits()
+            };
+            let mut seen = 0usize;
+            let err = any_checked(&mixed_ins, &lim_pre, |t| {
+                seen += 1;
+                if seen == 500 {
+                    cancel_pre.store(true, Ordering::Relaxed);
+                }
+                t[1] == first || t[1] == rest
+            })
+            .expect_err("any_checked must cancel mid-prefix");
+            assert!(err.to_string().contains("cancelled"), "{err:#}");
+            assert_eq!(seen, VISIT_BATCH as usize);
+        }
+
+        // Mid-loop cancellation: flag starts `false` and flips `true` on the first batch
+        // during the non-list prefix in `removed`, proving cancellation is polled mid-loop.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seen_batch = AtomicBool::new(false);
+        let mut total_c = 0u64;
+        let lim_cancel = Limits {
+            cancel: Some(cancel.clone()),
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let mut visit_c = |n: u64| {
+            total_c += n;
+            if n >= 1_024 {
+                seen_batch.store(true, Ordering::Relaxed);
+                cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        };
+        let Err(cerr) =
+            changed_lists_metered(&c_bound, &[], &mixed_ins, false, &lim_cancel, &mut visit_c)
+        else {
+            panic!("mid-loop cancellation must stop changed_lists");
+        };
+        assert!(
+            seen_batch.load(Ordering::Relaxed),
+            "cancellation must trigger mid-loop, not only at entry"
+        );
+        assert!((1_024..2_500).contains(&total_c), "total_c={total_c}");
+        assert!(cerr.to_string().contains("cancelled"), "{cerr:#}");
+    }
+
+    /// Join-only deletions (no list edits and `closures: false`) anchor `Bound`'s memory
+    /// baseline after `Plans` and the first frontier/dedup set are held, matching the
+    /// documented contract: an update with ample hard budget and enough `HELD_BOUND` room
+    /// for proof scratch succeeds even when `Plans` alone exceeds `HELD_BOUND`.
+    #[test]
+    fn join_only_deletion_preserves_proof_phase_memory_baseline() {
+        let store = Store::in_memory(StoreOptions::default());
+        let p0_iri = format!("{EX}jp0");
+        let q0_iri = format!("{EX}jq0");
+        let nq = format!("<{EX}a0> <{p0_iri}> <{EX}b0> .\n<{EX}b0> <{q0_iri}> <{EX}c0> .\n");
+        store
+            .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        let snap0 = store.snapshot();
+        let t0 = Terms::new(snap0.clone());
+        // 300 join rules make `Plans` large (> 100 KiB), while deleting 1 fact needs only
+        // a few KiB of proof scratch once `Plans` and the first frontier are held.
+        let mut text = String::from("@prefix ex: <http://ex.org/>.\n");
+        for i in 0..300usize {
+            text.push_str(&format!(
+                "[j{i}: (?x ex:jp{i} ?y), (?y ex:jq{i} ?z) -> (?x ex:jr{i} ?z)]\n"
+            ));
+        }
+        let rules0 = compiled(&text, &t0);
+        let mut probe_g = Graph::default();
+        let plans_bytes = Plans::new(&mut probe_g, &rules0).unwrap().bytes;
+        assert!(
+            plans_bytes > 32_768,
+            "fixture must produce substantial Plans allocation, got {plans_bytes}"
+        );
+        let scratch_cap = plans_bytes / 2;
+
+        let rem_quad = [
+            snap0.lookup_iri(&format!("{EX}a0")).unwrap(),
+            snap0.lookup_iri(&p0_iri).unwrap(),
+            snap0.lookup_iri(&format!("{EX}b0")).unwrap(),
+            Id::DEFAULT_GRAPH,
+        ];
+        let mut txn = store.write();
+        txn.delete(rem_quad).unwrap();
+        txn.commit().unwrap();
+        let snap1 = store.snapshot();
+
+        let build_for_update = || {
+            let g0 = Graph::with_base(Arc::new(
+                Base::new(snap0.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+            ));
+            let mut c = Closure::new(g0, Terms::new(snap0.clone())).unwrap();
+            engine::run(&mut c.graph, &rules0, &c.terms, &limits(), None).unwrap();
+            let moved = c.terms.rebase(snap1.clone()).unwrap();
+            c.remap(&moved).unwrap();
+            c.set_inputs(snap1.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+            let rules1 = compiled(&text, &c.terms);
+            let rem = vec![[
+                snap1.lookup_iri(&format!("{EX}a0")).unwrap().0,
+                snap1.lookup_iri(&p0_iri).unwrap().0,
+                snap1.lookup_iri(&format!("{EX}b0")).unwrap().0,
+            ]];
+            (c, rules1, rem)
+        };
+
+        // 1. With `closures: false`, ample hard budget (4 MiB -> 256-byte step granularity),
+        //    and `HELD_BOUND = plans_bytes / 2` (strictly below `plans_bytes`, well above
+        //    1-fact proof scratch), incremental deletion must succeed rather than falling
+        //    back.
+        let (mut c_ok, rules_ok, rem_ok) = build_for_update();
+        let lim_ok = Limits {
+            closures: false,
+            budget: Budget::new(Some(4 << 20)),
+            ..limits()
+        };
+        HELD_BOUND.with(|b| b.set(Some(scratch_cap)));
+        let up = update(&mut c_ok, &rules_ok, &lim_ok, &[], &rem_ok, None)
+            .expect("join-only deletion within proof-phase scratch cap must not fall back");
+        HELD_BOUND.with(|b| b.set(None));
+        assert!(
+            up.held_beside <= scratch_cap,
+            "held_beside={} exceeded scratch_cap={scratch_cap} (plans_bytes={plans_bytes})",
+            up.held_beside
+        );
+        let r0_id = c_ok
+            .terms
+            .id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                format!("{EX}jr0"),
+            )))
+            .unwrap();
+        assert_eq!(
+            c_ok.graph
+                .cands(
+                    None,
+                    Some(r0_id),
+                    None,
+                    c_ok.graph.offset(),
+                    c_ok.graph.len()
+                )
+                .iter()
+                .filter(|&r| c_ok.graph.alive(r))
+                .count(),
+            0
+        );
+
+        // 2. With `HELD_BOUND = Some(0)`, the proof-phase memory bound is still enforced
+        //    and releases all reservations on fallback.
+        let (mut c_zero, rules_zero, rem_zero) = build_for_update();
+        let lim_zero = Limits {
+            closures: false,
+            budget: Budget::new(Some(4 << 20)),
+            ..limits()
+        };
+        let used_before = lim_zero.budget.used();
+        HELD_BOUND.with(|b| b.set(Some(0)));
+        let err = update(&mut c_zero, &rules_zero, &lim_zero, &[], &rem_zero, None)
+            .expect_err("HELD_BOUND = 0 must still stop proof-phase memory growth");
+        HELD_BOUND.with(|b| b.set(None));
+        assert!(
+            err.downcast_ref::<Fallback>()
+                .is_some_and(|f| f.0.contains("held more than 0 bytes")),
+            "{err:#}"
+        );
+        drop(c_zero);
+        assert!(
+            lim_zero.budget.used() <= used_before,
+            "{} > {used_before}",
+            lim_zero.budget.used()
+        );
+    }
+
+    /// `TierProgram::prepare` holds `plans_held` during `estimate_deletion_visits` so the
+    /// combined live memory of `Plans` and the estimator's projection maps + `>16`-variable
+    /// `var_bound` buffer cannot bypass a tight budget cap.
+    #[test]
+    fn deletion_memory_admission_charges_plans_during_estimate_and_var_bound_spill() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let terms = Terms::new(snap);
+        // Rule with 20 variables (> 16) over only 2 predicates (`ex:p0`, `ex:out`) so
+        // `by_p` stays in its initial 4-bucket table with no resize peak, isolating the
+        // `var_bound` heap-spill charge directly.
+        let text = "@prefix ex: <http://ex.org/>.\n\
+                    [wide: (?v0 ex:p0 ?v1), (?v1 ex:p0 ?v2), (?v2 ex:p0 ?v3), (?v3 ex:p0 ?v4),\
+                           (?v4 ex:p0 ?v5), (?v5 ex:p0 ?v6), (?v6 ex:p0 ?v7), (?v7 ex:p0 ?v8),\
+                           (?v8 ex:p0 ?v9), (?v9 ex:p0 ?v10), (?v10 ex:p0 ?v11), (?v11 ex:p0 ?v12),\
+                           (?v12 ex:p0 ?v13), (?v13 ex:p0 ?v14), (?v14 ex:p0 ?v15),\
+                           (?v15 ex:p0 ?v16), (?v16 ex:p0 ?v17), (?v17 ex:p0 ?v18),\
+                           (?v18 ex:p0 ?v19) -> (?v0 ex:out ?v19)]";
+        let rules = compiled(text, &terms);
+        assert!(rules[0].nvars > 16);
+        let p0 = terms
+            .id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                "http://ex.org/p0",
+            )))
+            .unwrap();
+        let mut g = Graph::default();
+        g.try_add_batch(vec![[10_000, p0, 20_000]]).unwrap();
+        let mut c = Closure::new(g, terms).unwrap();
+        let plans = Plans::new(&mut c.graph, &rules).unwrap();
+        let removed = vec![[10_000, p0, 20_000]];
+
+        // Measure exact un-stepped estimator peak alone (`limit < 16 KiB` keeps
+        // `Budget::step == 0`, giving 1-byte granularity). Includes `by_p` (2 keys,
+        // 4 buckets) + `var_bound` spill of `nvars` bytes.
+        let probe_lim = Limits {
+            budget: Budget::new(Some(16_000)),
+            ..limits()
+        };
+        estimate_deletion_visits(&c, &rules, &plans, &removed, &probe_lim).unwrap();
+        let est_peak = probe_lim.budget.peak();
+        let by_p_bytes = table_bytes(table_capacity(2), size_of::<(u64, u64)>());
+        assert_eq!(
+            est_peak,
+            by_p_bytes + rules[0].nvars,
+            "estimator must charge exact by_p + >16-var SmallVec spill"
+        );
+        assert_eq!(probe_lim.budget.used(), 0);
+
+        // Estimator alone fails when budget is 1 byte short of `est_peak`.
+        let short_est = Limits {
+            budget: Budget::new(Some(est_peak - 1)),
+            ..limits()
+        };
+        let err = estimate_deletion_visits(&c, &rules, &plans, &removed, &short_est)
+            .expect_err("1 byte short of estimator peak (including var_bound spill) must fail");
+        assert!(
+            crate::budget::BudgetFailure::from_anyhow(&err).is_some(),
+            "{err:#}"
+        );
+        assert_eq!(short_est.budget.used(), 0);
+
+        // Combined admission in `TierProgram::prepare`: pick a cap larger than `plans.bytes`
+        // and larger than `est_peak` individually (plus the single removed triple), yet below
+        // `plans.bytes + est_peak`. Because `plans_held` stays live during the estimate,
+        // `prepare` must reject with `BudgetFailure` and release all charges.
+        assert!(plans.bytes > 0);
+        let combined_cap = (plans.bytes + est_peak) - 1;
+        assert!(combined_cap > plans.bytes && combined_cap > est_peak);
+        let lim_overlap = Limits {
+            budget: Budget::new(Some(combined_cap)),
+            ..limits()
+        };
+        let mut prog = TierProgram::default();
+        let mut cx = TierCx {
+            rules: &rules,
+            limits: &lim_overlap,
+            inserted: &[],
+            removed: &removed,
+            moved: &[],
+            multi_graph: false,
+            before_delete: None,
+            rebuild: None,
+            out: Update::default(),
+            started: std::time::Instant::now(),
+        };
+        let mut tstore = TierStore::new(&mut c, &lim_overlap.budget);
+        let err = prog
+            .prepare(&mut cx, &mut tstore)
+            .expect_err("prepare must hold plans_held during estimate_deletion_visits");
+        assert!(
+            crate::budget::BudgetFailure::from_anyhow(&err).is_some(),
+            "{err:#}"
+        );
+        assert_eq!(lim_overlap.budget.used(), 0);
+    }
+
+    /// The no-revival branch in `TierProgram::saturate` drops the backing allocation of
+    /// `overdeleted_touching_op` before releasing `overdeleted_held`.
+    #[test]
+    fn overdeleted_no_revival_drops_buffer_before_releasing_charge() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let terms = Terms::new(snap);
+        let rules = compiled(crate::RDFS_RULES, &terms);
+        let g = Graph::default();
+        let mut c = Closure::new(g, terms).unwrap();
+        let lim = Limits {
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let mut prog = TierProgram::default();
+        let mut held = Held::new(&lim.budget);
+        for i in 0..256u64 {
+            push_charged(&mut prog.overdeleted_touching_op, [i, 1, 2], &mut held).unwrap();
+        }
+        assert!(prog.overdeleted_touching_op.capacity() >= 256);
+        assert!(held.bytes() >= 256 * size_of::<Triple>());
+        prog.overdeleted_held = Some(held);
+        let plans = Plans::new(&mut c.graph, &rules).unwrap();
+        let plans_held = Held::try_new(&lim.budget, plans.bytes).unwrap();
+        prog.del = Some(Deletion {
+            plans,
+            _plans_held: plans_held,
+            ops: None,
+            bound: None,
+            prep_visits: 0,
+            prep_peak_held: 0,
+            search: Search::new(&lim.budget),
+            abort: AtomicBool::new(false),
+        });
+        let mut cx = TierCx {
+            rules: &rules,
+            limits: &lim,
+            inserted: &[],
+            removed: &[],
+            moved: &[],
+            multi_graph: false,
+            before_delete: None,
+            rebuild: None,
+            out: Update::default(),
+            started: std::time::Instant::now(),
+        };
+        let mut tstore = TierStore::new(&mut c, &lim.budget);
+        prog.saturate(&mut cx, &mut tstore).unwrap();
+        assert_eq!(prog.overdeleted_touching_op.capacity(), 0);
+        assert!(prog.overdeleted_held.is_none());
+        assert_eq!(lim.budget.used(), 0);
     }
 
     #[test]

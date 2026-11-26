@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::error::ComponentError;
 use sparkles_core::id::{Id, Tag};
+use sparkles_core::incr::footprint::Resolved as FootprintResolved;
 use sparkles_core::index::Perm;
 use sparkles_core::sparql::reasoning::{
     Demand, DemandInfo, DemandReport, DemandTerm, Derived, LocalTerm as OutTerm, ReasoningProvider,
@@ -769,12 +770,12 @@ pub(crate) struct Session {
     compact_round_overflow: bool,
     /// the magic predicates of every program of the session
     hidden: FxHashSet<u64>,
-    /// the schema vocabulary, and the rows of the derived tier that the schema pass gave.
-    /// The schema facts among those rows go out only to the demands that can read them.
-    /// The instance facts the pass derived on the way go out with the next derivation
-    /// like any other, since the query's program finds them already held and does not
-    /// derive them again.
-    closed: Option<demand::Closed>,
+    /// the schema vocabulary as a shared incremental footprint (with `rdf:type`), and the
+    /// rows of the derived tier that the schema pass gave. The schema facts among those
+    /// rows go out only to the demands that can read them. The instance facts the pass
+    /// derived on the way go out with the next derivation like any other, since the
+    /// query's program finds them already held and does not derive them again.
+    schema_footprint: Option<(FootprintResolved, u64)>,
     schema_rows: Option<(usize, usize)>,
     schema_instance_rows: Option<(usize, usize)>,
     /// the rows the lower stages of the schema pass derived, the facts its `noValue`
@@ -930,7 +931,7 @@ impl Session {
             compact_round_count: 0,
             compact_round_overflow: false,
             hidden: FxHashSet::default(),
-            closed: None,
+            schema_footprint: None,
             schema_rows: None,
             schema_instance_rows: None,
             lower_rows: None,
@@ -1716,8 +1717,8 @@ impl Session {
             if let Some(key) = key.filter(|_| fresh) {
                 // the schema facts the lower stages gave belong to the schema, and their
                 // instance facts are derived again by the sessions that read the table
-                let closed = crate::specialize::closed(&vocab, rdf_type);
-                self.cache_schema(key, schema_from, lower_end, &closed);
+                let schema_fp = vocab.resolved_footprint(rdf_type);
+                self.cache_schema(key, schema_from, lower_end, &schema_fp);
             }
         }
         let schema_to = self.graph.as_ref().expect("graph made").derived_len();
@@ -1730,8 +1731,8 @@ impl Session {
             }
         }
         // Cached schema rows are valid seeds even when a relation is not yet
-        // complete. Keep that vocabulary for exposure independently of closure.
-        self.closed = Some(crate::specialize::closed(&vocab, rdf_type));
+        // complete. Keep that vocabulary footprint for exposure independently of closure.
+        self.schema_footprint = Some((vocab.resolved_footprint(rdf_type), rdf_type));
         let same_as = self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"))?;
         // The proof reads the rules and the session's graph. A fresh session that read
         // the schema's table holds the view's facts and that table's facts and nothing
@@ -2005,38 +2006,36 @@ impl Session {
     /// Whether `t` is a fact of the schema vocabulary, which only the demands that
     /// [`Session::reads_schema`] can read.
     fn schema_fact(&self, t: &[u64; 3]) -> bool {
-        self.closed.as_ref().is_some_and(|c| {
-            c.closes(&Atom {
-                s: Slot::Const(t[0]),
-                p: Slot::Const(t[1]),
-                o: Slot::Const(t[2]),
-            })
-        })
+        self.schema_footprint
+            .as_ref()
+            .is_some_and(|(fp, _)| fp.matches_triple(&[Id(t[0]), Id(t[1]), Id(t[2])]))
     }
 
     /// Whether demand `d` can read facts of the schema.
     fn reads_schema(&self, d: usize) -> bool {
-        let Some(c) = &self.closed else {
+        let Some((fp, rdf_type)) = &self.schema_footprint else {
             return true;
         };
         let k = &self.keys[d];
         match k.p {
-            KeyP::Const(p) if p == c.rdf_type => k.class.is_none_or(|x| c.classes.contains(&x)),
-            KeyP::Const(p) => c.preds.contains(&p),
+            KeyP::Const(p) if p == *rdf_type => k
+                .class
+                .is_none_or(|x| fp.matches_triple(&[Id::UNDEF, Id(p), Id(x)])),
+            KeyP::Const(p) => fp.matches_predicate(Id(p)),
             _ => true,
         }
     }
 
     /// Keep the facts the schema pass derived from row `from` of the derived tier in the
     /// table cache, unless a rule made a blank node among them. Of the rows before
-    /// `lower_end`, which its lower stages derived, only the schema facts `closed` names
-    /// are kept (Codex re-review F17-P1 #1).
+    /// `lower_end`, which its lower stages derived, only the schema facts `schema_fp`
+    /// names are kept (Codex re-review F17-P1 #1).
     fn cache_schema(
         &self,
         key: tables::Key,
         from: usize,
         lower_end: usize,
-        closed: &demand::Closed,
+        schema_fp: &FootprintResolved,
     ) {
         let g = self.graph.as_ref().expect("graph made");
         let mut facts: Vec<[u64; 3]> = Vec::new();
@@ -2047,13 +2046,7 @@ impl Session {
             if self.hidden.contains(&t[1]) || !self.terms.valid(t) || !live(g, from + i) {
                 continue;
             }
-            let schema = || {
-                closed.closes(&Atom {
-                    s: Slot::Const(t[0]),
-                    p: Slot::Const(t[1]),
-                    o: Slot::Const(t[2]),
-                })
-            };
+            let schema = || schema_fp.matches_triple(&[Id(t[0]), Id(t[1]), Id(t[2])]);
             if from + i < lower_end && !schema() {
                 continue;
             }

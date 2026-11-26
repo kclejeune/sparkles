@@ -18,6 +18,7 @@ use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use sparkles_core::access::GraphAccess;
 use sparkles_core::id::{self, Id, Tag};
+use sparkles_core::incr::footprint::{FGraph, Footprint};
 use sparkles_core::index::Perm;
 use sparkles_core::store::{Chunk, Snapshot, Store, TermKind};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -51,6 +52,26 @@ impl GraphRef {
         match self {
             GraphRef::Default => "default",
             GraphRef::Named(g) => g,
+        }
+    }
+
+    /// This graph reference as a shared incremental [`FGraph`].
+    pub fn to_fgraph(&self) -> FGraph {
+        match self {
+            GraphRef::Default => FGraph::Default,
+            GraphRef::Named(g) => {
+                FGraph::Graph(Term::NamedNode(oxrdf::NamedNode::new_unchecked(g.clone())))
+            }
+        }
+    }
+
+    /// Recover a [`GraphRef`] from a shared incremental [`FGraph`], when it names a
+    /// concrete default or named graph.
+    pub fn from_fgraph(g: &FGraph) -> Option<GraphRef> {
+        match g {
+            FGraph::Default => Some(GraphRef::Default),
+            FGraph::Graph(Term::NamedNode(n)) => Some(GraphRef::Named(n.as_str().to_string())),
+            _ => None,
         }
     }
 
@@ -764,6 +785,26 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The footprint of the graphs whose changes make the inferences stale: those read,
+    /// and those an import that did not resolve would be read from, in deterministic
+    /// graph order.
+    pub fn footprint(&self) -> Footprint {
+        let entries = self
+            .watched()
+            .into_iter()
+            .map(|g| sparkles_core::incr::footprint::Entry {
+                g: g.to_fgraph(),
+                s: None,
+                p: None,
+                o: None,
+            })
+            .collect();
+        Footprint {
+            entries,
+            all: false,
+        }
+    }
+
     /// The graphs whose changes make the inferences stale: those read, and those an
     /// import that did not resolve would be read from.
     pub fn watched(&self) -> Vec<GraphRef> {
