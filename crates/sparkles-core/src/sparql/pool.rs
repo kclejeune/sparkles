@@ -529,6 +529,25 @@ impl PoolGrant {
         drop(lock);
         self.pool.release(cur - t2);
     }
+
+    /// Give back all unused grant capacity down to `used`, releasing the active-query
+    /// `INITIAL_GRANT` slack once a query transitions to idle retention (such as a
+    /// completed MCP task or a replay-cached response frame).
+    pub fn trim_to_used(&self) {
+        let lock = self.resize.lock();
+        let cur = self.granted.load(Ordering::SeqCst);
+        let t1 = self.used.load(Ordering::SeqCst).min(cur);
+        if t1 >= cur {
+            return;
+        }
+        self.granted.store(t1, Ordering::SeqCst);
+        let t2 = self.used.load(Ordering::SeqCst).min(cur).max(t1);
+        if t2 != t1 {
+            self.granted.store(t2, Ordering::SeqCst);
+        }
+        drop(lock);
+        self.pool.release(cur - t2);
+    }
 }
 
 impl Drop for PoolGrant {
@@ -1002,6 +1021,36 @@ mod tests {
                 });
             }
         });
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn trim_to_used_releases_initial_grant_slack_and_wakes_waiters() {
+        let pool = QueryPool::new(32 * MB);
+        let a = pool.try_grant(INITIAL_GRANT).unwrap();
+        let b = pool.try_grant(INITIAL_GRANT).unwrap();
+        assert_eq!(pool.granted(), 32 * MB);
+        a.charge(4096).unwrap();
+        // A waiter for 16 MiB cannot fit while both grants hold 16 MiB slack.
+        let mut waiter = pool.enter(INITIAL_GRANT, None);
+        assert!(waiter.poll().is_none());
+        // Trimming `a` to actual usage frees ~16 MiB (minus 4 KiB); trimming `b` frees all 16 MiB.
+        a.trim_to_used();
+        assert_eq!(a.granted(), 4096);
+        assert_eq!(pool.granted(), 16 * MB + 4096);
+        b.trim_to_used();
+        assert_eq!(b.granted(), 0);
+        assert_eq!(pool.granted(), 4096);
+        let c = waiter.poll().expect("waiter admitted after trim_to_used");
+        assert_eq!(c.granted(), INITIAL_GRANT);
+        // The trimmed grant can still grow cleanly on subsequent charges.
+        a.charge(8 * MB).unwrap();
+        assert_eq!(a.granted(), 12 * MB);
+        a.release(8 * MB);
+        a.trim_to_used();
+        assert_eq!(a.granted(), 4096);
+        a.release(4096);
+        drop((a, b, c));
         assert_eq!(pool.granted(), 0);
     }
 }
