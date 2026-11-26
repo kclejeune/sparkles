@@ -423,6 +423,11 @@ fn spin_template_calls_work_with_sp_text_rdf_bodies_defaults_optional_and_inheri
             )
           ] .
 
+        ex:rawScore a rdf:Property .
+        ex:score a rdf:Property .
+        ex:TopItem a rdfs:Class .
+        ex:PassedItem a rdfs:Class .
+
         ex:Item spin:rule [
           a ex:CopyProperty ;
           ex:fromProp ex:rawScore ;
@@ -498,6 +503,223 @@ fn spin_template_missing_arg_and_cycles_are_refused_end_to_end() {
     );
     let err = run(&cyclic_rdf, ShaclAf::default()).unwrap_err();
     assert!(format!("{err:#}").contains("cyclic"), "{err:#}");
+}
+
+#[test]
+fn spin_upstream_rdf_encodings_match_equivalent_text_rules() {
+    let data = r#"
+        ex:a a ex:Node ; ex:maybe ex:b ; ex:ok true .
+        ex:b ex:tag "t1", "t2" .
+        ex:c a ex:Node ; ex:ok true ; ex:blocked true .
+    "#;
+    let rdf_rules = store_of(&format!(
+        r#"
+        ex:Node spin:rule [
+          a sp:Construct ;
+          sp:templates (
+            [ sp:subject spin:_this ; sp:predicate ex:count ; sp:object [ sp:varName "n" ] ]
+          ) ;
+          sp:where (
+            [ a sp:SubQuery ;
+              sp:query [
+                a sp:Select ;
+                sp:resultVariables (
+                  spin:_this
+                  [ a sp:Count ; sp:as [ sp:varName "n" ] ; sp:expression [ sp:varName "t" ] ]
+                ) ;
+                sp:where (
+                  [ a sp:TriplePath ;
+                    sp:subject spin:_this ;
+                    sp:path [ a sp:ModPath ; sp:subPath ex:maybe ; sp:modMin 0 ; sp:modMax -1 ] ;
+                    sp:object [ sp:varName "m" ] ]
+                  [ sp:subject [ sp:varName "m" ] ; sp:predicate ex:tag ; sp:object [ sp:varName "t" ] ]
+                  [ a sp:Filter ;
+                    sp:expression [
+                      a sp:and ;
+                      sp:arg1 [ a sp:exists ; sp:elements ( [ sp:subject spin:_this ; sp:predicate ex:ok ; sp:object true ] ) ] ;
+                      sp:arg2 [ a sp:notExists ; sp:elements ( [ sp:subject spin:_this ; sp:predicate ex:blocked ; sp:object true ] ) ]
+                    ] ]
+                ) ;
+                sp:groupBy ( spin:_this )
+              ] ]
+          )
+        ] .
+        {data}
+        "#
+    ));
+    let text_rules = store_of(&format!(
+        r#"
+        ex:Node spin:rule [
+          a sp:Construct ;
+          sp:text """
+            CONSTRUCT {{ ?this <http://example.org/count> ?n }}
+            WHERE {{
+              {{
+                SELECT ?this (COUNT(?t) AS ?n)
+                WHERE {{
+                  ?this <http://example.org/maybe>? ?m .
+                  ?m <http://example.org/tag> ?t .
+                  FILTER (EXISTS {{ ?this <http://example.org/ok> true }} && NOT EXISTS {{ ?this <http://example.org/blocked> true }})
+                }}
+                GROUP BY ?this
+              }}
+            }}
+          """
+        ] .
+        {data}
+        "#
+    ));
+    run(&rdf_rules, ShaclAf::default()).unwrap();
+    run(&text_rules, ShaclAf::default()).unwrap();
+    let got_rdf = inferred(&rdf_rules);
+    let got_text = inferred(&text_rules);
+    assert_eq!(got_rdf, got_text);
+    assert!(
+        got_rdf.contains("a count \"2\"^^http://www.w3.org/2001/XMLSchema#integer"),
+        "{got_rdf:?}"
+    );
+}
+
+#[test]
+fn spin_dual_form_fallback_anon_subquery_scope_and_named_shapes_value_type() {
+    // 1. Dual-form rule falls back to sp:text when RDF uses an unsupported construct,
+    //    while SHACL-SPARQL restrictions (e.g. MINUS) are still enforced on the fallback.
+    let s_fb = store_of(
+        r#"
+        ex:A spin:rule [
+          a sp:Construct ;
+          sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:flag ; sp:object true ] ) ;
+          sp:where ( [ a sp:UnsupportedNode ; sp:subject spin:_this ] ) ;
+          sp:text "CONSTRUCT { ?this <http://example.org/flag> true } WHERE { ?this <http://example.org/ready> true }"
+        ] .
+        ex:x a ex:A ; ex:ready true .
+        "#,
+    );
+    run(&s_fb, ShaclAf::default()).unwrap();
+    assert!(
+        inferred(&s_fb).iter().any(|t| t.starts_with("x flag")),
+        "{:?}",
+        inferred(&s_fb)
+    );
+
+    let s_fb_minus = store_of(
+        r#"
+        ex:A spin:rule [
+          a sp:Construct ;
+          sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:flag ; sp:object true ] ) ;
+          sp:where ( [ a sp:UnsupportedNode ; sp:subject spin:_this ] ) ;
+          sp:text "CONSTRUCT { ?this <http://example.org/flag> true } WHERE { ?this <http://example.org/ready> true MINUS { ?this <http://example.org/skip> true } }"
+        ] .
+        ex:x a ex:A ; ex:ready true .
+        "#,
+    );
+    assert!(
+        run(&s_fb_minus, ShaclAf::default()).is_err(),
+        "SHACL-SPARQL must still reject MINUS in fallback sp:text"
+    );
+
+    // 2. Mixed RDF + sp:SubQuery sp:text projecting ?_spin_v1 does not capture outer WHERE
+    //    bare blank node, and CONSTRUCT template blank nodes stay distinct per solution.
+    let s_mixed = store_of(
+        r#"
+        ex:A spin:rule [
+          a sp:Construct ;
+          sp:templates (
+            [ sp:subject spin:_this ; sp:predicate ex:entry ; sp:object _:node ]
+            [ sp:subject _:node ; sp:predicate ex:val ; sp:object [ sp:varName "v" ] ]
+          ) ;
+          sp:where (
+            [ sp:subject spin:_this ; sp:predicate ex:link ; sp:object [] ]
+            [ a sp:SubQuery ;
+              sp:query [
+                a sp:Select ;
+                sp:text "SELECT ?_spin_v1 ?v WHERE { ?_spin_v1 <http://example.org/other> ?v }"
+              ] ]
+          )
+        ] .
+        ex:a a ex:A ; ex:link ex:one .
+        ex:different ex:other 10, 20 .
+        "#,
+    );
+    run(&s_mixed, ShaclAf::default()).unwrap();
+    let got = inferred(&s_mixed);
+    assert_eq!(
+        got.len(),
+        4,
+        "outer blank node must not join with subquery ?_spin_v1, and each solution gets its own blank node: {got:?}"
+    );
+
+    // 3. Class-valued spl:valueType validated across separate named shapes and data graphs
+    let s_sep = store_of(
+        r#"
+        ex:Student rdfs:subClassOf ex:Person .
+        ex:alice a ex:Student .
+        ex:car a ex:Vehicle .
+        ex:item a ex:Item .
+        "#,
+    );
+    s_sep
+        .load(&[Source::from_bytes(
+            format!(
+                r#"{PREFIXES}
+                ex:AssignOwner a spin:ConstructTemplate ;
+                  spin:constraint [ a spl:Argument ; spl:predicate ex:owner ; spl:valueType ex:Person ] ;
+                  spin:body [
+                    a sp:Construct ;
+                    sp:text "CONSTRUCT {{ ?this <http://example.org/ownedBy> ?owner }} WHERE {{ {{ SELECT ?owner WHERE {{ ?owner a ?t }} }} }}"
+                  ] .
+                ex:Item spin:rule [ a ex:AssignOwner ; ex:owner ex:alice ] .
+                "#
+            )
+            .into_bytes(),
+            RdfFormat::Turtle,
+            Some(NamedNode::new("urn:x:shapes-ok").unwrap()),
+        )])
+        .unwrap();
+    run(
+        &s_sep,
+        ShaclAf {
+            shapes: vec!["urn:x:shapes-ok".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        inferred(&s_sep).contains("item ownedBy alice"),
+        "{:?}",
+        inferred(&s_sep)
+    );
+
+    s_sep
+        .load(&[Source::from_bytes(
+            format!(
+                r#"{PREFIXES}
+                ex:AssignOwner a spin:ConstructTemplate ;
+                  spin:constraint [ a spl:Argument ; spl:predicate ex:owner ; spl:valueType ex:Person ] ;
+                  spin:body [
+                    a sp:Construct ;
+                    sp:text "CONSTRUCT {{ ?this <http://example.org/ownedBy> ?owner }} WHERE {{}}"
+                  ] .
+                ex:Item spin:rule [ a ex:AssignOwner ; ex:owner ex:car ] .
+                "#
+            )
+            .into_bytes(),
+            RdfFormat::Turtle,
+            Some(NamedNode::new("urn:x:shapes-bad").unwrap()),
+        )])
+        .unwrap();
+    let err = run(
+        &s_sep,
+        ShaclAf {
+            shapes: vec!["urn:x:shapes-bad".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("expects an instance of"),
+        "{err:#}"
+    );
 }
 
 #[test]

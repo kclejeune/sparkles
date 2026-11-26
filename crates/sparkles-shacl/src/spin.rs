@@ -19,13 +19,112 @@ mod template;
 mod vocab;
 
 use crate::shapes::G;
-use crate::vocab::{rdf as rdf_vocab, sh};
+use crate::vocab::{rdf as rdf_vocab, rdfs as rdfs_vocab, sh};
 use anyhow::{Context as _, Result, bail};
 use oxrdf::{BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::Query;
+use sparkles_core::id::Id;
+use sparkles_core::index::{Key, Perm};
+use sparkles_core::store::{Chunk, Snapshot};
 
 pub use vocab::{SP_NS, SPIN_NS, SPL_NS};
+
+/// Optional read-only store lookup for `rdf:type` and `rdfs:subClassOf` when shapes and
+/// data live in separate graphs (e.g. `shacl-af?shapes=...`).
+pub(crate) struct ExtraTypes<'a> {
+    snap: &'a Snapshot,
+    graph_ids: Vec<Id>,
+    rdf_type: Option<Id>,
+    sub_class_of: Option<Id>,
+}
+
+impl<'a> ExtraTypes<'a> {
+    pub(crate) fn new(snap: &'a Snapshot, graphs: &[String]) -> Self {
+        let mut graph_ids = Vec::new();
+        for iri in graphs {
+            if let Some(id) = sparkles_core::validation::graph_id(snap, iri)
+                && !graph_ids.contains(&id)
+            {
+                graph_ids.push(id);
+            }
+        }
+        let rdf_type = snap.lookup_iri(rdf_vocab::TYPE.as_str());
+        let sub_class_of = snap.lookup_iri(rdfs_vocab::SUB_CLASS_OF.as_str());
+        Self {
+            snap,
+            graph_ids,
+            rdf_type,
+            sub_class_of,
+        }
+    }
+
+    pub(crate) fn rdf_types(
+        &self,
+        subject: &Term,
+        budget: &mut rdf::WorkBudget,
+    ) -> Result<Vec<Term>> {
+        self.objects_for(subject, self.rdf_type, budget)
+    }
+
+    pub(crate) fn superclasses(
+        &self,
+        class: &Term,
+        budget: &mut rdf::WorkBudget,
+    ) -> Result<Vec<Term>> {
+        self.objects_for(class, self.sub_class_of, budget)
+    }
+
+    fn objects_for(
+        &self,
+        subject: &Term,
+        pred: Option<Id>,
+        budget: &mut rdf::WorkBudget,
+    ) -> Result<Vec<Term>> {
+        let Some(pred_id) = pred else {
+            return Ok(Vec::new());
+        };
+        let Some(sub_id) = self.snap.lookup_term(subject) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        let mut budget_err: Option<anyhow::Error> = None;
+        for &gid in &self.graph_ids {
+            let res = self.snap.scan_checked(
+                Perm::Gspo,
+                &[gid.0, sub_id.0, pred_id.0],
+                || Ok(()),
+                |chunk| {
+                    let mut visit = |k: Key| -> sparkles_core::Result<()> {
+                        if let Err(e) = budget.step() {
+                            budget_err = Some(e);
+                            return Err(sparkles_core::Error::Cancelled);
+                        }
+                        let q = Perm::Gspo.to_quad(&k);
+                        if let Some(term) = self.snap.term(q[2]) {
+                            out.push(term);
+                        }
+                        Ok(())
+                    };
+                    match chunk {
+                        Chunk::Block(b, s, e) => {
+                            for idx in s..e {
+                                visit(b.key(idx))?;
+                            }
+                        }
+                        Chunk::Row(k) => visit(k)?,
+                    }
+                    Ok(true)
+                },
+            );
+            if let Some(err) = budget_err {
+                return Err(err);
+            }
+            res.map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(out)
+    }
+}
 
 /// The prefixes a SPIN query may use without declaring them: those of RDF, RDFS, OWL,
 /// XSD, SHACL and SPIN's own vocabularies.
@@ -42,18 +141,24 @@ pub const STANDARD_PREFIXES: &[(&str, &str)] = &[
 
 /// Whether a graph holds SPIN rules.
 pub fn has_rules(graph: &Graph) -> bool {
-    !rule_properties(graph).is_empty()
+    let mut budget = rdf::WorkBudget::new(rdf::MAX_NODES);
+    // On budget exhaustion return true so `translate` surfaces the limit error cleanly.
+    rule_properties(graph, &mut budget).map_or(true, |props| !props.is_empty())
 }
 
 /// `spin:rule` and its subproperties (`rdfs:subPropertyOf*`).
-fn rule_properties(graph: &Graph) -> Vec<NamedNode> {
+fn rule_properties(graph: &Graph, budget: &mut rdf::WorkBudget) -> Result<Vec<NamedNode>> {
     let mut out = vec![vocab::spin::RULE.into_owned()];
+    let mut seen: FxHashSet<NamedNode> = FxHashSet::default();
+    seen.insert(vocab::spin::RULE.into_owned());
     let mut i = 0;
     while i < out.len() {
+        budget.step()?;
         let p = Term::NamedNode(out[i].clone());
         for t in graph.subjects_for_predicate_object(oxrdf::vocab::rdfs::SUB_PROPERTY_OF, &p) {
+            budget.step()?;
             if let NamedOrBlankNode::NamedNode(n) = t.into_owned()
-                && !out.contains(&n)
+                && seen.insert(n.clone())
             {
                 out.push(n);
             }
@@ -61,49 +166,91 @@ fn rule_properties(graph: &Graph) -> Vec<NamedNode> {
         i += 1;
     }
     out.retain(|p| graph.triples_for_predicate(p).next().is_some());
-    out
+    Ok(out)
 }
 
 /// Serialize a SPIN query node (in SPIN RDF syntax, as a SPIN template call, or via
 /// `sp:text`) into SPARQL 1.1 query text.
 pub fn serialize_query(graph: &Graph, query: &Term) -> Result<String> {
     let g = G { g: graph };
-    query_to_sparql(&g, query)
+    let mut budget = rdf::WorkBudget::new(rdf::MAX_NODES);
+    let mut cache = template::HierarchyCache::default();
+    query_to_sparql(&g, None, query, &mut budget, &mut cache)
 }
 
-fn query_to_sparql(g: &G<'_>, node: &Term) -> Result<String> {
+fn read_direct_sp_text(
+    g: &G<'_>,
+    node: &Term,
+    budget: &mut rdf::WorkBudget,
+) -> Result<Option<String>> {
+    match rdf::single_object(g, node, vocab::sp::TEXT, budget)? {
+        None => Ok(None),
+        Some(Term::Literal(l)) => {
+            if l.value().len() > rdf::MAX_OUTPUT_BYTES {
+                return Err(rdf::limit_err(format!(
+                    "SPIN sp:text exceeds maximum size ({} bytes)",
+                    rdf::MAX_OUTPUT_BYTES
+                )));
+            }
+            Ok(Some(l.value().to_string()))
+        }
+        Some(other) => bail!("the sp:text of the SPIN rule {node} is {other}, not a string"),
+    }
+}
+
+fn query_to_sparql(
+    g: &G<'_>,
+    extra: Option<&ExtraTypes<'_>>,
+    node: &Term,
+    budget: &mut rdf::WorkBudget,
+    cache: &mut template::HierarchyCache,
+) -> Result<String> {
     // 1. Template call (an instance of a spin:Template / spin:ConstructTemplate or subclass)
-    if let Some(template) = template::template_of_call(g, node)? {
-        return template::expand_template_call(g, node, &template);
+    if let Some(template) = template::template_of_call(g, node, budget, cache)? {
+        return template::expand_template_call(g, extra, node, &template, budget, cache);
     }
     // 2. SPIN RDF syntax (prefer structural RDF over sp:text so TopBraid files with full
-    //    IRIs run even when Turtle prefix declarations are absent)
+    //    IRIs run even when Turtle prefix declarations are absent; fall back to sp:text on
+    //    unsupported structural constructs to preserve compatibility for dual-form files)
     if rdf::has_rdf_query_structure(g, node) {
         let empty = FxHashMap::default();
-        return rdf::serialize_query_with_bindings(g, node, &empty);
-    }
-    // 3. Direct sp:text query
-    let texts = g.objects(node, vocab::sp::TEXT);
-    match texts.as_slice() {
-        [Term::Literal(l)] => Ok(l.value().to_string()),
-        [other] => bail!("the sp:text of the SPIN rule {node} is {other}, not a string"),
-        [_, _, ..] => bail!("the SPIN rule {node} has multiple sp:text values"),
-        [] => {
-            let kind = g
-                .object(node, rdf_vocab::TYPE)
-                .map_or_else(|| "no type".to_string(), |t| t.to_string());
-            bail!(
-                "the SPIN rule {node} ({kind}) has neither SPIN RDF syntax, a SPIN template \
-                 definition, nor sp:text"
-            );
+        match rdf::serialize_query_with_bindings(g, node, &empty, budget) {
+            Ok(sparql) => return Ok(sparql),
+            Err(rdf_err) => {
+                if !rdf::is_limit_or_cycle_error(&rdf_err)
+                    && let Some(text) = read_direct_sp_text(g, node, budget)?
+                {
+                    return Ok(text);
+                }
+                return Err(rdf_err);
+            }
         }
     }
+    // 3. Direct sp:text query
+    if let Some(text) = read_direct_sp_text(g, node, budget)? {
+        return Ok(text);
+    }
+    let kind = g
+        .object(node, rdf_vocab::TYPE)
+        .map_or_else(|| "no type".to_string(), |t| t.to_string());
+    bail!(
+        "the SPIN rule {node} ({kind}) has neither SPIN RDF syntax, a SPIN template \
+         definition, nor sp:text"
+    );
 }
 
 /// The SHACL-AF triples of the SPIN rules of `graph`: for each class with rules, a node
 /// shape with the class as its target and one `sh:SPARQLRule` per rule. The queries get
 /// the declarations of `prefixes` and of [`STANDARD_PREFIXES`] before their own text.
 pub fn translate(graph: &Graph, prefixes: &[(String, String)]) -> Result<Graph> {
+    translate_with_extra_types(graph, None, prefixes)
+}
+
+pub(crate) fn translate_with_extra_types(
+    graph: &Graph,
+    extra: Option<&ExtraTypes<'_>>,
+    prefixes: &[(String, String)],
+) -> Result<Graph> {
     let g = G { g: graph };
     let mut head = String::new();
     let mut declared = FxHashSet::default();
@@ -116,14 +263,16 @@ pub fn translate(graph: &Graph, prefixes: &[(String, String)]) -> Result<Graph> 
             head.push_str(&format!("PREFIX {p}: <{ns}>\n"));
         }
     }
+    let mut discovery_budget = rdf::WorkBudget::new(rdf::MAX_NODES);
     let mut pairs: Vec<(Term, Term)> = Vec::new();
-    for p in rule_properties(graph) {
+    for p in rule_properties(graph, &mut discovery_budget)? {
         for t in graph.triples_for_predicate(&p) {
             pairs.push((Term::from(t.subject.into_owned()), t.object.into_owned()));
         }
     }
     pairs.sort_by_cached_key(|(c, r)| (c.to_string(), r.to_string()));
     pairs.dedup();
+    let mut cache = template::HierarchyCache::default();
     let mut out = Graph::new();
     let mut n = 0usize;
     let mut fresh = || {
@@ -134,7 +283,8 @@ pub fn translate(graph: &Graph, prefixes: &[(String, String)]) -> Result<Graph> 
         let Term::NamedNode(class) = class else {
             bail!("the SPIN rule {rule} belongs to {class}, which is not an IRI");
         };
-        let text = query_to_sparql(&g, &rule)
+        let mut rule_budget = rdf::WorkBudget::new(rdf::MAX_NODES);
+        let text = query_to_sparql(&g, extra, &rule, &mut rule_budget, &mut cache)
             .with_context(|| format!("translating SPIN rule {rule} of {class}"))?;
         let shape = fresh();
         let r = fresh();
@@ -443,6 +593,7 @@ mod tests {
               rdfs:subClassOf ex:BaseTmpl ;
               spin:constraint [ a spl:Argument ; spl:predicate ex:minVal ; spl:defaultValue 50 ] .
 
+            ex:HighScorer a rdfs:Class .
             ex:call1 a ex:SubTmpl ; ex:targetClass ex:HighScorer ; ex:optTag "gold" .
             ex:call2 a ex:SubTmpl ; ex:targetClass ex:HighScorer .
             "#,
@@ -667,6 +818,626 @@ mod tests {
         assert!(
             format!("{err:#}").contains("assigns to bound argument"),
             "{err:#}"
+        );
+    }
+
+    #[test]
+    fn bounds_pre_ast_work_unrelated_vars_oversized_literals_and_nested_triples() {
+        // 1. Unrelated graph-wide sp:varName triples do not exhaust a small query's budget
+        let mut g = parse_ttl(
+            r#"
+            ex:q a sp:Ask ;
+              sp:where ( [ sp:subject [ sp:varName "x" ] ; sp:predicate ex:p ; sp:object 1 ] ) .
+            "#,
+        );
+        for i in 0..20_000 {
+            let b = BlankNode::new_unchecked(format!("unrel{i}"));
+            g.insert(&Triple::new(
+                b,
+                super::vocab::sp::VAR_NAME,
+                Literal::new_simple_literal(format!("v{i}")),
+            ));
+        }
+        let sparql = serialize_query(&g, &ex("q")).unwrap();
+        assert!(sparql.contains("?x"), "{sparql}");
+
+        // 2. Wide template hierarchy exceeds shared work budget cleanly
+        let mut g = Graph::new();
+        let root = NamedNode::new_unchecked("http://example.org/WideRoot");
+        let call = NamedNode::new_unchecked("http://example.org/wideCall");
+        g.insert(&Triple::new(
+            call.clone(),
+            crate::vocab::rdf::TYPE,
+            root.clone(),
+        ));
+        for i in 0..17_000 {
+            let sup = NamedNode::new_unchecked(format!("http://example.org/Sup{i}"));
+            g.insert(&Triple::new(
+                root.clone(),
+                crate::vocab::rdfs::SUB_CLASS_OF,
+                sup,
+            ));
+        }
+        let err = serialize_query(&g, &Term::NamedNode(call)).unwrap_err();
+        assert!(format!("{err:#}").contains("node budget"), "{err:#}");
+
+        // 3. Many unrelated template types on one call refuse cleanly without O(k^2) blowup
+        let mut g = Graph::new();
+        let call = NamedNode::new_unchecked("http://example.org/multiCall");
+        for i in 0..120 {
+            let t = NamedNode::new_unchecked(format!("http://example.org/T{i}"));
+            g.insert(&Triple::new(
+                t.clone(),
+                crate::vocab::rdf::TYPE,
+                super::vocab::spin::CONSTRUCT_TEMPLATE,
+            ));
+            g.insert(&Triple::new(call.clone(), crate::vocab::rdf::TYPE, t));
+        }
+        let err = serialize_query(&g, &Term::NamedNode(call)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("multiple unrelated template types"),
+            "{err:#}"
+        );
+
+        // 4. Oversized literal rejected before allocation
+        let mut g = Graph::new();
+        let q = NamedNode::new_unchecked("http://example.org/bigLitQ");
+        let cell = BlankNode::new_unchecked("c1");
+        let tp = BlankNode::new_unchecked("tp1");
+        let huge = "a".repeat(super::rdf::MAX_OUTPUT_BYTES + 16);
+        g.insert(&Triple::new(
+            q.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::ASK,
+        ));
+        g.insert(&Triple::new(
+            q.clone(),
+            super::vocab::sp::WHERE,
+            cell.clone(),
+        ));
+        g.insert(&Triple::new(
+            cell.clone(),
+            crate::vocab::rdf::FIRST,
+            tp.clone(),
+        ));
+        g.insert(&Triple::new(
+            cell,
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g.insert(&Triple::new(
+            tp.clone(),
+            super::vocab::sp::SUBJECT,
+            NamedNode::new_unchecked("http://example.org/s"),
+        ));
+        g.insert(&Triple::new(
+            tp.clone(),
+            super::vocab::sp::PREDICATE,
+            NamedNode::new_unchecked("http://example.org/p"),
+        ));
+        g.insert(&Triple::new(
+            tp,
+            super::vocab::sp::OBJECT,
+            Literal::new_simple_literal(huge),
+        ));
+        let err = serialize_query(&g, &Term::NamedNode(q)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum output size"),
+            "{err:#}"
+        );
+
+        // 5. Deeply nested Term::Triple rejected under MAX_DEPTH
+        let mut nested = Term::NamedNode(NamedNode::new_unchecked("http://example.org/leaf"));
+        let s = NamedNode::new_unchecked("http://example.org/s");
+        let p = NamedNode::new_unchecked("http://example.org/p");
+        for _ in 0..70 {
+            nested = Term::Triple(Box::new(Triple::new(s.clone(), p.clone(), nested)));
+        }
+        let mut out = String::new();
+        let err = super::rdf::write_term_value(&mut out, &nested, 0).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum nesting depth"),
+            "{err:#}"
+        );
+
+        // 6. Over-long RDF list (> MAX_LIST_LEN) rejected
+        let mut g = Graph::new();
+        let q = NamedNode::new_unchecked("http://example.org/longListQ");
+        g.insert(&Triple::new(
+            q.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::ASK,
+        ));
+        let mut head = Term::NamedNode(crate::vocab::rdf::NIL.into_owned());
+        for i in 0..(super::rdf::MAX_LIST_LEN + 2) {
+            let c = BlankNode::new_unchecked(format!("ll{i}"));
+            g.insert(&Triple::new(
+                c.clone(),
+                crate::vocab::rdf::FIRST,
+                Literal::from(1),
+            ));
+            g.insert(&Triple::new(c.clone(), crate::vocab::rdf::REST, head));
+            head = Term::BlankNode(c);
+        }
+        g.insert(&Triple::new(q.clone(), super::vocab::sp::WHERE, head));
+        let err = serialize_query(&g, &Term::NamedNode(q)).unwrap_err();
+        assert!(format!("{err:#}").contains("maximum length"), "{err:#}");
+    }
+
+    #[test]
+    fn substitute_sparql_text_handles_prefixed_names_lt_spacing_long_strings_and_clauses() {
+        let g = parse_ttl(
+            r#"
+            ex:T a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:target ] ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:limit ] ;
+              spin:body [
+                a sp:Construct ;
+                sp:text """
+                  PREFIX ex: <http://example.org/>
+                  CONSTRUCT { ?this ex:same-as ?target ; ex:v1.as $target ; ex:quote ?q }
+                  WHERE {
+                    { SELECT ?target WHERE { ?target ex:known-as ?o } GROUP BY ?target ORDER BY ?target }
+                    ?this ex:val ?x .
+                    FILTER (?x<?limit)
+                    BIND (ex:upper-bound(?limit) AS ?u)
+                    BIND (IF(BOUND($limit), \"\"\"say "hi" and ""ok""!\"\"\" , "") AS ?q)
+                    FILTER (?target != <http://example.org/none>)
+                  }
+                """
+              ] .
+            ex:call a ex:T ; ex:target ex:Alice ; ex:limit ex:MaxVal .
+            "#,
+        );
+        let q = serialize_query(&g, &ex("call")).unwrap();
+        let parsed = parse_query(&q, None, &[]).expect(&q);
+        assert!(matches!(parsed, spargebra::Query::Construct { .. }), "{q}");
+        assert!(q.contains("ex:same-as <http://example.org/Alice>"), "{q}");
+        assert!(q.contains("ex:v1.as <http://example.org/Alice>"), "{q}");
+        assert!(
+            q.contains("SELECT (<http://example.org/Alice> AS ?target)"),
+            "{q}"
+        );
+        assert!(q.contains("GROUP BY (<http://example.org/Alice>)"), "{q}");
+        assert!(q.contains("ORDER BY (<http://example.org/Alice>)"), "{q}");
+        assert!(q.contains("?x< <http://example.org/MaxVal>"), "{q}");
+        assert!(
+            q.contains("ex:upper-bound(<http://example.org/MaxVal>)"),
+            "{q}"
+        );
+        assert!(q.contains("IF(true,"), "{q}");
+        assert!(
+            q.contains("<http://example.org/Alice> != <http://example.org/none>"),
+            "{q}"
+        );
+
+        // Long string literals ending in 4 or 5 quotes do not swallow subsequent ?arg tokens
+        let mut bindings = super::FxHashMap::default();
+        bindings.insert("arg".to_string(), Some(ex("Bob")));
+        let out4 = super::template::substitute_sparql_text(
+            r#"SELECT * WHERE { ?s <http://example.org/p> """say "hi"""" . ?s <http://example.org/q> ?arg }"#,
+            &bindings,
+        )
+        .unwrap();
+        assert!(
+            out4.contains("<http://example.org/q> <http://example.org/Bob>"),
+            "{out4}"
+        );
+        let out5 = super::template::substitute_sparql_text(
+            r#"SELECT * WHERE { ?s <http://example.org/p> """say ""hi""""" . ?s <http://example.org/q> ?arg }"#,
+            &bindings,
+        )
+        .unwrap();
+        assert!(
+            out5.contains("<http://example.org/q> <http://example.org/Bob>"),
+            "{out5}"
+        );
+
+        // VALUES with bound argument is refused
+        let bad_values = parse_ttl(
+            r#"
+            ex:Tv a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:x ] ;
+              spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this <http://example.org/p> ?x } WHERE { VALUES (?x ?y) { (1 2) } }" ] .
+            ex:cv a ex:Tv ; ex:x 1 .
+            "#,
+        );
+        let err = serialize_query(&bad_values, &ex("cv")).unwrap_err();
+        assert!(format!("{err:#}").contains("VALUES"), "{err:#}");
+    }
+
+    #[test]
+    fn nested_template_forwarding_and_unbound_spin_variables() {
+        // 1. Omitted optional outer argument falls back to inner spl:defaultValue
+        let g = parse_ttl(
+            r#"
+            ex:Inner a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:x ; spl:defaultValue 42 ] ;
+              spin:body [
+                a sp:Construct ;
+                sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:val ; sp:object [ sp:varName "x" ] ] ) ;
+                sp:where ( [ sp:subject spin:_this ; sp:predicate ex:active ; sp:object true ] )
+              ] .
+            ex:Outer a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:opt ; spl:optional true ] ;
+              spin:body [ a ex:Inner ; ex:x [ sp:varName "opt" ] ] .
+            ex:callDefault a ex:Outer .
+            ex:callPassed a ex:Outer ; ex:opt 7 .
+            "#,
+        );
+        let q_def = serialize_query(&g, &ex("callDefault")).unwrap();
+        assert!(q_def.contains("\"42\""), "{q_def}");
+        let q_pass = serialize_query(&g, &ex("callPassed")).unwrap();
+        assert!(q_pass.contains("\"7\""), "{q_pass}");
+
+        // 2. Omitted optional outer argument forwarded to required inner argument fails
+        let g_req = parse_ttl(
+            r#"
+            ex:InnerReq a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:req ] ;
+              spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this <http://example.org/v> ?req } WHERE {}" ] .
+            ex:OuterOpt a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:opt ; spl:optional true ] ;
+              spin:body [ a ex:InnerReq ; ex:req [ sp:varName "opt" ] ] .
+            ex:c a ex:OuterOpt .
+            "#,
+        );
+        let err = serialize_query(&g_req, &ex("c")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing required argument"),
+            "{err:#}"
+        );
+
+        // 3. Unbound spin:_this, spin:_arg1, and named sp:Variable are rejected instead of
+        //    being bound as constant IRIs
+        for arg_expr in ["spin:_this", "spin:_arg1", "ex:namedVar"] {
+            let g_var = parse_ttl(&format!(
+                r#"
+                ex:namedVar a sp:Variable ; sp:varName "foo" .
+                ex:T a spin:ConstructTemplate ;
+                  spin:constraint [ a spl:Argument ; spl:predicate ex:arg ] ;
+                  spin:body [ a sp:Construct ; sp:text "CONSTRUCT {{ ?this <http://example.org/p> ?arg }} WHERE {{}}" ] .
+                ex:c a ex:T ; ex:arg {arg_expr} .
+                "#
+            ));
+            let err = serialize_query(&g_var, &ex("c")).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("unbound SPIN variable"),
+                "{arg_expr}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_reserves_this_enforces_value_types_and_rejects_arg_conflicts() {
+        // 1. Reserving ?this
+        let g_this = parse_ttl(
+            r#"
+            ex:BadThis a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:this ] ;
+              spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this <http://example.org/flag> true } WHERE {}" ] .
+            ex:c a ex:BadThis ; ex:this ex:other .
+            "#,
+        );
+        let err = serialize_query(&g_this, &ex("c")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("reserved variable name ?this"),
+            "{err:#}"
+        );
+
+        // 2. Class-valued spl:valueType (subclass passes, unrelated class and untyped fail)
+        let g_cls = parse_ttl(
+            r#"
+            ex:Student rdfs:subClassOf ex:Person .
+            ex:alice a ex:Student .
+            ex:car a ex:Vehicle .
+            ex:T a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:who ; spl:valueType ex:Person ] ;
+              spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this <http://example.org/owner> ?who } WHERE {}" ] .
+            ex:ok a ex:T ; ex:who ex:alice .
+            ex:bad1 a ex:T ; ex:who ex:car .
+            ex:bad2 a ex:T ; ex:who ex:untyped .
+            "#,
+        );
+        assert!(serialize_query(&g_cls, &ex("ok")).is_ok());
+        assert!(serialize_query(&g_cls, &ex("bad1")).is_err());
+        assert!(serialize_query(&g_cls, &ex("bad2")).is_err());
+
+        // 3. Custom rdfs:Datatype
+        let g_dt = parse_ttl(
+            r#"
+            ex:Code a rdfs:Datatype .
+            ex:T a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:code ; spl:valueType ex:Code ] ;
+              spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this <http://example.org/c> ?code } WHERE {}" ] .
+            ex:ok a ex:T ; ex:code "A1"^^ex:Code .
+            ex:badLit a ex:T ; ex:code "A1" .
+            ex:badIri a ex:T ; ex:code ex:notLit .
+            "#,
+        );
+        assert!(serialize_query(&g_dt, &ex("ok")).is_ok());
+        assert!(serialize_query(&g_dt, &ex("badLit")).is_err());
+        assert!(serialize_query(&g_dt, &ex("badIri")).is_err());
+
+        // 4. Conflicting spl:Argument in diamond siblings refused; subclass override resolves
+        let g_diamond = parse_ttl(
+            r#"
+            ex:Root a spin:ConstructTemplate ;
+              spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this <http://example.org/v> ?v } WHERE {}" ] .
+            ex:Left rdfs:subClassOf ex:Root ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:v ; spl:defaultValue 1 ] .
+            ex:Right rdfs:subClassOf ex:Root ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:v ; spl:defaultValue 2 ] .
+            ex:ConflictLeaf rdfs:subClassOf ex:Left, ex:Right .
+            ex:ResolvedLeaf rdfs:subClassOf ex:Left, ex:Right ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:v ; spl:defaultValue 3 ] .
+            ex:cBad a ex:ConflictLeaf .
+            ex:cOk a ex:ResolvedLeaf .
+            "#,
+        );
+        let err = serialize_query(&g_diamond, &ex("cBad")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("conflicting spl:defaultValue"),
+            "{err:#}"
+        );
+        let q_ok = serialize_query(&g_diamond, &ex("cOk")).unwrap();
+        assert!(q_ok.contains("\"3\""), "{q_ok}");
+
+        // 5. Duplicate conflicting spl:Argument on one class refused
+        let g_dup = parse_ttl(
+            r#"
+            ex:Dup a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:v ; spl:optional true ] ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:v ; spl:optional false ] ;
+              spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this <http://example.org/v> ?v } WHERE {}" ] .
+            ex:c a ex:Dup ; ex:v 1 .
+            "#,
+        );
+        let err = serialize_query(&g_dup, &ex("c")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("conflicting spl:optional"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn upstream_encodings_rdf_edge_cases_strict_booleans_and_anon_var_collisions() {
+        // 1. Upstream ARQ2SPIN encodings: ModPath (0, -1), lowercase sp:exists / sp:notExists,
+        //    direct sp:Count with sp:as, fixed ModPath unrolling, ReverseLinkPath, sp:Values
+        //    with sp:variables, spin:_arg1, custom XSD cast, anonymous sp:Variable predicate,
+        //    and sp:Ask with trailing sp:values.
+        let g = parse_ttl(
+            r#"
+            ex:q a sp:Select ;
+              sp:distinct "1"^^xsd:boolean ;
+              sp:resultVariables (
+                [ sp:varName "s" ]
+                [ a sp:Count ; sp:as [ sp:varName "cnt" ] ; sp:expression [ sp:varName "o" ] ]
+                [ a sp:Count ; sp:as [ sp:varName "all" ] ]
+                [ sp:varName "joined" ; sp:expression [ a sp:GroupConcat ; sp:expression [ sp:varName "o" ] ; sp:separator "," ] ]
+              ) ;
+              sp:where (
+                [ a sp:TriplePath ;
+                  sp:subject [ sp:varName "s" ] ;
+                  sp:path [ a sp:ModPath ; sp:subPath ex:opt ; sp:modMin 0 ; sp:modMax -1 ] ;
+                  sp:object [ sp:varName "o" ] ]
+                [ a sp:TriplePath ;
+                  sp:subject [ sp:varName "s" ] ;
+                  sp:path [ a sp:ModPath ; sp:subPath ex:step ; sp:modMin 2 ; sp:modMax 3 ] ;
+                  sp:object [ sp:varName "o2" ] ]
+                [ a sp:TriplePath ;
+                  sp:subject [ sp:varName "s" ] ;
+                  sp:path [ a sp:ModPath ; sp:subPath ex:hop ; sp:modMin 2 ; sp:modMax -2 ] ;
+                  sp:object [ sp:varName "o3" ] ]
+                [ a sp:TriplePath ;
+                  sp:subject [ sp:varName "s" ] ;
+                  sp:path [ a sp:ReverseLinkPath ; sp:node ex:parent ] ;
+                  sp:object [ sp:varName "p1" ] ]
+                [ a sp:TriplePath ;
+                  sp:subject [ sp:varName "s" ] ;
+                  sp:path [ a sp:ReverseLinkPath ; sp:node [ a sp:ReversePath ; sp:subPath ex:parent ] ] ;
+                  sp:object [ sp:varName "p2" ] ]
+                [ sp:subject [ sp:varName "s" ] ; sp:predicate [ a sp:Variable ] ; sp:object spin:_arg1 ]
+                [ a sp:Filter ;
+                  sp:expression [ a sp:and ;
+                                  sp:arg1 [ a sp:exists ; sp:elements ( [ sp:subject [ sp:varName "s" ] ; sp:predicate ex:ok ; sp:object true ] ) ] ;
+                                  sp:arg2 [ a sp:notExists ; sp:elements ( [ sp:subject [ sp:varName "s" ] ; sp:predicate ex:no ; sp:object true ] ) ] ] ]
+                [ a sp:Bind ;
+                  sp:expression [ a xsd:integer ; sp:arg1 [ sp:varName "o" ] ] ;
+                  sp:variable [ sp:varName "num" ] ]
+                [ a sp:Values ;
+                  sp:variables ( [ sp:varName "k" ] ) ;
+                  sp:bindings ( ( 1 ) ( 2 ) ) ]
+              ) ;
+              sp:groupBy ( [ sp:varName "s" ] ) .
+
+            ex:askVal a sp:Ask ;
+              sp:where ( [ sp:subject [ sp:varName "x" ] ; sp:predicate ex:p ; sp:object [ sp:varName "v" ] ] ) ;
+              sp:values [ a sp:Values ; sp:varNames ( "v" ) ; sp:bindings ( ( 1 ) ) ] .
+            "#,
+        );
+        let q = serialize_query(&g, &ex("q")).unwrap();
+        assert!(
+            matches!(
+                parse_query(&q, None, &[]).expect(&q),
+                spargebra::Query::Select { .. }
+            ),
+            "{q}"
+        );
+        assert!(q.contains("SELECT DISTINCT"), "{q}");
+        assert!(q.contains("(COUNT(?o) AS ?cnt)"), "{q}");
+        assert!(q.contains("(COUNT(*) AS ?all)"), "{q}");
+        assert!(q.contains("(<http://example.org/opt>)?"), "{q}");
+        assert!(q.contains("^<http://example.org/parent>"), "{q}");
+        assert!(q.contains("^(^(<http://example.org/parent>))"), "{q}");
+        assert!(q.contains("?arg1"), "{q}");
+        assert!(
+            q.contains("<http://www.w3.org/2001/XMLSchema#integer>(?o)"),
+            "{q}"
+        );
+
+        let ask = serialize_query(&g, &ex("askVal")).unwrap();
+        assert!(
+            matches!(
+                parse_query(&ask, None, &[]).expect(&ask),
+                spargebra::Query::Ask { .. }
+            ),
+            "{ask}"
+        );
+        assert!(ask.contains("VALUES (?v)"), "{ask}");
+
+        // 2. Invalid xsd:boolean refused; "1"^^xsd:boolean accepted for spl:optional
+        let g_bool = parse_ttl(
+            r#"
+            ex:badFlag a sp:Select ; sp:distinct "notabool"^^xsd:boolean ; sp:where () .
+            ex:TOpt a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:opt ; spl:optional "1"^^xsd:boolean ] ;
+              spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this <http://example.org/p> ?opt } WHERE {}" ] .
+            ex:cOpt a ex:TOpt .
+            ex:TBadOpt a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:opt ; spl:optional "yes"^^xsd:boolean ] ;
+              spin:body [ a sp:Construct ; sp:text "CONSTRUCT { ?this <http://example.org/p> ?opt } WHERE {}" ] .
+            ex:cBadOpt a ex:TBadOpt .
+            "#,
+        );
+        assert!(serialize_query(&g_bool, &ex("badFlag")).is_err());
+        assert!(serialize_query(&g_bool, &ex("cOpt")).is_ok());
+        assert!(serialize_query(&g_bool, &ex("cBadOpt")).is_err());
+
+        // 3. Invalid GroupConcat separator, invalid SubQuery (Ask / FROM), and >16 ModPath
+        let g_bad = parse_ttl(
+            r#"
+            ex:badSep1 a sp:Select ;
+              sp:resultVariables ( [ sp:varName "j" ; sp:expression [ a sp:GroupConcat ; sp:expression [ sp:varName "o" ] ; sp:separator 123 ] ] ) ;
+              sp:where () .
+            ex:badSep2 a sp:Select ;
+              sp:resultVariables ( [ sp:varName "j" ; sp:expression [ a sp:GroupConcat ; sp:expression [ sp:varName "o" ] ; sp:separator ","@en ] ] ) ;
+              sp:where () .
+            ex:badSubAsk a sp:Select ;
+              sp:where ( [ a sp:SubQuery ; sp:query [ a sp:Ask ; sp:where () ] ] ) .
+            ex:badSubFrom a sp:Select ;
+              sp:where ( [ a sp:SubQuery ; sp:query [ a sp:Select ; sp:from ex:g1 ; sp:where () ] ] ) .
+            ex:badMod a sp:Ask ;
+              sp:where ( [ a sp:TriplePath ; sp:subject ex:a ; sp:path [ a sp:ModPath ; sp:subPath ex:p ; sp:modMin 1 ; sp:modMax 17 ] ; sp:object ex:b ] ) .
+            "#,
+        );
+        for name in ["badSep1", "badSep2", "badSubAsk", "badSubFrom", "badMod"] {
+            assert!(
+                serialize_query(&g_bad, &ex(name)).is_err(),
+                "expected {name} to fail"
+            );
+        }
+
+        // 4. Anonymous WHERE variable avoids collisions with sp:SubQuery sp:text and sp:Values
+        let g_col = parse_ttl(
+            r#"
+            ex:qCol a sp:Select ;
+              sp:where (
+                [ sp:subject [ sp:varName "s" ] ; sp:predicate ex:p ; sp:object [] ]
+                [ a sp:SubQuery ; sp:query [ a sp:Select ; sp:text "SELECT ?_spin_v1 WHERE { ?_spin_v1 <http://example.org/q> 1 }" ] ]
+                [ a sp:Values ; sp:varNames ( "_spin_v2" ) ; sp:bindings ( ( 2 ) ) ]
+              ) .
+            "#,
+        );
+        let q_col = serialize_query(&g_col, &ex("qCol")).unwrap();
+        assert!(parse_query(&q_col, None, &[]).is_ok(), "{q_col}");
+        assert!(
+            q_col.contains("?s <http://example.org/p> ?_spin_v3 ."),
+            "anonymous node must avoid both ?_spin_v1 (subquery text) and ?_spin_v2 (VALUES): {q_col}"
+        );
+    }
+
+    #[test]
+    fn dual_form_prefers_rdf_and_falls_back_to_sp_text_on_unsupported_rdf() {
+        // 1. Both valid RDF (full IRIs) and sp:text (undeclared prefix): RDF wins
+        let g_both = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object 1 ] ) ;
+              sp:where ( [ sp:subject spin:_this ; sp:predicate ex:in ; sp:object [ sp:varName "x" ] ] ) ;
+              sp:text "CONSTRUCT { ?this undeclared:out 1 } WHERE { ?this undeclared:in ?x }"
+            ] .
+            "#,
+        );
+        let translated = translate(&g_both, &[]).unwrap();
+        assert!(!translated.is_empty());
+
+        // 2. Dual-form rule whose RDF uses an unsupported construct falls back to valid sp:text
+        let g_fb = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object 1 ] ) ;
+              sp:where ( [ a sp:UnsupportedExtension ; sp:subject spin:_this ] ) ;
+              sp:text "CONSTRUCT { ?this <http://example.org/out> 1 } WHERE { ?this <http://example.org/in> ?x }"
+            ] .
+            "#,
+        );
+        let translated = translate(&g_fb, &[]).unwrap();
+        assert!(!translated.is_empty());
+
+        // 3. RDF-only rule with unsupported construct still fails
+        let g_only = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object 1 ] ) ;
+              sp:where ( [ a sp:UnsupportedExtension ; sp:subject spin:_this ] )
+            ] .
+            "#,
+        );
+        assert!(translate(&g_only, &[]).is_err());
+
+        // 4. Dual-form rule with cyclic RDF still fails (limit/cycle error is never masked)
+        let g_cyc = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object 1 ] ) ;
+              sp:where ( [ a sp:Filter ; sp:expression ex:e1 ] ) ;
+              sp:text "CONSTRUCT { ?this <http://example.org/out> 1 } WHERE {}"
+            ] .
+            ex:e1 a sp:not ; sp:arg1 ex:e1 .
+            "#,
+        );
+        let err = translate(&g_cyc, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("cyclic"), "{err:#}");
+
+        // 5. Template call with both base and subclass template types selects most specific
+        //    and supports bound sp:separator on sp:GroupConcat and bound SELECT ?arg in RDF body
+        let g_spec = parse_ttl(
+            r#"
+            ex:Base a spin:ConstructTemplate ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:sep ; spl:valueType xsd:string ] ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:who ] ;
+              spin:body [
+                a sp:Construct ;
+                sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:joined ; sp:object [ sp:varName "j" ] ] ) ;
+                sp:where (
+                  [ a sp:SubQuery ;
+                    sp:query [
+                      a sp:Select ;
+                      sp:resultVariables (
+                        [ sp:varName "who" ]
+                        [ sp:varName "j" ; sp:expression [ a sp:GroupConcat ; sp:expression [ sp:varName "v" ] ; sp:separator [ sp:varName "sep" ] ] ]
+                      ) ;
+                      sp:where ( [ sp:subject [ sp:varName "who" ] ; sp:predicate ex:v ; sp:object [ sp:varName "v" ] ] ) ;
+                      sp:groupBy ( [ sp:varName "who" ] )
+                    ] ]
+                )
+              ] .
+            ex:Child rdfs:subClassOf ex:Base ;
+              spin:constraint [ a spl:Argument ; spl:predicate ex:sep ; spl:defaultValue "|" ] .
+            ex:call a ex:Base, ex:Child ; ex:who ex:a .
+            "#,
+        );
+        let q_spec = serialize_query(&g_spec, &ex("call")).unwrap();
+        assert!(parse_query(&q_spec, None, &[]).is_ok(), "{q_spec}");
+        assert!(q_spec.contains("SEPARATOR = \"|\""), "{q_spec}");
+        assert!(
+            q_spec.contains("(<http://example.org/a> AS ?who)"),
+            "{q_spec}"
         );
     }
 }

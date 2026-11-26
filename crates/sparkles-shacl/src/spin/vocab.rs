@@ -55,6 +55,8 @@ pub mod sp {
         VALUES_CLS = "Values",
         EXISTS = "Exists",
         NOT_EXISTS = "NotExists",
+        EXISTS_FN = "exists",
+        NOT_EXISTS_FN = "notExists",
         ELEMENT_GROUP = "ElementGroup",
         // Graph pattern element properties
         SUBJECT = "subject",
@@ -63,6 +65,7 @@ pub mod sp {
         PATH = "path",
         EXPRESSION = "expression",
         VARIABLE = "variable",
+        AS = "as",
         ELEMENTS = "elements",
         QUERY_PROP = "query",
         GRAPH_NAME_NODE = "graphNameNode",
@@ -246,6 +249,8 @@ pub(crate) fn is_sp_expression_type(iri: &str) -> bool {
         || iri == sp::BOUND.as_str()
         || iri == sp::EXISTS.as_str()
         || iri == sp::NOT_EXISTS.as_str()
+        || iri == sp::EXISTS_FN.as_str()
+        || iri == sp::NOT_EXISTS_FN.as_str()
 }
 
 /// Structural `sp:` classes that cannot be called as custom IRI functions in an expression.
