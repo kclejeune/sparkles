@@ -1114,6 +1114,60 @@ impl Preparation {
         Ok(result)
     }
 
+    /// The IRI text of a stored named node, borrowed for `each` without full term
+    /// decoding. Only the key's own bytes and the reconstruction workspace are
+    /// charged, so a long rejected IRI does not pay the general term-decoder
+    /// multiplier. `None` for any non-IRI term.
+    pub fn with_iri<R>(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        each: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        self.check()?;
+        let mut each = Some(each);
+        let mut call = |key: &[u8]| -> Result<R> {
+            let each = each.take().expect("called once");
+            let Some(text) = key.strip_prefix(b"<") else {
+                return each(None);
+            };
+            let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+            each(std::str::from_utf8(text).ok())
+        };
+        let mut workspace = self.reserve(0)?;
+        let result = match id.tag() {
+            Tag::Vocab => {
+                if id.payload() >= snap.generation.vocab.len()
+                    || !snap.generation.vocab.is_iri(id.payload())
+                {
+                    None
+                } else {
+                    snap.generation.vocab.get_with_controlled(
+                        id.payload(),
+                        |bytes| {
+                            workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256))
+                        },
+                        |phase| self.checkpoint(phase),
+                        &mut call,
+                    )?
+                }
+            }
+            Tag::Delta => snap.generation.dvocab.with_prepared(self, |vocab| {
+                if id.payload() >= snap.dvocab_len {
+                    return Ok(None);
+                }
+                Ok(vocab.get(id.payload()).map(&mut call))
+            })?,
+            _ => None,
+        };
+        let result = match result {
+            Some(result) => result?,
+            None => (each.take().expect("not called"))(None)?,
+        };
+        self.check()?;
+        Ok(result)
+    }
+
     fn decode_term(&self, key: &[u8]) -> Result<(Term, Reservation)> {
         // Includes decoded strings/boxes. Explicit frame/value buffers below carry
         // separate reservations and avoid a recursive native-stack decoder.
@@ -2105,6 +2159,14 @@ impl PreparedView {
     /// by a snapshot-bound guard whose pattern matches `iri`.
     pub fn allows_guarded_read_iri(&self, iri: &str) -> bool {
         self.inner.access.allows_guarded_read_iri(iri)
+    }
+
+    /// See [`GraphAccess::visit_guarded_read_iris`].
+    pub fn visit_guarded_read_iris<E>(
+        &self,
+        visit: impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        self.inner.access.visit_guarded_read_iris(visit)
     }
 
     /// Whether the graph named by `term` (the default graph when `None`) is writable.

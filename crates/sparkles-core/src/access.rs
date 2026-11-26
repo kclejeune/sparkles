@@ -792,6 +792,39 @@ impl GraphAccess {
             })
     }
 
+    /// For a restricted policy (`!self.reads_everything()`), visits every graph IRI
+    /// admitted by [`Self::allows_guarded_read_iri`] (may visit an IRI more than once
+    /// if multiple guards exempt it) and returns `Ok(true)`. Returns `Ok(false)` when
+    /// reads are unrestricted (`self.reads_everything()`), meaning any named graph is
+    /// readable.
+    pub fn visit_guarded_read_iris<E>(
+        &self,
+        mut visit: impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        if self.reads_everything() {
+            return Ok(false);
+        }
+        let Graphs::Only(rule) = &self.read else {
+            return Ok(true);
+        };
+        for g in &rule.guards {
+            if g.bound_to.is_none() || g.decide.is_some() {
+                continue;
+            }
+            for iri in &g.exempt {
+                let s = iri.as_str();
+                if s != DEFAULT_GRAPH_IRI
+                    && s != UNION_GRAPH_IRI
+                    && glob(&g.pattern, s)
+                    && rule.matches_iri(s)
+                {
+                    visit(s)?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// A stable key of the read rule (for caches).
     pub fn read_key(&self) -> String {
         format!("{:?}", self.read)
@@ -825,6 +858,18 @@ impl GraphAccess {
         preparation: &Preparation,
     ) -> Result<PreparedView> {
         triples::controlled::prepare(self, snap, preparation)
+    }
+
+    /// Like [`Self::masked_controlled`], but prepares a read-only view without
+    /// binding `self.write` guards or invoking write guard providers. The returned
+    /// view preserves read grants, read guards and triple protections with
+    /// `write: Graphs::none()`.
+    pub fn masked_controlled_read_only(
+        &self,
+        snap: &Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<PreparedView> {
+        triples::controlled::prepare_read_only(self, snap, preparation)
     }
 
     /// Keep the rebuilt mask and its charge together without installing a raw

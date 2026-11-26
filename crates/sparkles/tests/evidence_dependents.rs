@@ -1288,17 +1288,73 @@ fn dependents_refuses_when_profile_is_disabled_or_unconfigured() {
     .unwrap_err();
     assert_eq!(err.code(), "unsupported-profile", "{err:?}");
 
-    // A dataset configured with `enabled: false` must refuse both head and historical calls.
+    // Unconfigured head must refuse with `unsupported-profile`.
+    let uncfg_head_err = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&dummy),
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        uncfg_head_err.code(),
+        "unsupported-profile",
+        "{uncfg_head_err:?}"
+    );
+
+    // Enable the profile, detach its managed graphs, and then explicitly disable it so
+    // disabled owner settings bytes (`enabled: false`) are genuinely recorded in both
+    // the live managed registry and configuration history.
+    let enabled = settings();
+    evidence::configure(&ds, &enabled, &Control::none()).unwrap();
+    for g in enabled.managed_graphs() {
+        evidence::detach(&ds, &g).unwrap();
+    }
     let disabled = Settings {
         enabled: false,
-        ..Settings::default()
+        ..enabled
     };
     evidence::configure(&ds, &disabled, &Control::none()).unwrap();
+    let live_settings_bytes = ds
+        .store()
+        .managed_snapshot()
+        .unwrap()
+        .expect("managed snapshot recorded")
+        .settings
+        .get(&sparkles::managed::OwnerKind::Evidence)
+        .cloned()
+        .expect("disabled evidence settings recorded at head");
+    let live_settings = Settings::from_slice(&live_settings_bytes, &Control::none()).unwrap();
+    assert!(
+        !live_settings.enabled,
+        "head must carry recorded disabled settings"
+    );
+
+    // Advance RDF history after disabling so the new commit binds the recorded disabled
+    // configuration generation in configuration history.
+    add_report(
+        &ds,
+        REPORTS,
+        "urn:report:after-disable",
+        None,
+        &[dummy.as_str()],
+    );
     let dis_seq = ds.store().head_commit().seq;
+    assert!(dis_seq > pre_seq);
     let dis_view = ds
         .store()
         .evidence_view(&sparkles::history::At::Commit(dis_seq), &prep)
         .unwrap();
+    let hist_settings_bytes = dis_view
+        .owner_settings(sparkles::managed::OwnerKind::Evidence)
+        .expect("disabled evidence settings recorded in historical view");
+    let hist_settings = Settings::from_slice(hist_settings_bytes, &Control::none()).unwrap();
+    assert!(
+        !hist_settings.enabled,
+        "historical view must carry recorded disabled settings"
+    );
 
     let head_err = evidence::find_dependents(
         &ds,
@@ -1850,11 +1906,12 @@ fn long_input_iri_repeated_across_reports_hits_memory_budget() {
     assert!(matches!(err, sparkles::Error::BudgetExceeded(_)), "{err:?}");
 }
 
-/// An undecided legacy write guard on `access.write` does not force view preparation or
-/// fail read-only `find_dependents`.
+/// An undecided legacy write guard on `access.write` does not block read-only
+/// `find_dependents` or `find_dependents_at`, whether alone or combined with an
+/// undecided controlled read guard or a triple mask that requires view preparation.
 #[test]
 fn undecided_write_guard_does_not_block_read_only_dependents() {
-    use sparkles::access::{Decider, GuardDecision};
+    use sparkles::access::{Decider, GuardDecision, triples};
 
     struct LegacyWriteGuard;
     impl GuardDecision for LegacyWriteGuard {
@@ -1864,24 +1921,222 @@ fn undecided_write_guard_does_not_block_read_only_dependents() {
         // Uses default `exempt_controlled`, which returns `Error::Unsupported`.
     }
 
-    let ds = configured();
+    let ds = Dataset::memory();
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    evidence::configure(&ds, &settings(), &Control::none()).unwrap();
     let c = claim(&ds, "advisory");
     add_report(&ds, REPORTS, "urn:report:ok", None, &[c.0.as_str()]);
-    let write_guarded = Arc::new(GraphAccess::graphs(
-        Graphs::All,
-        Graphs::All.guarded_by("urn:g:*", Decider(Arc::new(LegacyWriteGuard))),
-    ));
+    add_report(&ds, REPORTS, "urn:report:secret", None, &[c.0.as_str()]);
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{REPORTS}> {{ <urn:report:secret> <urn:secret:tag> \"hidden\" . }} }}"
+    ))
+    .unwrap();
+    let seq = ds.store().head_commit().seq;
+    let view = ds
+        .store()
+        .evidence_view(&sparkles::history::At::Commit(seq), &prep)
+        .unwrap();
+
+    let legacy_write = || Graphs::All.guarded_by("urn:g:*", Decider(Arc::new(LegacyWriteGuard)));
+
+    // 1. Legacy write guard alone (no view preparation needed).
+    let write_only = Arc::new(GraphAccess::graphs(Graphs::All, legacy_write()));
     let res = evidence::find_dependents(
         &ds,
         &ds,
         std::slice::from_ref(&c.0),
         false,
-        Some(write_guarded),
+        Some(write_only),
         &Control::none(),
     )
     .unwrap();
-    assert_eq!(res.reports.len(), 1);
-    assert_eq!(res.reports[0].report.as_str(), "urn:report:ok");
+    assert_eq!(res.reports.len(), 2);
+
+    // 2. Legacy write guard combined with an undecided controlled read guard.
+    let with_read_guard = Arc::new(GraphAccess::graphs(
+        Graphs::All.guarded_by(
+            "urn:x-sparkles:graphrag:*",
+            Decider(Arc::new(FixedGuard(vec![REPORTS.into()]))),
+        ),
+        legacy_write(),
+    ));
+    let head_rg = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(with_read_guard.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(head_rg.reports.len(), 2);
+    let hist_rg = evidence::find_dependents_at(
+        &view,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(with_read_guard),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(hist_rg.reports.len(), 2);
+
+    // 3. Legacy write guard combined with a triple mask (and controlled read guard).
+    let secret_rules = || triples::TripleRules {
+        rules: vec![triples::Rule {
+            protection: Arc::new(triples::Protection {
+                name: "hide-secret".into(),
+                predicates: Some(vec!["urn:secret:tag".into()]),
+                classes: None,
+                subclasses: false,
+                graphs: Some(Graphs::Only(GraphRule::new([REPORTS], &[]))),
+                pattern: None,
+                prefixes: Default::default(),
+                hide_inferences: false,
+            }),
+            read: Graphs::none(),
+            write: Graphs::none(),
+        }],
+        caller: triples::Caller::default(),
+        limits: triples::Limits::default(),
+    };
+    let with_mask_and_guard = Arc::new(GraphAccess::with_triples(
+        Graphs::All.guarded_by(
+            "urn:x-sparkles:graphrag:*",
+            Decider(Arc::new(FixedGuard(vec![REPORTS.into()]))),
+        ),
+        legacy_write(),
+        secret_rules(),
+    ));
+    let head_masked = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(with_mask_and_guard.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(head_masked.reports.len(), 1);
+    assert_eq!(head_masked.reports[0].report.as_str(), "urn:report:ok");
+    let hist_masked = evidence::find_dependents_at(
+        &view,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(with_mask_and_guard),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(hist_masked.reports.len(), 1);
+    assert_eq!(hist_masked.reports[0].report.as_str(), "urn:report:ok");
+
+    // 4. Legacy write guard combined with a triple mask alone (no read guard).
+    let with_mask_only = Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        legacy_write(),
+        secret_rules(),
+    ));
+    let head_mask_only = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(with_mask_only.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(head_mask_only.reports.is_empty());
+    let hist_mask_only = evidence::find_dependents_at(
+        &view,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(with_mask_only),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(hist_mask_only.reports.is_empty());
+}
+
+/// An unreadable guarded graph with an oversized (140 KiB) IRI carrying a hidden
+/// `rdf:type gr:Report` (or hidden `prov:used` / `gr:editOf`) must not turn an empty
+/// lookup into `BudgetExceeded(Memory)`, and many admitted report-type graphs with
+/// no edit edges return cleanly without retaining all membership graphs.
+#[test]
+fn unreadable_long_report_type_graph_and_many_admitted_graphs_without_edits() {
+    let ds = configured();
+    let target = iri("urn:known:target");
+    let narrow_read = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new([CLAIMS], &[])),
+        Graphs::none(),
+    ));
+
+    // Baseline without the hidden type statement.
+    let before = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&target),
+        false,
+        Some(narrow_read.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(before.dependents.is_empty());
+    assert!(before.reports.is_empty());
+
+    // Add a hidden `rdf:type gr:Report` (plus hidden `prov:used` and `gr:editOf`) in
+    // an unreadable guarded graph with a 140 KiB IRI. Under `with_term` (128x charge),
+    // decoding this graph IRI alone would exceed the 16 MiB preparation cap.
+    let huge_unreadable = format!("urn:x-sparkles:graphrag:hidden-{}", "x".repeat(140 * 1024));
+    ds.update(&format!(
+        "INSERT DATA {{ \
+            GRAPH <{huge_unreadable}> {{ \
+                <{t}> <{RDF_TYPE}> <{GR}Report> . \
+                <urn:act:hidden> <{RDF_TYPE}> <{PROV_ACTIVITY}> ; <{PROV_USED}> <{t}> . \
+                <urn:edit:hidden> <{RDF_TYPE}> <{GR}Report> ; <{GR}editOf> <{t}> . \
+            }} \
+        }}",
+        t = target.as_str()
+    ))
+    .unwrap();
+
+    let after = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&target),
+        false,
+        Some(narrow_read),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(after.dependents, before.dependents);
+    assert_eq!(after.reports, before.reports);
+
+    // Many admitted membership graphs with `rdf:type gr:Report` and no `gr:editOf`
+    // edges succeed cleanly under unrestricted read access.
+    let ds_many = configured();
+    let mut trig = String::new();
+    for i in 0..300 {
+        trig.push_str(&format!(
+            "GRAPH <urn:x-sparkles:graphrag:empty-edits-{i}> {{ <{t}> <{RDF_TYPE}> <{GR}Report> . }}\n",
+            t = target.as_str()
+        ));
+    }
+    ds_many
+        .update(&format!("INSERT DATA {{ {trig} }}"))
+        .unwrap();
+    let many = evidence::find_dependents(
+        &ds_many,
+        &ds_many,
+        std::slice::from_ref(&target),
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(many.dependents.is_empty());
+    assert!(many.reports.is_empty());
 }
 
 /// Historical `find_dependents_at` binds undecided guards and triple protections against

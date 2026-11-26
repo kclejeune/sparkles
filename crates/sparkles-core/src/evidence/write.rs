@@ -51,7 +51,7 @@ use super::{
     Settings, Sha256Digest, SourceContent,
     model::{BoundaryInput, ValidityInput},
 };
-use crate::access::{Preparation, Reservation};
+use crate::access::{Preparation, PreparationBuffer as Buffer, Reservation};
 use crate::id::{Id, Tag};
 use crate::index::Perm;
 use crate::store::Snapshot;
@@ -1248,6 +1248,11 @@ impl<'a> Reads<'a> {
         Self::new(preparation, view.snapshot())
     }
 
+    /// Resolve an IRI to its snapshot identifier under this reader's cached budget.
+    pub fn iri_id(&mut self, iri: &str) -> Result<Option<Id>> {
+        self.id(iri)
+    }
+
     fn id(&mut self, iri: &str) -> Result<Option<Id>> {
         if let Some(id) = self.ids.get(iri) {
             return Ok(*id);
@@ -1422,8 +1427,7 @@ impl<'a> Reads<'a> {
                 _held: self.preparation.reserve(0)?,
             });
         };
-        let mut scan_held = self.preparation.reserve(0)?;
-        let mut ids: Vec<Id> = Vec::new();
+        let mut ids: Buffer<Id> = Buffer::new(self.preparation)?;
         let mut more = false;
         self.preparation
             .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
@@ -1440,18 +1444,7 @@ impl<'a> Reads<'a> {
                     more = true;
                     return Ok(false);
                 }
-                if ids.len() == ids.capacity() {
-                    let next = ids
-                        .capacity()
-                        .checked_mul(2)
-                        .map(|n| n.max(16))
-                        .ok_or_else(|| self.preparation.exhausted())?;
-                    let add = (next - ids.capacity()) as u64 * std::mem::size_of::<Id>() as u64;
-                    scan_held.grow_by(add)?;
-                    ids.try_reserve_exact(next - ids.len())
-                        .map_err(|_| self.preparation.exhausted())?;
-                }
-                ids.push(q[0]);
+                ids.push(q[0])?;
                 Ok(true)
             })?;
         let mut out_held = self
@@ -1460,18 +1453,18 @@ impl<'a> Reads<'a> {
         let mut out = Vec::new();
         out.try_reserve_exact(ids.len())
             .map_err(|_| self.preparation.exhausted())?;
-        for id in ids {
-            if let Some(n) = self.preparation.with_term(self.snap, id, |t| match t {
-                Some(Term::NamedNode(n)) => {
-                    out_held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
-                    Ok(Some(n.clone()))
+        for &id in &*ids {
+            if let Some(n) = self.preparation.with_iri(self.snap, id, |iri| match iri {
+                Some(iri) => {
+                    let owned = self.preparation.copy_string(iri, &mut out_held)?;
+                    Ok(Some(NamedNode::new_unchecked(owned)))
                 }
-                _ => Ok(None),
+                None => Ok(None),
             })? {
                 out.push(n);
             }
         }
-        drop(scan_held);
+        drop(ids);
         Ok(AdmittedScan {
             items: out,
             more,
@@ -1492,8 +1485,71 @@ impl<'a> Reads<'a> {
         o: &Term,
         limit: usize,
         skip_masked: bool,
+        keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        self.scan_subjects_in_graphs(p, o, None, limit, skip_masked, None, keep_graph)
+    }
+
+    /// Like [`Self::subjects_in_graphs_up_to`], but when `admitted` is `Some(map)`,
+    /// restricts candidate graphs to IDs present in `map` before touching the
+    /// vocabulary or decoding any graph IRI.
+    pub fn subjects_in_admitted_graphs_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        limit: usize,
+        skip_masked: bool,
+        admitted: Option<&BTreeMap<Id, Arc<NamedNode>>>,
+        keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        self.scan_subjects_in_graphs(p, o, None, limit, skip_masked, admitted, keep_graph)
+    }
+
+    /// Like [`Self::subjects_in_admitted_graphs_up_to`], additionally requiring that
+    /// the object `o` itself carries `o rdf_type object_class` in the candidate graph
+    /// (and, when `skip_masked` is set, has no triple hidden in that graph) before
+    /// counting the edge toward `limit`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subjects_for_typed_object_in_graphs_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        rdf_type: &str,
+        object_class: &str,
+        limit: usize,
+        skip_masked: bool,
+        admitted: Option<&BTreeMap<Id, Arc<NamedNode>>>,
+        keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        self.scan_subjects_in_graphs(
+            p,
+            o,
+            Some((rdf_type, object_class)),
+            limit,
+            skip_masked,
+            admitted,
+            keep_graph,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_subjects_in_graphs(
+        &mut self,
+        p: &str,
+        o: &Term,
+        object_type: Option<(&str, &str)>,
+        limit: usize,
+        skip_masked: bool,
+        admitted: Option<&BTreeMap<Id, Arc<NamedNode>>>,
         mut keep_graph: impl FnMut(&str) -> bool,
     ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        if admitted.is_some_and(BTreeMap::is_empty) {
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
+        }
         let Some(p) = self.id(p)? else {
             return Ok(AdmittedScan {
                 items: Vec::new(),
@@ -1512,13 +1568,26 @@ impl<'a> Reads<'a> {
                 _held: self.preparation.reserve(0)?,
             });
         };
+        let object_type_ids = match object_type {
+            Some((rdf_type, class)) => {
+                let (Some(tp), Some(cls)) = (self.id(rdf_type)?, self.id(class)?) else {
+                    return Ok(AdmittedScan {
+                        items: Vec::new(),
+                        more: false,
+                        _held: self.preparation.reserve(0)?,
+                    });
+                };
+                Some((tp, cls))
+            }
+            None => None,
+        };
         const SKIP_SLOTS: usize = 256;
         let mut skipped = [None::<Id>; SKIP_SLOTS];
         let mut out_held = self.preparation.reserve(0)?;
         let mut scan_held = self.preparation.reserve(0)?;
         let mut accepted: BTreeMap<Id, Arc<NamedNode>> = BTreeMap::new();
         let mut accepted_started = false;
-        let mut pairs: Vec<(Id, Id)> = Vec::new();
+        let mut pairs: Buffer<(Id, Id)> = Buffer::new(self.preparation)?;
         let mut more = false;
         self.preparation
             .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
@@ -1530,6 +1599,12 @@ impl<'a> Reads<'a> {
                 if skipped[slot] == Some(g) {
                     return Ok(true);
                 }
+                if let Some(map) = admitted
+                    && !map.contains_key(&g)
+                {
+                    skipped[slot] = Some(g);
+                    return Ok(true);
+                }
                 if !self.is_iri_id(q[0])? {
                     return Ok(true);
                 }
@@ -1537,13 +1612,30 @@ impl<'a> Reads<'a> {
                     return Ok(true);
                 }
                 if let std::collections::btree_map::Entry::Vacant(e) = accepted.entry(g) {
-                    let node = self.preparation.with_term(self.snap, g, |t| match t {
-                        Some(Term::NamedNode(n)) if keep_graph(n.as_str()) => {
-                            out_held.grow_by((n.as_str().len() as u64).saturating_add(64))?;
-                            Ok(Some(Arc::new(n.clone())))
+                    if let Some((tp, cls)) = object_type_ids
+                        && ((skip_masked && self.hides_subject_id_in_graph(o, g)?)
+                            || !self.snap.contains(&[o, tp, cls, g])?)
+                    {
+                        skipped[slot] = Some(g);
+                        return Ok(true);
+                    }
+                    let node = if let Some(map) = admitted {
+                        let candidate = map.get(&g).expect("checked admitted graph id");
+                        if keep_graph(candidate.as_str()) {
+                            Some(Arc::clone(candidate))
+                        } else {
+                            None
                         }
-                        _ => Ok(None),
-                    })?;
+                    } else {
+                        self.preparation.with_iri(self.snap, g, |iri| match iri {
+                            Some(iri) if keep_graph(iri) => {
+                                let owned = self.preparation.copy_string(iri, &mut out_held)?;
+                                out_held.grow_by(32)?;
+                                Ok(Some(Arc::new(NamedNode::new_unchecked(owned))))
+                            }
+                            _ => Ok(None),
+                        })?
+                    };
                     let Some(node) = node else {
                         skipped[slot] = Some(g);
                         return Ok(true);
@@ -1557,20 +1649,7 @@ impl<'a> Reads<'a> {
                     more = true;
                     return Ok(false);
                 }
-                if pairs.len() == pairs.capacity() {
-                    let next = pairs
-                        .capacity()
-                        .checked_mul(2)
-                        .map(|n| n.max(16))
-                        .ok_or_else(|| self.preparation.exhausted())?;
-                    let add =
-                        (next - pairs.capacity()) as u64 * std::mem::size_of::<(Id, Id)>() as u64;
-                    scan_held.grow_by(add)?;
-                    pairs
-                        .try_reserve_exact(next - pairs.len())
-                        .map_err(|_| self.preparation.exhausted())?;
-                }
-                pairs.push((q[0], g));
+                pairs.push((q[0], g))?;
                 Ok(true)
             })?;
         let vec_bytes = (pairs.len() as u64)
@@ -1579,14 +1658,17 @@ impl<'a> Reads<'a> {
         let mut out = Vec::new();
         out.try_reserve_exact(pairs.len())
             .map_err(|_| self.preparation.exhausted())?;
-        for (s_id, g_id) in pairs {
-            if let Some(s) = self.preparation.with_term(self.snap, s_id, |t| match t {
-                Some(Term::NamedNode(n)) => {
-                    out_held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
-                    Ok(Some(n.clone()))
-                }
-                _ => Ok(None),
-            })? {
+        for &(s_id, g_id) in &*pairs {
+            if let Some(s) = self
+                .preparation
+                .with_iri(self.snap, s_id, |iri| match iri {
+                    Some(iri) => {
+                        let owned = self.preparation.copy_string(iri, &mut out_held)?;
+                        Ok(Some(NamedNode::new_unchecked(owned)))
+                    }
+                    None => Ok(None),
+                })?
+            {
                 let g = Arc::clone(
                     accepted
                         .get(&g_id)
@@ -1595,72 +1677,12 @@ impl<'a> Reads<'a> {
                 out.push((s, g));
             }
         }
+        drop(pairs);
         drop(accepted);
         drop(scan_held);
         Ok(AdmittedScan {
             items: out,
             more,
-            _held: out_held,
-        })
-    }
-
-    /// Named graphs accepted by `keep_graph` in which `s rdf_type class` holds (and,
-    /// when `skip_masked` is set, no triple of `s` in that graph is hidden by this
-    /// snapshot's mask). Returned graph IRIs stay charged to the preparation through
-    /// the returned [`AdmittedScan`].
-    pub fn graphs_with_subject_type(
-        &mut self,
-        s: &str,
-        rdf_type: &str,
-        class: &str,
-        skip_masked: bool,
-        mut keep_graph: impl FnMut(&str) -> bool,
-    ) -> Result<AdmittedScan<Arc<NamedNode>>> {
-        let (Some(s), Some(p), Some(o)) = (self.id(s)?, self.id(rdf_type)?, self.id(class)?) else {
-            return Ok(AdmittedScan {
-                items: Vec::new(),
-                more: false,
-                _held: self.preparation.reserve(0)?,
-            });
-        };
-        let mut out_held = self.preparation.reserve(0)?;
-        let mut out: Vec<Arc<NamedNode>> = Vec::new();
-        self.preparation
-            .scan(self.snap, Perm::Spo, &[s.0, p.0, o.0], |q| {
-                let g = q[3];
-                if g == Id::DEFAULT_GRAPH {
-                    return Ok(true);
-                }
-                if skip_masked && self.hides_subject_id_in_graph(s, g)? {
-                    return Ok(true);
-                }
-                let node = self.preparation.with_term(self.snap, g, |t| match t {
-                    Some(Term::NamedNode(n)) if keep_graph(n.as_str()) => {
-                        out_held.grow_by((n.as_str().len() as u64).saturating_add(64))?;
-                        Ok(Some(Arc::new(n.clone())))
-                    }
-                    _ => Ok(None),
-                })?;
-                if let Some(node) = node {
-                    if out.len() == out.capacity() {
-                        let next = out
-                            .capacity()
-                            .checked_mul(2)
-                            .map(|n| n.max(4))
-                            .ok_or_else(|| self.preparation.exhausted())?;
-                        let add = (next - out.capacity()) as u64
-                            * std::mem::size_of::<Arc<NamedNode>>() as u64;
-                        out_held.grow_by(add)?;
-                        out.try_reserve_exact(next - out.len())
-                            .map_err(|_| self.preparation.exhausted())?;
-                    }
-                    out.push(node);
-                }
-                Ok(true)
-            })?;
-        Ok(AdmittedScan {
-            items: out,
-            more: false,
             _held: out_held,
         })
     }
@@ -1694,12 +1716,12 @@ impl<'a> Reads<'a> {
         let Some(id) = first else {
             return Ok(None);
         };
-        self.preparation.with_term(self.snap, id, |t| match t {
-            Some(Term::NamedNode(n)) => {
-                held.grow_by(n.as_str().len() as u64)?;
-                Ok(Some(n.clone()))
+        self.preparation.with_iri(self.snap, id, |iri| match iri {
+            Some(iri) => {
+                let owned = self.preparation.copy_string(iri, held)?;
+                Ok(Some(NamedNode::new_unchecked(owned)))
             }
-            _ => Ok(None),
+            None => Ok(None),
         })
     }
 

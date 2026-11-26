@@ -20,9 +20,22 @@ use oxrdf::{NamedNode, Term};
 use sparkles_core::evidence::review::MAX_EVIDENCE;
 use sparkles_core::evidence::write::Reads;
 use sparkles_core::evidence::{RecordKind, Settings};
+use sparkles_core::id::Id;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Shared `NamedNode` wrapper whose `Borrow<str>` lets `BTreeSet` probe by `&str`
+/// without cloning. `NamedNode`'s `Ord` delegates directly to `str::cmp`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SharedIri(Arc<NamedNode>);
+
+impl Borrow<str> for SharedIri {
+    fn borrow(&self) -> &str {
+        self.0.as_str()
+    }
+}
 
 const PROV_USED: &str = "http://www.w3.org/ns/prov#used";
 const PROV_WAS_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
@@ -134,8 +147,8 @@ impl<'a> DependentsHead<'a> {
         preparation: &Preparation,
     ) -> Result<PreparedView> {
         let prepared = match self {
-            Self::Snapshot(head) => access.masked_controlled(head, preparation),
-            Self::Evidence(view) => view.prepare_view(access.clone(), preparation),
+            Self::Snapshot(head) => access.masked_controlled_read_only(head, preparation),
+            Self::Evidence(view) => view.prepare_read_only_view(access.clone(), preparation),
         };
         prepared.map_err(|e| match e {
             Error::Unsupported(m) => ManagedError::error(ManagedErrorKind::IncompleteEvidence, m),
@@ -303,15 +316,6 @@ fn dependents_in_with_budget(
             true
         }
     };
-    let allows_reports_read = |iri: &str| -> bool {
-        if let Some(v) = prepared.as_ref() {
-            v.allows_guarded_read_iri(iri)
-        } else if let Some(a) = access.as_deref() {
-            a.allows_guarded_read_iri(iri)
-        } else {
-            true
-        }
-    };
     let graphs: Vec<(NamedNode, Option<Uuid>)> = settings
         .proposals
         .iter()
@@ -335,14 +339,45 @@ fn dependents_in_with_budget(
         withdrawn: BTreeSet::new(),
     };
     let skip_masked = state.seen.is_some();
-    // Declared before the retained traversal and output maps so those drop before credit
-    // releases back to `preparation`.
+    // Declared before the retained traversal, admitted-graph and output maps so those
+    // drop before credit releases back to `preparation`.
     let mut result_held = preparation.reserve(0)?;
+    // For any restricted policy (`!reads_everything()`), `allows_guarded_read_iri` can
+    // only admit graphs explicitly exempted by a snapshot-bound decided guard. Pre-resolve
+    // those graph IDs once so unreadable graphs are rejected by ID without ever reading or
+    // decoding their vocabulary entries. `None` means unrestricted (`reads_everything()`).
+    let admitted_report_graphs: Option<BTreeMap<Id, Arc<NamedNode>>> = {
+        let mut map: BTreeMap<Id, Arc<NamedNode>> = BTreeMap::new();
+        let mut started = false;
+        let mut visit = |iri: &str| -> Result<()> {
+            if !is_reports_graph(iri) {
+                return Ok(());
+            }
+            if let Some(id) = state.reads.iri_id(iri)?
+                && !map.contains_key(&id)
+            {
+                let start = if started { 0 } else { 1024 };
+                result_held.grow_by(start + MAP_ENTRY_BYTES)?;
+                let owned = preparation.copy_string(iri, &mut result_held)?;
+                map.insert(id, Arc::new(NamedNode::new_unchecked(owned)));
+                started = true;
+            }
+            Ok(())
+        };
+        let restricted = if let Some(v) = prepared.as_ref() {
+            v.visit_guarded_read_iris(&mut visit)?
+        } else if let Some(a) = access.as_deref() {
+            a.visit_guarded_read_iris(&mut visit)?
+        } else {
+            false
+        };
+        restricted.then_some(map)
+    };
     let mut found: BTreeMap<NamedNode, Dependent> = BTreeMap::new();
     let mut found_reports: BTreeMap<NamedNode, ReportDependent> = BTreeMap::new();
     let mut asked: BTreeSet<Arc<NamedNode>> = BTreeSet::new();
     let mut queue: VecDeque<(Arc<NamedNode>, u32)> = VecDeque::new();
-    let mut expanded_edits: BTreeSet<(Arc<NamedNode>, Arc<NamedNode>)> = BTreeSet::new();
+    let mut expanded_edits: BTreeMap<Arc<NamedNode>, BTreeSet<SharedIri>> = BTreeMap::new();
     for c in changed {
         if !asked.contains(c) {
             result_held.grow_by((c.as_str().len() as u64).saturating_add(SET_ENTRY_BYTES * 2))?;
@@ -419,130 +454,143 @@ fn dependents_in_with_budget(
         }
         // 2. Community reports in readable guarded reports graphs whose generating
         //    activity recorded `prov:used <on>` (plus human edits via `gr:editOf`).
-        let remaining = MAX_EVIDENCE.saturating_sub(read);
-        let mut act_scan = match state.seen.as_mut() {
-            Some(seen) => seen.subjects_in_graphs_up_to(PROV_USED, &o, remaining, true, |g| {
-                is_reports_graph(g) && allows_reports_read(g)
-            })?,
-            None => state
-                .reads
-                .subjects_in_graphs_up_to(PROV_USED, &o, remaining, false, |g| {
-                    is_reports_graph(g) && allows_reports_read(g)
-                })?,
-        };
-        read += act_scan.items.len();
-        if act_scan.more || read > MAX_EVIDENCE {
-            return Err(super::incomplete("the dependents of the changed records"));
-        }
-        act_scan
-            .items
-            .sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
-        for (act, g) in &act_scan.items {
-            control.check()?;
-            if state.masked(act, g)? {
-                continue;
-            }
-            let is_activity = match state.seen.as_mut() {
-                Some(seen) => seen.contains(act.as_str(), RDF_TYPE, &activity_type, g.as_str())?,
-                None => state
-                    .reads
-                    .contains(act.as_str(), RDF_TYPE, &activity_type, g.as_str())?,
-            };
-            if !is_activity {
-                continue;
-            }
+        let admitted_reports = admitted_report_graphs.as_ref();
+        if !admitted_reports.is_some_and(BTreeMap::is_empty) {
             let remaining = MAX_EVIDENCE.saturating_sub(read);
-            let _act_term_held = preparation.reserve(act.as_str().len() as u64)?;
-            let act_term = Term::NamedNode(act.clone());
-            let mut rep_scan = match state.seen.as_mut() {
-                Some(seen) => seen.visible_subjects_up_to(
-                    PROV_WAS_GENERATED_BY,
-                    &act_term,
-                    g.as_str(),
+            let mut act_scan = match state.seen.as_mut() {
+                Some(seen) => seen.subjects_in_admitted_graphs_up_to(
+                    PROV_USED,
+                    &o,
                     remaining,
                     true,
+                    admitted_reports,
+                    |g| admitted_reports.is_some() || is_reports_graph(g),
                 )?,
-                None => state.reads.visible_subjects_up_to(
-                    PROV_WAS_GENERATED_BY,
-                    &act_term,
-                    g.as_str(),
+                None => state.reads.subjects_in_admitted_graphs_up_to(
+                    PROV_USED,
+                    &o,
                     remaining,
                     false,
+                    admitted_reports,
+                    |g| admitted_reports.is_some() || is_reports_graph(g),
                 )?,
             };
-            read += rep_scan.items.len();
-            if rep_scan.more || read > MAX_EVIDENCE {
+            read += act_scan.items.len();
+            if act_scan.more || read > MAX_EVIDENCE {
                 return Err(super::incomplete("the dependents of the changed records"));
             }
-            rep_scan.items.sort();
-            for rep in &rep_scan.items {
-                record_report_and_edits(
-                    &mut state,
-                    &preparation,
-                    &mut result_held,
-                    rep,
-                    g,
-                    &on,
-                    depth,
-                    transitive,
-                    skip_masked,
-                    &report_type,
-                    &mut read,
-                    &mut found_reports,
-                    &mut asked,
-                    &mut queue,
-                    &mut expanded_edits,
-                    control,
-                )?;
-            }
-        }
-        drop(act_scan);
-        // 3. Reports that directly edited `<on>` via `gr:editOf`, only when `<on>` is
-        //    itself a visible, unmasked `gr:Report` in that proven reports graph and
-        //    its `gr:editOf` chain has not already been expanded.
-        let mut report_graphs = match state.seen.as_mut() {
-            Some(seen) => {
-                seen.graphs_with_subject_type(on.as_str(), RDF_TYPE, GR_REPORT, true, |g| {
-                    is_reports_graph(g) && allows_reports_read(g)
-                })?
-            }
-            None => state.reads.graphs_with_subject_type(
-                on.as_str(),
-                RDF_TYPE,
-                GR_REPORT,
-                false,
-                |g| is_reports_graph(g) && allows_reports_read(g),
-            )?,
-        };
-        report_graphs.items.sort();
-        for g in &report_graphs.items {
-            control.check()?;
-            let key = (Arc::clone(&on), Arc::clone(g));
-            if expanded_edits.contains(&key) {
-                continue;
-            }
-            result_held.grow_by((g.as_str().len() as u64).saturating_add(SET_ENTRY_BYTES))?;
-            expanded_edits.insert(key);
-            let remaining = MAX_EVIDENCE.saturating_sub(read);
-            let mut edit_scan = match state.seen.as_mut() {
-                Some(seen) => {
-                    seen.visible_subjects_up_to(GR_EDIT_OF, &o, g.as_str(), remaining, true)?
+            act_scan
+                .items
+                .sort_unstable_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
+            for (act, g) in &act_scan.items {
+                control.check()?;
+                if state.masked(act, g)? {
+                    continue;
                 }
-                None => state.reads.visible_subjects_up_to(
-                    GR_EDIT_OF,
-                    &o,
-                    g.as_str(),
-                    remaining,
-                    false,
-                )?,
+                let is_activity = match state.seen.as_mut() {
+                    Some(seen) => {
+                        seen.contains(act.as_str(), RDF_TYPE, &activity_type, g.as_str())?
+                    }
+                    None => {
+                        state
+                            .reads
+                            .contains(act.as_str(), RDF_TYPE, &activity_type, g.as_str())?
+                    }
+                };
+                if !is_activity {
+                    continue;
+                }
+                let remaining = MAX_EVIDENCE.saturating_sub(read);
+                let _act_term_held = preparation.reserve(act.as_str().len() as u64)?;
+                let act_term = Term::NamedNode(act.clone());
+                let mut rep_scan = match state.seen.as_mut() {
+                    Some(seen) => seen.visible_subjects_up_to(
+                        PROV_WAS_GENERATED_BY,
+                        &act_term,
+                        g.as_str(),
+                        remaining,
+                        true,
+                    )?,
+                    None => state.reads.visible_subjects_up_to(
+                        PROV_WAS_GENERATED_BY,
+                        &act_term,
+                        g.as_str(),
+                        remaining,
+                        false,
+                    )?,
+                };
+                read += rep_scan.items.len();
+                if rep_scan.more || read > MAX_EVIDENCE {
+                    return Err(super::incomplete("the dependents of the changed records"));
+                }
+                rep_scan.items.sort_unstable();
+                for rep in &rep_scan.items {
+                    record_report_and_edits(
+                        &mut state,
+                        &preparation,
+                        &mut result_held,
+                        rep,
+                        g,
+                        &on,
+                        depth,
+                        transitive,
+                        skip_masked,
+                        &report_type,
+                        &mut read,
+                        &mut found_reports,
+                        &mut asked,
+                        &mut queue,
+                        &mut expanded_edits,
+                        control,
+                    )?;
+                }
+            }
+            drop(act_scan);
+            // 3. Reports that directly edited `<on>` via `gr:editOf`, driven from incoming
+            //    edit edges so graphs without edit links are never scanned or retained.
+            //    Each candidate graph is admitted only when `<on>` is itself a visible,
+            //    unmasked `gr:Report` there and its `gr:editOf` chain has not already been
+            //    expanded.
+            let remaining = MAX_EVIDENCE.saturating_sub(read);
+            let mut edit_scan = {
+                let expanded_for_on = expanded_edits.get(&on);
+                let keep = |g: &str| {
+                    (admitted_reports.is_some() || is_reports_graph(g))
+                        && expanded_for_on.is_none_or(|set| !set.contains(g))
+                };
+                match state.seen.as_mut() {
+                    Some(seen) => seen.subjects_for_typed_object_in_graphs_up_to(
+                        GR_EDIT_OF,
+                        &o,
+                        RDF_TYPE,
+                        GR_REPORT,
+                        remaining,
+                        true,
+                        admitted_reports,
+                        keep,
+                    )?,
+                    None => state.reads.subjects_for_typed_object_in_graphs_up_to(
+                        GR_EDIT_OF,
+                        &o,
+                        RDF_TYPE,
+                        GR_REPORT,
+                        remaining,
+                        false,
+                        admitted_reports,
+                        keep,
+                    )?,
+                }
             };
             read += edit_scan.items.len();
             if edit_scan.more || read > MAX_EVIDENCE {
                 return Err(super::incomplete("the dependents of the changed records"));
             }
-            edit_scan.items.sort();
-            for edit in &edit_scan.items {
+            edit_scan
+                .items
+                .sort_unstable_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
+            for (edit, g) in &edit_scan.items {
                 control.check()?;
+                mark_expanded_edit(&mut expanded_edits, &mut result_held, &on, g)?;
                 record_report_and_edits(
                     &mut state,
                     &preparation,
@@ -562,8 +610,8 @@ fn dependents_in_with_budget(
                     control,
                 )?;
             }
+            drop(edit_scan);
         }
-        drop(report_graphs);
     }
     let final_vec_bytes = (found.len() as u64)
         .saturating_mul(std::mem::size_of::<Dependent>() as u64)
@@ -572,15 +620,53 @@ fn dependents_in_with_budget(
                 .saturating_mul(std::mem::size_of::<ReportDependent>() as u64),
         );
     result_held.grow_by(final_vec_bytes)?;
-    let mut dependents: Vec<Dependent> = found.into_values().collect();
-    dependents.sort_by(|a, b| (a.depth, &a.assessment).cmp(&(b.depth, &b.assessment)));
-    let mut reports: Vec<ReportDependent> = found_reports.into_values().collect();
-    reports.sort_by(|a, b| (a.depth, &a.report, &a.graph).cmp(&(b.depth, &b.report, &b.graph)));
+    let mut dependents = Vec::new();
+    dependents
+        .try_reserve_exact(found.len())
+        .map_err(|_| preparation.exhausted())?;
+    dependents.extend(found.into_values());
+    dependents.sort_unstable_by(|a, b| (a.depth, &a.assessment).cmp(&(b.depth, &b.assessment)));
+    let mut reports = Vec::new();
+    reports
+        .try_reserve_exact(found_reports.len())
+        .map_err(|_| preparation.exhausted())?;
+    reports.extend(found_reports.into_values());
+    reports.sort_unstable_by(|a, b| {
+        (a.depth, &a.report, &a.graph).cmp(&(b.depth, &b.report, &b.graph))
+    });
     Ok(Dependents {
         commit: head.commit(),
         dependents,
         reports,
     })
+}
+
+/// Record `(predecessor, graph)` as expanded for `gr:editOf` traversal, reserving
+/// its retained map/set and graph IRI bytes before insertion. Returns `true` when
+/// newly recorded and `false` when already expanded.
+fn mark_expanded_edit(
+    expanded_edits: &mut BTreeMap<Arc<NamedNode>, BTreeSet<SharedIri>>,
+    result_held: &mut Reservation,
+    predecessor: &Arc<NamedNode>,
+    graph: &Arc<NamedNode>,
+) -> Result<bool> {
+    if expanded_edits
+        .get(predecessor)
+        .is_some_and(|graphs| graphs.contains(graph.as_str()))
+    {
+        return Ok(false);
+    }
+    let extra = if expanded_edits.contains_key(predecessor) {
+        SET_ENTRY_BYTES
+    } else {
+        MAP_ENTRY_BYTES.saturating_add(SET_ENTRY_BYTES)
+    };
+    result_held.grow_by((graph.as_str().len() as u64).saturating_add(extra))?;
+    expanded_edits
+        .entry(Arc::clone(predecessor))
+        .or_default()
+        .insert(SharedIri(Arc::clone(graph)));
+    Ok(true)
 }
 
 /// Record `report` in `graph` when it is an unmasked `gr:Report`, and follow any
@@ -602,7 +688,7 @@ fn record_report_and_edits(
     found_reports: &mut BTreeMap<NamedNode, ReportDependent>,
     asked: &mut BTreeSet<Arc<NamedNode>>,
     queue: &mut VecDeque<(Arc<NamedNode>, u32)>,
-    expanded_edits: &mut BTreeSet<(Arc<NamedNode>, Arc<NamedNode>)>,
+    expanded_edits: &mut BTreeMap<Arc<NamedNode>, BTreeSet<SharedIri>>,
     control: &Control,
 ) -> Result<()> {
     if found_reports.contains_key(report) || state.masked(report, graph)? {
@@ -661,12 +747,9 @@ fn record_report_and_edits(
     let mut edit_queue = VecDeque::from([report_arc]);
     while let Some(prev) = edit_queue.pop_front() {
         control.check()?;
-        let key = (Arc::clone(&prev), Arc::clone(graph));
-        if expanded_edits.contains(&key) {
+        if !mark_expanded_edit(expanded_edits, result_held, &prev, graph)? {
             continue;
         }
-        result_held.grow_by((graph.as_str().len() as u64).saturating_add(SET_ENTRY_BYTES))?;
-        expanded_edits.insert(key);
         let remaining = MAX_EVIDENCE.saturating_sub(*read);
         let _prev_term_held = preparation.reserve(prev.as_str().len() as u64)?;
         let prev_term = Term::NamedNode((*prev).clone());
@@ -690,7 +773,7 @@ fn record_report_and_edits(
         if edit_scan.more || *read > MAX_EVIDENCE {
             return Err(super::incomplete("the dependents of the changed records"));
         }
-        edit_scan.items.sort();
+        edit_scan.items.sort_unstable();
         for edit in &edit_scan.items {
             if found_reports.contains_key(edit)
                 || state.masked(edit, graph)?
@@ -796,5 +879,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.reports.len(), 20);
+    }
+
+    /// Many admitted `rdf:type gr:Report` membership graphs without incoming `gr:editOf`
+    /// edges do not retain graph IRIs or exceed a tight memory budget.
+    #[test]
+    fn many_admitted_report_type_graphs_without_edits_stay_within_tight_budget() {
+        let ds = Dataset::memory();
+        let settings = Settings {
+            enabled: true,
+            ..Settings::default()
+        };
+        let target = "urn:report:many-graphs";
+        let pad = "g".repeat(2048);
+        let mut trig = String::new();
+        for i in 0..80 {
+            trig.push_str(&format!(
+                "GRAPH <urn:x-sparkles:graphrag:many-{i}-{pad}> {{ <{target}> <{RDF_TYPE}> <{GR_REPORT}> . }}\n"
+            ));
+        }
+        ds.update(&format!("INSERT DATA {{ {trig} }}")).unwrap();
+
+        let head = ds.store().snapshot();
+        let changed = [NamedNode::new(target).unwrap()];
+        let no_nonce = |_: &str| None;
+        // Retaining all 80 x 2 KiB graphs (~165 KiB) would exceed this 64 KiB budget.
+        let res = dependents_in_with_budget(
+            &settings,
+            &no_nonce,
+            DependentsHead::Snapshot(&head),
+            &changed,
+            false,
+            None,
+            &Control::none(),
+            64 << 10,
+        )
+        .unwrap();
+        assert!(res.dependents.is_empty());
+        assert!(res.reports.is_empty());
     }
 }

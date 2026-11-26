@@ -10,7 +10,15 @@ pub(crate) fn prepare(
     snap: &Arc<Snapshot>,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
-    prepare_input(Input::Legacy { original, snap }, preparation)
+    prepare_input(Input::Legacy { original, snap }, preparation, true)
+}
+
+pub(crate) fn prepare_read_only(
+    original: &GraphAccess,
+    snap: &Arc<Snapshot>,
+    preparation: &Preparation,
+) -> Result<PreparedView> {
+    prepare_input(Input::Legacy { original, snap }, preparation, false)
 }
 
 pub(crate) fn prepare_rebuild(
@@ -18,14 +26,14 @@ pub(crate) fn prepare_rebuild(
     snap: &Arc<Snapshot>,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
-    prepare_input(Input::Rebuild { original, snap }, preparation)
+    prepare_input(Input::Rebuild { original, snap }, preparation, true)
 }
 
 pub(crate) fn prepare_selected(
     selected: crate::store::bound_read_source::PreparedRead,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
-    prepare_input(Input::Selected(selected), preparation)
+    prepare_input(Input::Selected(selected), preparation, true)
 }
 
 pub(crate) fn prepare_evidence(
@@ -41,6 +49,24 @@ pub(crate) fn prepare_evidence(
             identity,
         },
         preparation,
+        true,
+    )
+}
+
+pub(crate) fn prepare_evidence_read_only(
+    evidence: crate::store::BoundEvidenceView,
+    policy: Arc<GraphAccess>,
+    preparation: &Preparation,
+) -> Result<PreparedView> {
+    let identity = Arc::downgrade(&policy);
+    prepare_input(
+        Input::Evidence {
+            evidence,
+            policy,
+            identity,
+        },
+        preparation,
+        false,
     )
 }
 
@@ -49,7 +75,7 @@ pub(crate) fn prepare_txn(
     original: &GraphAccess,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
-    prepare_input(Input::Transaction { txn, original }, preparation)
+    prepare_input(Input::Transaction { txn, original }, preparation, true)
 }
 
 enum Input<'a> {
@@ -135,7 +161,11 @@ fn finish(
     )
 }
 
-fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<PreparedView> {
+fn prepare_input(
+    input: Input<'_>,
+    preparation: &Preparation,
+    bind_write: bool,
+) -> Result<PreparedView> {
     // Strict Store-minted, BoundEvidenceView and WriteTxn preparations never publish
     // into any base snapshot deduplication table. Controlled raw-snapshot preparations
     // use only the dedicated non-owning controlled weak table, separate from legacy
@@ -174,12 +204,18 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
         }
         held.merge(preparation.reserve(bytes)?);
     }
-    let normalize = original.read.undecided() || original.write.undecided();
+    let normalize = original.read.undecided() || (bind_write && original.write.undecided());
     let bound = crate::access::BoundSnapshot::of(snap);
     let (read, read_held) = bind_graphs(&original.read, snap, preparation, normalize, bound)?;
     held.merge(read_held);
-    let (write, write_held) = bind_graphs(&original.write, snap, preparation, normalize, bound)?;
-    held.merge(write_held);
+    let write = if bind_write {
+        let (write, write_held) =
+            bind_graphs(&original.write, snap, preparation, normalize, bound)?;
+        held.merge(write_held);
+        write
+    } else {
+        Graphs::none()
+    };
     let access = Arc::new(GraphAccess {
         read,
         write,

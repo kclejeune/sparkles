@@ -530,3 +530,212 @@ fn admitted_scans_skip_non_iri_and_masked_subjects_and_retain_credit() {
     drop(long_reads);
     assert!(prep_keep.reserve(LIMIT - 4096).is_ok());
 }
+
+/// Scan vector growth in `visible_subjects_up_to` and `subjects_in_graphs_up_to`
+/// reserves the full replacement buffer while holding the old buffer's credit
+/// (peak = old_cap + new_cap), rather than admitting only the net delta.
+#[test]
+fn scan_buffer_growth_reserves_reallocation_peak() {
+    use crate::store::{Store, StoreOptions};
+
+    let s = Store::in_memory(StoreOptions::default());
+    let g1 = "urn:g:peak-1";
+    let g2 = "urn:g:peak-2";
+    let mut trig = format!("GRAPH <{g1}> {{\n");
+    for i in 0..129 {
+        trig.push_str(&format!("<urn:s:{i:04}> <urn:p> <urn:target> .\n"));
+    }
+    trig.push_str("}\n");
+    trig.push_str(&format!(
+        "GRAPH <{g2}> {{ <urn:s:9999> <urn:p> <urn:target> . }}\n"
+    ));
+    crate::sparql::update::update(
+        &s,
+        &format!("INSERT DATA {{ {trig} }}"),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let snap = s.snapshot();
+    let target = Term::NamedNode(NamedNode::new_unchecked("urn:target"));
+
+    // 1. Verify peak reservation at the 128 -> 256 reallocation of `Buffer<Id>` in
+    //    `visible_subjects_up_to`.
+    let prep = Preparation::new(crate::task::Control::none(), 4 << 20).unwrap();
+    let mut reads = Reads::new(&prep, &snap);
+    // Warm `Reads` cache so `base_used` isolates scan buffer reservations.
+    assert!(reads.iri_id("urn:p").unwrap().is_some());
+    assert!(reads.iri_id("urn:target").unwrap().is_some());
+    assert!(reads.iri_id(g1).unwrap().is_some());
+    let base_used = prep.inner_used();
+    let id_new_bytes = 256 * std::mem::size_of::<Id>();
+    let id_old_bytes = 128 * std::mem::size_of::<Id>();
+    let (count, low, _) =
+        crate::test_alloc::record_admitted_allocations(&prep, id_new_bytes, || {
+            let scan = reads
+                .visible_subjects_up_to("urn:p", &target, g1, 200, false)
+                .unwrap();
+            assert_eq!(scan.items.len(), 129);
+        });
+    assert!(count >= 1, "expected 256-slot Id buffer allocation");
+    assert!(
+        low >= base_used + (id_old_bytes + id_new_bytes) as u64,
+        "Id buffer growth reserved only {} above base, expected peak >= {}",
+        low.saturating_sub(base_used),
+        id_old_bytes + id_new_bytes
+    );
+
+    // 2. Verify peak reservation at the 128 -> 256 reallocation of `Buffer<(Id, Id)>` in
+    //    `subjects_in_graphs_up_to`.
+    let pair_new_bytes = 256 * std::mem::size_of::<(Id, Id)>();
+    let pair_old_bytes = 128 * std::mem::size_of::<(Id, Id)>();
+    let base_used = prep.inner_used();
+    let (count, low, _) =
+        crate::test_alloc::record_admitted_allocations(&prep, pair_new_bytes, || {
+            let scan = reads
+                .subjects_in_graphs_up_to("urn:p", &target, 200, false, |g| g == g1)
+                .unwrap();
+            assert_eq!(scan.items.len(), 129);
+        });
+    assert!(count >= 1, "expected 256-slot (Id, Id) buffer allocation");
+    assert!(
+        low >= base_used + (pair_old_bytes + pair_new_bytes) as u64,
+        "pair buffer growth reserved only {} above base, expected peak >= {}",
+        low.saturating_sub(base_used),
+        pair_old_bytes + pair_new_bytes
+    );
+
+    // 3. A tight allowance between net new capacity (4096 B) and old+new peak (6144 B)
+    //    must refuse with BudgetExceeded(Memory) at the 128 -> 256 growth step, before
+    //    reaching `g2` (whose callback would cancel the scan).
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control = crate::task::Control::with_cancel(cancel.clone());
+    const BUDGET: u64 = 64 << 10;
+    let tight = Preparation::new(control, BUDGET).unwrap();
+    let mut tight_reads = Reads::new(&tight, &snap);
+    assert!(tight_reads.iri_id("urn:p").unwrap().is_some());
+    assert!(tight_reads.iri_id("urn:target").unwrap().is_some());
+    // Leave 5,800 bytes: enough for accepted map (1,024 + 160) + g1 IRI (~120) + net
+    // 256-slot pair vec (4,096) = ~5,400, but below the old+new peak (~7,450).
+    let avail = tight.available_bytes();
+    let _fill = tight.reserve(avail - 5800).unwrap();
+    let err = match tight_reads.subjects_in_graphs_up_to("urn:p", &target, 200, false, |g| {
+        if g == g2 {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        g == g1
+    }) {
+        Ok(_) => panic!("expected memory budget refusal at pair buffer reallocation peak"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                ..
+            })
+        ),
+        "expected Memory BudgetExceeded before g2 cancellation, got {err:?}"
+    );
+}
+
+/// Pre-resolved `admitted` graph IDs skip unreadable oversized graph IRIs without
+/// reading or charging their vocabulary entries, and `subjects_for_typed_object_in_graphs_up_to`
+/// validates the predecessor's type and mask before counting edges against `limit`.
+#[test]
+fn admitted_graph_ids_skip_oversized_unreadable_graphs_and_check_object_type() {
+    use crate::access::{GraphAccess, GraphRule, Graphs, triples};
+    use crate::store::{Store, StoreOptions};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    let s = Store::in_memory(StoreOptions::default());
+    let g_ok = "urn:x-sparkles:graphrag:ok";
+    let g_untyped = "urn:x-sparkles:graphrag:untyped";
+    let g_masked = "urn:x-sparkles:graphrag:masked";
+    let g_huge_unreadable = format!("urn:x-sparkles:graphrag:secret-{}", "z".repeat(140 * 1024));
+    let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let report_cls = "urn:x-sparkles:graphrag#Report";
+    let edit_of = "urn:x-sparkles:graphrag#editOf";
+    let target_iri = "urn:report:base";
+    let target = Term::NamedNode(NamedNode::new_unchecked(target_iri));
+
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ \
+                GRAPH <{g_huge_unreadable}> {{ \
+                    <{target_iri}> <{rdf_type}> <{report_cls}> . \
+                    <urn:edit:hidden> <{edit_of}> <{target_iri}> . \
+                }} \
+                GRAPH <{g_untyped}> {{ \
+                    <urn:edit:untyped> <{edit_of}> <{target_iri}> . \
+                }} \
+                GRAPH <{g_masked}> {{ \
+                    <{target_iri}> <{rdf_type}> <{report_cls}> ; <urn:secret> \"x\" . \
+                    <urn:edit:masked> <{edit_of}> <{target_iri}> . \
+                }} \
+                GRAPH <{g_ok}> {{ \
+                    <{target_iri}> <{rdf_type}> <{report_cls}> . \
+                    <urn:edit:visible> <{edit_of}> <{target_iri}> . \
+                }} \
+            }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+
+    let snap = s.snapshot();
+    let mask_prep = Preparation::new(crate::task::Control::none(), 1 << 20).unwrap();
+    let mask_access = GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::none(),
+        triples::TripleRules {
+            rules: vec![triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "hide-secret".into(),
+                    predicates: Some(vec!["urn:secret".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: Some(Graphs::Only(GraphRule::new([g_masked], &[]))),
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: triples::Caller::default(),
+            limits: triples::Limits::default(),
+        },
+    );
+    let prepared = mask_access.masked_controlled(&snap, &mask_prep).unwrap();
+
+    // Even under a 64 KiB budget (smaller than the 140 KiB unreadable graph IRI itself),
+    // `admitted = Some(map)` rejects `g_huge_unreadable` by ID without touching vocab,
+    // and `object_type` skips `g_untyped` and `g_masked` before counting against `limit = 1`.
+    let tight = Preparation::new(crate::task::Control::none(), 64 << 10).unwrap();
+    let mut seen = Reads::from_prepared(&tight, &prepared);
+    let mut admitted = BTreeMap::new();
+    for g in [g_ok, g_untyped, g_masked] {
+        let id = seen.iri_id(g).unwrap().unwrap();
+        admitted.insert(id, Arc::new(NamedNode::new_unchecked(g)));
+    }
+    let scan = seen
+        .subjects_for_typed_object_in_graphs_up_to(
+            edit_of,
+            &target,
+            rdf_type,
+            report_cls,
+            1,
+            true,
+            Some(&admitted),
+            |_| true,
+        )
+        .unwrap();
+    assert!(!scan.more);
+    assert_eq!(scan.items.len(), 1);
+    assert_eq!(scan.items[0].0.as_str(), "urn:edit:visible");
+    assert_eq!(scan.items[0].1.as_str(), g_ok);
+}
