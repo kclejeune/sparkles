@@ -546,7 +546,7 @@ pub(in crate::mcp) fn owned_page(
     flags.values.resize(prefixes.by_ns.len(), 0);
     let n = page.rows.len();
     let mut count = 0;
-    let mut shortened = 0;
+    let mut shortened: usize = 0;
     let mut row_bytes = 0usize;
     let state = |count| {
         if count < n {
@@ -560,7 +560,9 @@ pub(in crate::mcp) fn owned_page(
     let mut truncated = state(0);
     for index in 0..n {
         budget.check()?;
-        shortened += observe(page, index, prefixes, &mut flags.values, budget)?;
+        shortened = shortened
+            .checked_add(observe(page, index, prefixes, &mut flags.values, budget)?)
+            .ok_or_else(|| Error::invalid("compact shortened count overflow"))?;
         let row = cells(page, index, prefixes, budget)?;
         let bytes = if json {
             json_size(&row.values, budget, &first)?
@@ -621,6 +623,8 @@ pub(in crate::mcp) fn owned_page(
             finish(budget, &first, result)?;
             counter.bytes
         };
+        // Fit against the exact final table byte length (unlike the legacy `render::table`
+        // oracle, which kept one spare byte for a trailing newline it popped afterwards).
         if metadata
             .checked_add(row_bytes)
             .is_none_or(|bytes| bytes > page.max_bytes)
@@ -630,7 +634,15 @@ pub(in crate::mcp) fn owned_page(
             flags.values.fill(0);
             shortened = 0;
             for accepted in 0..count {
-                shortened += observe(page, accepted, prefixes, &mut flags.values, budget)?;
+                shortened = shortened
+                    .checked_add(observe(
+                        page,
+                        accepted,
+                        prefixes,
+                        &mut flags.values,
+                        budget,
+                    )?)
+                    .ok_or_else(|| Error::invalid("compact shortened count overflow"))?;
             }
             break;
         }
@@ -936,5 +948,53 @@ mod tests {
                 .join()
                 .unwrap();
         });
+    }
+
+    #[test]
+    fn owned_table_fits_exact_max_bytes_and_truncates_one_byte_below() {
+        let store = Store::in_memory(StoreOptions::default());
+        let prefixes = Prefixes::new(&BTreeMap::from([("ex".into(), "http://ex.org/".into())]));
+        let result = sparql::query(
+            store.snapshot(),
+            "PREFIX ex:<http://ex.org/> SELECT ?s WHERE { VALUES ?s { ex:a } }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let budget = result.output_budget().native_budget().unwrap();
+        let make_page = |cap: usize| QueryPage {
+            dataset: "actual",
+            commit: 1,
+            query_type: "SELECT",
+            vars: Some(result.variables()),
+            rows: RowSource::Solutions(result.rows_range(0..result.len()).unwrap()),
+            more_beyond: false,
+            total: Some(result.len()),
+            total_is_lower_bound: false,
+            offset: 0,
+            max_rows: 100,
+            max_bytes: cap,
+            max_chars: 200,
+            elapsed_ms: 0.1,
+            reasoning: None,
+        };
+        let full = owned_page(&make_page(4096), &prefixes, false, &budget).unwrap();
+        let exact_len = full.as_str().len();
+        assert!(!full.as_str().contains("TRUNCATED"));
+
+        // Exact final byte length fits in `owned_page` (the legacy `render::table` oracle
+        // counted one spare byte for the trailing newline it later popped, so it truncated here).
+        let at_exact = owned_page(&make_page(exact_len), &prefixes, false, &budget).unwrap();
+        assert_eq!(at_exact.as_str(), full.as_str());
+        assert_eq!(at_exact.as_str().len(), exact_len);
+        let legacy_at_exact = super::super::table(&make_page(exact_len), &prefixes);
+        assert!(legacy_at_exact.contains("TRUNCATED: maxBytes="));
+
+        let one_below = owned_page(&make_page(exact_len - 1), &prefixes, false, &budget).unwrap();
+        assert!(
+            one_below.as_str().contains("TRUNCATED: maxBytes="),
+            "expected truncation at exact_len - 1 ({}), got:\n{}",
+            exact_len - 1,
+            one_below.as_str()
+        );
     }
 }

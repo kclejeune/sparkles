@@ -5,19 +5,19 @@
 //! query's memory credit (`Bytes::from_owner(FrameOwner)`), keeping credit live across:
 //!
 //! 1. in-flight SSE channel buffering and slow client writes (`CreditedSseBody`), and
-//! 2. `Last-Event-ID` session replay buffers when a client disconnects before receiving
-//!    its response frame.
+//! 2. `Last-Event-ID` session replay buffers for the bounded `completed_cache_ttl` window
+//!    (including disconnects after Hyper buffers a terminal frame mid-write).
 //!
-//! Once the terminal response frame is delivered to the client (or the replay cache TTL
-//! elapses, or the session closes via `DELETE` / idle timeout / server shutdown), the
-//! cached `Bytes` drops and its `QueryPool` credit returns to `0`.
+//! Terminal replay entries hold only their trimmed frame bytes (releasing `INITIAL_GRANT`
+//! slack immediately) and release to `0` on client-observable `Last-Event-ID`
+//! acknowledgment, `notifications/cancelled`, `completed_cache_ttl` expiry, `DELETE`,
+//! idle timeout, or `HttpConf.shutdown`.
 
 use super::retained::{Framing, ResponseSlot, StagedResponse};
 use axum::body::Bytes;
 use futures_util::Stream;
 use http_body::{Body, Frame};
 use parking_lot::Mutex;
-use rmcp::RoleServer;
 use rmcp::model::{
     CancelledNotificationParam, ClientJsonRpcMessage, ClientNotification, ClientRequest,
     JsonRpcNotification, JsonRpcRequest, Notification, ProgressNotificationParam, ProgressToken,
@@ -32,11 +32,12 @@ use rmcp::transport::streamable_http_server::session::{RestoreOutcome, SessionMa
 use rmcp::transport::worker::{
     Worker, WorkerConfig, WorkerContext, WorkerQuitReason, WorkerSendRequest,
 };
+use rmcp::{ErrorData as McpError, RoleServer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -92,13 +93,128 @@ impl CreditedSseEvent {
     }
 }
 
+struct SseQueueInner {
+    items: VecDeque<CreditedSseEvent>,
+    capacity: usize,
+    closed: bool,
+    waker: Option<Waker>,
+}
+
+/// Non-blocking bounded queue shared between [`CreditedSessionWorker`] and
+/// [`CreditedSseBody`].
+///
+/// Unlike `tokio::sync::mpsc`, this lets the session worker:
+/// 1. never await on a stalled SSE client (preventing head-of-line blocking of TTL
+///    eviction, cancellation, and `DELETE /$/mcp`), and
+/// 2. discard queued credited frames immediately on teardown (`DELETE`, cancellation,
+///    TTL expiry, or server shutdown) even if Hyper never polls `CreditedSseBody` again.
+#[derive(Clone)]
+pub(super) struct SharedSseQueue {
+    inner: Arc<Mutex<SseQueueInner>>,
+}
+
+impl SharedSseQueue {
+    fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Self {
+            inner: Arc::new(Mutex::new(SseQueueInner {
+                items: VecDeque::with_capacity(cap.min(16)),
+                capacity: cap,
+                closed: false,
+                waker: None,
+            })),
+        }
+    }
+
+    fn closed() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SseQueueInner {
+                items: VecDeque::new(),
+                capacity: 1,
+                closed: true,
+                waker: None,
+            })),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.lock().closed
+    }
+
+    /// Push `event` without blocking. If the client has fallen behind (`items.len() >= capacity`),
+    /// closes and discards the stalled live queue so the worker stays responsive and the client
+    /// can reconnect via `Last-Event-ID`.
+    fn try_push(&self, event: CreditedSseEvent) -> bool {
+        let (waker, dropped) = {
+            let mut q = self.inner.lock();
+            if q.closed {
+                drop(q);
+                drop(event);
+                return false;
+            }
+            if q.items.len() >= q.capacity {
+                q.closed = true;
+                let dropped = std::mem::take(&mut q.items);
+                let waker = q.waker.take();
+                (waker, Some((dropped, event)))
+            } else {
+                q.items.push_back(event);
+                let waker = q.waker.take();
+                (waker, None)
+            }
+        };
+        let ok = dropped.is_none();
+        drop(dropped);
+        if let Some(w) = waker {
+            w.wake();
+        }
+        ok
+    }
+
+    /// Signal clean EOF after any already-queued events are drained by the body.
+    fn close_eof(&self) {
+        let waker = {
+            let mut q = self.inner.lock();
+            q.closed = true;
+            q.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// Close immediately and drop every queued frame outside the lock so credited bytes
+    /// release even if the consumer never polls again.
+    fn close_and_discard(&self) {
+        let (dropped, waker) = {
+            let mut q = self.inner.lock();
+            q.closed = true;
+            (std::mem::take(&mut q.items), q.waker.take())
+        };
+        drop(dropped);
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    fn poll_pop(&self, cx: &mut Context<'_>) -> Poll<Option<CreditedSseEvent>> {
+        let mut q = self.inner.lock();
+        if let Some(event) = q.items.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+        if q.closed {
+            return Poll::Ready(None);
+        }
+        q.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
 /// Hand-off payload installed into [`HTTP_SSE_SLOT`] by [`CreditedSessionManager`] so
 /// `Endpoint::forward` replaces `rmcp`'s placeholder SSE body with a zero-copy
 /// [`CreditedSseBody`].
 pub(super) struct CreditedSseReceiver {
-    rx: mpsc::Receiver<CreditedSseEvent>,
-    /// Notifies the session worker when a request-wise SSE stream finishes or disconnects.
-    finish: Option<(mpsc::Sender<SessionEvent>, HttpRequestId)>,
+    queue: SharedSseQueue,
 }
 
 tokio::task_local! {
@@ -110,22 +226,16 @@ tokio::task_local! {
 /// An `http_body::Body` streaming credited SSE frames (`Bytes` backed by `FrameOwner`)
 /// with optional keep-alive comments and server shutdown cancellation.
 ///
-/// Tracks whether the terminal JSON-RPC response frame was actually yielded to hyper:
-/// - If yielded, notifies the session worker so the replay entry can release immediately
-///   once hyper finishes writing the body.
-/// - If dropped before yielding (client disconnect), leaves the replay cache entry alive
-///   for `completed_cache_ttl` so `GET /$/mcp` with `Last-Event-ID` can replay it.
+/// Dropping the body discards only its unread live queue; the session worker's replay
+/// cache retains completed terminal events for the bounded `completed_cache_ttl` window
+/// so disconnects after Hyper buffers a frame mid-write can still replay via
+/// `Last-Event-ID`.
 pub(super) struct CreditedSseBody {
-    rx: mpsc::Receiver<CreditedSseEvent>,
-    finish: Option<(mpsc::Sender<SessionEvent>, HttpRequestId)>,
-    delivered_terminal: bool,
+    queue: SharedSseQueue,
     keep_alive: Option<Duration>,
     ping_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     shutdown: CancellationToken,
     shutdown_fut: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
-    /// The last yielded frame's bytes are already owned by hyper once returned from
-    /// `poll_frame`. Any buffered event still inside `rx` stays charged until polled or
-    /// dropped here.
     done: bool,
 }
 
@@ -138,9 +248,7 @@ impl CreditedSseBody {
         let ping_sleep = keep_alive.map(|d| Box::pin(tokio::time::sleep(d)));
         let shutdown_fut = Box::pin(shutdown.clone().cancelled_owned());
         Self {
-            rx: receiver.rx,
-            finish: receiver.finish,
-            delivered_terminal: false,
+            queue: receiver.queue,
             keep_alive,
             ping_sleep,
             shutdown,
@@ -152,15 +260,7 @@ impl CreditedSseBody {
 
 impl Drop for CreditedSseBody {
     fn drop(&mut self) {
-        if let Some((event_tx, http_request_id)) = self.finish.take()
-            && self.delivered_terminal
-            && let Err(mpsc::error::TrySendError::Full(evt)) =
-                event_tx.try_send(SessionEvent::Delivered { http_request_id })
-        {
-            tokio::spawn(async move {
-                let _ = event_tx.send(evt).await;
-            });
-        }
+        self.queue.close_and_discard();
     }
 }
 
@@ -178,13 +278,11 @@ impl Body for CreditedSseBody {
         }
         if this.shutdown.is_cancelled() || this.shutdown_fut.as_mut().poll(cx).is_ready() {
             this.done = true;
+            this.queue.close_and_discard();
             return Poll::Ready(None);
         }
-        match this.rx.poll_recv(cx) {
+        match this.queue.poll_pop(cx) {
             Poll::Ready(Some(event)) => {
-                if event.terminal {
-                    this.delivered_terminal = true;
-                }
                 if let Some(d) = this.keep_alive
                     && let Some(sleep) = &mut this.ping_sleep
                 {
@@ -273,8 +371,12 @@ enum ResourceKey {
     ProgressToken(ProgressToken),
 }
 
+struct ReplayOutcome {
+    client_acked_terminal: bool,
+}
+
 struct CachedChannel {
-    tx: mpsc::Sender<CreditedSseEvent>,
+    tx: SharedSseQueue,
     cache: VecDeque<CreditedSseEvent>,
     http_request_id: Option<HttpRequestId>,
     capacity: usize,
@@ -282,11 +384,7 @@ struct CachedChannel {
 }
 
 impl CachedChannel {
-    fn new(
-        tx: mpsc::Sender<CreditedSseEvent>,
-        http_request_id: Option<HttpRequestId>,
-        capacity: usize,
-    ) -> Self {
+    fn new(tx: SharedSseQueue, http_request_id: Option<HttpRequestId>, capacity: usize) -> Self {
         Self {
             cache: VecDeque::with_capacity(capacity.min(16)),
             capacity: capacity.max(1),
@@ -310,66 +408,85 @@ impl CachedChannel {
         (index, id)
     }
 
-    async fn send_priming(&mut self, retry: Duration) {
+    fn send_priming(&mut self, retry: Duration) {
         let (index, event_id) = self.alloc_index();
         let event = CreditedSseEvent::priming(index, &event_id, retry);
-        self.cache_and_send(event).await;
+        self.cache_and_send(event);
     }
 
-    async fn send_event(&mut self, event: CreditedSseEvent) -> bool {
-        self.cache_and_send(event).await
+    fn send_event(&mut self, event: CreditedSseEvent) -> bool {
+        self.cache_and_send(event)
     }
 
-    async fn cache_and_send(&mut self, event: CreditedSseEvent) -> bool {
+    fn cache_and_send(&mut self, event: CreditedSseEvent) -> bool {
         if self.cache.len() >= self.capacity {
             self.cache.pop_front();
         }
         self.cache.push_back(event.clone());
-        self.tx.send(event).await.is_ok()
+        self.tx.try_push(event)
     }
 
-    /// Replay events strictly after `last_index` (matching SSE `Last-Event-ID` semantics).
-    async fn replay_after(&mut self, last_index: usize) -> Result<bool, CreditedSessionError> {
+    /// Replay events strictly after `last_index` (matching SSE `Last-Event-ID` semantics)
+    /// without blocking. Returns whether the client's `last_index` already acknowledged a
+    /// cached terminal event.
+    fn replay_after(&mut self, last_index: usize) -> Result<ReplayOutcome, CreditedSessionError> {
         let Some(front) = self.cache.front() else {
-            return Ok(false);
+            return Ok(ReplayOutcome {
+                client_acked_terminal: false,
+            });
         };
         if last_index.saturating_add(1) < front.index {
             return Err(CreditedSessionError::InvalidEventId);
         }
-        let mut replayed_terminal = false;
+        let client_acked_terminal = self
+            .cache
+            .iter()
+            .any(|e| e.terminal && e.index <= last_index);
         for event in self.cache.iter().filter(|e| e.index > last_index) {
-            if event.terminal {
-                replayed_terminal = true;
-            }
-            if self.tx.send(event.clone()).await.is_err() {
+            if !self.tx.try_push(event.clone()) {
                 return Err(CreditedSessionError::ChannelClosed(self.http_request_id));
             }
         }
-        Ok(replayed_terminal)
+        Ok(ReplayOutcome {
+            client_acked_terminal,
+        })
+    }
+
+    /// Replay every event currently held in the ring buffer (used when a fresh standalone
+    /// `GET /$/mcp` without `Last-Event-ID` replaces the dead initial primary).
+    fn replay_all(&mut self) -> Result<(), CreditedSessionError> {
+        for event in &self.cache {
+            if !self.tx.try_push(event.clone()) {
+                return Err(CreditedSessionError::ChannelClosed(self.http_request_id));
+            }
+        }
+        Ok(())
     }
 }
 
 struct RequestChannel {
+    mcp_request_id: Option<RequestId>,
     resources: HashSet<ResourceKey>,
     channel: CachedChannel,
     completed_at: Option<Instant>,
 }
 
-type RequestWiseChannelResult =
-    Result<(HttpRequestId, mpsc::Receiver<CreditedSseEvent>), CreditedSessionError>;
-type ResumeChannelResult =
-    Result<(Option<HttpRequestId>, mpsc::Receiver<CreditedSseEvent>), CreditedSessionError>;
+type RequestWiseChannelResult = Result<(HttpRequestId, SharedSseQueue), CreditedSessionError>;
+type ResumeChannelResult = Result<(Option<HttpRequestId>, SharedSseQueue), CreditedSessionError>;
 
 enum SessionEvent {
+    /// Atomically establish a request-wise channel and forward the initiating client
+    /// message so cancelling `create_stream` mid-flight cannot orphan a `RequestChannel`.
+    CreateRequestStream {
+        message: ClientJsonRpcMessage,
+        responder: oneshot::Sender<RequestWiseChannelResult>,
+    },
     ClientMessage {
         message: ClientJsonRpcMessage,
         http_request_id: Option<HttpRequestId>,
     },
-    EstablishRequestWiseChannel {
-        responder: oneshot::Sender<RequestWiseChannelResult>,
-    },
     EstablishCommonChannel {
-        responder: oneshot::Sender<Result<mpsc::Receiver<CreditedSseEvent>, CreditedSessionError>>,
+        responder: oneshot::Sender<Result<SharedSseQueue, CreditedSessionError>>,
     },
     Resume {
         last_event_id: EventId,
@@ -379,23 +496,21 @@ enum SessionEvent {
         request: ClientJsonRpcMessage,
         responder: oneshot::Sender<Result<ServerJsonRpcMessage, CreditedSessionError>>,
     },
-    Delivered {
-        http_request_id: HttpRequestId,
-    },
     Close,
 }
 
 #[derive(Clone)]
 pub(super) struct CreditedSessionHandle {
     event_tx: mpsc::Sender<SessionEvent>,
+    /// Independent teardown token (child of `HttpConf.shutdown`), cancelled immediately by
+    /// `DELETE /$/mcp` regardless of `event_tx` backpressure.
+    session_ct: CancellationToken,
 }
 
 impl CreditedSessionHandle {
-    async fn close(&self) -> Result<(), CreditedSessionError> {
-        self.event_tx
-            .send(SessionEvent::Close)
-            .await
-            .map_err(|_| CreditedSessionError::SessionServiceTerminated)
+    fn close(&self) {
+        self.session_ct.cancel();
+        let _ = self.event_tx.try_send(SessionEvent::Close);
     }
 
     async fn push_message(
@@ -412,21 +527,23 @@ impl CreditedSessionHandle {
             .map_err(|_| CreditedSessionError::SessionServiceTerminated)
     }
 
-    async fn establish_request_wise_channel(
+    async fn create_request_stream(
         &self,
-    ) -> Result<(HttpRequestId, mpsc::Receiver<CreditedSseEvent>), CreditedSessionError> {
+        message: ClientJsonRpcMessage,
+    ) -> Result<(HttpRequestId, SharedSseQueue), CreditedSessionError> {
         let (tx, rx) = oneshot::channel();
         self.event_tx
-            .send(SessionEvent::EstablishRequestWiseChannel { responder: tx })
+            .send(SessionEvent::CreateRequestStream {
+                message,
+                responder: tx,
+            })
             .await
             .map_err(|_| CreditedSessionError::SessionServiceTerminated)?;
         rx.await
             .map_err(|_| CreditedSessionError::SessionServiceTerminated)?
     }
 
-    async fn establish_common_channel(
-        &self,
-    ) -> Result<mpsc::Receiver<CreditedSseEvent>, CreditedSessionError> {
+    async fn establish_common_channel(&self) -> Result<SharedSseQueue, CreditedSessionError> {
         let (tx, rx) = oneshot::channel();
         self.event_tx
             .send(SessionEvent::EstablishCommonChannel { responder: tx })
@@ -439,8 +556,7 @@ impl CreditedSessionHandle {
     async fn resume(
         &self,
         last_event_id: EventId,
-    ) -> Result<(Option<HttpRequestId>, mpsc::Receiver<CreditedSseEvent>), CreditedSessionError>
-    {
+    ) -> Result<(Option<HttpRequestId>, SharedSseQueue), CreditedSessionError> {
         let (tx, rx) = oneshot::channel();
         self.event_tx
             .send(SessionEvent::Resume {
@@ -517,16 +633,34 @@ impl From<tokio::task::JoinError> for CreditedWorkerError {
     }
 }
 
+fn close_message_slot(message: &ClientJsonRpcMessage) {
+    use rmcp::model::GetExtensions;
+    if let ClientJsonRpcMessage::Request(req) = message
+        && let Some(slot) = req
+            .request
+            .extensions()
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<ResponseSlot>())
+    {
+        slot.close();
+    }
+}
+
 pub(super) struct CreditedSessionWorker {
     id: SessionId,
     next_http_request_id: HttpRequestId,
     tx_router: HashMap<HttpRequestId, RequestChannel>,
     resource_router: HashMap<ResourceKey, HttpRequestId>,
+    /// Tracks completed request channels by MCP `RequestId` for their replay lifetime so
+    /// a `notifications/cancelled` arriving after the terminal frame is cached still
+    /// evicts the replay entry and discards queued body frames.
+    replay_by_request_id: HashMap<RequestId, HttpRequestId>,
     /// Per-request staged response slots extracted from inbound HTTP `Parts`.
     pending_slots: HashMap<RequestId, ResponseSlot>,
     common: CachedChannel,
-    shadow_txs: Vec<mpsc::Sender<CreditedSseEvent>>,
+    shadow_queues: Vec<SharedSseQueue>,
     event_rx: mpsc::Receiver<SessionEvent>,
+    session_ct: CancellationToken,
     config: SessionConfig,
     max_timeout_secs: f64,
 }
@@ -535,6 +669,13 @@ impl Drop for CreditedSessionWorker {
     fn drop(&mut self) {
         for (_, slot) in self.pending_slots.drain() {
             slot.close();
+        }
+        self.common.tx.close_and_discard();
+        for (_, rw) in self.tx_router.drain() {
+            rw.channel.tx.close_and_discard();
+        }
+        for q in self.shadow_queues.drain(..) {
+            q.close_and_discard();
         }
     }
 }
@@ -555,8 +696,41 @@ impl CreditedSessionWorker {
 
     fn evict_expired_channels(&mut self) {
         let ttl = self.config.completed_cache_ttl;
-        self.tx_router
-            .retain(|_, rw| rw.completed_at.is_none_or(|at| at.elapsed() < ttl));
+        let expired: Vec<HttpRequestId> = self
+            .tx_router
+            .iter()
+            .filter_map(|(&id, rw)| {
+                rw.completed_at
+                    .is_some_and(|at| at.elapsed() >= ttl)
+                    .then_some(id)
+            })
+            .collect();
+        for id in expired {
+            self.remove_request_channel(id);
+        }
+    }
+
+    fn remove_request_channel(&mut self, http_request_id: HttpRequestId) {
+        if let Some(channel) = self.tx_router.remove(&http_request_id) {
+            channel.channel.tx.close_and_discard();
+            for r in &channel.resources {
+                if self.resource_router.get(r) == Some(&http_request_id) {
+                    self.resource_router.remove(r);
+                }
+            }
+            if let Some(mcp_id) = &channel.mcp_request_id
+                && self.replay_by_request_id.get(mcp_id) == Some(&http_request_id)
+            {
+                self.replay_by_request_id.remove(mcp_id);
+            }
+        }
+    }
+
+    fn is_in_flight(&self, id: &RequestId) -> bool {
+        self.pending_slots.contains_key(id)
+            || self
+                .resource_router
+                .contains_key(&ResourceKey::McpRequestId(id.clone()))
     }
 
     fn register_request(
@@ -570,13 +744,13 @@ impl CreditedSessionWorker {
             .extensions()
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<ResponseSlot>().cloned())
-            && let Some(old) = self.pending_slots.insert(request.id.clone(), slot)
         {
-            old.close();
+            self.pending_slots.insert(request.id.clone(), slot);
         }
         if let Some(http_request_id) = http_request_id
             && let Some(channel) = self.tx_router.get_mut(&http_request_id)
         {
+            channel.mcp_request_id = Some(request.id.clone());
             let key = ResourceKey::McpRequestId(request.id.clone());
             channel.resources.insert(key.clone());
             self.resource_router.insert(key, http_request_id);
@@ -596,40 +770,56 @@ impl CreditedSessionWorker {
                 slot.close();
             }
             let key = ResourceKey::McpRequestId(request_id.clone());
-            if let Some(http_request_id) = self.resource_router.remove(&key)
-                && let Some(channel) = self.tx_router.get_mut(&http_request_id)
-            {
-                let resources: Vec<_> = channel.resources.drain().collect();
-                for r in resources {
-                    self.resource_router.remove(&r);
-                }
-                channel.completed_at = Some(Instant::now());
-                let (closed_tx, _) = mpsc::channel(1);
-                channel.channel.tx = closed_tx;
+            if let Some(http_request_id) = self.resource_router.remove(&key) {
+                self.remove_request_channel(http_request_id);
+            }
+            if let Some(http_request_id) = self.replay_by_request_id.remove(request_id) {
+                self.remove_request_channel(http_request_id);
             }
         }
     }
 
-    async fn establish_request_wise_channel(
-        &mut self,
-    ) -> Result<(HttpRequestId, mpsc::Receiver<CreditedSseEvent>), CreditedSessionError> {
+    fn alloc_request_wise_channel(&mut self) -> (HttpRequestId, SharedSseQueue) {
         let http_request_id = self.next_http_request_id;
         self.next_http_request_id = self.next_http_request_id.wrapping_add(1);
-        let (tx, rx) = mpsc::channel(self.config.channel_capacity);
-        let mut channel =
-            CachedChannel::new(tx, Some(http_request_id), self.config.channel_capacity);
+        let queue = SharedSseQueue::new(self.config.channel_capacity);
+        let mut channel = CachedChannel::new(
+            queue.clone(),
+            Some(http_request_id),
+            self.config.channel_capacity,
+        );
         if let Some(retry) = self.config.sse_retry {
-            channel.send_priming(retry).await;
+            channel.send_priming(retry);
         }
         self.tx_router.insert(
             http_request_id,
             RequestChannel {
+                mcp_request_id: None,
                 resources: HashSet::new(),
                 channel,
                 completed_at: None,
             },
         );
-        Ok((http_request_id, rx))
+        (http_request_id, queue)
+    }
+
+    fn reject_duplicate_request_stream(
+        &mut self,
+        req_id: RequestId,
+    ) -> (HttpRequestId, SharedSseQueue) {
+        let (http_request_id, queue) = self.alloc_request_wise_channel();
+        if let Some(channel) = self.tx_router.get_mut(&http_request_id) {
+            let (index, event_id) = channel.channel.alloc_index();
+            let err_msg = ServerJsonRpcMessage::error(
+                McpError::invalid_request("duplicate in-flight request id", None),
+                Some(req_id),
+            );
+            let event = CreditedSseEvent::from_uncredited_message(index, &event_id, &err_msg, true);
+            channel.channel.send_event(event);
+            channel.completed_at = Some(Instant::now());
+            channel.channel.tx.close_eof();
+        }
+        (http_request_id, queue)
     }
 
     fn resolve_outbound_channel(&self, message: &ServerJsonRpcMessage) -> OutboundChannel {
@@ -706,7 +896,7 @@ impl CreditedSessionWorker {
         self.pending_slots.remove(id).and_then(|slot| slot.take())
     }
 
-    async fn handle_server_message(
+    fn handle_server_message(
         &mut self,
         message: ServerJsonRpcMessage,
     ) -> Result<(), CreditedSessionError> {
@@ -737,113 +927,132 @@ impl CreditedSessionWorker {
                         CreditedSseEvent::from_uncredited_message(index, &event_id, &message, close)
                     }
                 };
-                let _delivered_to_channel = request_wise.channel.send_event(event).await;
+                let _ = request_wise.channel.send_event(event);
                 if close {
                     let resources: Vec<_> = request_wise.resources.drain().collect();
-                    for r in resources {
-                        self.resource_router.remove(&r);
-                    }
+                    let mcp_id = request_wise.mcp_request_id.clone();
                     request_wise.completed_at = Some(Instant::now());
-                    // Close the sender so the client's SSE stream ends after reading
-                    // the terminal event, while keeping the replay cache until
-                    // delivery confirmation (`SessionEvent::Delivered`) or
-                    // `completed_cache_ttl` expiry.
-                    let (closed_tx, _) = mpsc::channel(1);
-                    request_wise.channel.tx = closed_tx;
+                    // Signal clean EOF on the live stream after the terminal event while
+                    // keeping the replay cache for `completed_cache_ttl` (or until client
+                    // acknowledgment, cancellation, DELETE, or shutdown).
+                    request_wise.channel.tx.close_eof();
+                    for r in resources {
+                        if self.resource_router.get(&r) == Some(&id) {
+                            self.resource_router.remove(&r);
+                        }
+                    }
+                    if let Some(mcp_id) = mcp_id {
+                        self.replay_by_request_id.insert(mcp_id, id);
+                    }
                 }
             }
             OutboundChannel::Common => {
+                // Never pin an unowned credited StagedResponse inside `common.cache`
+                // without a request-wise replay TTL.
+                if let Some(staged) = staged {
+                    tracing::warn!(
+                        id = %staged.id(),
+                        "dropping orphaned staged response routed to common SSE stream"
+                    );
+                    drop(staged);
+                    return Ok(());
+                }
                 let (index, event_id) = self.common.alloc_index();
-                let event = match staged {
-                    Some(staged) => {
-                        let bytes = staged.into_frame_or_error(
-                            Framing::Sse {
-                                event_id: Some(&event_id),
-                                retry: None,
-                            },
-                            self.max_timeout_secs,
-                        );
-                        CreditedSseEvent {
-                            index,
-                            bytes,
-                            terminal: false,
-                        }
-                    }
-                    None => {
-                        CreditedSseEvent::from_uncredited_message(index, &event_id, &message, false)
-                    }
-                };
-                let _ = self.common.send_event(event).await;
+                let event =
+                    CreditedSseEvent::from_uncredited_message(index, &event_id, &message, false);
+                let _ = self.common.send_event(event);
             }
         }
         Ok(())
     }
 
-    async fn resume(
+    fn resume(
         &mut self,
         last_event_id: EventId,
-    ) -> Result<(Option<HttpRequestId>, mpsc::Receiver<CreditedSseEvent>), CreditedSessionError>
-    {
-        self.shadow_txs.retain(|tx| !tx.is_closed());
+    ) -> Result<(Option<HttpRequestId>, SharedSseQueue), CreditedSessionError> {
+        self.shadow_queues.retain(|q| !q.is_closed());
         let (index, req_id) = parse_event_id_parts(&last_event_id);
         match req_id {
             Some(http_request_id) => {
-                let request_wise = self
-                    .tx_router
-                    .get_mut(&http_request_id)
-                    .ok_or(CreditedSessionError::ChannelClosed(Some(http_request_id)))?;
-                let is_completed = request_wise.completed_at.is_some();
-                let (tx, rx) = mpsc::channel(self.config.channel_capacity);
-                request_wise.channel.tx = tx;
-                request_wise.channel.replay_after(index).await?;
-                if is_completed {
-                    let (closed_tx, _) = mpsc::channel(1);
-                    request_wise.channel.tx = closed_tx;
+                let (queue, acked_terminal) = {
+                    let request_wise = self
+                        .tx_router
+                        .get_mut(&http_request_id)
+                        .ok_or(CreditedSessionError::ChannelClosed(Some(http_request_id)))?;
+                    let is_completed = request_wise.completed_at.is_some();
+                    let cap = self
+                        .config
+                        .channel_capacity
+                        .max(request_wise.channel.cache.len() + 2);
+                    let queue = SharedSseQueue::new(cap);
+                    request_wise.channel.tx.close_and_discard();
+                    request_wise.channel.tx = queue.clone();
+                    let outcome = request_wise.channel.replay_after(index)?;
+                    if is_completed {
+                        request_wise.channel.tx.close_eof();
+                    }
+                    (queue, is_completed && outcome.client_acked_terminal)
+                };
+                if acked_terminal {
+                    // Client explicitly sent a `Last-Event-ID` at or past the terminal
+                    // event, proving delivery; evict the replay entry now.
+                    self.remove_request_channel(http_request_id);
                 }
-                Ok((Some(http_request_id), rx))
+                Ok((Some(http_request_id), queue))
             }
             None => {
-                let rx = self.resume_or_shadow_common(Some(index)).await?;
-                Ok((None, rx))
+                let queue = self.resume_or_shadow_common(Some(index))?;
+                Ok((None, queue))
             }
         }
     }
 
-    async fn establish_common_channel(
-        &mut self,
-    ) -> Result<mpsc::Receiver<CreditedSseEvent>, CreditedSessionError> {
-        self.resume_or_shadow_common(None).await
+    fn establish_common_channel(&mut self) -> Result<SharedSseQueue, CreditedSessionError> {
+        self.resume_or_shadow_common(None)
     }
 
-    async fn resume_or_shadow_common(
+    fn resume_or_shadow_common(
         &mut self,
         last_event_index: Option<usize>,
-    ) -> Result<mpsc::Receiver<CreditedSseEvent>, CreditedSessionError> {
+    ) -> Result<SharedSseQueue, CreditedSessionError> {
+        self.shadow_queues.retain(|q| !q.is_closed());
         let replacing = self.common.tx.is_closed();
         let cap = if replacing {
-            self.config.channel_capacity.max(2)
+            self.config
+                .channel_capacity
+                .max(self.common.cache.len() + 2)
         } else {
             2
         };
-        let (tx, rx) = mpsc::channel(cap);
+        let queue = SharedSseQueue::new(cap);
         if last_event_index.is_none()
             && let Some(retry) = self.config.sse_retry
         {
-            let _ = tx.send(CreditedSseEvent::priming(0, "0", retry)).await;
+            let _ = queue.try_push(CreditedSseEvent::priming(0, "0", retry));
         }
         if replacing {
-            self.common.tx = tx;
-            if let Some(idx) = last_event_index {
-                self.common.replay_after(idx).await?;
+            self.common.tx = queue.clone();
+            match last_event_index {
+                Some(idx) => {
+                    let _ = self.common.replay_after(idx)?;
+                }
+                None => {
+                    // Fresh standalone `GET /$/mcp` without `Last-Event-ID`: replay any
+                    // queued common notifications (index >= 1), matching stock
+                    // `LocalSessionWorker` backlog semantics without failing if older
+                    // notifications already rolled off the ring buffer.
+                    self.common.replay_all()?;
+                }
             }
         } else {
             const MAX_SHADOW_STREAMS: usize = 32;
-            if self.shadow_txs.len() >= MAX_SHADOW_STREAMS {
-                self.shadow_txs.remove(0);
+            if self.shadow_queues.len() >= MAX_SHADOW_STREAMS {
+                let evicted = self.shadow_queues.remove(0);
+                evicted.close_and_discard();
             }
-            self.shadow_txs.push(tx);
+            self.shadow_queues.push(queue.clone());
         }
-        Ok(rx)
+        Ok(queue)
     }
 }
 
@@ -882,17 +1091,23 @@ impl Worker for CreditedSessionWorker {
             FromHttpService(SessionEvent),
             FromHandler(WorkerSendRequest<CreditedSessionWorker>),
         }
+        let ct = context.cancellation_token.clone();
+        let session_ct = self.session_ct.clone();
         let init_timeout = self.config.init_timeout.unwrap_or(Duration::MAX);
         let evt = tokio::select! {
+            biased;
+            _ = session_ct.cancelled() => {
+                return Err(WorkerQuitReason::TransportClosed);
+            }
+            _ = ct.cancelled() => {
+                return Err(WorkerQuitReason::Cancelled);
+            }
             evt = self.event_rx.recv() => evt.ok_or_else(|| {
                 WorkerQuitReason::fatal(
                     CreditedWorkerError::TransportTerminated,
                     "get initialize request",
                 )
             })?,
-            _ = context.cancellation_token.cancelled() => {
-                return Err(WorkerQuitReason::Cancelled);
-            }
             _ = tokio::time::sleep(init_timeout) => {
                 return Err(WorkerQuitReason::fatal(
                     CreditedWorkerError::InitTimeout(init_timeout),
@@ -906,8 +1121,18 @@ impl Worker for CreditedSessionWorker {
                 "get initialize request",
             ));
         };
-        context.send_to_handler(request).await?;
-        let init_resp = context.recv_from_handler().await?;
+        tokio::select! {
+            biased;
+            _ = session_ct.cancelled() => return Err(WorkerQuitReason::TransportClosed),
+            _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
+            res = context.send_to_handler(request) => res?,
+        }
+        let init_resp = tokio::select! {
+            biased;
+            _ = session_ct.cancelled() => return Err(WorkerQuitReason::TransportClosed),
+            _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
+            res = context.recv_from_handler() => res?,
+        };
         responder.send(Ok(init_resp.message)).map_err(|_| {
             WorkerQuitReason::fatal(
                 CreditedWorkerError::InitializeFailed,
@@ -919,7 +1144,6 @@ impl Worker for CreditedSessionWorker {
             .send(Ok(()))
             .map_err(|_| WorkerQuitReason::HandlerTerminated)?;
 
-        let ct = context.cancellation_token.clone();
         let keep_alive = self.config.keep_alive.unwrap_or(Duration::MAX);
         let mut last_activity = Instant::now();
         loop {
@@ -930,6 +1154,9 @@ impl Worker for CreditedSessionWorker {
                 .next_eviction_deadline()
                 .map(|deadline| deadline.saturating_duration_since(now));
             let event = tokio::select! {
+                biased;
+                _ = session_ct.cancelled() => return Err(WorkerQuitReason::TransportClosed),
+                _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
                 evt = self.event_rx.recv() => match evt {
                     Some(e) => {
                         last_activity = Instant::now();
@@ -956,7 +1183,6 @@ impl Worker for CreditedSessionWorker {
                     self.evict_expired_channels();
                     continue;
                 }
-                _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
                 _ = tokio::time::sleep(idle_wait) => {
                     return Err(WorkerQuitReason::IdleTimeout(keep_alive));
                 }
@@ -967,14 +1193,62 @@ impl Worker for CreditedSessionWorker {
                 }) => {
                     let res = self
                         .handle_server_message(message)
-                        .await
                         .map_err(CreditedWorkerError::Session);
                     let _ = responder.send(res);
+                }
+                InnerEvent::FromHttpService(SessionEvent::CreateRequestStream {
+                    message,
+                    responder,
+                }) => {
+                    if responder.is_closed() {
+                        close_message_slot(&message);
+                        continue;
+                    }
+                    if let ClientJsonRpcMessage::Request(req) = &message
+                        && self.is_in_flight(&req.id)
+                    {
+                        let dup_id = req.id.clone();
+                        close_message_slot(&message);
+                        let res = self.reject_duplicate_request_stream(dup_id);
+                        let _ = responder.send(Ok(res));
+                        continue;
+                    }
+                    let (http_request_id, queue) = self.alloc_request_wise_channel();
+                    match &message {
+                        ClientJsonRpcMessage::Request(req) => {
+                            self.register_request(req, Some(http_request_id));
+                        }
+                        ClientJsonRpcMessage::Notification(n) => {
+                            self.catch_cancellation(n);
+                        }
+                        _ => {}
+                    }
+                    if responder.send(Ok((http_request_id, queue))).is_err() {
+                        // Caller cancelled before receiving the stream handle.
+                        close_message_slot(&message);
+                        if let ClientJsonRpcMessage::Request(req) = &message {
+                            self.pending_slots.remove(&req.id);
+                        }
+                        self.remove_request_channel(http_request_id);
+                        continue;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = session_ct.cancelled() => return Err(WorkerQuitReason::TransportClosed),
+                        _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
+                        res = context.send_to_handler(message) => res?,
+                    }
                 }
                 InnerEvent::FromHttpService(SessionEvent::ClientMessage {
                     message,
                     http_request_id,
                 }) => {
+                    if let ClientJsonRpcMessage::Request(req) = &message
+                        && self.is_in_flight(&req.id)
+                    {
+                        close_message_slot(&message);
+                        continue;
+                    }
                     match &message {
                         ClientJsonRpcMessage::Request(req) => {
                             self.register_request(req, http_request_id);
@@ -984,30 +1258,23 @@ impl Worker for CreditedSessionWorker {
                         }
                         _ => {}
                     }
-                    context.send_to_handler(message).await?;
-                }
-                InnerEvent::FromHttpService(SessionEvent::EstablishRequestWiseChannel {
-                    responder,
-                }) => {
-                    let res = self.establish_request_wise_channel().await;
-                    let _ = responder.send(res);
+                    tokio::select! {
+                        biased;
+                        _ = session_ct.cancelled() => return Err(WorkerQuitReason::TransportClosed),
+                        _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
+                        res = context.send_to_handler(message) => res?,
+                    }
                 }
                 InnerEvent::FromHttpService(SessionEvent::EstablishCommonChannel { responder }) => {
-                    let res = self.establish_common_channel().await;
+                    let res = self.establish_common_channel();
                     let _ = responder.send(res);
                 }
                 InnerEvent::FromHttpService(SessionEvent::Resume {
                     last_event_id,
                     responder,
                 }) => {
-                    let res = self.resume(last_event_id).await;
+                    let res = self.resume(last_event_id);
                     let _ = responder.send(res);
-                }
-                InnerEvent::FromHttpService(SessionEvent::Delivered { http_request_id }) => {
-                    // The client received the terminal response frame on this request's
-                    // SSE stream; evict its replay cache immediately so QueryPool credit
-                    // returns to 0 promptly.
-                    self.tx_router.remove(&http_request_id);
                 }
                 InnerEvent::FromHttpService(SessionEvent::Close) => {
                     return Err(WorkerQuitReason::TransportClosed);
@@ -1024,14 +1291,20 @@ pub(super) struct CreditedSessionManager {
     pub(super) sessions: tokio::sync::RwLock<HashMap<SessionId, CreditedSessionHandle>>,
     pub(super) session_config: SessionConfig,
     max_timeout_secs: f64,
+    shutdown: CancellationToken,
 }
 
 impl CreditedSessionManager {
-    pub(super) fn new(session_config: SessionConfig, max_timeout_secs: f64) -> Self {
+    pub(super) fn new(
+        session_config: SessionConfig,
+        max_timeout_secs: f64,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             sessions: tokio::sync::RwLock::new(HashMap::new()),
             session_config,
             max_timeout_secs,
+            shutdown,
         }
     }
 
@@ -1046,22 +1319,27 @@ fn create_credited_session(
     id: SessionId,
     config: SessionConfig,
     max_timeout_secs: f64,
+    session_ct: CancellationToken,
 ) -> (CreditedSessionHandle, CreditedSessionWorker) {
     let (event_tx, event_rx) = mpsc::channel(config.channel_capacity);
-    let (common_tx, _) = mpsc::channel(config.channel_capacity);
-    let mut common = CachedChannel::new(common_tx, None, config.channel_capacity);
+    let mut common = CachedChannel::new(SharedSseQueue::closed(), None, config.channel_capacity);
     // Standalone stream priming uses event ID "0"; real notifications start at "1".
     common.next_index = 1;
-    let handle = CreditedSessionHandle { event_tx };
+    let handle = CreditedSessionHandle {
+        event_tx,
+        session_ct: session_ct.clone(),
+    };
     let worker = CreditedSessionWorker {
         id,
         next_http_request_id: 0,
         tx_router: HashMap::new(),
         resource_router: HashMap::new(),
+        replay_by_request_id: HashMap::new(),
         pending_slots: HashMap::new(),
         common,
-        shadow_txs: Vec::new(),
+        shadow_queues: Vec::new(),
         event_rx,
+        session_ct,
         config,
         max_timeout_secs,
     };
@@ -1074,13 +1352,15 @@ impl SessionManager for CreditedSessionManager {
 
     async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
         let id = session_id();
+        let session_ct = self.shutdown.child_token();
         let (handle, worker) = create_credited_session(
             id.clone(),
             self.session_config.clone(),
             self.max_timeout_secs,
+            session_ct.clone(),
         );
         self.sessions.write().await.insert(id.clone(), handle);
-        Ok((id, WorkerTransport::spawn(worker)))
+        Ok((id, WorkerTransport::spawn_with_ct(worker, session_ct)))
     }
 
     async fn initialize_session(
@@ -1107,10 +1387,7 @@ impl SessionManager for CreditedSessionManager {
     async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
         let handle = self.sessions.write().await.remove(id);
         if let Some(handle) = handle {
-            match handle.close().await {
-                Ok(()) | Err(CreditedSessionError::SessionServiceTerminated) => {}
-                Err(e) => return Err(e.into()),
-            }
+            handle.close();
         }
         Ok(())
     }
@@ -1127,12 +1404,8 @@ impl SessionManager for CreditedSessionManager {
                 .cloned()
                 .ok_or_else(|| CreditedSessionManagerError::SessionNotFound(id.clone()))?
         };
-        let (http_request_id, rx) = handle.establish_request_wise_channel().await?;
-        handle.push_message(message, Some(http_request_id)).await?;
-        Self::install_sse_receiver(CreditedSseReceiver {
-            rx,
-            finish: Some((handle.event_tx.clone(), http_request_id)),
-        });
+        let (_http_request_id, queue) = handle.create_request_stream(message).await?;
+        Self::install_sse_receiver(CreditedSseReceiver { queue });
         // `Endpoint::forward` replaces the placeholder SSE body with `CreditedSseBody`.
         Ok(futures_util::stream::empty::<ServerSseMessage>())
     }
@@ -1164,8 +1437,8 @@ impl SessionManager for CreditedSessionManager {
                 .cloned()
                 .ok_or_else(|| CreditedSessionManagerError::SessionNotFound(id.clone()))?
         };
-        let rx = handle.establish_common_channel().await?;
-        Self::install_sse_receiver(CreditedSseReceiver { rx, finish: None });
+        let queue = handle.establish_common_channel().await?;
+        Self::install_sse_receiver(CreditedSseReceiver { queue });
         Ok(futures_util::stream::empty::<ServerSseMessage>())
     }
 
@@ -1184,11 +1457,8 @@ impl SessionManager for CreditedSessionManager {
         let parsed: EventId = last_event_id
             .parse()
             .map_err(|e: EventIdParseError| CreditedSessionManagerError::InvalidEventId(e))?;
-        let (http_request_id, rx) = handle.resume(parsed).await?;
-        Self::install_sse_receiver(CreditedSseReceiver {
-            rx,
-            finish: http_request_id.map(|rid| (handle.event_tx.clone(), rid)),
-        });
+        let (_http_request_id, queue) = handle.resume(parsed).await?;
+        Self::install_sse_receiver(CreditedSseReceiver { queue });
         Ok(futures_util::stream::empty::<ServerSseMessage>())
     }
 
@@ -1200,12 +1470,76 @@ impl SessionManager for CreditedSessionManager {
         if sessions.contains_key(&id) {
             return Ok(RestoreOutcome::AlreadyPresent);
         }
+        let session_ct = self.shutdown.child_token();
         let (handle, worker) = create_credited_session(
             id.clone(),
             self.session_config.clone(),
             self.max_timeout_secs,
+            session_ct.clone(),
         );
         sessions.insert(id, handle);
-        Ok(RestoreOutcome::Restored(WorkerTransport::spawn(worker)))
+        Ok(RestoreOutcome::Restored(WorkerTransport::spawn_with_ct(
+            worker, session_ct,
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_common_stream_replays_queued_notifications_without_last_event_id() {
+        let mut cfg = SessionConfig::default();
+        cfg.sse_retry = Some(Duration::from_secs(3));
+        let (_handle, mut worker) =
+            create_credited_session("s1".into(), cfg, 30.0, CancellationToken::new());
+        // Emit a common notification before the first standalone GET opens.
+        let notif = ServerJsonRpcMessage::notification(
+            ServerNotification::ToolListChangedNotification(Default::default()),
+        );
+        worker.handle_server_message(notif).unwrap();
+
+        let queue = worker.establish_common_channel().unwrap();
+        let mut events = Vec::new();
+        {
+            let mut q = queue.inner.lock();
+            while let Some(ev) = q.items.pop_front() {
+                events.push(String::from_utf8_lossy(&ev.bytes).into_owned());
+            }
+        }
+        assert_eq!(
+            events.len(),
+            2,
+            "expected priming + queued notification: {events:?}"
+        );
+        assert!(events[0].contains("id: 0"), "{events:?}");
+        assert!(
+            events[1].contains("notifications/tools/list_changed"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn full_sse_queue_closes_without_blocking_and_teardown_discards_buffered_frames() {
+        let queue = SharedSseQueue::new(2);
+        let mk = |idx: usize| CreditedSseEvent {
+            index: idx,
+            bytes: Bytes::from_static(b"data: {}\n\n"),
+            terminal: false,
+        };
+        assert!(queue.try_push(mk(0)));
+        assert!(queue.try_push(mk(1)));
+        // Third push overflows capacity: closes & discards immediately instead of blocking.
+        assert!(!queue.try_push(mk(2)));
+        assert!(queue.is_closed());
+        assert!(queue.inner.lock().items.is_empty());
+
+        let queue2 = SharedSseQueue::new(4);
+        assert!(queue2.try_push(mk(0)));
+        assert_eq!(queue2.inner.lock().items.len(), 1);
+        queue2.close_and_discard();
+        assert!(queue2.is_closed());
+        assert!(queue2.inner.lock().items.is_empty());
     }
 }

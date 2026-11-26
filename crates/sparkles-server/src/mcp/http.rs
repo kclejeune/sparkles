@@ -245,6 +245,17 @@ struct Endpoint {
     require_auth: bool,
 }
 
+fn is_json_content_type(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        })
+}
+
 /// The `/$/mcp` route, or `None` when the endpoint is off.
 pub fn route(state: &Arc<AppState>) -> Option<MethodRouter<Arc<AppState>>> {
     route_inner(state, SessionConfig::default(), None)
@@ -277,9 +288,11 @@ fn route_inner(
     };
     let adapter = Adapter::with_transport(server.clone(), Transport::Http);
     let max_timeout_secs = conf.cfg.max_timeout.as_secs_f64();
+    server.shared.tasks.attach_shutdown(conf.shutdown.clone());
     let sessions = Arc::new(CreditedSessionManager::new(
         session_config,
         max_timeout_secs,
+        conf.shutdown.clone(),
     ));
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(conf.max_sessions > 0)
@@ -650,6 +663,7 @@ impl Endpoint {
             return Response::from_parts(parts, Body::new(body));
         }
         if resp.status() == StatusCode::OK
+            && is_json_content_type(resp.headers())
             && let Some(staged) = slot.take()
         {
             let bytes = staged
@@ -702,5 +716,26 @@ mod tests {
             Charge::default()
         );
         assert_eq!(c("[1,2]"), Charge::default());
+    }
+
+    #[test]
+    fn json_content_type_check_rejects_sse_and_accepts_json_with_charset() {
+        let mut h = axum::http::HeaderMap::new();
+        assert!(!is_json_content_type(&h));
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        assert!(!is_json_content_type(&h));
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        assert!(is_json_content_type(&h));
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("Application/JSON"),
+        );
+        assert!(is_json_content_type(&h));
     }
 }

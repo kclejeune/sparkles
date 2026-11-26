@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 /// Tasks running at once, over all callers.
 pub const MAX_RUNNING: usize = 64;
@@ -214,6 +215,8 @@ impl Drop for TaskEntry {
 #[derive(Default)]
 struct Inner {
     tasks: HashMap<String, TaskEntry>,
+    shut_down: bool,
+    shutdown_watchers: Vec<AbortHandle>,
 }
 
 /// The tasks of one server, with their callers and retained results.
@@ -242,28 +245,63 @@ impl Tasks {
         }
     }
 
-    /// Abort all running tasks and release all retained task results immediately.
-    pub fn shutdown(&self) {
+    /// Propagate a server shutdown token to this task store so active tasks stop and
+    /// retained task results release their `QueryPool` credit immediately on shutdown,
+    /// even while the router or server remains alive.
+    pub fn attach_shutdown(&self, shutdown: CancellationToken) {
+        let inner_arc = self.inner.clone();
         let mut inner = self.inner.lock();
-        for (_, mut entry) in inner.tasks.drain() {
-            entry.state.abort_handles();
+        if inner.shut_down || shutdown.is_cancelled() {
+            drop(inner);
+            self.shutdown();
+            return;
         }
+        let watcher = tokio::spawn(async move {
+            shutdown.cancelled().await;
+            Self::shutdown_inner(&inner_arc);
+        })
+        .abort_handle();
+        inner.shutdown_watchers.push(watcher);
     }
 
-    fn sweep_expired(inner: &mut Inner) {
+    fn shutdown_inner(inner_arc: &Arc<Mutex<Inner>>) {
+        let dropped: Vec<TaskEntry> = {
+            let mut inner = inner_arc.lock();
+            inner.shut_down = true;
+            for handle in inner.shutdown_watchers.drain(..) {
+                handle.abort();
+            }
+            inner.tasks.drain().map(|(_, entry)| entry).collect()
+        };
+        // Drop entries outside the mutex so pool wake-ups never run under `Tasks`'s lock.
+        drop(dropped);
+    }
+
+    /// Abort all running tasks and release all retained task results immediately.
+    pub fn shutdown(&self) {
+        Self::shutdown_inner(&self.inner);
+    }
+
+    fn sweep_expired(inner_arc: &Arc<Mutex<Inner>>, inner: &mut Inner) {
         let now = Instant::now();
-        // Phase 1: fail overdue running tasks and drop their join handles.
-        for entry in inner.tasks.values_mut() {
+        // Phase 1: fail overdue running tasks, drop their join handles, and schedule
+        // their terminal eviction timers so failed entries never linger without new RPCs.
+        for (id, entry) in inner.tasks.iter_mut() {
             if entry.state.is_working() && now.saturating_duration_since(entry.created) >= entry.ttl
             {
                 entry.state.abort_handles();
+                let evict_timer = Some(Self::schedule_eviction(
+                    inner_arc.clone(),
+                    id.clone(),
+                    entry.ttl,
+                ));
                 entry.state = TaskState::Failed {
                     error: McpError::internal_error(
                         "task expired: TTL elapsed before completion",
                         None,
                     ),
                     terminal_at: now,
-                    evict_timer: None,
+                    evict_timer,
                 };
                 entry.touch();
             }
@@ -280,15 +318,20 @@ impl Tasks {
     fn schedule_eviction(inner: Arc<Mutex<Inner>>, task_id: String, ttl: Duration) -> AbortHandle {
         tokio::spawn(async move {
             tokio::time::sleep(ttl).await;
-            let mut guard = inner.lock();
-            if let Some(entry) = guard.tasks.get(&task_id)
-                && entry
-                    .state
-                    .terminal_at()
-                    .is_some_and(|at| at.elapsed() >= entry.ttl)
-            {
-                guard.tasks.remove(&task_id);
-            }
+            let removed = {
+                let mut guard = inner.lock();
+                if let Some(entry) = guard.tasks.get(&task_id)
+                    && entry
+                        .state
+                        .terminal_at()
+                        .is_some_and(|at| at.elapsed() >= entry.ttl)
+                {
+                    guard.tasks.remove(&task_id)
+                } else {
+                    None
+                }
+            };
+            drop(removed);
         })
         .abort_handle()
     }
@@ -296,7 +339,10 @@ impl Tasks {
     /// Whether another task may start.
     pub fn can_start(&self) -> bool {
         let mut inner = self.inner.lock();
-        Self::sweep_expired(&mut inner);
+        if inner.shut_down {
+            return false;
+        }
+        Self::sweep_expired(&self.inner, &mut inner);
         inner
             .tasks
             .values()
@@ -305,14 +351,16 @@ impl Tasks {
             < MAX_RUNNING
     }
 
-    /// Make the running call `work` a task of `owner` that retains its credited result.
+    /// Atomically admit the running call `work` as a background task of `owner` if the
+    /// server has not shut down and fewer than [`MAX_RUNNING`] tasks are active. Returns
+    /// `Err(work)` when full or shut down so the caller can keep running `work` inline.
     /// `cancel` is the call's cancel flag, which `tasks/cancel` sets.
-    pub(super) fn start_retained(
+    pub(super) fn try_start_retained(
         &self,
         owner: String,
         mut work: JoinHandle<TaskOutcome>,
         cancel: Arc<AtomicBool>,
-    ) -> Task {
+    ) -> Result<Task, JoinHandle<TaskOutcome>> {
         let task_id = uuid::Uuid::new_v4().to_string();
         let now = current_timestamp();
         let ttl = self.ttl;
@@ -334,7 +382,18 @@ impl Tasks {
         };
         {
             let mut inner = self.inner.lock();
-            Self::sweep_expired(&mut inner);
+            if inner.shut_down {
+                return Err(work);
+            }
+            Self::sweep_expired(&self.inner, &mut inner);
+            let running = inner
+                .tasks
+                .values()
+                .filter(|e| e.state.is_working())
+                .count();
+            if running >= MAX_RUNNING {
+                return Err(work);
+            }
             inner.tasks.insert(task_id.clone(), entry);
         }
 
@@ -342,13 +401,7 @@ impl Tasks {
         let id_for_task = task_id.clone();
         let handle = tokio::spawn(async move {
             let outcome = tokio::select! {
-                r = &mut work => match r {
-                    Ok(out) => Ok(out),
-                    Err(e) => {
-                        tracing::error!("MCP task failed: {e}");
-                        Err(Some(McpError::internal_error("the tool call failed", None)))
-                    }
-                },
+                biased;
                 _ = async {
                     while !*cancel_rx.borrow_and_update() {
                         if cancel_rx.changed().await.is_err() {
@@ -369,42 +422,69 @@ impl Tasks {
                         None,
                     )))
                 }
+                r = &mut work => match r {
+                    Ok(out) => Ok(out),
+                    Err(e) => {
+                        tracing::error!("MCP task failed: {e}");
+                        Err(Some(McpError::internal_error("the tool call failed", None)))
+                    }
+                },
             };
-            let mut guard = inner_arc.lock();
-            let Some(entry) = guard.tasks.get_mut(&id_for_task) else {
-                // Task was already evicted or shut down; drop `outcome` outside the lock.
-                drop(guard);
-                drop(outcome);
-                return;
-            };
-            if !entry.state.is_working() {
-                drop(guard);
-                drop(outcome);
-                return;
+            // Release active-query `INITIAL_GRANT` slack outside `Tasks`'s mutex before
+            // retaining the completed result for `TTL`.
+            if let Ok(TaskOutcome::Retained(ref retained)) = outcome {
+                retained.trim_grant();
             }
-            let terminal_at = Instant::now();
-            let evict_timer = Some(Self::schedule_eviction(
-                inner_arc.clone(),
-                id_for_task.clone(),
-                entry.ttl,
-            ));
-            entry.state = match outcome {
-                Ok(out) => TaskState::Completed {
-                    outcome: out,
-                    terminal_at,
-                    evict_timer,
-                },
-                Err(None) => TaskState::Cancelled {
-                    terminal_at,
-                    evict_timer,
-                },
-                Err(Some(error)) => TaskState::Failed {
-                    error,
-                    terminal_at,
-                    evict_timer,
-                },
-            };
-            entry.touch();
+            let mut dropped_outcome: Option<Result<TaskOutcome, Option<McpError>>> = None;
+            {
+                let mut guard = inner_arc.lock();
+                let Some(entry) = guard.tasks.get_mut(&id_for_task) else {
+                    dropped_outcome = Some(outcome);
+                    drop(guard);
+                    drop(dropped_outcome);
+                    return;
+                };
+                if !entry.state.is_working() {
+                    dropped_outcome = Some(outcome);
+                    drop(guard);
+                    drop(dropped_outcome);
+                    return;
+                }
+                let terminal_at = Instant::now();
+                let evict_timer = Some(Self::schedule_eviction(
+                    inner_arc.clone(),
+                    id_for_task.clone(),
+                    entry.ttl,
+                ));
+                // Re-check acknowledged cancellation under the lock so a cancel that raced
+                // with `work` finishing still transitions to Cancelled and drops credit now.
+                if *cancel_rx.borrow() && outcome.is_ok() {
+                    dropped_outcome = Some(outcome);
+                    entry.state = TaskState::Cancelled {
+                        terminal_at,
+                        evict_timer,
+                    };
+                } else {
+                    entry.state = match outcome {
+                        Ok(out) => TaskState::Completed {
+                            outcome: out,
+                            terminal_at,
+                            evict_timer,
+                        },
+                        Err(None) => TaskState::Cancelled {
+                            terminal_at,
+                            evict_timer,
+                        },
+                        Err(Some(error)) => TaskState::Failed {
+                            error,
+                            terminal_at,
+                            evict_timer,
+                        },
+                    };
+                }
+                entry.touch();
+            }
+            drop(dropped_outcome);
         });
 
         let mut inner = self.inner.lock();
@@ -416,7 +496,7 @@ impl Tasks {
             }
             None => handle.abort(),
         }
-        task
+        Ok(task)
     }
 
     /// Convenience wrapper for tests that spawn a plain `CallToolResult`.
@@ -433,13 +513,15 @@ impl Tasks {
                 Err(_) => TaskOutcome::Fallback(CallToolResult::error(Vec::new())),
             }
         });
-        self.start_retained(owner, wrapped, cancel)
+        self.try_start_retained(owner, wrapped, cancel)
+            .ok()
+            .expect("task capacity available")
     }
 
     /// `tasks/get` of `owner`, returning a retained snapshot when completed.
     pub(super) fn get_retained(&self, owner: &str, id: &str) -> Result<TaskSnapshot, McpError> {
         let mut inner = self.inner.lock();
-        Self::sweep_expired(&mut inner);
+        Self::sweep_expired(&self.inner, &mut inner);
         let entry = inner
             .tasks
             .get(id)
@@ -452,7 +534,7 @@ impl Tasks {
     #[cfg(test)]
     pub fn get(&self, owner: &str, id: &str) -> Result<DetailedTask, McpError> {
         let mut inner = self.inner.lock();
-        Self::sweep_expired(&mut inner);
+        Self::sweep_expired(&self.inner, &mut inner);
         let entry = inner
             .tasks
             .get(id)
@@ -462,9 +544,13 @@ impl Tasks {
     }
 
     /// `tasks/cancel` of `owner`.
+    ///
+    /// Per MCP SEP-2663, cancelling a running task signals its cooperative cancel flag so
+    /// it stops and releases credit immediately; cancelling an already-terminal task is an
+    /// idempotent acknowledgement that leaves its terminal state unchanged.
     pub fn cancel(&self, owner: &str, id: &str) -> Result<(), McpError> {
         let mut inner = self.inner.lock();
-        Self::sweep_expired(&mut inner);
+        Self::sweep_expired(&self.inner, &mut inner);
         let entry = inner
             .tasks
             .get_mut(id)
@@ -484,7 +570,7 @@ impl Tasks {
     /// `tasks/update` of `owner`: no tool asks for input during a task.
     pub fn update(&self, owner: &str, id: &str) -> Result<(), McpError> {
         let mut inner = self.inner.lock();
-        Self::sweep_expired(&mut inner);
+        Self::sweep_expired(&self.inner, &mut inner);
         let _ = inner
             .tasks
             .get(id)
@@ -494,5 +580,55 @@ impl Tasks {
             format!("task {id} asks for no input"),
             None,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn try_start_retained_enforces_max_running_atomically() {
+        let tasks = Tasks::with_ttl(Duration::from_secs(60));
+        let mut gates = Vec::new();
+        for _ in 0..MAX_RUNNING {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            gates.push(tx);
+            let work = tokio::spawn(async move {
+                let _ = rx.await;
+                TaskOutcome::Fallback(CallToolResult::default())
+            });
+            assert!(
+                tasks
+                    .try_start_retained("alice".into(), work, Arc::new(AtomicBool::new(false)))
+                    .is_ok()
+            );
+        }
+        // MAX_RUNNING + 1 must be refused atomically and return `work` intact.
+        let extra = tokio::spawn(async { TaskOutcome::Fallback(CallToolResult::default()) });
+        let returned = tasks
+            .try_start_retained("alice".into(), extra, Arc::new(AtomicBool::new(false)))
+            .expect_err("must reject beyond MAX_RUNNING");
+        let _ = returned.await;
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_phase1_schedules_eviction_timer() {
+        let tasks = Tasks::with_ttl(Duration::from_millis(60));
+        let work = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            TaskOutcome::Fallback(CallToolResult::default())
+        });
+        let task = tasks
+            .try_start_retained("alice".into(), work, Arc::new(AtomicBool::new(false)))
+            .ok()
+            .unwrap();
+        // Wait past initial TTL so Phase 1 transitions Working -> Failed with an eviction timer.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = tasks.can_start();
+        // Wait past the second TTL window without any further RPCs: eviction timer removes it.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!tasks.inner.lock().tasks.contains_key(&task.task_id));
     }
 }

@@ -23,12 +23,12 @@ use serde_json::value::RawValue;
 use sparkles::access::Preparation;
 use sparkles::error::{Error, Result};
 use sparkles::sparql::output::{NativeBudget, NativeReservation, OwnedBytes, OwnedJson, OwnedText};
-use sparkles::sparql::pool::PoolGrant;
 use sparkles::task::Control;
 use std::alloc::Layout;
+use std::fmt;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
@@ -37,9 +37,21 @@ fn implementation() -> Implementation {
     Implementation::new("sparkles", env!("CARGO_PKG_VERSION"))
 }
 
+struct TrimOnDrop(Preparation);
+
+impl Drop for TrimOnDrop {
+    fn drop(&mut self) {
+        self.0.trim_grant();
+    }
+}
+
 struct FrameOwner {
     bytes: OwnedBytes,
     _credit: NativeReservation,
+    // Drops LAST (after `bytes` and `_credit` release their grant charges) so a
+    // retained task's grant shrinks back to actual retained usage once a `tasks/get`
+    // wire frame finishes writing.
+    _trim_on_drop: Option<TrimOnDrop>,
 }
 
 impl AsRef<[u8]> for FrameOwner {
@@ -66,7 +78,11 @@ fn arc_bytes<T>() -> Result<u64> {
     u64::try_from(layout.pad_to_align().size()).map_err(|_| overflow())
 }
 
-fn bytes_from_owned(bytes: OwnedBytes, budget: &NativeBudget) -> Result<Bytes> {
+fn bytes_from_owned(
+    bytes: OwnedBytes,
+    budget: &NativeBudget,
+    trim_on_drop: Option<Preparation>,
+) -> Result<Bytes> {
     let metadata = u64::try_from(std::mem::size_of::<BytesOwnerLayout<FrameOwner>>())
         .map_err(|_| overflow())?;
     let credit = budget.reserve(metadata)?;
@@ -74,6 +90,7 @@ fn bytes_from_owned(bytes: OwnedBytes, budget: &NativeBudget) -> Result<Bytes> {
     let frame = Bytes::from_owner(FrameOwner {
         bytes,
         _credit: credit,
+        _trim_on_drop: trim_on_drop.map(TrimOnDrop),
     });
     budget.check()?;
     Ok(frame)
@@ -96,12 +113,19 @@ pub(super) enum Framing<'a> {
 // SSE requires each raw line of JSON data to carry its own `data: ` prefix.
 struct SseData<'a> {
     writer: &'a mut dyn Write,
+    prev_cr: bool,
 }
 
 impl Write for SseData<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let mut start = 0;
-        for (i, byte) in bytes.iter().enumerate() {
+        for (i, &byte) in bytes.iter().enumerate() {
+            if byte == b'\n' && self.prev_cr {
+                self.prev_cr = false;
+                start = i + 1;
+                continue;
+            }
+            self.prev_cr = byte == b'\r';
             if matches!(byte, b'\r' | b'\n') {
                 self.writer.write_all(&bytes[start..i])?;
                 self.writer.write_all(b"\ndata: ")?;
@@ -117,15 +141,20 @@ impl Write for SseData<'_> {
     }
 }
 
+fn valid_event_id(id: &str) -> bool {
+    !id.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+}
+
 fn encode_with_framing<T: Serialize>(
     value: &T,
     budget: &NativeBudget,
     framing: Framing<'_>,
+    trim_on_drop: Option<Preparation>,
 ) -> Result<Bytes> {
     if let Framing::Sse {
         event_id: Some(id), ..
     } = framing
-        && id.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+        && !valid_event_id(id)
     {
         return Err(Error::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -146,6 +175,7 @@ fn encode_with_framing<T: Serialize>(
                 serde_json::to_writer(
                     SseData {
                         writer: &mut *writer,
+                        prev_cr: false,
                     },
                     value,
                 )
@@ -162,7 +192,7 @@ fn encode_with_framing<T: Serialize>(
         }
         Ok(())
     })?;
-    bytes_from_owned(bytes, budget)
+    bytes_from_owned(bytes, budget, trim_on_drop)
 }
 
 fn encode_uncredited_framing<T: Serialize>(value: &T, framing: Framing<'_>) -> Bytes {
@@ -177,9 +207,17 @@ fn encode_uncredited_framing<T: Serialize>(value: &T, framing: Framing<'_>) -> B
         }
         Framing::Sse { event_id, retry } => {
             out.extend_from_slice(b"data: ");
-            let _ = serde_json::to_writer(SseData { writer: &mut out }, value);
+            let _ = serde_json::to_writer(
+                SseData {
+                    writer: &mut out,
+                    prev_cr: false,
+                },
+                value,
+            );
             out.push(b'\n');
-            if let Some(id) = event_id {
+            if let Some(id) = event_id
+                && valid_event_id(id)
+            {
                 let _ = writeln!(&mut out, "id: {id}");
             }
             if let Some(retry) = retry {
@@ -189,6 +227,130 @@ fn encode_uncredited_framing<T: Serialize>(value: &T, framing: Framing<'_>) -> B
         }
     }
     Bytes::from(out)
+}
+
+/// Format `ToolError` text directly into a `NativeBudget` without an intermediate `String`.
+struct ToolErrorText<'a>(&'a ToolError);
+
+impl fmt::Display for ToolErrorText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.message)?;
+        if let Some(hint) = &self.0.hint {
+            f.write_str("\nHint: ")?;
+            f.write_str(hint)?;
+        }
+        if let Some(data) = &self.0.data {
+            f.write_str("\n")?;
+            fmt::Display::fmt(data, f)?;
+        }
+        Ok(())
+    }
+}
+
+/// Serialize `ToolError` metadata directly into a `NativeBudget` without cloning `data`.
+struct ToolErrorMeta<'a>(&'a ToolError);
+
+impl Serialize for ToolErrorMeta<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let count = 2 + usize::from(self.0.budget.is_some()) + usize::from(self.0.data.is_some());
+        let mut map = serializer.serialize_map(Some(count))?;
+        map.serialize_entry("code", &*self.0.code)?;
+        map.serialize_entry("status", &self.0.status)?;
+        if let Some(budget) = self.0.budget {
+            map.serialize_entry("budget", budget)?;
+        }
+        if let Some(data) = &self.0.data {
+            map.serialize_entry("data", data)?;
+        }
+        map.end()
+    }
+}
+
+/// Whether `error` is a strictly small, fixed-bound diagnostic error with no attached `data`
+/// payload (e.g., `budget-memory` with a short remedy hint) that may be returned even when a
+/// tiny configured `query_memory_bytes` ceiling cannot also admit its error text.
+pub(super) fn is_small_bounded_error(error: &ToolError) -> bool {
+    error.data.is_none()
+        && error.code.len() <= 64
+        && error.message.len() <= 512
+        && error.hint.as_deref().map_or(0, str::len) <= 512
+}
+
+fn truncate_str_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Build a strictly bounded (<= 2 KiB serialized) incomplete diagnostic summary for
+/// `why_empty` when its own checks hit the memory budget under a tiny ceiling (e.g. 512 B)
+/// and the full diagnosis object cannot be admitted into `NativeBudget`.
+pub(super) fn bounded_why_empty_summary(value: &Value) -> Option<Value> {
+    let obj = value.as_object()?;
+    if obj.get("complete") != Some(&Value::Bool(false)) {
+        return None;
+    }
+    let dataset = obj
+        .get("dataset")
+        .and_then(Value::as_str)
+        .map(|s| truncate_str_bytes(s, 128))
+        .unwrap_or("");
+    let commit = obj.get("commit").and_then(Value::as_u64).unwrap_or(0);
+    let empty = match obj.get("empty") {
+        Some(Value::Bool(b)) => Value::Bool(*b),
+        _ => Value::Null,
+    };
+    let message = obj
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|s| truncate_str_bytes(s, 256))
+        .unwrap_or("query diagnosis exceeded the memory budget; steps are incomplete");
+    let mut steps = Vec::new();
+    if let Some(arr) = obj.get("steps").and_then(Value::as_array) {
+        for step in arr.iter().take(8) {
+            let Some(so) = step.as_object() else {
+                continue;
+            };
+            let kind = so
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(|s| truncate_str_bytes(s, 32))
+                .unwrap_or("pattern");
+            let text = so
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|s| truncate_str_bytes(s, 128))
+                .unwrap_or("");
+            let solutions = match so.get("solutions") {
+                Some(Value::Bool(b)) => Value::Bool(*b),
+                _ => Value::Null,
+            };
+            steps.push(serde_json::json!({
+                "kind": kind,
+                "text": text,
+                "solutions": solutions,
+            }));
+        }
+    }
+    let summary = serde_json::json!({
+        "dataset": dataset,
+        "commit": commit,
+        "empty": empty,
+        "steps": steps,
+        "complete": false,
+        "message": message,
+        "prefixes": {},
+    });
+    debug_assert!(serde_json::to_vec(&summary).is_ok_and(|b| b.len() <= 2048));
+    Some(summary)
 }
 
 enum RetainedCallKind {
@@ -205,8 +367,7 @@ struct RetainedCallInner {
     kind: RetainedCallKind,
     modern: bool,
     budget: NativeBudget,
-    grant: Option<Arc<PoolGrant>>,
-    memory_limit: u64,
+    preparation: Preparation,
     _credit: NativeReservation,
 }
 
@@ -222,15 +383,18 @@ impl RetainedCallResult {
     /// `CompactPage` without copying.
     ///
     /// Returns `Err(ToolError)` if admitting the result hits a memory/cancel/timeout limit
-    /// so the caller can return a clean MCP tool error without allocating past the ceiling.
+    /// so the caller can return a bounded MCP tool error without allocating past the ceiling.
     pub(super) fn from_outcome(
         outcome: std::result::Result<Outcome, ToolError>,
         preparation: &Preparation,
-        grant: Option<Arc<PoolGrant>>,
         modern: bool,
         err_ctx: &ErrorContext<'_>,
     ) -> std::result::Result<Self, ToolError> {
-        let budget = NativeBudget::from_preparation(preparation).map_err(|e| err_ctx.engine(e))?;
+        let budget = NativeBudget::from_preparation(preparation).map_err(|e| match &outcome {
+            Err(tool_error) if is_small_bounded_error(tool_error) => tool_error.clone(),
+            _ => err_ctx.engine(e),
+        })?;
+        let mut small_err: Option<ToolError> = None;
         let kind = match outcome {
             Ok(Outcome::Retained(CompactPage::Table(text))) => RetainedCallKind::Text(text),
             Ok(Outcome::Retained(CompactPage::Json(json))) => RetainedCallKind::JsonText(json),
@@ -241,28 +405,67 @@ impl RetainedCallResult {
                 RetainedCallKind::Structured(budget.json(&value).map_err(|e| err_ctx.engine(e))?)
             }
             Err(tool_error) => {
-                // Tool errors are tiny diagnostic payloads; if the call already exhausted
-                // its budget, return `Err(tool_error)` so the caller renders it directly.
-                let text = budget
-                    .text(&tool_error.text())
-                    .map_err(|_| tool_error.clone())?;
-                let error_meta = budget
-                    .json(&tool_error.meta())
-                    .map_err(|_| tool_error.clone())?;
+                let text = match budget.format_text(&ToolErrorText(&tool_error)) {
+                    Ok(t) => t,
+                    Err(admit_err) => {
+                        return Err(if is_small_bounded_error(&tool_error) {
+                            tool_error
+                        } else {
+                            err_ctx.engine(admit_err)
+                        });
+                    }
+                };
+                let error_meta = match budget.json(&ToolErrorMeta(&tool_error)) {
+                    Ok(m) => m,
+                    Err(admit_err) => {
+                        return Err(if is_small_bounded_error(&tool_error) {
+                            tool_error
+                        } else {
+                            err_ctx.engine(admit_err)
+                        });
+                    }
+                };
+                if is_small_bounded_error(&tool_error) {
+                    small_err = Some(tool_error);
+                }
                 RetainedCallKind::Error { text, error_meta }
             }
         };
+        let map_final = |e: Error| match small_err.take() {
+            Some(tool_error) => tool_error,
+            None => err_ctx.engine(e),
+        };
         let credit = budget
             .reserve(arc_bytes::<RetainedCallInner>().map_err(|e| err_ctx.engine(e))?)
-            .map_err(|e| err_ctx.engine(e))?;
+            .map_err(map_final)?;
         budget.check().map_err(|e| err_ctx.engine(e))?;
         Ok(Self {
             inner: Arc::new(RetainedCallInner {
                 kind,
                 modern,
                 budget,
-                grant,
-                memory_limit: preparation.limit(),
+                preparation: preparation.clone(),
+                _credit: credit,
+            }),
+        })
+    }
+
+    /// Borrow a structured `Value` and admit it into `preparation` without cloning `value`.
+    pub(super) fn from_structured_ref(
+        value: &Value,
+        preparation: &Preparation,
+        modern: bool,
+    ) -> Result<Self> {
+        let budget = NativeBudget::from_preparation(preparation)?;
+        let kind = RetainedCallKind::Structured(budget.json(value)?);
+        let credit = budget.reserve(arc_bytes::<RetainedCallInner>()?)?;
+        budget.check()?;
+        Ok(Self {
+            inner: Arc::new(RetainedCallInner {
+                kind,
+                modern,
+                budget,
+                preparation: preparation.clone(),
                 _credit: credit,
             }),
         })
@@ -276,18 +479,17 @@ impl RetainedCallResult {
         &self.inner.budget
     }
 
-    /// Create a fresh-control `NativeBudget` sharing this retained result's `PoolGrant`
-    /// and memory ceiling, so a later `tasks/get` poll can render a wire frame without
-    /// failing on the original query's expired deadline or deadlocking on a second
-    /// `INITIAL_GRANT` admission on a small pool.
+    pub(super) fn trim_grant(&self) {
+        self.inner.preparation.trim_grant();
+    }
+
+    /// Create a fresh-control `NativeBudget` sharing this retained result's remaining
+    /// `query_memory_bytes` allowance and `PoolGrant`, so a later `tasks/get` poll can
+    /// render a wire frame after the original query's deadline without exceeding the
+    /// configured memory ceiling or deadlocking on a second `INITIAL_GRANT` admission.
     pub(super) fn fresh_frame_budget(&self, control: Control) -> Result<NativeBudget> {
-        let prep = match &self.inner.grant {
-            Some(grant) => {
-                Preparation::with_grant(control, self.inner.memory_limit, grant.clone())?
-            }
-            None => Preparation::new(control, self.inner.memory_limit)?,
-        };
-        NativeBudget::from_preparation(&prep)
+        let child = self.inner.preparation.child_with_control(control)?;
+        NativeBudget::from_preparation(&child)
     }
 
     /// Fallback conversion to an ordinary `CallToolResult` when no qualified transport
@@ -419,6 +621,7 @@ struct RetainedResourceInner {
     ttl_ms: u64,
     cache_scope: CacheScope,
     budget: NativeBudget,
+    preparation: Preparation,
     _credit: NativeReservation,
 }
 
@@ -429,6 +632,7 @@ pub(super) struct RetainedResourceResult {
 }
 
 impl RetainedResourceResult {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         uri: String,
         mime_type: &'static str,
@@ -437,8 +641,13 @@ impl RetainedResourceResult {
         ttl_ms: u64,
         cache_scope: CacheScope,
         budget: NativeBudget,
+        preparation: Preparation,
     ) -> Result<Self> {
-        let credit = budget.reserve(arc_bytes::<RetainedResourceInner>()?)?;
+        let uri_bytes = u64::try_from(uri.capacity()).map_err(|_| overflow())?;
+        let total = arc_bytes::<RetainedResourceInner>()?
+            .checked_add(uri_bytes)
+            .ok_or_else(overflow)?;
+        let credit = budget.reserve(total)?;
         budget.check()?;
         Ok(Self {
             inner: Arc::new(RetainedResourceInner {
@@ -449,6 +658,7 @@ impl RetainedResourceResult {
                 ttl_ms,
                 cache_scope,
                 budget,
+                preparation,
                 _credit: credit,
             }),
         })
@@ -499,9 +709,11 @@ impl Serialize for RetainedResourceResult {
 }
 
 /// Wire shape for a completed `GetTaskResult` whose `result` borrows a `RetainedCallResult`.
+/// Matches `rmcp::model::GetTaskResult` verbatim, including outer `"resultType": "complete"`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompletedTaskWire<'a> {
+    result_type: ResultType,
     #[serde(flatten)]
     task: &'a Task,
     result: &'a RetainedCallResult,
@@ -533,6 +745,7 @@ pub(super) enum StagedResponse {
         task: Task,
         result: RetainedCallResult,
         frame_budget: NativeBudget,
+        cancel: Arc<AtomicBool>,
     },
     Resource {
         id: RequestId,
@@ -556,6 +769,21 @@ impl StagedResponse {
         }
     }
 
+    fn cancel_on_close(&self) {
+        if let Self::TaskCompleted { cancel, .. } = self {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn trim_preparation(&self) -> Preparation {
+        match self {
+            Self::Tool { result, .. } | Self::TaskCompleted { result, .. } => {
+                result.inner.preparation.clone()
+            }
+            Self::Resource { result, .. } => result.inner.preparation.clone(),
+        }
+    }
+
     /// Encode this staged response into a credited `Bytes` frame under its `NativeBudget`.
     pub(super) fn encode_frame(&self, framing: Framing<'_>) -> Result<Bytes> {
         match self {
@@ -567,20 +795,27 @@ impl StagedResponse {
                 },
                 result.budget(),
                 framing,
+                None,
             ),
             Self::TaskCompleted {
                 id,
                 task,
                 result,
                 frame_budget,
+                ..
             } => encode_with_framing(
                 &JsonRpcEnvelope {
                     jsonrpc: "2.0",
                     id,
-                    result: CompletedTaskWire { task, result },
+                    result: CompletedTaskWire {
+                        result_type: ResultType::COMPLETE,
+                        task,
+                        result,
+                    },
                 },
                 frame_budget,
                 framing,
+                Some(result.inner.preparation.clone()),
             ),
             Self::Resource { id, result } => encode_with_framing(
                 &JsonRpcEnvelope {
@@ -590,6 +825,7 @@ impl StagedResponse {
                 },
                 &result.inner.budget,
                 framing,
+                None,
             ),
         }
     }
@@ -597,15 +833,31 @@ impl StagedResponse {
     /// Encode `self` into a credited wire frame, or if encoding is refused by a memory
     /// or control limit, drop `self` FIRST (releasing all credit!) and return a clean,
     /// tiny MCP error frame without allocating past the pool ceiling.
+    ///
+    /// On success, drops the staged intermediate payload (`RetainedCallResult` /
+    /// `RetainedResourceResult`) and trims unused `INITIAL_GRANT` slack from the
+    /// backing `PoolGrant` so idle HTTP bodies and SSE replay caches hold only the
+    /// encoded frame's actual bytes.
     pub(super) fn into_frame_or_error(self, framing: Framing<'_>, max_timeout_secs: f64) -> Bytes {
         match self.encode_frame(framing) {
-            Ok(bytes) => bytes,
+            Ok(bytes) => {
+                let trim_prep = self.trim_preparation();
+                drop(self);
+                trim_prep.trim_grant();
+                drop(trim_prep);
+                bytes
+            }
             Err(err) => {
                 let id = self.id().clone();
                 let modern = self.modern();
                 let is_tool = matches!(self, Self::Tool { .. });
+                let trim_prep =
+                    matches!(self, Self::TaskCompleted { .. }).then(|| self.trim_preparation());
                 // Release all retained payload credit before building the tiny error frame.
                 drop(self);
+                if let Some(prep) = trim_prep {
+                    prep.trim_grant();
+                }
                 let req_id = id.to_string();
                 let tool_err = ErrorContext {
                     timeout_secs: max_timeout_secs,
@@ -684,6 +936,7 @@ impl ResponseSlot {
             *slot = Some(Box::new(staged));
         } else {
             drop(guard);
+            staged.cancel_on_close();
             drop(staged);
         }
     }
@@ -697,8 +950,10 @@ impl ResponseSlot {
     }
 
     pub(super) fn close(&self) {
-        let dropped = self.take();
-        drop(dropped);
+        if let Some(dropped) = self.take() {
+            dropped.cancel_on_close();
+            drop(dropped);
+        }
     }
 }
 
@@ -727,7 +982,7 @@ impl Drop for SlotGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sparkles::sparql::pool::QueryPool;
+    use sparkles::sparql::pool::{PoolGrant, QueryPool};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn fixture(limit: u64) -> (Preparation, Arc<PoolGrant>, Arc<QueryPool>, Arc<AtomicBool>) {
@@ -757,7 +1012,6 @@ mod tests {
         let retained = RetainedCallResult::from_outcome(
             Ok(Outcome::Retained(CompactPage::Table(text))),
             &prep,
-            Some(grant.clone()),
             true,
             &err_ctx(),
         )
@@ -799,7 +1053,6 @@ mod tests {
         let retained = RetainedCallResult::from_outcome(
             Ok(Outcome::Structured(serde_json::json!({"rows": [["ok"]]}))),
             &prep,
-            Some(grant.clone()),
             false,
             &err_ctx(),
         )
@@ -837,7 +1090,6 @@ mod tests {
         let retained = RetainedCallResult::from_outcome(
             Ok(Outcome::Retained(CompactPage::Table(text))),
             &prep,
-            Some(grant.clone()),
             true,
             &err_ctx(),
         )
@@ -868,7 +1120,6 @@ mod tests {
         let retained = RetainedCallResult::from_outcome(
             Ok(Outcome::Text("a".repeat(64 << 10))),
             &prep,
-            Some(grant.clone()),
             true,
             &err_ctx(),
         )
@@ -887,7 +1138,6 @@ mod tests {
         let retained2 = RetainedCallResult::from_outcome(
             Ok(Outcome::Text("b".repeat(64 << 10))),
             &prep2,
-            Some(grant.clone()),
             true,
             &err_ctx(),
         )
@@ -900,5 +1150,127 @@ mod tests {
         assert_eq!(grant.used(), 0);
         drop(grant);
         assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn completed_task_wire_includes_outer_result_type_and_enforces_query_memory_bytes() {
+        // 96 KiB cap: retains 64 KiB payload, so fresh_frame_budget must NOT allow another 64 KiB!
+        let (prep, grant, pool, _) = fixture(96 << 10);
+        let budget = NativeBudget::from_preparation(&prep).unwrap();
+        let text = budget.text(&"k".repeat(64 << 10)).unwrap();
+        let retained = RetainedCallResult::from_outcome(
+            Ok(Outcome::Retained(CompactPage::Table(text))),
+            &prep,
+            true,
+            &err_ctx(),
+        )
+        .unwrap();
+        drop(budget);
+        drop(prep);
+        let task = Task::new(
+            "t-1".to_string(),
+            rmcp::model::TaskStatus::Completed,
+            "2026-01-01T00:00:00Z".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let frame_budget = retained
+            .fresh_frame_budget(Control::with_cancel(cancel.clone()))
+            .unwrap();
+        let staged = StagedResponse::TaskCompleted {
+            id: RequestId::Number(3),
+            task: task.clone(),
+            result: retained.clone(),
+            frame_budget,
+            cancel,
+        };
+        // Encoding the >64 KiB wire frame on top of the 64 KiB retained payload exceeds 96 KiB!
+        let err = staged.encode_frame(Framing::Json).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b) if b.kind == sparkles::BudgetKind::Memory
+        ));
+        drop(staged);
+        drop(retained);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+
+        // With enough room, CompletedTaskWire emits outer `resultType: "complete"`.
+        let (prep, grant, pool, _) = fixture(4 << 20);
+        let retained = RetainedCallResult::from_outcome(
+            Ok(Outcome::Text("hello".to_string())),
+            &prep,
+            true,
+            &err_ctx(),
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let frame_budget = retained
+            .fresh_frame_budget(Control::with_cancel(cancel.clone()))
+            .unwrap();
+        let staged = StagedResponse::TaskCompleted {
+            id: RequestId::Number(4),
+            task,
+            result: retained,
+            frame_budget,
+            cancel,
+        };
+        let frame = staged.encode_frame(Framing::Json).unwrap();
+        let v: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(v["result"]["resultType"], "complete", "{v}");
+        assert_eq!(v["result"]["taskId"], "t-1");
+        assert_eq!(v["result"]["status"], "completed");
+        assert_eq!(v["result"]["result"]["resultType"], "complete");
+        assert_eq!(v["result"]["result"]["content"][0]["text"], "hello");
+        drop((frame, staged, prep, grant));
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn detailed_tool_error_cannot_bypass_memory_budget_uncredited() {
+        let (prep, grant, pool, _) = fixture(8 << 10);
+        let huge_errors: Vec<Value> = (0..200)
+            .map(|i| serde_json::json!({"code": "e", "message": format!("problem-{i}-{}", "x".repeat(80))}))
+            .collect();
+        let detailed = ToolError::new("invalid-facts", 422, "200 checks failed")
+            .hint("fix all errors")
+            .data(serde_json::json!({ "errors": huge_errors }));
+        let err = RetainedCallResult::from_outcome(Err(detailed), &prep, true, &err_ctx())
+            .err()
+            .expect("must refuse oversized detailed ToolError");
+        assert_eq!(&*err.code, "budget-memory");
+        assert!(
+            err.data.is_none(),
+            "must not attach unbounded original data"
+        );
+        drop((prep, grant));
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn sse_data_handles_crlf_as_single_line_break_and_uncredited_skips_bad_event_id() {
+        let mut out = Vec::new();
+        {
+            let mut sse = SseData {
+                writer: &mut out,
+                prev_cr: false,
+            };
+            sse.write_all(b"a\r\nb\r").unwrap();
+            sse.write_all(b"\nc\nd").unwrap();
+        }
+        assert_eq!(out, b"a\ndata: b\ndata: c\ndata: d");
+
+        let frame = encode_uncredited_framing(
+            &serde_json::json!({"ok": true}),
+            Framing::Sse {
+                event_id: Some("bad\nid"),
+                retry: None,
+            },
+        );
+        let s = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(
+            !s.contains("id:"),
+            "invalid event_id must not be emitted: {s:?}"
+        );
     }
 }

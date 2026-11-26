@@ -1396,7 +1396,7 @@ impl Tools<'_> {
             })
             .transpose()?;
         let derived = r.reasoning().and_then(|a| a.header());
-        let budget = sparkles::sparql::output::NativeBudget::from_preparation(request)
+        let budget = sparkles::sparql::output::NativeBudget::from_preparation(&controlled)
             .map_err(|e| ctx.engine(e))?;
         let rendered = match r.kind {
             QueryKind::Ask => render::owned_ask(

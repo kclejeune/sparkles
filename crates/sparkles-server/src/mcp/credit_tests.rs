@@ -734,16 +734,25 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let completed = completed.expect("task should complete");
+    assert_eq!(
+        completed["result"]["resultType"], "complete",
+        "GetTaskResult must carry outer resultType=complete: {completed}"
+    );
+    assert_eq!(completed["result"]["taskId"], task_id);
+    assert_eq!(completed["result"]["status"], "completed");
     let tool_res = &completed["result"]["result"];
+    assert_eq!(tool_res["resultType"], "complete", "{completed}");
     assert_eq!(tool_res["isError"], false, "{completed}");
     let parsed: Value =
         serde_json::from_str(tool_res["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(parsed["rows"].as_array().unwrap().len(), 180);
 
-    // While the completed task stays retained in `Tasks`, QueryPool credit MUST remain held.
+    // While the completed task stays retained in `Tasks`, QueryPool credit MUST remain held,
+    // trimmed down from the 16 MiB INITIAL_GRANT slack to the actual retained payload size.
+    let held = pool.granted();
     assert!(
-        pool.granted() > 0,
-        "completed task should retain QueryPool credit until TTL expiry"
+        held > 0 && held < (4 << 20),
+        "completed task should retain trimmed QueryPool credit (0 < held < 4 MiB), got {held}"
     );
 
     // A second `tasks/get` poll on the 16 MiB pool must succeed without deadlocking.
@@ -761,6 +770,7 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
         }),
     )
     .await;
+    assert_eq!(again["result"]["resultType"], "complete", "{again}");
     assert_eq!(again["result"]["status"], "completed", "{again}");
     assert_eq!(again["result"]["result"]["isError"], false);
 
@@ -775,4 +785,688 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
     drop(cw);
     drop(lines);
     let _ = serve_handle.await;
+}
+
+/// F1: `explain_query` with `notes: true` under a tight `query_memory_bytes` ceiling must
+/// return a bounded `budget-memory` error rather than bypassing admission uncredited.
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_query_under_tight_budget_returns_bounded_error_without_bypass() {
+    let ttl = big_turtle(40, 64);
+    let cfg = McpConfig {
+        max_bytes: 1 << 20,
+        query_memory_bytes: Some(1536),
+        ..Default::default()
+    };
+    let (_dir, state, pool) = pooled_state(32 << 20, &ttl, cfg.clone(), 0);
+    let server = McpServer::new(state, cfg);
+
+    let (client, srv) = tokio::io::duplex(1 << 20);
+    let (sr, sw) = tokio::io::split(srv);
+    let serve_handle = tokio::spawn(super::adapter::serve(Adapter::new(server), sr, sw));
+    let (cr, mut cw) = tokio::io::split(client);
+    let mut lines = BufReader::new(cr).lines();
+
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 61,
+        "method": "tools/call",
+        "params": {
+            "_meta": modern_meta(false),
+            "name": "explain_query",
+            "arguments": {
+                "dataset": "t",
+                "query": "PREFIX ex: <http://ex.org/> SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?s",
+                "notes": true
+            }
+        }
+    });
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    cw.write_all(line.as_bytes()).await.unwrap();
+    cw.flush().await.unwrap();
+
+    let reply_line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let reply: Value = serde_json::from_str(&reply_line).unwrap();
+    assert_eq!(reply["id"], 61);
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    assert_eq!(
+        reply["result"]["_meta"]["io.github.kclejeune.sparkles/error"]["code"], "budget-memory",
+        "{reply}"
+    );
+    assert!(
+        reply["result"].get("structuredContent").is_none(),
+        "oversized explain_query payload must not escape uncredited: {reply}"
+    );
+    drop((cw, lines));
+    let _ = serve_handle.await;
+    assert!(wait_for(Duration::from_secs(5), || pool.granted() == 0).await);
+}
+
+/// Custom `AsyncWrite` that accepts at most `chunk` bytes per `poll_write` and yields
+/// `Poll::Pending` on alternate polls to stress partial writes and cancel-safety.
+struct ShortWriter<W> {
+    inner: W,
+    chunk: usize,
+    yield_next: bool,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ShortWriter<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.yield_next {
+            self.yield_next = false;
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        self.yield_next = true;
+        let n = buf.len().min(self.chunk);
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..n])
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// F3, F8, F9:
+/// - `notifications/cancelled` drops a queued large stdio response and releases its credit
+///   even while stdout remains open and backpressured;
+/// - duplicate in-flight `RequestId` is rejected with `-32600` without corrupting the
+///   original request;
+/// - interleaved protocol-error writes on a short-writing sink never tear NDJSON lines.
+#[tokio::test(flavor = "multi_thread")]
+async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
+    let ttl = big_turtle(180, 900);
+    let cfg = McpConfig {
+        max_bytes: 1 << 20,
+        ..Default::default()
+    };
+    let (_dir, state, pool) = pooled_state(64 << 20, &ttl, cfg.clone(), 0);
+    let server = McpServer::new(state, cfg);
+
+    // Subcase 1 (F9 + F8): open 4 KiB backpressured pipe — cancel queued req 2 while req 1
+    // blocks the pipe, and reject a duplicate in-flight req 1.
+    {
+        let (client, srv) = tokio::io::duplex(4096);
+        let (sr, sw) = tokio::io::split(srv);
+        let serve_handle =
+            tokio::spawn(super::adapter::serve(Adapter::new(server.clone()), sr, sw));
+        let (cr, mut cw) = tokio::io::split(client);
+
+        let make_call = |id: u64| {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "_meta": modern_meta(false),
+                    "name": "sparql_query",
+                    "arguments": large_query_args(512 << 10)
+                }
+            });
+            format!("{}\n", serde_json::to_string(&req).unwrap())
+        };
+
+        // Send req 1 so its ~180 KiB response blocks on the 4 KiB duplex pipe.
+        cw.write_all(make_call(101).as_bytes()).await.unwrap();
+        cw.flush().await.unwrap();
+        assert!(wait_for(Duration::from_secs(5), || pool.granted() > 0).await);
+        // Wait for req 1 to finish executing and trim down to its blocked frame size.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let held_by_one = pool.granted();
+        assert!(held_by_one > 0);
+
+        // Send req 2: it executes and queues behind req 1 in `StdioQueue`.
+        cw.write_all(make_call(102).as_bytes()).await.unwrap();
+        cw.flush().await.unwrap();
+        assert!(
+            wait_for(Duration::from_secs(5), || pool.granted() > held_by_one).await,
+            "expected req 2 queued behind backpressured req 1 to add credit"
+        );
+
+        // Cancel req 2 while the pipe stays OPEN and backpressured on req 1!
+        let cancel_2 = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 102 }
+        });
+        cw.write_all(format!("{}\n", serde_json::to_string(&cancel_2).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        cw.flush().await.unwrap();
+        // Req 2's credit MUST drop immediately while req 1 is still blocked on the open pipe.
+        assert!(
+            wait_for(Duration::from_secs(5), || pool.granted() <= held_by_one).await,
+            "cancelled queued stdio frame kept credit under open backpressure: granted={}, held_by_one={held_by_one}",
+            pool.granted()
+        );
+
+        // Now drain req 1 (pipe still open) and verify a subsequent ping works cleanly with
+        // no stray response for cancelled req 2 and pool.granted() == 0!
+        let mut lines = BufReader::new(cr).lines();
+        let line1 = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reply1: Value = serde_json::from_str(&line1).unwrap();
+        assert_eq!(reply1["id"], 101);
+        assert_eq!(reply1["result"]["isError"], false);
+
+        let list = json!({
+            "jsonrpc": "2.0",
+            "id": 103,
+            "method": "tools/list",
+            "params": { "_meta": modern_meta(false) }
+        });
+        cw.write_all(format!("{}\n", serde_json::to_string(&list).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        cw.flush().await.unwrap();
+        let line_list = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reply_list: Value = serde_json::from_str(&line_list).unwrap();
+        assert_eq!(
+            reply_list["id"], 103,
+            "cancelled req 102 must not emit a response before req 103: {reply_list}"
+        );
+        assert!(
+            wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+            "credit leaked on open stdio pipe: granted={}",
+            pool.granted()
+        );
+
+        drop((cw, lines));
+        let _ = serve_handle.await;
+    }
+
+    // Subcase 2 (F8): duplicate in-flight RequestId on stdio is rejected with -32600 while
+    // the original request completes intact.
+    {
+        let (client, srv) = tokio::io::duplex(1 << 20);
+        let (sr, sw) = tokio::io::split(srv);
+        let serve_handle =
+            tokio::spawn(super::adapter::serve(Adapter::new(server.clone()), sr, sw));
+        let (cr, mut cw) = tokio::io::split(client);
+        let mut lines = BufReader::new(cr).lines();
+
+        let req_a = json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "tools/call",
+            "params": {
+                "_meta": modern_meta(false),
+                "name": "sparql_query",
+                "arguments": large_query_args(512 << 10)
+            }
+        });
+        let req_dup = json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "tools/list",
+            "params": { "_meta": modern_meta(false) }
+        });
+        let batch = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&req_a).unwrap(),
+            serde_json::to_string(&req_dup).unwrap()
+        );
+        cw.write_all(batch.as_bytes()).await.unwrap();
+        cw.flush().await.unwrap();
+
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            replies.push(serde_json::from_str::<Value>(&line).unwrap());
+        }
+        assert!(
+            replies
+                .iter()
+                .any(|r| r["id"] == 77 && r["error"]["code"] == -32600),
+            "expected -32600 duplicate ID rejection in {replies:?}"
+        );
+        assert!(
+            replies
+                .iter()
+                .any(|r| r["id"] == 77 && r["result"]["isError"] == false),
+            "expected original request 77 to succeed intact in {replies:?}"
+        );
+        drop((cw, lines));
+        let _ = serve_handle.await;
+        assert!(wait_for(Duration::from_secs(5), || pool.granted() == 0).await);
+    }
+
+    // Subcase 3 (F3): interleaved Invalid Request protocol errors and responses over a
+    // short-writing 7-byte sink produce intact NDJSON lines with zero tearing.
+    {
+        let (client, srv) = tokio::io::duplex(256 << 10);
+        let (sr, sw) = tokio::io::split(srv);
+        let short_sw = ShortWriter {
+            inner: sw,
+            chunk: 7,
+            yield_next: false,
+        };
+        let serve_handle = tokio::spawn(super::adapter::serve(Adapter::new(server), sr, short_sw));
+        let (cr, mut cw) = tokio::io::split(client);
+
+        let mut batch = String::new();
+        for i in 0..6u64 {
+            let valid = json!({
+                "jsonrpc": "2.0",
+                "id": 200 + i,
+                "method": "tools/list",
+                "params": { "_meta": modern_meta(false) }
+            });
+            batch.push_str(&serde_json::to_string(&valid).unwrap());
+            batch.push('\n');
+            // Triggers serde_json Category::Data inside CreditedStdioTransport::receive.
+            batch.push_str("{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":123}\n");
+        }
+        cw.write_all(batch.as_bytes()).await.unwrap();
+        cw.flush().await.unwrap();
+
+        let mut lines = BufReader::new(cr).lines();
+        let mut valid_count = 0usize;
+        let mut err_count = 0usize;
+        for _ in 0..12 {
+            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("intact NDJSON line");
+            let v: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("torn NDJSON frame: {e}: {line:?}"));
+            if v.get("error").is_some() {
+                assert_eq!(v["error"]["code"], -32600);
+                err_count += 1;
+            } else {
+                valid_count += 1;
+            }
+        }
+        assert_eq!(valid_count, 6);
+        assert_eq!(err_count, 6);
+        drop((cw, lines));
+        let _ = serve_handle.await;
+    }
+}
+
+/// F2, F6, F7, F8, F16:
+/// - Mid-write disconnect after Hyper polls the terminal SSE frame to EOF stays replayable;
+/// - Explicit `Last-Event-ID` ack past the terminal frame evicts replay credit immediately;
+/// - Post-cache `notifications/cancelled` evicts replay credit AND discards unread body queues;
+/// - `DELETE /$/mcp` releases credit even while a stalled SSE body sits unread;
+/// - Duplicate in-flight `RequestId` in a legacy session returns `-32600` without breaking
+///   the original request;
+/// - `HttpConf.shutdown.cancel()` releases disconnected replay caches AND retained completed
+///   tasks immediately while the router stays alive.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown() {
+    let ttl = big_turtle(180, 900);
+    let cfg = McpConfig {
+        max_bytes: 1 << 20,
+        http: true,
+        task_after: Duration::ZERO,
+        ..Default::default()
+    };
+    let (_dir, state, pool) = pooled_state(64 << 20, &ttl, cfg, 16);
+    let mut session_cfg = SessionConfig::default();
+    session_cfg.completed_cache_ttl = Duration::from_secs(60);
+    let app = mcp_http_router(state.clone(), session_cfg, Some(Duration::from_secs(60)));
+
+    // Open a legacy session.
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "r1-fix-test", "version": "1"}
+        }
+    });
+    let init_resp = app
+        .clone()
+        .oneshot(http_req("POST", &[ACCEPT, JSON_CT], &init.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(init_resp.status(), StatusCode::OK);
+    let sid = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = axum::body::to_bytes(init_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let init_ack = app
+        .clone()
+        .oneshot(http_req(
+            "POST",
+            &[
+                ACCEPT,
+                JSON_CT,
+                ("mcp-protocol-version", "2025-11-25"),
+                ("mcp-session-id", sid.as_str()),
+            ],
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(init_ack.status(), StatusCode::ACCEPTED);
+
+    let post_query = |id: u64| {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "sparql_query",
+                "arguments": large_query_args(512 << 10)
+            }
+        });
+        http_req(
+            "POST",
+            &[
+                ACCEPT,
+                JSON_CT,
+                ("mcp-protocol-version", "2025-11-25"),
+                ("mcp-session-id", sid.as_str()),
+            ],
+            &body.to_string(),
+        )
+    };
+
+    // 1. (F2) Poll the body ALL the way to EOF and drop it (simulating Hyper buffering the
+    //    terminal frame before TCP drops mid-write). Reconnecting with priming `Last-Event-ID`
+    //    MUST still replay the full terminal response!
+    let resp = app.clone().oneshot(post_query(301)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let full = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let full_text = String::from_utf8_lossy(&full);
+    let event_ids: Vec<&str> = full_text
+        .lines()
+        .filter_map(|l| l.strip_prefix("id: "))
+        .collect();
+    assert!(
+        event_ids.len() >= 2,
+        "expected priming + terminal event ids in {full_text:?}"
+    );
+    let priming_id = event_ids[0].to_string();
+    let terminal_id = event_ids[1].to_string();
+    drop(full);
+    // Replay cache still retains the terminal frame (trimmed well below 16 MiB).
+    assert!(pool.granted() > 0 && pool.granted() < (4 << 20));
+
+    let replay = app
+        .clone()
+        .oneshot(http_req(
+            "GET",
+            &[
+                ("accept", "text/event-stream"),
+                ("mcp-protocol-version", "2025-11-25"),
+                ("mcp-session-id", sid.as_str()),
+                ("last-event-id", priming_id.as_str()),
+            ],
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_bytes = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let replay_text = String::from_utf8_lossy(&replay_bytes);
+    let payload_line = replay_text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .find(|d| d.starts_with('{'))
+        .expect("replayed terminal response after body EOF");
+    let reply: Value = serde_json::from_str(payload_line).unwrap();
+    assert_eq!(reply["id"], 301);
+    assert_eq!(reply["result"]["isError"], false);
+    drop(replay_bytes);
+
+    // Explicit client ack at `terminal_id` evicts the replay entry immediately!
+    let ack = app
+        .clone()
+        .oneshot(http_req(
+            "GET",
+            &[
+                ("accept", "text/event-stream"),
+                ("mcp-protocol-version", "2025-11-25"),
+                ("mcp-session-id", sid.as_str()),
+                ("last-event-id", terminal_id.as_str()),
+            ],
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ack.status(), StatusCode::OK);
+    drop(ack);
+    assert!(
+        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        "client Last-Event-ID ack at terminal frame did not evict replay credit: granted={}",
+        pool.granted()
+    );
+
+    // 2. (F6) Hold an SSE response body completely UNREAD so its terminal frame sits in BOTH
+    //    the body queue and the replay cache; post-cache `notifications/cancelled` must drop
+    //    BOTH and return credit to 0 immediately while `unread_resp` is still alive!
+    let unread_resp = app.clone().oneshot(post_query(302)).await.unwrap();
+    assert_eq!(unread_resp.status(), StatusCode::OK);
+    assert!(wait_for(Duration::from_secs(5), || pool.granted() > 0).await);
+    // Give the handler time to finish caching the terminal frame.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let cancel_302 = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": 302 }
+    });
+    let cancel_resp = app
+        .clone()
+        .oneshot(http_req(
+            "POST",
+            &[
+                ACCEPT,
+                JSON_CT,
+                ("mcp-protocol-version", "2025-11-25"),
+                ("mcp-session-id", sid.as_str()),
+            ],
+            &cancel_302.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), StatusCode::ACCEPTED);
+    assert!(
+        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        "post-cache notifications/cancelled failed to release unread body + replay credit: granted={}",
+        pool.granted()
+    );
+    drop(unread_resp);
+
+    // 3. (F7) Create BOTH an unread/disconnected replay entry AND a retained completed task
+    //    (with 60 s TTLs), then cancel `HttpConf.shutdown` WITHOUT dropping `app` -> credit
+    //    MUST drop to 0 immediately!
+    let held_sse = app.clone().oneshot(post_query(303)).await.unwrap();
+    assert_eq!(held_sse.status(), StatusCode::OK);
+    let task_start = app
+        .clone()
+        .oneshot(http_req(
+            "POST",
+            &[
+                ACCEPT,
+                JSON_CT,
+                ("mcp-protocol-version", "2026-07-28"),
+                ("mcp-method", "tools/call"),
+                ("mcp-name", "sparql_query"),
+            ],
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 304,
+                "method": "tools/call",
+                "params": {
+                    "_meta": modern_meta(true),
+                    "name": "sparql_query",
+                    "arguments": large_query_args(512 << 10)
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(task_start.status(), StatusCode::OK);
+    let start_raw = axum::body::to_bytes(task_start.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let start_v: Value = serde_json::from_slice(&start_raw).unwrap();
+    let task_id = start_v["result"]["taskId"].as_str().unwrap().to_string();
+    // Wait until the task finishes and is retained.
+    for poll in 0..50 {
+        let poll_resp = app
+            .clone()
+            .oneshot(http_req(
+                "POST",
+                &[
+                    ACCEPT,
+                    JSON_CT,
+                    ("mcp-protocol-version", "2026-07-28"),
+                    ("mcp-method", "tasks/get"),
+                ],
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 400 + poll,
+                    "method": "tasks/get",
+                    "params": { "_meta": modern_meta(true), "taskId": task_id }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let raw = axum::body::to_bytes(poll_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&raw).unwrap();
+        if v["result"]["status"] == "completed" {
+            assert_eq!(v["result"]["resultType"], "complete", "{v}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(pool.granted() > 0);
+
+    // Fire HTTP shutdown while `app` and `held_sse` are still alive!
+    state.mcp.as_ref().unwrap().shutdown.cancel();
+    assert!(
+        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        "HttpConf.shutdown did not immediately release session replay + task credit: granted={}",
+        pool.granted()
+    );
+    drop(held_sse);
+    drop(app);
+}
+
+/// F10 & F12: 20 small completed background tasks on a 32 MiB pool trim their grants so they
+/// hold < 1 MiB total (instead of 20 * 16 MiB = 320 MiB) and never starve new queries.
+#[tokio::test(flavor = "multi_thread")]
+async fn many_small_completed_tasks_trim_grants_and_never_starve_pool() {
+    use super::errors::ErrorContext;
+    use super::retained::RetainedCallResult;
+    use super::tasks::{TaskOutcome, Tasks};
+    use sparkles::access::Preparation;
+    use sparkles::sparql::pool::INITIAL_GRANT;
+    use sparkles::task::Control;
+    use std::sync::atomic::AtomicBool;
+
+    let pool = QueryPool::new(32 << 20);
+    let tasks = Tasks::with_ttl(Duration::from_secs(60));
+    let mut task_ids = Vec::new();
+    for i in 0..20usize {
+        // Every call starts with a full 16 MiB `INITIAL_GRANT` (20 * 16 MiB = 320 MiB >> 32 MiB).
+        let grant =
+            Arc::new(pool.try_grant(INITIAL_GRANT).unwrap_or_else(|| {
+                panic!("pool starved before task {i}: granted={}", pool.granted())
+            }));
+        assert_eq!(grant.granted(), INITIAL_GRANT);
+        let prep = Preparation::with_grant(Control::none(), 4 << 20, grant.clone()).unwrap();
+        let err_ctx = ErrorContext {
+            timeout_secs: 30.0,
+            max_timeout_secs: 60.0,
+            prefix_names: &[],
+            request_id: "trim",
+        };
+        let retained = RetainedCallResult::from_outcome(
+            Ok(Outcome::Text(format!("small-task-result-{i}"))),
+            &prep,
+            true,
+            &err_ctx,
+        )
+        .unwrap();
+        drop(prep);
+        drop(grant);
+        let work = tokio::spawn(async move { TaskOutcome::Retained(retained) });
+        let task = tasks
+            .try_start_retained("alice".into(), work, Arc::new(AtomicBool::new(false)))
+            .ok()
+            .expect("task admitted");
+        // Wait for this task to complete and trim its grant before admitting the next one.
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                tasks
+                    .get("alice", &task.task_id)
+                    .is_ok_and(|d| d.task.status == rmcp::model::TaskStatus::Completed)
+            })
+            .await,
+            "task {i} did not complete"
+        );
+        task_ids.push(task.task_id);
+    }
+
+    // All 20 retained tasks together MUST hold far less than 1 MiB (not 20 * 16 MiB = 320 MiB!).
+    let granted = pool.granted();
+    assert!(
+        granted > 0 && granted < (1 << 20),
+        "20 small completed tasks held too much pool credit: {granted} bytes"
+    );
+    // A fresh 16 MiB query grant still admits immediately on the 32 MiB pool!
+    let fresh_grant = pool
+        .try_grant(INITIAL_GRANT)
+        .expect("32 MiB pool must still admit a 16 MiB query beside 20 small completed tasks");
+    drop(fresh_grant);
+
+    // Shutdown releases every retained task and returns pool credit to 0.
+    tasks.shutdown();
+    assert!(
+        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        "tasks.shutdown() leaked credit: granted={}",
+        pool.granted()
+    );
+    assert_eq!(task_ids.len(), 20);
 }
