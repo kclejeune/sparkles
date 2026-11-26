@@ -385,7 +385,7 @@ impl super::Store {
         };
         let retained = charge
             .delta_bytes
-            .checked_add(snapshot.generation.retained_bytes_limited(&limit)?)
+            .checked_add(snapshot.generation.retained_bytes_with(&limit)?)
             .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))
             .ok_or_else(|| selection.exhausted())?;
         if retained > allowance {

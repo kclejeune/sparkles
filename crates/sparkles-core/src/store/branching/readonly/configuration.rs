@@ -74,7 +74,7 @@ impl PrimaryReader {
         )?;
         let result = (|| {
             let family_root = super::super::super::link::dataset_root_of(root)?;
-            let family = commit::read_dataset_file_controlled(&family_root, budget)?
+            let family = commit::read_dataset_file_with(&family_root, budget)?
                 .ok_or_else(|| Error::Corrupt("primary family identity is missing".into()))?;
             let bytes = budget.read_file(&root.join(BRANCH_FILE))?;
             let mut raw: Loaded<serde_json::Value> = budget.json(&bytes)?;

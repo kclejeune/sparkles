@@ -34,10 +34,8 @@ pub(super) fn select_catalog(
             At::Time(ms) => commit.timestamp_ms <= *ms,
             _ => wanted == Some(commit.seq),
         };
-        let catalog = commit::walk_catalog_controlled(
-            &root.join("commits.bin"),
-            budget,
-            |commit, budget| {
+        let catalog =
+            commit::walk_catalog_with(&root.join("commits.bin"), budget, |commit, budget| {
                 budget.check()?;
                 if commit.seq > head {
                     return Ok(());
@@ -54,8 +52,7 @@ pub(super) fn select_catalog(
                     selected = Some(commit);
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         if catalog.is_some_and(|(found, _, _)| found != id) {
             return Err(Error::Corrupt(
                 "retained catalog belongs to another branch".into(),

@@ -10,7 +10,7 @@ use std::{fs::File, io::Read, path::Path};
 
 mod linked;
 mod value;
-pub(super) use linked::{head_vocabulary_controlled, read_link_controlled};
+pub(super) use linked::{head_vocabulary_controlled, open_link_vocabulary, segment_dir};
 
 const CHUNK: usize = 64 << 10;
 // The input stays live while Serde owns its scratch and decoded containers. Metadata
@@ -79,7 +79,7 @@ impl<'a> ColdBudget<'a> {
         self.limit.holding(self.used)
     }
 
-    fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32]> {
+    pub(crate) fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         let mut digest = Sha256::new();
         for chunk in bytes.chunks(CHUNK) {
@@ -437,12 +437,19 @@ impl super::Generation {
     /// Also accounts for a sealed generation first opened by the compatible
     /// unlimited API. Current live generations are handled as store-owned backing
     /// by the caller, rather than copied into each request's owned parse scope.
-    pub(crate) fn retained_bytes_limited(&self, limit: &ReadLimit<'_>) -> Result<u64> {
+    pub(crate) fn retained_bytes_with<C: crate::budgeted::Control>(
+        &self,
+        limit: &C,
+    ) -> Result<u64> {
+        if !C::ACCOUNTS {
+            return Ok(0);
+        }
         if self.cold_bytes != 0 {
             limit.check(self.cold_bytes)?;
             return Ok(self.cold_bytes);
         }
-        let mut budget = ColdBudget::new(*limit)?;
+        let read_limit = limit.read_limit();
+        let mut budget = ColdBudget::new(read_limit)?;
         budget.charge(
             std::mem::size_of::<Self>() as u64
                 + 256
@@ -450,7 +457,7 @@ impl super::Generation {
                 + self.dir.as_ref().map_or(0, |p| p.as_os_str().len()) as u64,
         )?;
         budget.charge(self.vocab.resident_bytes() + 64)?;
-        budget.charge(self.dvocab.resident_bytes_limited(limit)?)?;
+        budget.charge(self.dvocab.resident_bytes_limited(&read_limit)?)?;
         budget.charge(
             self.perms.capacity() as u64 * std::mem::size_of::<crate::index::PermIndex>() as u64,
         )?;
@@ -507,45 +514,41 @@ impl super::Generation {
         Ok(budget.used())
     }
 
-    /// Open immutable base files without a writer, recovery or mutable sidecars.
-    /// The caller keeps its history/origin retention guard until publication.
-    pub(crate) fn open_sealed_controlled(
+    /// Open immutable base files without a writer, recovery or mutable sidecars under
+    /// `control`. Under [`crate::budgeted::Unlimited`], all accounting compiles away.
+    pub(crate) fn open_sealed_with<C: crate::budgeted::BudgetControl>(
         dir: &Path,
         name: &str,
         written_by: Option<&str>,
-        budget: &mut ColdBudget<'_>,
+        control: &mut C,
     ) -> Result<Loaded<Self>> {
-        Self::open_base_controlled(dir, name, written_by, None, budget)
+        Self::open_base_with(dir, name, written_by, None, control)
     }
 
-    fn open_base_controlled(
+    pub(crate) fn open_base_with<C: crate::budgeted::BudgetControl>(
         dir: &Path,
         name: &str,
         written_by: Option<&str>,
         dvocab: Option<Loaded<crate::vocab::DeltaVocab>>,
-        budget: &mut ColdBudget<'_>,
+        control: &mut C,
     ) -> Result<Loaded<Self>> {
-        use crate::{
-            builder,
-            index::Perm,
-            vocab::{DeltaVocab, Vocab},
-        };
+        use crate::{builder, index::Perm};
         use std::sync::Arc;
-        let start = budget
+        let start = control
             .used()
             .checked_sub(dvocab.as_ref().map_or(0, |v| v.charge))
             .expect("supplied dictionary is admitted by the same cold budget");
         // Paths/names and wrapper allocations remain live with the generation.
-        budget.charge(
+        control.charge(
             std::mem::size_of::<Self>() as u64
                 + 256
                 + name.len() as u64
                 + dir.as_os_str().len() as u64,
         )?;
-        let bytes = budget.read_file(&dir.join("meta.json"))?;
+        let bytes = control.read_file(&dir.join("meta.json"))?;
         // Preserve the existing version-first refusal, including a future metadata
-        // shape. Both passes use the same controlled Serde reader.
-        let version: Loaded<serde_json::Value> = budget.json(&bytes)?;
+        // shape. Under accounting control, both passes use the same controlled reader.
+        let version: Loaded<serde_json::Value> = control.json(&bytes, "meta.json")?;
         let number = version
             .value
             .get("format_version")
@@ -554,62 +557,91 @@ impl super::Generation {
             .ok_or_else(|| {
                 Error::Corrupt("meta.json: format_version is missing or not a u32".into())
             })?;
-        crate::formats::INDEX.check("historical generation", number, written_by)?;
+        let dir_label = (!C::ACCOUNTS).then(|| dir.display().to_string());
+        let label = dir_label.as_deref().unwrap_or("historical generation");
+        crate::formats::INDEX.check(label, number, written_by)?;
         builder::check_features_listed(&version.value, "meta.json")?;
-        drop(version.value);
-        budget.release(version.charge);
-        let meta: Loaded<builder::IndexMeta> = budget.json(&bytes)?;
-        budget.drop_vec(bytes);
-        // check_features only allocates on an unsupported-feature error. Its
-        // payloads and output remain covered by the admitted metadata parse lease.
-        for feature in &meta.value.features {
-            budget.check()?;
-            builder::check_features(
-                "historical generation",
-                std::slice::from_ref(feature),
-                written_by,
-            )?;
-        }
-        let meta = retain_meta(meta, budget)?;
-        let bytes = budget.read_file(&dir.join("stats.json"))?;
-        let stats: Loaded<builder::Stats> = budget.json(&bytes)?;
-        budget.drop_vec(bytes);
-        let stats = retain_stats(stats, budget)?;
-        let vocab =
-            Vocab::open_controlled(dir, meta.has_feature(builder::FEATURE_FSST_VOCAB), budget)?;
-        budget.charge(64)?;
+        let meta: Loaded<builder::IndexMeta> = if C::ACCOUNTS {
+            drop(version.value);
+            control.release(version.charge);
+            let meta = control.json(&bytes, "meta.json")?;
+            control.drop_vec(bytes);
+            meta
+        } else {
+            control.drop_vec(bytes);
+            Loaded {
+                value: control.value(version.value, "meta.json")?,
+                charge: 0,
+            }
+        };
+        let meta = if C::ACCOUNTS {
+            // check_features only allocates on an unsupported-feature error. Its
+            // payloads and output remain covered by the admitted metadata parse lease.
+            for feature in &meta.value.features {
+                control.check(0)?;
+                builder::check_features(
+                    "historical generation",
+                    std::slice::from_ref(feature),
+                    written_by,
+                )?;
+            }
+            retain_meta(meta, control)?
+        } else {
+            builder::check_features(label, &meta.value.features, written_by)?;
+            meta.value
+        };
+        let bytes = control.read_file(&dir.join("stats.json"))?;
+        let stats: Loaded<builder::Stats> = control.json(&bytes, "stats.json")?;
+        control.drop_vec(bytes);
+        let stats = if C::ACCOUNTS {
+            retain_stats(stats, control)?
+        } else {
+            if let Some(why) = stats.value.correlations.refusal() {
+                tracing::warn!(target: "sparkles::store", "generation {name}: {why}");
+            }
+            stats.value
+        };
+        let vocab = control.open_vocab(dir, meta.has_feature(builder::FEATURE_FSST_VOCAB))?;
+        control.charge(64)?;
         let vocab = Arc::new(vocab.value);
         let dvocab = match dvocab {
             Some(vocab) => vocab,
-            None => DeltaVocab::open_read_only_controlled(&dir.join("delta.vocab"), budget)?,
+            None => control.open_dvocab_ro(&dir.join("delta.vocab"))?,
         };
         let mut perms = Vec::new();
-        budget.reserve(&mut perms, Perm::ALL.len())?;
+        control.reserve(&mut perms, Perm::ALL.len())?;
         for perm in Perm::ALL {
-            budget.check()?;
-            perms.push(crate::index::PermIndex::open_controlled(dir, perm, budget)?.value);
+            control.check(0)?;
+            perms.push(crate::index::PermIndex::open_with(
+                dir, perm, true, control,
+            )?);
         }
         // Pattern opening maps immutable data and decodes at most two fixed table
         // descriptors. Bound its wrappers and optional diagnostic before opening.
-        let allowance = std::mem::size_of::<crate::patterns::PatternFile>() as u64
-            + 2048
-            + dir.as_os_str().len() as u64 * 3
-            + meta
-                .patterns
-                .as_ref()
-                .and_then(|p| p.skipped.as_ref())
-                .map_or(0, |s| s.len()) as u64;
-        budget.charge(allowance)?;
-        budget.check()?;
-        let patterns = crate::patterns::Loaded::open(dir, meta.patterns.as_ref());
-        budget.check()?;
-        let retained = if patterns.file.is_some() {
-            std::mem::size_of::<crate::patterns::PatternFile>() as u64 + 64
+        let patterns = if C::ACCOUNTS {
+            let allowance = std::mem::size_of::<crate::patterns::PatternFile>() as u64
+                + 2048
+                + dir.as_os_str().len() as u64 * 3
+                + meta
+                    .patterns
+                    .as_ref()
+                    .and_then(|p| p.skipped.as_ref())
+                    .map_or(0, |s| s.len()) as u64;
+            control.charge(allowance)?;
+            control.check(0)?;
+            let patterns = crate::patterns::Loaded::open(dir, meta.patterns.as_ref());
+            control.check(0)?;
+            let retained = if patterns.file.is_some() {
+                std::mem::size_of::<crate::patterns::PatternFile>() as u64 + 64
+            } else {
+                patterns.missing.as_ref().map_or(0, |s| s.len() as u64 + 64)
+            };
+            control.release(allowance - retained);
+            patterns
         } else {
-            patterns.missing.as_ref().map_or(0, |s| s.len() as u64 + 64)
+            crate::patterns::Loaded::open(dir, meta.patterns.as_ref())
         };
-        budget.release(allowance - retained);
-        let charge = budget.used() - start;
+        let charge = control.used() - start;
         let value = Self {
             uid: crate::index::next_uid(),
             name: name.to_owned(),
@@ -631,27 +663,27 @@ impl super::Generation {
             link: None,
             cold_bytes: charge,
         };
-        budget.check()?;
+        control.check(0)?;
         Ok(Loaded { value, charge })
     }
 }
 
-fn retain_meta(
+fn retain_meta<C: crate::budgeted::BudgetControl>(
     loaded: Loaded<crate::builder::IndexMeta>,
-    budget: &mut ColdBudget<'_>,
+    budget: &mut C,
 ) -> Result<crate::builder::IndexMeta> {
     let meta = &loaded.value;
     let mut retained = meta.created.capacity() as u64
         + meta.features.capacity() as u64 * std::mem::size_of::<String>() as u64
         + 256;
     for (key, value) in &meta.prefixes {
-        budget.check()?;
+        budget.check(0)?;
         retained = retained
             .checked_add(key.capacity() as u64 + value.capacity() as u64 + 256)
             .ok_or_else(|| budget.exhausted())?;
     }
     for feature in &meta.features {
-        budget.check()?;
+        budget.check(0)?;
         retained = retained
             .checked_add(feature.capacity() as u64)
             .ok_or_else(|| budget.exhausted())?;
@@ -664,16 +696,20 @@ fn retain_meta(
     retain_parse(loaded, retained, budget)
 }
 
-fn retain_stats(
+fn retain_stats<C: crate::budgeted::BudgetControl>(
     loaded: Loaded<crate::builder::Stats>,
-    budget: &mut ColdBudget<'_>,
+    budget: &mut C,
 ) -> Result<crate::builder::Stats> {
-    budget.check()?;
+    budget.check(0)?;
     let retained = loaded.value.heap_bytes();
     retain_parse(loaded, retained, budget)
 }
 
-fn retain_parse<T>(loaded: Loaded<T>, retained: u64, budget: &mut ColdBudget<'_>) -> Result<T> {
+pub(super) fn retain_parse<T, C: crate::budgeted::BudgetControl>(
+    loaded: Loaded<T>,
+    retained: u64,
+    budget: &mut C,
+) -> Result<T> {
     if retained > loaded.charge {
         budget.charge(retained - loaded.charge)?;
     } else {
@@ -756,7 +792,7 @@ mod tests {
             crate::annotations::seqs_controlled(root.path(), uuid::Uuid::new_v4(), &mut budget)
                 .map(|loaded| drop(loaded.value))
         } else {
-            crate::commit::walk_catalog_controlled(&path, &mut budget, |_, _| Ok(())).map(|_| ())
+            crate::commit::walk_catalog_with(&path, &mut budget, |_, _| Ok(())).map(|_| ())
         };
         writer.join().unwrap();
         assert!(
@@ -1104,7 +1140,7 @@ mod tests {
                 held: 0,
             })
             .unwrap();
-            let loaded = super::super::Generation::open_sealed_controlled(
+            let loaded = super::super::Generation::open_sealed_with(
                 dir.path(),
                 "gen-0001",
                 None,
@@ -1145,12 +1181,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            super::super::Generation::open_sealed_controlled(
-                dir.path(),
-                "gen-0001",
-                None,
-                &mut budget
-            ),
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget),
             Err(Error::BudgetExceeded(_))
         ));
         assert_eq!(before, durable_bytes(dir.path()));
@@ -1167,12 +1198,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            super::super::Generation::open_sealed_controlled(
-                dir.path(),
-                "gen-0001",
-                None,
-                &mut budget
-            ),
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget),
             Err(Error::Unsupported(_))
         ));
         assert_eq!(before, durable_bytes(dir.path()));
@@ -1237,5 +1263,60 @@ mod tests {
             held: 0,
         };
         assert!(matches!(ColdBudget::new(limit), Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn ordinary_open_matches_read_index_meta_duplicate_key_and_exact_small_capacities() {
+        use crate::{builder, index::Perm};
+        let dir = immutable_base(false);
+        let normal = super::super::Generation::open_sealed(dir.path(), "gen-0001").unwrap();
+        assert_eq!(normal.perms.capacity(), Perm::ALL.len());
+        for perm in Perm::ALL {
+            let p = normal.perm(perm);
+            assert_eq!(p.blocks.len(), 1);
+            assert_eq!(p.blocks.capacity(), 1);
+            let segs = p.segs.as_ref().expect("segmented");
+            assert_eq!(segs.start_len_and_capacity(), (2, 2));
+        }
+        let options = HistoryOptions::default();
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(16 << 20),
+            held: 0,
+        };
+        let retained_normal = normal.retained_bytes_with(&limit).unwrap();
+        let mut budget = ColdBudget::new(limit).unwrap();
+        let loaded =
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget)
+                .unwrap();
+        for perm in Perm::ALL {
+            assert_eq!(
+                normal.perm(perm).resident_bytes(),
+                loaded.value.perm(perm).resident_bytes()
+            );
+        }
+        let exact_cap = ReadLimit {
+            options: &options,
+            memory: Some(retained_normal),
+            held: 0,
+        };
+        assert_eq!(
+            normal.retained_bytes_with(&exact_cap).unwrap(),
+            retained_normal
+        );
+        drop(loaded.value);
+        budget.release(loaded.charge);
+
+        // Repeat a known JSON key ("quads") as `builder::read_index_meta` accepts via `Value`.
+        let meta_path = dir.path().join("meta.json");
+        let raw = std::fs::read_to_string(&meta_path).unwrap();
+        let needle = "\"quads\":";
+        let pos = raw.find(needle).expect("quads field present");
+        let duplicated = format!("{}\"quads\": 0, {}", &raw[..pos], &raw[pos..]);
+        std::fs::write(&meta_path, duplicated).unwrap();
+        let expected = builder::read_index_meta(dir.path(), None).unwrap();
+        let opened = super::super::Generation::open_sealed(dir.path(), "gen-0001").unwrap();
+        assert_eq!(opened.meta.quads, expected.quads);
+        assert_eq!(opened.meta.features, expected.features);
     }
 }

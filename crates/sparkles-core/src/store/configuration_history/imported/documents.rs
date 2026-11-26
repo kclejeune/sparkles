@@ -476,7 +476,7 @@ pub(super) fn dataset_id(bytes: &[u8], preparation: &Preparation) -> Result<Uuid
         memory: Some(allowance),
         held: 0,
     })?;
-    crate::commit::dataset_id_bytes_controlled(bytes, &mut budget)
+    crate::commit::dataset_id_bytes_with(bytes, &mut budget)
 }
 
 pub(super) fn branch_identity(

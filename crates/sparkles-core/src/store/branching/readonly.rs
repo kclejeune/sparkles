@@ -46,7 +46,7 @@ fn check_identity(
                 "retained branch descriptor disagrees with its family table".into(),
             ));
         }
-        if commit::read_dataset_file_controlled(root, budget)? != Some(entry.id) {
+        if commit::read_dataset_file_with(root, budget)? != Some(entry.id) {
             return Err(Error::Corrupt(
                 "retained branch dataset identity is missing or foreign".into(),
             ));
@@ -147,7 +147,7 @@ fn current_controlled(
         })?;
         budget.release(iteration_scratch);
         budget.drop_vec(bytes);
-        let physical = commit::read_gen_commit_controlled(&dir, budget)?.ok_or_else(|| {
+        let physical = commit::read_gen_commit_with(&dir, budget)?.ok_or_else(|| {
             Error::Corrupt("retained CURRENT has no physical commit identity".into())
         })?;
         if physical.value.dataset_id != id {
@@ -276,7 +276,7 @@ pub(in crate::store) fn authenticate_retained_generation(
             .saturating_add(entry.name.len() as u64 * 4)
             .saturating_add(2048),
     )?;
-    let physical = commit::read_gen_commit_controlled(&entry.dir, &mut budget)?;
+    let physical = commit::read_gen_commit_with(&entry.dir, &mut budget)?;
     if physical.as_ref().is_some_and(|physical| {
         physical.value.dataset_id != store.dataset_id || physical.value.commit.seq != entry.base.seq
     }) {
@@ -430,7 +430,7 @@ fn generation_for(
                 (root.as_os_str().len() as u64 + text.len() as u64 + 128).saturating_mul(4);
             budget.charge(path_charge)?;
             let dir = entry.path();
-            let Some(identity) = commit::read_gen_commit_controlled(&dir, budget)? else {
+            let Some(identity) = commit::read_gen_commit_with(&dir, budget)? else {
                 drop(dir);
                 budget.release(budget.used() - before);
                 continue;
@@ -537,7 +537,7 @@ impl Store {
             return Err(branch::no_such_branch(&id.to_string()));
         }
         let table = limit.lock(&set.table)?;
-        let entry = table.any_by_id_limited(id, limit)?.ok_or_else(|| {
+        let entry = table.any_by_id_with(id, limit)?.ok_or_else(|| {
             BranchError::error(
                 BranchErrorKind::Gone,
                 "merge-base-gone",
@@ -717,16 +717,17 @@ impl Store {
             });
         }
         let geo = historical_geo_controlled(&root, &set.opts, &mut budget)?;
-        let loaded = match cold::read_link_controlled(&selected.value.dir, &mut budget)? {
-            Some(file) => Generation::open_linked_controlled(
+        let loaded = match link::read_link_with(&selected.value.dir, &mut budget)? {
+            Some(file) => Generation::open_linked_with(
                 &selected.value.dir,
                 &selected.value.name,
                 &root,
                 file,
+                true,
                 &self.cache,
                 &mut budget,
             )?,
-            None => Generation::open_sealed_controlled(
+            None => Generation::open_sealed_with(
                 &selected.value.dir,
                 &selected.value.name,
                 None,
@@ -864,7 +865,7 @@ fn generation_end(
     }
     let mut recorded = None;
     let catalog =
-        commit::walk_catalog_controlled(&root.join("commits.bin"), budget, |commit, budget| {
+        commit::walk_catalog_with(&root.join("commits.bin"), budget, |commit, budget| {
             budget.check()?;
             if commit.seq <= head && commit.generation == generation.number {
                 recorded = Some(commit.seq.max(generation.base.seq));

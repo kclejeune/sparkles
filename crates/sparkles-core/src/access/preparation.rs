@@ -660,6 +660,16 @@ impl Preparation {
         limit.saturating_sub(counter.load(Ordering::Relaxed))
     }
 
+    /// The active budget's remaining allowance, capped by the backing pool grant's
+    /// growth headroom when one is attached.
+    pub(crate) fn available_room(&self) -> u64 {
+        let local = self.room();
+        self.inner
+            .grant
+            .as_ref()
+            .map_or(local, |grant| local.min(grant.growth_room()))
+    }
+
     // This is a sizing observation only. The actual reservation below the
     // selection boundary still decides atomic local/pool admission.
     pub(crate) fn selection_room(&self) -> u64 {
@@ -680,12 +690,7 @@ impl Preparation {
     /// the room the grant already covers when another grant takes free pool
     /// granules first. Returns the actual reserved allowance and its guard.
     pub(crate) fn reserve_available(&self) -> Result<(u64, Reservation)> {
-        let local = self.room();
-        let allowance = self
-            .inner
-            .grant
-            .as_ref()
-            .map_or(local, |grant| local.min(grant.growth_room()));
+        let allowance = self.available_room();
         match self.reserve(allowance) {
             Ok(held) => Ok((allowance, held)),
             Err(Error::BudgetExceeded(_)) => {

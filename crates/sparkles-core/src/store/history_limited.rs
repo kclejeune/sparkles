@@ -111,9 +111,9 @@ impl Store {
         use branching::readonly::{OriginRead, Purpose};
         for _ in 0..1024 {
             limit.check(0)?;
-            commit = self.owned_set()?.normalize_limited(commit, limit)?;
+            commit = self.owned_set()?.normalize_with(commit, limit)?;
             let result = if commit.branch_id == self.dataset_id {
-                self.resolve_limited(&At::Commit(commit.seq), limit)
+                self.resolve_under(&At::Commit(commit.seq), limit)
                     .map(|resolved| OriginRead::Clock(resolved.commit.timestamp_ms))
             } else {
                 match self.readonly_branch_read_limited(
@@ -123,7 +123,7 @@ impl Store {
                     limit,
                 )? {
                     OriginRead::Resident(store) => store
-                        .resolve_limited(&At::Commit(commit.seq), limit)
+                        .resolve_under(&At::Commit(commit.seq), limit)
                         .map(|resolved| OriginRead::Clock(resolved.commit.timestamp_ms)),
                     value => Ok(value),
                 }
@@ -150,9 +150,16 @@ impl Store {
         Err(Error::invalid("fork clock has no acyclic retained origin"))
     }
 
-    /// [`resolve`](Store::resolve) under `limit`, which also refuses an invalid snapshot
-    /// name and takes the writer's head under its control.
-    pub(super) fn resolve_limited(&self, at: &At, limit: &ReadLimit<'_>) -> Result<Resolved> {
+    /// [`resolve`](Store::resolve) under `limit`. Under an accounting control, refuses an
+    /// invalid snapshot name and takes the writer's head under its control.
+    pub(super) fn resolve_under<C: crate::budgeted::Control>(
+        &self,
+        at: &At,
+        limit: &C,
+    ) -> Result<Resolved> {
+        if !C::ACCOUNTS {
+            return self.resolve(at);
+        }
         if let At::Snapshot(name) = at
             && !crate::history::valid_name(name)
         {
@@ -161,77 +168,6 @@ impl Store {
         // Capture the same writer head as resolve(), but do not wait without control.
         let head = limit.lock(&self.writer)?.head;
         self.resolve_in(at, head, limit)
-    }
-
-    pub(super) fn history_generation_limited(
-        &self,
-        history: &mut crate::history::HistoryState,
-        owner: u32,
-        current: u32,
-        live: &Snapshot,
-        limit: &ReadLimit<'_>,
-        through: u64,
-    ) -> Result<Arc<Generation>> {
-        limit.check(0)?;
-        if owner == current {
-            return Ok(live.generation.clone());
-        }
-        let entry = history.gens.get(&owner).ok_or_else(|| {
-            Error::HistoryUnsupported("the selected generation is no longer retained".into())
-        })?;
-        branching::readonly::authenticate_retained_generation(self, entry, limit, through)?;
-        if let Some(index) = history.open.iter().position(|(number, _)| *number == owner) {
-            history.open[index].1.retained_bytes_limited(limit)?;
-            let entry = history.open.remove(index);
-            let generation = entry.1.clone();
-            history.open.insert(0, entry);
-            limit.check(0)?;
-            return Ok(generation);
-        }
-        let entry = history.gens.get(&owner).ok_or_else(|| {
-            Error::HistoryUnsupported("the selected generation is no longer retained".into())
-        })?;
-        let mut budget = cold::ColdBudget::new(*limit)?;
-        let loaded = match cold::read_link_controlled(&entry.dir, &mut budget)? {
-            Some(file) => Generation::open_linked_controlled(
-                &entry.dir,
-                &entry.name,
-                self.root.as_deref().ok_or_else(|| {
-                    Error::HistoryUnsupported("linked history needs a persistent origin".into())
-                })?,
-                file,
-                &self.cache,
-                &mut budget,
-            )?,
-            None => Generation::open_sealed_controlled(&entry.dir, &entry.name, None, &mut budget)?,
-        };
-        let generation = Arc::new(loaded.value);
-        // Caching the backing generation is optional. Do not grow an unrelated
-        // shared vector outside this request's remaining preparation allowance.
-        if history.open.capacity() < 2 {
-            let relocating = (history.open.capacity() + 2) as u64
-                * std::mem::size_of::<(u32, Arc<Generation>)>() as u64;
-            let fits = match limit.check(loaded.charge.saturating_add(relocating)) {
-                Ok(()) => true,
-                Err(Error::BudgetExceeded(_)) => false,
-                Err(error) => return Err(error),
-            };
-            if !fits
-                || history
-                    .open
-                    .try_reserve_exact(2 - history.open.len())
-                    .is_err()
-            {
-                limit.check(loaded.charge)?;
-                return Ok(generation);
-            }
-        }
-        while history.open.len() >= 2 {
-            history.open.pop();
-        }
-        history.open.insert(0, (owner, generation.clone()));
-        limit.check(loaded.charge)?;
-        Ok(generation)
     }
 
     pub(super) fn cache_limited_snapshot(
@@ -388,11 +324,11 @@ impl Store {
                 max_memory_bytes,
             );
         }
-        self.listed_limited(branch, &limit)?;
+        self.listed_with(branch, &limit)?;
         let read =
             self.snapshot_from_limited(PinnedSource::Cold(branch), at, options, max_memory_bytes)?;
         // A branch deleted while it was read no longer names this state.
-        self.listed_limited(branch, &limit)?;
+        self.listed_with(branch, &limit)?;
         Ok(read)
     }
 
@@ -507,7 +443,7 @@ impl Store {
                         }
                     }
                     hops += 1;
-                    let owner = self.owned_set()?.normalize_limited(commit, &limit)?;
+                    let owner = self.owned_set()?.normalize_with(commit, &limit)?;
                     selected = if owner.branch_id == self.dataset_id {
                         Source::Resident(branching::BranchStore::Main(self))
                     } else {

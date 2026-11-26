@@ -1210,7 +1210,7 @@ pub(crate) fn apply_forward<C: Control>(
                 let held = super::history_limited::preparation_mutation_bytes(delta)
                     .saturating_add(buffers);
                 limit.check(held)?;
-                spo.contains_limited(cache, &Perm::Spo.to_key(&q), &limit.read_limit(), held)?
+                spo.contains_with(cache, &Perm::Spo.to_key(&q), limit, held)?
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };
@@ -1350,7 +1350,7 @@ pub(crate) fn apply_backward<C: Control>(
                     .saturating_add(held_buffers)
                     .saturating_add(fwd.capacity() as u64);
                 limit.check(held)?;
-                spo.contains_limited(cache, &Perm::Spo.to_key(&q), &limit.read_limit(), held)?
+                spo.contains_with(cache, &Perm::Spo.to_key(&q), limit, held)?
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };

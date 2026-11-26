@@ -1,6 +1,6 @@
 # X16: Storage consolidation
 
-> **Status:** implemented in part (Phases 1, 2, 3 stage 1, 4, 5 apart from `imbl`, and item 846). The plan below is ordered and audited against the code.
+> **Status:** implemented in part (Phases 1, 2, 3 stages 1 and 3, 4, 5 apart from `imbl`, and item 846). The plan below is ordered and audited against the code.
 >
 > **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 830 and 833 hold the remaining ready phases, item 1152 takes the last `imbl` maps of Phase 5, and items 479, 484, 831, 832 and 846 are complete. The later candidate phases get their numbers when their prerequisites land.
 
@@ -714,6 +714,37 @@ vocabulary cases by up to 3.9% through the single codegen unit's inlining, and t
 finished stage does not. The `insn_screen` binary's text grew by 0.08%. The compile
 time of `sparkles-core` before and after the stage is still to be timed on a quiet
 host.
+
+The third stage of Phase 3 is built for the cold, commit, index, link, history,
+branching and lifecycle readers. `budgeted.rs` adds `BudgetControl` for mutable
+accounting carriers (`Unlimited` and `ColdBudget`), implements `Control` for
+`Preparation`, `WriteOptions` and `FnControl`, and adds `read_lock` and `no_wait` to
+`Control`. Under `Unlimited`, every accounting step compiles away and file, JSON and
+digest helpers lower directly to `std::fs`, `serde_json` and `sha2`. Twenty-four twin
+readers fold into generic implementations: `Segments::open_with`, `PermIndex::open_with`,
+`PermIndex::contains_with`, `decode_point_column_with`, `for_each_key_range_masked_with`
+and `for_each_segment_rows` in `index.rs`; `Snapshot::scan_between_cols_with`,
+`distinct_first_with`, `for_each_graph_id_with`, `Store::history_generation_with` and
+`Store::resolve_under` in `store.rs` and `store/history_limited.rs`;
+`Generation::open_base_with`, `open_sealed_with` and `retained_bytes_with` in
+`store/cold.rs`; `read_link_with`, `apply_overlay_with` and `Generation::open_linked_with`
+in `store/link.rs`; `parse_dataset_with`, `read_dataset_file_with`,
+`decode_gen_commit_bytes_with`, `read_gen_commit_with` and `walk_catalog_with` in
+`commit.rs`; `decode_file_with`, `checked_document` and `checked_file` in `history.rs`;
+`any_by_id_with`, `normalize_with`, `listed_with` and `Control::lock` in
+`store/branching.rs`; and `WeakLink::upgrade_with` in `store/lifecycle.rs`. Ordinary
+`read_catalog` now shares `walk_catalog_with` and refuses a recognized primary header with
+a future version before `Catalog::open` reconciles it, while keeping a zero version
+reconcilable on the ordinary path. The `limit.read_limit()` bridges in `store/wal.rs` and
+the unified index, link, branching and lifecycle readers are removed. `read_limit` still
+serves Stage 2's vocabulary bridges (`dvocab.len_limited` and
+`dvocab.resident_bytes_limited`), `Control`'s default lock and refusal helpers,
+`HistoryCeiling` lock acquisition, `cache_limited_snapshot`,
+`authenticate_retained_generation`, and `ColdBudget` initialization in
+`history_generation_with` and `retained_bytes_with`. Stage 2's vocabulary scanners
+(`vocab.rs` and `vocab/`) stay for the next slice of item 830, and Stage 3's `bench:insn`,
+`sparkles-core` binary size, compile time and spill matrix measurements remain to be
+recorded on a quiet host before landing.
 
 Phase 4 is built. `LoadPlan::choose` in `store/load_plan.rs` takes a `LoadInputs` and a
 `Sizes` that reads a source's estimate or probes its streams only when the plan depends

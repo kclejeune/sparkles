@@ -266,11 +266,14 @@ impl Generation {
 
     /// A generation no longer written (not `CURRENT`), opened for reading past states.
     pub(crate) fn open_sealed(dir: &Path, name: &str) -> Result<Generation> {
-        Self::open_with(
+        let written_by = dir.parent().and_then(commit::read_written_by);
+        Ok(Self::open_sealed_with(
             dir,
             name,
-            DeltaVocab::open_read_only(&dir.join("delta.vocab"))?,
-        )
+            written_by.as_deref(),
+            &mut crate::budgeted::Unlimited,
+        )?
+        .value)
     }
 
     fn open(dir: &Path, name: &str, persistent: bool) -> Result<Generation> {
@@ -294,40 +297,17 @@ impl Generation {
     fn open_with(dir: &Path, name: &str, dvocab: DeltaVocab) -> Result<Generation> {
         // the database's directory holds the generation (a branch's holds its own)
         let written_by = dir.parent().and_then(commit::read_written_by);
-        let meta: IndexMeta = crate::builder::read_index_meta(dir, written_by.as_deref())?;
-        let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
-            .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
-        if let Some(why) = stats.correlations.refusal() {
-            tracing::warn!(target: "sparkles::store", "generation {name}: {why}");
-        }
-        let patterns = crate::patterns::Loaded::open(dir, meta.patterns.as_ref());
-        Ok(Generation {
-            uid: crate::index::next_uid(),
-            name: name.to_string(),
-            dir: Some(dir.to_path_buf()),
-            vocab: Arc::new(Vocab::open_codec(
-                dir,
-                meta.has_feature(crate::builder::FEATURE_FSST_VOCAB),
-            )?),
-            perms: Perm::ALL
-                .iter()
-                .map(|&p| PermIndex::open(dir, p))
-                .collect::<Result<_>>()?,
-            stats,
-            meta,
-            dvocab,
-            _tmp: None,
-            _base: None,
-            vectors: Default::default(),
-            geo: Default::default(),
-            counts: Default::default(),
-            charsets: Default::default(),
-            patterns,
-            ill_typed_literals: Mutex::new(None),
-            wal_index: Mutex::new(None),
-            link: None,
-            cold_bytes: 0,
-        })
+        Ok(Self::open_base_with(
+            dir,
+            name,
+            written_by.as_deref(),
+            Some(cold::Loaded {
+                value: dvocab,
+                charge: 0,
+            }),
+            &mut crate::budgeted::Unlimited,
+        )?
+        .value)
     }
 
     #[inline]
@@ -1142,7 +1122,7 @@ impl Snapshot {
         mask: crate::index::ColMask,
         f: impl FnMut(Chunk<'_>) -> Result<bool>,
     ) -> Result<()> {
-        self.scan_between_cols_checked(perm, lo, hi, mask, || Ok(()), f)
+        self.scan_between_cols_with(perm, lo, hi, mask, &crate::budgeted::Unlimited, f)
     }
 
     pub(crate) fn scan_between_cols_checked(
@@ -1152,9 +1132,21 @@ impl Snapshot {
         hi: Key,
         mask: crate::index::ColMask,
         check: impl Fn() -> Result<()>,
+        f: impl FnMut(Chunk<'_>) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_between_cols_with(perm, lo, hi, mask, &crate::budgeted::FnControl(check), f)
+    }
+
+    pub(crate) fn scan_between_cols_with<C: crate::budgeted::Control>(
+        &self,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
+        mask: crate::index::ColMask,
+        control: &C,
         mut f: impl FnMut(Chunk<'_>) -> Result<bool>,
     ) -> Result<()> {
-        check()?;
+        control.check(0)?;
         let pi = perm.index();
         let (ins_set, del_set) = (&self.delta.ins[pi], &self.delta.del[pi]);
         let mut ins = Delta::key_range(ins_set, lo, hi).peekable();
@@ -1179,12 +1171,12 @@ impl Snapshot {
         };
         let mut stop = false;
         if base.rows > 0 {
-            let r = base.for_each_key_range_masked_checked(
+            let r = base.for_each_key_range_masked_with(
                 &self.cache,
                 &lo,
                 &hi,
                 mask_of,
-                &check,
+                control,
                 |blk, s, e| {
                     if stop {
                         return Ok(!stop);
@@ -1212,7 +1204,7 @@ impl Snapshot {
                             (Some(a), _) => (a, true),
                             (None, Some(d)) => (d, false),
                         };
-                        check()?;
+                        control.check(0)?;
                         let j = first_row_from(blk, i, e, &k);
                         if i < j && !f(Chunk::Block(blk, i, j))? {
                             stop = true;
@@ -1244,12 +1236,12 @@ impl Snapshot {
         }
         if !stop {
             for k in ins {
-                check()?;
+                control.check(0)?;
                 if !f(Chunk::Row(*k))? {
                     return Ok(());
                 }
             }
-            check()?;
+            control.check(0)?;
         }
         Ok(())
     }
@@ -1541,15 +1533,15 @@ impl Snapshot {
     }
 
     /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
-    fn distinct_first_checked(
+    fn distinct_first_with<C: crate::budgeted::Control>(
         &self,
         perm: Perm,
-        check: impl Fn() -> Result<()>,
+        control: &C,
         mut each: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
         let mut cur: Option<u64> = None;
         loop {
-            check()?;
+            control.check(0)?;
             let from = match cur {
                 None => 0,
                 Some(u64::MAX) => break,
@@ -1561,7 +1553,7 @@ impl Snapshot {
             let b = base.blocks.partition_point(|m| m.last[0] < from);
             if b < base.blocks.len() {
                 let blk = self.cache.get(base, b)?;
-                check()?;
+                control.check(0)?;
                 let i = blk.cols[0].partition_point(|&v| v < from);
                 if i < blk.len() {
                     next = Some(blk.cols[0][i]);
@@ -1580,13 +1572,20 @@ impl Snapshot {
             // whether any quad remains under `v`: the first one found answers it, where
             // a count would walk every inserted and deleted key of the delta under `v`
             let mut any = false;
-            self.scan_checked(perm, &[v], &check, |c| {
-                any = match c {
-                    Chunk::Block(_, start, end) => start < end,
-                    Chunk::Row(_) => true,
-                };
-                Ok(!any)
-            })?;
+            self.scan_between_cols_with(
+                perm,
+                pad(&[v], 0),
+                pad(&[v], u64::MAX),
+                crate::index::ALL_COLS,
+                control,
+                |c| {
+                    any = match c {
+                        Chunk::Block(_, start, end) => start < end,
+                        Chunk::Row(_) => true,
+                    };
+                    Ok(!any)
+                },
+            )?;
             if any {
                 each(v)?;
             }
@@ -1598,15 +1597,27 @@ impl Snapshot {
     /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
     pub fn distinct_first(&self, perm: Perm) -> Result<Vec<u64>> {
         let mut out = Vec::new();
-        self.distinct_first_checked(
-            perm,
-            || Ok(()),
-            |value| {
-                out.push(value);
-                Ok(())
-            },
-        )?;
+        self.distinct_first_with(perm, &crate::budgeted::Unlimited, |value| {
+            out.push(value);
+            Ok(())
+        })?;
         Ok(out)
+    }
+
+    /// Visit visible named graph IDs in the same order as `graph_ids`, without a list,
+    /// under `control`.
+    pub(crate) fn for_each_graph_id_with<C: crate::budgeted::Control>(
+        &self,
+        control: &C,
+        mut each: impl FnMut(Id) -> Result<()>,
+    ) -> Result<()> {
+        self.distinct_first_with(Perm::Gspo, control, |value| {
+            let graph = Id(value);
+            if graph != Id::DEFAULT_GRAPH {
+                each(graph)?;
+            }
+            Ok(())
+        })
     }
 
     /// Visit visible named graph IDs in the same order as graph_ids, without a list.
@@ -1614,15 +1625,9 @@ impl Snapshot {
     pub(crate) fn for_each_graph_id_checked(
         &self,
         check: impl Fn() -> Result<()>,
-        mut each: impl FnMut(Id) -> Result<()>,
+        each: impl FnMut(Id) -> Result<()>,
     ) -> Result<()> {
-        self.distinct_first_checked(Perm::Gspo, check, |value| {
-            let graph = Id(value);
-            if graph != Id::DEFAULT_GRAPH {
-                each(graph)?;
-            }
-            Ok(())
-        })
+        self.for_each_graph_id_with(&crate::budgeted::FnControl(check), each)
     }
 
     /// All named graph ids (excludes the default graph).
@@ -3332,7 +3337,7 @@ impl Store {
         if !C::ACCOUNTS {
             return Ok(self.inherited(at, seq));
         }
-        let name = limit.read_limit().read_lock(&self.branching.name)?;
+        let name = limit.read_lock(&self.branching.name)?;
         limit.check(name.len() as u64)?;
         Ok(self.inherited_named(at, seq, &name))
     }
@@ -3448,11 +3453,7 @@ impl Store {
         history_limited::SnapshotCharge,
     )> {
         limit.check(0)?;
-        let r = if C::ACCOUNTS {
-            self.resolve_limited(at, &limit.read_limit())?
-        } else {
-            self.resolve(at)?
-        };
+        let r = self.resolve_under(at, &limit)?;
         let live = self.snapshot();
         self.snapshot_at_resolved(at, limit, r, live)
     }
@@ -3492,7 +3493,7 @@ impl Store {
                     let read_limit = limit.read_limit().holding(delta_bytes)?;
                     let generation_bytes =
                         if C::ACCOUNTS && !Arc::ptr_eq(&snap.generation, &live.generation) {
-                            snap.generation.retained_bytes_limited(&read_limit)?
+                            snap.generation.retained_bytes_with(&read_limit)?
                         } else {
                             0
                         };
@@ -3559,17 +3560,12 @@ impl Store {
         if let Some(i) = cached {
             let generation_bytes =
                 if C::ACCOUNTS && !Arc::ptr_eq(&h.cache[i].snap.generation, &live.generation) {
-                    h.cache[i]
-                        .snap
-                        .generation
-                        .retained_bytes_limited(&limit.read_limit())?
+                    h.cache[i].snap.generation.retained_bytes_with(&limit)?
                 } else {
                     0
                 };
-            limit
-                .read_limit()
-                .holding(generation_bytes)?
-                .check(history_limited::SHARED_SNAPSHOT_BYTES)?;
+            limit.check(generation_bytes)?;
+            limit.check(generation_bytes.saturating_add(history_limited::SHARED_SNAPSHOT_BYTES))?;
             let e = h.cache.remove(i);
             let snap = e.snap.clone();
             h.cache.insert(0, e);
@@ -3587,21 +3583,11 @@ impl Store {
         // Snapshot/entry/path metadata remains live beside replay's owned buffers.
         let limit = limit.holding(16 << 10)?;
         let entry = h.gens[&owner].clone();
-        let generation = if C::ACCOUNTS {
-            self.history_generation_limited(
-                &mut h,
-                owner,
-                current,
-                &live,
-                &limit.read_limit(),
-                seq,
-            )?
-        } else {
-            self.history_generation(&mut h, owner, current, &live, &entry, seq)?
-        };
+        let generation =
+            self.history_generation_with(&mut h, owner, current, &live, &entry, seq, &limit)?;
         let (limit, generation_bytes) =
             if C::ACCOUNTS && !Arc::ptr_eq(&generation, &live.generation) {
-                let retained = generation.retained_bytes_limited(&limit.read_limit())?;
+                let retained = generation.retained_bytes_with(&limit)?;
                 (limit.holding(retained)?, retained)
             } else {
                 (limit, 0)
@@ -3732,41 +3718,105 @@ impl Store {
         entry: &crate::history::GenEntry,
         through: u64,
     ) -> Result<Arc<Generation>> {
+        self.history_generation_with(
+            h,
+            owner,
+            current,
+            live,
+            entry,
+            through,
+            &crate::budgeted::Unlimited,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn history_generation_with<C: crate::budgeted::Control>(
+        &self,
+        h: &mut crate::history::HistoryState,
+        owner: u32,
+        current: u32,
+        live: &Snapshot,
+        entry: &crate::history::GenEntry,
+        through: u64,
+        limit: &C,
+    ) -> Result<Arc<Generation>> {
+        limit.check(0)?;
         if owner == current {
             return Ok(live.generation.clone());
         }
-        let history_options = crate::history::HistoryOptions::default();
-        let history_limit = crate::history::ReadLimit {
-            options: &history_options,
-            memory: None,
-            held: 0,
-        };
         branching::readonly::authenticate_retained_generation(
             self,
             entry,
-            &history_limit,
+            &limit.read_limit(),
             through,
         )?;
         if let Some(i) = h.open.iter().position(|(n, _)| *n == owner) {
+            if C::ACCOUNTS {
+                h.open[i].1.retained_bytes_with(limit)?;
+            }
             let e = h.open.remove(i);
             let g = e.1.clone();
             h.open.insert(0, e);
+            limit.check(0)?;
             return Ok(g);
         }
-        let g = match (link::read_link(&entry.dir)?, &self.root) {
-            (Some(f), Some(root)) => Arc::new(Generation::open_linked(
-                &entry.dir,
-                &entry.name,
-                root,
-                f,
-                true,
-                &self.cache,
-            )?),
-            _ => Arc::new(Generation::open_sealed(&entry.dir, &entry.name)?),
+        let (generation, charge) = if C::ACCOUNTS {
+            let mut budget = cold::ColdBudget::new(limit.read_limit())?;
+            let loaded = match link::read_link_with(&entry.dir, &mut budget)? {
+                Some(file) => Generation::open_linked_with(
+                    &entry.dir,
+                    &entry.name,
+                    self.root.as_deref().ok_or_else(|| {
+                        Error::HistoryUnsupported("linked history needs a persistent origin".into())
+                    })?,
+                    file,
+                    true,
+                    &self.cache,
+                    &mut budget,
+                )?,
+                None => Generation::open_sealed_with(&entry.dir, &entry.name, None, &mut budget)?,
+            };
+            (Arc::new(loaded.value), loaded.charge)
+        } else {
+            let g = match (link::read_link(&entry.dir)?, &self.root) {
+                (Some(f), Some(root)) => Arc::new(Generation::open_linked(
+                    &entry.dir,
+                    &entry.name,
+                    root,
+                    f,
+                    true,
+                    &self.cache,
+                )?),
+                _ => Arc::new(Generation::open_sealed(&entry.dir, &entry.name)?),
+            };
+            (g, 0)
         };
-        h.open.insert(0, (owner, g.clone()));
-        h.open.truncate(2);
-        Ok(g)
+        if C::ACCOUNTS {
+            // Caching the backing generation is optional. Do not grow an unrelated
+            // shared vector outside this request's remaining preparation allowance.
+            if h.open.capacity() < 2 {
+                let relocating = (h.open.capacity() + 2) as u64
+                    * std::mem::size_of::<(u32, Arc<Generation>)>() as u64;
+                let fits = match limit.check(charge.saturating_add(relocating)) {
+                    Ok(()) => true,
+                    Err(Error::BudgetExceeded(_)) => false,
+                    Err(error) => return Err(error),
+                };
+                if !fits || h.open.try_reserve_exact(2 - h.open.len()).is_err() {
+                    limit.check(charge)?;
+                    return Ok(generation);
+                }
+            }
+            while h.open.len() >= 2 {
+                h.open.pop();
+            }
+            h.open.insert(0, (owner, generation.clone()));
+            limit.check(charge)?;
+        } else {
+            h.open.insert(0, (owner, generation.clone()));
+            h.open.truncate(2);
+        }
+        Ok(generation)
     }
 
     /// The delta of commit `seq` in generation `owner`, and where the commit ends in
@@ -7298,7 +7348,7 @@ impl WriteTxn<'_> {
             crate::store::history_limited::SHARED_SNAPSHOT_BYTES
         };
         let retained = delta_bytes
-            .checked_add(self.base.generation.retained_bytes_limited(&limit)?)
+            .checked_add(self.base.generation.retained_bytes_with(&limit)?)
             .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))
             .ok_or_else(|| selection.exhausted())?;
         let held = selection.reserve(retained)?;
@@ -8587,7 +8637,6 @@ pub(crate) fn wal_point_with<C: crate::budgeted::Control>(
     let path = entry.dir.join("wal.log");
     let floor = if C::ACCOUNTS {
         let floor = limit
-            .read_limit()
             .lock(&g.wal_index)?
             .as_ref()
             .map(|index| index.floor(seq))
@@ -11145,5 +11194,157 @@ mod ordinary_sync_tests {
         let reopened = Store::open(dir.path(), Default::default()).unwrap();
         assert_eq!(reopened.snapshot().commit, receipt.commit.seq);
         assert_eq!(reopened.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn uncapped_snapshot_at_propagates_cancel_and_timeout_into_history_generation() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                build: crate::builder::BuildOptions {
+                    threads: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .set_retention(crate::history::Retention {
+                keep_commits: Some(10),
+                keep_age_ms: None,
+                max_bytes: None,
+            })
+            .unwrap();
+        let r1 = insert(&store, "first").unwrap();
+        insert(&store, "second").unwrap();
+        store.compact().unwrap();
+        insert(&store, "third").unwrap();
+        let at = crate::history::At::Commit(r1.commit.seq);
+        assert!(store.snapshot_at(&at, &Default::default()).is_ok());
+
+        let cancel_opts = crate::history::HistoryOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            deadline: None,
+        };
+        assert!(matches!(
+            store.snapshot_at(&at, &cancel_opts),
+            Err(Error::Cancelled)
+        ));
+
+        let expired_opts = crate::history::HistoryOptions {
+            cancel: None,
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(matches!(
+            store.snapshot_at(&at, &expired_opts),
+            Err(Error::Timeout)
+        ));
+
+        // Directly verify history_generation_with forwards HistoryCeiling's ReadLimit
+        // (and not a blank HistoryOptions) into authenticate_retained_generation:
+        // clear the open-generation cache so the uncached !C::ACCOUNTS branch runs,
+        // corrupt commit.json so authentication fails with Error::Corrupt if reached,
+        // then let the entry check(0) pass once and trigger cancel/timeout inside
+        // authenticate_retained_generation before commit.json is read.
+        struct FailAfterFirst {
+            calls: std::sync::atomic::AtomicUsize,
+            timeout: bool,
+        }
+        impl crate::history::ReadControl for FailAfterFirst {
+            fn check_read(&self) -> Result<()> {
+                if self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    >= 1
+                {
+                    if self.timeout {
+                        Err(Error::Timeout)
+                    } else {
+                        Err(Error::Cancelled)
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+        let live = store.snapshot();
+        let current = commit::generation_number(&live.generation.name);
+        let hist = store.history.as_ref().unwrap();
+        let mut h = hist.lock();
+        let owner = h.owner(r1.commit.seq, current, live.commit).unwrap();
+        assert_ne!(owner, current);
+        let entry = h.gens[&owner].clone();
+        h.open.clear();
+        std::fs::write(entry.dir.join("commit.json"), b"{corrupt").unwrap();
+        // Confirm the tampered fixture fails authentication with Error::Corrupt when uninterrupted.
+        assert!(matches!(
+            store.history_generation_with(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &entry,
+                r1.commit.seq,
+                &crate::budgeted::Unlimited,
+            ),
+            Err(Error::Corrupt(_))
+        ));
+        let cancel_after_first = FailAfterFirst {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            timeout: false,
+        };
+        let cancel_ceiling = HistoryCeiling {
+            limit: crate::history::ReadLimit {
+                options: &cancel_after_first,
+                memory: None,
+                held: 0,
+            },
+            ceiling: u64::MAX,
+        };
+        assert!(matches!(
+            store.history_generation_with(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &entry,
+                r1.commit.seq,
+                &cancel_ceiling,
+            ),
+            Err(Error::Cancelled)
+        ));
+        let timeout_after_first = FailAfterFirst {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            timeout: true,
+        };
+        let timeout_ceiling = HistoryCeiling {
+            limit: crate::history::ReadLimit {
+                options: &timeout_after_first,
+                memory: None,
+                held: 0,
+            },
+            ceiling: u64::MAX,
+        };
+        assert!(matches!(
+            store.history_generation_with(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &entry,
+                r1.commit.seq,
+                &timeout_ceiling,
+            ),
+            Err(Error::Timeout)
+        ));
     }
 }

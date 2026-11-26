@@ -191,14 +191,13 @@ impl TableFile {
 
     /// A listed or a retired branch.
     fn any_by_id(&self, id: uuid::Uuid) -> Option<&Entry> {
-        self.by_id(id)
-            .or_else(|| self.retired.iter().find(|e| e.id == id))
+        crate::history::uncontrolled(self.any_by_id_with(id, &crate::budgeted::Unlimited))
     }
 
-    fn any_by_id_limited(
+    fn any_by_id_with<C: crate::budgeted::Control>(
         &self,
         id: uuid::Uuid,
-        limit: &crate::history::ReadLimit<'_>,
+        limit: &C,
     ) -> Result<Option<&Entry>> {
         for entry in self.branches.iter().chain(&self.retired) {
             limit.check(0)?;
@@ -1106,21 +1105,13 @@ impl BranchSet {
     /// The commit `c` names, on the branch that made it: a seq at or below a branch's
     /// starting commit is a commit of its upstream.
     pub(crate) fn normalize(&self, c: CommitRef) -> CommitRef {
-        let t = self.table.lock();
-        let mut c = c;
-        for _ in 0..1024 {
-            match self.start_of(&t, c.branch_id) {
-                Some(f) if c.seq <= f.seq => c.branch_id = f.branch_id,
-                _ => break,
-            }
-        }
-        c
+        crate::history::uncontrolled(self.normalize_with(c, &crate::budgeted::Unlimited))
     }
 
-    pub(super) fn normalize_limited(
+    pub(super) fn normalize_with<C: crate::budgeted::Control>(
         &self,
         mut commit: CommitRef,
-        limit: &crate::history::ReadLimit<'_>,
+        limit: &C,
     ) -> Result<CommitRef> {
         let table = limit.lock(&self.table)?;
         for _ in 0..1024 {
@@ -1129,7 +1120,7 @@ impl BranchSet {
                 None
             } else {
                 table
-                    .any_by_id_limited(commit.branch_id, limit)?
+                    .any_by_id_with(commit.branch_id, limit)?
                     .map(|entry| entry.from.into())
             };
             if from.is_none() && commit.branch_id != self.dataset_id {
@@ -1554,7 +1545,7 @@ impl Store {
         let set = match &self.branching.set {
             SetRef::None => None,
             SetRef::Owner(set) => Some(set.clone()),
-            SetRef::Member(link) => link.upgrade_controlled(options)?,
+            SetRef::Member(link) => link.upgrade_with(options)?,
         };
         options.check()?;
         Ok(set)
@@ -1590,11 +1581,11 @@ impl Store {
                 Err(error) => return Err(error),
             }
         };
-        let table = controlled_lock(&set.table, options)?;
+        let table = crate::budgeted::Control::lock(options, &set.table)?;
         if table.by_id(id).is_none() {
             return Ok(None);
         }
-        let stores = controlled_lock(&set.stores, options)?;
+        let stores = crate::budgeted::Control::lock(options, &set.stores)?;
         let store = stores
             .get(&id)
             .filter(|store| !store.branching.retired.load(Ordering::Acquire))
@@ -1769,7 +1760,7 @@ impl Store {
         let SetRef::Owner(set) = &self.branching.set else {
             return Ok(None);
         };
-        let table = controlled_lock(&set.table, options)?;
+        let table = crate::budgeted::Control::lock(options, &set.table)?;
         for (n, entry) in table.branches.iter().enumerate() {
             if n % 1024 == 0 {
                 options.check()?;
@@ -1836,10 +1827,10 @@ impl Store {
     }
 
     /// Fail with `no-such-branch` unless `branch` is a listed branch of this main.
-    pub(super) fn listed_limited(
+    pub(super) fn listed_with<C: crate::budgeted::Control>(
         &self,
         branch: uuid::Uuid,
-        limit: &crate::history::ReadLimit<'_>,
+        limit: &C,
     ) -> Result<()> {
         let missing = || crate::branch::no_such_branch(&branch.to_string());
         let set = match &self.branching.set {
@@ -3412,6 +3403,73 @@ mod source_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn normalize_with_and_listed_with_match_unlimited_and_honor_uncapped_controls() {
+        use crate::history::{HistoryOptions, ReadLimit};
+        use std::sync::atomic::AtomicBool;
+
+        let main = Store::in_memory(Default::default());
+        let dev = main.create_branch("dev", &Default::default()).unwrap();
+        let set = main.owned_set().unwrap();
+        let commit = CommitRef {
+            branch_id: dev.id,
+            seq: dev.from.unwrap().seq,
+        };
+        let options = HistoryOptions::default();
+        let uncapped = ReadLimit {
+            options: &options,
+            memory: None,
+            held: 0,
+        };
+        assert_eq!(
+            set.normalize(commit),
+            set.normalize_with(commit, &uncapped).unwrap()
+        );
+        assert!(
+            main.listed_with(dev.id, &crate::budgeted::Unlimited)
+                .is_ok()
+        );
+        assert!(main.listed_with(dev.id, &uncapped).is_ok());
+        assert!(main.listed_with(uuid::Uuid::new_v4(), &uncapped).is_err());
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel_opts = HistoryOptions {
+            cancel: Some(cancel),
+            deadline: None,
+        };
+        let cancelled = ReadLimit {
+            options: &cancel_opts,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            set.normalize_with(commit, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            main.listed_with(dev.id, &cancelled),
+            Err(Error::Cancelled)
+        ));
+
+        let expired_opts = HistoryOptions {
+            cancel: None,
+            deadline: Some(Instant::now() - std::time::Duration::from_secs(1)),
+        };
+        let timed_out = ReadLimit {
+            options: &expired_opts,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            set.normalize_with(commit, &timed_out),
+            Err(Error::Timeout)
+        ));
+        assert!(matches!(
+            main.listed_with(dev.id, &timed_out),
+            Err(Error::Timeout)
+        ));
     }
 }
 

@@ -272,8 +272,8 @@ impl Store {
                     .saturating_mul(4)
                     .saturating_add(4096),
             )?;
-            let physical = commit::read_gen_commit_controlled(&entry.dir, &mut budget)?
-                .ok_or_else(|| {
+            let physical =
+                commit::read_gen_commit_with(&entry.dir, &mut budget)?.ok_or_else(|| {
                     managed_history::unavailable("retained generation has no commit identity")
                 })?;
             if physical.value.dataset_id != self.dataset_id
