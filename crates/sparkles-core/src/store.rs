@@ -1835,7 +1835,63 @@ const STAGED_PREFIXES_FORMAT_VERSION: u32 = 1;
 struct StagedPrefixesFile {
     format_version: u32,
     commit_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_seq: Option<u64>,
     prefixes: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod staged_prefix_test_hooks {
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    pub(super) struct Faults {
+        pub fail_after_stage_rename: bool,
+        pub fail_clear_staged: bool,
+    }
+
+    thread_local! {
+        static FAULTS: RefCell<Faults> = RefCell::new(Faults::default());
+    }
+
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAULTS.with(|f| *f.borrow_mut() = Faults::default());
+        }
+    }
+
+    pub(super) fn install(faults: Faults) -> Guard {
+        FAULTS.with(|f| *f.borrow_mut() = faults);
+        Guard
+    }
+
+    pub(super) fn after_stage_rename() -> crate::error::Result<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_after_stage_rename {
+                s.fail_after_stage_rename = false;
+                return Err(crate::error::Error::Io(std::io::Error::other(
+                    "injected directory sync failure after staging prefixes.staged.tmp",
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn before_clear_staged() -> crate::error::Result<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_clear_staged {
+                s.fail_clear_staged = false;
+                return Err(crate::error::Error::Io(std::io::Error::other(
+                    "injected failure clearing prefixes.staged.tmp",
+                )));
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Whether loaded data may bind a prefix name (spec C20 §3.4).
@@ -2599,6 +2655,10 @@ impl Store {
             commit::check_dataset_compatibility(root)?;
             crate::formats::check_dataset_dir(root)?;
         }
+        // Check any staged prefix recovery file's format version before WAL tail repair,
+        // catalog opening, or generation creation so an unsupported version never modifies
+        // any file on disk.
+        preflight_staged_prefixes(root)?;
         let configuration_preparation = managed_history::administrative_preparation()?;
         if ctx.is_none() {
             // Pin import selection before generation creation, replay, recovery
@@ -2852,7 +2912,12 @@ impl Store {
             .last()
             .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
             .unwrap_or(base);
-        reconcile_staged_prefixes(root, head.seq, &mut prefixes)?;
+        reconcile_staged_prefixes(
+            root,
+            head.seq,
+            control_opened.as_ref().map(|o| o.state.seq),
+            &mut prefixes,
+        )?;
         // The settings files were checked by the preflight after the lock, and every file
         // this open read is in a version this build reads. The release now writes the
         // database: record it in dataset.json, and require the reader of the
@@ -5061,9 +5126,10 @@ impl Store {
         Ok(())
     }
 
-    fn stage_prefixes_for_commit(
+    pub(super) fn stage_prefixes_for_commit(
         &self,
         commit_seq: u64,
+        control_seq: Option<u64>,
         next: &BTreeMap<String, String>,
     ) -> Result<()> {
         self.preflight_prefixes_target()?;
@@ -5071,6 +5137,7 @@ impl Store {
             let staged = StagedPrefixesFile {
                 format_version: STAGED_PREFIXES_FORMAT_VERSION,
                 commit_seq,
+                control_seq,
                 prefixes: next.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&staged).unwrap();
@@ -5079,22 +5146,33 @@ impl Store {
                 &root.join(STAGED_PREFIXES_WRITE_TMP),
                 &bytes,
             )?;
+            #[cfg(test)]
+            staged_prefix_test_hooks::after_stage_rename()?;
             self.failpoint("prefixes-staged");
         }
         Ok(())
     }
 
-    fn clear_staged_prefixes(&self) {
+    pub(super) fn clear_staged_prefixes(&self) -> Result<()> {
         if let Some(root) = &self.root {
-            let _ = std::fs::remove_file(root.join(STAGED_PREFIXES_FILE));
-            let _ = sync_dir(root);
+            #[cfg(test)]
+            staged_prefix_test_hooks::before_clear_staged()?;
+            for name in [STAGED_PREFIXES_WRITE_TMP, STAGED_PREFIXES_FILE] {
+                match std::fs::remove_file(root.join(name)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            sync_dir(root)?;
         }
+        Ok(())
     }
 
-    fn install_staged_prefixes(&self, next: &BTreeMap<String, String>) -> Result<()> {
+    pub(super) fn install_staged_prefixes(&self, next: &BTreeMap<String, String>) -> Result<()> {
         self.failpoint("prefixes-before-install");
         self.save_prefixes(next)?;
-        self.clear_staged_prefixes();
+        self.clear_staged_prefixes()?;
         Ok(())
     }
 
@@ -6514,8 +6592,11 @@ impl Store {
             .then(|| self.prepare_added_prefixes(&combined_prefixes));
         if let Some(prep) = prepared_prefixes.as_ref()
             && let Some(next) = prep.next.as_ref()
-            && let Err(e) = self.stage_prefixes_for_commit(head.seq, next)
+            && let Err(e) = self.stage_prefixes_for_commit(head.seq, None, next)
         {
+            if self.clear_staged_prefixes().is_err() {
+                w.poisoned = true;
+            }
             drop(prepared_prefixes);
             drop(gen_);
             if self.root.is_some() {
@@ -6564,7 +6645,9 @@ impl Store {
             let (wal, wal_size, ann) = match pre_switch {
                 Ok(v) => v,
                 Err(e) => {
-                    self.clear_staged_prefixes();
+                    if self.clear_staged_prefixes().is_err() {
+                        w.poisoned = true;
+                    }
                     return Err(e);
                 }
             };
@@ -6574,7 +6657,9 @@ impl Store {
                 // may bring the bulk commit back with its annotation and staged prefixes,
                 // both go.
                 if !f.maybe_switched {
-                    self.clear_staged_prefixes();
+                    if self.clear_staged_prefixes().is_err() {
+                        w.poisoned = true;
+                    }
                     if !annotation.is_empty() && self.undo_annotation(head.seq).is_err() {
                         w.poisoned = true;
                     }
@@ -6597,7 +6682,9 @@ impl Store {
             annotation = match self.annotate(&head, message.clone(), || None) {
                 Ok(a) => a,
                 Err(e) => {
-                    self.clear_staged_prefixes();
+                    if self.clear_staged_prefixes().is_err() {
+                        w.poisoned = true;
+                    }
                     return Err(SparqlLoadError::Store(e));
                 }
             };
@@ -7984,12 +8071,11 @@ impl WriteTxn<'_> {
             }
             if self.net_ins == 0 && self.net_del == 0 && !self.force {
                 if self.control_staged() {
-                    // control changes alone: a control-only frame, not a commit
+                    // control changes alone: a control-only frame, not a commit. Staged
+                    // prefixes are reconciled against the control frame sequence inside
+                    // `publish_control_only` so a refused control frame never publishes
+                    // them.
                     self.opts.check_publish()?;
-                    if !self.staged_prefixes.is_empty() {
-                        let staged = std::mem::take(&mut self.staged_prefixes);
-                        self.store.add_prefixes(staged)?;
-                    }
                     return self.publish_control_only();
                 }
                 // no net change: no commit, nothing to validate or publish
@@ -8037,7 +8123,12 @@ impl WriteTxn<'_> {
             let target_seq = self.guard.head.seq + 1;
             let mut prep = store.prepare_added_prefixes(&staged_prefixes);
             if let Some(next) = prep.next.take() {
-                store.stage_prefixes_for_commit(target_seq, &next)?;
+                if let Err(e) = store.stage_prefixes_for_commit(target_seq, None, &next) {
+                    if store.clear_staged_prefixes().is_err() {
+                        self.guard.poisoned = true;
+                    }
+                    return Err(e);
+                }
                 let res = if self.guard.wal.is_none() {
                     self.publish_memory(validation)
                 } else {
@@ -8056,8 +8147,8 @@ impl WriteTxn<'_> {
                         return Ok(receipt);
                     }
                     Err(e) => {
-                        if !self.guard.poisoned {
-                            store.clear_staged_prefixes();
+                        if !self.guard.poisoned && store.clear_staged_prefixes().is_err() {
+                            self.guard.poisoned = true;
                         }
                         return Err(e);
                     }
@@ -8348,26 +8439,15 @@ fn guard_required_by(root: &Path) -> bool {
     }
 }
 
-/// Reconcile any crash-recoverable [`STAGED_PREFIXES_FILE`] against the store's recovered
-/// durable commit head `head_seq`.
+/// Read and validate [`STAGED_PREFIXES_FILE`] without mutating any file on disk.
 ///
-/// If the staged commit reached `head_seq`, install the staged prefix map into
-/// `prefixes.json` and update `prefixes`. Otherwise discard the uncommitted staging file so
-/// prefixes stay aligned with the rolled-back quad state. Unknown `format_version` values
-/// are refused cleanly with [`Error::Unsupported`].
-fn reconcile_staged_prefixes(
-    root: &Path,
-    head_seq: u64,
-    prefixes: &mut BTreeMap<String, String>,
-) -> Result<()> {
-    let write_tmp = root.join(STAGED_PREFIXES_WRITE_TMP);
-    if write_tmp.exists() {
-        let _ = std::fs::remove_file(&write_tmp);
-    }
+/// Called early during [`Store::open_inner`] so an unknown `format_version` or corrupt
+/// sidecar refuses cleanly before WAL tail truncation or catalog changes occur.
+fn parse_staged_prefixes_file(root: &Path) -> Result<Option<StagedPrefixesFile>> {
     let staged_path = root.join(STAGED_PREFIXES_FILE);
     let bytes = match std::fs::read(&staged_path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
@@ -8398,7 +8478,41 @@ fn reconcile_staged_prefixes(
             staged_path.display()
         ))
     })?;
-    if staged.commit_seq <= head_seq {
+    Ok(Some(staged))
+}
+
+fn preflight_staged_prefixes(root: &Path) -> Result<()> {
+    let _ = parse_staged_prefixes_file(root)?;
+    Ok(())
+}
+
+/// Reconcile any crash-recoverable [`STAGED_PREFIXES_FILE`] against the store's recovered
+/// durable commit head `head_seq` (and durable control sequence `control_seq` for
+/// control-only transactions).
+///
+/// If the staged commit (or control frame) reached the recovered head, install the staged
+/// prefix map into `prefixes.json` and update `prefixes`. Otherwise discard the uncommitted
+/// staging file so prefixes stay aligned with the rolled-back state. Unknown
+/// `format_version` values are refused cleanly with [`Error::Unsupported`].
+fn reconcile_staged_prefixes(
+    root: &Path,
+    head_seq: u64,
+    control_seq: Option<u64>,
+    prefixes: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let write_tmp = root.join(STAGED_PREFIXES_WRITE_TMP);
+    if write_tmp.exists() {
+        let _ = std::fs::remove_file(&write_tmp);
+    }
+    let staged_path = root.join(STAGED_PREFIXES_FILE);
+    let Some(staged) = parse_staged_prefixes_file(root)? else {
+        return Ok(());
+    };
+    let committed = match staged.control_seq {
+        Some(cseq) => control_seq.is_some_and(|recovered| recovered >= cseq),
+        None => staged.commit_seq <= head_seq,
+    };
+    if committed {
         write_atomic(
             &root.join("prefixes.json"),
             &serde_json::to_vec_pretty(&staged.prefixes).unwrap(),
@@ -11784,5 +11898,223 @@ mod ordinary_sync_tests {
         });
         t1.join().unwrap();
         t2.join().unwrap();
+    }
+
+    #[test]
+    fn failed_prefix_stage_after_rename_cannot_attach_to_later_unrelated_commit() {
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+
+        let insert_quad = |tx: &mut WriteTxn<'_>, n: i64| {
+            let mut labels = std::collections::HashMap::new();
+            let q = Quad::new(
+                NamedNode::new_unchecked(format!("http://example.org/r48s{n}")),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(n),
+                GraphName::DefaultGraph,
+            );
+            let id = tx.encode_quad(&q, &mut labels).unwrap();
+            tx.insert(id).unwrap();
+        };
+
+        // 1. Post-rename staging error where cleanup succeeds: sidecar is durably cleared so
+        //    an unrelated commit reusing that sequence number never inherits the refused
+        //    prefixes on reopen.
+        let dir1 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir1.path(), Default::default()).unwrap();
+            {
+                let _g = staged_prefix_test_hooks::install(staged_prefix_test_hooks::Faults {
+                    fail_after_stage_rename: true,
+                    ..Default::default()
+                });
+                let mut tx = store.write();
+                insert_quad(&mut tx, 1);
+                tx.stage_prefixes(BTreeMap::from([(
+                    "aborted".into(),
+                    "http://example.org/aborted/".into(),
+                )]));
+                assert!(tx.commit().is_err());
+            }
+            assert!(
+                !dir1.path().join(STAGED_PREFIXES_FILE).exists(),
+                "failed post-rename stage must clear prefixes.staged.tmp"
+            );
+            let mut unrelated = store.write();
+            insert_quad(&mut unrelated, 2);
+            unrelated.commit().unwrap();
+        }
+        let reopened1 = Store::open(dir1.path(), Default::default()).unwrap();
+        assert_eq!(reopened1.snapshot().len(), 1);
+        assert!(
+            !reopened1.prefixes().contains_key("aborted"),
+            "refused prefixes must not be recovered on an unrelated commit"
+        );
+
+        // 2. Post-rename staging error where cleanup ALSO fails: the writer is poisoned so no
+        //    later unrelated commit can reuse the sequence number, and reopen discards the
+        //    uncommitted sidecar.
+        let dir2 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir2.path(), Default::default()).unwrap();
+            {
+                let _g = staged_prefix_test_hooks::install(staged_prefix_test_hooks::Faults {
+                    fail_after_stage_rename: true,
+                    fail_clear_staged: true,
+                });
+                let mut tx = store.write();
+                insert_quad(&mut tx, 10);
+                tx.stage_prefixes(BTreeMap::from([(
+                    "ghost".into(),
+                    "http://example.org/ghost/".into(),
+                )]));
+                assert!(tx.commit().is_err());
+            }
+            assert!(dir2.path().join(STAGED_PREFIXES_FILE).is_file());
+            let mut unrelated = store.write();
+            let mut labels = std::collections::HashMap::new();
+            let q = Quad::new(
+                NamedNode::new_unchecked("http://example.org/r48s11"),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(11i64),
+                GraphName::DefaultGraph,
+            );
+            let res = unrelated
+                .encode_quad(&q, &mut labels)
+                .and_then(|id| unrelated.insert(id))
+                .and_then(|_| unrelated.commit());
+            assert!(
+                matches!(res, Err(Error::Poisoned)),
+                "writer must be poisoned when staged prefix cleanup fails, got {res:?}"
+            );
+        }
+        let reopened2 = Store::open(dir2.path(), Default::default()).unwrap();
+        assert_eq!(reopened2.snapshot().len(), 0);
+        assert!(!reopened2.prefixes().contains_key("ghost"));
+        assert!(!dir2.path().join(STAGED_PREFIXES_FILE).exists());
+    }
+
+    #[test]
+    fn control_only_txn_staged_prefixes_align_with_refusal_and_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        store.enable_control().unwrap();
+
+        // 1. Refused control-only transaction must NOT persist or expose staged prefixes.
+        store.refuse_next_control_frame(|| Error::Cancelled);
+        {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/refused", Arc::from(&b"no"[..]))
+                .unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "refusedp".into(),
+                "http://example.org/refused/".into(),
+            )]));
+            assert!(matches!(tx.commit(), Err(Error::Cancelled)));
+        }
+        assert!(!store.prefixes().contains_key("refusedp"));
+        assert!(!dir.path().join("prefixes.json").exists());
+        assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+
+        // 2. Successful control-only transaction publishes both control key and prefixes.
+        {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/ok", Arc::from(&b"yes"[..])).unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "okp".into(),
+                "http://example.org/ok/".into(),
+            )]));
+            let receipt = tx.commit().unwrap();
+            assert!(!receipt.committed);
+        }
+        assert_eq!(
+            store.prefixes().get("okp").map(String::as_str),
+            Some("http://example.org/ok/")
+        );
+        assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+
+        // 3. Crash after control-only frame append and before prefixes.json install reconciles
+        //    on reopen.
+        store.set_failpoint(
+            "prefixes-before-install",
+            Some(Arc::new(|_| {
+                panic!("simulated crash after control-only append before prefix install")
+            })),
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/crash", Arc::from(&b"durable"[..]))
+                .unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "ctrlp".into(),
+                "http://example.org/ctrl/".into(),
+            )]));
+            let _ = tx.commit();
+        }));
+        assert!(panicked.is_err());
+        assert!(dir.path().join(STAGED_PREFIXES_FILE).is_file());
+        drop(store);
+
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(
+            reopened.prefixes().get("ctrlp").map(String::as_str),
+            Some("http://example.org/ctrl/")
+        );
+        assert!(!reopened.prefixes().contains_key("refusedp"));
+        assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+    }
+
+    #[test]
+    fn unknown_staged_prefixes_version_refuses_open_before_wal_tail_truncation() {
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path(), Default::default()).unwrap();
+            let mut tx = store.write();
+            let mut labels = std::collections::HashMap::new();
+            let q = Quad::new(
+                NamedNode::new_unchecked("http://example.org/s"),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(1i64),
+                GraphName::DefaultGraph,
+            );
+            let id = tx.encode_quad(&q, &mut labels).unwrap();
+            tx.insert(id).unwrap();
+            tx.commit().unwrap();
+        }
+        let gen_name = std::fs::read_to_string(dir.path().join("CURRENT"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let wal_path = dir.path().join(&gen_name).join("wal.log");
+        // Append a torn tail byte that WAL repair would truncate if open progressed past
+        // staged-prefix version preflight.
+        {
+            let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            std::io::Write::write_all(&mut f, &[0xAB, 0xCD, 0xEF]).unwrap();
+        }
+        let wal_bytes_before = std::fs::read(&wal_path).unwrap();
+        std::fs::write(
+            dir.path().join(STAGED_PREFIXES_FILE),
+            br#"{"format_version":99,"commit_seq":1,"prefixes":{}}"#,
+        )
+        .unwrap();
+
+        let err = match Store::open(dir.path(), Default::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Unsupported error for unknown staged prefixes version"),
+        };
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        let wal_bytes_after = std::fs::read(&wal_path).unwrap();
+        assert_eq!(
+            wal_bytes_after, wal_bytes_before,
+            "unknown staged prefixes version must refuse open before modifying wal.log"
+        );
     }
 }

@@ -701,21 +701,51 @@ impl WriteTxn<'_> {
             .as_ref()
             .is_some_and(|c| c.base.get(control::ORIGIN_KEY).is_some())
             && state.get(control::ORIGIN_KEY).is_none();
+        let staged_prefixes = std::mem::take(&mut self.staged_prefixes);
+        let store = self.store;
+        let mut prep =
+            (!staged_prefixes.is_empty()).then(|| store.prepare_added_prefixes(&staged_prefixes));
+        let pending_next = prep.as_mut().and_then(|p| p.next.take());
+        if let Some(ref next) = pending_next
+            && let Err(e) = store.stage_prefixes_for_commit(head.seq, Some(frame.seq), next)
+        {
+            if store.clear_staged_prefixes().is_err() {
+                self.guard.poisoned = true;
+            }
+            return Err(e);
+        }
         let w = &mut **self.guard;
-        self.store.append_control(w, &frame, state)?;
+        if let Err(e) = store.append_control(w, &frame, state) {
+            if pending_next.is_some() && !w.poisoned && store.clear_staged_prefixes().is_err() {
+                w.poisoned = true;
+            }
+            return Err(e);
+        }
         if consumes_origin {
             // the origin leaves the checkpoint before the writer is released, so a lost
             // log is never recreated empty after a transition was acknowledged
             w.poisoned = true;
-            self.store.checkpoint_control(w)?;
+            store.checkpoint_control(w)?;
             w.poisoned = false;
         }
+        if let Some(mut prep) = prep {
+            if let Some(next) = pending_next {
+                if let Err(e) = store.install_staged_prefixes(&next) {
+                    w.poisoned = true;
+                    return Err(e);
+                }
+                *prep.cur = next;
+            }
+            let skipped = prep.skipped;
+            drop(prep);
+            store.warn_skipped_prefixes(skipped);
+        }
         Ok(Receipt {
-            dataset_id: self.store.owner_dataset_id(),
+            dataset_id: store.owner_dataset_id(),
             committed: false,
             commit: head,
             validation: None,
-            annotation: self.store.annotation(head.seq).unwrap_or_default(),
+            annotation: store.annotation(head.seq).unwrap_or_default(),
         })
     }
 }
