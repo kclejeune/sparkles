@@ -25,8 +25,8 @@ use sparkles_reasoner::inputs::{GraphRef, ImportMode};
 
 pub(crate) use onto::wire::{
     AxiomQuery, ClassifyQuery, DEFAULT_LIMIT, MAX_LIMIT, SummaryView, axiom_page, check_body,
-    classify_body, diff_body, diff_lines, edit_body, expansion_of, head_body, mentioned, page_body,
-    summary_body,
+    classify_body, diff_body, diff_lines, edit_body, edit_body_bounded, expansion_of, head_body,
+    mentioned, page_body, summary_body,
 };
 
 fn bad(m: impl Into<String>) -> ApiError {
@@ -54,6 +54,8 @@ pub(super) use imports::{
     catalog as imports_catalog, fetch as imports_fetch, get_map as imports_get,
     patch_map as imports_patch,
 };
+mod patterns;
+pub(super) use patterns::{apply as patterns_apply, preview as patterns_preview};
 
 /// The ontology the query parameters name, with the import map and the vocabulary
 /// resources its imports may resolve through (spec U12, import resolution).

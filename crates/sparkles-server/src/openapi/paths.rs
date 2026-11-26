@@ -1317,6 +1317,267 @@ fn ontology(p: &mut Paths) {
             } } } })),
         );
     p.add(write_params(o).errors(&[400, 403, 404, 408, 412, 422]));
+    let pattern_table = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["data"],
+        "properties": {
+            "data": { "type": "string", "description": "CSV or TSV spreadsheet text (at most 2 MiB and 5,000 data rows)." },
+            "format": { "type": "string", "enum": ["auto", "csv", "tsv"], "description": "Delimiter selection (`auto` by default)." }
+        }
+    });
+    let pattern_spec = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mode"],
+        "properties": {
+            "mode": { "type": "string", "enum": ["robot", "pattern"], "description": "`robot` for ROBOT-template column directives, or `pattern` for DOSDP/Cellfie-style parameterized axiom rules." },
+            "baseIri": { "type": ["string", "null"], "description": "Optional base IRI for resolving bare local names." },
+            "prefixes": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra prefix bindings merged on top of the dataset's prefixes." },
+            "headerTemplateRow": { "type": "boolean", "description": "In `robot` mode, whether row 2 carries the directive strings." },
+            "columns": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["column", "directive"],
+                "properties": {
+                    "column": { "type": "string" },
+                    "directive": { "type": "string" },
+                    "split": { "type": ["string", "null"] }
+                }
+            } },
+            "rules": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["template"],
+                "properties": {
+                    "name": { "type": ["string", "null"] },
+                    "template": { "type": "string" },
+                    "syntax": { "type": "string", "enum": ["manchester", "functional"] },
+                    "skipIfEmpty": { "type": "boolean" },
+                    "requiredColumns": { "type": "array", "items": { "type": "string" } },
+                    "split": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "annotations": { "type": "array", "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["property", "value"],
+                        "properties": {
+                            "property": { "type": "string" },
+                            "value": { "type": "string" },
+                            "lang": { "type": ["string", "null"] },
+                            "datatype": { "type": ["string", "null"] },
+                            "iri": { "type": "boolean" }
+                        }
+                    } }
+                }
+            } },
+            "declarations": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["column", "kind"],
+                "properties": {
+                    "column": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["Class", "ObjectProperty", "DataProperty", "AnnotationProperty", "NamedIndividual", "Datatype"] },
+                    "split": { "type": ["string", "null"] }
+                }
+            } }
+        }
+    });
+    let pattern_diag = json!({
+        "type": "object",
+        "properties": {
+            "row": { "type": "integer", "description": "1-based source line number." },
+            "column": { "type": ["string", "null"] },
+            "severity": { "type": "string", "enum": ["error", "warning"] },
+            "code": { "type": "string" },
+            "message": { "type": "string" }
+        }
+    });
+    let mut preview_headers = commit_headers();
+    if let Some(m) = preview_headers.as_object_mut() {
+        m.insert(
+            "ETag".into(),
+            json!({ "description": "A weak entity tag naming the commit, ontology import-target digest, and dataset prefix digest, reusable as `If-Match` on apply.", "schema": { "type": "string" } }),
+        );
+    }
+    let mut apply_headers = commit_headers();
+    if let Some(m) = apply_headers.as_object_mut() {
+        m.insert(
+            "Sparkles-Dry-Run".into(),
+            json!({ "description": "Present and `true` on dry-run responses.", "schema": { "type": "boolean" } }),
+        );
+        m.insert(
+            "Sparkles-Dry-Run-Outcome".into(),
+            json!({ "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.", "schema": { "type": "string", "enum": ["commit", "no-change", "precondition-failed", "rejected", "storage-refused"] } }),
+        );
+    }
+    let dry_run_headers = json!({
+        "Sparkles-Dry-Run": { "description": "Present and `true` on dry-run responses.", "schema": { "type": "boolean" } },
+        "Sparkles-Dry-Run-Outcome": { "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.", "schema": { "type": "string", "enum": ["commit", "no-change", "precondition-failed", "rejected", "storage-refused"] } }
+    });
+    let pattern_apply_ok = json!({
+        "type": "object",
+        "properties": {
+            "added": { "type": "integer" },
+            "present": { "type": "integer" },
+            "removed": { "type": "integer" },
+            "absent": { "type": "array", "items": { "type": "string" } },
+            "declared": { "type": "array", "items": { "type": "string" } },
+            "addedAxioms": edited.clone(),
+            "removedAxioms": edited.clone(),
+            "axiomsTruncated": { "type": "boolean" },
+            "inserted": { "type": "integer" },
+            "deleted": { "type": "integer" },
+            "kept": { "type": "integer" },
+            "committed": { "type": "boolean" },
+            "pattern": { "type": "object", "properties": {
+                "delimiter": { "type": "string" },
+                "headers": { "type": "array", "items": { "type": "string" } },
+                "rowsProcessed": { "type": "integer" },
+                "rowsSkipped": { "type": "integer" },
+                "rowsWithErrors": { "type": "integer" },
+                "generated": { "type": "integer" },
+                "valid": { "type": "boolean" },
+                "diagnostics": { "type": "array", "items": pattern_diag.clone() },
+                "diagnosticsTruncated": { "type": "boolean" }
+            } }
+        }
+    });
+    let pattern_errors = json!({
+        "type": "object",
+        "required": ["error", "code", "rowsProcessed", "rowsSkipped", "rowsWithErrors", "diagnostics", "diagnosticsTruncated"],
+        "properties": {
+            "error": { "type": "string" },
+            "code": { "type": "string", "const": "pattern-errors" },
+            "rowsProcessed": { "type": "integer" },
+            "rowsSkipped": { "type": "integer" },
+            "rowsWithErrors": { "type": "integer" },
+            "diagnostics": { "type": "array", "items": pattern_diag.clone() },
+            "diagnosticsTruncated": { "type": "boolean" }
+        }
+    });
+    p.add(
+        read(op(POST, "/$/ontology/{ds}/patterns/preview", "previewOntologyPatterns", "Ontology", "Preview axioms generated from a table"))
+            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the pattern preview entity tag (encoding the head commit, import-target digest, and dataset prefix binding digest) and commit headers for `If-Match` on apply.")
+            .see("ontology")
+            .param("at")
+            .param("timeout")
+            .body(
+                true,
+                "The table, pattern specification, and preview options.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["table", "spec"],
+                    "properties": {
+                        "graph": selection["graph"],
+                        "imports": selection["imports"],
+                        "mode": selection["mode"],
+                        "table": pattern_table.clone(),
+                        "spec": pattern_spec.clone(),
+                        "declare": { "type": "boolean", "description": "Whether missing entity declarations would be added on apply (true by default)." },
+                        "target": { "type": "string", "description": "The graph that would take the added axioms." },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "The most generated axioms listed in `axioms` (200 by default)." }
+                    }
+                } } }),
+            )
+            .resp_h(
+                "200",
+                "The preview of generated axioms, diff summary, and row diagnostics.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "dataset": { "type": "string" },
+                        "commit": { "type": "integer" },
+                        "graphs": { "type": "array", "items": { "type": "string" } },
+                        "target": { "type": "string" },
+                        "delimiter": { "type": "string", "enum": ["csv", "tsv"] },
+                        "headers": { "type": "array", "items": { "type": "string" } },
+                        "valid": { "type": "boolean" },
+                        "rowsProcessed": { "type": "integer" },
+                        "rowsSkipped": { "type": "integer" },
+                        "rowsWithErrors": { "type": "integer" },
+                        "generated": { "type": "integer" },
+                        "newAxioms": { "type": "integer" },
+                        "existingAxioms": { "type": "integer" },
+                        "autoDeclarations": { "type": "array", "items": { "type": "object", "properties": { "iri": { "type": "string" }, "kind": { "type": "string" } } } },
+                        "estimatedTriples": { "type": "integer" },
+                        "axioms": { "type": "array", "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string" },
+                                "ofn": { "type": "string" },
+                                "manchester": { "type": ["string", "null"] },
+                                "axiom": { "type": "object" },
+                                "rows": { "type": "array", "items": { "type": "integer" } },
+                                "status": { "type": "string", "enum": ["new", "existing"] }
+                            }
+                        } },
+                        "axiomsTruncated": { "type": "boolean" },
+                        "diagnostics": { "type": "array", "items": pattern_diag },
+                        "diagnosticsTruncated": { "type": "boolean" }
+                    }
+                } } })),
+                preview_headers,
+            )
+            .errors(&[400, 403, 404, 408, 413, 507]),
+    );
+    p.add(
+        write_params(op(POST, "/$/ontology/{ds}/patterns/apply", "applyOntologyPatterns", "Ontology", "Generate and commit axioms from a table"))
+            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target and dataset prefix binding digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: \"abort\"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: \"skip\"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.")
+            .see("ontology")
+            .param("ifMatch")
+            .body(
+                true,
+                "The table, pattern specification, and commit options.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["table", "spec"],
+                    "properties": {
+                        "graph": selection["graph"],
+                        "imports": selection["imports"],
+                        "mode": selection["mode"],
+                        "table": pattern_table,
+                        "spec": pattern_spec,
+                        "declare": { "type": "boolean" },
+                        "target": { "type": "string", "description": "The graph that takes the added axioms." },
+                        "message": { "type": "string" },
+                        "onError": { "type": "string", "enum": ["abort", "skip"], "description": "Whether row errors refuse the commit (`abort`, the default) or skip erroneous rows (`skip`)." }
+                    }
+                } } }),
+            )
+            .resp_h(
+                "200",
+                "What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report (JSON, or RDF Patch when `Accept` prefers `application/rdf-patch`, `text/rdf-patch`, or `application/rdf-patch+thrift`) when `dryRun=true`.",
+                Some(json!({
+                    "application/json": { "schema": { "anyOf": [pattern_apply_ok.clone(), sref("DryRunReport")] } },
+                    "application/x-sparkles+json": { "schema": { "allOf": [sref("Receipt"), pattern_apply_ok] } },
+                    "application/rdf-patch": text(),
+                    "text/rdf-patch": text(),
+                    "application/rdf-patch+thrift": binary()
+                })),
+                apply_headers,
+            )
+            .errors(&[400, 403, 404, 408, 413])
+            .resp_h(
+                "412",
+                "Precondition failed (`If-Match` did not match the current head, import-target digest, or dataset prefix binding digest), or a dry-run precondition failure report.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [sref("DryRunReport"), sref("Error")] } } })),
+                dry_run_headers.clone(),
+            )
+            .resp_h(
+                "422",
+                "Pattern evaluation errors (`pattern-errors`), write validation refusal, or a dry-run validation rejection report.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [pattern_errors, sref("DryRunReport"), sref("Error")] } } })),
+                dry_run_headers.clone(),
+            )
+            .resp_h(
+                "507",
+                "Projected RDF triple or payload budget refusal (`triple-limit`), storage limit refusal, or a dry-run storage refusal report.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [sref("DryRunReport"), sref("Error")] } } })),
+                dry_run_headers,
+            ),
+    );
     p.add(
         write_params(sel(op(DELETE, "/$/ontology/{ds}/entity", "removeOntologyEntity", "Ontology", "Remove an entity")))
             .doc("Removes an entity in one commit: its declarations, the axioms of the graphs read that mention it and the assertions about it that the store holds there. The ontology is read from the head under the writer lock. The answer is an edit's, and `removedAxioms` lists what the removal took. An IRI the ontology does not mention removes nothing and makes no commit.")

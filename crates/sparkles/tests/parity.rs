@@ -642,6 +642,42 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 &any(),
             );
         }),
+        op_if!(
+            "ontology",
+            "previewOntologyPatterns",
+            "ontology.patterns.preview",
+            |ds| {
+                if let Ok(o) = ds.ontology().open(&any(), &any()) {
+                    let v = sparkles::owl::manchester::Vocabulary::of_ontology(
+                        &o.ontology,
+                        std::collections::BTreeMap::<String, String>::new(),
+                    );
+                    let _ = sparkles::owl::patterns::evaluate("", any(), &any(), &v, &any());
+                }
+            }
+        ),
+        op_if!(
+            "ontology",
+            "applyOntologyPatterns",
+            "ontology.patterns.apply",
+            |ds| {
+                let _ = ds.ontology().edit_from_head(
+                    &any(),
+                    None,
+                    None,
+                    &any(),
+                    |_, _| {},
+                    |o| {
+                        let v = sparkles::owl::manchester::Vocabulary::of_ontology(
+                            &o.ontology,
+                            std::collections::BTreeMap::<String, String>::new(),
+                        );
+                        let _ = sparkles::owl::patterns::evaluate("", any(), &any(), &v, &any());
+                        Ok::<_, ()>((any(), ()))
+                    },
+                );
+            }
+        ),
         // the import map (item 624) is a file of the server beside the dataset, like the
         // ingest and memory settings, and a fetch goes through the server's outbound
         // policy; a library caller passes the map's targets in `OntologyRequest`

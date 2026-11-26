@@ -105,6 +105,8 @@
   import Discussions from '$components/Discussions.svelte';
   import WatchButton from '$components/WatchButton.svelte';
   import BulkEdit from '$components/BulkEdit.svelte';
+  import OntoPatterns from '$components/OntoPatterns.svelte';
+  import { PatternCommitCoordinator, patternCommitToast } from '$lib/ontology-patterns';
   import OntoImports from '$components/OntoImports.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
@@ -118,6 +120,7 @@
     ['history', 'History'],
     ['discussions', 'Discussions'],
     ['bulk', 'Bulk edits'],
+    ['patterns', 'Patterns'],
     ['imports', 'Imports'],
   ];
 
@@ -1157,6 +1160,27 @@
     if (seq != null) session.own.add(seq);
     void loadAll();
   };
+
+  let pageMounted = true;
+  onMount(() => () => {
+    pageMounted = false;
+  });
+  let patternPendingTargets = $state<ReadonlySet<string>>(new Set());
+  const patternCommit = new PatternCommitCoordinator({
+    onCommitted: (submittedTarget, seq, notice, res, handledInTab) => {
+      if (!pageMounted || submittedTarget !== target) return;
+      discussed(seq);
+      const toast = patternCommitToast(res, notice, handledInTab);
+      if (toast) toasts.push(toast.kind, toast.title, toast.detail);
+    },
+    onDetachedError: (submittedTarget, e) => {
+      if (!pageMounted || submittedTarget !== target) return;
+      toasts.push('error', 'Pattern apply failed', api.errorMessage(e));
+    },
+    onPendingChange: (pending) => {
+      if (pageMounted) patternPendingTargets = pending;
+    },
+  });
   /**
    * Preview `op`. `selection` is the graphs the edit reads and writes, the page's own unless
    * the edit was planned from another reading, as a bulk edit is from the graph alone.
@@ -1614,6 +1638,20 @@
               onedit={(op, label) =>
                 // the plan was read without the imports, and its edit reads and writes the same
                 edit(op, label, undefined, null, { graph, imports: false })}
+            />{/key}
+        </div>
+      </section>
+    {:else if tab === 'patterns' && summary}
+      <section class="panel" aria-label="Pattern axiom generation">
+        <div class="panel-body">
+          {#key `${target}|${graph}`}<OntoPatterns
+              {target}
+              {sel}
+              {etag}
+              {readonly}
+              oncommitted={discussed}
+              commitCoordinator={patternCommit}
+              externalApplying={patternPendingTargets.has(target)}
             />{/key}
         </div>
       </section>

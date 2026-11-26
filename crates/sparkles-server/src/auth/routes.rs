@@ -87,6 +87,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}/imports", &["GET", "PATCH"]),
     ("/$/ontology/{ds}/imports/catalog", &["POST"]),
     ("/$/ontology/{ds}/imports/fetch", &["POST"]),
+    // pattern-based axiom generation (U12): preview reads, apply writes
+    ("/$/ontology/{ds}/patterns/preview", &["POST"]),
+    ("/$/ontology/{ds}/patterns/apply", &["POST"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
     // editing forms (U02): the check and the save check write on the branch they name
@@ -455,6 +458,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/ontology/{ds}/imports"
         | "/$/ontology/{ds}/imports/catalog"
         | "/$/ontology/{ds}/imports/fetch" => Dataset(Admin),
+        "/$/ontology/{ds}/patterns/apply" => Dataset(Write),
         "/$/assistant/{ds}" => Dataset(Admin),
         "/$/graphrag/{ds}"
         | "/$/graphrag/{ds}/communities"
@@ -541,6 +545,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ontology/{ds}/individuals"
         | "/$/ontology/{ds}/classification"
         | "/$/ontology/{ds}/term"
+        | "/$/ontology/{ds}/patterns/preview"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
         | "/$/forms/{ds}"
@@ -755,9 +760,10 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/$/ontology/{ds}/individuals"
         | "/$/ontology/{ds}/classification"
         | "/$/ontology/{ds}/term"
+        | "/$/ontology/{ds}/patterns/preview"
         | "/$/ontology/{ds}/entity" => Endpoint::Query,
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
-        "/$/ontology/{ds}/axioms" => Endpoint::Update,
+        "/$/ontology/{ds}/axioms" | "/$/ontology/{ds}/patterns/apply" => Endpoint::Update,
         "/$/ontology/{ds}/imports" if get => Endpoint::Query,
         "/$/ontology/{ds}/imports"
         | "/$/ontology/{ds}/imports/catalog"

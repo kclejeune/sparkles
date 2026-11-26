@@ -88,6 +88,8 @@ mod ontology {
     pub(super) use self::summary as imports_fetch;
     pub(super) use self::summary as imports_get;
     pub(super) use self::summary as imports_patch;
+    pub(super) use self::summary as patterns_apply;
+    pub(super) use self::summary as patterns_preview;
 
     pub(super) async fn axioms() -> ApiResult {
         not_built()
@@ -235,6 +237,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/$/ontology/{ds}/imports/fetch",
             post(ontology::imports_fetch),
+        )
+        .route(
+            "/$/ontology/{ds}/patterns/preview",
+            post(ontology::patterns_preview),
+        )
+        .route(
+            "/$/ontology/{ds}/patterns/apply",
+            post(ontology::patterns_apply),
         )
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
@@ -2629,21 +2639,35 @@ fn write_response(
     wanted: bool,
     restricted: bool,
 ) -> Response {
+    write_response_with_receipt_map(ds, status, body, receipt, None, wanted, restricted)
+}
+
+fn write_response_with_receipt_map(
+    ds: &Dataset,
+    status: StatusCode,
+    body: Option<J>,
+    receipt: &sparkles::commit::Receipt,
+    receipt_override: Option<serde_json::Map<String, J>>,
+    wanted: bool,
+    restricted: bool,
+) -> Response {
     crate::otel::commit(receipt);
     let validation = receipt.validation.clone().filter(|_| !restricted);
     let r = if wanted {
         let mut doc = body.unwrap_or_else(|| json!({}));
-        if let (Some(m), Ok(J::Object(mut rm))) =
-            (doc.as_object_mut(), serde_json::to_value(receipt))
-        {
-            if restricted {
-                rm.remove("validation");
-                if let Some(c) = rm.get_mut("commit") {
-                    redact_commit_json(c);
+        if let Some(m) = doc.as_object_mut() {
+            if let Some(rm) = receipt_override {
+                m.extend(rm);
+            } else if let Ok(J::Object(mut rm)) = serde_json::to_value(receipt) {
+                if restricted {
+                    rm.remove("validation");
+                    if let Some(c) = rm.get_mut("commit") {
+                        redact_commit_json(c);
+                    }
                 }
+                m.insert("dataset".into(), ds.name.clone().into());
+                m.extend(rm);
             }
-            m.insert("dataset".into(), ds.name.clone().into());
-            m.extend(rm);
         }
         let status = if status == StatusCode::NO_CONTENT {
             StatusCode::OK

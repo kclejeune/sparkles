@@ -478,7 +478,7 @@ graph and its imports ([U12](../specs/U12-ontology-workbench/SPEC.md#outcome),
 annotation properties, and individuals sit beside the selected entity's frame, whose add
 fields accept Manchester syntax (with name/label completion and inline parse underlines)
 or functional-style syntax. Tabs cover **Tree**, **DL Query**, **Header**, **History**,
-**Discussions**, **Bulk edits**, and **Imports**, with a tree kind selector and a
+**Discussions**, **Bulk edits**, **Patterns**, and **Imports**, with a tree kind selector and a
 frame/usage/history/discussion segmented control on the entity panel.
 
 * **Incremental loading and individuals.** Opening the editor loads only the ontology
@@ -548,6 +548,14 @@ frame/usage/history/discussion segmented control on the entity panel.
   graphs with more than 100,000 annotation assertions or `SubClassOf` axioms, moves
   exceeding 10,000 changed axioms, empty-matching regexes, and cyclic class moves. Larger
   ontology bulk edits are tracked in roadmap item 770.
+* **Patterns.** The **Patterns** tab generates OWL 2 axioms from uploaded or pasted CSV
+  and TSV spreadsheets through ROBOT-template column directives (`ID`, `LABEL`, `TYPE`,
+  `SC`, `EC`, `DC`, `SP`, `C`, `I`, `TI`, `A`, `SPLIT`, and axiom annotations) or DOSDP
+  and Cellfie style parameterized Manchester and functional-style axiom rules (`${col}`
+  placeholders and filters). Starter presets, live preview of new and existing axioms,
+  per-row validation diagnostics, dry-run triple diffs, and single-commit apply with
+  `If-Match` preconditions are built in, bounded to 2 MiB, 5,000 data rows, and 50,000
+  unique generated axioms. Readers and protected branches can preview without committing.
 * **Imports.** The **Imports** tab draws the `owl:imports` closure tree, marks cycles and
   unreadable targets, and manages the dataset-wide import map
   ([screenshot](../images/ontology-imports.png)). Imports resolve in order through the

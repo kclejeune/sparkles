@@ -45927,6 +45927,1476 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/ontology/{ds}/patterns/apply": {
+      "post": {
+        "description": "Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target and dataset prefix binding digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: \"abort\"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: \"skip\"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "applyOntologyPatterns",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "declare": {
+                    "type": "boolean"
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "onError": {
+                    "description": "Whether row errors refuse the commit (`abort`, the default) or skip erroneous rows (`skip`).",
+                    "enum": [
+                      "abort",
+                      "skip"
+                    ],
+                    "type": "string"
+                  },
+                  "spec": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "baseIri": {
+                        "description": "Optional base IRI for resolving bare local names.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "columns": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "column": {
+                              "type": "string"
+                            },
+                            "directive": {
+                              "type": "string"
+                            },
+                            "split": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "column",
+                            "directive"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "declarations": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "column": {
+                              "type": "string"
+                            },
+                            "kind": {
+                              "enum": [
+                                "Class",
+                                "ObjectProperty",
+                                "DataProperty",
+                                "AnnotationProperty",
+                                "NamedIndividual",
+                                "Datatype"
+                              ],
+                              "type": "string"
+                            },
+                            "split": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "column",
+                            "kind"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "headerTemplateRow": {
+                        "description": "In `robot` mode, whether row 2 carries the directive strings.",
+                        "type": "boolean"
+                      },
+                      "mode": {
+                        "description": "`robot` for ROBOT-template column directives, or `pattern` for DOSDP/Cellfie-style parameterized axiom rules.",
+                        "enum": [
+                          "robot",
+                          "pattern"
+                        ],
+                        "type": "string"
+                      },
+                      "prefixes": {
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "description": "Extra prefix bindings merged on top of the dataset's prefixes.",
+                        "type": "object"
+                      },
+                      "rules": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "annotations": {
+                              "items": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "datatype": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "iri": {
+                                    "type": "boolean"
+                                  },
+                                  "lang": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "property": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "property",
+                                  "value"
+                                ],
+                                "type": "object"
+                              },
+                              "type": "array"
+                            },
+                            "name": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "requiredColumns": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "skipIfEmpty": {
+                              "type": "boolean"
+                            },
+                            "split": {
+                              "additionalProperties": {
+                                "type": "string"
+                              },
+                              "type": "object"
+                            },
+                            "syntax": {
+                              "enum": [
+                                "manchester",
+                                "functional"
+                              ],
+                              "type": "string"
+                            },
+                            "template": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "template"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "mode"
+                    ],
+                    "type": "object"
+                  },
+                  "table": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "description": "CSV or TSV spreadsheet text (at most 2 MiB and 5,000 data rows).",
+                        "type": "string"
+                      },
+                      "format": {
+                        "description": "Delimiter selection (`auto` by default).",
+                        "enum": [
+                          "auto",
+                          "csv",
+                          "tsv"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data"
+                    ],
+                    "type": "object"
+                  },
+                  "target": {
+                    "description": "The graph that takes the added axioms.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "table",
+                  "spec"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The table, pattern specification, and commit options.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "absent": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "added": {
+                          "type": "integer"
+                        },
+                        "addedAxioms": {
+                          "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                          "items": {
+                            "properties": {
+                              "axiom": {
+                                "type": "object"
+                              },
+                              "ofn": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "axiomsTruncated": {
+                          "type": "boolean"
+                        },
+                        "committed": {
+                          "type": "boolean"
+                        },
+                        "declared": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "deleted": {
+                          "type": "integer"
+                        },
+                        "inserted": {
+                          "type": "integer"
+                        },
+                        "kept": {
+                          "type": "integer"
+                        },
+                        "pattern": {
+                          "properties": {
+                            "delimiter": {
+                              "type": "string"
+                            },
+                            "diagnostics": {
+                              "items": {
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "column": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "row": {
+                                    "description": "1-based source line number.",
+                                    "type": "integer"
+                                  },
+                                  "severity": {
+                                    "enum": [
+                                      "error",
+                                      "warning"
+                                    ],
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "type": "array"
+                            },
+                            "diagnosticsTruncated": {
+                              "type": "boolean"
+                            },
+                            "generated": {
+                              "type": "integer"
+                            },
+                            "headers": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "rowsProcessed": {
+                              "type": "integer"
+                            },
+                            "rowsSkipped": {
+                              "type": "integer"
+                            },
+                            "rowsWithErrors": {
+                              "type": "integer"
+                            },
+                            "valid": {
+                              "type": "boolean"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "present": {
+                          "type": "integer"
+                        },
+                        "removed": {
+                          "type": "integer"
+                        },
+                        "removedAxioms": {
+                          "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                          "items": {
+                            "properties": {
+                              "axiom": {
+                                "type": "object"
+                              },
+                              "ofn": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DryRunReport"
+                    }
+                  ]
+                }
+              },
+              "application/rdf-patch": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf-patch+thrift": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "type": "string"
+                }
+              },
+              "application/x-sparkles+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Receipt"
+                    },
+                    {
+                      "properties": {
+                        "absent": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "added": {
+                          "type": "integer"
+                        },
+                        "addedAxioms": {
+                          "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                          "items": {
+                            "properties": {
+                              "axiom": {
+                                "type": "object"
+                              },
+                              "ofn": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "axiomsTruncated": {
+                          "type": "boolean"
+                        },
+                        "committed": {
+                          "type": "boolean"
+                        },
+                        "declared": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "deleted": {
+                          "type": "integer"
+                        },
+                        "inserted": {
+                          "type": "integer"
+                        },
+                        "kept": {
+                          "type": "integer"
+                        },
+                        "pattern": {
+                          "properties": {
+                            "delimiter": {
+                              "type": "string"
+                            },
+                            "diagnostics": {
+                              "items": {
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "column": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "row": {
+                                    "description": "1-based source line number.",
+                                    "type": "integer"
+                                  },
+                                  "severity": {
+                                    "enum": [
+                                      "error",
+                                      "warning"
+                                    ],
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "type": "array"
+                            },
+                            "diagnosticsTruncated": {
+                              "type": "boolean"
+                            },
+                            "generated": {
+                              "type": "integer"
+                            },
+                            "headers": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "rowsProcessed": {
+                              "type": "integer"
+                            },
+                            "rowsSkipped": {
+                              "type": "integer"
+                            },
+                            "rowsWithErrors": {
+                              "type": "integer"
+                            },
+                            "valid": {
+                              "type": "boolean"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "present": {
+                          "type": "integer"
+                        },
+                        "removed": {
+                          "type": "integer"
+                        },
+                        "removedAxioms": {
+                          "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                          "items": {
+                            "properties": {
+                              "axiom": {
+                                "type": "object"
+                              },
+                              "ofn": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "text/rdf-patch": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report (JSON, or RDF Patch when `Accept` prefers `application/rdf-patch`, `text/rdf-patch`, or `application/rdf-patch+thrift`) when `dryRun=true`.",
+            "headers": {
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Commit": {
+                "description": "The commit a read saw, or a write produced.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Sparkles-Dataset-Id": {
+                "description": "The dataset id.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Dry-Run": {
+                "description": "Present and `true` on dry-run responses.",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Sparkles-Dry-Run-Outcome": {
+                "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.",
+                "schema": {
+                  "enum": [
+                    "commit",
+                    "no-change",
+                    "precondition-failed",
+                    "rejected",
+                    "storage-refused"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DryRunReport"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Precondition failed (`If-Match` did not match the current head, import-target digest, or dataset prefix binding digest), or a dry-run precondition failure report.",
+            "headers": {
+              "Sparkles-Dry-Run": {
+                "description": "Present and `true` on dry-run responses.",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Sparkles-Dry-Run-Outcome": {
+                "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.",
+                "schema": {
+                  "enum": [
+                    "commit",
+                    "no-change",
+                    "precondition-failed",
+                    "rejected",
+                    "storage-refused"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "code": {
+                          "const": "pattern-errors",
+                          "type": "string"
+                        },
+                        "diagnostics": {
+                          "items": {
+                            "properties": {
+                              "code": {
+                                "type": "string"
+                              },
+                              "column": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "message": {
+                                "type": "string"
+                              },
+                              "row": {
+                                "description": "1-based source line number.",
+                                "type": "integer"
+                              },
+                              "severity": {
+                                "enum": [
+                                  "error",
+                                  "warning"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "diagnosticsTruncated": {
+                          "type": "boolean"
+                        },
+                        "error": {
+                          "type": "string"
+                        },
+                        "rowsProcessed": {
+                          "type": "integer"
+                        },
+                        "rowsSkipped": {
+                          "type": "integer"
+                        },
+                        "rowsWithErrors": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "error",
+                        "code",
+                        "rowsProcessed",
+                        "rowsSkipped",
+                        "rowsWithErrors",
+                        "diagnostics",
+                        "diagnosticsTruncated"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DryRunReport"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Pattern evaluation errors (`pattern-errors`), write validation refusal, or a dry-run validation rejection report.",
+            "headers": {
+              "Sparkles-Dry-Run": {
+                "description": "Present and `true` on dry-run responses.",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Sparkles-Dry-Run-Outcome": {
+                "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.",
+                "schema": {
+                  "enum": [
+                    "commit",
+                    "no-change",
+                    "precondition-failed",
+                    "rejected",
+                    "storage-refused"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DryRunReport"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Projected RDF triple or payload budget refusal (`triple-limit`), storage limit refusal, or a dry-run storage refusal report.",
+            "headers": {
+              "Sparkles-Dry-Run": {
+                "description": "Present and `true` on dry-run responses.",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Sparkles-Dry-Run-Outcome": {
+                "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.",
+                "schema": {
+                  "enum": [
+                    "commit",
+                    "no-change",
+                    "precondition-failed",
+                    "rejected",
+                    "storage-refused"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Generate and commit axioms from a table",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/$/ontology/{ds}/patterns/preview": {
+      "post": {
+        "description": "Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the pattern preview entity tag (encoding the head commit, import-target digest, and dataset prefix binding digest) and commit headers for `If-Match` on apply.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "previewOntologyPatterns",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "declare": {
+                    "description": "Whether missing entity declarations would be added on apply (true by default).",
+                    "type": "boolean"
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "limit": {
+                    "description": "The most generated axioms listed in `axioms` (200 by default).",
+                    "maximum": 2000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "spec": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "baseIri": {
+                        "description": "Optional base IRI for resolving bare local names.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "columns": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "column": {
+                              "type": "string"
+                            },
+                            "directive": {
+                              "type": "string"
+                            },
+                            "split": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "column",
+                            "directive"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "declarations": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "column": {
+                              "type": "string"
+                            },
+                            "kind": {
+                              "enum": [
+                                "Class",
+                                "ObjectProperty",
+                                "DataProperty",
+                                "AnnotationProperty",
+                                "NamedIndividual",
+                                "Datatype"
+                              ],
+                              "type": "string"
+                            },
+                            "split": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "column",
+                            "kind"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "headerTemplateRow": {
+                        "description": "In `robot` mode, whether row 2 carries the directive strings.",
+                        "type": "boolean"
+                      },
+                      "mode": {
+                        "description": "`robot` for ROBOT-template column directives, or `pattern` for DOSDP/Cellfie-style parameterized axiom rules.",
+                        "enum": [
+                          "robot",
+                          "pattern"
+                        ],
+                        "type": "string"
+                      },
+                      "prefixes": {
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "description": "Extra prefix bindings merged on top of the dataset's prefixes.",
+                        "type": "object"
+                      },
+                      "rules": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "annotations": {
+                              "items": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "datatype": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "iri": {
+                                    "type": "boolean"
+                                  },
+                                  "lang": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "property": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "property",
+                                  "value"
+                                ],
+                                "type": "object"
+                              },
+                              "type": "array"
+                            },
+                            "name": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "requiredColumns": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "skipIfEmpty": {
+                              "type": "boolean"
+                            },
+                            "split": {
+                              "additionalProperties": {
+                                "type": "string"
+                              },
+                              "type": "object"
+                            },
+                            "syntax": {
+                              "enum": [
+                                "manchester",
+                                "functional"
+                              ],
+                              "type": "string"
+                            },
+                            "template": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "template"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "mode"
+                    ],
+                    "type": "object"
+                  },
+                  "table": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "data": {
+                        "description": "CSV or TSV spreadsheet text (at most 2 MiB and 5,000 data rows).",
+                        "type": "string"
+                      },
+                      "format": {
+                        "description": "Delimiter selection (`auto` by default).",
+                        "enum": [
+                          "auto",
+                          "csv",
+                          "tsv"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "data"
+                    ],
+                    "type": "object"
+                  },
+                  "target": {
+                    "description": "The graph that would take the added axioms.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "table",
+                  "spec"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The table, pattern specification, and preview options.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "autoDeclarations": {
+                      "items": {
+                        "properties": {
+                          "iri": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "axioms": {
+                      "items": {
+                        "properties": {
+                          "axiom": {
+                            "type": "object"
+                          },
+                          "manchester": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "ofn": {
+                            "type": "string"
+                          },
+                          "rows": {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": "array"
+                          },
+                          "status": {
+                            "enum": [
+                              "new",
+                              "existing"
+                            ],
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "axiomsTruncated": {
+                      "type": "boolean"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "delimiter": {
+                      "enum": [
+                        "csv",
+                        "tsv"
+                      ],
+                      "type": "string"
+                    },
+                    "diagnostics": {
+                      "items": {
+                        "properties": {
+                          "code": {
+                            "type": "string"
+                          },
+                          "column": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "message": {
+                            "type": "string"
+                          },
+                          "row": {
+                            "description": "1-based source line number.",
+                            "type": "integer"
+                          },
+                          "severity": {
+                            "enum": [
+                              "error",
+                              "warning"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "diagnosticsTruncated": {
+                      "type": "boolean"
+                    },
+                    "estimatedTriples": {
+                      "type": "integer"
+                    },
+                    "existingAxioms": {
+                      "type": "integer"
+                    },
+                    "generated": {
+                      "type": "integer"
+                    },
+                    "graphs": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "headers": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "newAxioms": {
+                      "type": "integer"
+                    },
+                    "rowsProcessed": {
+                      "type": "integer"
+                    },
+                    "rowsSkipped": {
+                      "type": "integer"
+                    },
+                    "rowsWithErrors": {
+                      "type": "integer"
+                    },
+                    "target": {
+                      "type": "string"
+                    },
+                    "valid": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The preview of generated axioms, diff summary, and row diagnostics.",
+            "headers": {
+              "ETag": {
+                "description": "A weak entity tag naming the commit, ontology import-target digest, and dataset prefix digest, reusable as `If-Match` on apply.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Commit": {
+                "description": "The commit a read saw, or a write produced.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Sparkles-Dataset-Id": {
+                "description": "The dataset id.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Preview axioms generated from a table",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/ontology/{ds}/search": {
       "get": {
         "description": "The entities whose labels, synonyms, short forms, IRIs or definitions match `q`, in any language and with typo tolerance, ranked for a typeahead: a label equal to the query first, then labels that start with it, synonyms, short forms and IRIs equal to it or starting with it, labels and then synonyms that contain its words, matches within a few edits, and definitions that contain its words. Within each tier the order is the edits, the field, entities that are not deprecated first, the caller's language, the length of the matched text, the text and the IRI. The search reads the head of the branch from an entity index that each commit's changes keep current, and the caller sees only the graphs their grants allow. A query of 1 to 3 characters takes no edits as typed, 4 to 7 characters take one and longer queries two. `at` and `inferences` are refused.",

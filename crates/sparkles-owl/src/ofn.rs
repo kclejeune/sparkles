@@ -90,6 +90,25 @@ impl<W: fmt::Write + ?Sized> PolledWrite<fmt::Error> for FmtSink<'_, W> {
     }
 }
 
+struct BoundedSink {
+    buf: String,
+    limit: usize,
+}
+
+impl PolledWrite<()> for BoundedSink {
+    fn push_str(&mut self, s: &str) -> Result<(), ()> {
+        if self.buf.len().saturating_add(s.len()) > self.limit {
+            return Err(());
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
+
+    fn tick(&mut self, _work: usize) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
 /// The prefixes every rendering knows.
 pub const STANDARD_PREFIXES: [(&str, &str); 4] = [
     ("owl", vocab::OWL),
@@ -403,6 +422,297 @@ impl Renderer {
         w: &mut impl fmt::Write,
     ) -> fmt::Result {
         self.write_class_expression_polled(c, &mut FmtSink(w))
+    }
+
+    pub(crate) fn write_entity_polled<E>(
+        &self,
+        e: &Entity,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        w.write_str_polled(e.kind().name())?;
+        w.write_char_polled('(')?;
+        self.write_iri_polled(e.iri().as_str(), w)?;
+        w.write_char_polled(')')
+    }
+
+    pub(crate) fn write_annotation_value_polled<E>(
+        &self,
+        v: &AnnotationValue,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        match v {
+            AnnotationValue::Iri(i) => self.write_iri_polled(i.as_str(), w),
+            AnnotationValue::Literal(l) => self.write_literal_polled(l, w),
+            AnnotationValue::Anonymous(a) => {
+                w.write_str_polled("_:")?;
+                w.write_str_polled(a.label())
+            }
+        }
+    }
+
+    pub(crate) fn write_annotation_polled<E>(
+        &self,
+        a: &Annotation,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        w.write_str_polled("Annotation(")?;
+        for inner in &a.annotations {
+            self.write_annotation_polled(inner, w)?;
+            w.write_char_polled(' ')?;
+        }
+        self.write_iri_polled(a.property.as_str(), w)?;
+        w.write_char_polled(' ')?;
+        self.write_annotation_value_polled(&a.value, w)?;
+        w.write_char_polled(')')
+    }
+
+    pub(crate) fn write_axiom_polled<E>(
+        &self,
+        ax: &Axiom,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        use AxiomKind as K;
+        w.write_str_polled(ax.axiom_type().name())?;
+        w.write_char_polled('(')?;
+        let mut first = true;
+        let mut sep = |w: &mut dyn FnMut() -> Result<(), E>| -> Result<(), E> {
+            if first {
+                first = false;
+                Ok(())
+            } else {
+                w()
+            }
+        };
+        for a in &ax.annotations {
+            sep(&mut || w.write_char_polled(' '))?;
+            self.write_annotation_polled(a, w)?;
+        }
+        match &ax.kind {
+            K::Declaration(e) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_entity_polled(e, w)?;
+            }
+            K::SubClassOf(a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_class_expression_polled(a, w)?;
+                w.write_char_polled(' ')?;
+                self.write_class_expression_polled(b, w)?;
+            }
+            K::EquivalentClasses(cs) => {
+                for c in cs {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_class_expression_polled(c, w)?;
+                }
+            }
+            K::DisjointClasses(cs) => {
+                for c in cs {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_class_expression_polled(c, w)?;
+                }
+            }
+            K::DisjointUnion(c, cs) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(c.as_str(), w)?;
+                for x in cs {
+                    w.write_char_polled(' ')?;
+                    self.write_class_expression_polled(x, w)?;
+                }
+            }
+            K::SubObjectPropertyOf(sub, sup) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                match sub {
+                    SubObjectPropertyExpression::Expression(p) => self.write_ope_polled(p, w)?,
+                    SubObjectPropertyExpression::Chain(ps) => {
+                        w.write_str_polled("ObjectPropertyChain(")?;
+                        for (i, p) in ps.iter().enumerate() {
+                            if i > 0 {
+                                w.write_char_polled(' ')?;
+                            }
+                            self.write_ope_polled(p, w)?;
+                        }
+                        w.write_char_polled(')')?;
+                    }
+                }
+                w.write_char_polled(' ')?;
+                self.write_ope_polled(sup, w)?;
+            }
+            K::EquivalentObjectProperties(ps) => {
+                for p in ps {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_ope_polled(p, w)?;
+                }
+            }
+            K::DisjointObjectProperties(ps) => {
+                for p in ps {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_ope_polled(p, w)?;
+                }
+            }
+            K::InverseObjectProperties(a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_ope_polled(a, w)?;
+                w.write_char_polled(' ')?;
+                self.write_ope_polled(b, w)?;
+            }
+            K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_ope_polled(p, w)?;
+                w.write_char_polled(' ')?;
+                self.write_class_expression_polled(c, w)?;
+            }
+            K::FunctionalObjectProperty(p)
+            | K::InverseFunctionalObjectProperty(p)
+            | K::ReflexiveObjectProperty(p)
+            | K::IrreflexiveObjectProperty(p)
+            | K::SymmetricObjectProperty(p)
+            | K::AsymmetricObjectProperty(p)
+            | K::TransitiveObjectProperty(p) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_ope_polled(p, w)?;
+            }
+            K::SubDataPropertyOf(a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(a.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_iri_polled(b.as_str(), w)?;
+            }
+            K::EquivalentDataProperties(ps) => {
+                for p in ps {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_iri_polled(p.as_str(), w)?;
+                }
+            }
+            K::DisjointDataProperties(ps) => {
+                for p in ps {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_iri_polled(p.as_str(), w)?;
+                }
+            }
+            K::DataPropertyDomain(p, c) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_class_expression_polled(c, w)?;
+            }
+            K::DataPropertyRange(p, r) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_data_range_polled(r, w)?;
+            }
+            K::FunctionalDataProperty(p) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+            }
+            K::DatatypeDefinition(d, r) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(d.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_data_range_polled(r, w)?;
+            }
+            K::HasKey(c, ops, dprops) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_class_expression_polled(c, w)?;
+                w.write_str_polled(" (")?;
+                for (i, p) in ops.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_ope_polled(p, w)?;
+                }
+                w.write_str_polled(") (")?;
+                for (i, p) in dprops.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_iri_polled(p.as_str(), w)?;
+                }
+                w.write_char_polled(')')?;
+            }
+            K::SameIndividual(is) => {
+                for i in is {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_individual_polled(i, w)?;
+                }
+            }
+            K::DifferentIndividuals(is) => {
+                for i in is {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_individual_polled(i, w)?;
+                }
+            }
+            K::ClassAssertion(c, i) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_class_expression_polled(c, w)?;
+                w.write_char_polled(' ')?;
+                self.write_individual_polled(i, w)?;
+            }
+            K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_ope_polled(p, w)?;
+                w.write_char_polled(' ')?;
+                self.write_individual_polled(a, w)?;
+                w.write_char_polled(' ')?;
+                self.write_individual_polled(b, w)?;
+            }
+            K::DataPropertyAssertion(p, a, l) | K::NegativeDataPropertyAssertion(p, a, l) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_individual_polled(a, w)?;
+                w.write_char_polled(' ')?;
+                self.write_literal_polled(l, w)?;
+            }
+            K::AnnotationAssertion(p, s, v) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                match s {
+                    AnnotationSubject::Iri(i) => self.write_iri_polled(i.as_str(), w)?,
+                    AnnotationSubject::Anonymous(a) => {
+                        w.write_str_polled("_:")?;
+                        w.write_str_polled(a.label())?;
+                    }
+                }
+                w.write_char_polled(' ')?;
+                self.write_annotation_value_polled(v, w)?;
+            }
+            K::SubAnnotationPropertyOf(a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(a.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_iri_polled(b.as_str(), w)?;
+            }
+            K::AnnotationPropertyDomain(p, i) | K::AnnotationPropertyRange(p, i) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_iri_polled(i.as_str(), w)?;
+            }
+        }
+        w.write_char_polled(')')
+    }
+
+    /// Render `e` into functional-style syntax if it fits within `max_bytes`, returning
+    /// `None` immediately upon exceeding `max_bytes`.
+    pub fn entity_bounded(&self, e: &Entity, max_bytes: usize) -> Option<String> {
+        let mut sink = BoundedSink {
+            buf: String::new(),
+            limit: max_bytes,
+        };
+        self.write_entity_polled(e, &mut sink).ok()?;
+        Some(sink.buf)
+    }
+
+    /// Render `ax` into functional-style syntax if it fits within `max_bytes`, returning
+    /// `None` immediately upon exceeding `max_bytes`.
+    pub fn axiom_bounded(&self, ax: &Axiom, max_bytes: usize) -> Option<String> {
+        let mut sink = BoundedSink {
+            buf: String::new(),
+            limit: max_bytes,
+        };
+        self.write_axiom_polled(ax, &mut sink).ok()?;
+        Some(sink.buf)
     }
 
     /// An IRI as a prefixed name, or in angle brackets.
