@@ -1847,7 +1847,7 @@ pub struct Saturation {
     dirty: bool,
     /// the subsumers of the classes that the last run classified in worlds of their own,
     /// with whether each is unsatisfiable
-    worlds: FxHashMap<Ex, (bool, Vec<Ex>)>,
+    worlds: PhysHashMap<Ex, (bool, Vec<Ex>)>,
     /// tracked EL dependency graph for merges, real reachability, keys, universal facts,
     /// and conditional worlds across incremental edits (roadmap item 664)
     el_deps: ElDeps,
@@ -3013,6 +3013,132 @@ impl Default for Saturation {
     }
 }
 
+/// `FxHashMap` wrapper that tracks the high-water `capacity()` of its currently live
+/// backing table (`phys_cap`), so in-place `remove`/`retain` tombstones never cause
+/// retained-table size or reallocation-growth bounds to undercount hashbrown's physical
+/// bucket allocation.
+#[derive(Debug)]
+struct PhysHashMap<K, V> {
+    inner: FxHashMap<K, V>,
+    phys_cap: usize,
+}
+
+impl<K: Eq + std::hash::Hash, V: PartialEq> PartialEq for PhysHashMap<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> std::ops::Index<&K> for PhysHashMap<K, V> {
+    type Output = V;
+
+    #[inline]
+    fn index(&self, key: &K) -> &V {
+        &self.inner[key]
+    }
+}
+
+impl<K, V> Default for PhysHashMap<K, V> {
+    fn default() -> Self {
+        Self {
+            inner: FxHashMap::default(),
+            phys_cap: 0,
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> PhysHashMap<K, V> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn phys_cap(&self) -> usize {
+        self.phys_cap
+    }
+
+    #[inline]
+    fn contains_key(&self, k: &K) -> bool {
+        self.inner.contains_key(k)
+    }
+
+    #[inline]
+    fn get(&self, k: &K) -> Option<&V> {
+        self.inner.get(k)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        self.inner.get_mut(k)
+    }
+
+    #[inline]
+    fn keys(&self) -> std::collections::hash_map::Keys<'_, K, V> {
+        self.inner.keys()
+    }
+
+    #[inline]
+    fn values(&self) -> std::collections::hash_map::Values<'_, K, V> {
+        self.inner.values()
+    }
+
+    #[inline]
+    fn insert(&mut self, k: K, v: V) -> Option<V> {
+        let out = self.inner.insert(k, v);
+        self.phys_cap = self.phys_cap.max(self.inner.capacity());
+        out
+    }
+
+    #[inline]
+    fn remove(&mut self, k: &K) -> Option<V> {
+        self.inner.remove(k)
+    }
+
+    #[inline]
+    fn retain(&mut self, f: impl FnMut(&K, &mut V) -> bool) {
+        self.inner.retain(f);
+    }
+
+    #[inline]
+    fn try_reserve(&mut self, additional: usize) -> Result<(), std::collections::TryReserveError> {
+        self.inner.try_reserve(additional)?;
+        self.phys_cap = self.phys_cap.max(self.inner.capacity());
+        Ok(())
+    }
+
+    #[inline]
+    fn table_bytes(&self) -> usize {
+        dl_clause::hash_table_bytes(
+            self.phys_cap.max(self.inner.capacity()),
+            std::mem::size_of::<(K, V)>(),
+        )
+    }
+
+    #[inline]
+    fn grow_bound(&self, add: usize) -> Option<usize> {
+        dl_clause::hash_table_grow_bound_with_phys(
+            self.inner.len(),
+            self.inner.capacity(),
+            self.phys_cap,
+            add,
+            std::mem::size_of::<(K, V)>(),
+        )
+    }
+}
+
 /// Tracked EL dependency records across incremental runs with individuals, keys,
 /// universal roles, and conditional worlds (roadmap item 664). Empty on plain EL runs
 /// that do not enter Phase 2.
@@ -3028,7 +3154,7 @@ struct ElDeps {
     /// Global key merges `(a, b)` fired in Phase 2 with their causal context dependencies.
     key_merges: Vec<world::KeyMergeDep>,
     /// Context- and key-level dependencies for each cached world in `Saturation::worlds`.
-    world_deps: FxHashMap<Ex, world::WorldDep>,
+    world_deps: PhysHashMap<Ex, world::WorldDep>,
 }
 
 impl ElDeps {
@@ -3077,10 +3203,7 @@ impl ElDeps {
                     .saturating_sub(self.key_merges.len())
                     .saturating_mul(std::mem::size_of::<world::KeyMergeDep>()),
             )
-            .saturating_add(dl_clause::hash_table_bytes(
-                self.world_deps.capacity(),
-                std::mem::size_of::<(Ex, world::WorldDep)>(),
-            ))
+            .saturating_add(self.world_deps.table_bytes())
             .saturating_add(
                 self.world_deps
                     .values()
@@ -3882,7 +4005,7 @@ impl Saturation {
             report_replaced: false,
             rewritten_excluded: false,
             dirty: true,
-            worlds: FxHashMap::default(),
+            worlds: PhysHashMap::default(),
             el_deps: ElDeps::default(),
             query_cache: std::sync::OnceLock::new(),
             entangled: false,
@@ -6117,7 +6240,7 @@ impl Saturation {
         self.interner = Interner::default();
         self.ctx = Vec::new();
         self.disjoint = Vec::new();
-        self.worlds = FxHashMap::default();
+        self.worlds = PhysHashMap::default();
         self.dynamic = None;
         self.dl_run = None;
         self.merge.clear();
@@ -7725,7 +7848,7 @@ impl Saturation {
     fn reset_empty(&mut self) {
         self.index = None;
         self.interner = Interner::default();
-        self.worlds = FxHashMap::default();
+        self.worlds = PhysHashMap::default();
         self.el_deps.clear();
         self.partial = None;
         self.stale_tier = false;
@@ -8927,7 +9050,7 @@ impl Saturation {
             && self.uses_el_index_diff(changes);
         let keep_el_state = el_index_diff;
         if !keep_el_state {
-            self.worlds = FxHashMap::default();
+            self.worlds = PhysHashMap::default();
             self.el_deps.clear();
         }
         self.query_cache = std::sync::OnceLock::new();
@@ -9161,7 +9284,7 @@ impl Saturation {
             self.dynamic = None;
             self.dl_run = None;
             self.last_roots = Vec::new();
-            self.worlds.clear();
+            self.worlds = PhysHashMap::default();
             self.el_deps.clear();
         }
         let premises = if (horn || disj) && !reuse {
@@ -9642,12 +9765,19 @@ impl Saturation {
                         .capacity()
                         .saturating_mul(std::mem::size_of::<std::sync::atomic::AtomicU64>()),
                 )
-                .saturating_add(
-                    reseed_real
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<(Ex, Ex)>()),
-                )
                 .saturating_add(pre_dirty_keys.capacity())
+        } else {
+            0
+        };
+        // `reseed_real` holds mandatory `Concl::Real` seeds discovered during
+        // `invalidate_changed_el` for kept contexts whose previous causal parent was
+        // cleared while another already-real parent survived. Track its bytes separately
+        // from optional `kept_el_aux_in_totals` so optional tracking refusals never drop
+        // these seeds before Phase 2 drains them.
+        let mut reseed_real_bytes = if el_indiv_reuse {
+            reseed_real
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(Ex, Ex)>())
         } else {
             0
         };
@@ -9662,6 +9792,7 @@ impl Saturation {
             + if el_indiv_reuse {
                 kept_el_deps_in_totals
                     .saturating_add(kept_el_aux_in_totals)
+                    .saturating_add(reseed_real_bytes)
                     .saturating_add(
                         kept_universal
                             .capacity()
@@ -10016,7 +10147,6 @@ impl Saturation {
                 el_tracking_dropped = true;
                 el_old_diff = ElOldDiff::default();
                 modified_atomics = Vec::new();
-                reseed_real = Vec::new();
                 pre_dirty_keys = Vec::new();
                 base = base
                     .saturating_sub(kept_el_deps_in_totals)
@@ -10025,7 +10155,7 @@ impl Saturation {
                 kept_el_deps_in_totals = 0;
                 kept_worlds_in_totals = 0;
                 kept_el_aux_in_totals = 0;
-                self.worlds = FxHashMap::default();
+                self.worlds = PhysHashMap::default();
                 self.el_deps.clear();
             }
         }
@@ -10087,6 +10217,16 @@ impl Saturation {
         if stats.incremental {
             admission_test::hit(admission_test::Point::KeptSaturationStart);
         }
+        let phase1_has_sheddable_el = !horn
+            && !disj
+            && !self.el_no_track
+            && (real_parent_bytes > 0
+                || kept_el_deps_in_totals > 0
+                || kept_worlds_in_totals > 0
+                || kept_el_aux_in_totals > 0
+                || reseed_real_bytes > 0);
+        let phase1_track_admitted =
+            phase1_has_sheddable_el && (max_memory.is_some() || charge_fn.is_some());
         let (sat_totals, sat_stop) = saturate::saturate_counted_tracked(
             &ix,
             &self.ctx,
@@ -10094,12 +10234,14 @@ impl Saturation {
             &[],
             &kept_universal,
             &bounds,
-            if track_el || !modified_atomics.is_empty() {
+            if track_el || !modified_atomics.is_empty() || phase1_track_admitted {
                 Some(saturate::ElTrack {
                     real_parent: (!real_parent_atomics.is_empty())
                         .then_some(real_parent_atomics.as_slice()),
                     modified: (!modified_atomics.is_empty()).then_some(modified_atomics.as_slice()),
-                    any_newly_real: Some(&any_newly_real),
+                    any_newly_real: (track_el || !modified_atomics.is_empty())
+                        .then_some(&any_newly_real),
+                    track_admitted_peak: phase1_track_admitted,
                 })
             } else {
                 None
@@ -10202,15 +10344,7 @@ impl Saturation {
                 });
             }
             (t, Some(s)) if partial => {
-                if !horn
-                    && !disj
-                    && matches!(s, Stop::Memory { .. })
-                    && !self.el_no_track
-                    && (real_parent_bytes > 0
-                        || kept_el_deps_in_totals > 0
-                        || kept_worlds_in_totals > 0
-                        || kept_el_aux_in_totals > 0)
-                {
+                if phase1_has_sheddable_el && matches!(s, Stop::Memory { .. }) {
                     self.el_track_memory_stop =
                         Some(peak_after_pre.max(t.admitted_peak).max(t.paid));
                     return Err(stopped(s));
@@ -10224,15 +10358,7 @@ impl Saturation {
                 t
             }
             (t, Some(s)) => {
-                if !horn
-                    && !disj
-                    && matches!(s, Stop::Memory { .. })
-                    && !self.el_no_track
-                    && (real_parent_bytes > 0
-                        || kept_el_deps_in_totals > 0
-                        || kept_worlds_in_totals > 0
-                        || kept_el_aux_in_totals > 0)
-                {
+                if phase1_has_sheddable_el && matches!(s, Stop::Memory { .. }) {
                     self.el_track_memory_stop =
                         Some(peak_after_pre.max(t.admitted_peak).max(t.paid));
                     return Err(stopped(s));
@@ -10634,7 +10760,6 @@ impl Saturation {
                     el_tracking_dropped = true;
                     el_old_diff = ElOldDiff::default();
                     modified_atomics = Vec::new();
-                    reseed_real = Vec::new();
                     pre_dirty_keys = Vec::new();
                     totals.memory = totals
                         .memory
@@ -10643,7 +10768,7 @@ impl Saturation {
                         .saturating_sub(kept_el_aux_in_totals);
                     kept_el_aux_in_totals = 0;
                     if kept_el_deps_in_totals > 0 || kept_worlds_in_totals > 0 {
-                        self.worlds = FxHashMap::default();
+                        self.worlds = PhysHashMap::default();
                         self.el_deps.clear();
                         kept_el_deps_in_totals = 0;
                         kept_worlds_in_totals = 0;
@@ -10664,6 +10789,11 @@ impl Saturation {
             for (e, p) in reseed_real.drain(..) {
                 seeds.push((e, saturate::Concl::Real(p)));
             }
+            if reseed_real_bytes > 0 {
+                reseed_real = Vec::new();
+                totals.memory = totals.memory.saturating_sub(reseed_real_bytes);
+                reseed_real_bytes = 0;
+            }
             macro_rules! shed_phase2_tracking {
                 () => {{
                     #[cfg(test)]
@@ -10675,7 +10805,6 @@ impl Saturation {
                     real_parent_atomics = Vec::new();
                     el_old_diff = ElOldDiff::default();
                     modified_atomics = Vec::new();
-                    reseed_real = Vec::new();
                     pre_dirty_keys = Vec::new();
                     totals.memory = totals
                         .memory
@@ -10688,7 +10817,7 @@ impl Saturation {
                     real_parent_bytes = 0;
                     kept_el_aux_in_totals = 0;
                     if kept_el_deps_in_totals > 0 || kept_worlds_in_totals > 0 {
-                        self.worlds = FxHashMap::default();
+                        self.worlds = PhysHashMap::default();
                         self.el_deps.clear();
                         kept_el_deps_in_totals = 0;
                         kept_worlds_in_totals = 0;
@@ -10736,6 +10865,16 @@ impl Saturation {
                     paid_memory: totals.paid,
                     ..bounds
                 };
+                let phase2_has_sheddable_el = !horn
+                    && !disj
+                    && !self.el_no_track
+                    && (real_parent_bytes > 0
+                        || phase2_dep_bytes > 0
+                        || kept_el_deps_in_totals > 0
+                        || kept_worlds_in_totals > 0
+                        || kept_el_aux_in_totals > 0);
+                let phase2_track_admitted =
+                    phase2_has_sheddable_el && (max_memory.is_some() || charge_fn.is_some());
                 let (more, stop) = saturate::saturate_counted_tracked(
                     &ix,
                     &self.ctx,
@@ -10743,13 +10882,15 @@ impl Saturation {
                     &woken,
                     &universal,
                     &round,
-                    if track_el || !modified_atomics.is_empty() {
+                    if track_el || !modified_atomics.is_empty() || phase2_track_admitted {
                         Some(saturate::ElTrack {
                             real_parent: (track_el && !real_parent_atomics.is_empty())
                                 .then_some(real_parent_atomics.as_slice()),
                             modified: (!modified_atomics.is_empty())
                                 .then_some(modified_atomics.as_slice()),
-                            any_newly_real: Some(&any_newly_real),
+                            any_newly_real: (track_el || !modified_atomics.is_empty())
+                                .then_some(&any_newly_real),
+                            track_admitted_peak: phase2_track_admitted,
                         })
                     } else {
                         None
@@ -10765,16 +10906,7 @@ impl Saturation {
                     merged: totals.merged || more.merged,
                 };
                 if let Some(s) = stop {
-                    if !horn
-                        && !disj
-                        && matches!(s, Stop::Memory { .. })
-                        && !self.el_no_track
-                        && (real_parent_bytes > 0
-                            || phase2_dep_bytes > 0
-                            || kept_el_deps_in_totals > 0
-                            || kept_worlds_in_totals > 0
-                            || kept_el_aux_in_totals > 0)
-                    {
+                    if phase2_has_sheddable_el && matches!(s, Stop::Memory { .. }) {
                         self.el_track_memory_stop =
                             Some(pre_round_peak.max(more.admitted_peak).max(more.paid));
                         return Err(stopped(s));
@@ -11169,10 +11301,19 @@ impl Saturation {
                     }
                 }
             }
-            self.worlds = FxHashMap::default();
+            self.worlds = PhysHashMap::default();
             self.el_deps.clear();
+            totals.memory = totals
+                .memory
+                .saturating_sub(kept_worlds_in_totals)
+                .saturating_sub(kept_el_deps_in_totals);
             kept_worlds_in_totals = 0;
             kept_el_deps_in_totals = 0;
+            if reseed_real_bytes > 0 {
+                reseed_real = Vec::new();
+                totals.memory = totals.memory.saturating_sub(reseed_real_bytes);
+                reseed_real_bytes = 0;
+            }
         }
         // the classes whose instances reach an individual through a context that is not
         // real, each in a world of its own
@@ -11212,9 +11353,9 @@ impl Saturation {
                     // bit set during Phase 2 broadcast): invalidate all cached worlds.
                     let freed_w = kept_worlds_in_totals;
                     totals.memory = totals.memory.saturating_sub(freed_w);
-                    self.worlds = FxHashMap::default();
+                    self.worlds = PhysHashMap::default();
                     let before_el = self.el_deps.bytes();
-                    self.el_deps.world_deps = FxHashMap::default();
+                    self.el_deps.world_deps = PhysHashMap::default();
                     let freed_wd = before_el
                         .saturating_sub(self.el_deps.bytes())
                         .min(kept_el_deps_in_totals);
@@ -11225,9 +11366,9 @@ impl Saturation {
                         None => {
                             let freed_w = kept_worlds_in_totals;
                             totals.memory = totals.memory.saturating_sub(freed_w);
-                            self.worlds = FxHashMap::default();
+                            self.worlds = PhysHashMap::default();
                             let before_el = self.el_deps.bytes();
-                            self.el_deps.world_deps = FxHashMap::default();
+                            self.el_deps.world_deps = PhysHashMap::default();
                             let freed_wd = before_el
                                 .saturating_sub(self.el_deps.bytes())
                                 .min(kept_el_deps_in_totals);
@@ -11368,9 +11509,9 @@ impl Saturation {
                                 let freed_w = kept_worlds_in_totals;
                                 totals.memory = totals.memory.saturating_sub(freed_w);
                                 kept_worlds_in_totals = 0;
-                                self.worlds = FxHashMap::default();
+                                self.worlds = PhysHashMap::default();
                                 let before_el = self.el_deps.bytes();
-                                self.el_deps.world_deps = FxHashMap::default();
+                                self.el_deps.world_deps = PhysHashMap::default();
                                 let freed_wd = before_el
                                     .saturating_sub(self.el_deps.bytes())
                                     .min(kept_el_deps_in_totals);
@@ -11479,6 +11620,12 @@ impl Saturation {
                                             }
                                         }
                                     }
+                                    #[cfg(test)]
+                                    if replayed_sticky && phase3_poll_err.is_none() {
+                                        el_test_hooks::scan_completed(
+                                            el_test_hooks::ScanKind::StickyReplay,
+                                        );
+                                    }
                                     if replayed_sticky
                                         && phase3_poll_err.is_none()
                                         && let Err(e) = poll(limits)
@@ -11494,7 +11641,7 @@ impl Saturation {
                                     .saturating_sub(kept_worlds_in_totals)
                                     .saturating_sub(kept_el_deps_in_totals);
                                 kept_el_deps_in_totals = 0;
-                                self.worlds = FxHashMap::default();
+                                self.worlds = PhysHashMap::default();
                                 self.el_deps.clear();
                                 if partial && !disj {
                                     halted = Some(err);
@@ -11511,9 +11658,9 @@ impl Saturation {
                                 if self.worlds.is_empty() {
                                     totals.memory =
                                         totals.memory.saturating_sub(kept_worlds_in_totals);
-                                    self.worlds = FxHashMap::default();
+                                    self.worlds = PhysHashMap::default();
                                     let before_el = self.el_deps.bytes();
-                                    self.el_deps.world_deps = FxHashMap::default();
+                                    self.el_deps.world_deps = PhysHashMap::default();
                                     let freed_wd = before_el
                                         .saturating_sub(self.el_deps.bytes())
                                         .min(kept_el_deps_in_totals);
@@ -11565,9 +11712,13 @@ impl Saturation {
                     el_old_diff = ElOldDiff::default();
                     modified_atomics = Vec::new();
                     pre_dirty_keys = Vec::new();
-                    reseed_real = Vec::new();
                     totals.memory = totals.memory.saturating_sub(kept_el_aux_in_totals);
                     kept_el_aux_in_totals = 0;
+                }
+                if reseed_real_bytes > 0 {
+                    reseed_real = Vec::new();
+                    totals.memory = totals.memory.saturating_sub(reseed_real_bytes);
+                    reseed_real_bytes = 0;
                 }
                 // the worlds running and the subsumers of those done count against the
                 // budget beside the saturated state, and the pool is charged for what
@@ -11633,11 +11784,15 @@ impl Saturation {
                     };
                     let el_track_active = std::sync::atomic::AtomicBool::new(track_el);
                     let dep_budget = track_el.then_some((&budget, &el_track_active));
+                    #[cfg(test)]
+                    let test_probe = el_test_hooks::current_probe();
                     if partial && !disj {
                         let classes_ref = classes.as_ref().expect("reaching classes");
                         let bound = |delta: isize| budget.tell(delta);
                         let mut chunks: Vec<(FoundWorldChunk<'_, '_>, Option<index::Halt>)> =
                             par_map(classes_ref, threads, MIN_CLASSES, |_offset, chunk| {
+                                #[cfg(test)]
+                                let _probe_guard = el_test_hooks::install_probe(test_probe.clone());
                                 let mut out = FoundWorldChunk {
                                     rows: Vec::new(),
                                     deps: Vec::new(),
@@ -11741,16 +11896,9 @@ impl Saturation {
                             continue;
                         }
                         let new_rows_count: usize = chunks.iter().map(|(c, _)| c.rows.len()).sum();
-                        let world_entry_size = std::mem::size_of::<(Ex, (bool, Vec<Ex>))>();
                         let old_worlds_len = self.worlds.len();
-                        let old_worlds_table =
-                            dl_clause::hash_table_bytes(self.worlds.capacity(), world_entry_size);
-                        let worlds_grow_peak = dl_clause::hash_table_grow_bound(
-                            old_worlds_len,
-                            self.worlds.capacity(),
-                            new_rows_count,
-                            world_entry_size,
-                        );
+                        let old_worlds_table = self.worlds.table_bytes();
+                        let worlds_grow_peak = self.worlds.grow_bound(new_rows_count);
                         let mut join_admitted = true;
                         let mut worlds_table_delta = 0usize;
                         if new_rows_count > 0 {
@@ -11799,8 +11947,9 @@ impl Saturation {
                                     .saturating_sub(phase2_dep_bytes)
                                     .saturating_sub(real_parent_bytes)
                                     .saturating_sub(kept_el_deps_in_totals);
-                                let _ =
-                                    (phase2_dep_bytes, real_parent_bytes, kept_el_deps_in_totals);
+                                phase2_dep_bytes = 0;
+                                real_parent_bytes = 0;
+                                kept_el_deps_in_totals = 0;
                                 let held_after =
                                     budget.held.load(Ordering::Relaxed).max(0) as usize;
                                 join_used =
@@ -11812,10 +11961,7 @@ impl Saturation {
                                 totals.peak = totals.peak.max(used);
                                 budget.paid.store(totals.paid, Ordering::Release);
                                 budget.peak.fetch_max(totals.peak, Ordering::Relaxed);
-                                let new_worlds_table = dl_clause::hash_table_bytes(
-                                    self.worlds.capacity(),
-                                    world_entry_size,
-                                );
+                                let new_worlds_table = self.worlds.table_bytes();
                                 worlds_table_delta =
                                     new_worlds_table.saturating_sub(old_worlds_table);
                                 if worlds_table_delta > 0 {
@@ -11894,16 +12040,18 @@ impl Saturation {
                             }
                             for (
                                 FoundWorldChunk {
-                                    rows,
-                                    deps,
                                     mut deps_debit,
+                                    deps,
                                     mut debit,
+                                    rows,
                                 },
                                 _,
                             ) in chunks
                             {
                                 // `rows` (`IntoIter`) stays live through the loop; `debit`
-                                // retires `rows_cap_bytes` strictly after `rows` drops.
+                                // retires `rows_cap_bytes` strictly after `rows` drops, and
+                                // `deps_debit` is bound before `deps` so unwinds drop `deps`
+                                // before retiring its debit.
                                 for (d, f, subs_bytes) in rows {
                                     let Some(next_bytes) = world_bytes.checked_add(subs_bytes)
                                     else {
@@ -11935,7 +12083,19 @@ impl Saturation {
                         if track_el && !el_track_active.load(Ordering::Relaxed) {
                             track_el = false;
                             el_tracking_dropped = true;
+                            new_universals = Vec::new();
+                            new_key_merges = Vec::new();
+                            real_parent_atomics = Vec::new();
                             new_world_deps = NewWorldDeps::Empty;
+                            self.el_deps.clear();
+                            totals.memory = totals
+                                .memory
+                                .saturating_sub(phase2_dep_bytes)
+                                .saturating_sub(real_parent_bytes)
+                                .saturating_sub(kept_el_deps_in_totals);
+                            phase2_dep_bytes = 0;
+                            real_parent_bytes = 0;
+                            kept_el_deps_in_totals = 0;
                         }
                         if let Some(err) = world_err {
                             halted = Some(err);
@@ -11969,6 +12129,8 @@ impl Saturation {
                         });
                         let bound = |delta: isize| budget.tell(delta);
                         let found = par_map(classes_ref, threads, MIN_CLASSES, |_offset, chunk| {
+                            #[cfg(test)]
+                            let _probe_guard = el_test_hooks::install_probe(test_probe.clone());
                             #[cfg(test)]
                             let mixed_worker = mixed_test
                                 .as_ref()
@@ -12174,16 +12336,9 @@ impl Saturation {
                         })?;
                         budget.finish(&mut totals);
                         let new_rows_count: usize = found.iter().map(|c| c.rows.len()).sum();
-                        let world_entry_size = std::mem::size_of::<(Ex, (bool, Vec<Ex>))>();
                         let old_worlds_len = self.worlds.len();
-                        let old_worlds_table =
-                            dl_clause::hash_table_bytes(self.worlds.capacity(), world_entry_size);
-                        let worlds_grow_peak = dl_clause::hash_table_grow_bound(
-                            old_worlds_len,
-                            self.worlds.capacity(),
-                            new_rows_count,
-                            world_entry_size,
-                        );
+                        let old_worlds_table = self.worlds.table_bytes();
+                        let worlds_grow_peak = self.worlds.grow_bound(new_rows_count);
                         let mut worlds_table_delta = 0usize;
                         if new_rows_count > 0 {
                             let try_admit_join =
@@ -12231,8 +12386,9 @@ impl Saturation {
                                     .saturating_sub(phase2_dep_bytes)
                                     .saturating_sub(real_parent_bytes)
                                     .saturating_sub(kept_el_deps_in_totals);
-                                let _ =
-                                    (phase2_dep_bytes, real_parent_bytes, kept_el_deps_in_totals);
+                                phase2_dep_bytes = 0;
+                                real_parent_bytes = 0;
+                                kept_el_deps_in_totals = 0;
                                 let held_after =
                                     budget.held.load(Ordering::Relaxed).max(0) as usize;
                                 join_used =
@@ -12273,10 +12429,7 @@ impl Saturation {
                             totals.peak = totals.peak.max(used);
                             budget.paid.store(totals.paid, Ordering::Release);
                             budget.peak.fetch_max(totals.peak, Ordering::Relaxed);
-                            let new_worlds_table = dl_clause::hash_table_bytes(
-                                self.worlds.capacity(),
-                                world_entry_size,
-                            );
+                            let new_worlds_table = self.worlds.table_bytes();
                             worlds_table_delta = new_worlds_table.saturating_sub(old_worlds_table);
                             if worlds_table_delta > 0 {
                                 budget.post(worlds_table_delta as isize);
@@ -12326,14 +12479,16 @@ impl Saturation {
                             }
                         }
                         for FoundWorldChunk {
-                            rows,
-                            deps,
                             mut deps_debit,
+                            deps,
                             mut debit,
+                            rows,
                         } in found
                         {
                             // `rows` (`IntoIter`) stays live through the loop; `debit`
-                            // retires `rows_cap_bytes` strictly after `rows` drops.
+                            // retires `rows_cap_bytes` strictly after `rows` drops, and
+                            // `deps_debit` is bound before `deps` so unwinds drop `deps`
+                            // before retiring its debit.
                             for (d, f, subs_bytes) in rows {
                                 let next_bytes =
                                     world_bytes.checked_add(subs_bytes).ok_or_else(|| {
@@ -12379,7 +12534,19 @@ impl Saturation {
                         if track_el && !el_track_active.load(Ordering::Relaxed) {
                             track_el = false;
                             el_tracking_dropped = true;
+                            new_universals = Vec::new();
+                            new_key_merges = Vec::new();
+                            real_parent_atomics = Vec::new();
                             new_world_deps = NewWorldDeps::Empty;
+                            self.el_deps.clear();
+                            totals.memory = totals
+                                .memory
+                                .saturating_sub(phase2_dep_bytes)
+                                .saturating_sub(real_parent_bytes)
+                                .saturating_sub(kept_el_deps_in_totals);
+                            phase2_dep_bytes = 0;
+                            real_parent_bytes = 0;
+                            kept_el_deps_in_totals = 0;
                         }
                         #[cfg(test)]
                         if admission_test::observing() {
@@ -12410,8 +12577,11 @@ impl Saturation {
             el_old_diff = ElOldDiff::default();
             modified_atomics = Vec::new();
             pre_dirty_keys = Vec::new();
-            reseed_real = Vec::new();
             totals.memory = totals.memory.saturating_sub(kept_el_aux_in_totals);
+        }
+        if reseed_real_bytes > 0 {
+            reseed_real = Vec::new();
+            totals.memory = totals.memory.saturating_sub(reseed_real_bytes);
         }
         if !disj && halted.is_some() {
             // Release transient EL tracking and diff scratch before `live_record_bytes`
@@ -12428,7 +12598,7 @@ impl Saturation {
             universal = Vec::new();
             self.el_deps.clear();
             if world_open.is_none() {
-                self.worlds = FxHashMap::default();
+                self.worlds = PhysHashMap::default();
             }
         }
         if !disj {
@@ -12758,12 +12928,36 @@ impl Saturation {
         }
         // Clear any unreachable kept orphan contexts before `dt_sat::collect` reads
         // every initialized context's last evaluation, so ghost `COVER`/`BOUND`/`UNCOUNTED`
-        // statuses never leak into `excluded` (roadmap item 753).
+        // statuses never leak into `excluded` (roadmap item 753). If optional EL tracking
+        // state (staged `new_world_deps` or retained EL metadata) pushes mandatory pruning
+        // scratch past the cap or pool, shed optional tracking, restore the first accepted
+        // peak, and retry pruning cleanly.
         if stats.incremental && ix.dt.is_some() && open.is_none() {
             let live_post_worlds = world_bytes
                 .saturating_add(new_world_deps.staging_bytes())
                 .saturating_add(new_world_deps.payload_bytes());
-            self.orphan_prune(
+            let pre_prune_peak = totals.peak;
+            #[cfg(test)]
+            {
+                let total_slots = self.ctx.len() + dynamic.as_ref().map_or(0, |d| d.len());
+                let scratch =
+                    total_slots.div_ceil(64) * 8 + total_slots * std::mem::size_of::<Ex>();
+                el_test_hooks::record_orphan_prune_used(
+                    totals
+                        .memory
+                        .saturating_add(live_post_worlds)
+                        .saturating_add(scratch),
+                );
+            }
+            let can_shed_prune = !horn
+                && !disj
+                && (track_el
+                    || new_world_deps.staging_bytes() > 0
+                    || new_world_deps.payload_bytes() > 0
+                    || real_parent_bytes > 0
+                    || phase2_dep_bytes > 0
+                    || kept_el_deps_in_totals > 0);
+            match self.orphan_prune(
                 &ix,
                 dynamic.as_ref(),
                 &roots,
@@ -12772,7 +12966,37 @@ impl Saturation {
                 charge_fn,
                 live_post_worlds,
                 &mut totals,
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(Error::Memory { .. }) if can_shed_prune => {
+                    #[cfg(test)]
+                    el_test_hooks::hit_orphan_prune_shed();
+                    track_el = false;
+                    el_tracking_dropped = true;
+                    new_universals = Vec::new();
+                    new_key_merges = Vec::new();
+                    real_parent_atomics = Vec::new();
+                    new_world_deps = NewWorldDeps::Empty;
+                    self.el_deps.clear();
+                    totals.memory = totals
+                        .memory
+                        .saturating_sub(phase2_dep_bytes)
+                        .saturating_sub(real_parent_bytes)
+                        .saturating_sub(kept_el_deps_in_totals);
+                    totals.peak = pre_prune_peak.max(totals.paid);
+                    self.orphan_prune(
+                        &ix,
+                        dynamic.as_ref(),
+                        &roots,
+                        limits,
+                        max_memory,
+                        charge_fn,
+                        world_bytes,
+                        &mut totals,
+                    )?;
+                }
+                Err(e) => return Err(e),
+            }
         }
         // the checker's covers and the answers it could not give, from each kept
         // context's last evaluation of a component and the worst of the others
@@ -13004,13 +13228,10 @@ impl Saturation {
                 );
             let new_world_dep_staging = new_world_deps.staging_bytes();
             let new_world_dep_payload = new_world_deps.payload_bytes();
-            let world_map_grow = dl_clause::hash_table_grow_bound(
-                candidate.world_deps.len(),
-                candidate.world_deps.capacity(),
-                new_world_deps.len(),
-                std::mem::size_of::<(Ex, world::WorldDep)>(),
-            )
-            .unwrap_or(usize::MAX);
+            let world_map_grow = candidate
+                .world_deps
+                .grow_bound(new_world_deps.len())
+                .unwrap_or(usize::MAX);
             let assemble_peak = base_without_deps
                 .saturating_add(existing_deps)
                 .saturating_add(real_parent_live)
@@ -13077,7 +13298,7 @@ impl Saturation {
                         .world_deps
                         .retain(|d, _| self.worlds.contains_key(d));
                     if candidate.world_deps.is_empty() {
-                        candidate.world_deps = FxHashMap::default();
+                        candidate.world_deps = PhysHashMap::default();
                     }
                     let with_deps = base_without_deps.saturating_add(candidate.bytes());
                     if limits.max_memory.is_some_and(|m| with_deps > m)
@@ -13331,11 +13552,7 @@ impl Saturation {
 
     /// Retained bytes of the `self.worlds` map and its subsumer vectors.
     fn worlds_bytes(&self) -> usize {
-        dl_clause::hash_table_bytes(
-            self.worlds.capacity(),
-            std::mem::size_of::<(Ex, (bool, Vec<Ex>))>(),
-        )
-        .saturating_add(
+        self.worlds.table_bytes().saturating_add(
             self.worlds
                 .values()
                 .map(|(_, v)| v.capacity().saturating_mul(std::mem::size_of::<Ex>()))
@@ -13828,8 +14045,8 @@ impl Saturation {
                     return Err(e);
                 }
                 if self.worlds.is_empty() {
-                    self.worlds = FxHashMap::default();
-                    *world_deps = FxHashMap::default();
+                    self.worlds = PhysHashMap::default();
+                    *world_deps = PhysHashMap::default();
                 } else {
                     world_deps.retain(|d, _| self.worlds.contains_key(d));
                 }
@@ -16231,7 +16448,7 @@ impl Drop for MandatoryDebit<'_, '_> {
 /// If a panic unwinds before the first row commits into an initially empty map, clears the
 /// reserved empty table before retiring `table_delta` from `WorldBudget`.
 struct WorldsJoinGuard<'m, 'r, 'a> {
-    worlds: &'m mut FxHashMap<Ex, (bool, Vec<Ex>)>,
+    worlds: &'m mut PhysHashMap<Ex, (bool, Vec<Ex>)>,
     budget: &'r WorldBudget<'a>,
     table_delta: isize,
     old_len: usize,
@@ -16250,7 +16467,7 @@ impl Drop for WorldsJoinGuard<'_, '_, '_> {
     fn drop(&mut self) {
         if !self.committed && self.table_delta != 0 {
             if self.old_len == 0 {
-                *self.worlds = FxHashMap::default();
+                *self.worlds = PhysHashMap::default();
             }
             self.budget.retire(self.table_delta);
         }
@@ -16574,7 +16791,7 @@ impl NewWorldDeps {
         }
     }
 
-    fn drain_into(self, target: &mut FxHashMap<Ex, world::WorldDep>) {
+    fn drain_into(self, target: &mut PhysHashMap<Ex, world::WorldDep>) {
         match self {
             Self::Empty => {}
             Self::One(v) => {
@@ -16920,9 +17137,9 @@ thread_local! {
 
 #[cfg(test)]
 pub(super) mod el_test_hooks {
-    use parking_lot::Mutex;
+    use std::cell::RefCell;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum ScanKind {
@@ -16932,29 +17149,89 @@ pub(super) mod el_test_hooks {
         StickyReplay,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum ScanEvent {
+        Progress(ScanKind),
+        Completed(ScanKind),
+    }
+
     #[derive(Clone, Copy, Debug, Default)]
     pub(super) struct Counts {
         pub taxonomy_shed: usize,
         pub key_retry_plain: usize,
         pub phase2_shed: usize,
         pub phase3_shed: usize,
+        pub orphan_prune_shed: usize,
+        pub orphan_prune_used: usize,
         pub no_track_retries: usize,
         pub opt_dep_refusals: usize,
     }
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-    static HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
-    static TAXONOMY_SHED: AtomicUsize = AtomicUsize::new(0);
-    static KEY_RETRY_PLAIN: AtomicUsize = AtomicUsize::new(0);
-    static PHASE2_SHED: AtomicUsize = AtomicUsize::new(0);
-    static PHASE3_SHED: AtomicUsize = AtomicUsize::new(0);
-    static NO_TRACK_RETRIES: AtomicUsize = AtomicUsize::new(0);
-    static OPT_DEP_REFUSALS: AtomicUsize = AtomicUsize::new(0);
-    type ScanCallback = Arc<dyn Fn(ScanKind) + Send + Sync>;
-    static SCAN_CB: Mutex<Option<ScanCallback>> = Mutex::new(None);
+    type ScanCallback = Arc<dyn Fn(ScanEvent) + Send + Sync>;
+
+    pub(super) struct Probe {
+        taxonomy_shed: AtomicUsize,
+        key_retry_plain: AtomicUsize,
+        phase2_shed: AtomicUsize,
+        phase3_shed: AtomicUsize,
+        orphan_prune_shed: AtomicUsize,
+        orphan_prune_used: AtomicUsize,
+        no_track_retries: AtomicUsize,
+        opt_dep_refusals: AtomicUsize,
+        scan_cb: Option<ScanCallback>,
+    }
+
+    impl Probe {
+        fn new(scan_cb: Option<ScanCallback>) -> Self {
+            Self {
+                taxonomy_shed: AtomicUsize::new(0),
+                key_retry_plain: AtomicUsize::new(0),
+                phase2_shed: AtomicUsize::new(0),
+                phase3_shed: AtomicUsize::new(0),
+                orphan_prune_shed: AtomicUsize::new(0),
+                orphan_prune_used: AtomicUsize::new(0),
+                no_track_retries: AtomicUsize::new(0),
+                opt_dep_refusals: AtomicUsize::new(0),
+                scan_cb,
+            }
+        }
+
+        fn counts(&self) -> Counts {
+            Counts {
+                taxonomy_shed: self.taxonomy_shed.load(Ordering::Relaxed),
+                key_retry_plain: self.key_retry_plain.load(Ordering::Relaxed),
+                phase2_shed: self.phase2_shed.load(Ordering::Relaxed),
+                phase3_shed: self.phase3_shed.load(Ordering::Relaxed),
+                orphan_prune_shed: self.orphan_prune_shed.load(Ordering::Relaxed),
+                orphan_prune_used: self.orphan_prune_used.load(Ordering::Relaxed),
+                no_track_retries: self.no_track_retries.load(Ordering::Relaxed),
+                opt_dep_refusals: self.opt_dep_refusals.load(Ordering::Relaxed),
+            }
+        }
+    }
 
     thread_local! {
+        static ACTIVE_PROBE: RefCell<Option<Arc<Probe>>> = const { RefCell::new(None) };
         static FORCE_NO_TRACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) struct ProbeGuard {
+        prev: Option<Arc<Probe>>,
+    }
+
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            ACTIVE_PROBE.with(|slot| *slot.borrow_mut() = self.prev.take());
+        }
+    }
+
+    pub(super) fn current_probe() -> Option<Arc<Probe>> {
+        ACTIVE_PROBE.with(|slot| slot.borrow().clone())
+    }
+
+    pub(super) fn install_probe(probe: Option<Arc<Probe>>) -> ProbeGuard {
+        let prev = ACTIVE_PROBE.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), probe));
+        ProbeGuard { prev }
     }
 
     pub(super) fn force_no_track() -> bool {
@@ -16974,46 +17251,80 @@ pub(super) mod el_test_hooks {
     }
 
     pub(super) fn hit_taxonomy_shed() {
-        if HOOK_ACTIVE.load(Ordering::Relaxed) {
-            TAXONOMY_SHED.fetch_add(1, Ordering::Relaxed);
-        }
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.taxonomy_shed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
     }
 
     pub(super) fn hit_key_retry_plain() {
-        if HOOK_ACTIVE.load(Ordering::Relaxed) {
-            KEY_RETRY_PLAIN.fetch_add(1, Ordering::Relaxed);
-        }
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.key_retry_plain.fetch_add(1, Ordering::Relaxed);
+            }
+        });
     }
 
     pub(super) fn hit_phase2_shed() {
-        if HOOK_ACTIVE.load(Ordering::Relaxed) {
-            PHASE2_SHED.fetch_add(1, Ordering::Relaxed);
-        }
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.phase2_shed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
     }
 
     pub(super) fn hit_phase3_shed() {
-        if HOOK_ACTIVE.load(Ordering::Relaxed) {
-            PHASE3_SHED.fetch_add(1, Ordering::Relaxed);
-        }
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.phase3_shed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn hit_orphan_prune_shed() {
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.orphan_prune_shed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn record_orphan_prune_used(used: usize) {
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.orphan_prune_used.fetch_max(used, Ordering::Relaxed);
+            }
+        });
     }
 
     pub(super) fn hit_no_track_retry() {
-        if HOOK_ACTIVE.load(Ordering::Relaxed) {
-            NO_TRACK_RETRIES.fetch_add(1, Ordering::Relaxed);
-        }
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.no_track_retries.fetch_add(1, Ordering::Relaxed);
+            }
+        });
     }
 
     pub(super) fn hit_opt_dep_refusal() {
-        if HOOK_ACTIVE.load(Ordering::Relaxed) {
-            OPT_DEP_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.opt_dep_refusals.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn scan_progress(kind: ScanKind) {
+        let cb = ACTIVE_PROBE.with(|slot| slot.borrow().as_ref().and_then(|p| p.scan_cb.clone()));
+        if let Some(cb) = cb {
+            cb(ScanEvent::Progress(kind));
         }
     }
 
-    pub(super) fn enter_scan(kind: ScanKind) {
-        if HOOK_ACTIVE.load(Ordering::Relaxed)
-            && let Some(cb) = SCAN_CB.lock().clone()
-        {
-            cb(kind);
+    pub(super) fn scan_completed(kind: ScanKind) {
+        let cb = ACTIVE_PROBE.with(|slot| slot.borrow().as_ref().and_then(|p| p.scan_cb.clone()));
+        if let Some(cb) = cb {
+            cb(ScanEvent::Completed(kind));
         }
     }
 
@@ -17025,32 +17336,10 @@ pub(super) mod el_test_hooks {
         scan_cb: Option<ScanCallback>,
         f: impl FnOnce() -> T,
     ) -> (T, Counts) {
-        let _guard = TEST_LOCK.lock();
-        TAXONOMY_SHED.store(0, Ordering::Relaxed);
-        KEY_RETRY_PLAIN.store(0, Ordering::Relaxed);
-        PHASE2_SHED.store(0, Ordering::Relaxed);
-        PHASE3_SHED.store(0, Ordering::Relaxed);
-        NO_TRACK_RETRIES.store(0, Ordering::Relaxed);
-        OPT_DEP_REFUSALS.store(0, Ordering::Relaxed);
-        *SCAN_CB.lock() = scan_cb;
-        HOOK_ACTIVE.store(true, Ordering::Release);
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                HOOK_ACTIVE.store(false, Ordering::Release);
-                *SCAN_CB.lock() = None;
-            }
-        }
-        let _reset = Reset;
+        let probe = Arc::new(Probe::new(scan_cb));
+        let _guard = install_probe(Some(probe.clone()));
         let out = f();
-        let counts = Counts {
-            taxonomy_shed: TAXONOMY_SHED.load(Ordering::Relaxed),
-            key_retry_plain: KEY_RETRY_PLAIN.load(Ordering::Relaxed),
-            phase2_shed: PHASE2_SHED.load(Ordering::Relaxed),
-            phase3_shed: PHASE3_SHED.load(Ordering::Relaxed),
-            no_track_retries: NO_TRACK_RETRIES.load(Ordering::Relaxed),
-            opt_dep_refusals: OPT_DEP_REFUSALS.load(Ordering::Relaxed),
-        };
+        let counts = probe.counts();
         (out, counts)
     }
 }
@@ -26988,6 +27277,7 @@ mod tests {
         let kinds: Vec<&AxiomKind> = axioms.iter().map(|a| &a.kind).collect();
         let unrestricted = Limits {
             threads: 1,
+            el_only: true,
             ..Limits::default()
         };
         let mut cal = Saturation::new();
@@ -27003,7 +27293,6 @@ mod tests {
                 .unwrap();
         assert!(plain.el_deps.is_empty());
         assert_eq!(plain_out.taxonomy, cal_out.taxonomy);
-        assert!(plain.el_deps.is_empty());
 
         let high = cal_out.stats.peak_memory;
         let low = plain_out.stats.peak_memory;
@@ -27244,84 +27533,65 @@ mod tests {
 
     #[test]
     fn el_nested_scan_cancellation_prompt_and_recovers() {
-        // Regression for R2-4 / R3-5: arm cancellation strictly AFTER entering each target
-        // nested scan (universal scan, key-touch scan, `World::build_dep`, and post-retain
-        // `dt_sticky` replay), assert `Error::Cancelled`, and replay the edit WITH its
-        // `Some(Changes { ... })` list to prove interrupted state invalidates and recovers
-        // cleanly without requiring `changes = None`.
-        let mut ofn = String::from(
-            "Prefix(:=<http://ex.org/pollscan#>) Ontology(\n\
-             SubClassOf(:W ObjectOneOf(:w))\n\
-             SubClassOf(:W :WTag)\n\
-             SubClassOf(ObjectIntersectionOf(ObjectOneOf(:w) :WTag) DataSomeValuesFrom(:b0 rdf:langString))\n\
-             SubClassOf(:W2 ObjectOneOf(:w2))\n\
-             SubClassOf(:W2 :WTag2)\n\
-             ClassAssertion(:OtherU :u0)\n",
-        );
-        for i in 0..12 {
-            ofn.push_str(&format!("SubDataPropertyOf(:b{i} :b{})\n", i + 1));
-        }
-        for i in 0..48 {
-            ofn.push_str(&format!(
-                "HasKey(:K{i} (:r{i}) (:d{i}))\n\
-                 SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty :OtherU) :U{i})\n"
-            ));
-        }
-        for i in 0..16 {
-            ofn.push_str(&format!("SubClassOf(:Q{i} ObjectSomeValuesFrom(:s :W))\n"));
-        }
-        ofn.push_str("SubClassOf(:DirtyTarget ObjectSomeValuesFrom(:s :W2))\n");
-        ofn.push_str("ClassAssertion(:K0 :other_ind)\n)\n");
-        let axioms = crate::ofn_read::parse(&ofn).unwrap().axioms;
-        let kinds: Vec<&AxiomKind> = axioms.iter().map(|a| &a.kind).collect();
-        let edit = crate::ofn_read::parse(
-            "Prefix(:=<http://ex.org/pollscan#>) Ontology(\n\
-             SubClassOf(:DirtyTarget :Extra)\n\
-             SubClassOf(:K0 :K0Extra)\n\
-             )",
-        )
-        .unwrap()
-        .axioms;
-        let edit_refs: Vec<&AxiomKind> = edit.iter().map(|a| &a.kind).collect();
-        let mut next_kinds = kinds.clone();
-        next_kinds.extend_from_slice(&edit_refs);
+        // Regression for R2-4 / R3-5 / R4-5: arm cancellation strictly AFTER measurable
+        // in-scan progress inside each target nested scan (universal scan, key-touch scan,
+        // `World::build_dep`, and post-retain `dt_sticky` replay) using classifier-scoped
+        // probes, assert `Error::Cancelled` AND that the target scan returned early before
+        // normal completion (`completed == 0`, proving periodic in-scan polls fired rather
+        // than entry or post-loop polls), then replay the edit WITH `Some(Changes { ... })`
+        // and verify fresh parity.
         let unrestricted = Limits {
             threads: 1,
             ..Limits::default()
         };
-        let mut fresh = Saturation::new();
-        let fresh_out = fresh.classify(&next_kinds, None, &unrestricted).unwrap();
 
-        for target in [
-            el_test_hooks::ScanKind::Universal,
-            el_test_hooks::ScanKind::KeyTouch,
-            el_test_hooks::ScanKind::WorldBuildDep,
-        ] {
+        // Helper running one isolated cancellation + `Some(Changes)` recovery check where
+        // cancellation arms strictly after `arm_after` in-scan `Progress(target)` ticks.
+        let run_case = |label: &str,
+                        target: el_test_hooks::ScanKind,
+                        base_kinds: &[&AxiomKind],
+                        next_kinds: &[&AxiomKind],
+                        added: &[&AxiomKind],
+                        arm_after: usize| {
+            let mut fresh = Saturation::new();
+            let fresh_out = fresh.classify(next_kinds, None, &unrestricted).unwrap();
+
             let mut sat = Saturation::new();
-            let base = sat.classify(&kinds, None, &unrestricted).unwrap();
-            assert!(base.consistent);
+            let base = sat.classify(base_kinds, None, &unrestricted).unwrap();
+            assert!(base.consistent, "{label}: base run must be consistent");
 
-            let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let entered_hook = entered.clone();
-            let entered_cancel = entered.clone();
+            let progress = std::sync::Arc::new(AtomicUsize::new(0));
+            let completed = std::sync::Arc::new(AtomicUsize::new(0));
+            let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let progress_cb = progress.clone();
+            let completed_cb = completed.clone();
+            let armed_cb = armed.clone();
+            let armed_cancel = armed.clone();
             let cancel_lim = Limits {
                 threads: 1,
                 cancelled: Some(std::sync::Arc::new(move || {
-                    entered_cancel.load(Ordering::Acquire)
+                    armed_cancel.load(Ordering::Acquire)
                 })),
                 ..Limits::default()
             };
             let (err_res, _) = el_test_hooks::with_scan_hook(
-                Some(std::sync::Arc::new(move |kind| {
-                    if kind == target {
-                        entered_hook.store(true, Ordering::Release);
+                Some(std::sync::Arc::new(move |ev| match ev {
+                    el_test_hooks::ScanEvent::Progress(kind) if kind == target => {
+                        let seen = progress_cb.fetch_add(1, Ordering::AcqRel) + 1;
+                        if seen >= arm_after {
+                            armed_cb.store(true, Ordering::Release);
+                        }
                     }
+                    el_test_hooks::ScanEvent::Completed(kind) if kind == target => {
+                        completed_cb.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
                 })),
                 || {
                     sat.classify(
-                        &next_kinds,
+                        next_kinds,
                         Some(Changes {
-                            added: &edit_refs,
+                            added,
                             removed: &[],
                         }),
                         &cancel_lim,
@@ -27329,21 +27599,28 @@ mod tests {
                 },
             );
             assert!(
-                entered.load(Ordering::Acquire),
-                "incremental edit must have entered target scan {target:?}"
+                armed.load(Ordering::Acquire),
+                "{label}: incremental edit must make at least {arm_after} in-scan progress ticks in {target:?} (saw {})",
+                progress.load(Ordering::Acquire),
             );
             assert_eq!(
                 err_res.unwrap_err(),
                 Error::Cancelled,
-                "cancellation armed inside {target:?} must stop with Error::Cancelled"
+                "{label}: cancellation armed inside {target:?} must stop with Error::Cancelled"
+            );
+            assert_eq!(
+                completed.load(Ordering::Acquire),
+                0,
+                "{label}: {target:?} must abort via its periodic in-scan poll before normal completion (progress={})",
+                progress.load(Ordering::Acquire),
             );
 
             // Recover by replaying the edit WITH its `Some(Changes { ... })` list.
             let recovered = sat
                 .classify(
-                    &next_kinds,
+                    next_kinds,
                     Some(Changes {
-                        added: &edit_refs,
+                        added,
                         removed: &[],
                     }),
                     &unrestricted,
@@ -27351,108 +27628,218 @@ mod tests {
                 .unwrap();
             assert!(
                 !recovered.stats.incremental,
-                "recovery after cancellation in {target:?} must fall back to fresh"
+                "{label}: recovery after cancellation in {target:?} must fall back to fresh"
             );
             assert_eq!(recovered.taxonomy, fresh_out.taxonomy);
-        }
-
-        // StickyReplay: unrelated terminology edit retains the `:Q0..:Q15` worlds whose
-        // `dt_sticky` rows are replayed via `replay_world_dt_sticky_polled`.
-        let mut sticky_ofn = String::from(
-            "Prefix(:=<http://ex.org/pollsticky#>) Ontology(\n\
-             SubClassOf(:W ObjectOneOf(:w))\n\
-             SubClassOf(:W :WTag)\n\
-             SubClassOf(ObjectIntersectionOf(ObjectOneOf(:w) :WTag) DataSomeValuesFrom(:b0 rdf:langString))\n\
-             SubClassOf(:Unrel0 :Unrel1)\n",
-        );
-        for i in 0..12 {
-            sticky_ofn.push_str(&format!("SubDataPropertyOf(:b{i} :b{})\n", i + 1));
-        }
-        for i in 0..16 {
-            sticky_ofn.push_str(&format!("SubClassOf(:Q{i} ObjectSomeValuesFrom(:s :W))\n"));
-        }
-        sticky_ofn.push_str(")\n");
-        let sticky_base_ax = crate::ofn_read::parse(&sticky_ofn).unwrap().axioms;
-        let sticky_base_kinds: Vec<&AxiomKind> = sticky_base_ax.iter().map(|a| &a.kind).collect();
-        let sticky_edit_ax = crate::ofn_read::parse(
-            "Prefix(:=<http://ex.org/pollsticky#>) Ontology(\n\
-             SubClassOf(:Unrel1 :Unrel2)\n\
-             )",
-        )
-        .unwrap()
-        .axioms;
-        let sticky_edit_refs: Vec<&AxiomKind> = sticky_edit_ax.iter().map(|a| &a.kind).collect();
-        let mut sticky_next = sticky_base_kinds.clone();
-        sticky_next.extend_from_slice(&sticky_edit_refs);
-        let mut fresh_sticky = Saturation::new();
-        let fresh_sticky_out = fresh_sticky
-            .classify(&sticky_next, None, &unrestricted)
-            .unwrap();
-
-        let mut sat_sticky = Saturation::new();
-        let base_sticky = sat_sticky
-            .classify(&sticky_base_kinds, None, &unrestricted)
-            .unwrap();
-        assert!(base_sticky.consistent);
-        assert!(
-            sat_sticky
-                .el_deps
-                .world_deps
-                .values()
-                .any(|dep| !dep.dt_sticky.is_empty()),
-            "sticky fixture must produce non-empty dt_sticky rows"
-        );
-        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let entered_hook = entered.clone();
-        let entered_cancel = entered.clone();
-        let cancel_lim = Limits {
-            threads: 1,
-            cancelled: Some(std::sync::Arc::new(move || {
-                entered_cancel.load(Ordering::Acquire)
-            })),
-            ..Limits::default()
         };
-        let (err_res, _) = el_test_hooks::with_scan_hook(
-            Some(std::sync::Arc::new(move |kind| {
-                if kind == el_test_hooks::ScanKind::StickyReplay {
-                    entered_hook.store(true, Ordering::Release);
-                }
-            })),
-            || {
-                sat_sticky.classify(
-                    &sticky_next,
-                    Some(Changes {
-                        added: &sticky_edit_refs,
-                        removed: &[],
-                    }),
-                    &cancel_lim,
-                )
-            },
-        );
-        assert!(
-            entered.load(Ordering::Acquire),
-            "incremental edit must have entered target scan StickyReplay"
-        );
-        assert_eq!(
-            err_res.unwrap_err(),
-            Error::Cancelled,
-            "cancellation armed inside StickyReplay must stop with Error::Cancelled"
-        );
-        let recovered = sat_sticky
-            .classify(
-                &sticky_next,
-                Some(Changes {
-                    added: &sticky_edit_refs,
-                    removed: &[],
-                }),
-                &unrestricted,
+
+        // 1. Universal: 70 real individuals × 70 distinct universal rules = 4,900 inner
+        // iterations (> `DEP_POLL_STEP = 4096`), arming after 8 inner progress ticks.
+        {
+            let mut ofn = String::from("Prefix(:=<http://ex.org/polluniv#>) Ontology(\n");
+            for i in 0..70 {
+                ofn.push_str(&format!("ClassAssertion(:OtherU0 :u{i})\n"));
+            }
+            for i in 0..70 {
+                ofn.push_str(&format!(
+                    "SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty :OtherU{i}) :U{i})\n"
+                ));
+            }
+            ofn.push_str("SubClassOf(:Unrel0 :Unrel1)\n)\n");
+            let base_ax = crate::ofn_read::parse(&ofn).unwrap().axioms;
+            let base_kinds: Vec<&AxiomKind> = base_ax.iter().map(|a| &a.kind).collect();
+            let edit_ax = crate::ofn_read::parse(
+                "Prefix(:=<http://ex.org/polluniv#>) Ontology(SubClassOf(:Unrel1 :Unrel2))",
             )
-            .unwrap();
-        assert!(
-            !recovered.stats.incremental,
-            "recovery after cancellation in StickyReplay must fall back to fresh"
-        );
-        assert_eq!(recovered.taxonomy, fresh_sticky_out.taxonomy);
+            .unwrap()
+            .axioms;
+            let edit_refs: Vec<&AxiomKind> = edit_ax.iter().map(|a| &a.kind).collect();
+            let mut next_kinds = base_kinds.clone();
+            next_kinds.extend_from_slice(&edit_refs);
+            run_case(
+                "Universal",
+                el_test_hooks::ScanKind::Universal,
+                &base_kinds,
+                &next_kinds,
+                &edit_refs,
+                8,
+            );
+        }
+
+        // 2. KeyTouch: one modified named individual `:dirty_ind` with 72 incoming object
+        // properties checked against one `HasKey` with 72 unrelated object properties
+        // (72 × 72 = 5,184 inner ticks > `POLL_INVALIDATE = 4096`), arming after 16 ticks.
+        {
+            let mut ofn = String::from(
+                "Prefix(:=<http://ex.org/pollkey#>) Ontology(\n\
+                 SubClassOf(:W ObjectOneOf(:w))\n\
+                 SubClassOf(:W :WTag)\n\
+                 SubClassOf(:Q0 ObjectSomeValuesFrom(:s :W))\n\
+                 ClassAssertion(:Src :src)\n\
+                 ClassAssertion(:Keep :dirty_ind)\n",
+            );
+            for i in 0..72 {
+                ofn.push_str(&format!(
+                    "ObjectPropertyAssertion(:br{i} :src :dirty_ind)\n"
+                ));
+            }
+            ofn.push_str("HasKey(:KBig (");
+            for i in 0..72 {
+                ofn.push_str(&format!(" :ko{i}"));
+            }
+            ofn.push_str(") ())\n)\n");
+            let base_ax = crate::ofn_read::parse(&ofn).unwrap().axioms;
+            let base_kinds: Vec<&AxiomKind> = base_ax.iter().map(|a| &a.kind).collect();
+            let edit_ax = crate::ofn_read::parse(
+                "Prefix(:=<http://ex.org/pollkey#>) Ontology(ClassAssertion(:DirtyTag :dirty_ind))",
+            )
+            .unwrap()
+            .axioms;
+            let edit_refs: Vec<&AxiomKind> = edit_ax.iter().map(|a| &a.kind).collect();
+            let mut next_kinds = base_kinds.clone();
+            next_kinds.extend_from_slice(&edit_refs);
+            run_case(
+                "KeyTouch",
+                el_test_hooks::ScanKind::KeyTouch,
+                &base_kinds,
+                &next_kinds,
+                &edit_refs,
+                16,
+            );
+        }
+
+        // 3. WorldBuildDep: one dirty conditional world `:DirtyTarget` reaching `:W`,
+        // where `:W` has 72 `DataSomeValuesFrom` subsumers checked against a `HasKey` with
+        // 72 data properties (72 × 72 = 5,184 inner `poll_step` ticks > `DEP_POLL_STEP = 4096`)
+        // strictly AFTER the function-entry poll, arming after the first Pass 1 slot tick.
+        {
+            let mut ofn = String::from(
+                "Prefix(:=<http://ex.org/pollwdep#>) Ontology(\n\
+                 SubClassOf(:W ObjectOneOf(:w))\n\
+                 SubClassOf(:W :WTag)\n\
+                 SubClassOf(:DirtyTarget ObjectSomeValuesFrom(:s :W))\n",
+            );
+            for i in 0..72 {
+                ofn.push_str(&format!(
+                    "SubClassOf(:W DataSomeValuesFrom(:dp{i} xsd:integer))\n"
+                ));
+            }
+            ofn.push_str("HasKey(:KBig () (");
+            for i in 0..72 {
+                ofn.push_str(&format!(" :kd{i}"));
+            }
+            ofn.push_str("))\n)\n");
+            let base_ax = crate::ofn_read::parse(&ofn).unwrap().axioms;
+            let base_kinds: Vec<&AxiomKind> = base_ax.iter().map(|a| &a.kind).collect();
+            let edit_ax = crate::ofn_read::parse(
+                "Prefix(:=<http://ex.org/pollwdep#>) Ontology(SubClassOf(:DirtyTarget :Extra))",
+            )
+            .unwrap()
+            .axioms;
+            let edit_refs: Vec<&AxiomKind> = edit_ax.iter().map(|a| &a.kind).collect();
+            let mut next_kinds = base_kinds.clone();
+            next_kinds.extend_from_slice(&edit_refs);
+            run_case(
+                "WorldBuildDep",
+                el_test_hooks::ScanKind::WorldBuildDep,
+                &base_kinds,
+                &next_kinds,
+                &edit_refs,
+                1,
+            );
+        }
+
+        // 4. StickyReplay: 2,600 retained conditional worlds `:Q0..:Q2599`, each holding a
+        // pure-EL `BOUND` datatype-checker sticky row (`:b0 -> ... -> :b12` with
+        // `rdf:langString`), so the sticky-replay scan exceeds `POLL_INVALIDATE = 4096`
+        // (2 ticks per world = 5,200 ticks). Arming after world 1's replay aborts inside
+        // the loop BEFORE all worlds replay and BEFORE `Completed(StickyReplay)` (and
+        // strictly before the post-loop poll). Also directly verify multi-chunk mid-slice
+        // polling inside `world::replay_world_dt_sticky_polled` (> `DEP_POLL_STEP = 4096`).
+        {
+            let mut sticky_ofn = String::from(
+                "Prefix(:=<http://ex.org/pollsticky#>) Ontology(\n\
+                 SubClassOf(:W ObjectOneOf(:w))\n\
+                 SubClassOf(:W :WTag)\n\
+                 SubClassOf(ObjectIntersectionOf(ObjectOneOf(:w) :WTag) DataSomeValuesFrom(:b0 rdf:langString))\n\
+                 SubClassOf(:Unrel0 :Unrel1)\n",
+            );
+            for i in 0..12 {
+                sticky_ofn.push_str(&format!("SubDataPropertyOf(:b{i} :b{})\n", i + 1));
+            }
+            for i in 0..2600 {
+                sticky_ofn.push_str(&format!("SubClassOf(:Q{i} ObjectSomeValuesFrom(:s :W))\n"));
+            }
+            sticky_ofn.push_str(")\n");
+            let base_ax = crate::ofn_read::parse(&sticky_ofn).unwrap().axioms;
+            let base_kinds: Vec<&AxiomKind> = base_ax.iter().map(|a| &a.kind).collect();
+            let edit_ax = crate::ofn_read::parse(
+                "Prefix(:=<http://ex.org/pollsticky#>) Ontology(SubClassOf(:Unrel1 :Unrel2))",
+            )
+            .unwrap()
+            .axioms;
+            let edit_refs: Vec<&AxiomKind> = edit_ax.iter().map(|a| &a.kind).collect();
+            let mut next_kinds = base_kinds.clone();
+            next_kinds.extend_from_slice(&edit_refs);
+            run_case(
+                "StickyReplay",
+                el_test_hooks::ScanKind::StickyReplay,
+                &base_kinds,
+                &next_kinds,
+                &edit_refs,
+                1,
+            );
+
+            // Also verify `world::replay_world_dt_sticky_polled` polls between chunks of
+            // `DEP_POLL_STEP = 4096` within a single large `dt_sticky` slice.
+            let mut single = Saturation::new();
+            let single_ax = crate::ofn_read::parse(
+                "Prefix(:=<http://ex.org/pollchunk#>) Ontology(\n\
+                 SubClassOf(:A DataSomeValuesFrom(:b0 rdf:langString))\n\
+                 SubDataPropertyOf(:b0 :b1)\n\
+                 )",
+            )
+            .unwrap()
+            .axioms;
+            let single_kinds: Vec<&AxiomKind> = single_ax.iter().map(|a| &a.kind).collect();
+            single.classify(&single_kinds, None, &unrestricted).unwrap();
+            let ix = single.index.as_ref().unwrap();
+            assert!(ix.dt.is_some());
+            let rows = vec![(0u32, dt_sat::BOUND); 9000];
+            let chunk_progress = std::sync::Arc::new(AtomicUsize::new(0));
+            let chunk_armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cp_cb = chunk_progress.clone();
+            let ca_cb = chunk_armed.clone();
+            let ca_poll = chunk_armed.clone();
+            let (chunk_res, _) = el_test_hooks::with_scan_hook(
+                Some(std::sync::Arc::new(move |ev| {
+                    if ev
+                        == el_test_hooks::ScanEvent::Progress(el_test_hooks::ScanKind::StickyReplay)
+                    {
+                        cp_cb.fetch_add(1, Ordering::AcqRel);
+                        ca_cb.store(true, Ordering::Release);
+                    }
+                })),
+                || {
+                    world::replay_world_dt_sticky_polled(ix, &rows, &mut |_| {
+                        if ca_poll.load(Ordering::Acquire) {
+                            Err(())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                },
+            );
+            assert!(
+                chunk_res.is_err(),
+                "multi-chunk replay_world_dt_sticky_polled must stop at chunk 2 poll"
+            );
+            assert_eq!(
+                chunk_progress.load(Ordering::Acquire),
+                1,
+                "must stop immediately after chunk 1 without processing chunks 2-3"
+            );
+        }
     }
 
     #[test]
@@ -27832,6 +28219,781 @@ mod tests {
         let mut fresh = Saturation::new();
         let fresh_out = fresh.classify(&next_kinds, None, &unrestricted).unwrap();
         assert_eq!(out1.taxonomy, fresh_out.taxonomy);
+    }
+
+    #[test]
+    fn el_real_parent_refusal_preserves_mandatory_reseed_real() {
+        // Regression for R4-1 (Neon P0-1 / Sol P1 #1): when pre-Phase-1
+        // `real_parent_atomics` admission is refused on an incremental edit that removed
+        // a kept context's recorded causal real parent while another already-real parent
+        // survives, mandatory `reseed_real` must NOT be cleared before Phase 2 drains it.
+        let unrestricted = Limits {
+            threads: 1,
+            ..Limits::default()
+        };
+
+        // Case A: dual-real-path nominal merge (`Probe ⊑ Extra` must survive).
+        {
+            let ofn = "Prefix(:=<http://ex.org/reseed#>) Ontology(\n\
+                ClassAssertion(ObjectSomeValuesFrom(:r1 :S) :r1_root)\n\
+                ClassAssertion(ObjectSomeValuesFrom(:r2 :S) :a)\n\
+                SubClassOf(:S ObjectSomeValuesFrom(:s :T))\n\
+                SubClassOf(:T ObjectOneOf(:b))\n\
+                SubClassOf(:T :Extra)\n\
+                SubClassOf(:Probe ObjectOneOf(:b))\n\
+                Declaration(Class(:Probe))\n\
+                Declaration(Class(:Extra))\n\
+            )";
+            let axioms = crate::ofn_read::parse(ofn).unwrap().axioms;
+            let kinds: Vec<&AxiomKind> = axioms.iter().map(|a| &a.kind).collect();
+            let mut sat = Saturation::new();
+            let out1 = sat.classify(&kinds, None, &unrestricted).unwrap();
+            assert!(out1.consistent);
+            assert!(sat.el_deps.phase2_ran);
+            let probe = Class::new("http://ex.org/reseed#Probe");
+            let extra = Class::new("http://ex.org/reseed#Extra");
+            let s_cls = Class::new("http://ex.org/reseed#S");
+            assert!(out1.taxonomy.is_subclass(&probe, &extra));
+
+            let s_ex = sat.interner.class_ex(&s_cls).unwrap();
+            let r1_ind = NamedIndividual::new("http://ex.org/reseed#r1_root");
+            let a_ind = NamedIndividual::new("http://ex.org/reseed#a");
+            let r1_ex = sat
+                .interner
+                .individuals
+                .get(&r1_ind)
+                .and_then(|id| {
+                    sat.interner
+                        .nodes
+                        .iter()
+                        .position(|n| *n == Node::Nominal(id))
+                })
+                .unwrap() as Ex;
+            let a_ex = sat
+                .interner
+                .individuals
+                .get(&a_ind)
+                .and_then(|id| {
+                    sat.interner
+                        .nodes
+                        .iter()
+                        .position(|n| *n == Node::Nominal(id))
+                })
+                .unwrap() as Ex;
+            let recorded_parent = sat.el_deps.real_parent[s_ex as usize];
+            assert!(
+                recorded_parent == r1_ex || recorded_parent == a_ex,
+                "expected recorded real_parent[:S] to be either :r1_root ({r1_ex}) or :a ({a_ex}), got {recorded_parent}"
+            );
+            let remove_idx = if recorded_parent == r1_ex { 0 } else { 1 };
+            let removed = &axioms[remove_idx].kind;
+            let next_kinds: Vec<&AxiomKind> = axioms
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != remove_idx)
+                .map(|(_, a)| &a.kind)
+                .collect();
+
+            FORCE_REFUSE_REAL_PARENT.with(|c| c.set(true));
+            let out2 = sat
+                .classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &[],
+                        removed: &[removed],
+                    }),
+                    &unrestricted,
+                )
+                .unwrap();
+            assert!(
+                !FORCE_REFUSE_REAL_PARENT.with(|c| c.get()),
+                "edit must have consumed FORCE_REFUSE_REAL_PARENT"
+            );
+            assert!(out2.stats.incremental);
+            assert!(sat.el_deps.is_empty() && sat.entangled);
+            assert!(
+                sat.ctx[s_ex as usize]
+                    .get()
+                    .is_some_and(|c| c.st.lock().real),
+                ":S must be re-marked real from surviving parent even when real_parent_atomics was refused"
+            );
+            assert!(
+                out2.taxonomy.is_subclass(&probe, &extra),
+                "Probe ⊑ Extra must survive through the second real parent"
+            );
+            let mut fresh = Saturation::new();
+            let fresh_out = fresh.classify(&next_kinds, None, &unrestricted).unwrap();
+            assert_eq!(out2.taxonomy, fresh_out.taxonomy);
+        }
+
+        // Case B: dual-real-path universal trigger driving inconsistency (`owl:Nothing`).
+        // Run 1 enters Phase 2 via an unrelated universal fact `:OtherU` (so removing
+        // `:E`'s recorded parent stays incremental instead of triggering universal-loss
+        // restart), and Run 2 adds `∃owl:topObjectProperty.:Trigger ⊑ owl:Nothing` while
+        // forcing pre-Phase-1 `real_parent_atomics` refusal.
+        {
+            let ofn = "Prefix(:=<http://ex.org/reseedbot#>) Ontology(\n\
+                ClassAssertion(:A :a)\n\
+                ClassAssertion(:B :b)\n\
+                SubClassOf(:A ObjectSomeValuesFrom(:r :E))\n\
+                SubClassOf(:B ObjectSomeValuesFrom(:r :E))\n\
+                SubClassOf(:E :Trigger)\n\
+                ClassAssertion(:Other :o)\n\
+                SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty :Other) :OtherU)\n\
+            )";
+            let axioms = crate::ofn_read::parse(ofn).unwrap().axioms;
+            let kinds: Vec<&AxiomKind> = axioms.iter().map(|a| &a.kind).collect();
+            let mut sat = Saturation::new();
+            let out1 = sat.classify(&kinds, None, &unrestricted).unwrap();
+            assert!(out1.consistent);
+            assert!(sat.el_deps.phase2_ran);
+            let e_cls = Class::new("http://ex.org/reseedbot#E");
+            let a_ind = NamedIndividual::new("http://ex.org/reseedbot#a");
+            let b_ind = NamedIndividual::new("http://ex.org/reseedbot#b");
+            let e_ex = sat.interner.class_ex(&e_cls).unwrap();
+            let a_ex = sat
+                .interner
+                .individuals
+                .get(&a_ind)
+                .and_then(|id| {
+                    sat.interner
+                        .nodes
+                        .iter()
+                        .position(|n| *n == Node::Nominal(id))
+                })
+                .unwrap() as Ex;
+            let b_ex = sat
+                .interner
+                .individuals
+                .get(&b_ind)
+                .and_then(|id| {
+                    sat.interner
+                        .nodes
+                        .iter()
+                        .position(|n| *n == Node::Nominal(id))
+                })
+                .unwrap() as Ex;
+            let recorded_parent = sat.el_deps.real_parent[e_ex as usize];
+            assert!(
+                recorded_parent == a_ex || recorded_parent == b_ex,
+                "expected recorded real_parent[:E] to be :a ({a_ex}) or :b ({b_ex}), got {recorded_parent}"
+            );
+            let remove_idx = if recorded_parent == a_ex { 2 } else { 3 };
+            let removed = &axioms[remove_idx].kind;
+            let add_bot = crate::ofn_read::parse(
+                "Prefix(:=<http://ex.org/reseedbot#>) Ontology(\
+                 SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty :Trigger) owl:Nothing)\
+                 )",
+            )
+            .unwrap()
+            .axioms
+            .pop()
+            .unwrap();
+            let mut next_kinds: Vec<&AxiomKind> = axioms
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != remove_idx)
+                .map(|(_, a)| &a.kind)
+                .collect();
+            next_kinds.push(&add_bot.kind);
+
+            FORCE_REFUSE_REAL_PARENT.with(|c| c.set(true));
+            let out2 = sat
+                .classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &[&add_bot.kind],
+                        removed: &[removed],
+                    }),
+                    &unrestricted,
+                )
+                .unwrap();
+            assert!(!FORCE_REFUSE_REAL_PARENT.with(|c| c.get()));
+            assert!(out2.stats.incremental);
+            assert!(
+                !out2.consistent,
+                "inconsistency via surviving real parent must NOT be silently lost when real_parent_atomics is refused"
+            );
+            let mut fresh = Saturation::new();
+            let fresh_out = fresh.classify(&next_kinds, None, &unrestricted).unwrap();
+            assert_eq!(out2.consistent, fresh_out.consistent);
+            assert_eq!(out2.taxonomy, fresh_out.taxonomy);
+        }
+    }
+
+    #[test]
+    fn tombstone_bearing_phys_hash_map_bounds_actual_growth() {
+        // Regression for R4-2 (Sol P1 #2): retaining 14 entries in a full 32-bucket
+        // hashbrown table can leave 14 tombstones (`capacity() == 14`, `phys_cap() == 28`).
+        // Reserving 1 more entry triggers a 64-bucket reallocation (since 15 > 28/2),
+        // which `PhysHashMap::grow_bound(1)` and `table_bytes()` must cover accurately.
+        let entry_sz = std::mem::size_of::<(Ex, (bool, Vec<Ex>))>();
+        let mut built: Option<PhysHashMap<Ex, (bool, Vec<Ex>)>> = None;
+        for seed in 0u32..512 {
+            let mut map: PhysHashMap<Ex, (bool, Vec<Ex>)> = PhysHashMap::default();
+            let mut keys = Vec::with_capacity(28);
+            for i in 0u32..28 {
+                let k = seed.wrapping_mul(1009).wrapping_add(i);
+                map.insert(k, (false, Vec::new()));
+                keys.push(k);
+            }
+            if map.capacity() != 28 || map.phys_cap() != 28 {
+                continue;
+            }
+            // Remove keys that leave tombstones (dropping `capacity()` alongside `len()`).
+            let mut removed = 0usize;
+            for &k in &keys {
+                if removed == 14 {
+                    break;
+                }
+                let before_cap = map.capacity();
+                let v = map.remove(&k).unwrap();
+                if map.capacity() < before_cap {
+                    removed += 1;
+                } else {
+                    map.insert(k, v);
+                }
+            }
+            if map.len() == 14 && map.capacity() == 14 && map.phys_cap() == 28 {
+                built = Some(map);
+                break;
+            }
+        }
+        let mut map = built.expect("must construct a 32-bucket map with 14 live + 14 tombstones");
+        let table_16 = dl_clause::hash_table_bytes(14, entry_sz);
+        let table_32 = dl_clause::hash_table_bytes(28, entry_sz);
+        let table_64 = dl_clause::hash_table_bytes(56, entry_sz);
+        assert_eq!(map.table_bytes(), table_32);
+        assert!(map.table_bytes() > table_16);
+        // Naive `hash_table_grow_bound(14, 14, 1, entry_sz)` would only admit 32 buckets.
+        assert_eq!(
+            dl_clause::hash_table_grow_bound(14, 14, 1, entry_sz),
+            Some(table_32)
+        );
+        // `PhysHashMap::grow_bound(1)` must admit the actual 64-bucket replacement table.
+        assert_eq!(map.grow_bound(1), Some(table_64));
+        // Verify hashbrown indeed allocates 64 buckets (`capacity() == 56`) on `try_reserve(1)`.
+        map.try_reserve(1).unwrap();
+        assert_eq!(map.capacity(), 56);
+        assert_eq!(map.phys_cap(), 56);
+        assert_eq!(map.table_bytes(), table_64);
+    }
+
+    #[test]
+    fn el_retained_tombstone_worlds_join_preadmit_cap_and_pool() {
+        // Regression for R4-2 (Sol P1 #2): end-to-end Phase 3 join on a tombstone-bearing
+        // retained `self.worlds` map under both a tight `max_memory` cap and a refusing
+        // `charge` pool. Verify the join refuses BEFORE reserving when old+new exceeds the
+        // budget, and admits the full old-plus-new allocation when it fits.
+        let mut base_ofn = String::from(
+            "Prefix(:=<http://ex.org/wtomb#>) Ontology(\n\
+             SubClassOf(:W ObjectOneOf(:w))\n\
+             SubClassOf(:W :WTag)\n\
+             SubClassOf(ObjectIntersectionOf(ObjectOneOf(:w) :WTag) :WHit)\n",
+        );
+        // `:W` plus 55 `:Q{i}` conditional worlds fill a 64-bucket `self.worlds` table
+        // (`len == 56`, `phys_cap == 56`).
+        for i in 0..55 {
+            base_ofn.push_str(&format!("SubClassOf(:Q{i} ObjectSomeValuesFrom(:s :W))\n"));
+        }
+        base_ofn.push_str(")\n");
+        let base_ax = crate::ofn_read::parse(&base_ofn).unwrap().axioms;
+        let base_kinds: Vec<&AxiomKind> = base_ax.iter().map(|a| &a.kind).collect();
+        let unrestricted = Limits {
+            threads: 1,
+            ..Limits::default()
+        };
+
+        let mut cal = Saturation::new();
+        let cal_out1 = cal.classify(&base_kinds, None, &unrestricted).unwrap();
+        assert!(cal_out1.consistent);
+        assert_eq!(cal.worlds.len(), 56);
+        assert_eq!(cal.worlds.phys_cap(), 56);
+
+        // Probe the exact physical bucket layout of a deterministic 1-thread `classify`
+        // (without cloning the `HashMap`, which would rehash into a fresh layout), and
+        // verify the post-`retain` capacity directly so `surviving_len + add_count` exceeds
+        // both the tombstone-lowered `capacity()` and `56 / 2`, forcing a 64 -> 128 bucket
+        // reallocation at join even though `surviving_len + add_count <= 56`.
+        let mut cal_probe = Saturation::new();
+        cal_probe
+            .classify(&base_kinds, None, &unrestricted)
+            .unwrap();
+        assert_eq!(cal_probe.worlds.len(), 56);
+        assert_eq!(cal_probe.worlds.phys_cap(), 56);
+        let mut q_entries: Vec<(usize, Ex)> = Vec::new();
+        for i in 0..55 {
+            let cls = Class::new(format!("http://ex.org/wtomb#Q{i}"));
+            let ex = cal_probe.interner.class_ex(&cls).unwrap();
+            q_entries.push((i, ex));
+        }
+        let mut remove_indices: Vec<usize> = Vec::new();
+        for &(i, ex) in &q_entries {
+            if remove_indices.len() == 26 {
+                break;
+            }
+            let before_cap = cal_probe.worlds.capacity();
+            let val = cal_probe.worlds.remove(&ex).unwrap();
+            if cal_probe.worlds.capacity() < before_cap {
+                remove_indices.push(i);
+            } else {
+                cal_probe.worlds.insert(ex, val);
+            }
+        }
+        // Replay `retain` in hashbrown's bucket iteration order on a fresh identical
+        // `Saturation` to measure the exact `capacity()` seen right before Phase 3 join.
+        let mut cal_retain = Saturation::new();
+        cal_retain
+            .classify(&base_kinds, None, &unrestricted)
+            .unwrap();
+        let drop_set: FxHashSet<Ex> = remove_indices
+            .iter()
+            .map(|&i| {
+                cal_retain
+                    .interner
+                    .class_ex(&Class::new(format!("http://ex.org/wtomb#Q{i}")))
+                    .unwrap()
+            })
+            .collect();
+        cal_retain.worlds.retain(|&d, _| !drop_set.contains(&d));
+        assert!(
+            cal_retain.worlds.capacity() < cal_retain.worlds.phys_cap(),
+            "retain must leave tombstones in 64-bucket worlds table (removed={}, len={}, cap={}, phys={})",
+            remove_indices.len(),
+            cal_retain.worlds.len(),
+            cal_retain.worlds.capacity(),
+            cal_retain.worlds.phys_cap(),
+        );
+        let add_count = (cal_retain.worlds.capacity() - cal_retain.worlds.len()) + 1;
+        assert!(
+            cal_retain.worlds.len() + add_count > 28 && cal_retain.worlds.len() + add_count <= 56,
+            "expected surviving ({}) + add ({add_count}) in (28, 56]",
+            cal_retain.worlds.len()
+        );
+        // Add `add_count` brand-new conditional worlds reaching an independent witness
+        // `:WNew` (so `:W` is never modified and all surviving `:Q{i}` worlds stay reused
+        // with their tombstones intact in `self.worlds` across Phase 3 join).
+        let mut add_ofn = String::from(
+            "Prefix(:=<http://ex.org/wtomb#>) Ontology(\n\
+             SubClassOf(:WNew ObjectOneOf(:w_new))\n",
+        );
+        for i in 1..add_count {
+            add_ofn.push_str(&format!(
+                "SubClassOf(:QNew{i} ObjectSomeValuesFrom(:s2 :WNew))\n"
+            ));
+        }
+        add_ofn.push_str(")\n");
+        let add_ax = crate::ofn_read::parse(&add_ofn).unwrap().axioms;
+        let added_refs: Vec<&AxiomKind> = add_ax.iter().map(|a| &a.kind).collect();
+        let removed_refs: Vec<&AxiomKind> = remove_indices
+            .iter()
+            .map(|&i| &base_ax[3 + i].kind)
+            .collect();
+        let mut next_kinds: Vec<&AxiomKind> = base_ax
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| idx < 3 || !remove_indices.contains(&(idx - 3)))
+            .map(|(_, a)| &a.kind)
+            .collect();
+        next_kinds.extend_from_slice(&added_refs);
+
+        let mut fresh = Saturation::new();
+        let fresh_out = fresh.classify(&next_kinds, None, &unrestricted).unwrap();
+
+        // 1. Unrestricted incremental run: verify surviving worlds stayed reused with
+        //    tombstones, 64 -> 128 bucket resize occurred, and physical heap is covered.
+        let (inc_res, sample_inc) = numeric::tests::measure(|| {
+            cal.classify(
+                &next_kinds,
+                Some(Changes {
+                    added: &added_refs,
+                    removed: &removed_refs,
+                }),
+                &unrestricted,
+            )
+        });
+        let inc_out = inc_res.unwrap();
+        assert!(inc_out.stats.incremental);
+        assert_eq!(
+            inc_out.stats.worlds_reused,
+            cal_retain.worlds.len(),
+            "surviving worlds must be reused in place with tombstones intact"
+        );
+        assert_eq!(inc_out.taxonomy, fresh_out.taxonomy);
+        assert_eq!(
+            cal.worlds.phys_cap(),
+            112,
+            "tombstone-bearing 64-bucket worlds map must have reallocated to 128 buckets"
+        );
+        assert!(
+            inc_out.stats.peak_memory >= sample_inc.peak,
+            "admitted peak ({}) undercounted measured heap ({}) across tombstone worlds resize",
+            inc_out.stats.peak_memory,
+            sample_inc.peak,
+        );
+
+        // 2. Cap and pool boundary check: bracket the plain incremental join peak (after
+        //    optional tracking is shed) so we witness BOTH a refusal strictly BEFORE
+        //    `self.worlds.try_reserve` (keeping `worlds.phys_cap() <= 56`) AND an acceptance
+        //    covering the full 64+128 overlap cleanly under both cap and pool.
+        let mut plain_cal = Saturation::new();
+        plain_cal
+            .classify(&base_kinds, None, &unrestricted)
+            .unwrap();
+        let plain_inc = el_test_hooks::with_force_no_track(|| {
+            plain_cal.classify(
+                &next_kinds,
+                Some(Changes {
+                    added: &added_refs,
+                    removed: &removed_refs,
+                }),
+                &unrestricted,
+            )
+        })
+        .unwrap();
+        let entry_sz = std::mem::size_of::<(Ex, (bool, Vec<Ex>))>();
+        let delta_128_vs_64 =
+            dl_clause::hash_table_bytes(112, entry_sz) - dl_clause::hash_table_bytes(56, entry_sz);
+        let low = plain_inc
+            .stats
+            .peak_memory
+            .min(inc_out.stats.peak_memory)
+            .saturating_sub(delta_128_vs_64 * 2);
+        let high = inc_out.stats.peak_memory.max(plain_inc.stats.peak_memory);
+        let step = (delta_128_vs_64 / 4).max(64);
+        let mut saw_cap_refuse_before_reserve = false;
+        let mut saw_cap_accept = false;
+        let mut saw_pool_refuse_before_reserve = false;
+        let mut saw_pool_accept = false;
+        let mut cap = low;
+        while cap <= high {
+            if !saw_cap_refuse_before_reserve || !saw_cap_accept {
+                let mut sat = Saturation::new();
+                sat.classify(&base_kinds, None, &unrestricted).unwrap();
+                assert_eq!(sat.worlds.phys_cap(), 56);
+                let lim = Limits {
+                    max_memory: Some(cap),
+                    ..unrestricted.clone()
+                };
+                match sat.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &added_refs,
+                        removed: &removed_refs,
+                    }),
+                    &lim,
+                ) {
+                    Ok(out) => {
+                        assert_eq!(out.taxonomy, fresh_out.taxonomy);
+                        if out.stats.incremental {
+                            assert!(
+                                out.stats.peak_memory <= cap,
+                                "incremental cap run peak {} exceeded cap {cap}",
+                                out.stats.peak_memory,
+                            );
+                            assert_eq!(sat.worlds.phys_cap(), 112);
+                            saw_cap_accept = true;
+                        } else {
+                            // Incremental join refused before reserving 128 buckets and
+                            // fell back to fresh classification (`phys_cap == 56`).
+                            assert!(
+                                sat.worlds.phys_cap() <= 56,
+                                "fallback after cap refusal must not grow tombstone map to 128 buckets (phys_cap={})",
+                                sat.worlds.phys_cap(),
+                            );
+                            saw_cap_refuse_before_reserve = true;
+                        }
+                    }
+                    Err(Error::Memory { .. }) => {
+                        assert!(
+                            sat.worlds.phys_cap() <= 56,
+                            "cap refusal must happen BEFORE self.worlds.try_reserve grows to 128 buckets (phys_cap={})",
+                            sat.worlds.phys_cap(),
+                        );
+                        saw_cap_refuse_before_reserve = true;
+                    }
+                    Err(e) => panic!("unexpected error under cap {cap}: {e:?}"),
+                }
+            }
+            if !saw_pool_refuse_before_reserve || !saw_pool_accept {
+                let mut sat = Saturation::new();
+                sat.classify(&base_kinds, None, &unrestricted).unwrap();
+                assert_eq!(sat.worlds.phys_cap(), 56);
+                let paid = std::sync::Arc::new(AtomicUsize::new(0));
+                let paid_cb = paid.clone();
+                let lim = Limits {
+                    charge: Some(std::sync::Arc::new(move |more| {
+                        let mut cur = paid_cb.load(Ordering::Relaxed);
+                        loop {
+                            let next = cur.saturating_add(more);
+                            if next > cap {
+                                return false;
+                            }
+                            match paid_cb.compare_exchange_weak(
+                                cur,
+                                next,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => return true,
+                                Err(actual) => cur = actual,
+                            }
+                        }
+                    })),
+                    ..unrestricted.clone()
+                };
+                match sat.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &added_refs,
+                        removed: &removed_refs,
+                    }),
+                    &lim,
+                ) {
+                    Ok(out) => {
+                        assert!(paid.load(Ordering::Acquire) <= cap);
+                        assert_eq!(out.taxonomy, fresh_out.taxonomy);
+                        if out.stats.incremental {
+                            assert!(
+                                out.stats.peak_memory <= cap,
+                                "incremental pool run peak {} exceeded cap {cap}",
+                                out.stats.peak_memory,
+                            );
+                            assert_eq!(sat.worlds.phys_cap(), 112);
+                            saw_pool_accept = true;
+                        } else {
+                            assert!(
+                                sat.worlds.phys_cap() <= 56,
+                                "fallback after pool refusal must not grow tombstone map to 128 buckets (phys_cap={})",
+                                sat.worlds.phys_cap(),
+                            );
+                            saw_pool_refuse_before_reserve = true;
+                        }
+                    }
+                    Err(Error::Memory { .. }) => {
+                        assert!(paid.load(Ordering::Acquire) <= cap);
+                        assert!(
+                            sat.worlds.phys_cap() <= 56,
+                            "pool refusal must happen BEFORE self.worlds.try_reserve grows to 128 buckets (phys_cap={})",
+                            sat.worlds.phys_cap(),
+                        );
+                        saw_pool_refuse_before_reserve = true;
+                    }
+                    Err(e) => panic!("unexpected error under pool cap {cap}: {e:?}"),
+                }
+            }
+            if saw_cap_refuse_before_reserve
+                && saw_cap_accept
+                && saw_pool_refuse_before_reserve
+                && saw_pool_accept
+            {
+                break;
+            }
+            if cap == high {
+                break;
+            }
+            cap = cap.saturating_add(step).min(high);
+        }
+        assert!(
+            saw_cap_refuse_before_reserve
+                && saw_cap_accept
+                && saw_pool_refuse_before_reserve
+                && saw_pool_accept,
+            "expected both cap (refuse={saw_cap_refuse_before_reserve}, accept={saw_cap_accept}) and pool (refuse={saw_pool_refuse_before_reserve}, accept={saw_pool_accept}) to cover or refuse tombstone worlds resize cleanly between {low} and {high}"
+        );
+    }
+
+    #[test]
+    fn el_orphan_prune_sheds_optional_world_deps_and_retries_cap_and_pool() {
+        // Regression for R4-3 (Sol P2 #1): on a completed incremental EL datatype edit,
+        // staged `new_world_deps` and retained EL tracking metadata are live when
+        // `orphan_prune` checks admission. When the combined request exceeds a cap or pool
+        // that fits mandatory pruning after shedding tracking, `orphan_prune` must shed
+        // optional tracking, exclude the refused estimate from `stats.peak_memory`, retry
+        // pruning cleanly, and match a fresh classification in both strict and partial modes.
+        let mut base_ofn = String::from(
+            "Prefix(:=<http://ex.org/oprune#>) Ontology(\n\
+             SubClassOf(:W ObjectOneOf(:w))\n\
+             SubClassOf(:W :WTag)\n\
+             SubClassOf(:W :KAll)\n\
+             SubClassOf(ObjectIntersectionOf(ObjectOneOf(:w) :WTag) :WHit)\n\
+             SubClassOf(:DtRoot DataSomeValuesFrom(:dp rdf:langString))\n\
+             DataPropertyRange(:dp rdf:langString)\n\
+             SubClassOf(:Q0 ObjectSomeValuesFrom(:s :W))\n",
+        );
+        // 128 keys on `:KAll` cause every newly executed conditional world to stage ~7.7 KB
+        // of `WorldDep::watched_keys`, so 32 new worlds stage ~250 KB of `new_world_deps`
+        // (well above `old_ix` during `CompareAdmit`).
+        for i in 0..128 {
+            base_ofn.push_str(&format!("HasKey(:KAll (:r{i}) ())\n"));
+        }
+        // 1,000 declared padding classes make `orphan_prune`'s mandatory `Marks` + `queue`
+        // scratch (~4.5 KB) exceed a single Phase 3 world's working set and `worlds_grow_peak`
+        // while keeping `CompareAdmit` well below `orphan_prune` with 48 new worlds (~370 KB
+        // of staged `new_world_deps`).
+        for i in 0..1000 {
+            base_ofn.push_str(&format!("Declaration(Class(:Pad{i}))\n"));
+        }
+        base_ofn.push_str(")\n");
+        let base_ax = crate::ofn_read::parse(&base_ofn).unwrap().axioms;
+        let base_kinds: Vec<&AxiomKind> = base_ax.iter().map(|a| &a.kind).collect();
+
+        // Incremental edit adds 48 new conditional worlds (producing ~370 KB of staged
+        // `new_world_deps`) alongside the datatype index so `orphan_prune` runs at peak.
+        let mut edit_ofn = String::from("Prefix(:=<http://ex.org/oprune#>) Ontology(\n");
+        for i in 0..48 {
+            edit_ofn.push_str(&format!(
+                "SubClassOf(:QNew{i} ObjectSomeValuesFrom(:s :W))\n"
+            ));
+        }
+        edit_ofn.push_str(")\n");
+        let edit_ax = crate::ofn_read::parse(&edit_ofn).unwrap().axioms;
+        let edit_refs: Vec<&AxiomKind> = edit_ax.iter().map(|a| &a.kind).collect();
+        let mut next_kinds = base_kinds.clone();
+        next_kinds.extend_from_slice(&edit_refs);
+
+        let unrestricted = Limits {
+            threads: 1,
+            ..Limits::default()
+        };
+        let mut fresh = Saturation::new();
+        let fresh_out = fresh.classify(&next_kinds, None, &unrestricted).unwrap();
+
+        let mut cal = Saturation::new();
+        cal.classify(&base_kinds, None, &unrestricted).unwrap();
+        let (cal_inc_res, cal_counts) = el_test_hooks::with_counts(|| {
+            cal.classify(
+                &next_kinds,
+                Some(Changes {
+                    added: &edit_refs,
+                    removed: &[],
+                }),
+                &unrestricted,
+            )
+        });
+        let cal_inc = cal_inc_res.unwrap();
+        assert!(cal_inc.stats.incremental);
+        assert!(cal.el_deps.bytes() > 0);
+        assert!(cal_counts.orphan_prune_used > 0);
+
+        // Target a cap just below `orphan_prune`'s combined tracked request
+        // (`totals.memory + live_post_worlds + scratch`), where Phase 1/2/3 succeed with
+        // staged `new_world_deps` live and `orphan_prune` is the first refusal point.
+        let cap = cal_counts.orphan_prune_used.saturating_sub(1);
+
+        // 1. Strict numeric `max_memory` cap.
+        {
+            let mut sat = Saturation::new();
+            sat.classify(&base_kinds, None, &unrestricted).unwrap();
+            let lim = Limits {
+                max_memory: Some(cap),
+                ..unrestricted.clone()
+            };
+            let (res, counts) = el_test_hooks::with_counts(|| {
+                sat.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &edit_refs,
+                        removed: &[],
+                    }),
+                    &lim,
+                )
+            });
+            let out = res.expect("strict cap must succeed after orphan_prune sheds optional deps");
+            assert!(
+                counts.orphan_prune_shed >= 1,
+                "strict cap {cap} must trigger orphan_prune optional-tracking shed (counts={counts:?}, prune_used={})",
+                cal_counts.orphan_prune_used,
+            );
+            assert!(out.stats.incremental);
+            assert!(
+                out.stats.peak_memory <= cap,
+                "refused orphan_prune estimate leaked past cap {cap}: peak={}",
+                out.stats.peak_memory,
+            );
+            assert!(sat.el_deps.is_empty() && sat.entangled);
+            assert_eq!(out.taxonomy, fresh_out.taxonomy);
+        }
+
+        // 2. Partial numeric `max_memory` cap.
+        {
+            let mut sat = Saturation::new();
+            sat.classify(&base_kinds, None, &unrestricted).unwrap();
+            let lim = Limits {
+                max_memory: Some(cap),
+                partial: true,
+                ..unrestricted.clone()
+            };
+            let (res, counts) = el_test_hooks::with_counts(|| {
+                sat.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &edit_refs,
+                        removed: &[],
+                    }),
+                    &lim,
+                )
+            });
+            let out = res.expect("partial cap must succeed after orphan_prune sheds optional deps");
+            assert!(
+                counts.orphan_prune_shed >= 1,
+                "partial cap {cap} must trigger orphan_prune optional-tracking shed (counts={counts:?})",
+            );
+            assert!(out.complete && out.incomplete.is_empty());
+            assert!(out.stats.incremental);
+            assert!(out.stats.peak_memory <= cap);
+            assert!(sat.el_deps.is_empty() && sat.entangled);
+            assert_eq!(out.taxonomy, fresh_out.taxonomy);
+        }
+
+        // 3. Refusing shared-pool `charge` callback.
+        {
+            let mut sat = Saturation::new();
+            sat.classify(&base_kinds, None, &unrestricted).unwrap();
+            let paid = std::sync::Arc::new(AtomicUsize::new(0));
+            let paid_cb = paid.clone();
+            let lim = Limits {
+                charge: Some(std::sync::Arc::new(move |more| {
+                    let mut cur = paid_cb.load(Ordering::Relaxed);
+                    loop {
+                        let next = cur.saturating_add(more);
+                        if next > cap {
+                            return false;
+                        }
+                        match paid_cb.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => return true,
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                })),
+                ..unrestricted.clone()
+            };
+            let (res, counts) = el_test_hooks::with_counts(|| {
+                sat.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &edit_refs,
+                        removed: &[],
+                    }),
+                    &lim,
+                )
+            });
+            let out = res.expect("pool cap must succeed after orphan_prune sheds optional deps");
+            assert!(
+                counts.orphan_prune_shed >= 1,
+                "pool cap {cap} must trigger orphan_prune optional-tracking shed (counts={counts:?})",
+            );
+            assert!(out.stats.incremental);
+            assert!(paid.load(Ordering::Acquire) <= cap);
+            assert!(out.stats.peak_memory <= cap);
+            assert!(sat.el_deps.is_empty() && sat.entangled);
+            assert_eq!(out.taxonomy, fresh_out.taxonomy);
+        }
     }
 }
 

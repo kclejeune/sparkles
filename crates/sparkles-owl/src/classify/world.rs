@@ -162,8 +162,6 @@ pub fn universal_facts_polled<E>(
     if ix.universal.is_empty() {
         return Ok(out);
     }
-    #[cfg(test)]
-    super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::Universal);
     let mut since_poll = 0usize;
     let mut stop_err: Option<E> = None;
     for e in 0..view.len() as Ex {
@@ -185,6 +183,8 @@ pub fn universal_facts_polled<E>(
                         return;
                     }
                 }
+                #[cfg(test)]
+                super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::Universal);
                 if !st.subs.contains(&f) {
                     continue;
                 }
@@ -211,6 +211,8 @@ pub fn universal_facts_polled<E>(
         }
     }
     out.sort_unstable();
+    #[cfg(test)]
+    super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::Universal);
     Ok(out)
 }
 
@@ -240,8 +242,6 @@ pub fn universal_facts_with_supports_polled<E>(
     if ix.universal.is_empty() {
         return Ok((facts, Some((supports_out, 0))));
     }
-    #[cfg(test)]
-    super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::Universal);
     let mut since_poll = 0usize;
     let mut stop_err: Option<E> = None;
     for e in 0..view.len() as Ex {
@@ -263,6 +263,8 @@ pub fn universal_facts_with_supports_polled<E>(
                         return;
                     }
                 }
+                #[cfg(test)]
+                super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::Universal);
                 if !st.subs.contains(&f) {
                     continue;
                 }
@@ -347,6 +349,8 @@ pub fn universal_facts_with_supports_polled<E>(
         }
     }
     facts.sort_unstable();
+    #[cfg(test)]
+    super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::Universal);
     if tracking {
         supports_out.sort_unstable_by_key(|u| u.fact);
         let actual_bytes = supports_out
@@ -726,19 +730,25 @@ pub fn context_touches_key_polled<E>(
     key: &super::index::Key,
     poll_step: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
-    #[cfg(test)]
-    super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::KeyTouch);
     if !has_named_alias_polled(ix, e, st, poll_step)? {
+        #[cfg(test)]
+        super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::KeyTouch);
         return Ok(false);
     }
     if st.subs.contains(&key.class) {
+        #[cfg(test)]
+        super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::KeyTouch);
         return Ok(true);
     }
     for (role, _) in &st.back {
         poll_step(1)?;
         for &op in &key.objects {
             poll_step(1)?;
+            #[cfg(test)]
+            super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::KeyTouch);
             if !ix.is_universal(op) && ix.roles.sub(*role, op) {
+                #[cfg(test)]
+                super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::KeyTouch);
                 return Ok(true);
             }
         }
@@ -746,10 +756,18 @@ pub fn context_touches_key_polled<E>(
     if !key.data.is_empty() {
         for &sub in &st.subs {
             poll_step(1)?;
+            #[cfg(test)]
+            super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::KeyTouch);
             if let Node::DataSome(role, _) = ix.head(sub).node {
                 for &dp in &key.data {
                     poll_step(1)?;
+                    #[cfg(test)]
+                    super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::KeyTouch);
                     if !ix.is_universal(dp) && ix.roles.sub(role, dp) {
+                        #[cfg(test)]
+                        super::el_test_hooks::scan_completed(
+                            super::el_test_hooks::ScanKind::KeyTouch,
+                        );
                         return Ok(true);
                     }
                 }
@@ -762,7 +780,15 @@ pub fn context_touches_key_polled<E>(
                     poll_step(1)?;
                     for &dp in &key.data {
                         poll_step(1)?;
+                        #[cfg(test)]
+                        super::el_test_hooks::scan_progress(
+                            super::el_test_hooks::ScanKind::KeyTouch,
+                        );
                         if !ix.is_universal(dp) && ix.roles.sub(r, dp) {
+                            #[cfg(test)]
+                            super::el_test_hooks::scan_completed(
+                                super::el_test_hooks::ScanKind::KeyTouch,
+                            );
                             return Ok(true);
                         }
                     }
@@ -770,6 +796,8 @@ pub fn context_touches_key_polled<E>(
             }
         }
     }
+    #[cfg(test)]
+    super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::KeyTouch);
     Ok(false)
 }
 
@@ -780,8 +808,6 @@ pub fn replay_world_dt_sticky_polled<E>(
     sticky_rows: &[(u32, u8)],
     poll_step: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<(), E> {
-    #[cfg(test)]
-    super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::StickyReplay);
     super::dt_sat::replay_sticky_polled(ix, sticky_rows, DEP_POLL_STEP, poll_step)
 }
 
@@ -2724,8 +2750,6 @@ impl<'a> World<'a> {
         budget: &'r super::WorldBudget<'b>,
         track_active: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<FoundDep<'r, 'b>>, Halt> {
-        #[cfg(test)]
-        super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::WorldBuildDep);
         let mut since_poll = 0usize;
         let mut poll_step = |work: usize| -> Result<(), Halt> {
             since_poll = since_poll.saturating_add(work);
@@ -2784,6 +2808,8 @@ impl<'a> World<'a> {
         let mut stop_err = false;
         for (&e, slot) in &self.slots {
             poll_step(1)?;
+            #[cfg(test)]
+            super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::WorldBuildDep);
             if (e as usize) < self.ctx.len() {
                 used_contexts_count = used_contexts_count.saturating_add(1);
             }
@@ -2929,6 +2955,8 @@ impl<'a> World<'a> {
 
         for (&e, slot) in &self.slots {
             poll_step(1)?;
+            #[cfg(test)]
+            super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::WorldBuildDep);
             if (e as usize) < self.ctx.len() {
                 used_contexts.push(e);
             }
@@ -3004,6 +3032,8 @@ impl<'a> World<'a> {
             }
             dt_sticky.truncate(write + 1);
         }
+        #[cfg(test)]
+        super::el_test_hooks::scan_completed(super::el_test_hooks::ScanKind::WorldBuildDep);
         Ok(Some(FoundDep {
             dep: WorldDep {
                 used_contexts,

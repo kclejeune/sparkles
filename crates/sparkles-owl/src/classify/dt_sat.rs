@@ -1037,6 +1037,8 @@ pub fn replay_sticky_polled<E>(
                 *slot = (*slot).max(last);
             }
         }
+        #[cfg(test)]
+        super::el_test_hooks::scan_progress(super::el_test_hooks::ScanKind::StickyReplay);
     }
     Ok(())
 }

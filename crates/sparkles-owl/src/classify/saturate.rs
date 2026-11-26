@@ -54,6 +54,9 @@ pub struct ElTrack<'a> {
     pub modified: Option<&'a [AtomicU64]>,
     /// Set to `true` whenever any context transitions `real: false -> true`.
     pub any_newly_real: Option<&'a AtomicBool>,
+    /// Whether this round can trigger the EL optional-tracking memory-stop fallback and
+    /// therefore needs accepted-only peak tracking (`Totals::admitted_peak`).
+    pub track_admitted_peak: bool,
 }
 
 /// A conclusion waiting in a context's to-do list.
@@ -1093,6 +1096,9 @@ struct Run<'a> {
     peak: AtomicUsize,
     /// the highest memory estimate accepted by limits and pool charges
     admitted_peak: AtomicUsize,
+    /// whether this round maintains `admitted_peak` (only capped/pooled EL rounds that can
+    /// trigger optional-tracking fallback; false avoids extra atomics on plain saturation)
+    track_admitted_peak: bool,
     /// whether committed memory and queued updates serialize through `admission`
     /// (true on bounded, pooled, or Tier D runs; false preserves lock-free EL/Horn fast path)
     serialized_admission: bool,
@@ -1903,6 +1909,10 @@ pub fn saturate_counted_tracked(
         bounds.dynamic,
         bounds.dl,
     );
+    let track_admitted_peak = track.is_some_and(|t| t.track_admitted_peak)
+        && (bounds.max_memory.is_some() || bounds.charge.is_some());
+    let track = track
+        .filter(|t| t.real_parent.is_some() || t.modified.is_some() || t.any_newly_real.is_some());
     let run = Run {
         ix,
         ctx,
@@ -1919,6 +1929,7 @@ pub fn saturate_counted_tracked(
         queued: AtomicIsize::new(bounds.base_queued as isize),
         peak: AtomicUsize::new(bounds.base_memory.max(bounds.peak_memory)),
         admitted_peak: AtomicUsize::new(bounds.peak_memory),
+        track_admitted_peak,
         serialized_admission,
         admission: Mutex::new(MemLedger {
             committed: bounds.base_memory,
@@ -2046,8 +2057,10 @@ pub fn saturate_counted_tracked(
                     ) {
                         raw_stop = STOP_MEMORY;
                     } else {
-                        run.admitted_peak
-                            .fetch_max(peak_committed, Ordering::Relaxed);
+                        if run.track_admitted_peak {
+                            run.admitted_peak
+                                .fetch_max(peak_committed, Ordering::Relaxed);
+                        }
                         if bounds.dl.is_some_and(|d| d.over_work()) {
                             raw_stop = STOP_WORK;
                         } else if bounds.deadline.is_some_and(super::deadline_passed) {
@@ -2060,7 +2073,13 @@ pub fn saturate_counted_tracked(
             }
         }
     }
-    let admitted_peak = run.admitted_peak.load(Ordering::Relaxed).max(ledger.paid);
+    let admitted_peak = if run.track_admitted_peak {
+        run.admitted_peak.load(Ordering::Relaxed).max(ledger.paid)
+    } else if raw_stop != STOP_MEMORY {
+        peak.max(ledger.paid)
+    } else {
+        bounds.peak_memory.max(ledger.paid)
+    };
     let totals = Totals {
         conclusions: run.applied.load(Ordering::Relaxed),
         memory,
@@ -2644,7 +2663,9 @@ impl<'r, 'a> Out<'r, 'a> {
         ledger.committed = next_committed;
         self.run.memory.store(next_committed, Ordering::Relaxed);
         ledger.committed_peak = ledger.committed_peak.max(used);
-        self.run.admitted_peak.fetch_max(used, Ordering::Relaxed);
+        if self.run.track_admitted_peak {
+            self.run.admitted_peak.fetch_max(used, Ordering::Relaxed);
+        }
         self.run.peak.fetch_max(used, Ordering::Relaxed);
         true
     }
@@ -4401,7 +4422,9 @@ impl<'a> Run<'a> {
             }
             return false;
         }
-        self.admitted_peak.fetch_max(used, Ordering::Relaxed);
+        if self.track_admitted_peak {
+            self.admitted_peak.fetch_max(used, Ordering::Relaxed);
+        }
         !self.stopped()
     }
 
@@ -4486,7 +4509,9 @@ impl<'a> Run<'a> {
                 }
                 return (true, false);
             }
-            self.admitted_peak.fetch_max(used, Ordering::Relaxed);
+            if self.track_admitted_peak {
+                self.admitted_peak.fetch_max(used, Ordering::Relaxed);
+            }
         }
         let _halt = HaltOnPanic::new(self);
         if !self.batch.load(Ordering::Relaxed) {
@@ -4573,7 +4598,9 @@ impl<'a> Run<'a> {
                 self.halt(STOP_MEMORY);
                 return false;
             }
-            self.admitted_peak.fetch_max(attempted, Ordering::Relaxed);
+            if self.track_admitted_peak {
+                self.admitted_peak.fetch_max(attempted, Ordering::Relaxed);
+            }
             return true;
         };
         self.admit_pooled(attempted, max, charge)
@@ -4617,7 +4644,9 @@ impl<'a> Run<'a> {
         if let Some(u) = used
             && super::cover_memory(u, max, Some(charge), &mut ledger.paid)
         {
-            self.admitted_peak.fetch_max(u, Ordering::Relaxed);
+            if self.track_admitted_peak {
+                self.admitted_peak.fetch_max(u, Ordering::Relaxed);
+            }
             return !self.stopped();
         }
         let won = self.publish_stop(STOP_MEMORY);
@@ -5723,6 +5752,7 @@ pub(super) fn test_concurrent_commit_dl_no_double_count() -> (bool, usize, usize
         queued: AtomicIsize::new(0),
         peak: AtomicUsize::new(base),
         admitted_peak: AtomicUsize::new(base),
+        track_admitted_peak: false,
         serialized_admission: true,
         admission: Mutex::new(MemLedger {
             committed: base,
@@ -6513,6 +6543,7 @@ mod horn_accounting_tests {
             queued: AtomicIsize::new(1),
             peak: AtomicUsize::new(bounds.peak_memory),
             admitted_peak: AtomicUsize::new(bounds.peak_memory),
+            track_admitted_peak: false,
             serialized_admission,
             admission: Mutex::new(MemLedger {
                 committed: bounds.base_memory,
