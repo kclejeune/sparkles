@@ -774,25 +774,67 @@ fn ordered_concat_admits_growth_before_allocating_and_polls_repetitions() {
         Some(String::new())
     );
 
-    // 5. Finalization under a 64 KiB limit for a 48 KiB result must not allocate unbudgeted
-    //    intermediate copies: an already-stored key succeeds within budget, and a brand-new key
-    //    is refused before allocating its retained vocabulary copy (both `Ordered` and `Concat`).
-    let store = Store::in_memory(StoreOptions::default());
-    let chunk_a = "a".repeat(1024);
-    let existing_48k = "a".repeat(48 * 1024);
-    crate::sparql::update::update(
-        &store,
-        &format!("INSERT DATA {{ <http://ex/s> <http://ex/p> \"{existing_48k}\" . }}"),
-        &QueryOptions::default(),
-    )
-    .unwrap();
+    // 5. Finalization under tight memory budgets for a 48 KiB result must not allocate
+    //    unbudgeted intermediate copies or FSST base-vocabulary lookup scratch: an
+    //    already-stored FSST-coded base-vocab key succeeds within budget, and a brand-new
+    //    key is refused before allocating its retained vocabulary copy (both `Ordered`
+    //    and `Concat`, with `Concat`'s text growth charged as `Grouping::add` does).
+    let chunk_a = "abcdefgh".repeat(128);
+    assert_eq!(chunk_a.len(), 1024);
+    let chunk_miss = format!("{}abcdefgz", "abcdefgh".repeat(127));
+    assert_eq!(chunk_miss.len(), 1024);
+    let existing_48k = chunk_a.repeat(48);
+    let store = Store::in_memory(StoreOptions {
+        build: crate::builder::BuildOptions {
+            vocab_codec: Some(crate::builder::VocabCodec::Fsst),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let nt = format!("<urn:s> <urn:p> \"a0\" .\n<urn:s> <urn:p> \"{existing_48k}\" .\n");
+    store
+        .load(&[crate::io::Source::from_bytes(
+            nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
     let snap = store.snapshot();
-    let existing_id = snap
-        .lookup_key(&crate::id::term_key(&oxrdf::Term::Literal(
-            oxrdf::Literal::new_simple_literal(&existing_48k),
-        )))
-        .expect("48 KiB literal stored in snapshot");
+    assert_eq!(
+        snap.generation.vocab_codec(),
+        crate::builder::VocabCodec::Fsst
+    );
+    let existing_key = crate::id::term_key(&oxrdf::Term::Literal(
+        oxrdf::Literal::new_simple_literal(&existing_48k),
+    ));
+    let (existing_id, hit_lookup_stats) =
+        crate::test_alloc::record_alloc_stats(|| snap.lookup_key(&existing_key));
+    let existing_id = existing_id.expect("48 KiB literal stored in FSST base vocabulary");
+    assert_eq!(existing_id.tag(), crate::id::Tag::Vocab);
+    assert!(
+        !(existing_id.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK),
+        "48 KiB literal must be a non-first entry in its FSST block"
+    );
+    assert!(
+        snap.generation.vocab.is_entry_coded(existing_id.payload()),
+        "48 KiB literal must have an FSST-coded suffix"
+    );
+    assert_eq!(
+        hit_lookup_stats.total_alloc, 0,
+        "FSST hit lookup allocated uncharged scratch: {hit_lookup_stats:?}"
+    );
+    let mut miss_last_byte_key = existing_key.clone();
+    let last_lex = miss_last_byte_key.len() - 2;
+    miss_last_byte_key[last_lex] = b'z';
+    let (miss_lookup, miss_lookup_stats) =
+        crate::test_alloc::record_alloc_stats(|| snap.lookup_key(&miss_last_byte_key));
+    assert_eq!(miss_lookup, None);
+    assert_eq!(
+        miss_lookup_stats.total_alloc, 0,
+        "FSST miss lookup allocated uncharged scratch: {miss_lookup_stats:?}"
+    );
 
+    // Retractable `Ordered::read` hit on the FSST base-vocabulary entry under 64 KiB.
     let mut existing_ctx = Ctx::new(snap.clone());
     existing_ctx.mem_limit = 64 * 1024;
     let existing_ctx = existing_ctx.into_shared();
@@ -812,18 +854,24 @@ fn ordered_concat_admits_growth_before_allocating_and_polls_repetitions() {
             &[0],
         )
         .unwrap();
-    let got_existing = acc_existing.read(&existing_ctx, 0).unwrap();
-    assert_eq!(got_existing, existing_id);
+    let (got_existing, ret_hit_stats) =
+        crate::test_alloc::record_alloc_stats(|| acc_existing.read(&existing_ctx, 0));
+    assert_eq!(got_existing.unwrap(), existing_id);
     assert!(
         existing_ctx.mem_peak() <= 64 * 1024,
         "existing 48 KiB GROUP_CONCAT exceeded 64 KiB budget: {}",
         existing_ctx.mem_peak()
     );
+    assert!(
+        ret_hit_stats.peak_live < 56 * 1024 && ret_hit_stats.total_alloc < 56 * 1024,
+        "retractable hit allocated extra copies or lookup scratch: {ret_hit_stats:?}"
+    );
 
+    // Retractable `Ordered::read` miss with matching prefix against the FSST entry under 64 KiB.
     let mut new_ctx = Ctx::new(snap.clone());
     new_ctx.mem_limit = 64 * 1024;
     let new_ctx = new_ctx.into_shared();
-    let chunk_b_id = new_ctx.intern_value(&Value::Str("b".repeat(1024).into()));
+    let chunk_miss_id = new_ctx.intern_value(&Value::Str(chunk_miss.clone().into()));
     let mut acc_new = retractable(&empty_agg, 1).unwrap();
     acc_new.init(1);
     acc_new
@@ -831,7 +879,7 @@ fn ordered_concat_admits_growth_before_allocating_and_polls_repetitions() {
             &new_ctx,
             &Batch {
                 table: &table,
-                arg: Arg::Column(&[chunk_b_id]),
+                arg: Arg::Column(&[chunk_miss_id]),
                 rows: None,
                 weights: Some(&[48]),
                 base: 0,
@@ -839,9 +887,8 @@ fn ordered_concat_admits_growth_before_allocating_and_polls_repetitions() {
             &[0],
         )
         .unwrap();
-    let err = acc_new
-        .read(&new_ctx, 0)
-        .expect_err("new 48 KiB key plus 48 KiB key buffer must exceed 64 KiB budget");
+    let (err, ret_miss_stats) = crate::test_alloc::record_alloc_stats(|| acc_new.read(&new_ctx, 0));
+    let err = err.expect_err("new 48 KiB key plus 48 KiB key buffer must exceed 64 KiB budget");
     assert!(
         matches!(err, crate::Error::BudgetExceeded(_)),
         "got {err:?}"
@@ -851,23 +898,100 @@ fn ordered_concat_admits_growth_before_allocating_and_polls_repetitions() {
         "mem_peak {} exceeded 64 KiB budget during finalization",
         new_ctx.mem_peak()
     );
+    assert!(
+        ret_miss_stats.peak_live < 56 * 1024 && ret_miss_stats.total_alloc < 56 * 1024,
+        "retractable miss allocated extra copies or lookup scratch: {ret_miss_stats:?}"
+    );
 
-    // One-off `Concat::finish` shares the same direct key-encoding finalization path.
-    let mut one_off_existing_ctx = Ctx::new(snap);
-    one_off_existing_ctx.mem_limit = 64 * 1024;
+    // One-off `Concat::finish` hit and miss with `take_growth()` charged (mirroring
+    // `Grouping::add`): folding 48 x 1 KiB chunks grows the String capacity to 64 KiB
+    // (`take_growth() == 128 KiB`), so a 160 KiB limit leaves ~30 KiB (< 48 KiB) of
+    // headroom during finalization.
+    const ONE_OFF_BUDGET: u64 = 160 * 1024;
+    let mut one_off_existing_ctx = Ctx::new(snap.clone());
+    one_off_existing_ctx.mem_limit = ONE_OFF_BUDGET;
     let one_off_existing_ctx = one_off_existing_ctx.into_shared();
-    let chunk_a_one_off = one_off_existing_ctx.intern_value(&Value::Str(chunk_a.into()));
+    let chunk_a_one_off = one_off_existing_ctx.intern_value(&Value::Str(chunk_a.clone().into()));
     let mut concat_acc = Concat::new(&empty_agg);
     concat_acc.init(1);
     let vals_48 = vec![chunk_a_one_off; 48];
     let slots_48 = vec![0u32; 48];
     fold(&one_off_existing_ctx, &mut concat_acc, &vals_48, &slots_48);
-    let got_one_off = concat_acc.finish(&one_off_existing_ctx, 0).unwrap();
-    assert_eq!(got_one_off, existing_id);
+    let growth = concat_acc.take_growth();
     assert!(
-        one_off_existing_ctx.mem_peak() <= 64 * 1024,
-        "one-off Concat::finish exceeded 64 KiB budget: {}",
+        growth >= 96 * 1024,
+        "expected text growth charge, got {growth}"
+    );
+    let _growth = one_off_existing_ctx.charge(growth).unwrap();
+    let (got_one_off, one_off_hit_stats) =
+        crate::test_alloc::record_alloc_stats(|| concat_acc.finish(&one_off_existing_ctx, 0));
+    assert_eq!(got_one_off.unwrap(), existing_id);
+    assert!(
+        one_off_existing_ctx.mem_peak() <= ONE_OFF_BUDGET,
+        "one-off Concat::finish exceeded budget: {}",
         one_off_existing_ctx.mem_peak()
+    );
+    assert!(
+        one_off_hit_stats.peak_live < 4096 && one_off_hit_stats.total_alloc < 4096,
+        "one-off hit allocated copies or lookup scratch: {one_off_hit_stats:?}"
+    );
+
+    // One-off `Concat::finish` miss differing only on the final byte of the 48 KiB key.
+    let mut one_off_miss_ctx = Ctx::new(snap.clone());
+    one_off_miss_ctx.mem_limit = ONE_OFF_BUDGET;
+    let one_off_miss_ctx = one_off_miss_ctx.into_shared();
+    let chunk_a_miss = one_off_miss_ctx.intern_value(&Value::Str(chunk_a.into()));
+    let chunk_b_miss = one_off_miss_ctx.intern_value(&Value::Str(chunk_miss.into()));
+    let mut concat_miss = Concat::new(&empty_agg);
+    concat_miss.init(1);
+    let mut vals_miss = vec![chunk_a_miss; 47];
+    vals_miss.push(chunk_b_miss);
+    fold(&one_off_miss_ctx, &mut concat_miss, &vals_miss, &slots_48);
+    let miss_growth = concat_miss.take_growth();
+    assert!(
+        miss_growth >= 96 * 1024,
+        "expected text growth charge, got {miss_growth}"
+    );
+    let _miss_growth = one_off_miss_ctx.charge(miss_growth).unwrap();
+    let (err, one_off_miss_stats) =
+        crate::test_alloc::record_alloc_stats(|| concat_miss.finish(&one_off_miss_ctx, 0));
+    let err = err.expect_err("one-off miss with charged text buffer must exceed budget");
+    assert!(
+        matches!(err, crate::Error::BudgetExceeded(_)),
+        "got {err:?}"
+    );
+    assert!(
+        one_off_miss_ctx.mem_peak() <= ONE_OFF_BUDGET,
+        "one-off miss mem_peak {} exceeded budget",
+        one_off_miss_ctx.mem_peak()
+    );
+    assert!(
+        one_off_miss_stats.peak_live < 4096 && one_off_miss_stats.total_alloc < 4096,
+        "one-off miss allocated copies or lookup scratch: {one_off_miss_stats:?}"
+    );
+
+    // One-off `Concat::finish` when `text.capacity() < text.len() + 2` (exact 48 KiB
+    // single-chunk buffer): framing growth is admitted before reallocating, so a budget
+    // without room for the reallocation refuses before growing the buffer.
+    let mut tight_ctx = Ctx::new(snap);
+    tight_ctx.mem_limit = 128 * 1024;
+    let tight_ctx = tight_ctx.into_shared();
+    let mut concat_tight = Concat::new(&empty_agg);
+    concat_tight.init(1);
+    fold(&tight_ctx, &mut concat_tight, &[existing_id], &[0]);
+    let tight_growth = concat_tight.take_growth();
+    assert_eq!(tight_growth, (48 * 1024 * 2) as u64);
+    let _tight_growth = tight_ctx.charge(tight_growth).unwrap();
+    let (err, tight_stats) =
+        crate::test_alloc::record_alloc_stats(|| concat_tight.finish(&tight_ctx, 0));
+    let err = err.expect_err("capacity-tight one-off framing growth must exceed budget");
+    assert!(
+        matches!(err, crate::Error::BudgetExceeded(_)),
+        "got {err:?}"
+    );
+    assert!(
+        tight_stats.peak_live < 4096 && tight_stats.total_alloc < 4096,
+        "capacity-tight refusal allocated before rejecting: {tight_stats:?}"
     );
 
     // 6. Unrepresentable lengths (> isize::MAX) are rejected before the first reservation even
