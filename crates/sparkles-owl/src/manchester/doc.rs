@@ -241,23 +241,10 @@ fn axiom_has_invalid_anon(ax: &Axiom) -> bool {
     }
 }
 
-fn is_builtin_manchester_datatype(iri: &str) -> bool {
-    iri.starts_with(vocab::XSD)
-        || matches!(
-            iri,
-            vocab::RDFS_LITERAL
-                | vocab::RDF_PLAIN_LITERAL
-                | vocab::RDF_XML_LITERAL
-                | vocab::RDF_LANG_STRING
-                | vocab::OWL_REAL
-                | vocab::OWL_RATIONAL
-        )
-}
-
 fn collect_dr_datatypes(r: &DataRange, dts: &mut BTreeSet<Datatype>) {
     match r {
         DataRange::Datatype(d) | DataRange::DatatypeRestriction(d, _) => {
-            if !is_builtin_manchester_datatype(d.as_str()) {
+            if !vocab::is_builtin_datatype(d.as_str()) {
                 dts.insert(d.clone());
             }
         }
@@ -386,7 +373,7 @@ fn collect_axiom_entity_refs(ax: &AxiomKind, refs: &mut AxiomEntityRefs) {
             }
         }
         K::Declaration(Entity::Datatype(d)) => {
-            if !is_builtin_manchester_datatype(d.as_str()) {
+            if !vocab::is_builtin_datatype(d.as_str()) {
                 refs.datatypes.insert(d.clone());
             }
         }
@@ -748,10 +735,17 @@ pub fn write_document<'a>(
         }
     }
 
-    let all_obj_prop_iris: BTreeSet<Iri> = all_refs.obj_props.iter().map(|p| p.0.clone()).collect();
-    let all_data_prop_iris: BTreeSet<Iri> =
+    let mut all_obj_prop_iris: BTreeSet<Iri> =
+        all_refs.obj_props.iter().map(|p| p.0.clone()).collect();
+    all_obj_prop_iris.insert(ObjectProperty::top().0);
+    all_obj_prop_iris.insert(ObjectProperty::bottom().0);
+    let mut all_data_prop_iris: BTreeSet<Iri> =
         all_refs.data_props.iter().map(|p| p.0.clone()).collect();
-    let all_class_iris: BTreeSet<Iri> = all_refs.classes.iter().map(|c| c.0.clone()).collect();
+    all_data_prop_iris.insert(DataProperty::top().0);
+    all_data_prop_iris.insert(DataProperty::bottom().0);
+    let mut all_class_iris: BTreeSet<Iri> = all_refs.classes.iter().map(|c| c.0.clone()).collect();
+    all_class_iris.insert(Class::thing().0);
+    all_class_iris.insert(Class::nothing().0);
 
     // Second pass: classify remaining axioms into entity frames or misc frames.
     let mut written_refs = AxiomEntityRefs::default();
@@ -1300,15 +1294,20 @@ pub fn write_document<'a>(
         datatypes.entry(dt).or_default();
     }
     // Synthesize matching frames for referenced ObjectProperties, Classes and
-    // NamedIndividuals whenever their IRI collides with another emitted frame kind so
-    // the reader's vocabulary never shadows or rejects unambiguous punned expressions.
+    // NamedIndividuals whenever their IRI collides with another emitted or built-in
+    // entity kind so the reader's vocabulary never shadows or rejects unambiguous punned
+    // expressions.
     for op in written_refs.obj_props {
         let iri = &op.0;
         let collides = data_props.contains_key(&DataProperty(iri.clone()))
             || classes.contains_key(&Class(iri.clone()))
             || datatypes.contains_key(&Datatype(iri.clone()))
             || ann_props.contains_key(&AnnotationProperty(iri.clone()))
-            || individuals.contains_key(&Individual::Named(NamedIndividual(iri.clone())));
+            || individuals.contains_key(&Individual::Named(NamedIndividual(iri.clone())))
+            || Entity::DataProperty(DataProperty(iri.clone())).is_builtin()
+            || Entity::Class(Class(iri.clone())).is_builtin()
+            || vocab::is_builtin_datatype(iri.as_str())
+            || vocab::is_builtin_annotation_property(iri.as_str());
         if collides {
             obj_props.entry(op).or_default();
         }
@@ -1319,7 +1318,11 @@ pub fn write_document<'a>(
             || obj_props.contains_key(&ObjectProperty(iri.clone()))
             || data_props.contains_key(&DataProperty(iri.clone()))
             || ann_props.contains_key(&AnnotationProperty(iri.clone()))
-            || individuals.contains_key(&Individual::Named(NamedIndividual(iri.clone())));
+            || individuals.contains_key(&Individual::Named(NamedIndividual(iri.clone())))
+            || vocab::is_builtin_datatype(iri.as_str())
+            || Entity::ObjectProperty(ObjectProperty(iri.clone())).is_builtin()
+            || Entity::DataProperty(DataProperty(iri.clone())).is_builtin()
+            || vocab::is_builtin_annotation_property(iri.as_str());
         if collides {
             classes.entry(c).or_default();
         }
@@ -1330,7 +1333,12 @@ pub fn write_document<'a>(
             || datatypes.contains_key(&Datatype(iri.clone()))
             || obj_props.contains_key(&ObjectProperty(iri.clone()))
             || data_props.contains_key(&DataProperty(iri.clone()))
-            || ann_props.contains_key(&AnnotationProperty(iri.clone()));
+            || ann_props.contains_key(&AnnotationProperty(iri.clone()))
+            || Entity::Class(Class(iri.clone())).is_builtin()
+            || vocab::is_builtin_datatype(iri.as_str())
+            || Entity::ObjectProperty(ObjectProperty(iri.clone())).is_builtin()
+            || Entity::DataProperty(DataProperty(iri.clone())).is_builtin()
+            || vocab::is_builtin_annotation_property(iri.as_str());
         if collides {
             individuals.entry(Individual::Named(ind)).or_default();
         }

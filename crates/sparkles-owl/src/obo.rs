@@ -137,21 +137,37 @@ fn obo_id_roundtrips(iri: &str, obo_id: &str, idspaces: &FxHashMap<String, Strin
         .is_some_and(|back| back.as_str() == iri)
 }
 
-/// Convert `iri` into an interoperable OBO 1.4 identifier that round-trips back to `iri`,
-/// falling back to the full HTTP(S) URL-as-ID if an abbreviation fails the identity check.
+fn obo_id_lexical_roundtrips(raw: &str) -> bool {
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Ok(escaped) = escape_obo_id(raw) else {
+        return false;
+    };
+    let stripped = strip_obo_comment(&escaped).trim();
+    if unescape_obo(stripped) != raw {
+        return false;
+    }
+    let tokens = split_obo_tokens(stripped);
+    tokens.len() == 1 && tokens[0] == raw
+}
+
+/// Convert `iri` into an interoperable OBO 1.4 identifier that round-trips back to `iri`
+/// both lexically (after OBO escaping, comment stripping, trimming and token splitting)
+/// and semantically, falling back to the full HTTP(S) URL-as-ID if an abbreviation fails.
 fn checked_obo_id(
     iri: &str,
     match_spaces: &[(String, String)],
     idspace_map: &FxHashMap<String, String>,
 ) -> Option<String> {
-    if iri.contains(['\r', '\n']) {
-        return None;
-    }
     let id = iri_to_obo_id(iri, match_spaces);
-    if !id.contains(['\r', '\n']) && obo_id_roundtrips(iri, &id, idspace_map) {
+    if obo_id_lexical_roundtrips(&id) && obo_id_roundtrips(iri, &id, idspace_map) {
         return Some(id);
     }
-    if is_obo_url_as_id(iri) && obo_id_roundtrips(iri, iri, idspace_map) {
+    if is_obo_url_as_id(iri)
+        && obo_id_lexical_roundtrips(iri)
+        && obo_id_roundtrips(iri, iri, idspace_map)
+    {
         return Some(iri.to_string());
     }
     None
@@ -164,7 +180,8 @@ fn ontology_short_id(iri: &str) -> String {
     if let Some(rest) = iri.strip_prefix(OBO_PURL)
         && let Some(trimmed) = rest.strip_suffix(".owl")
         && !trimmed.is_empty()
-        && !trimmed.contains(['/', '#', ' ', ':'])
+        && !trimmed.contains(['/', '#', ':'])
+        && !trimmed.chars().any(char::is_whitespace)
     {
         return trimmed.to_string();
     }
@@ -447,16 +464,35 @@ fn obo_kinds_compatible(
     entity_kinds: &BTreeMap<String, OboEntityKind>,
     reqs: &[(&str, OboEntityKind)],
 ) -> bool {
-    for (i, &(id, kind)) in reqs.iter().enumerate() {
+    if reqs.len() <= 4 {
+        for (i, &(id, kind)) in reqs.iter().enumerate() {
+            if let Some(&existing) = entity_kinds.get(id)
+                && existing != kind
+            {
+                return false;
+            }
+            for &(other_id, other_kind) in &reqs[i + 1..] {
+                if id == other_id && kind != other_kind {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    let mut seen: FxHashMap<&str, OboEntityKind> = FxHashMap::default();
+    seen.reserve(reqs.len());
+    for &(id, kind) in reqs {
         if let Some(&existing) = entity_kinds.get(id)
             && existing != kind
         {
             return false;
         }
-        for &(other_id, other_kind) in &reqs[i + 1..] {
-            if id == other_id && kind != other_kind {
+        if let Some(&prev) = seen.get(id) {
+            if prev != kind {
                 return false;
             }
+        } else {
+            seen.insert(id, kind);
         }
     }
     true
@@ -628,6 +664,7 @@ pub fn write_document<'a>(
             && is_obo_prefix(p)
             && !STANDARD_PREFIXES.iter().any(|(sp, _)| *sp == p)
             && ns != OBO_PURL
+            && obo_id_lexical_roundtrips(ns)
         {
             idspace_by_name.insert(p.to_string(), ns.to_string());
         }
@@ -1999,13 +2036,17 @@ pub fn write_document<'a>(
     // --- Validate & prepare header ---
     let mut header_data_version: Option<String> = None;
     if let Some(ver) = &header.version_iri {
-        if is_obo_url_as_id(ver.as_str()) {
-            header_data_version = Some(ver.as_str().to_string());
+        let raw = ver.as_str();
+        let roundtrips = is_obo_url_as_id(raw)
+            && !raw.chars().any(char::is_whitespace)
+            && escape_obo_text(raw)
+                .ok()
+                .is_some_and(|esc| unescape_obo(strip_obo_comment(&esc).trim()) == raw);
+        if roundtrips {
+            header_data_version = Some(raw.to_string());
         } else {
-            let msg = format!(
-                "OBO 1.4 cannot preserve non-HTTP(S) versionIRI <{}> in data-version:",
-                ver.as_str()
-            );
+            let msg =
+                format!("OBO 1.4 cannot preserve versionIRI <{raw}> losslessly in data-version:");
             if options.strict {
                 return Err(WriteError::Unsupported(msg));
             }
@@ -2015,16 +2056,30 @@ pub fn write_document<'a>(
     let mut header_ontology: Option<String> = None;
     if let Some(iri) = &header.iri {
         let short = ontology_short_id(iri.as_str());
-        if expand_ontology_id(&short)
-            .ok()
-            .is_some_and(|back| back.as_str() == iri.as_str())
+        if obo_id_lexical_roundtrips(&short)
+            && expand_ontology_id(&short)
+                .ok()
+                .is_some_and(|back| back.as_str() == iri.as_str())
         {
             header_ontology = Some(short);
         } else {
             let msg = format!(
-                "OBO 1.4 cannot preserve non-HTTP(S) ontology IRI <{}> in ontology:",
+                "OBO 1.4 cannot preserve ontology IRI <{}> losslessly in ontology:",
                 iri.as_str()
             );
+            if options.strict {
+                return Err(WriteError::Unsupported(msg));
+            }
+            report.record_skipped_header(msg);
+        }
+    }
+    let mut header_imports: Vec<String> = Vec::new();
+    for imp in &header.imports {
+        let raw = imp.as_str();
+        if obo_id_lexical_roundtrips(raw) && parse_iri(raw).is_ok() {
+            header_imports.push(raw.to_string());
+        } else {
+            let msg = format!("OBO 1.4 cannot preserve import IRI <{raw}> losslessly in import:");
             if options.strict {
                 return Err(WriteError::Unsupported(msg));
             }
@@ -2126,8 +2181,8 @@ pub fn write_document<'a>(
     for (p, ns) in &idspaces {
         writeln!(w, "idspace: {} {}", escape_obo_id(p)?, escape_obo_id(ns)?)?;
     }
-    for imp in &header.imports {
-        writeln!(w, "import: {}", escape_obo_id(imp.as_str())?)?;
+    for imp in &header_imports {
+        writeln!(w, "import: {}", escape_obo_id(imp)?)?;
     }
     header_remarks.sort();
     for r in &header_remarks {

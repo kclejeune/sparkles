@@ -26,6 +26,7 @@ use crate::vocab;
 use crate::write_common::{
     WriteError, WriteOptions, WriteReport, check_axiom_depth, check_header_depth,
 };
+use rustc_hash::FxHashMap;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -348,21 +349,46 @@ fn nodes_compatible(
     nodes: &BTreeMap<String, NodeEntry>,
     reqs: &[(&str, NodeType, Option<PropertyType>)],
 ) -> bool {
-    for (i, &(id, ty, pt)) in reqs.iter().enumerate() {
+    if reqs.len() <= 4 {
+        for (i, &(id, ty, pt)) in reqs.iter().enumerate() {
+            if !node_compatible(nodes, id, ty, pt) {
+                return false;
+            }
+            for &(oid, oty, opt) in &reqs[i + 1..] {
+                if id == oid {
+                    if ty != oty {
+                        return false;
+                    }
+                    if let (Some(a), Some(b)) = (pt, opt)
+                        && a != b
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    let mut seen: FxHashMap<&str, (NodeType, Option<PropertyType>)> = FxHashMap::default();
+    seen.reserve(reqs.len());
+    for &(id, ty, pt) in reqs {
         if !node_compatible(nodes, id, ty, pt) {
             return false;
         }
-        for &(oid, oty, opt) in &reqs[i + 1..] {
-            if id == oid {
-                if ty != oty {
-                    return false;
-                }
-                if let (Some(a), Some(b)) = (pt, opt)
-                    && a != b
-                {
-                    return false;
-                }
+        if let Some((prev_ty, prev_pt)) = seen.get_mut(id) {
+            if *prev_ty != ty {
+                return false;
             }
+            if let (Some(a), Some(b)) = (*prev_pt, pt)
+                && a != b
+            {
+                return false;
+            }
+            if prev_pt.is_none() && pt.is_some() {
+                *prev_pt = pt;
+            }
+        } else {
+            seen.insert(id, (ty, pt));
         }
     }
     true

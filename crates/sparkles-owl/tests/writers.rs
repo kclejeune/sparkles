@@ -1923,7 +1923,7 @@ fn obographs_property_types_punning_strict_values_io_error_and_bounds() {
             Ok(())
         }
     }
-    // "{\n  \"graphs\" : [ {\n    \"id\" : " is 31 bytes; failing at byte 34 triggers inside
+    // "{\n  \"graphs\" : [ {\n    \"id\" : " is 30 bytes; failing at byte 34 triggers inside
     // write_json_str's serde_json::to_writer call writing "\"http://ex.org/g\"".
     let mut fw = FailAfter {
         remaining: 34,
@@ -2636,4 +2636,422 @@ fn obographs_same_axiom_punning_stub_nodes_and_reserved_imports_header() {
     assert_eq!(rep_imp.skipped_header_count, 1, "{rep_imp:?}");
     let back_imp = obographs::parse(&json_imp).unwrap();
     assert!(back_imp.header.imports.is_empty());
+}
+
+#[test]
+fn manchester_builtin_punning_nested_restriction_lookahead_and_left_boolean_depth() {
+    // 1. P2.1(a): DataMinCardinality on builtin owl:topObjectProperty must not silently
+    // round-trip as ObjectMinCardinality.
+    let builtin_data_card = [Axiom::sub_class_of(
+        cls("C"),
+        ClassExpression::DataMinCardinality(
+            1,
+            DataProperty::new(vocab::OWL_TOP_OBJECT_PROPERTY),
+            None,
+        ),
+    )];
+    assert!(matches!(
+        manchester::document(
+            &renderer(),
+            &Header::default(),
+            builtin_data_card.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (omn_bd, rep_bd) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        builtin_data_card.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_bd.skipped_count, 1, "{rep_bd:?}");
+    let back_bd = manchester::parse_document(&omn_bd).unwrap();
+    assert!(
+        !back_bd.axioms.iter().any(|a| matches!(
+            a.kind,
+            AxiomKind::SubClassOf(_, ClassExpression::ObjectMinCardinality(..))
+        )),
+        "builtin owl:topObjectProperty DataMinCardinality must not become ObjectMinCardinality:\n{omn_bd}"
+    );
+
+    // Symmetric builtin case: ObjectMinCardinality on builtin owl:topDataProperty.
+    let builtin_obj_card = [Axiom::sub_class_of(
+        cls("C"),
+        ClassExpression::ObjectMinCardinality(
+            1,
+            ObjectProperty::new(vocab::OWL_TOP_DATA_PROPERTY).into(),
+            None,
+        ),
+    )];
+    assert!(matches!(
+        manchester::document(
+            &renderer(),
+            &Header::default(),
+            builtin_obj_card.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+
+    // 2. P2.1(b): Punned :p (ObjectProperty + DataProperty) with qualified nested object
+    // restriction whose property :q is also declared as a Datatype.
+    let nested_dt_prop = [
+        Axiom::declaration(Entity::ObjectProperty(op("p"))),
+        Axiom::declaration(Entity::DataProperty(dp("p"))),
+        Axiom::declaration(Entity::Datatype(Datatype::new(ex("q")))),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::some(op("p"), ClassExpression::some(op("q"), cls("D"))),
+        ),
+    ];
+    let (omn_nq, rep_nq) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        nested_dt_prop.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep_nq.is_lossless(), "{rep_nq:?}");
+    let back_nq = manchester::parse_document(&omn_nq).unwrap_or_else(|e| {
+        panic!("failed to parse nested datatype-punned restriction: {e}\n{omn_nq}")
+    });
+    for expected in &nested_dt_prop {
+        assert!(
+            back_nq.axioms.contains(expected),
+            "missing {expected:?} in:\n{omn_nq}"
+        );
+    }
+
+    // 3. P2.1(c): Builtin datatype xsd:string used as Class filler under punned :p must
+    // synthesize a Class: xsd:string frame so the reader keeps it as ObjectSomeValuesFrom.
+    let builtin_dt_class = [
+        Axiom::declaration(Entity::ObjectProperty(op("p"))),
+        Axiom::declaration(Entity::DataProperty(dp("p"))),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::some(op("p"), Class::new(vocab::XSD_STRING)),
+        ),
+    ];
+    let (omn_bc, rep_bc) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        builtin_dt_class.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep_bc.is_lossless(), "{rep_bc:?}");
+    let back_bc = manchester::parse_document(&omn_bc).unwrap();
+    assert!(
+        back_bc.axioms.contains(&builtin_dt_class[2]),
+        "missing ObjectSomeValuesFrom(:p xsd:string) in:\n{omn_bc}"
+    );
+
+    // 4. P2.2: Left-nested boolean expressions at exact semantic depth 128 (accepted by
+    // both writer and parser) and depth 129 (rejected by both writer and parser).
+    fn left_nested_ce(n: usize, union: bool) -> ClassExpression {
+        let mut ce = ClassExpression::Class(cls("A"));
+        for i in 0..n {
+            let other = ClassExpression::Class(cls(&format!("B{i}")));
+            let set = [ce, other].into_iter().collect();
+            ce = if union {
+                ClassExpression::ObjectUnionOf(set)
+            } else {
+                ClassExpression::ObjectIntersectionOf(set)
+            };
+        }
+        ce
+    }
+    fn left_nested_dr(n: usize, union: bool) -> DataRange {
+        let mut dr = DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER));
+        for i in 0..n {
+            let other = DataRange::Datatype(Datatype::new(ex(&format!("DT{i}"))));
+            let set = [dr, other].into_iter().collect();
+            dr = if union {
+                DataRange::UnionOf(set)
+            } else {
+                DataRange::IntersectionOf(set)
+            };
+        }
+        dr
+    }
+
+    for union in [true, false] {
+        // Depth 128 = 127 nested operators over leaf: lossless round-trip
+        let ce128 = left_nested_ce(127, union);
+        let dr128 = left_nested_dr(127, union);
+        let axioms = [
+            Axiom::declaration(Entity::Class(cls("C"))),
+            Axiom::declaration(Entity::DataProperty(dp("d"))),
+            Axiom::sub_class_of(cls("C"), ce128.clone()),
+            Axiom::new(AxiomKind::DataPropertyRange(dp("d"), dr128.clone())),
+        ];
+        let (omn, rep) = manchester::document(
+            &renderer(),
+            &Header::default(),
+            axioms.iter(),
+            WriteOptions { strict: true },
+        )
+        .unwrap();
+        assert!(rep.is_lossless(), "union={union}: {rep:?}");
+        let back = manchester::parse_document(&omn)
+            .unwrap_or_else(|e| panic!("union={union} depth-128 parse failed: {e}"));
+        assert!(back.axioms.contains(&axioms[2]));
+        assert!(back.axioms.contains(&axioms[3]));
+
+        // Depth 129 = 128 nested operators: writer refuses
+        let over_ce_ax = Axiom::sub_class_of(cls("C"), left_nested_ce(128, union));
+        assert!(matches!(
+            manchester::document(
+                &renderer(),
+                &Header::default(),
+                [&over_ce_ax],
+                WriteOptions { strict: true },
+            ),
+            Err(WriteError::Unsupported(_))
+        ));
+        let over_dr_ax = Axiom::new(AxiomKind::DataPropertyRange(
+            dp("d"),
+            left_nested_dr(128, union),
+        ));
+        assert!(matches!(
+            manchester::document(
+                &renderer(),
+                &Header::default(),
+                [&over_dr_ax],
+                WriteOptions { strict: true },
+            ),
+            Err(WriteError::Unsupported(_))
+        ));
+
+        // Depth 128 in raw Manchester syntax with left-operand nesting: parser accepts and
+        // writer round-trips losslessly; depth 129 in raw Manchester syntax: parser refuses.
+        let kw = if union { "or" } else { "and" };
+        let mut ce_src_128 = ":A".to_string();
+        let mut dr_src_128 = "xsd:integer".to_string();
+        for i in 0..127 {
+            ce_src_128 = format!("({ce_src_128} {kw} :B{i})");
+            dr_src_128 = format!("({dr_src_128} {kw} :DT{i})");
+        }
+        let ce_src_129 = format!("({ce_src_128} {kw} :B127)");
+        let dr_src_129 = format!("({dr_src_128} {kw} :DT127)");
+
+        let mut ce_prefix = String::from("Prefix: : <http://ex.org/>\nOntology:\nClass: :A\n");
+        for i in 0..128 {
+            ce_prefix.push_str(&format!("Class: :B{i}\n"));
+        }
+        let ce_doc_128 = format!("{ce_prefix}Class: :C\n  SubClassOf: {ce_src_128}\n");
+        let parsed_ce_128 = manchester::parse_document(&ce_doc_128)
+            .unwrap_or_else(|e| panic!("parser must accept depth-128 left-nested class {kw}: {e}"));
+        let (_, rep_ce_128) = manchester::document(
+            &renderer(),
+            &parsed_ce_128.header,
+            parsed_ce_128.axioms.iter(),
+            WriteOptions { strict: true },
+        )
+        .unwrap();
+        assert!(rep_ce_128.is_lossless());
+
+        let ce_doc_129 = format!("{ce_prefix}Class: :C\n  SubClassOf: {ce_src_129}\n");
+        assert!(
+            manchester::parse_document(&ce_doc_129).is_err(),
+            "parser must reject depth-129 left-nested class {kw}"
+        );
+
+        let mut dr_prefix = String::from("Prefix: : <http://ex.org/>\nOntology:\n");
+        for i in 0..128 {
+            dr_prefix.push_str(&format!("Datatype: :DT{i}\n"));
+        }
+        let dr_doc_128 = format!("{dr_prefix}DataProperty: :d\n  Range: {dr_src_128}\n");
+        let parsed_dr_128 = manchester::parse_document(&dr_doc_128)
+            .unwrap_or_else(|e| panic!("parser must accept depth-128 left-nested data {kw}: {e}"));
+        let (_, rep_dr_128) = manchester::document(
+            &renderer(),
+            &parsed_dr_128.header,
+            parsed_dr_128.axioms.iter(),
+            WriteOptions { strict: true },
+        )
+        .unwrap();
+        assert!(rep_dr_128.is_lossless());
+
+        let dr_doc_129 = format!("{dr_prefix}DataProperty: :d\n  Range: {dr_src_129}\n");
+        assert!(
+            manchester::parse_document(&dr_doc_129).is_err(),
+            "parser must reject depth-129 left-nested data {kw}"
+        );
+    }
+}
+
+#[test]
+fn obo_nbsp_iris_header_fields_and_wide_logical_definitions() {
+    // 1. P2.3: Class IRI ending in U+00A0 (NBSP) or containing internal U+00A0 must not
+    // silently trim/split or merge with https://example.org/C.
+    let c_plain = Class::new("https://example.org/C");
+    let c_trailing_nbsp = Class::new("https://example.org/C\u{00A0}");
+    let c_internal_nbsp = Class::new("https://example.org/C\u{00A0}D");
+    let axioms = [
+        Axiom::declaration(Entity::Class(c_plain.clone())),
+        Axiom::declaration(Entity::Class(c_trailing_nbsp.clone())),
+        Axiom::declaration(Entity::Class(c_internal_nbsp.clone())),
+        Axiom::sub_class_of(
+            c_plain.clone(),
+            ClassExpression::some(op("part_of"), c_internal_nbsp.clone()),
+        ),
+    ];
+    assert!(matches!(
+        obo::document(
+            &renderer(),
+            &Header::default(),
+            axioms.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (obo_text, rep) = obo::document(
+        &renderer(),
+        &Header::default(),
+        axioms.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep.skipped_count, 3, "{rep:?}\n{obo_text}");
+    assert_valid_obo_structure(&obo_text);
+    let back = obo::parse(&obo_text).unwrap();
+    assert_eq!(
+        back.axioms,
+        vec![Axiom::declaration(Entity::Class(c_plain))],
+        "{obo_text}"
+    );
+
+    // 2. P2.3: Reserved OBO header IRIs with NBSP (OBO PURL ontology IRI, HTTP version IRI,
+    // and import IRI) must be refused in strict mode and recorded in skipped_header in lenient mode.
+    let mut bad_hdr = Header {
+        iri: Some(iri("http://purl.obolibrary.org/obo/demo\u{00A0}.owl")),
+        version_iri: Some(iri("https://example.org/v1\u{00A0}")),
+        ..Default::default()
+    };
+    bad_hdr
+        .imports
+        .insert(iri("https://example.org/imp\u{00A0}"));
+    assert!(matches!(
+        obo::document(
+            &renderer(),
+            &bad_hdr,
+            std::iter::empty::<&Axiom>(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (hdr_obo, hdr_rep) = obo::document(
+        &renderer(),
+        &bad_hdr,
+        std::iter::empty::<&Axiom>(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(hdr_rep.skipped_header_count, 3, "{hdr_rep:?}\n{hdr_obo}");
+    let hdr_back = obo::parse(&hdr_obo).unwrap();
+    assert!(hdr_back.header.iri.is_none());
+    assert!(hdr_back.header.version_iri.is_none());
+    assert!(hdr_back.header.imports.is_empty());
+
+    // 3. P2.6: Wide logical definitions (5,000 genera) stay linear in both OBO and OBO Graphs
+    // JSON, and wide (>4) definitions with an intra-axiom class/property kind conflict are
+    // still refused in strict mode and skipped cleanly in lenient mode.
+    let mut genera: BTreeSet<ClassExpression> = BTreeSet::new();
+    for i in 0..5_000 {
+        genera.insert(ClassExpression::Class(Class::new(format!(
+            "http://purl.obolibrary.org/obo/GO_{i:07}"
+        ))));
+    }
+    let wide_ax = Axiom::new(AxiomKind::EquivalentClasses(
+        [
+            ClassExpression::Class(Class::new("http://purl.obolibrary.org/obo/GO_9999999")),
+            ClassExpression::ObjectIntersectionOf(genera),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    let (wide_obo, wide_obo_rep) = obo::document(
+        &renderer(),
+        &Header::default(),
+        [&wide_ax],
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(wide_obo_rep.is_lossless());
+    assert!(obo::parse(&wide_obo).unwrap().axioms.contains(&wide_ax));
+    let (wide_json, wide_json_rep) = obographs::document(
+        &renderer(),
+        &Header::default(),
+        [&wide_ax],
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(wide_json_rep.is_lossless());
+    assert!(
+        obographs::parse(&wide_json)
+            .unwrap()
+            .axioms
+            .contains(&wide_ax)
+    );
+
+    // Wide (>4) intra-axiom conflict: GO_0000001 used as both genus class and restriction property.
+    let conflict_members: BTreeSet<ClassExpression> = [
+        ClassExpression::Class(Class::new("http://purl.obolibrary.org/obo/GO_0000001")),
+        ClassExpression::Class(Class::new("http://purl.obolibrary.org/obo/GO_0000002")),
+        ClassExpression::Class(Class::new("http://purl.obolibrary.org/obo/GO_0000003")),
+        ClassExpression::Class(Class::new("http://purl.obolibrary.org/obo/GO_0000004")),
+        ClassExpression::some(
+            ObjectProperty::new("http://purl.obolibrary.org/obo/GO_0000001"),
+            Class::new("http://purl.obolibrary.org/obo/GO_0000005"),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let conflict_ax = Axiom::new(AxiomKind::EquivalentClasses(
+        [
+            ClassExpression::Class(Class::new("http://purl.obolibrary.org/obo/GO_0000010")),
+            ClassExpression::ObjectIntersectionOf(conflict_members),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    assert!(matches!(
+        obo::document(
+            &renderer(),
+            &Header::default(),
+            [&conflict_ax],
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    assert!(matches!(
+        obographs::document(
+            &renderer(),
+            &Header::default(),
+            [&conflict_ax],
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (c_obo, c_obo_rep) = obo::document(
+        &renderer(),
+        &Header::default(),
+        [&conflict_ax],
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(c_obo_rep.skipped_count, 1);
+    assert!(obo::parse(&c_obo).unwrap().axioms.is_empty());
+    let (c_json, c_json_rep) = obographs::document(
+        &renderer(),
+        &Header::default(),
+        [&conflict_ax],
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(c_json_rep.skipped_count, 1);
+    assert!(obographs::parse(&c_json).unwrap().axioms.is_empty());
 }
