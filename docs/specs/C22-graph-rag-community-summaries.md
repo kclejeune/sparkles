@@ -1,11 +1,11 @@
 # C22: Community summaries for global questions (GraphRAG)
 
-> **Status:** implemented in part, Phase 1 and parts of Phases 2 and 3.
+> **Status:** implemented in part, Phases 1 and 3 and parts of Phase 2.
 >
-> **Phases:** Community builds, cited reports, review, global Ask and memory retrieval
-> are available. Automatic refresh uses the change feed and report digests. Maintenance
-> from an F13 accumulator and reports for distinct audiences remain planned. Evaluation limits
-> are recorded separately from implementation status.
+> **Phases:** Community builds, cited reports, review, global Ask, memory retrieval and
+> automatic refresh from an internal F13 accumulator circuit are available. Reports for
+> distinct audiences remain planned under item 100. Evaluation limits are recorded
+> separately from implementation status.
 >
 > **User docs:** [Model settings](../USAGE.md#changing-models-and-keys-at-runtime) and
 > [community reports](../USAGE.md#community-reports-graphrag).
@@ -940,31 +940,55 @@ that are checked exactly, with a labelled heuristic for the prose. §6 now holds
 design of the disclosure footprint and the common read guard. Reports stay unpublished
 until that guard has passed review.
 
-Phase 3 is partly implemented. With `refresh.mode: "auto"`, a loop on the server looks
-at each dataset once a second and follows the debounce of §5. A due dataset reads the
-change feed from the commit of its last build or refresh with the principal's view and
-counts the changed facts of each stored community, the facts being those a report is
-written from. A refresh task starts when a community's count reaches
-`minChangedFraction` of its facts, when an edge joins an entity outside every stored
-community to a member, or when the feed cannot list the changes because a commit is too
-large, the history is gone or the view depends on the data. Tests with stub providers
-cover the debounce, the counting and A4 under automatic refresh.
+Phase 3 is implemented. With `refresh.mode: "auto"`, a loop on the server looks at each
+dataset once a second and follows the debounce of §5. For every enabled dataset with a
+build on `main`, the server attaches an internal F13 accumulator circuit
+(`graphrag-refresh`, F13 §3.6) over the projection's graphs and predicates, read through
+the settings' principal's `InternalAccess` view. Exact graph lists compile to per-graph
+patterns so commits to unrelated graphs are skipped by the circuit's footprint, while
+wildcard patterns filter named graphs and exclude the guarded namespace and any
+non-output evidence graphs under `reviewPolicy`. Because the refresh circuit uses only
+stateless operators, building or resetting it scans no existing quads. The views worker
+advances the accumulator incrementally on each commit, keeps counts bounded by its memory
+cap (64 MiB, or `--views-memory` when lower), and checkpoints its state under
+`<db>/circuits/graphrag-refresh/main/` so restarts recover counted commits and replay any
+offline commits from the change log.
+
+A due dataset waits for the accumulator to reach the head commit, reads its per-key counts
+since the last build or refresh (advancing past contiguous GraphRAG-only commits), and
+totals changed facts per stored community. A refresh task starts when a community's count
+reaches `minChangedFraction` of its facts, when an edge joins an entity outside every
+stored community to a member, or when the accumulator cannot cover every commit (a bulk
+commit, a change-log gap, memory eviction, a circuit failure or data-dependent
+protections on the principal's view). When a build or refresh saves its state on `main`,
+the server discards the acted-on counts through that commit. Switching to manual refresh,
+disabling GraphRAG, deleting a dataset or replacing it on restore detaches the internal
+circuit, and changing settings or reloading access policies replaces it after collecting
+the old handle. Under `reviewPolicy`, uncounted ranges still route to the private check
+of C25 so hidden evidence changes never surface as visible refresh triggers. Tests with
+stub providers cover the debounce, incremental insertions, deletions and replacements
+across multiple communities, entity joining, principal graph and predicate isolation,
+data-dependent fallback, review-policy graph exclusion, checkpoint recovery across
+restarts with and without a change log, memory eviction recovery, and A4 under automatic
+refresh.
 
 These Phase 3 choices refine §5. The refresh that the loop starts is the manual refresh
 of Phase 1, so it compares the digests of every report, re-runs Leiden every time rather
 than above 5% of the edges, and rewrites exactly the reports whose facts changed enough.
-A commit the feed lists with counts only therefore starts that refresh rather than a
-full rebuild, because the digests find the changed communities without rewriting the
-rest. The count starts at the last build or refresh, so changes that stay below the
-fraction in every window add up only when some refresh runs, because a kept report's
-baseline stays until it is rewritten. An edge between two entities that no community
-holds starts no refresh, since such entities form at most a community too small for a
-report. The task needs no confirmation and runs within `tokensPerDay`, the loop never
-starts a first build or works on a branch, and a run that left pending communities is
-retried once a day without a new commit. Only commits of other kinds than GraphRAG's own
-count as activity, so a refresh never follows its own commit. A failed check or
-refresh is retried after a backoff of two to 64 debounce periods, and one admission lock
-lets only one GraphRAG task of a dataset be listed at a time. Counting with an accumulator on an internal F13 circuit waits for roadmap items 413 and 414.
+An uncounted range therefore starts that refresh rather than a full rebuild, because the
+digests find the changed communities without rewriting the rest. The count starts at the
+last build or refresh, so changes that stay below the fraction in every window add up
+until a refresh runs, because a kept report's baseline stays until it is rewritten. An
+edge between two entities that no community holds starts no refresh, since such entities
+form at most a community too small for a report. A principal view with data-dependent
+protections detaches the circuit rather than running a full-dataset recompute pass on
+every commit, and falls back to digest comparison or the C25 private check. The task needs
+no confirmation and runs within `tokensPerDay`, the loop never starts a first build or
+works on a branch, and a run that left pending communities is retried once a day without
+a new commit. Only commits of other kinds than GraphRAG's own count as activity, so a
+refresh never follows its own commit. A failed check or refresh is retried after a
+backoff of two to 64 debounce periods, and one admission lock lets only one GraphRAG task
+of a dataset be listed at a time.
 
 The Explore overview of U06 is a reader of the reports since 2026-10-23. Its
 `by: {reports}` grouping draws the communities of a level with their titles, statuses

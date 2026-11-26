@@ -147,8 +147,7 @@ phase retains its spec's correctness, conformance, durability and resource gates
 ### Wave B: memory and entities
 
 Wave B starts with item 81 Phase 3, then items 341 and 396 and the remaining C18
-work. Item 12 can move its refresh onto an internal circuit now, and item 18 Phase 3
-builds on the reasoner witnesses of item 416. The MCP tools of item 462 also belong to Wave B, starting with the `ask` MCP tool in item 488.
+work. Item 18 Phase 3 builds on the reasoner witnesses of item 416. The MCP tools of item 462 also belong to Wave B, starting with the `ask` MCP tool in item 488.
 
 ### Wave C: ontology and data platform
 
@@ -307,7 +306,7 @@ not to every extension in a spec or to phases that have already shipped.
 | Track | Open items | Specs |
 |---|---|---|
 | **Performance** | 1 refreshes the evidence while 7 addresses its remaining gates. 560 and 561 correct the quota's count of preallocated space. Write-path work goes before item 421. | X06, X08 Phase 2, X09 Phase 4, X07 |
-| **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh can use the internal circuits of F13. | F14, C22, F13 |
+| **Graph features** | 8 closes algorithm surfaces and acceptance. | F14, C22, F13 |
 | **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 reads the reasoner witnesses of 416, and item 19 Phase 3 can build on item 417's fixed-point operator, while existing explanations remain available. Item 456 completes the reasoner core through items 836, 837, 839 and 958. | F16, F17, F13, F18, F23 |
 | **Engine architecture** | 453 unifies the executors behind the gates of 469 to 473, continuing through items 829 and 534 before the merge. Item 454 follows the executor merge, and 455 continues through items 830 and 833 after 14. | X14, X15, X16, X17, X05 |
 | **Ontology and data platform** | Built on item 71's axiom model and the policy plumbing of items 480 to 483, items 457 to 461 continue the ontology workbench, resource catalog, checks and protected merges, git sync and linked-data publishing. | F21, F24, U12, C30, X18, C31, F25, C32 |
@@ -367,8 +366,7 @@ flowchart LR
     D --> S["66 · Synchronous replication and fenced failover"]
 ```
 
-Item 226 comes before item 12 moves its refresh onto an internal circuit, because every
-commit copies its changes into the change ring while an internal circuit is attached. Item 223 comes before item 427, and item 222 comes before
+Item 226 measures and reduces the commit-path cost of the change ring while circuits are attached. Item 223 comes before item 427, and item 222 comes before
 items 424 and 426. The other item 17 parts in Stage B and Stage C are listed in the
 [table of its parts](#parts-of-item-17).
 
@@ -406,7 +404,7 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [C25](specs/C25-evidence-and-assessments.md#outcome) | 81, 395 | Close the remaining Phase 3 follow-ups (declared settings, binding handles, cross-dataset holds, existing-record selectors, projection and map rebuilds, support-aware projection visibility, claim proposition indexing, CLI policies and report dependents) and integrate maintained analyses under item 340, retaining exact identity, authorization, retry and crash acceptance. |
 | [C27](specs/C27-valid-time-profiles.md#outcome) | 341 | Add the temporal projection helper, event-time controls and expiry integration with interval, visibility and recovery acceptance. |
 | [C21](specs/C21-outbound-notifications.md#outcome) | 785 | Add schema bounds and the last two events (`repository.refresh.failed` and `backup.overdue` for a new policy whose scheduled runs never start). Delivery tests retain the retry, outbound, secret, disabled-channel, independent-channel and backup-failure guarantees. |
-| [C22](specs/C22-graph-rag-community-summaries.md#outcome) | 12, 100, 260, 261, 262, 264 | Add refresh counting with an accumulator on an internal F13 circuit, finish person-checked and broader-corpus evaluation, and validate global-question routing and schema-order decisions. Multiple report configurations follow C22b under 100, retaining shared spending and disclosure controls. |
+| [C22](specs/C22-graph-rag-community-summaries.md#outcome) | 100, 260, 261, 262, 264 | Finish person-checked and broader-corpus evaluation, and validate global-question routing and schema-order decisions. Multiple report configurations follow C22b under 100, retaining shared spending and disclosure controls. |
 | [F03](specs/F03-full-text-search/SPEC.md#outcome) | 23, 35, 50, 250, 251 | Complete online changes, uncommitted and historical search, multi-field documents and the named analyzer parity gaps. Verify tokens against the adopted Lucene references and preserve restricted-view scoring and query correctness across rebuilds and pins. |
 | [F04](specs/F04-vector-search.md#outcome) | 34, 82 | Deliver the chosen quantization modes, result caching and statistics. Measure catch-up, worker sizing and binary16 recall on all named distance distributions, and verify cancellation, version invalidation and memory ownership. |
 | [F05](specs/F05-snapshot-repositories/SPEC.md#outcome) | 61, 65, 401 | Restore whole-server and multi-dataset runs with consistent, versioned definitions and paused external work. Complete repository transfer, chunking adoption, optional retained-history capture and storage-retention controls, proving restored retained commits and preserving older backup readers. |
@@ -547,17 +545,15 @@ continues within its caller-visible evidence and measured-latency scope.
 | 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress and the remaining binding and JVM surfaces for the existing algorithms remain. New algorithms belong to item 463. The C23 writer is item 36 and openCypher procedures are item 20. JVM statistics inside a transaction use a binding copy of the library's statistics code, while Node.js and Python statistics read only the head, so a library method that takes the snapshot should give the bindings one implementation. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
 | 9 | **Materialization at scale.** Phase 1 materialization is available. The separate derived-fact layer of Phase 2, `owl:sameAs` representatives of Phase 3 and eligible execution without iteration barriers and equality maintenance in Phase 4 remain. Representatives would also let derivation on demand read equality without the `eq-rep-*` rules. Today a demand on a small view where `owl:sameAs` relates classes and properties can take much longer than materializing the whole view. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
 | 456 | **Reasoning engine.** Materialization and query-time reasoning close transitive relations with closure operators and run the OWL 2 RL rules of the Profiles tables, rule bodies of three or more atoms use sampled-binding planning, and derived facts live in a columnar tier at about 52 bytes each with the triple index. Incremental updates still evaluate transitive relations as joins, and the reasoner's maintenance is separate from the incremental core of F13. The [plan](specs/F23-reasoner-core/PLAN.md) orders the rest, with the derivation records of item 836 and the shared maintenance core of item 837 first, and the remaining n-ary core of item 839 and maintained SHACL rules of item 958 after them. | [F23](specs/F23-reasoner-core/README.md) | XL | High |
-| 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes with an accumulator on an internal F13 circuit, which F13 provides, remains planned. Item 226 measures the change ring's cost first. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
 | 14 | **Compaction and operation progress.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain. Shared controlled load and compaction progress must also reach the Node callbacks without weakening cancellation or memory budgets. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#operation-progress) | M | Medium–high |
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 
 ### Parts of item 17
 
-Stage A makes the incremental core safe and supplies what items 12, 18 and 19 need.
-Items 12, 18 Phase 3 and 19 Phase 3 do not need all of Phase 2 and Phase 3. Item 18
+Stage A makes the incremental core safe and supplies what items 18 and 19 need.
+Items 18 Phase 3 and 19 Phase 3 do not need all of Phase 2 and Phase 3. Item 18
 Phase 3 reads the witnesses of item 416, and item 19 Phase 3 builds on the fixed-point
-operator of item 417. Item 12
-uses the internal circuits that are already available. Stage B delivers the rest of Phase 2. Stage C delivers view
+operator of item 417. Stage B delivers the rest of Phase 2. Stage C delivers view
 provenance. The F13 spec records the design decisions that the parts follow. Items that
 affect the write path measure with the `--views none|async:N|commit:Q|graph:N` option of
 the write screen, which item 1134 qualifies on Boat or a local host.
@@ -949,7 +945,7 @@ spec sections.
 | 223 | **Parallel view passes.** Each dataset runs its view passes on one worker thread, which falls behind a fast writer with 100 views. `--view-threads`, a shared worker pool and joins whose large deltas split across threads are not built. Item 223 comes before item 427. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
 | 430 | **Streaming view reads.** `ViewRows` and the snapshot events of live queries decode the whole result before they return it. Stream the rows in bounded chunks, so that reading a large view or opening a large live query does not hold the whole result in memory. | [F13](specs/F13-incremental-views-and-provenance.md#22-reading-a-view), [X05](specs/X05-streaming-query-execution.md#outcome) | M |
 | 225 | **The F13 benchmarks.** The SNB update streams with live short reads and views, BSBM's mix with views and the fan-out test of 1,000 subscribers are not built. A grouped COUNT's pass is only 15 to 35 times cheaper than the query on synthetic data, short of the 100 times target. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
-| 226 | **The cost of the change ring on commits.** While a view or live query is subscribed, each commit copies its changes into a ring, which adds about 4% to a two-quad commit on atlas. It needs a pinned forge measurement and a cheaper copy. An internal circuit keeps the ring filled on every commit, so item 226 comes before item 12 attaches one to every dataset with automatic refresh. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
+| 226 | **The cost of the change ring on commits.** While a view, live query or internal circuit is subscribed, each commit copies its changes into a ring, which adds about 4% to a two-quad commit on atlas. It needs a pinned forge measurement and a cheaper copy. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
 | 506 | **Small screen differences after the internal circuits.** In Namespace screens, the internal circuits build ran `two-hop-count` 4.8% slower over 12 interleaved rounds than the build before them. The `writers` scenario ran 0.8% fewer transactions per second without views and 2.2% fewer with four table views, though the change touches neither the query path nor the commit path. Pin both on forge and bisect what holds. | [F13](specs/F13-incremental-views-and-provenance.md#internal-circuits) | S |
 | 507 | **View checkpoints across the union default graph setting.** A view checkpoint's fingerprint does not cover `union_default_graph`, so a dataset reopened with the other setting can load a view state that reads other quads. Internal circuits cover it. Adding it to the view fingerprint builds such views again once. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
 | 528 | **Witnesses through recompute nodes, correlated EXISTS and template blank nodes.** Rows of a `recompute` node, rows a correlated `EXISTS` keeps and triples of a CONSTRUCT template with blank nodes carry provenance with unknown atoms, so they report `truncated` with no witnesses. Evaluating such a subtree with annotations, or splitting a solution's derivations across its occurrences, would give them witnesses. A correlated `EXISTS` could keep its input rows' annotations and add the condition as an unknown factor. | [F13](specs/F13-incremental-views-and-provenance.md#provenance-annotations) | M |
@@ -1569,6 +1565,7 @@ linked spec Outcome records how they landed.
 - **1121.** Immutable shared view versions with frozen term tables and a native streaming `ViewRead` cursor over current, stale, history-rewound and rebuilt reads. [X14 Outcome](specs/X14-unified-executor/SPEC.md#streamed-service-text-and-history-readers)
 - **542.** Live snapshots and persistent history-cache hits charge a 4 KiB delta handle in bounded history reads and evidence resolution. In-memory historical snapshots and private replays charge by delta size. Release resolution checks cover 10⁴ to 10⁵ delta quads. [C25](specs/C25-evidence-and-assessments.md#resolution-decisions), [C29](specs/C29-bounded-view-preparation/SPEC.md#outcome)
 - **714.** Extended `Limits::partial` and `ClassifyRequest::partial` to the EL (`Plain`, `Full`) and Horn (`Horn`, `HornFull`) tiers across Phase 1 saturation, Phase 2 marking and key merges, and Phase 3 conditional worlds, backed by a unified pre-admitted flat-CSR dependency recorder, `State::interrupted` tracking on stopped partial activations, and non-taxonomy teardown that preserves the requested tier under tight memory caps. [F24](specs/F24-owl-classification/SPEC.md#outcome)
+- **12.** GraphRAG automatic refresh now maintains per-community changed-fact counts and entity-join detection incrementally through a bounded internal F13 accumulator circuit (`graphrag-refresh`) with stateless builds, principal visibility and review-policy isolation, checkpoint recovery across restarts, and clean detachment on disable, delete or restore. [C22](specs/C22-graph-rag-community-summaries.md#outcome)
 
 ## Keeping this current
 
