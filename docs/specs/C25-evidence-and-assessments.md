@@ -1156,9 +1156,10 @@ conformance of the written records to the shapes, and the HTTP routes.
 7. **Bindings and MCP.** The routes are HTTP, OpenAPI and Rust only. MCP waits for Phase 3
    and the bindings for roadmap item 509.
 8. **Output visibility.** A review checks the reviewer's access, and the output graph is
-   read under each reader's grants. The administrator must give the output's readers
-   the policy's boundary. Roadmap item 582 tracks support-aware visibility of
-   projections with F18.
+   read under each reader's grants. Support-aware visibility of accepted projections
+   (roadmap item 582) restricts readers of a policy's output graph to triples backed by at
+   least one live, authenticated acceptance support they can read; see
+   [Support-aware visibility of accepted projections](#support-aware-visibility-of-accepted-projections).
 9. **Bounds.** One review reads at most 10,000 evidence records, and one triple's
    supports, one target's decisions and one decision's successors are each read up to
    10,000 records, beyond which the operation answers `incomplete-evidence`.
@@ -2345,6 +2346,52 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+### Support-aware visibility of accepted projections
+
+Roadmap item 582 adds support-aware visibility for review-policy accepted projections using
+the triple-masking machinery of C12b §8 and F18 §7.1. When a dataset has enabled evidence
+settings with at least one review policy and a reader does not have unrestricted read
+access to the dataset, preparing a snapshot view filters each readable policy output graph
+so that a projected triple is visible only when at least one live, authenticated
+`ev:AcceptanceSupport` for that triple is completely readable under the caller's grants
+and triple protections.
+
+A support counts as readable and live when every part of its justification is authenticated
+under the current graph protections and visible to the caller. That check requires read
+access to the policy's decisions and supports graphs, an authenticating `ev:Projection`
+record whose stored protection nonces match the current protections of the decisions,
+supports and output graphs, an authenticated `ev:AcceptanceSupport` and `ev:ReviewDecision`
+that are neither masked by triple rules nor superseded by an authenticated decision, an
+authenticated `ev:Claim` in a configured proposal graph that is readable, unmasked across
+its record sub-nodes and not withdrawn in any configured proposal graph, a readable
+authenticated `ev:SourceRevision` when the claim cites one, and every authenticated
+`ev:Supports` link targeting the claim in the policy boundary or the claim's graph together
+with its `ev:EvidenceRef`, referenced source records and stored-fact target. A missing
+projection record, a changed protection nonce, an unreadable policy metadata graph, a
+cross-dataset or non-reproducible stored-fact reference, or a support scan past the 10,000
+record cap fails closed by hiding the affected projected triples without surfacing hidden
+evidence or errors.
+
+Because the filter joins `Snapshot::mask` in both the legacy and controlled masking paths
+and folds a deterministic fingerprint of the active evidence configuration and protection
+nonces into the mask cache key, SPARQL queries, Graph Store reads, Recall, Ask, GraphRAG
+and MCP tools enforce the same visibility boundary and reuse cached masks safely across
+commits and configuration changes. Live snapshots resolve the active configuration from the
+store's shared managed state with a single atomic load when no review policies exist.
+Historical reads through `snapshot_at`, `branch_snapshot_at`, `snapshot_pinned` and
+`BoundEvidenceView` pin the historical configuration generation and its recorded
+protection nonces when configuration history is active, while enforcing the caller's
+current grants and triple protections. Mask preparation charges every lookup, scan and
+temporary buffer to `Preparation` and enforces `MaskLimits::max_hidden`.
+
+Unit, library and HTTP router tests cover readers with one live support, readers with
+output or policy metadata grants alone, withdrawal of one of multiple supports,
+re-acceptance, superseding decisions, `ev:Supports` links to unreadable stored facts and
+passages, triple-protection masking of underlying claims, historical snapshot and branch
+reads, detached projections failing closed while historical snapshots retain their pinned
+configuration, bounded preparation memory refusal, and end-to-end SPARQL, Graph Store,
+Recall and Ask queries.
 
 ### Scope changes
 

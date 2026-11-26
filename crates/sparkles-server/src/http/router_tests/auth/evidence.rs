@@ -837,3 +837,518 @@ async fn evidence_settings_reads_use_admin_middleware() {
         }
     }
 }
+
+// -------------------------------------------------- support-aware projection visibility --
+
+#[tokio::test(flavor = "multi_thread")]
+async fn projected_triples_enforce_support_visibility_across_sparql_gsp_recall_and_ask() {
+    use crate::models::mock::{self, MockModel};
+    use crate::models::{Models, ModelsConfig};
+    use oxrdf::{NamedNode, Triple};
+    use sparkles::evidence::{
+        self, ClaimInput, ClaimKind, ConflictMode, DecisionInput, Disposition, EvidenceInput,
+        Polarity, Policy, ProposeOptions, RecordKey, RecordRef, RecordVersion, ReviewOptions,
+        Settings, Sha256Digest, SourceContent, SourceRevisionInput, WithdrawalInput,
+    };
+    use sparkles::task::Control;
+
+    const SOURCES_A: &str = "urn:ev:sources-a";
+    const SOURCES_B: &str = "urn:ev:sources-b";
+    const CLAIMS_A: &str = "urn:ev:claims-a";
+    const CLAIMS_B: &str = "urn:ev:claims-b";
+    const DECISIONS: &str = "urn:ev:decisions";
+    const SUPPORTS: &str = "urn:ev:supports";
+    const ACCEPTED: &str = "urn:ev:accepted";
+    const PUBLIC: &str = "urn:ev:public";
+
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[users]]
+name = "ra"
+password = "{ra}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{PUBLIC}", "{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"]
+
+[[users]]
+name = "rb"
+password = "{rb}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{PUBLIC}", "{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_B}", "{SOURCES_B}"]
+
+[[users]]
+name = "rmeta"
+password = "{rmeta}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{PUBLIC}", "{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}"]
+
+[[users]]
+name = "rout"
+password = "{rout}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{PUBLIC}", "{ACCEPTED}"]
+
+[[users]]
+name = "rall"
+password = "{rall}"
+datasets = {{ ev = "read" }}
+"#,
+            ra = h("ra-pw"),
+            rb = h("rb-pw"),
+            rmeta = h("rmeta-pw"),
+            rout = h("rout-pw"),
+            rall = h("rall-pw"),
+        ),
+        ..Default::default()
+    });
+
+    // Wire a mock model so we can verify POST /ev/ask as well.
+    let mock_model = MockModel::start(|req, _| {
+        let body = req.body.to_string();
+        if body.contains("summarize") || body.contains("Question:") {
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "text": "Checked the release status.",
+                        "citations": [],
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        (
+            200,
+            mock::openai(
+                &serde_json::json!({
+                    "sparql": format!(
+                        "SELECT ?cve WHERE {{ GRAPH <{ACCEPTED}> {{ <urn:release> <urn:affectedBy> ?cve }} }}"
+                    ),
+                    "reason": "check release vulnerabilities"
+                })
+                .to_string(),
+            ),
+        )
+    });
+    let pair = serde_json::json!({ "provider": "p", "model": "m" });
+    let cfg = serde_json::json!({
+        "providers": {
+            "p": {
+                "kind": "openai",
+                "endpoint": mock_model.url(),
+                "requestTimeoutSecs": 5,
+                "allowedModels": ["m"]
+            }
+        },
+        "roles": { "draft": [pair], "summarize": [pair] },
+    });
+    let models = Models::new(
+        ModelsConfig::parse(&cfg.to_string()).unwrap(),
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+    );
+    s.state.models.store(Some(Arc::new(models)));
+
+    let ds = s.state.attach("ev", DbType::Memory, None).unwrap();
+    ds.store
+        .set_retention(sparkles::history::Retention {
+            keep_commits: Some(64),
+            ..Default::default()
+        })
+        .unwrap();
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.dataset
+        .store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    let settings = Settings {
+        enabled: true,
+        source_records: vec![SOURCES_A.into(), SOURCES_B.into()],
+        proposals: vec![CLAIMS_A.into(), CLAIMS_B.into()],
+        decisions: vec![DECISIONS.into()],
+        supports: vec![SUPPORTS.into()],
+        projections: vec![ACCEPTED.into()],
+        policies: [(
+            "main".into(),
+            Policy {
+                version: 1,
+                admitted_kinds: vec![ClaimKind::Reported],
+                required_scope: vec![],
+                conflicts: ConflictMode::AdmitLabelled,
+                boundary: vec![
+                    SOURCES_A.into(),
+                    SOURCES_B.into(),
+                    CLAIMS_A.into(),
+                    CLAIMS_B.into(),
+                ],
+                decisions: DECISIONS.into(),
+                supports: SUPPORTS.into(),
+                output: ACCEPTED.into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    evidence::configure(&ds.dataset, &settings, &Control::none()).unwrap();
+    // Add an ordinary public triple and property declaration so Recall/Ask always have a
+    // readable entity anchor and known predicate without disclosing hidden projections.
+    ds.dataset
+        .update(&format!(
+            "INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:release> <http://www.w3.org/2000/01/rdf-schema#label> \"Release 1\" . <urn:affectedBy> a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> }} }}"
+        ))
+        .unwrap();
+    // Enable assistant on `ev` as server admin `alice`.
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/assistant/ev",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({ "enabled": true, "send": "rows" }).to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    let iri = |u: &str| NamedNode::new(u).unwrap();
+    let all = || Some(Arc::new(sparkles::access::GraphAccess::all()));
+    let propose_claim = |src_g: &str, clm_g: &str, src_k: &str, occ: &str, cve: &str| {
+        let input = EvidenceInput {
+            revisions: vec![SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: RecordKey::new("rev").unwrap(),
+                source: iri(&format!("urn:source:{src_k}")),
+                source_key: RecordKey::new(src_k).unwrap(),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly {
+                    digest: Sha256Digest::of_bytes(src_k.as_bytes(), &Control::none()).unwrap(),
+                },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+            }],
+            claims: vec![ClaimInput {
+                version: RecordVersion::V1,
+                key: RecordKey::new("claim").unwrap(),
+                occurrence_key: RecordKey::new(occ).unwrap(),
+                revision: RecordRef::Local(RecordKey::new("rev").unwrap()),
+                proposition: Triple::new(iri("urn:release"), iri("urn:affectedBy"), iri(cve)),
+                kind: ClaimKind::Reported,
+                polarity: Polarity::Positive,
+                attributed_author: iri("urn:publisher"),
+                scope: Default::default(),
+                confidence: Default::default(),
+                validity: None,
+            }],
+            ..Default::default()
+        };
+        let mut o = ProposeOptions::new(iri("urn:principal:importer"));
+        o.source_graph = Some(iri(src_g));
+        o.proposal_graph = Some(iri(clm_g));
+        let p = evidence::propose(
+            None,
+            &ds.dataset,
+            &ds.dataset,
+            &input,
+            &o,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let rec = p.records.iter().find(|r| r.key == "claim").unwrap();
+        (rec.iri.clone(), rec.digest)
+    };
+    let accept_claim = |c: &(NamedNode, Sha256Digest)| {
+        let mut ro = ReviewOptions::new(iri("urn:principal:reviewer"));
+        ro.if_head = Some(ds.store.head_commit().seq);
+        evidence::review(
+            None,
+            &ds.dataset,
+            &ds.dataset,
+            "main",
+            1,
+            &[DecisionInput {
+                key: "d".into(),
+                target: c.0.clone(),
+                target_digest: c.1,
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            }],
+            &ro,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+    };
+
+    // Both Claim A and Claim B support cve-1; only Claim B2 supports cve-2.
+    let ca = propose_claim(SOURCES_A, CLAIMS_A, "src-a", "a1", "urn:cve-1");
+    let cb = propose_claim(SOURCES_B, CLAIMS_B, "src-b", "b1", "urn:cve-1");
+    let cb2 = propose_claim(SOURCES_B, CLAIMS_B, "src-b2", "b2", "urn:cve-2");
+    accept_claim(&ca);
+    accept_claim(&cb);
+    accept_claim(&cb2);
+    let commit_before_withdraw = ds.store.head_commit().seq;
+
+    let sparql_objects = |user: &'static str, at: Option<u64>| {
+        let app = s.app.clone();
+        async move {
+            let path = match at {
+                Some(seq) => format!("/ev/sparql?at=commit:{seq}"),
+                None => "/ev/sparql".to_string(),
+            };
+            let q = format!(
+                "SELECT ?o WHERE {{ GRAPH <{ACCEPTED}> {{ <urn:release> <urn:affectedBy> ?o }} }} ORDER BY ?o"
+            );
+            let r = call(
+                &app,
+                "POST",
+                &path,
+                &[
+                    ("authorization", &b(user)),
+                    ("content-type", "application/sparql-query"),
+                    ("accept", "application/sparql-results+json"),
+                ],
+                &q,
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            r.json()["results"]["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["o"]["value"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let gsp_get = |user: &'static str| {
+        let app = s.app.clone();
+        async move {
+            call(
+                &app,
+                "GET",
+                &format!("/ev/data?graph={ACCEPTED}"),
+                &[
+                    ("authorization", &b(user)),
+                    ("accept", "application/n-triples"),
+                ],
+                "",
+            )
+            .await
+        }
+    };
+
+    let recall_accepted_objects = |user: &'static str, policy: Option<&'static str>| {
+        let app = s.app.clone();
+        async move {
+            let mut body = serde_json::json!({
+                "seeds": ["urn:release"],
+                "format": "json"
+            });
+            if let Some(p) = policy {
+                body["reviewPolicy"] = serde_json::json!(p);
+            }
+            let r = call(
+                &app,
+                "POST",
+                "/ev/recall",
+                &[
+                    ("authorization", &b(user)),
+                    ("content-type", "application/json"),
+                ],
+                &body.to_string(),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            let v = r.json();
+            let mut objs = Vec::new();
+            for e in v["entities"].as_array().unwrap() {
+                for f in e["facts"].as_array().unwrap() {
+                    if f["p"].as_str().unwrap().contains("affectedBy") {
+                        objs.push(f["o"].as_str().unwrap().to_string());
+                    }
+                }
+            }
+            objs.sort();
+            (objs, v)
+        }
+    };
+
+    // 1. SPARQL before withdrawal
+    assert_eq!(sparql_objects("ra", None).await, vec!["urn:cve-1"]);
+    assert_eq!(
+        sparql_objects("rb", None).await,
+        vec!["urn:cve-1", "urn:cve-2"]
+    );
+    assert!(sparql_objects("rmeta", None).await.is_empty());
+    assert!(sparql_objects("rout", None).await.is_empty());
+    assert_eq!(
+        sparql_objects("rall", None).await,
+        vec!["urn:cve-1", "urn:cve-2"]
+    );
+
+    // 2. Graph Store GET before withdrawal (non-disclosing 404 for readers with no readable support)
+    let r = gsp_get("ra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("urn:cve-1") && !r.text().contains("urn:cve-2"));
+    let r = gsp_get("rb").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("urn:cve-1") && r.text().contains("urn:cve-2"));
+    assert_eq!(gsp_get("rmeta").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(gsp_get("rout").await.status, StatusCode::NOT_FOUND);
+
+    // 3. Recall (without and with reviewPolicy) before withdrawal
+    assert_eq!(
+        recall_accepted_objects("ra", None).await.0,
+        vec!["<urn:cve-1>"]
+    );
+    assert_eq!(
+        recall_accepted_objects("rb", None).await.0,
+        vec!["<urn:cve-1>", "<urn:cve-2>"]
+    );
+    assert!(recall_accepted_objects("rmeta", None).await.0.is_empty());
+    assert!(recall_accepted_objects("rout", None).await.0.is_empty());
+
+    let (ra_pol_objs, ra_pol_json) = recall_accepted_objects("ra", Some("main")).await;
+    assert_eq!(ra_pol_objs, vec!["<urn:cve-1>"]);
+    assert_eq!(
+        ra_pol_json["claims"]["occurrences"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (rmeta_pol_objs, rmeta_pol_json) = recall_accepted_objects("rmeta", Some("main")).await;
+    assert!(rmeta_pol_objs.is_empty());
+    assert!(
+        rmeta_pol_json["claims"]["occurrences"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // 4. Ask before withdrawal: ra gets cve-1, rmeta gets 0 rows and no leaked cve in model prompt.
+    let ask_req = |user: &'static str| {
+        let app = s.app.clone();
+        async move {
+            let r = call(
+                &app,
+                "POST",
+                "/ev/ask",
+                &[
+                    ("authorization", &b(user)),
+                    ("content-type", "application/json"),
+                    ("accept", "application/json"),
+                ],
+                &serde_json::json!({
+                    "question": "Which CVEs affect Release 1?",
+                    "query": format!(
+                        "SELECT ?cve WHERE {{ GRAPH <{ACCEPTED}> {{ <urn:release> <urn:affectedBy> ?cve }} }} ORDER BY ?cve"
+                    )
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            r.json()
+        }
+    };
+    let ask_ra = ask_req("ra").await;
+    assert_eq!(ask_ra["outcome"], "answered", "{ask_ra}");
+    let ra_res_str = ask_ra["result"]["results"].to_string();
+    assert!(
+        ra_res_str.contains("urn:cve-1") && !ra_res_str.contains("urn:cve-2"),
+        "{ask_ra}"
+    );
+    let before_rmeta_reqs = mock_model.requests().len();
+    let ask_rmeta = ask_req("rmeta").await;
+    assert_eq!(ask_rmeta["outcome"], "empty", "{ask_rmeta}");
+    assert!(
+        !ask_rmeta.to_string().contains("cve-1") && !ask_rmeta.to_string().contains("cve-2"),
+        "{ask_rmeta}"
+    );
+    for req in &mock_model.requests()[before_rmeta_reqs..] {
+        let txt = req.body.to_string();
+        assert!(!txt.contains("cve-1") && !txt.contains("cve-2"), "{txt}");
+    }
+
+    // 5. Withdraw Claim A: cve-1 remains projected via Claim B, so ra loses visibility across
+    //    SPARQL, GSP, Recall and Ask while rb keeps both triples.
+    evidence::withdraw(
+        &ds.dataset,
+        &ds.dataset,
+        &[WithdrawalInput {
+            key: "w".into(),
+            target: ca.0.clone(),
+            target_digest: ca.1,
+        }],
+        &ReviewOptions::new(iri("urn:principal:reviewer")),
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+
+    assert!(sparql_objects("ra", None).await.is_empty());
+    assert_eq!(
+        sparql_objects("rb", None).await,
+        vec!["urn:cve-1", "urn:cve-2"]
+    );
+    assert_eq!(gsp_get("ra").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(gsp_get("rb").await.status, StatusCode::OK);
+    assert!(recall_accepted_objects("ra", None).await.0.is_empty());
+    assert!(
+        recall_accepted_objects("ra", Some("main"))
+            .await
+            .0
+            .is_empty()
+    );
+    assert_eq!(
+        recall_accepted_objects("rb", None).await.0,
+        vec!["<urn:cve-1>", "<urn:cve-2>"]
+    );
+    let before_ra_after_withdraw = mock_model.requests().len();
+    let ask_ra_after = ask_req("ra").await;
+    assert_eq!(ask_ra_after["outcome"], "empty", "{ask_ra_after}");
+    assert!(
+        !ask_ra_after.to_string().contains("cve-1") && !ask_ra_after.to_string().contains("cve-2"),
+        "{ask_ra_after}"
+    );
+    for req in &mock_model.requests()[before_ra_after_withdraw..] {
+        let txt = req.body.to_string();
+        assert!(!txt.contains("cve-1") && !txt.contains("cve-2"), "{txt}");
+    }
+    let ask_rb_after = ask_req("rb").await;
+    assert_eq!(ask_rb_after["outcome"], "answered", "{ask_rb_after}");
+    let rb_res_str = ask_rb_after["result"]["results"].to_string();
+    assert!(
+        rb_res_str.contains("urn:cve-1") && rb_res_str.contains("urn:cve-2"),
+        "{ask_rb_after}"
+    );
+
+    // 6. Historical SPARQL at the commit before withdrawal still shows cve-1 to ra
+    //    and hides it from rmeta.
+    assert_eq!(
+        sparql_objects("ra", Some(commit_before_withdraw)).await,
+        vec!["urn:cve-1"]
+    );
+    assert!(
+        sparql_objects("rmeta", Some(commit_before_withdraw))
+            .await
+            .is_empty()
+    );
+}
