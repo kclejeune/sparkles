@@ -8217,7 +8217,7 @@ pub(super) trait ScratchAdmit {
     }
 }
 
-struct DirectScratch;
+pub(super) struct DirectScratch;
 
 impl ScratchAdmit for DirectScratch {}
 
@@ -8994,8 +8994,24 @@ impl AggState {
                         }
                     }
                 };
+                let intern_scratch = if scratch.is_none() {
+                    match v.as_ref() {
+                        Some(Value::BigInteger(i)) => Some(scratch_admit.charge_scratch(
+                            ctx,
+                            super::bignum::intern_scratch_bytes(i.lexical_len()),
+                        )?),
+                        Some(Value::BigDecimal(d)) => Some(scratch_admit.charge_scratch(
+                            ctx,
+                            super::bignum::intern_scratch_bytes(d.lexical_len()),
+                        )?),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let id = v.as_ref().map_or(Id::UNDEF, |v| ctx.intern_value(v));
                 drop(v);
+                drop(intern_scratch);
                 drop(scratch);
                 Ok(id)
             }

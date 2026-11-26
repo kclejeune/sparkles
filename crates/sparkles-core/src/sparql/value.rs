@@ -452,9 +452,9 @@ impl Value {
             }
             Value::Bool(b) => typed(b.to_string(), xsd::BOOLEAN.into()),
             Value::Integer(i) => typed(i.to_string(), xsd::INTEGER.into()),
-            Value::BigInteger(i) => typed(i.to_string(), xsd::INTEGER.into()),
+            Value::BigInteger(i) => typed(i.0.to_lexical_string(), xsd::INTEGER.into()),
             Value::Decimal(d) => typed(d.to_string(), xsd::DECIMAL.into()),
-            Value::BigDecimal(d) => typed(d.to_string(), xsd::DECIMAL.into()),
+            Value::BigDecimal(d) => typed(d.0.to_lexical_string(), xsd::DECIMAL.into()),
             Value::Float(f) => typed(f.to_string(), xsd::FLOAT.into()),
             Value::Double(d) => typed(d.to_string(), xsd::DOUBLE.into()),
             Value::DateTime(d) => typed(d.to_string(), xsd::DATE_TIME.into()),

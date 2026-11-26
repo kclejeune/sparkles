@@ -246,12 +246,6 @@ impl GroupMemory {
     }
 }
 
-impl ScratchAdmit for GroupMemory {
-    fn charge_scratch<'a>(&mut self, ctx: &'a Ctx, bytes: u64) -> Result<Charge<'a>> {
-        GroupMemory::charge_scratch(self, ctx, bytes)
-    }
-}
-
 /// Access to the pass's memory and deferred arguments during a batch fold.
 pub(crate) enum BatchBudget<'a> {
     #[cfg(test)]
@@ -752,6 +746,7 @@ impl Grouping {
             deferred.seal()?;
             self.spilled += deferred.take_written();
         }
+        self.memory.trim()?;
         Ok(())
     }
 
@@ -763,6 +758,20 @@ impl Grouping {
         vars: &[VarId],
         cap: usize,
     ) -> Result<Option<Table>> {
+        let mut scratch = crate::sparql::exec::DirectScratch;
+        self.output_with_scratch(ctx, vars, cap, &mut scratch)
+    }
+
+    pub(crate) fn output_with_scratch(
+        &mut self,
+        ctx: &Ctx,
+        vars: &[VarId],
+        cap: usize,
+        scratch: &mut dyn ScratchAdmit,
+    ) -> Result<Option<Table>> {
+        // Release speculative group-growth headroom before finalizing results,
+        // reading deferred spill frames, or interning output terms.
+        self.memory.trim()?;
         let n = cap.min(self.groups - self.at);
         if n == 0 {
             return Ok(None);
@@ -776,14 +785,11 @@ impl Grouping {
             out.cols[k].extend((self.at..self.at + n).map(|g| self.order[g * nk + k]));
         }
         if let Some(deferred) = &mut self.deferred {
-            // Release speculative group-growth headroom before replay reads spill frames
-            // and expands deferred subtotals.
-            self.memory.trim()?;
             // Replay the shared spill stream in its slot and aggregate order.
             for g in self.at..self.at + n {
                 ctx.check()?;
                 for (a, acc) in self.accs.iter_mut().enumerate() {
-                    let id = acc.finish_replay(ctx, g, a, deferred)?;
+                    let id = acc.finish_replay(ctx, g, a, deferred, scratch)?;
                     ctx.check()?;
                     out.cols[nk + a].push(id);
                 }
@@ -796,7 +802,7 @@ impl Grouping {
             for (a, acc) in self.accs.iter_mut().enumerate() {
                 ctx.check()?;
                 for g in self.at..self.at + n {
-                    let id = acc.finish_with(ctx, g, &mut self.memory)?;
+                    let id = acc.finish_with(ctx, g, scratch)?;
                     ctx.check()?;
                     out.cols[nk + a].push(id);
                 }

@@ -153,8 +153,9 @@ pub(crate) trait Accumulator: Send {
         group: usize,
         _aggregate: usize,
         _deferred: &mut Deferred,
+        scratch: &mut dyn ScratchAdmit,
     ) -> Result<Id> {
-        self.finish(ctx, group)
+        self.finish_with(ctx, group, scratch)
     }
 
     /// Whether [`Accumulator::retract`] can take back every row.
@@ -427,6 +428,7 @@ impl Accumulator for Running {
         group: usize,
         aggregate: usize,
         deferred: &mut Deferred,
+        scratch: &mut dyn ScratchAdmit,
     ) -> Result<Id> {
         let state = &mut self.states[group];
         let _subtotal = if state.sum_deferred() {
@@ -438,7 +440,7 @@ impl Accumulator for Running {
         } else {
             None
         };
-        self.finish(ctx, group)
+        self.finish_with(ctx, group, scratch)
     }
 
     fn retractable(&self) -> bool {
@@ -815,8 +817,10 @@ impl Accumulator for Distinct {
         group: usize,
         aggregate: usize,
         deferred: &mut Deferred,
+        scratch: &mut dyn ScratchAdmit,
     ) -> Result<Id> {
-        self.inner.finish_replay(ctx, group, aggregate, deferred)
+        self.inner
+            .finish_replay(ctx, group, aggregate, deferred, scratch)
     }
 
     fn take_growth(&mut self) -> u64 {

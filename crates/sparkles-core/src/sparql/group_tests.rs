@@ -715,7 +715,173 @@ fn big_avg_finalization_charges_division_scratch_deferred_and_direct() {
     assert!(nt_lex.starts_with("3333333333"), "got {nt_lex}");
 
     // Deferred AVG finalization must hold both the expanded subtotal charge and division
-    // scratch simultaneously.
+    // scratch simultaneously, and replay must reach division rather than failing earlier.
+    let make_deferred_avg = || {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Spill::open(&SpillOptions {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let mut ctx_def = ctx();
+        ctx_def.mem_limit = 512 << 10;
+        ctx_def.spill = Some(std::sync::Arc::new(spill.query(None)));
+        let key = ctx_def.var("key");
+        let value = ctx_def.var("value");
+        let avg_var = ctx_def.var("avg");
+        let ctx_def = std::sync::Arc::new(ctx_def);
+        ctx_def.attach_owner();
+
+        let big_def = ctx_def.intern_value(&Value::from_typed(
+            &big_str,
+            oxrdf::vocab::xsd::INTEGER.as_str(),
+        ));
+        let zero_def = int(&ctx_def, 0);
+        let mut table = Table::new(vec![key, value]);
+        for group in 0..512 {
+            table.push_row(&[int(&ctx_def, group), zero_def]);
+        }
+        let mut g_agg = agg(AggregateFunction::Avg, true, false);
+        g_agg.expr = Some(super::expr::Expr::Var(value));
+        let mut grouping = Grouping::new(
+            &ctx_def,
+            &[key],
+            &[(avg_var, g_agg)],
+            &table.vars,
+            true,
+            true,
+        )
+        .unwrap();
+        let mut report = super::exprcache::Report::default();
+        grouping.start_pass(&ctx_def);
+        grouping.add(&ctx_def, &table, &mut report).unwrap();
+
+        let mut single = Table::new(table.vars.clone());
+        single.push_row(&[int(&ctx_def, 0), big_def]);
+        assert_eq!(spill.written_bytes(), 0);
+        let deferred_group = (0..512)
+            .find(|&group| {
+                single.cols[0][0] = int(&ctx_def, group);
+                grouping.add(&ctx_def, &single, &mut report).unwrap();
+                spill.written_bytes() > 0
+            })
+            .expect("expected a deferred AVG subtotal");
+        single.cols[0][0] = int(&ctx_def, deferred_group);
+        single.cols[1][0] = zero_def;
+        grouping.add(&ctx_def, &single, &mut report).unwrap();
+        grouping.end_input().unwrap();
+        assert!(grouping.spilled > 0, "expected deferred AVG subtotals");
+
+        // Drain the non-deferred prefix so the next emitted group is `deferred_group`.
+        let prefix = grouping
+            .output(&ctx_def, &[key, avg_var], deferred_group as usize)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.len(), deferred_group as usize);
+        (dir, ctx_def, grouping, key, avg_var, deferred_group)
+    };
+
+    // Case 1: observe the division charge during deferred finalization after replay
+    // finishes and drops its reader guard, proving `_subtotal` stays live alongside it.
+    {
+        struct ObserveDiv {
+            seen: Option<(u64, u64, u64)>,
+        }
+        impl super::exec::ScratchAdmit for ObserveDiv {
+            fn charge_scratch<'a>(
+                &mut self,
+                ctx: &'a Ctx,
+                bytes: u64,
+            ) -> crate::error::Result<super::ctx::Charge<'a>> {
+                let before = ctx.live_bytes();
+                let charge = ctx.charge(bytes)?;
+                let after = ctx.live_bytes();
+                self.seen = Some((bytes, before, after));
+                Ok(charge)
+            }
+        }
+
+        let (_dir, ctx_def, mut grouping, key, avg_var, deferred_group) = make_deferred_avg();
+        let base_live = ctx_def.live_bytes();
+        let mut observe = ObserveDiv { seen: None };
+        let out = grouping
+            .output_with_scratch(&ctx_def, &[key, avg_var], 1, &mut observe)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.cols[0][0].as_i64(), deferred_group);
+        let (requested, live_before, live_after) = observe
+            .seen
+            .expect("deferred AVG replay must reach division scratch admission");
+        assert_eq!(requested, AGG_SUM_SCRATCH_BYTES);
+        assert_eq!(
+            live_before,
+            base_live + AGG_SUM_PAYLOAD_BYTES,
+            "expanded subtotal guard must stay live across division finalization"
+        );
+        assert_eq!(
+            live_after,
+            base_live + AGG_SUM_PAYLOAD_BYTES + AGG_SUM_SCRATCH_BYTES,
+            "subtotal and division scratch guards must coexist during deferred AVG division"
+        );
+        let got_lex = ctx_def
+            .value(out.cols[1][0])
+            .unwrap()
+            .lexical()
+            .unwrap()
+            .to_string();
+        assert_eq!(got_lex, nt_lex);
+    }
+
+    // Case 2: replay succeeds with ample room, then pinning room just below
+    // `AGG_SUM_SCRATCH_BYTES` when division runs refuses specifically at division.
+    {
+        struct FailAtDiv {
+            called: bool,
+        }
+        impl super::exec::ScratchAdmit for FailAtDiv {
+            fn charge_scratch<'a>(
+                &mut self,
+                ctx: &'a Ctx,
+                bytes: u64,
+            ) -> crate::error::Result<super::ctx::Charge<'a>> {
+                self.called = true;
+                assert_eq!(bytes, AGG_SUM_SCRATCH_BYTES);
+                let pin = ctx.charge(ctx.memory_room().saturating_sub(bytes - 1))?;
+                let res = ctx.charge(bytes);
+                drop(pin);
+                res
+            }
+        }
+
+        let (_dir, ctx_def, mut grouping, key, avg_var, _deferred_group) = make_deferred_avg();
+        let mut fail_div = FailAtDiv { called: false };
+        let err = grouping
+            .output_with_scratch(&ctx_def, &[key, avg_var], 1, &mut fail_div)
+            .unwrap_err();
+        assert!(
+            fail_div.called,
+            "deferred AVG replay must reach division before refusing"
+        );
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+            ),
+            "expected memory refusal specifically at deferred AVG division, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn spill_group_big_avg_releases_speculative_headroom_before_interning() {
+    use super::bignum::AGG_SUM_SCRATCH_BYTES;
+    use super::group::op::Grouping;
+    use crate::spill::{Spill, SpillOptions};
+
     let dir = tempfile::tempdir().unwrap();
     let spill = Spill::open(&SpillOptions {
         dir: dir.path().to_path_buf(),
@@ -725,82 +891,254 @@ fn big_avg_finalization_charges_division_scratch_deferred_and_direct() {
         encrypted: false,
     })
     .unwrap();
-    let mut ctx_def = ctx();
-    ctx_def.mem_limit = 1 << 20;
-    ctx_def.spill = Some(std::sync::Arc::new(spill.query(None)));
-    let key = ctx_def.var("key");
-    let value = ctx_def.var("value");
-    let avg_var = ctx_def.var("avg");
-    let ctx_def = std::sync::Arc::new(ctx_def);
-    ctx_def.attach_owner();
+    let big_str = format!("1{}1", "0".repeat(3_998));
 
-    let big_def = ctx_def.intern_value(&Value::from_typed(
-        &big_str,
-        oxrdf::vocab::xsd::INTEGER.as_str(),
-    ));
-    let zero_def = int(&ctx_def, 0);
-    let mut table = Table::new(vec![key, value]);
-    for group in 0..1024 {
-        table.push_row(&[int(&ctx_def, group), zero_def]);
+    // Case 1: fixed budget where GroupMemory takes its 64 KiB speculative step during fold
+    // and leaves only `AGG_SUM_SCRATCH_BYTES + 1024` on the ledger. Trimming speculative
+    // headroom before output makes that credit available to both division and novel
+    // decimal vocabulary admission.
+    {
+        let mut ctx = ctx();
+        ctx.spill = Some(std::sync::Arc::new(spill.query(None)));
+        let key = ctx.var("key");
+        let value = ctx.var("value");
+        let avg_var = ctx.var("avg");
+        let big = ctx.intern_value(&Value::from_typed(
+            &big_str,
+            oxrdf::vocab::xsd::INTEGER.as_str(),
+        ));
+        let _ = ctx.value_checked(big).unwrap();
+
+        let mut table = Table::new(vec![key, value]);
+        table.push_row(&[int(&ctx, 1), big]);
+
+        let mut g_agg = agg(AggregateFunction::Avg, true, false);
+        g_agg.expr = Some(super::expr::Expr::Var(value));
+
+        let base_bytes = 256 + 64 + 1024;
+        let per_group = 13 * 2 + 8 + (size_of::<super::exec::AggState>() as u64 * 2 + 8) + 16;
+        let setup_live = ctx.live_bytes();
+        ctx.mem_limit =
+            setup_live + base_bytes + per_group + (64 << 10) + AGG_SUM_SCRATCH_BYTES + 1024;
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+
+        let mut grouping =
+            Grouping::new(&ctx, &[key], &[(avg_var, g_agg)], &table.vars, true, true).unwrap();
+        grouping.start_pass(&ctx);
+        grouping.add(&ctx, &table, &mut Default::default()).unwrap();
+        let room_before_end = ctx.memory_room();
+        assert!(
+            room_before_end <= AGG_SUM_SCRATCH_BYTES + 1024,
+            "expected speculative reservation to leave <= AGG_SUM_SCRATCH_BYTES + 1024, got {room_before_end}"
+        );
+        grouping.end_input().unwrap();
+        assert!(
+            ctx.memory_room() >= room_before_end + (60 << 10),
+            "expected end_input to release speculative group headroom"
+        );
+        let out = grouping.output(&ctx, &[key, avg_var], 1).unwrap().unwrap();
+        assert_eq!(out.len(), 1);
+        let val = ctx.value(out.cols[1][0]).unwrap();
+        assert_eq!(val.lexical().unwrap().as_ref(), big_str);
+        assert_eq!(
+            val.datatype().unwrap().as_str(),
+            oxrdf::vocab::xsd::DECIMAL.as_str()
+        );
     }
-    let mut g_agg = agg(AggregateFunction::Avg, true, false);
-    g_agg.expr = Some(super::expr::Expr::Var(value));
-    let mut grouping = Grouping::new(
-        &ctx_def,
-        &[key],
-        &[(avg_var, g_agg)],
-        &table.vars,
-        true,
-        true,
-    )
-    .unwrap();
-    let mut report = super::exprcache::Report::default();
-    grouping.start_pass(&ctx_def);
-    grouping.add(&ctx_def, &table, &mut report).unwrap();
-    table.cols[1].fill(big_def);
-    grouping.add(&ctx_def, &table, &mut report).unwrap();
-    table.cols[1].fill(zero_def);
-    grouping.add(&ctx_def, &table, &mut report).unwrap();
-    grouping.end_input().unwrap();
-    assert!(grouping.spilled > 0, "expected deferred AVG subtotals");
 
-    // Emit one non-deferred prefix group first so `Grouping::output` trims any
-    // speculative GroupMemory headroom before we measure remaining room.
-    let first = grouping
-        .output(&ctx_def, &[key, avg_var], 1)
-        .unwrap()
-        .unwrap();
-    assert_eq!(first.len(), 1);
-    let first_lex = ctx_def
-        .value(first.cols[1][0])
-        .unwrap()
-        .lexical()
-        .unwrap()
-        .to_string();
-    assert_eq!(first_lex, nt_lex);
+    // Case 2: calling `output` directly without `end_input` (e.g. `whole`) while the
+    // ledger has only `AGG_SUM_SCRATCH_BYTES + 1024` free must also trim speculative
+    // headroom before finalizing and interning the novel 4,000-digit decimal result.
+    {
+        let mut ctx = ctx();
+        ctx.mem_limit = 512 << 10;
+        ctx.spill = Some(std::sync::Arc::new(spill.query(None)));
+        let key = ctx.var("key");
+        let value = ctx.var("value");
+        let avg_var = ctx.var("avg");
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
 
-    // Pin room below AGG_SUM_PAYLOAD_BYTES + AGG_SUM_SCRATCH_BYTES (but above
-    // AGG_SUM_PAYLOAD_BYTES + READER_BYTES) so deferred replay/finalization must refuse.
-    let insufficient = AGG_SUM_PAYLOAD_BYTES + AGG_SUM_SCRATCH_BYTES - 1;
-    let room = ctx_def.memory_room();
-    assert!(room > insufficient);
-    let pin_def = ctx_def.charge(room - insufficient).unwrap();
-    let mut refused = false;
-    while let Some(res) = match grouping.output(&ctx_def, &[key, avg_var], 64) {
-        Ok(batch) => batch,
-        Err(crate::error::Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory => {
-            refused = true;
-            None
+        let big = ctx.intern_value(&Value::from_typed(
+            &big_str,
+            oxrdf::vocab::xsd::INTEGER.as_str(),
+        ));
+        let _ = ctx.value_checked(big).unwrap();
+
+        let mut table = Table::new(vec![key, value]);
+        table.push_row(&[int(&ctx, 1), big]);
+
+        let mut g_agg = agg(AggregateFunction::Avg, true, false);
+        g_agg.expr = Some(super::expr::Expr::Var(value));
+
+        let mut grouping =
+            Grouping::new(&ctx, &[key], &[(avg_var, g_agg)], &table.vars, true, true).unwrap();
+        grouping.start_pass(&ctx);
+        grouping.add(&ctx, &table, &mut Default::default()).unwrap();
+
+        let pin = ctx
+            .charge(
+                ctx.memory_room()
+                    .saturating_sub(AGG_SUM_SCRATCH_BYTES + 1024),
+            )
+            .unwrap();
+        let out = grouping.output(&ctx, &[key, avg_var], 1).unwrap().unwrap();
+        drop(pin);
+        assert_eq!(out.len(), 1);
+        let val = ctx.value(out.cols[1][0]).unwrap();
+        assert_eq!(val.lexical().unwrap().as_ref(), big_str);
+        assert_eq!(
+            val.datatype().unwrap().as_str(),
+            oxrdf::vocab::xsd::DECIMAL.as_str()
+        );
+    }
+}
+
+#[test]
+fn big_sum_finalization_charges_intern_scratch_on_vocab_hit_and_miss() {
+    use super::bignum::intern_scratch_bytes;
+    use super::group::op::Grouping;
+    use crate::spill::{Spill, SpillOptions};
+
+    struct ObserveScratch {
+        charges: Vec<u64>,
+    }
+    impl super::exec::ScratchAdmit for ObserveScratch {
+        fn charge_scratch<'a>(
+            &mut self,
+            ctx: &'a Ctx,
+            bytes: u64,
+        ) -> crate::error::Result<super::ctx::Charge<'a>> {
+            self.charges.push(bytes);
+            ctx.charge(bytes)
         }
-        Err(other) => panic!("unexpected error: {other:?}"),
-    } {
-        assert!(!res.is_empty());
     }
-    assert!(
-        refused,
-        "deferred AVG replay/finish should fail without room for both subtotal and division scratch"
-    );
-    drop(pin_def);
+
+    let dir = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: dir.path().to_path_buf(),
+        max_bytes: 1 << 30,
+        query_bytes: 1 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+
+    let big_int_str = format!("1{}1", "0".repeat(3_998));
+    let big_dec_str = format!("1{}.5", "0".repeat(3_997));
+
+    for (label, lex, dt) in [
+        (
+            "BigInt",
+            big_int_str.as_str(),
+            oxrdf::vocab::xsd::INTEGER.as_str(),
+        ),
+        (
+            "BigDec",
+            big_dec_str.as_str(),
+            oxrdf::vocab::xsd::DECIMAL.as_str(),
+        ),
+    ] {
+        // Vocabulary hit: single-row SUM equals the already-interned input term, yet
+        // formatting and key encoding must still require scratch credit before lookup.
+        let mut ctx = ctx();
+        ctx.mem_limit = 512 << 10;
+        ctx.spill = Some(std::sync::Arc::new(spill.query(None)));
+        let key = ctx.var("key");
+        let value = ctx.var("value");
+        let sum_var = ctx.var("sum");
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+
+        let term_id = ctx.intern_value(&Value::from_typed(lex, dt));
+        let _ = ctx.value_checked(term_id).unwrap();
+
+        let mut table = Table::new(vec![key, value]);
+        table.push_row(&[int(&ctx, 1), term_id]);
+
+        let mut g_agg = agg(AggregateFunction::Sum, true, false);
+        g_agg.expr = Some(super::expr::Expr::Var(value));
+
+        let mut grouping = Grouping::new(
+            &ctx,
+            &[key],
+            &[(sum_var, g_agg.clone())],
+            &table.vars,
+            true,
+            true,
+        )
+        .unwrap();
+        grouping.start_pass(&ctx);
+        grouping.add(&ctx, &table, &mut Default::default()).unwrap();
+        grouping.end_input().unwrap();
+
+        let pin = ctx.charge(ctx.memory_room().saturating_sub(1024)).unwrap();
+        let err = grouping.output(&ctx, &[key, sum_var], 1).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+            ),
+            "{label} vocab-hit SUM should refuse formatting/key scratch with only 1 KiB left, got {err:?}"
+        );
+        drop(pin);
+
+        // With ample room, verify the exact intern scratch charge and vocab hit.
+        let mut grouping_ok = Grouping::new(
+            &ctx,
+            &[key],
+            &[(sum_var, g_agg.clone())],
+            &table.vars,
+            true,
+            true,
+        )
+        .unwrap();
+        grouping_ok.start_pass(&ctx);
+        grouping_ok
+            .add(&ctx, &table, &mut Default::default())
+            .unwrap();
+        grouping_ok.end_input().unwrap();
+        let mut obs = ObserveScratch {
+            charges: Vec::new(),
+        };
+        let out = grouping_ok
+            .output_with_scratch(&ctx, &[key, sum_var], 1, &mut obs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            obs.charges,
+            vec![intern_scratch_bytes(lex.len())],
+            "{label}"
+        );
+        assert_eq!(out.cols[1][0], term_id, "{label}: expected vocabulary hit");
+
+        // Vocabulary miss: two-row SUM produces a novel large term and charges intern
+        // scratch before admitting the new vocabulary entry.
+        table.push_row(&[int(&ctx, 1), term_id]);
+        let mut grouping_miss =
+            Grouping::new(&ctx, &[key], &[(sum_var, g_agg)], &table.vars, true, true).unwrap();
+        grouping_miss.start_pass(&ctx);
+        grouping_miss
+            .add(&ctx, &table, &mut Default::default())
+            .unwrap();
+        grouping_miss.end_input().unwrap();
+        let mut obs_miss = ObserveScratch {
+            charges: Vec::new(),
+        };
+        let out_miss = grouping_miss
+            .output_with_scratch(&ctx, &[key, sum_var], 1, &mut obs_miss)
+            .unwrap()
+            .unwrap();
+        let out_id = out_miss.cols[1][0];
+        assert_ne!(out_id, term_id, "{label}: expected novel vocabulary entry");
+        let out_lex = ctx.value(out_id).unwrap().lexical().unwrap().to_string();
+        assert_eq!(
+            obs_miss.charges,
+            vec![intern_scratch_bytes(out_lex.len())],
+            "{label} miss"
+        );
+    }
 }
 
 #[test]

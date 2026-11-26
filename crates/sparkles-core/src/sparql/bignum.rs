@@ -52,6 +52,14 @@ pub(crate) const AGG_SUM_SCRATCH_BYTES: u64 = 5 * AGG_SUM_PAYLOAD_BYTES;
 pub(crate) const TO_F32_SCRATCH_BYTES: u64 = 256;
 /// Transient decimal-string scratch for converting a [`BigInt`] or [`BigDec`] to `f64`.
 pub(crate) const TO_F64_SCRATCH_BYTES: u64 = 1024;
+/// Transient scratch for formatting a [`BigInt`] or [`BigDec`] lexical string and
+/// encoding its vocabulary key during result interning (covers both vocabulary hits
+/// and misses).
+pub(crate) fn intern_scratch_bytes(lexical_len: usize) -> u64 {
+    // Pre-sized lexical String (`lexical_len`), datatype IRI (~40 B), and encoded key
+    // Vec<u8> (`lexical_len + 43` B via `write_literal_ref_key`), plus framing overhead.
+    (lexical_len as u64).saturating_mul(2).saturating_add(160)
+}
 /// Minimum fractional digits produced by a non-terminating [`BigDec`] division, matching
 /// `oxsdatatypes::Decimal`.
 const MIN_DIV_SCALE: u32 = 18;
@@ -663,6 +671,26 @@ impl BigInt {
         (self.limbs.capacity() * std::mem::size_of::<u32>()) as u64 + 32
     }
 
+    /// Exact byte length of `self`'s canonical decimal lexical form.
+    #[inline]
+    pub(crate) fn lexical_len(&self) -> usize {
+        if self.limbs.is_empty() {
+            1
+        } else {
+            self.decimal_digits() + usize::from(self.neg)
+        }
+    }
+
+    /// Format `self`'s canonical decimal lexical form into a single pre-sized buffer.
+    pub(crate) fn to_lexical_string(&self) -> String {
+        use std::fmt::Write;
+        let len = self.lexical_len();
+        let mut s = String::with_capacity(len);
+        let _ = write!(s, "{self}");
+        debug_assert_eq!(s.len(), len);
+        s
+    }
+
     pub fn to_i64(&self) -> Option<i64> {
         let v = self.to_i128()?;
         i64::try_from(v).ok()
@@ -1101,6 +1129,35 @@ impl BigDec {
 
     pub fn heap_bytes(&self) -> u64 {
         self.mantissa.heap_bytes() + 8
+    }
+
+    /// Exact byte length of `self`'s canonical decimal lexical form.
+    #[inline]
+    pub(crate) fn lexical_len(&self) -> usize {
+        if self.is_zero() {
+            return 1;
+        }
+        let sign = usize::from(self.mantissa.neg);
+        if self.scale == 0 {
+            return sign + self.mantissa.decimal_digits();
+        }
+        let scale = self.scale as usize;
+        let digits = self.mantissa.decimal_digits();
+        if digits <= scale {
+            sign + 2 + scale
+        } else {
+            sign + digits + 1
+        }
+    }
+
+    /// Format `self`'s canonical decimal lexical form into a single pre-sized buffer.
+    pub(crate) fn to_lexical_string(&self) -> String {
+        use std::fmt::Write;
+        let len = self.lexical_len();
+        let mut s = String::with_capacity(len);
+        let _ = write!(s, "{self}");
+        debug_assert_eq!(s.len(), len);
+        s
     }
 
     pub fn negated(&self) -> Self {
@@ -1822,5 +1879,31 @@ mod tests {
         assert!(d03 < BigDec::parse("0.3").unwrap());
         let d1e22 = BigDec::from_exact_f64(1e22).unwrap();
         assert_eq!(d1e22, BigDec::parse("10000000000000000000000").unwrap());
+
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "99999999999999999999999",
+            "-100000000000000000000001",
+        ] {
+            let bi = BigInt::parse(s).unwrap();
+            assert_eq!(bi.to_lexical_string(), bi.to_string(), "BigInt {s}");
+        }
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "0.0001",
+            "-0.0001",
+            "123.45",
+            "-123.45",
+            &format!("0.{}1", "0".repeat(MAX_SCALE as usize - 1)),
+            &format!("-0.{}1", "0".repeat(MAX_SCALE as usize - 1)),
+            &format!("1{}.5", "0".repeat(3_997)),
+        ] {
+            let bd = BigDec::parse(s).unwrap();
+            assert_eq!(bd.to_lexical_string(), bd.to_string(), "BigDec {s}");
+        }
     }
 }
