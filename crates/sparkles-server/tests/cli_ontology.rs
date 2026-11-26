@@ -578,15 +578,38 @@ fn classify_answers_in_part_under_a_deadline() {
 
 #[test]
 fn classify_el_and_horn_partial_under_deadline() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Probe {
+        TimedOut,
+        Partial,
+        Complete,
+    }
+
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
 
+    // Declare every entity explicitly so `OntologyFile::read` takes the direct OFN fast
+    // path instead of falling back to an in-memory RDF store round-trip under `--timeout`,
+    // and size both fixtures so saturation comfortably dominates indexing and process jitter.
     let mut el_ofn = String::from(
         "Prefix(:=<http://ex.org/>)\nOntology(\n\
+         Declaration(ObjectProperty(:part))\n\
+         Declaration(ObjectProperty(:r1))\n\
+         Declaration(ObjectProperty(:r2))\n\
+         Declaration(ObjectProperty(:s))\n\
          TransitiveObjectProperty(:part)\n\
          SubObjectPropertyOf(ObjectPropertyChain(:r1 :r2) :s)\n",
     );
-    let en = if cfg!(debug_assertions) { 100 } else { 300 };
+    let en = if cfg!(debug_assertions) { 250 } else { 800 };
+    for i in 0..en {
+        el_ofn.push_str(&format!(
+            "Declaration(Class(:A{i}))\n\
+             Declaration(Class(:B{i}))\n\
+             Declaration(Class(:C{i}))\n\
+             Declaration(Class(:D{i}))\n\
+             Declaration(Class(:P{i}))\n",
+        ));
+    }
     for i in 0..en {
         let next = (i + 1) % en;
         el_ofn.push_str(&format!(
@@ -602,18 +625,37 @@ fn classify_el_and_horn_partial_under_deadline() {
 
     let mut horn_ofn = String::from(
         "Prefix(:=<http://ex.org/>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n\
-         InverseObjectProperties(:r :rinv)\n",
+         Declaration(ObjectProperty(:r))\n\
+         Declaration(ObjectProperty(:rinv))\n\
+         Declaration(ObjectProperty(:part))\n\
+         InverseObjectProperties(:r :rinv)\n\
+         TransitiveObjectProperty(:part)\n",
     );
-    let hn = if cfg!(debug_assertions) { 90 } else { 300 };
+    // Coprime to 7 and 11 so the modular indices visit every class uniformly.
+    let hn = if cfg!(debug_assertions) { 128 } else { 360 };
     for i in 0..hn {
+        horn_ofn.push_str(&format!(
+            "Declaration(Class(:H{i}))\n\
+             Declaration(Class(:M{i}))\n\
+             Declaration(Class(:F{i}))\n\
+             Declaration(Class(:G{i}))\n\
+             Declaration(Class(:Back{i}))\n\
+             Declaration(Class(:P{i}))\n",
+        ));
+    }
+    for i in 0..hn {
+        let next = (i + 1) % hn;
         let b = (7 * i + 3) % hn;
         let d_idx = (11 * i + 5) % hn;
         horn_ofn.push_str(&format!(
-            "SubClassOf(:H{i} ObjectSomeValuesFrom(:r :M{i}))\n\
+            "SubClassOf(:H{i} :H{next})\n\
+             SubClassOf(:H{i} ObjectSomeValuesFrom(:r :M{i}))\n\
              SubClassOf(:H{i} ObjectAllValuesFrom(:r :F{b}))\n\
              SubClassOf(:H{i} ObjectMaxCardinality(1 :r owl:Thing))\n\
              SubClassOf(:H{i} ObjectSomeValuesFrom(:r :G{d_idx}))\n\
-             SubClassOf(:M{i} ObjectAllValuesFrom(:rinv :Back{i}))\n",
+             SubClassOf(:M{i} ObjectAllValuesFrom(:rinv :Back{i}))\n\
+             SubClassOf(:F{i} ObjectSomeValuesFrom(:part :P{next}))\n\
+             SubClassOf(:P{i} ObjectSomeValuesFrom(:part :P{next}))\n",
         ));
     }
     horn_ofn.push_str(")\n");
@@ -635,52 +677,138 @@ fn classify_el_and_horn_partial_under_deadline() {
         assert_eq!(full["tier"], tier, "{tier}: {full}");
         assert_eq!(full["partial"], false, "{tier}: {full}");
         let s = &full["stats"];
-        let took = (s["indexMs"].as_f64().unwrap()
-            + s["saturationMs"].as_f64().unwrap()
-            + s["taxonomyMs"].as_f64().unwrap())
-            / 1000.0;
-        let limit = ((took * 20000.0) as u64).max(2000);
-        let saw_partial = std::cell::Cell::new(false);
-        let answered = std::cell::Cell::new(0usize);
-        let run = |ms: u64| -> bool {
+        let index_ms = s["indexMs"].as_f64().unwrap();
+        let sat_ms = s["saturationMs"].as_f64().unwrap();
+        let tax_ms = s["taxonomyMs"].as_f64().unwrap();
+        let limit = (((index_ms + sat_ms + tax_ms) * 20.0) as u64).max(2000);
+        let mut trace: Vec<(u64, Probe)> = Vec::new();
+        let probe = |ms: u64, trace: &mut Vec<(u64, Probe)>| -> Probe {
             let t = format!("{}", ms as f64 / 1000.0);
             let o = sparkles(dir, &[&args[..], &["--partial", "--timeout", &t]].concat());
             let Ok(j) = serde_json::from_slice::<serde_json::Value>(&o.stdout) else {
                 assert_eq!(o.status.code(), Some(1), "{tier}: {}", err(&o));
-                return false;
+                trace.push((ms, Probe::TimedOut));
+                return Probe::TimedOut;
             };
-            answered.set(answered.get() + 1);
             assert_eq!(j["tier"], tier, "{tier}: {j}");
+            assert_eq!(j["classes"], full["classes"], "{tier}: {j}");
             if j["partial"] == true {
                 assert_eq!(j["complete"], false, "{tier}: {j}");
                 assert_eq!(o.status.code(), Some(2), "{tier}: {}", err(&o));
                 assert!(err(&o).contains("partial answer"), "{tier}: {}", err(&o));
-                saw_partial.set(true);
-            }
-            true
-        };
-        let after = |ms: u64| ms + (ms * 8 / 100).max(1);
-        let (mut lo, mut ms) = (0, 2);
-        while ms < limit && !run(ms) {
-            lo = ms;
-            ms = after(ms);
-        }
-        let mut hi = ms;
-        while hi - lo > 1 && !saw_partial.get() {
-            let mid = (lo + hi) / 2;
-            if run(mid) {
-                hi = mid;
+                assert_eq!(
+                    j["incompleteCount"].as_u64(),
+                    Some(j["incomplete"].as_array().unwrap().len() as u64),
+                    "{tier}: {j}"
+                );
+                trace.push((ms, Probe::Partial));
+                Probe::Partial
             } else {
-                lo = mid;
+                assert_eq!(j["complete"], true, "{tier}: {j}");
+                assert_eq!(o.status.code(), Some(0), "{tier}: {}", err(&o));
+                trace.push((ms, Probe::Complete));
+                Probe::Complete
+            }
+        };
+
+        let mut saw_partial = false;
+        let mut lo_timeout: Option<u64> = None;
+        let mut hi_complete: Option<u64> = None;
+
+        // Seed probes directly inside the measured saturation window.
+        for frac in [0.25, 0.50, 0.12, 0.70, 0.06] {
+            let ms = (index_ms + sat_ms * frac).round().max(1.0) as u64;
+            if trace.iter().any(|&(tried, _)| tried == ms)
+                || hi_complete.is_some_and(|h| ms >= h)
+                || lo_timeout.is_some_and(|l| ms <= l)
+            {
+                continue;
+            }
+            match probe(ms, &mut trace) {
+                Probe::Partial => {
+                    saw_partial = true;
+                    break;
+                }
+                Probe::Complete => {
+                    hi_complete = Some(hi_complete.map_or(ms, |h| h.min(ms)));
+                }
+                Probe::TimedOut => {
+                    if hi_complete.is_none_or(|h| ms < h) {
+                        lo_timeout = Some(lo_timeout.map_or(ms, |l| l.max(ms)));
+                    }
+                }
             }
         }
-        while !saw_partial.get() && answered.get() < 20 && ms < limit {
-            ms = after(ms);
-            run(ms);
+
+        // Adaptive bracket + binary search fallback if machine speed shifted sharply.
+        if !saw_partial && hi_complete.is_none() {
+            let mut ms = lo_timeout.unwrap_or(2).max(2);
+            while ms < limit {
+                ms = (ms * 3 / 2).max(ms + 1).min(limit);
+                match probe(ms, &mut trace) {
+                    Probe::Partial => {
+                        saw_partial = true;
+                        break;
+                    }
+                    Probe::Complete => {
+                        hi_complete = Some(ms);
+                        break;
+                    }
+                    Probe::TimedOut => {
+                        lo_timeout = Some(ms);
+                    }
+                }
+            }
+        }
+        if !saw_partial && lo_timeout.is_none() {
+            let mut ms = hi_complete.unwrap_or(2);
+            while ms > 1 {
+                ms /= 2;
+                match probe(ms, &mut trace) {
+                    Probe::Partial => {
+                        saw_partial = true;
+                        break;
+                    }
+                    Probe::Complete => {
+                        hi_complete = Some(ms);
+                    }
+                    Probe::TimedOut => {
+                        lo_timeout = Some(ms);
+                        break;
+                    }
+                }
+            }
+        }
+        if !saw_partial {
+            let mut lo = lo_timeout.unwrap_or(0);
+            let mut hi = hi_complete.unwrap_or(limit);
+            while hi > lo + 1 {
+                let mid = (lo + hi) / 2;
+                match probe(mid, &mut trace) {
+                    Probe::Partial => {
+                        saw_partial = true;
+                        break;
+                    }
+                    Probe::Complete => hi = mid,
+                    Probe::TimedOut => lo = mid,
+                }
+            }
+            if !saw_partial {
+                for retry in [
+                    hi.saturating_sub(1).max(1),
+                    hi,
+                    (index_ms + sat_ms * 0.35).round().max(1.0) as u64,
+                ] {
+                    if probe(retry, &mut trace) == Probe::Partial {
+                        saw_partial = true;
+                        break;
+                    }
+                }
+            }
         }
         assert!(
-            saw_partial.get(),
-            "{tier}: no deadline gave a partial CLI answer"
+            saw_partial,
+            "{tier}: no deadline gave a partial CLI answer (indexMs={index_ms:.2}, saturationMs={sat_ms:.2}, taxonomyMs={tax_ms:.2}, trace={trace:?})"
         );
     }
 }
