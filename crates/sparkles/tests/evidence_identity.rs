@@ -2778,4 +2778,7 @@ fn added_boundary_graph_with_many_unrelated_quads_and_few_proposals() {
     // Rebuilding restores reads and includes the accepted proposal from HIDDEN.
     evidence::rebuild_resolution_map(&ds, &ds, "people", None, &admin, &Control::none()).unwrap();
     assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c", "x x", "y x"]));
+    let restored =
+        evidence::resolve_entities(&ds, &ds, "people", &[e("y")], all(), &Control::none()).unwrap();
+    assert_eq!(restored.entities[0].representative, e("x"));
 }

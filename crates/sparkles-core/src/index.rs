@@ -2852,7 +2852,7 @@ impl PermIndex {
 
     /// Decode one admitted block or segment with only the columns in `mask` under
     /// `preparation`, keeping the workspace reservation alive across `each` and releasing
-    /// the decoded block before releasing the reservation.
+    /// the decoded block and decompression scratch before releasing the reservation.
     fn with_part_prepared<R, E: From<Error>>(
         &self,
         cache: &BlockCache,
@@ -2870,7 +2870,9 @@ impl PermIndex {
         let workspace = (rows as u64)
             .saturating_mul(col_count.saturating_mul(8).saturating_add(20))
             .saturating_add(1024);
-        // This reservation participates in the caller's single ledger.
+        // This reservation participates in the caller's single ledger. `_held` is declared
+        // before `scratch` and `columns`/`block`, so reverse declaration order frees both
+        // the decoded columns and the decompression buffer before releasing the reservation.
         let _held = preparation.reserve(workspace)?;
         let limit = crate::history::ReadLimit {
             options: preparation,
@@ -2939,10 +2941,7 @@ impl PermIndex {
             cols: columns,
             rows,
         };
-        let out = each(&block);
-        drop(block);
-        drop(_held);
-        out
+        each(&block)
     }
 
     /// Exact number of base rows with keys in `[lo_key, hi_key]`, summing fully covered
@@ -5116,6 +5115,87 @@ mod tests {
                 idx.contains_prepared(&cold, &[2, 20, 42_000, 0], &tiny),
                 Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
             ));
+        }
+    }
+
+    #[test]
+    fn count_between_prepared_keeps_reservation_until_scratch_drops() {
+        use crate::access::Preparation;
+        use crate::task::Control;
+
+        // Initialize the shared static empty column before entering the allocation stage.
+        let _ = empty_col();
+
+        for segmented in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = PermWriter::create_format(dir.path(), Perm::Pos, segmented).unwrap();
+            for s in 0..4_000u64 {
+                w.push([1, 10, s, 0]).unwrap();
+            }
+            w.finish(dir.path(), Perm::Pos).unwrap();
+
+            let idx = if segmented {
+                PermIndex::open(dir.path(), Perm::Pos).unwrap()
+            } else {
+                PermIndex::open_whole_columns(dir.path(), Perm::Pos).unwrap()
+            };
+            assert_eq!(idx.segmented(), segmented);
+
+            let cold = BlockCache::new(1 << 24).read_through();
+            let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+            let rlo = [1, 10, 500, 0];
+            let rhi = [1, 10, 2_500, 0];
+            let expected = 2_001u64;
+
+            let (max, _) = crate::test_alloc::record_unadmitted_events(&prep, || {
+                let _stage = crate::test_alloc::Stage::enter(0);
+                let (n, work) = idx
+                    .count_between_prepared_with_work(&cold, &rlo, &rhi, &prep)
+                    .unwrap();
+                assert_eq!(n, expected);
+                assert!(work.edge_decodes >= 1);
+            });
+            assert_eq!(
+                max[0].excess, 0,
+                "count_between_prepared (segmented={segmented}) released reservation with live scratch: {:?}",
+                max[0]
+            );
+
+            let (max, _) = crate::test_alloc::record_unadmitted_events(&prep, || {
+                let _stage = crate::test_alloc::Stage::enter(0);
+                assert!(
+                    idx.contains_prepared(&cold, &[1, 10, 1_500, 0], &prep)
+                        .unwrap()
+                );
+            });
+            assert_eq!(
+                max[0].excess, 0,
+                "contains_prepared (segmented={segmented}) released reservation with live scratch: {:?}",
+                max[0]
+            );
+
+            let mut seen = 0usize;
+            let (max, _) = crate::test_alloc::record_unadmitted_events(&prep, || {
+                let _stage = crate::test_alloc::Stage::enter(0);
+                idx.for_each_prepared::<Error, false>(
+                    &cold,
+                    &rlo,
+                    &rhi,
+                    &prep,
+                    |_| false,
+                    |_block, start, end| {
+                        seen += end - start;
+                        Ok(true)
+                    },
+                )
+                .unwrap();
+            });
+            assert_eq!(seen, expected as usize);
+            assert_eq!(
+                max[0].excess, 0,
+                "for_each_prepared (segmented={segmented}) released reservation with live scratch: {:?}",
+                max[0]
+            );
         }
     }
 }
