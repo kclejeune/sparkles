@@ -1522,329 +1522,50 @@ fn could_resolve_to_registered_aggregate(ns: &str) -> bool {
                 }))
 }
 
-fn has_iri_scheme(s: &str) -> bool {
-    let mut bytes = s.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() {
-        return false;
-    }
-    for b in bytes {
-        if b == b':' {
-            return true;
-        }
-        if !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) {
-            return false;
-        }
-    }
-    false
-}
-
-fn resolved_iri_len(raw: &str, base_len: usize) -> usize {
-    if base_len > 0 && !has_iri_scheme(raw) {
-        base_len.saturating_add(raw.len())
-    } else {
-        raw.len()
-    }
-}
-
-fn skip_sparql_ws_and_comments(text: &str, pos: &mut usize, budget: &mut WorkBudget) -> Result<()> {
-    let b = text.as_bytes();
-    let mut i = *pos;
-    let mut next_charge = i.saturating_add(256);
-    while i < b.len() {
-        while i >= next_charge {
-            budget.step()?;
-            next_charge = next_charge.saturating_add(256);
-        }
-        if matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
-            i += 1;
-        } else if b[i] == b'#' {
-            while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
-                i += 1;
-            }
-        } else {
-            break;
-        }
-    }
-    while i >= next_charge {
-        budget.step()?;
-        next_charge = next_charge.saturating_add(256);
-    }
-    *pos = i;
-    Ok(())
-}
-
-/// Scan a SPARQL `PNAME_NS` (`PN_PREFIX? ":"`) starting at `start`, returning `(prefix, end)`.
-fn scan_pname_ns(text: &str, start: usize) -> Option<(&str, usize)> {
-    let b = text.as_bytes();
-    if b.get(start) == Some(&b':') {
-        return Some(("", start + 1));
-    }
-    let first = text.get(start..)?.chars().next()?;
-    if !pn_chars_base(first) {
-        return None;
-    }
-    let mut j = start + first.len_utf8();
-    let mut last_non_dot = j;
-    while j < b.len() {
-        let Some(c) = text[j..].chars().next() else {
-            break;
-        };
-        if pn_chars(c) {
-            j += c.len_utf8();
-            last_non_dot = j;
-        } else if c == '.' {
-            j += 1;
-        } else {
-            break;
-        }
-    }
-    if last_non_dot == j && b.get(j) == Some(&b':') {
-        Some((&text[start..j], j + 1))
-    } else {
-        None
-    }
-}
-
-/// Scan a `spargebra` `IRIREF` (`"<" (!'>')* ">"`) starting at `start`, returning
-/// `(inner_without_angles, end_pos)`.
-fn scan_prologue_iriref<'a>(
-    text: &'a str,
-    start: usize,
+/// Visit `prefix` and every candidate suffix produced by stripping zero-whitespace SPARQL
+/// keywords/tokens that `spargebra`'s PEG grammar can consume immediately before a
+/// `PrefixedName` (e.g. `FILTERp:f(?x)`, `?s ap:C`, `VALUES ?x { truetruetruetruep:a0 UNDEFp:a1 }`).
+///
+/// The keyword set is pairwise prefix-free, so at most one token matches at each step and
+/// every step strictly shrinks `cur`. Case-sensitive `"a"` (`rdf:type` verb shorthand) is
+/// stripped at most once, while repeatable value/keyword tokens loop without a fixed cap
+/// under `budget`.
+fn for_each_candidate_prefix<'a>(
+    prefix: &'a str,
     budget: &mut WorkBudget,
-) -> Result<Option<(&'a str, usize)>> {
-    let b = text.as_bytes();
-    if b.get(start) != Some(&b'<') {
-        return Ok(None);
-    }
-    let inner_start = start + 1;
-    let Some(rel_end) = text[inner_start..].find('>') else {
-        return Ok(None);
-    };
-    let steps = (rel_end / 256).max(1);
-    for _ in 0..steps {
-        budget.step()?;
-    }
-    let inner_end = inner_start + rel_end;
-    Ok(Some((&text[inner_start..inner_end], inner_end + 1)))
-}
-
-/// Scan a SPARQL `STRING_LITERAL1` or `STRING_LITERAL2` starting at `start` (for
-/// `VersionDecl`), returning the byte offset after the closing quote.
-fn scan_prologue_short_string(
-    text: &str,
-    start: usize,
-    budget: &mut WorkBudget,
-) -> Result<Option<usize>> {
-    let b = text.as_bytes();
-    let Some(&q @ (b'\'' | b'"')) = b.get(start) else {
-        return Ok(None);
-    };
-    let mut j = start + 1;
-    let mut next_charge = j.saturating_add(256);
-    while j < b.len() {
-        while j >= next_charge {
-            budget.step()?;
-            next_charge = next_charge.saturating_add(256);
-        }
-        if b[j] == b'\\' {
-            let next_len = text
-                .get(j + 1..)
-                .and_then(|s| s.chars().next())
-                .map_or(0, char::len_utf8);
-            j = (j + 1 + next_len).min(b.len());
-        } else if b[j] == q {
-            return Ok(Some(j + 1));
-        } else if b[j] == b'\n' || b[j] == b'\r' {
-            return Ok(None);
-        } else {
-            let ch_len = text[j..].chars().next().map_or(1, char::len_utf8);
-            j += ch_len;
-        }
-    }
-    Ok(None)
-}
-
-fn resolve_admission_prefix_len(
-    prefix: &str,
-    local_prefixes: &FxHashMap<&str, usize>,
-    base_prefixes: Option<&FxHashMap<&str, &str>>,
-) -> Option<usize> {
-    let lookup = |p: &str| {
-        local_prefixes
-            .get(p)
-            .copied()
-            .or_else(|| base_prefixes.and_then(|m| m.get(p).map(|ns| ns.len())))
-    };
-    if let Some(len) = lookup(prefix) {
-        return Some(len);
-    }
-    // `spargebra`'s PEG keyword rule `i(kw) _` allows zero whitespace before an immediately
-    // following `PrefixedName` (e.g. `FILTERp:f(?x)`, `GRAPHp:g {}`, `FROMNAMEDp:g`,
-    // `GROUPBYp:f(?x)`, `COUNT(DISTINCTp:a)`). Strip any such leading keywords if the whole
-    // token prefix is not itself declared.
+    mut f: impl FnMut(&'a str, &mut WorkBudget) -> Result<()>,
+) -> Result<()> {
     const IRI_PRECEDING_KEYWORDS: &[&str] = &[
         "DESCRIBE", "DISTINCT", "REDUCED", "SERVICE", "FILTER", "HAVING", "SILENT", "GRAPH",
-        "NAMED", "ORDER", "GROUP", "FROM", "BY",
+        "NAMED", "ORDER", "GROUP", "FROM", "BY", "TRUE", "FALSE", "UNDEF",
     ];
+    f(prefix, budget)?;
     let mut cur = prefix;
-    for _ in 0..3 {
-        let Some(rest) = IRI_PRECEDING_KEYWORDS.iter().find_map(|kw| {
-            if cur.len() >= kw.len()
-                && cur.is_char_boundary(kw.len())
-                && cur[..kw.len()].eq_ignore_ascii_case(kw)
-            {
-                Some(&cur[kw.len()..])
-            } else {
-                None
-            }
-        }) else {
+    let mut stripped_a = false;
+    loop {
+        let next = if !stripped_a && let Some(rest) = cur.strip_prefix('a') {
+            stripped_a = true;
+            Some(rest)
+        } else {
+            IRI_PRECEDING_KEYWORDS.iter().find_map(|kw| {
+                if cur.len() >= kw.len()
+                    && cur.is_char_boundary(kw.len())
+                    && cur[..kw.len()].eq_ignore_ascii_case(kw)
+                {
+                    Some(&cur[kw.len()..])
+                } else {
+                    None
+                }
+            })
+        };
+        let Some(rest) = next else {
             break;
         };
-        if let Some(len) = lookup(rest) {
-            return Some(len);
+        budget.step()?;
+        if rest.is_empty() || rest.chars().next().is_some_and(pn_chars_base) {
+            f(rest, budget)?;
         }
         cur = rest;
-    }
-    None
-}
-
-/// Admit the resolved IRI bytes that `spargebra` will materialize when parsing `sparql`
-/// under `base_prefixes` (plus any inline `BASE` / `PREFIX` declarations in `sparql`).
-/// Refuses with [`super::rdf::SpinLimitError`] before parse allocations if any single
-/// resolved IRI exceeds [`MAX_OUTPUT_BYTES`] or total resolved IRI bytes exceed
-/// `max_resolved_bytes`.
-pub(crate) fn admit_resolved_prefixed_iris(
-    sparql: &str,
-    base_prefixes: Option<&FxHashMap<&str, &str>>,
-    max_resolved_bytes: usize,
-) -> Result<()> {
-    let mut scan_budget = WorkBudget::new(MAX_OUTPUT_BYTES);
-    let mut base_len = 0usize;
-    let mut local_prefixes: FxHashMap<&str, usize> = FxHashMap::default();
-    let mut total_resolved = 0usize;
-
-    // 1. Parse `spargebra`'s exact `Prologue()` (`(BaseDecl _ / PrefixDecl _ / VersionDecl _)*`),
-    //    where `_` may consume zero whitespace (so compact forms like `PREFIXp: <ns/>`,
-    //    `PREFIXp:<ns/>`, `PREFIX:<ns/>`, and `BASE<iri>` are accepted by `spargebra`).
-    let mut pos = 0usize;
-    loop {
-        skip_sparql_ws_and_comments(sparql, &mut pos, &mut scan_budget)?;
-        if sparql
-            .get(pos..pos + 6)
-            .is_some_and(|kw| kw.eq_ignore_ascii_case("PREFIX"))
-        {
-            let mut cur = pos + 6;
-            skip_sparql_ws_and_comments(sparql, &mut cur, &mut scan_budget)?;
-            if let Some((prefix, after_ns)) = scan_pname_ns(sparql, cur) {
-                cur = after_ns;
-                skip_sparql_ws_and_comments(sparql, &mut cur, &mut scan_budget)?;
-                if let Some((inner, end)) = scan_prologue_iriref(sparql, cur, &mut scan_budget)? {
-                    scan_budget.step()?;
-                    let ns_len = resolved_iri_len(inner, base_len);
-                    if ns_len > MAX_OUTPUT_BYTES {
-                        return Err(limit_err(format!(
-                            "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
-                        )));
-                    }
-                    total_resolved = total_resolved.saturating_add(ns_len);
-                    if total_resolved > max_resolved_bytes {
-                        return Err(limit_err(format!(
-                            "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
-                        )));
-                    }
-                    local_prefixes.insert(prefix, ns_len);
-                    pos = end;
-                    continue;
-                }
-            }
-        }
-        if sparql
-            .get(pos..pos + 4)
-            .is_some_and(|kw| kw.eq_ignore_ascii_case("BASE"))
-        {
-            let mut cur = pos + 4;
-            skip_sparql_ws_and_comments(sparql, &mut cur, &mut scan_budget)?;
-            if let Some((inner, end)) = scan_prologue_iriref(sparql, cur, &mut scan_budget)? {
-                scan_budget.step()?;
-                base_len = resolved_iri_len(inner, base_len);
-                if base_len > MAX_OUTPUT_BYTES {
-                    return Err(limit_err(format!(
-                        "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
-                    )));
-                }
-                total_resolved = total_resolved.saturating_add(base_len);
-                if total_resolved > max_resolved_bytes {
-                    return Err(limit_err(format!(
-                        "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
-                    )));
-                }
-                pos = end;
-                continue;
-            }
-        }
-        if sparql
-            .get(pos..pos + 7)
-            .is_some_and(|kw| kw.eq_ignore_ascii_case("VERSION"))
-        {
-            let mut cur = pos + 7;
-            skip_sparql_ws_and_comments(sparql, &mut cur, &mut scan_budget)?;
-            if let Some(end) = scan_prologue_short_string(sparql, cur, &mut scan_budget)? {
-                scan_budget.step()?;
-                pos = end;
-                continue;
-            }
-        }
-        break;
-    }
-
-    // 2. Scan query body tokens after the prologue.
-    let body = &sparql[pos..];
-    let tokens = tokenize_sparql(body, &mut scan_budget)?;
-    for tok in tokens {
-        match tok.kind {
-            TokKind::PrefixedName => {
-                if let Some((prefix, local)) = tok.as_str(body).split_once(':') {
-                    let ns_len =
-                        resolve_admission_prefix_len(prefix, &local_prefixes, base_prefixes);
-                    if let Some(ns_len) = ns_len {
-                        let resolved_len = ns_len.saturating_add(local.len());
-                        if resolved_len > MAX_OUTPUT_BYTES {
-                            return Err(limit_err(format!(
-                                "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
-                            )));
-                        }
-                        total_resolved = total_resolved.saturating_add(resolved_len);
-                        if total_resolved > max_resolved_bytes {
-                            return Err(limit_err(format!(
-                                "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
-                            )));
-                        }
-                    }
-                }
-            }
-            TokKind::IriRef if base_len > 0 => {
-                let iri_tok = tok.as_str(body);
-                let inner = &iri_tok[1..iri_tok.len().saturating_sub(1)];
-                if !has_iri_scheme(inner) {
-                    let resolved_len = base_len.saturating_add(inner.len());
-                    if resolved_len > MAX_OUTPUT_BYTES {
-                        return Err(limit_err(format!(
-                            "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
-                        )));
-                    }
-                    total_resolved = total_resolved.saturating_add(resolved_len);
-                    if total_resolved > max_resolved_bytes {
-                        return Err(limit_err(format!(
-                            "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
-                        )));
-                    }
-                }
-            }
-            _ => {}
-        }
     }
     Ok(())
 }
@@ -1858,10 +1579,12 @@ pub(crate) fn admit_resolved_prefixed_iris(
 /// prefixes use bounded-length placeholders preserving the real namespace's RFC 3987 parser
 /// end state (cached across fragments and charged to `budget` on first scan) so discarded
 /// structural candidates never amplify long caller namespaces while preserving real IRI
-/// validity for local fallbacks. When `None` (standalone serialization without a prefix
-/// table), synthetic placeholder prefixes are registered on `SparqlParser` so both `DISTINCT`
-/// and non-`DISTINCT` single-argument prefixed calls are admitted as potential custom
-/// aggregates while explicit `<IRI>` calls stay strictly validated.
+/// validity for local fallbacks. Compact keyword-glued prefixed names (such as `FILTERp:f`,
+/// `ap:C`, `truetruetruetruep:a0`, and `UNDEFp:a1`) are also inspected so valid compact
+/// subqueries declare every matching caller prefix. When `None` (standalone serialization
+/// without a prefix table), synthetic placeholder prefixes are registered on `SparqlParser`
+/// so both `DISTINCT` and non-`DISTINCT` single-argument prefixed calls are admitted as
+/// potential custom aggregates while explicit `<IRI>` calls stay strictly validated.
 pub(crate) fn validate_subquery_text(
     text: &str,
     known_prefixes: Option<&KnownPrefixes<'_>>,
@@ -1882,8 +1605,6 @@ pub(crate) fn validate_subquery_text(
     let mut brace_depth: isize = 0;
     let mut prefix_indices: FxHashMap<&str, usize> = FxHashMap::default();
     let mut used_prefixes: Vec<(&str, String)> = Vec::new();
-    let mut resolved_iri_bytes = 0usize;
-    let max_resolved_bytes = budget.remaining_bytes();
     for tok in &tokens {
         match tok.kind {
             TokKind::LBrace => brace_depth += 1,
@@ -1894,39 +1615,22 @@ pub(crate) fn validate_subquery_text(
                 }
             }
             TokKind::PrefixedName => {
-                if let Some((prefix, local)) = tok.as_str(text).split_once(':') {
-                    let slot = if let Some(&existing) = prefix_indices.get(prefix) {
-                        Some(existing)
-                    } else {
+                if let Some((prefix, _local)) = tok.as_str(text).split_once(':') {
+                    for_each_candidate_prefix(prefix, budget, |cand, budget| {
+                        if prefix_indices.contains_key(cand) {
+                            return Ok(());
+                        }
                         let effective_ns = match known_prefixes {
-                            Some(env) => {
-                                env.placeholder_for(prefix, used_prefixes.len(), budget)?
-                            }
+                            Some(env) => env.placeholder_for(cand, used_prefixes.len(), budget)?,
                             None => Some(indexed_placeholder_ns(used_prefixes.len())),
                         };
                         if let Some(ns) = effective_ns {
                             let new_slot = used_prefixes.len();
-                            prefix_indices.insert(prefix, new_slot);
-                            used_prefixes.push((prefix, ns));
-                            Some(new_slot)
-                        } else {
-                            None
+                            prefix_indices.insert(cand, new_slot);
+                            used_prefixes.push((cand, ns));
                         }
-                    };
-                    if let Some(slot) = slot {
-                        let resolved_len = used_prefixes[slot].1.len().saturating_add(local.len());
-                        if resolved_len > MAX_OUTPUT_BYTES {
-                            return Err(limit_err(format!(
-                                "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
-                            )));
-                        }
-                        resolved_iri_bytes = resolved_iri_bytes.saturating_add(resolved_len);
-                        if resolved_iri_bytes > max_resolved_bytes {
-                            return Err(limit_err(format!(
-                                "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
-                            )));
-                        }
-                    }
+                        Ok(())
+                    })?;
                 }
             }
             _ => {}
@@ -1954,7 +1658,9 @@ pub(crate) fn validate_subquery_text(
         )));
     }
 
-    let mut parser = sparkles_core::sparql::aggext::register(spargebra::SparqlParser::new());
+    let mut parser = sparkles_core::sparql::aggext::register(
+        spargebra::SparqlParser::new().with_max_resolved_iri_bytes(budget.remaining_bytes()),
+    );
     let wrapped = if known_prefixes.is_none() {
         for (p, ns) in &used_prefixes {
             parser = parser
@@ -1981,7 +1687,7 @@ pub(crate) fn validate_subquery_text(
         w
     };
     let parsed = parser.parse_query(&wrapped).map_err(|e| {
-        if e.is_too_deep() {
+        if e.is_too_deep() || e.is_resolved_iri_limit_exceeded() {
             limit_err(format!("invalid sp:SubQuery sp:text: {e}"))
         } else {
             anyhow!("invalid sp:SubQuery sp:text: {e}")

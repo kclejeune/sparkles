@@ -59,7 +59,9 @@ pub(crate) fn is_limit_or_cycle_error(err: &anyhow::Error) -> bool {
 /// fallback cannot hide them.
 pub(crate) fn map_core_parse_error(err: sparkles_core::Error, context: &str) -> anyhow::Error {
     let is_limit = match &err {
-        sparkles_core::Error::SparqlSyntax(e) => e.is_too_deep(),
+        sparkles_core::Error::SparqlSyntax(e) => {
+            e.is_too_deep() || e.is_resolved_iri_limit_exceeded()
+        }
         sparkles_core::Error::BudgetExceeded(_)
         | sparkles_core::Error::Timeout
         | sparkles_core::Error::Cancelled => true,

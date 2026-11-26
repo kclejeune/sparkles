@@ -183,11 +183,6 @@ pub(crate) struct CandidateCheck<'a> {
 
 impl CandidateCheck<'_> {
     pub(crate) fn validate(&self, sparql: &str, budget: &mut rdf::WorkBudget) -> Result<Query> {
-        template::admit_resolved_prefixed_iris(
-            sparql,
-            Some(&self.prefixes.map),
-            budget.remaining_bytes(),
-        )?;
         let full_len = self.prefix_head.len().saturating_add(sparql.len());
         if full_len > rdf::MAX_RETAINED_BYTES {
             return Err(rdf::limit_err(format!(
@@ -200,8 +195,13 @@ impl CandidateCheck<'_> {
         } else {
             std::borrow::Cow::Owned(format!("{}{sparql}", self.prefix_head))
         };
-        let parsed = sparkles_core::sparql::parse_query(&full, None, &[])
-            .map_err(|e| rdf::map_core_parse_error(e, "invalid SPIN candidate query"))?;
+        let parsed = sparkles_core::sparql::parse_query_with_max_resolved_iri_bytes(
+            &full,
+            None,
+            &[],
+            budget.remaining_bytes(),
+        )
+        .map_err(|e| rdf::map_core_parse_error(e, "invalid SPIN candidate query"))?;
         if self.require_construct && !matches!(parsed, Query::Construct { .. }) {
             bail!("SPIN rule query must be a CONSTRUCT query");
         }
@@ -417,12 +417,6 @@ pub(crate) fn translate_with_extra_types(
         let r = fresh();
         // a variable named this in the parsed query, not a word in a comment or a
         // longer variable name
-        template::admit_resolved_prefixed_iris(
-            &text,
-            Some(&check.prefixes.map),
-            rule_budget.remaining_bytes(),
-        )
-        .with_context(|| format!("the SPARQL query of the SPIN rule {rule}"))?;
         let full_len = head.len().saturating_add(text.len());
         if full_len > rdf::MAX_RETAINED_BYTES {
             return Err(rdf::limit_err(format!(
@@ -432,9 +426,15 @@ pub(crate) fn translate_with_extra_types(
             .with_context(|| format!("the SPARQL query of the SPIN rule {rule}"));
         }
         let full = format!("{head}{text}");
-        let parsed = sparkles_core::sparql::parse_query(&full, None, &[])
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .map_err(|e| e.context(format!("the SPARQL query of the SPIN rule {rule}")))?;
+        let parsed = sparkles_core::sparql::parse_query_with_max_resolved_iri_bytes(
+            &full,
+            None,
+            &[],
+            rule_budget.remaining_bytes(),
+        )
+        .map_err(|e| {
+            rdf::map_core_parse_error(e, &format!("the SPARQL query of the SPIN rule {rule}"))
+        })?;
         if !matches!(parsed, Query::Construct { .. }) {
             bail!("the SPIN rule {rule} of {class} must be a CONSTRUCT query");
         }
@@ -3701,7 +3701,18 @@ mod tests {
         let mut g = parse_ttl(
             r#"
             ex:sel a sp:Select ;
-              sp:resultVariables ( [ sp:varName "arg" ] [ sp:varName "_spin_v1" ] ) ;
+              sp:resultVariables (
+                [ sp:varName "arg" ]
+                [ sp:varName "_spin_v1" ]
+                [ sp:varName "_spin_v2" ]
+                [ sp:varName "_spin_v3" ]
+                [ sp:varName "_spin_v4" ]
+                [ sp:varName "_spin_v5" ]
+                [ sp:varName "_spin_v6" ]
+                [ sp:varName "_spin_v7" ]
+                [ sp:varName "_spin_v8" ]
+                [ sp:varName "_spin_v9" ]
+              ) ;
               sp:limit 3 .
             "#,
         );
@@ -3850,7 +3861,240 @@ mod tests {
             peaks.finalization_live
         );
         assert!(parse_query(&q, None, &[]).is_ok(), "invalid SPARQL output");
-        assert!(q.contains("?_spin_v2 <http://example.org/p1>"));
+        assert!(
+            q.contains("?_spin_v10 <http://example.org/p1>"),
+            "collision rewrite must widen _spin_v1 to _spin_v10"
+        );
         assert!(q.contains("<http://example.org/Val> <http://example.org/p2>"));
+    }
+
+    #[test]
+    fn round7_parser_enforced_resolved_iri_budget_blocks_compact_and_shadowed_forms() {
+        let long_base = format!("https://example.org/{}/", "a".repeat(200_000));
+
+        // 1. Short-prefix shadowing on compact FILTER (`PREFIX FILTERp: <http://s/>`
+        //    alongside long `PREFIX p: <ns/>` and `FILTERp:f{i}(?x)`).
+        let mut filter_shadow = format!(
+            "BASE <{long_base}>\nPREFIX FILTERp: <http://s/>\nPREFIX p: <ns/>\n\
+             CONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{ ?this <urn:in> ?x .\n"
+        );
+        for i in 0..16 {
+            filter_shadow.push_str(&format!("  FILTERp:f{i}(?x)\n"));
+        }
+        filter_shadow.push('}');
+
+        // 2. Short-prefix shadowing on compact GRAPH (`PREFIX GRAPHp: <http://s/>`
+        //    alongside long `PREFIX p: <ns/>` and `GRAPHp:g{i} { ... }`).
+        let mut graph_shadow = format!(
+            "BASE <{long_base}>\nPREFIX GRAPHp: <http://s/>\nPREFIX p: <ns/>\n\
+             CONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{\n"
+        );
+        for i in 0..16 {
+            graph_shadow.push_str(&format!("  GRAPHp:g{i} {{ ?this <urn:in> ?x }}\n"));
+        }
+        graph_shadow.push('}');
+
+        // 3. Case-sensitive `a` shorthand in CONSTRUCT template and WHERE (`?this ap:C{i} .`).
+        let mut a_construct = format!("BASE <{long_base}>\nPREFIX p: <ns/>\nCONSTRUCT {{\n");
+        let mut a_where = format!(
+            "BASE <{long_base}>\nPREFIX p: <ns/>\nCONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{\n"
+        );
+        for i in 0..16 {
+            a_construct.push_str(&format!("  ?this ap:C{i} .\n"));
+            a_where.push_str(&format!("  ?this ap:C{i} .\n"));
+        }
+        a_construct.push_str("} WHERE { ?this <urn:in> ?x }");
+        a_where.push('}');
+
+        // 4. Default prefix glued onto `a` (`?this a:C{i} .`).
+        let mut a_default = format!("BASE <{long_base}>\nPREFIX : <ns/>\nCONSTRUCT {{\n");
+        for i in 0..16 {
+            a_default.push_str(&format!("  ?this a:C{i} .\n"));
+        }
+        a_default.push_str("} WHERE { ?this <urn:in> ?x }");
+
+        // 5. >3 zero-whitespace boolean / UNDEF tokens in VALUES (`truetruetruetruep:a{i}`,
+        //    `falsep:b{i}`, `UNDEFp:c{i}`).
+        let mut values_glued = format!(
+            "BASE <{long_base}>\nPREFIX p: <ns/>\nCONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{ ?this <urn:in> ?x . VALUES ?x {{"
+        );
+        for i in 0..8 {
+            values_glued.push_str(&format!(" truetruetruetruep:a{i} falsep:b{i} UNDEFp:c{i}"));
+        }
+        values_glued.push_str(" } }");
+
+        // 6. Zero-whitespace boolean before IRI in collection (`( truep:a0 ... )`).
+        let mut coll_glued = format!(
+            "BASE <{long_base}>\nPREFIX p: <ns/>\nCONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{ ?this <urn:in> ("
+        );
+        for i in 0..16 {
+            coll_glued.push_str(&format!(" truep:a{i}"));
+        }
+        coll_glued.push_str(" ) }");
+
+        for (label, query) in [
+            ("FILTERp shadow", filter_shadow),
+            ("GRAPHp shadow", graph_shadow),
+            ("a shorthand CONSTRUCT", a_construct),
+            ("a shorthand WHERE", a_where),
+            ("a shorthand default prefix", a_default),
+            ("VALUES >3 booleans + UNDEF", values_glued),
+            ("collection truep", coll_glued),
+        ] {
+            let mut g = parse_ttl(r#"ex:Person spin:rule ex:r ."#);
+            g.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/r"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(query),
+            ));
+            let err = translate(&g, &[]).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("maximum resolved IRI size"),
+                "{label}: {err:#}"
+            );
+            assert!(
+                super::rdf::is_limit_or_cycle_error(&err),
+                "{label} must propagate SpinLimitError: {err:#}"
+            );
+        }
+
+        // 6. Dual-form structural candidate whose textual subquery overflows resolved-IRI
+        //    budget via compact `FILTERp:f{i}(?x)` under shadowed `FILTERp` must NOT fall
+        //    back to outer `sp:text`.
+        let long_ns = format!("http://example.org/{}/", "a".repeat(200_000));
+        let mut sq = String::from("SELECT ?x WHERE { ?s <urn:in> ?x .\n");
+        for i in 0..16 {
+            sq.push_str(&format!("  FILTERp:f{i}(?x)\n"));
+        }
+        sq.push('}');
+        let mut g_dual = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object [ sp:varName "x" ] ] ) ;
+              sp:where ( [ a sp:SubQuery ; sp:query ex:sq ] ) ;
+              sp:text "CONSTRUCT { ?this <urn:fallback> 1 } WHERE { ?this <urn:in> ?x }"
+            ] .
+            "#,
+        );
+        g_dual.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/sq"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(sq),
+        ));
+        let prefixes = vec![
+            ("FILTERp".to_string(), "http://short.example/".to_string()),
+            ("p".to_string(), long_ns),
+        ];
+        let err = translate(&g_dual, &prefixes).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum resolved IRI size"),
+            "dual-form shadowed FILTERp must fail with limit error, not fall back: {err:#}"
+        );
+    }
+
+    #[test]
+    fn round7_standalone_inferred_aggregate_nesting_in_having_and_order_by() {
+        let wrap_subquery = |subquery: &str| {
+            let mut g = parse_ttl(
+                r#"
+                ex:q a sp:Construct ;
+                  sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "a" ] ] ) ;
+                  sp:where ( [ a sp:SubQuery ; sp:query ex:inner ] ) .
+                "#,
+            );
+            g.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/inner"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(subquery),
+            ));
+            g
+        };
+
+        // Forward bare Constraint (`ORDER BY` / `HAVING`) and reverse order across
+        // `HAVING` / `ORDER BY` (both bare and parenthesized) must reject nested calls
+        // to an inferred synthetic aggregate.
+        for bad_subquery in [
+            "SELECT (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v } ORDER BY p:f(COUNT(?v))",
+            "SELECT (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v } HAVING p:f(COUNT(?v))",
+            "SELECT (COUNT(?v) AS ?a) WHERE { ?s <urn:p> ?v } HAVING(p:f(COUNT(?v))) ORDER BY p:f(DISTINCT ?v)",
+            "SELECT (COUNT(?v) AS ?a) WHERE { ?s <urn:p> ?v } HAVING p:f(COUNT(?v)) ORDER BY p:f(DISTINCT ?v)",
+            "SELECT (COUNT(?v) AS ?a) WHERE { ?s <urn:p> ?v } HAVING (p:f(COUNT(?v)) > 0 && p:f(DISTINCT ?v) > 0)",
+            "SELECT (COUNT(?v) AS ?a) WHERE { ?s <urn:p> ?v } ORDER BY p:f(COUNT(?v)) p:f(DISTINCT ?v)",
+            "SELECT (p:f(COUNT(?v)) AS ?a) WHERE { ?s <urn:p> ?v } ORDER BY p:f(DISTINCT ?v)",
+        ] {
+            let g_bad = wrap_subquery(bad_subquery);
+            assert!(
+                serialize_query(&g_bad, &ex("q")).is_err(),
+                "must reject nested inferred aggregate in solution modifiers: {bad_subquery}"
+            );
+        }
+
+        // Valid non-nested calls and explicit-IRI controls in both orders must succeed.
+        for ok_subquery in [
+            "SELECT (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v } ORDER BY p:f(?v)",
+            "SELECT (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v } HAVING p:f(?v)",
+            "SELECT (COUNT(?v) AS ?a) WHERE { ?s <urn:p> ?v } HAVING p:f(?v) ORDER BY p:f(DISTINCT ?v)",
+            "SELECT (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v } ORDER BY <urn:sparkles:spin-subquery-check:p0/f>(COUNT(?v))",
+            "SELECT (COUNT(?v) AS ?a) WHERE { ?s <urn:p> ?v } HAVING (<urn:sparkles:spin-subquery-check:p0/f>(COUNT(?v)) > 0) ORDER BY p:f(DISTINCT ?v)",
+            "SELECT (COUNT(?v) AS ?a) WHERE { ?s <urn:p> ?v } HAVING (p:f(COUNT(?v)) > 0)",
+        ] {
+            let g_ok = wrap_subquery(ok_subquery);
+            assert!(
+                serialize_query(&g_ok, &ex("q")).is_ok(),
+                "must accept valid standalone modifier query: {ok_subquery}"
+            );
+        }
+    }
+
+    #[test]
+    fn round7_known_prefix_compact_subquery_preflight_keeps_structural_rule() {
+        // R7-3: A valid structural SPIN rule containing a textual subquery with compact
+        // keyword-glued prefixed names (`FILTERp:f(?x)`, `?s ap:C`,
+        // `VALUES ?v { truetruetruetruep:a0 UNDEFp:a1 }`) must pass known-prefix preflight
+        // and win over outer `sp:text` fallback — both when only `p` is declared and when
+        // `FILTERp` is also declared.
+        let subquery = "SELECT ?x WHERE { ?s ap:C . ?s <urn:p> ?x . FILTERp:f(?x) VALUES ?v { truetruetruetruep:a0 UNDEFp:a1 } }";
+        let mut g = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:structuralWin ; sp:object [ sp:varName "x" ] ] ) ;
+              sp:where ( [ a sp:SubQuery ; sp:query ex:sq ] ) ;
+              sp:text "CONSTRUCT { ?this <urn:fallbackLost> 1 } WHERE { ?this <urn:in> ?x }"
+            ] .
+            "#,
+        );
+        g.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/sq"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(subquery),
+        ));
+
+        for caller_prefixes in [
+            vec![("p".to_string(), "http://example.org/p/".to_string())],
+            vec![
+                ("FILTERp".to_string(), "http://example.org/fp/".to_string()),
+                ("p".to_string(), "http://example.org/p/".to_string()),
+            ],
+        ] {
+            let translated = translate(&g, &caller_prefixes).unwrap();
+            let construct_str = translated
+                .triples_for_predicate(crate::vocab::sh::CONSTRUCT)
+                .next()
+                .and_then(|t| match t.object {
+                    oxrdf::TermRef::Literal(l) => Some(l.value().to_string()),
+                    _ => None,
+                })
+                .expect("missing sh:construct");
+            assert!(
+                construct_str.contains("structuralWin"),
+                "structural form must win over outer sp:text fallback (prefixes={caller_prefixes:?}): {construct_str}"
+            );
+            assert!(
+                !construct_str.contains("fallbackLost"),
+                "outer sp:text fallback must not be selected (prefixes={caller_prefixes:?}): {construct_str}"
+            );
+        }
     }
 }
