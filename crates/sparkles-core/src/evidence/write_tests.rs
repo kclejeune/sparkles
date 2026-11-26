@@ -385,3 +385,117 @@ fn single_identities_charge_their_first_allocations() {
     drop(held);
     assert!(preparation.reserve(LIMIT - 2048).is_ok());
 }
+
+/// Allocation-free N-Triples and JSON-escaped byte estimates upper-bound actual
+/// serialization, including control characters that expand up to 7x under N-Triples
+/// plus JSON escaping.
+#[test]
+fn ntriples_and_json_escaped_byte_estimates_bound_actual_serialization() {
+    let cases = vec![
+        Triple::new(
+            NamedNode::new_unchecked("urn:s"),
+            NamedNode::new_unchecked("urn:p"),
+            Literal::new_simple_literal("\0\x01\x07\x08\t\n\x0c\r\x1f\"\\\x7f\u{FFFE}\u{FFFF}abc"),
+        ),
+        Triple::new(
+            oxrdf::BlankNode::new_unchecked("b0"),
+            NamedNode::new_unchecked("urn:p"),
+            Literal::new_language_tagged_literal_unchecked("hello\0world", "en-US"),
+        ),
+        Triple::new(
+            NamedNode::new_unchecked("urn:s"),
+            NamedNode::new_unchecked("urn:p"),
+            Literal::new_typed_literal(
+                "[\"\\u0000\"]",
+                NamedNode::new_unchecked("http://example.org/dt"),
+            ),
+        ),
+        Triple::new(
+            NamedNode::new_unchecked("urn:outer"),
+            NamedNode::new_unchecked("urn:reifies"),
+            Term::Triple(Box::new(Triple::new(
+                oxrdf::BlankNode::new_unchecked("inner"),
+                NamedNode::new_unchecked("urn:q"),
+                Literal::new_simple_literal("\0".repeat(256)),
+            ))),
+        ),
+    ];
+    for t in cases {
+        let nt = t.to_string();
+        let json = serde_json::to_string(&nt).unwrap();
+        assert!(
+            ntriples_triple_bytes(&t) >= nt.len() as u64,
+            "ntriples estimate {} < actual {} for {nt}",
+            ntriples_triple_bytes(&t),
+            nt.len()
+        );
+        assert!(
+            json_escaped_ntriples_triple_bytes(&t) >= json.len() as u64,
+            "json estimate {} < actual {} for {json}",
+            json_escaped_ntriples_triple_bytes(&t),
+            json.len()
+        );
+    }
+}
+
+/// `subjects_up_to_held` and `objects_up_to_held` charge retained decoded clones to
+/// the caller's reservation before cloning so long IRIs or literals cannot exceed the
+/// preparation allowance.
+#[test]
+fn subjects_up_to_held_and_objects_up_to_held_charge_before_cloning() {
+    use crate::store::{Store, StoreOptions};
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("INSERT DATA { GRAPH <urn:g> {");
+    for i in 0..80 {
+        data.push_str(&format!(
+            " <urn:subj:{i}:{}> <urn:p> <urn:target> . <urn:head> <urn:rev> <urn:obj:{i}:{}> .",
+            "x".repeat(1024),
+            "y".repeat(1024)
+        ));
+    }
+    data.push_str(" } }");
+    crate::sparql::update::update(&s, &data, &crate::sparql::QueryOptions::default()).unwrap();
+    let snap = s.snapshot();
+    // 80 * ~1 KiB = ~80 KiB of retained IRIs per scan: both scans together fit in
+    // 512 KiB, while a single scan refuses in 64 KiB.
+    let roomy = Preparation::new(crate::task::Control::none(), 512 << 10).unwrap();
+    let mut reads = Reads::new(&roomy, &snap);
+    let mut held = roomy.reserve(0).unwrap();
+    let (subs, more_s) = reads
+        .subjects_up_to_held(
+            "urn:p",
+            &Term::NamedNode(NamedNode::new_unchecked("urn:target")),
+            "urn:g",
+            1000,
+            &mut held,
+        )
+        .unwrap();
+    assert_eq!(subs.len(), 80);
+    assert!(!more_s);
+    let (objs, more_o) = reads
+        .objects_up_to_held("urn:head", "urn:rev", "urn:g", 1000, &mut held)
+        .unwrap();
+    assert_eq!(objs.len(), 80);
+    assert!(!more_o);
+    drop(held);
+
+    let tight = Preparation::new(crate::task::Control::none(), 64 << 10).unwrap();
+    let mut reads = Reads::new(&tight, &snap);
+    let mut held = tight.reserve(0).unwrap();
+    assert!(matches!(
+        reads.subjects_up_to_held(
+            "urn:p",
+            &Term::NamedNode(NamedNode::new_unchecked("urn:target")),
+            "urn:g",
+            1000,
+            &mut held,
+        ),
+        Err(Error::BudgetExceeded(_))
+    ));
+    drop(held);
+    let mut held = tight.reserve(0).unwrap();
+    assert!(matches!(
+        reads.objects_up_to_held("urn:head", "urn:rev", "urn:g", 1000, &mut held),
+        Err(Error::BudgetExceeded(_))
+    ));
+}

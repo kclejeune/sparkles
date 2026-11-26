@@ -1205,6 +1205,86 @@ pub fn triple_bytes(triple: &Triple) -> u64 {
         .saturating_add(std::mem::size_of::<Triple>() as u64)
 }
 
+fn literal_formatted_bytes(literal: &Literal, json_escape: bool) -> u64 {
+    // Opening and closing double quotes (`"` vs `\"`).
+    let mut n: u64 = if json_escape { 4 } else { 2 };
+    for c in literal.value().chars() {
+        n = n.saturating_add(match c {
+            '\u{8}' | '\t' | '\n' | '\u{C}' | '\r' => {
+                if json_escape {
+                    3
+                } else {
+                    2
+                }
+            }
+            '"' | '\\' => {
+                if json_escape {
+                    4
+                } else {
+                    2
+                }
+            }
+            '\0'..='\u{1F}' | '\u{7F}' | '\u{FFFE}' | '\u{FFFF}' => {
+                if json_escape {
+                    7
+                } else {
+                    6
+                }
+            }
+            _ => c.len_utf8() as u64,
+        });
+    }
+    if let Some(lang) = literal.language() {
+        // `@lang` plus optional `--ltr` / `--rtl` base direction suffix.
+        n = n
+            .saturating_add(1)
+            .saturating_add(lang.len() as u64)
+            .saturating_add(6);
+    } else if literal.datatype().as_str() != format!("{XSD}string") {
+        // `^^<datatype>`
+        n = n
+            .saturating_add(4)
+            .saturating_add(literal.datatype().as_str().len() as u64);
+    }
+    n
+}
+
+fn ntriples_subject_bytes(subject: &NamedOrBlankNode) -> u64 {
+    match subject {
+        NamedOrBlankNode::NamedNode(n) => (n.as_str().len() as u64).saturating_add(2),
+        NamedOrBlankNode::BlankNode(b) => (b.as_str().len() as u64).saturating_add(2),
+    }
+}
+
+fn triple_formatted_bytes(triple: &Triple, json_escape: bool) -> u64 {
+    ntriples_subject_bytes(&triple.subject)
+        .saturating_add(1)
+        .saturating_add((triple.predicate.as_str().len() as u64).saturating_add(2))
+        .saturating_add(1)
+        .saturating_add(term_formatted_bytes(&triple.object, json_escape))
+}
+
+fn term_formatted_bytes(term: &Term, json_escape: bool) -> u64 {
+    match term {
+        Term::NamedNode(n) => (n.as_str().len() as u64).saturating_add(2),
+        Term::BlankNode(b) => (b.as_str().len() as u64).saturating_add(2),
+        Term::Literal(l) => literal_formatted_bytes(l, json_escape),
+        // `<<( ... )>>`
+        Term::Triple(t) => triple_formatted_bytes(t, json_escape).saturating_add(8),
+    }
+}
+
+/// Conservative N-Triples byte length of `triple.to_string()`, computed without allocating.
+pub fn ntriples_triple_bytes(triple: &Triple) -> u64 {
+    triple_formatted_bytes(triple, false)
+}
+
+/// Conservative JSON-encoded string byte length of `serde_json::to_string(&triple.to_string())`,
+/// including the surrounding JSON quotes, computed without allocating.
+pub fn json_escaped_ntriples_triple_bytes(triple: &Triple) -> u64 {
+    triple_formatted_bytes(triple, true).saturating_add(2)
+}
+
 /// A graph's stored quad with its physical `[Id; 4]` and decoded triple.
 pub type StoredQuad = ([Id; 4], Triple);
 
@@ -1304,16 +1384,76 @@ impl<'a> Reads<'a> {
                 ids.push(q[2]);
                 Ok(ids.len() < 2)
             })?;
+        let mut held = self.preparation.reserve(0)?;
         let mut out = Vec::new();
         for id in ids {
-            if let Some(t) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
+            if let Some(t) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(term) => {
+                    held.grow_by(term_bytes(term))?;
+                    Ok(Some(term.clone()))
+                }
+                None => Ok(None),
+            })? {
                 out.push(t);
             }
         }
         Ok(out)
+    }
+
+    /// The objects of `s p ?o` in `g`, at most `limit` of them, and whether more exist.
+    /// The scan buffer, output buffer and every retained term are charged to `held`
+    /// before allocation or cloning.
+    pub fn objects_up_to_held(
+        &mut self,
+        s: &str,
+        p: &str,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<Term>, bool)> {
+        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+            return Ok((Vec::new(), false));
+        };
+        const ROW: u64 = std::mem::size_of::<Id>() as u64;
+        const CHUNK: usize = 1024;
+        const OUT_ROW: u64 = std::mem::size_of::<Term>() as u64;
+        const OUT_CHUNK: usize = 256;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut ids: Vec<Id> = Vec::new();
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                if ids.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                if ids.len() == ids.capacity() {
+                    let add = limit.saturating_sub(ids.len()).clamp(1, CHUNK);
+                    rows_held.grow_by((add as u64).saturating_mul(ROW))?;
+                    ids.reserve_exact(add);
+                }
+                ids.push(q[2]);
+                Ok(true)
+            })?;
+        let mut out: Vec<Term> = Vec::new();
+        let total = ids.len();
+        for (i, id) in ids.into_iter().enumerate() {
+            if out.len() == out.capacity() {
+                let add = total.saturating_sub(i).clamp(1, OUT_CHUNK);
+                held.grow_by((add as u64).saturating_mul(OUT_ROW))?;
+                out.reserve_exact(add);
+            }
+            if let Some(t) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(term) => {
+                    held.grow_by(term_bytes(term))?;
+                    Ok(Some(term.clone()))
+                }
+                None => Ok(None),
+            })? {
+                out.push(t);
+            }
+        }
+        Ok((out, more))
     }
 
     /// The objects of `s p ?o` in `g`, at most `limit` of them, and whether more exist.
@@ -1324,27 +1464,71 @@ impl<'a> Reads<'a> {
         g: &str,
         limit: usize,
     ) -> Result<(Vec<Term>, bool)> {
-        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+        let mut held = self.preparation.reserve(0)?;
+        self.objects_up_to_held(s, p, g, limit, &mut held)
+    }
+
+    /// The IRI subjects of `?s p o` in `g`, at most `limit` of them, and whether more
+    /// exist. `o` is a ground term. The scan buffer, output buffer and every retained
+    /// IRI are charged to `held` before allocation or cloning.
+    pub fn subjects_up_to_held(
+        &mut self,
+        p: &str,
+        o: &Term,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
+        let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
             return Ok((Vec::new(), false));
         };
-        let mut ids = Vec::new();
+        let o = match o {
+            Term::NamedNode(n) => self.id(n.as_str())?,
+            t => self.preparation.lookup_term(self.snap, t)?,
+        };
+        let Some(o) = o else {
+            return Ok((Vec::new(), false));
+        };
+        const ROW: u64 = std::mem::size_of::<Id>() as u64;
+        const CHUNK: usize = 1024;
+        const OUT_ROW: u64 = std::mem::size_of::<NamedNode>() as u64;
+        const OUT_CHUNK: usize = 256;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut ids: Vec<Id> = Vec::new();
         let mut more = false;
         self.preparation
-            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+            .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
+                if q[3] != g {
+                    return Ok(true);
+                }
                 if ids.len() == limit {
                     more = true;
                     return Ok(false);
                 }
-                ids.push(q[2]);
+                if ids.len() == ids.capacity() {
+                    let add = limit.saturating_sub(ids.len()).clamp(1, CHUNK);
+                    rows_held.grow_by((add as u64).saturating_mul(ROW))?;
+                    ids.reserve_exact(add);
+                }
+                ids.push(q[0]);
                 Ok(true)
             })?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(t) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
-                out.push(t);
+        let mut out: Vec<NamedNode> = Vec::new();
+        let total = ids.len();
+        for (i, id) in ids.into_iter().enumerate() {
+            if out.len() == out.capacity() {
+                let add = total.saturating_sub(i).clamp(1, OUT_CHUNK);
+                held.grow_by((add as u64).saturating_mul(OUT_ROW))?;
+                out.reserve_exact(add);
+            }
+            if let Some(n) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(32))?;
+                    Ok(Some(n.clone()))
+                }
+                _ => Ok(None),
+            })? {
+                out.push(n);
             }
         }
         Ok((out, more))
@@ -1359,40 +1543,8 @@ impl<'a> Reads<'a> {
         g: &str,
         limit: usize,
     ) -> Result<(Vec<NamedNode>, bool)> {
-        let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
-            return Ok((Vec::new(), false));
-        };
-        let o = match o {
-            Term::NamedNode(n) => self.id(n.as_str())?,
-            t => self.preparation.lookup_term(self.snap, t)?,
-        };
-        let Some(o) = o else {
-            return Ok((Vec::new(), false));
-        };
-        let mut ids = Vec::new();
-        let mut more = false;
-        self.preparation
-            .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
-                if q[3] != g {
-                    return Ok(true);
-                }
-                if ids.len() == limit {
-                    more = true;
-                    return Ok(false);
-                }
-                ids.push(q[0]);
-                Ok(true)
-            })?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(Term::NamedNode(n)) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
-                out.push(n);
-            }
-        }
-        Ok((out, more))
+        let mut held = self.preparation.reserve(0)?;
+        self.subjects_up_to_held(p, o, g, limit, &mut held)
     }
 
     /// The number of triples whose subject is `s` in `g`, counting at most `limit`.
@@ -1558,6 +1710,11 @@ impl<'a> Reads<'a> {
                 Ok(false)
             })?;
         Ok(found)
+    }
+
+    /// Whether `op` is recorded as an `ev:Operation` in graph `g`.
+    pub fn has_operation(&mut self, op: &str, g: &str) -> Result<bool> {
+        self.is_operation(op, g)
     }
 
     fn is_operation(&mut self, op: &str, g: &str) -> Result<bool> {

@@ -111,7 +111,8 @@ pub use review::identity::{
 };
 pub use review::{
     Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, ReconciledProjection,
-    Reviewed, Withdrawn, WithdrawnClaim, reconcile_projection, review, withdraw,
+    Reviewed, Withdrawn, WithdrawnClaim, reconcile_projection, reconcile_projection_prepared,
+    review, withdraw,
 };
 pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
 pub use sparkles_core::evidence::{
