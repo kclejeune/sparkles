@@ -273,9 +273,52 @@ impl Runtime {
                 }
             }
         }
+        #[cfg(test)]
+        fire_wait_built_final_hook();
         let reg = self.reg.lock();
+        if self.is_closed() {
+            return Err(crate::incr::error(
+                "views-unavailable",
+                "the dataset is closing",
+            ));
+        }
         let e = reg.view(name)?;
         let head = e.cell.as_ref().map_or(0, |c| c.info.lock().applied);
         Ok(self.info(name, e, head))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAIT_BUILT_FINAL_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct WaitBuiltFinalHookGuard;
+
+#[cfg(test)]
+impl Drop for WaitBuiltFinalHookGuard {
+    fn drop(&mut self) {
+        WAIT_BUILT_FINAL_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_wait_built_final_hook(f: impl FnMut() + 'static) -> WaitBuiltFinalHookGuard {
+    WAIT_BUILT_FINAL_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    WaitBuiltFinalHookGuard
+}
+
+#[cfg(test)]
+fn fire_wait_built_final_hook() {
+    let f = WAIT_BUILT_FINAL_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = f {
+        f();
+        WAIT_BUILT_FINAL_HOOK.with(|h| {
+            if h.borrow().is_none() {
+                *h.borrow_mut() = Some(f);
+            }
+        });
     }
 }

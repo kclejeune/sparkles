@@ -258,6 +258,12 @@ impl Runtime {
             let step = (Instant::now() + WAIT_STEP).min(until);
             let entry = if let Some(reg) = self.reg.try_lock_until(step) {
                 check()?;
+                if self.is_closed() {
+                    return Err(crate::incr::error(
+                        "views-unavailable",
+                        "the dataset is closing",
+                    ));
+                }
                 let mode_ready = mode.as_ref().is_none_or(|(errors, inference)| {
                     reg.aggregate_errors == *errors
                         && Inference::same(reg.inference.as_deref(), inference.as_ref())
@@ -302,8 +308,16 @@ impl Runtime {
                     // `building`, so they describe the circuit whose version is returned. A
                     // build holds that lock, so wait in short cooperative steps until `until`.
                     let step = (Instant::now() + WAIT_STEP).min(until);
+                    #[cfg(test)]
+                    fire_open_view_state_hook();
                     if let Some(st) = cell.state.try_lock_until(step) {
                         check()?;
+                        if self.is_closed() {
+                            return Err(crate::incr::error(
+                                "views-unavailable",
+                                "the dataset is closing",
+                            ));
+                        }
                         let held = st.circuit.aggregate_errors.unwrap_or(errors);
                         // another reading of errors than the view's: evaluate the view's query
                         // at the reader's snapshot without touching the view's state
@@ -776,5 +790,40 @@ mod tests {
             &mut |_| Ok(()),
         );
         assert!(matches!(outcome, Err(Error::Cancelled)));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPEN_VIEW_STATE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct OpenViewStateHookGuard;
+
+#[cfg(test)]
+impl Drop for OpenViewStateHookGuard {
+    fn drop(&mut self) {
+        OPEN_VIEW_STATE_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_open_view_state_hook(f: impl FnMut() + 'static) -> OpenViewStateHookGuard {
+    OPEN_VIEW_STATE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    OpenViewStateHookGuard
+}
+
+#[cfg(test)]
+fn fire_open_view_state_hook() {
+    let f = OPEN_VIEW_STATE_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = f {
+        f();
+        OPEN_VIEW_STATE_HOOK.with(|h| {
+            if h.borrow().is_none() {
+                *h.borrow_mut() = Some(f);
+            }
+        });
     }
 }

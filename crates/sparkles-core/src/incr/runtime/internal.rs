@@ -138,6 +138,41 @@ fn status_error(s: &Status) -> Option<Error> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static WAIT_TIMEOUT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct WaitTimeoutHookGuard;
+
+#[cfg(test)]
+impl Drop for WaitTimeoutHookGuard {
+    fn drop(&mut self) {
+        WAIT_TIMEOUT_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_wait_timeout_hook(f: impl FnMut() + 'static) -> WaitTimeoutHookGuard {
+    WAIT_TIMEOUT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    WaitTimeoutHookGuard
+}
+
+#[cfg(test)]
+fn fire_wait_timeout_hook() {
+    let f = WAIT_TIMEOUT_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = f {
+        f();
+        WAIT_TIMEOUT_HOOK.with(|h| {
+            if h.borrow().is_none() {
+                *h.borrow_mut() = Some(f);
+            }
+        });
+    }
+}
+
 impl InternalCircuit {
     pub fn id(&self) -> &str {
         &self.cell.spec.id
@@ -177,7 +212,10 @@ impl InternalCircuit {
             }
             rt.kick();
             if !rt.wait_round_after(epoch, until) {
-                return self.commit() >= commit && !self.cell.failed.load(Ordering::Acquire);
+                let reached = self.commit() >= commit;
+                #[cfg(test)]
+                fire_wait_timeout_hook();
+                return reached && !self.cell.failed.load(Ordering::Acquire);
             }
         }
     }
