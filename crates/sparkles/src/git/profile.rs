@@ -208,6 +208,12 @@ pub struct WriteOptions {
     /// Maximum number of indistinguishable adjacent blank nodes permitted in one
     /// RDFC-1.0 permutation bucket before refusing cleanly.
     pub max_canonicalize_ambiguous_group: usize,
+    /// Maximum size of `.sparkles-git/manifest.json` in bytes.
+    pub max_manifest_bytes: u64,
+    /// Maximum size of a single per-graph RDF file in bytes.
+    pub max_graph_file_bytes: u64,
+    /// Maximum aggregate bytes written across a canonical tree.
+    pub max_total_bytes: u64,
 }
 
 impl Default for WriteOptions {
@@ -219,6 +225,9 @@ impl Default for WriteOptions {
             max_quads: DEFAULT_MAX_QUADS,
             max_blank_nodes: DEFAULT_MAX_BLANK_NODES,
             max_canonicalize_ambiguous_group: DEFAULT_MAX_AMBIGUOUS_GROUP,
+            max_manifest_bytes: DEFAULT_MAX_MANIFEST_BYTES,
+            max_graph_file_bytes: DEFAULT_MAX_GRAPH_FILE_BYTES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
         }
     }
 }
@@ -355,16 +364,17 @@ pub(crate) fn write_git_tree_tracked(
     dir: &Path,
     options: &WriteOptions,
 ) -> GitResult<(CanonicalManifest, Vec<String>)> {
-    // 1. Validate target root and managed subdirectories BEFORE canonicalizing or mutating
-    //    anything, rejecting symlinks on root, `.sparkles-git`, `graphs`, and `manifest.json`.
-    ensure_dir_no_symlink(dir)?;
-    let meta_dir = ensure_child_dir_no_symlink(dir, METADATA_DIR)?;
-    let graphs_dir = ensure_child_dir_no_symlink(dir, GRAPHS_DIR)?;
-    let manifest_path = resolve_safe_path(dir, MANIFEST_REL_PATH)?;
-
-    // Read previously profile-owned graph paths (if an earlier valid manifest exists) so
-    // stale pruning removes only files this profile wrote and never deletes unmanaged files.
-    let prior_owned_paths = read_prior_owned_graph_paths(&manifest_path)?;
+    // 1. Read-only preflight of root, managed subdirectories, and any prior manifest BEFORE
+    //    creating directories, canonicalizing, or mutating any files.
+    let (clean_dir, dir_exists) = preflight_target_dir_no_symlink(dir)?;
+    let prior_owned = if dir_exists {
+        preflight_optional_child_dir_no_symlink(&clean_dir, METADATA_DIR)?;
+        preflight_optional_child_dir_no_symlink(&clean_dir, GRAPHS_DIR)?;
+        let manifest_path = resolve_safe_path(&clean_dir, MANIFEST_REL_PATH)?;
+        read_prior_owned_graph_paths(&manifest_path, options.max_manifest_bytes)?
+    } else {
+        BTreeMap::new()
+    };
 
     // 2. Bounded dataset-wide RDFC-1.0 canonicalization (preserving composite literal
     //    `cdt:List` / `cdt:Map` blank-node links).
@@ -393,22 +403,78 @@ pub(crate) fn write_git_tree_tracked(
         }
     }
 
-    // 5. Assign collision-free relative filenames and stream each graph directly to an
-    //    exclusively created temp file while hashing.
+    // 5. Assign collision-free relative filenames and preflight EVERY destination collision
+    //    and stale prior-owned file BEFORE creating directories or mutating the tree.
     let mut used_paths: BTreeSet<String> = BTreeSet::new();
-    let mut entries = Vec::with_capacity(by_graph.len());
-
+    let mut planned: Vec<(GraphKey, String, Vec<Quad>)> = Vec::with_capacity(by_graph.len());
     for (graph_key, graph_quads) in by_graph {
         let rel_path = assign_graph_path(&graph_key, options.syntax, &mut used_paths);
         validate_graph_path(&rel_path, options.syntax)?;
-        let full_path = resolve_safe_path(dir, &rel_path)?;
-        let quad_count = graph_quads.len() as u64;
+        planned.push((graph_key, rel_path, graph_quads));
+    }
 
-        let digest = write_atomic_stream_hashed(&full_path, |w| match options.syntax {
-            CanonicalSyntax::Turtle => write_canonical_turtle(&graph_quads, &merged_prefixes, w),
-            CanonicalSyntax::NQuads => write_canonical_nquads(&graph_quads, w),
-        })?;
+    let mut stale_to_prune: Vec<String> = Vec::new();
+    if dir_exists {
+        for (_, rel_path, _) in &planned {
+            let full_path = resolve_safe_path(&clean_dir, rel_path)?;
+            preflight_owned_graph_file(
+                &full_path,
+                rel_path,
+                prior_owned.get(rel_path).map(String::as_str),
+                options.max_graph_file_bytes,
+                "overwrite",
+            )?;
+        }
+        if options.prune_stale_graphs {
+            for (rel, expected_sha) in &prior_owned {
+                if used_paths.contains(rel) {
+                    continue;
+                }
+                let full_path = resolve_safe_path(&clean_dir, rel)?;
+                if preflight_owned_graph_file(
+                    &full_path,
+                    rel,
+                    Some(expected_sha.as_str()),
+                    options.max_graph_file_bytes,
+                    "prune",
+                )? {
+                    stale_to_prune.push(rel.clone());
+                }
+            }
+        }
+    }
+
+    // 6. Now create target and managed directories safely.
+    let clean_dir = ensure_dir_no_symlink(&clean_dir)?;
+    let meta_dir = ensure_child_dir_no_symlink(&clean_dir, METADATA_DIR)?;
+    let graphs_dir = ensure_child_dir_no_symlink(&clean_dir, GRAPHS_DIR)?;
+    let manifest_path = resolve_safe_path(&clean_dir, MANIFEST_REL_PATH)?;
+
+    // 7. Stream each graph into an exclusively created temp file (`TempPath`, closing the
+    //    descriptor immediately) while enforcing per-file and aggregate byte limits so an
+    //    over-limit write fails atomically without leaving partial files behind.
+    let mut total_bytes_written = 0u64;
+    let mut staged_graphs: Vec<(tempfile::TempPath, PathBuf)> = Vec::with_capacity(planned.len());
+    let mut entries = Vec::with_capacity(planned.len());
+
+    for (graph_key, rel_path, graph_quads) in planned {
+        let full_path = resolve_safe_path(&clean_dir, &rel_path)?;
+        let quad_count = graph_quads.len() as u64;
+        let remaining = options.max_total_bytes.saturating_sub(total_bytes_written);
+        let file_cap = options.max_graph_file_bytes.min(remaining);
+
+        let (temp_path, written, digest) =
+            stage_atomic_stream_hashed(&full_path, &rel_path, file_cap, |w| {
+                match options.syntax {
+                    CanonicalSyntax::Turtle => {
+                        write_canonical_turtle(&graph_quads, &merged_prefixes, w)
+                    }
+                    CanonicalSyntax::NQuads => write_canonical_nquads(&graph_quads, w),
+                }
+            })?;
         drop(graph_quads);
+        total_bytes_written = total_bytes_written.saturating_add(written);
+        staged_graphs.push((temp_path, full_path));
 
         let (iri, label) = match &graph_key {
             GraphKey::Default => (None, None),
@@ -425,20 +491,55 @@ pub(crate) fn write_git_tree_tracked(
         });
     }
 
-    // 6. Remove stale graph files previously owned by the profile (never following symlinks
-    //    and never touching unmanaged files).
+    // 8. Serialize and size-check the manifest BEFORE publishing any staged graph file.
+    let manifest = CanonicalManifest {
+        format_version: MANIFEST_FORMAT_VERSION,
+        profile: MANIFEST_PROFILE_NAME.to_string(),
+        syntax: options.syntax,
+        canonicalization: CANONICALIZATION_ALGORITHM.to_string(),
+        prefixes: merged_prefixes,
+        graphs: entries,
+    };
+    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| GitError::InvalidManifest(format!("failed to serialize manifest: {e}")))?;
+    manifest_bytes.push(b'\n');
+    let manifest_len = manifest_bytes.len() as u64;
+    if manifest_len > options.max_manifest_bytes {
+        return Err(GitError::Format(format!(
+            "{MANIFEST_REL_PATH} ({manifest_len} bytes) exceeds maximum manifest size ({} bytes)",
+            options.max_manifest_bytes
+        )));
+    }
+    if total_bytes_written.saturating_add(manifest_len) > options.max_total_bytes {
+        return Err(GitError::Format(format!(
+            "canonical tree exceeds maximum aggregate size ({} bytes)",
+            options.max_total_bytes
+        )));
+    }
+    let (staged_manifest, _, _) = stage_atomic_stream_hashed(
+        &manifest_path,
+        MANIFEST_REL_PATH,
+        options.max_manifest_bytes,
+        |w| {
+            w.write_all(&manifest_bytes)
+                .map_err(|e| GitError::io(&manifest_path, e))
+        },
+    )?;
+
+    // 9. Commit staged graph files, prune verified stale files, and publish manifest.
+    let wrote_graphs = !staged_graphs.is_empty();
+    for (temp_path, full_path) in staged_graphs {
+        check_dest_file_not_symlink(&full_path)?;
+        temp_path
+            .persist(&full_path)
+            .map_err(|e| GitError::io(&full_path, e.error))?;
+    }
+
     let mut pruned_paths = Vec::new();
-    if options.prune_stale_graphs && !prior_owned_paths.is_empty() {
+    if !stale_to_prune.is_empty() {
         verify_existing_dir_no_symlink(&graphs_dir, GRAPHS_DIR)?;
-        for rel in prior_owned_paths {
-            if used_paths.contains(&rel) {
-                continue;
-            }
-            if validate_relative_path(&rel).is_err() || !rel.starts_with(&format!("{GRAPHS_DIR}/"))
-            {
-                continue;
-            }
-            let full = resolve_safe_path(dir, &rel)?;
+        for rel in stale_to_prune {
+            let full = resolve_safe_path(&clean_dir, &rel)?;
             match fs::symlink_metadata(&full) {
                 Ok(meta) => {
                     if meta.file_type().is_symlink() {
@@ -456,30 +557,28 @@ pub(crate) fn write_git_tree_tracked(
                 Err(e) => return Err(GitError::io(&full, e)),
             }
         }
-        if !pruned_paths.is_empty() {
-            fsutil::sync_dir(&graphs_dir).map_err(|e| GitError::io(&graphs_dir, e))?;
-        }
+    }
+    if wrote_graphs || !pruned_paths.is_empty() {
+        fsutil::sync_dir(&graphs_dir).map_err(|e| GitError::io(&graphs_dir, e))?;
     }
 
-    // 7. Write versioned manifest atomically with exclusive temp-file creation.
     verify_existing_dir_no_symlink(&meta_dir, METADATA_DIR)?;
-    let manifest = CanonicalManifest {
-        format_version: MANIFEST_FORMAT_VERSION,
-        profile: MANIFEST_PROFILE_NAME.to_string(),
-        syntax: options.syntax,
-        canonicalization: CANONICALIZATION_ALGORITHM.to_string(),
-        prefixes: merged_prefixes,
-        graphs: entries,
-    };
-    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
-        .map_err(|e| GitError::InvalidManifest(format!("failed to serialize manifest: {e}")))?;
-    manifest_bytes.push(b'\n');
-    write_atomic_safe(&manifest_path, &manifest_bytes)?;
+    check_dest_file_not_symlink(&manifest_path)?;
+    staged_manifest
+        .persist(&manifest_path)
+        .map_err(|e| GitError::io(&manifest_path, e.error))?;
+    fsutil::sync_dir(&meta_dir).map_err(|e| GitError::io(&meta_dir, e))?;
 
     Ok((manifest, pruned_paths))
 }
 
-fn read_prior_owned_graph_paths(manifest_path: &Path) -> GitResult<Vec<String>> {
+/// Read and strictly validate an existing `.sparkles-git/manifest.json` (if present),
+/// returning its owned `rel_path -> sha256` map. Refuses unsupported format versions,
+/// malformed JSON, non-canonical paths, and symlinks instead of silently overwriting them.
+fn read_prior_owned_graph_paths(
+    manifest_path: &Path,
+    max_manifest_bytes: u64,
+) -> GitResult<BTreeMap<String, String>> {
     match fs::symlink_metadata(manifest_path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -495,17 +594,77 @@ fn read_prior_owned_graph_paths(manifest_path: &Path) -> GitResult<Vec<String>> 
                 });
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(GitError::io(manifest_path, e)),
     }
-    let bytes =
-        read_bounded_regular_file(manifest_path, MANIFEST_REL_PATH, DEFAULT_MAX_MANIFEST_BYTES)?;
-    // If an existing manifest is corrupted or from another version, we do not prune based
-    // on it; overwriting still produces a valid v1 manifest for the new snapshot.
-    match parse_and_validate_manifest(&bytes, false) {
-        Ok(prior) => Ok(prior.graphs.into_iter().map(|g| g.path).collect()),
-        Err(_) => Ok(Vec::new()),
+    let bytes = read_bounded_regular_file(manifest_path, MANIFEST_REL_PATH, max_manifest_bytes)?;
+    let prior = parse_and_validate_manifest(&bytes, true)?;
+    Ok(prior
+        .graphs
+        .into_iter()
+        .map(|g| (g.path, g.sha256))
+        .collect())
+}
+
+/// Preflight a graph path on disk before overwriting or pruning it.
+///
+/// Returns `Ok(true)` if the file exists and is verified to match `expected_sha`, `Ok(false)`
+/// if it does not exist, or an `UnsafePath` error if the path is a symlink, non-regular
+/// file, unmanaged (`expected_sha == None`), or modified relative to the prior manifest.
+fn preflight_owned_graph_file(
+    full_path: &Path,
+    rel_path: &str,
+    expected_sha: Option<&str>,
+    max_graph_file_bytes: u64,
+    verb: &str,
+) -> GitResult<bool> {
+    match fs::symlink_metadata(full_path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(GitError::io(full_path, e)),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(GitError::UnsafePath {
+                    path: rel_path.to_string(),
+                    reason: "destination graph path must not be a symlink".into(),
+                });
+            }
+            if !meta.file_type().is_file() {
+                return Err(GitError::UnsafePath {
+                    path: rel_path.to_string(),
+                    reason: "destination graph path is not a regular file".into(),
+                });
+            }
+        }
     }
+    let Some(expected) = expected_sha else {
+        return Err(GitError::UnsafePath {
+            path: rel_path.to_string(),
+            reason: format!("refusing to {verb} unmanaged file {rel_path:?}"),
+        });
+    };
+    let (file, len) = open_regular_file_no_symlink(full_path, rel_path)?;
+    if len > max_graph_file_bytes {
+        return Err(GitError::UnsafePath {
+            path: rel_path.to_string(),
+            reason: format!(
+                "existing file {rel_path:?} exceeds maximum graph size ({max_graph_file_bytes} bytes); \
+                 refusing to {verb} without checksum verification"
+            ),
+        });
+    }
+    let mut reader = BoundedHashingReader::new(file, max_graph_file_bytes, rel_path.to_string());
+    reader.drain_to_eof()?;
+    let (_, actual_sha) = reader.finish();
+    if actual_sha != expected {
+        return Err(GitError::UnsafePath {
+            path: rel_path.to_string(),
+            reason: format!(
+                "existing file {rel_path:?} does not match prior manifest checksum; \
+                 refusing to {verb} modified or unmanaged file"
+            ),
+        });
+    }
+    Ok(true)
 }
 
 /// Read and strictly validate a canonical git serialization tree using default [`ReadOptions`].
@@ -538,13 +697,19 @@ pub fn verify_git_tree(dir: &Path) -> GitResult<VerifyReport> {
 /// [`ReadOptions`].
 ///
 /// Verification validates:
-/// - non-symlink root directory and non-symlink regular files (`O_NOFOLLOW` / `is_file`),
+/// - non-symlink root directory (including directory aliases like trailing `/` or `/.`)
+///   and non-symlink regular files (`O_NOFOLLOW` / `is_file`),
 /// - duplicate-key-free JSON manifest, `format_version == 1`, profile & canonicalization IDs,
 /// - canonical graph ordering, non-empty graph entries, canonical filenames under `graphs/`,
 /// - absence of unlisted files or symlinks under `graphs/` (when `strict_layout == true`),
+/// - canonical `c14n<N>` blank-node labels without leading zeros across graph names, quad
+///   positions, nested triple terms, and composite literals (when `strict_layout == true`),
 /// - bounded file sizes, total bytes, and total quad counts,
 /// - streaming SHA-256 checksums and exact deduplicated quad counts (when `verify_checksums == true`),
 /// - strict RDF syntax, graph membership, and duplicate-quad rejection per graph file.
+///
+/// Streaming verification does not re-run dataset-wide RDFC-1.0 canonicalization or
+/// re-check serializer line-by-line byte ordering.
 pub fn verify_git_tree_with(dir: &Path, options: &ReadOptions) -> GitResult<VerifyReport> {
     scan_git_tree_with(dir, options, |_| Ok(()))
 }
@@ -554,8 +719,8 @@ fn scan_git_tree_with(
     options: &ReadOptions,
     mut on_quad: impl FnMut(Quad) -> GitResult<()>,
 ) -> GitResult<VerifyReport> {
-    verify_existing_dir_no_symlink(dir, &dir.display().to_string())?;
-    let manifest_path = resolve_safe_path(dir, MANIFEST_REL_PATH)?;
+    let clean_dir = verify_existing_dir_no_symlink(dir, &dir.display().to_string())?;
+    let manifest_path = resolve_safe_path(&clean_dir, MANIFEST_REL_PATH)?;
     let raw_bytes = read_bounded_regular_file(
         &manifest_path,
         MANIFEST_REL_PATH,
@@ -571,13 +736,13 @@ fn scan_git_tree_with(
     let manifest = parse_and_validate_manifest(&raw_bytes, options.strict_layout)?;
 
     if options.strict_layout {
-        check_no_unlisted_graph_files(dir, &manifest)?;
+        check_no_unlisted_graph_files(&clean_dir, &manifest)?;
     }
 
     let mut total_quads = 0u64;
     for entry in &manifest.graphs {
         let expected_graph = entry.graph_name()?;
-        let full_path = resolve_safe_path(dir, &entry.path)?;
+        let full_path = resolve_safe_path(&clean_dir, &entry.path)?;
         let (file, file_len) = open_regular_file_no_symlink(&full_path, &entry.path)?;
         if file_len > options.max_graph_file_bytes {
             return Err(GitError::InvalidManifest(format!(
@@ -706,6 +871,7 @@ fn check_quad_limits_and_uniqueness(
         )));
     }
     if let Some(seen) = seen_hashes {
+        validate_quad_canonical_bnodes(quad, rel_path)?;
         let h = quad_hash_256(quad);
         if !seen.insert(h) {
             return Err(GitError::InvalidManifest(format!(
@@ -714,6 +880,68 @@ fn check_quad_limits_and_uniqueness(
         }
     }
     Ok(())
+}
+
+fn validate_quad_canonical_bnodes(quad: &Quad, rel_path: &str) -> GitResult<()> {
+    if let NamedOrBlankNode::BlankNode(b) = &quad.subject
+        && !is_canonical_bnode_label(b.as_str())
+    {
+        return Err(GitError::InvalidManifest(format!(
+            "non-canonical blank-node label {:?} in {rel_path}; expected c14n<N>",
+            b.as_str()
+        )));
+    }
+    validate_term_canonical_bnodes(&quad.object, rel_path)?;
+    if let GraphName::BlankNode(b) = &quad.graph_name
+        && !is_canonical_bnode_label(b.as_str())
+    {
+        return Err(GitError::InvalidManifest(format!(
+            "non-canonical blank-node graph label {:?} in {rel_path}; expected c14n<N>",
+            b.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_term_canonical_bnodes(term: &Term, rel_path: &str) -> GitResult<()> {
+    match term {
+        Term::BlankNode(b) => {
+            if !is_canonical_bnode_label(b.as_str()) {
+                return Err(GitError::InvalidManifest(format!(
+                    "non-canonical blank-node label {:?} in {rel_path}; expected c14n<N>",
+                    b.as_str()
+                )));
+            }
+            Ok(())
+        }
+        Term::Triple(tr) => {
+            if let NamedOrBlankNode::BlankNode(b) = &tr.subject
+                && !is_canonical_bnode_label(b.as_str())
+            {
+                return Err(GitError::InvalidManifest(format!(
+                    "non-canonical blank-node label {:?} in {rel_path}; expected c14n<N>",
+                    b.as_str()
+                )));
+            }
+            validate_term_canonical_bnodes(&tr.object, rel_path)
+        }
+        Term::Literal(l) if cdt::may_name_bnodes(l) => {
+            let mut bad: Option<String> = None;
+            let _ = cdt::relabel_literal(l, &mut |b| {
+                if bad.is_none() && !is_canonical_bnode_label(b) {
+                    bad = Some(b.to_string());
+                }
+                b.to_string()
+            });
+            if let Some(label) = bad {
+                return Err(GitError::InvalidManifest(format!(
+                    "non-canonical blank-node label {label:?} inside composite literal in {rel_path}; expected c14n<N>"
+                )));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn quad_hash_256(q: &Quad) -> [u8; 32] {
@@ -797,8 +1025,8 @@ pub fn import_git_tree(dataset: &Dataset, dir: &Path) -> GitResult<Receipt> {
 
 /// Read a canonical git tree from `dir` and import it into `dataset` with explicit options.
 ///
-/// Prefix updates are applied only after the guarded write transaction succeeds, and are
-/// never applied when `write_options.dry_run` is `true` or when the transaction is refused.
+/// Quads and prefixes are published jointly in one guarded write transaction: dry runs,
+/// refused writes, and prefix persistence errors abort before quads become visible.
 pub fn import_git_tree_with(
     dataset: &Dataset,
     dir: &Path,
@@ -806,16 +1034,15 @@ pub fn import_git_tree_with(
     write_options: crate::guard::WriteOptions,
 ) -> GitResult<Receipt> {
     let tree = read_git_tree_with(dir, read_options)?;
-    let is_dry_run = write_options.dry_run.is_some();
     let (_, receipt) = dataset.transaction_receipt_with(write_options, |tx| {
         for q in &tree.quads {
             tx.insert(q.as_ref())?;
         }
+        if !tree.prefixes.is_empty() {
+            tx.stage_prefixes(tree.prefixes.clone());
+        }
         Ok(())
     })?;
-    if !is_dry_run && !tree.prefixes.is_empty() {
-        dataset.store().add_prefixes(tree.prefixes)?;
-    }
     Ok(receipt)
 }
 
@@ -1007,7 +1234,13 @@ fn is_canonical_bnode_label(label: &str) -> bool {
     let Some(rest) = label.strip_prefix("c14n") else {
         return false;
     };
-    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+    if rest == "0" {
+        return true;
+    }
+    let bytes = rest.as_bytes();
+    !bytes.is_empty()
+        && (b'1'..=b'9').contains(&bytes[0])
+        && bytes[1..].iter().all(u8::is_ascii_digit)
 }
 
 /// Strictly validate a relative graph path from a manifest.
@@ -1090,9 +1323,122 @@ pub(crate) fn validate_relative_path(rel: &str) -> GitResult<()> {
     Ok(())
 }
 
-/// Ensure `dir` exists (creating if needed) and is not a symlink.
-pub(crate) fn ensure_dir_no_symlink(dir: &Path) -> GitResult<()> {
-    match fs::symlink_metadata(dir) {
+/// Normalize trailing slashes and `.` components so `symlink_metadata` inspects the target
+/// directory entry itself rather than following a symlinked directory on Unix. Also refuses
+/// any `Normal` component cancelled by `..` if that component is a symlink.
+pub(crate) fn normalize_dir_for_lstat(path: &Path) -> GitResult<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(GitError::UnsafePath {
+            path: String::new(),
+            reason: "directory path is empty".into(),
+        });
+    }
+    let mut out = PathBuf::new();
+    let mut saw_normal = false;
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {
+                if out.as_os_str().is_empty() {
+                    out.push(".");
+                }
+            }
+            Component::Normal(s) => {
+                if out == Path::new(".") {
+                    out.clear();
+                }
+                out.push(s);
+                saw_normal = true;
+            }
+            Component::ParentDir => {
+                if saw_normal && matches!(out.components().next_back(), Some(Component::Normal(_)))
+                {
+                    match fs::symlink_metadata(&out) {
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            return Err(GitError::UnsafePath {
+                                path: path.display().to_string(),
+                                reason: "path traverses a symlink component before '..'".into(),
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(GitError::io(&out, e)),
+                    }
+                    out.pop();
+                    if !out.as_os_str().is_empty()
+                        && matches!(out.components().next_back(), Some(Component::Normal(_)))
+                    {
+                        match fs::symlink_metadata(&out) {
+                            Ok(meta) if meta.file_type().is_symlink() => {
+                                return Err(GitError::UnsafePath {
+                                    path: path.display().to_string(),
+                                    reason: "resolved directory target must not be a symlink"
+                                        .into(),
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(GitError::io(&out, e)),
+                        }
+                    }
+                } else {
+                    if out == Path::new(".") {
+                        out.clear();
+                    }
+                    out.push("..");
+                }
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    Ok(out)
+}
+
+/// Resolve the parent directory of a file path, mapping a bare filename like `mapping.json`
+/// to `"."` and rejecting trailing slashes or directory-only spellings.
+pub(crate) fn effective_parent(path: &Path) -> GitResult<PathBuf> {
+    reject_trailing_sep_on_file_path(path)?;
+    if path.file_name().is_none() {
+        return Err(GitError::UnsafePath {
+            path: path.display().to_string(),
+            reason: "destination path must name a file".into(),
+        });
+    }
+    match path.parent() {
+        None => Err(GitError::UnsafePath {
+            path: path.display().to_string(),
+            reason: "destination path has no parent directory".into(),
+        }),
+        Some(p) if p.as_os_str().is_empty() => Ok(PathBuf::from(".")),
+        Some(p) => normalize_dir_for_lstat(p),
+    }
+}
+
+fn reject_trailing_sep_on_file_path(path: &Path) -> GitResult<()> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.is_empty() {
+        return Err(GitError::UnsafePath {
+            path: String::new(),
+            reason: "destination file path is empty".into(),
+        });
+    }
+    if bytes.ends_with(b"/") || (cfg!(windows) && bytes.ends_with(b"\\")) {
+        return Err(GitError::UnsafePath {
+            path: path.display().to_string(),
+            reason: "destination file path must not end with a directory separator".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Check `dir` (without creating it) and report whether it already exists. Refuses symlinks
+/// on `dir` (including trailing `/` or `/.`) or on its deepest existing ancestor.
+fn preflight_target_dir_no_symlink(dir: &Path) -> GitResult<(PathBuf, bool)> {
+    let clean = normalize_dir_for_lstat(dir)?;
+    match fs::symlink_metadata(&clean) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
                 return Err(GitError::UnsafePath {
@@ -1106,18 +1452,155 @@ pub(crate) fn ensure_dir_no_symlink(dir: &Path) -> GitResult<()> {
                     reason: "target path is not a directory".into(),
                 });
             }
+            Ok((clean, true))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(dir).map_err(|e| GitError::io(dir, e))?;
+            verify_deepest_existing_ancestor_no_symlink(&clean)?;
+            Ok((clean, false))
         }
-        Err(e) => return Err(GitError::io(dir, e)),
+        Err(e) => Err(GitError::io(&clean, e)),
     }
-    Ok(())
 }
 
-/// Verify an already-existing directory is not a symlink.
-pub(crate) fn verify_existing_dir_no_symlink(dir: &Path, label: &str) -> GitResult<()> {
-    let meta = fs::symlink_metadata(dir).map_err(|e| GitError::io(dir, e))?;
+fn preflight_optional_child_dir_no_symlink(parent: &Path, child: &str) -> GitResult<()> {
+    let full = parent.join(child);
+    match fs::symlink_metadata(&full) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(GitError::UnsafePath {
+                    path: child.to_string(),
+                    reason: format!("managed directory {child:?} must not be a symlink"),
+                });
+            }
+            if !meta.file_type().is_dir() {
+                return Err(GitError::UnsafePath {
+                    path: child.to_string(),
+                    reason: format!("managed path {child:?} is not a directory"),
+                });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(GitError::io(&full, e)),
+    }
+}
+
+fn verify_deepest_existing_ancestor_no_symlink(clean: &Path) -> GitResult<PathBuf> {
+    let mut cur = clean.to_path_buf();
+    loop {
+        match cur.parent() {
+            None => return Ok(cur),
+            Some(p) if p.as_os_str().is_empty() => {
+                let dot = PathBuf::from(".");
+                verify_existing_dir_no_symlink(&dot, ".")?;
+                return Ok(dot);
+            }
+            Some(p) => {
+                cur = p.to_path_buf();
+                match fs::symlink_metadata(&cur) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            return Err(GitError::UnsafePath {
+                                path: cur.display().to_string(),
+                                reason: "ancestor directory must not be a symlink".into(),
+                            });
+                        }
+                        if !meta.file_type().is_dir() {
+                            return Err(GitError::UnsafePath {
+                                path: cur.display().to_string(),
+                                reason: "ancestor path is not a directory".into(),
+                            });
+                        }
+                        return Ok(cur);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(GitError::io(&cur, e)),
+                }
+            }
+        }
+    }
+}
+
+/// Ensure `dir` exists (creating missing components one by one without following symlinks)
+/// and is not a symlink (even when passed with trailing `/` or `/.`), returning its
+/// normalized path.
+pub(crate) fn ensure_dir_no_symlink(dir: &Path) -> GitResult<PathBuf> {
+    let clean = normalize_dir_for_lstat(dir)?;
+    match fs::symlink_metadata(&clean) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(GitError::UnsafePath {
+                    path: dir.display().to_string(),
+                    reason: "target directory must not be a symlink".into(),
+                });
+            }
+            if !meta.file_type().is_dir() {
+                return Err(GitError::UnsafePath {
+                    path: dir.display().to_string(),
+                    reason: "target path is not a directory".into(),
+                });
+            }
+            Ok(clean)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut missing: Vec<std::ffi::OsString> = Vec::new();
+            let mut probe = clean.clone();
+            let base = loop {
+                match fs::symlink_metadata(&probe) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            return Err(GitError::UnsafePath {
+                                path: probe.display().to_string(),
+                                reason: "ancestor directory must not be a symlink".into(),
+                            });
+                        }
+                        if !meta.file_type().is_dir() {
+                            return Err(GitError::UnsafePath {
+                                path: probe.display().to_string(),
+                                reason: "ancestor path is not a directory".into(),
+                            });
+                        }
+                        break probe;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        let Some(name) = probe.file_name() else {
+                            return Err(GitError::io(&probe, err));
+                        };
+                        missing.push(name.to_os_string());
+                        match probe.parent() {
+                            Some(p) if !p.as_os_str().is_empty() => probe = p.to_path_buf(),
+                            _ => {
+                                let dot = PathBuf::from(".");
+                                verify_existing_dir_no_symlink(&dot, ".")?;
+                                break dot;
+                            }
+                        }
+                    }
+                    Err(err) => return Err(GitError::io(&probe, err)),
+                }
+            };
+            let mut cur = base;
+            for seg in missing.into_iter().rev() {
+                cur.push(seg);
+                match fs::create_dir(&cur) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        verify_existing_dir_no_symlink(&cur, &cur.display().to_string())?;
+                    }
+                    Err(err) => return Err(GitError::io(&cur, err)),
+                }
+            }
+            Ok(clean)
+        }
+        Err(e) => Err(GitError::io(&clean, e)),
+    }
+}
+
+/// Verify an already-existing directory is not a symlink (including trailing `/` or `/.`),
+/// returning its normalized path.
+pub(crate) fn verify_existing_dir_no_symlink(dir: &Path, label: &str) -> GitResult<PathBuf> {
+    let clean = normalize_dir_for_lstat(dir)?;
+    let meta = fs::symlink_metadata(&clean).map_err(|e| GitError::io(&clean, e))?;
     if meta.file_type().is_symlink() {
         return Err(GitError::UnsafePath {
             path: label.to_string(),
@@ -1130,13 +1613,14 @@ pub(crate) fn verify_existing_dir_no_symlink(dir: &Path, label: &str) -> GitResu
             reason: "path is not a directory".into(),
         });
     }
-    Ok(())
+    Ok(clean)
 }
 
 /// Ensure immediate child directory `child` under an already verified `parent` exists and is
 /// not a symlink.
 pub(crate) fn ensure_child_dir_no_symlink(parent: &Path, child: &str) -> GitResult<PathBuf> {
-    let full = parent.join(child);
+    let clean_parent = normalize_dir_for_lstat(parent)?;
+    let full = clean_parent.join(child);
     match fs::symlink_metadata(&full) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -1163,7 +1647,7 @@ pub(crate) fn ensure_child_dir_no_symlink(parent: &Path, child: &str) -> GitResu
 /// Resolve `rel` inside `root`, verifying that no component beneath `root` is a symlink.
 pub(crate) fn resolve_safe_path(root: &Path, rel: &str) -> GitResult<PathBuf> {
     validate_relative_path(rel)?;
-    let mut cur = root.to_path_buf();
+    let mut cur = normalize_dir_for_lstat(root)?;
     for segment in rel.split('/') {
         cur.push(segment);
         match fs::symlink_metadata(&cur) {
@@ -1253,50 +1737,76 @@ pub(crate) fn read_bounded_regular_file(
 /// Atomically write `bytes` to `path` via an exclusively created temporary file in the same
 /// directory, refusing symlinks on `path` and its parent directory.
 pub(crate) fn write_atomic_safe(path: &Path, bytes: &[u8]) -> GitResult<()> {
-    write_atomic_stream_hashed(path, |w| {
-        w.write_all(bytes).map_err(|e| GitError::io(path, e))
-    })
-    .map(|_| ())
+    let parent = effective_parent(path)?;
+    let (temp_path, _, _) =
+        stage_atomic_stream_hashed(path, &path.display().to_string(), u64::MAX, |w| {
+            w.write_all(bytes).map_err(|e| GitError::io(path, e))
+        })?;
+    check_dest_file_not_symlink(path)?;
+    temp_path
+        .persist(path)
+        .map_err(|e| GitError::io(path, e.error))?;
+    fsutil::sync_dir(&parent).map_err(|e| GitError::io(&parent, e))?;
+    Ok(())
 }
 
-/// Atomically stream serialized bytes to `path` via an exclusively created temporary file
-/// (`O_CREAT | O_EXCL`) while computing its lowercase hex SHA-256 digest.
-fn write_atomic_stream_hashed(
+/// Stream serialized bytes to an exclusively created temporary file (`O_CREAT | O_EXCL`)
+/// in `path`'s parent directory while enforcing `max_bytes` and computing its lowercase hex
+/// SHA-256 digest. Closes the file descriptor and returns `(TempPath, bytes_written, sha256)`
+/// so callers can validate all files before atomically persisting them.
+fn stage_atomic_stream_hashed(
     path: &Path,
+    label: &str,
+    max_bytes: u64,
     write_fn: impl FnOnce(&mut HashingWriter<BufWriter<&mut File>>) -> GitResult<()>,
-) -> GitResult<String> {
-    let parent = path.parent().ok_or_else(|| GitError::UnsafePath {
-        path: path.display().to_string(),
-        reason: "destination path has no parent directory".into(),
-    })?;
-    verify_existing_dir_no_symlink(parent, &parent.display().to_string())?;
+) -> GitResult<(tempfile::TempPath, u64, String)> {
+    let parent = effective_parent(path)?;
+    verify_existing_dir_no_symlink(&parent, &parent.display().to_string())?;
     check_dest_file_not_symlink(path)?;
 
     let mut tmp = tempfile::Builder::new()
         .prefix(".sparkles-tmp-")
-        .tempfile_in(parent)
-        .map_err(|e| GitError::io(parent, e))?;
+        .tempfile_in(&parent)
+        .map_err(|e| GitError::io(&parent, e))?;
 
-    let digest = {
+    let (written, digest) = {
         let bw = BufWriter::new(tmp.as_file_mut());
-        let mut hw = HashingWriter::new(bw);
-        write_fn(&mut hw)?;
-        hw.flush().map_err(|e| GitError::io(path, e))?;
+        let mut hw = HashingWriter::new(bw, max_bytes, label.to_string());
+        write_fn(&mut hw).map_err(|e| map_write_limit_err(e, label, max_bytes))?;
+        hw.flush()
+            .map_err(|e| map_io_write_limit_err(path, e, label, max_bytes))?;
         hw.finish()
     };
     tmp.as_file()
         .sync_all()
         .map_err(|e| GitError::io(path, e))?;
 
-    // Re-check destination immediately before atomic rename so pre-existing symlinks fail
-    // explicitly with `UnsafePath`.
-    check_dest_file_not_symlink(path)?;
-    tmp.persist(path).map_err(|e| GitError::io(path, e.error))?;
-    fsutil::sync_dir(parent).map_err(|e| GitError::io(parent, e))?;
-    Ok(digest)
+    Ok((tmp.into_temp_path(), written, digest))
 }
 
-fn check_dest_file_not_symlink(path: &Path) -> GitResult<()> {
+fn map_write_limit_err(err: GitError, label: &str, max_bytes: u64) -> GitError {
+    if let GitError::Io { ref source, .. } = err
+        && source.kind() == io::ErrorKind::FileTooLarge
+    {
+        return GitError::Format(format!(
+            "{label} exceeds maximum allowed write size ({max_bytes} bytes)"
+        ));
+    }
+    err
+}
+
+fn map_io_write_limit_err(path: &Path, err: io::Error, label: &str, max_bytes: u64) -> GitError {
+    if err.kind() == io::ErrorKind::FileTooLarge {
+        GitError::Format(format!(
+            "{label} exceeds maximum allowed write size ({max_bytes} bytes)"
+        ))
+    } else {
+        GitError::io(path, err)
+    }
+}
+
+pub(crate) fn check_dest_file_not_symlink(path: &Path) -> GitResult<()> {
+    reject_trailing_sep_on_file_path(path)?;
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -1321,24 +1831,41 @@ fn check_dest_file_not_symlink(path: &Path) -> GitResult<()> {
 struct HashingWriter<W> {
     inner: W,
     hasher: Sha256Stream,
+    written: u64,
+    max_bytes: u64,
+    label: String,
 }
 
 impl<W> HashingWriter<W> {
-    fn new(inner: W) -> Self {
+    fn new(inner: W, max_bytes: u64, label: String) -> Self {
         Self {
             inner,
             hasher: Sha256Stream::new(),
+            written: 0,
+            max_bytes,
+            label,
         }
     }
 
-    fn finish(self) -> String {
-        self.hasher.finalize_hex()
+    fn finish(self) -> (u64, String) {
+        (self.written, self.hasher.finalize_hex())
     }
 }
 
 impl<W: Write> Write for HashingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let next = self.written.saturating_add(buf.len() as u64);
+        if next > self.max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!(
+                    "{} exceeds maximum allowed write size ({} bytes)",
+                    self.label, self.max_bytes
+                ),
+            ));
+        }
         let n = self.inner.write(buf)?;
+        self.written = self.written.saturating_add(n as u64);
         self.hasher.update(&buf[..n]);
         Ok(n)
     }
@@ -1530,7 +2057,7 @@ fn canonicalize_dataset_bounded(
         return Ok(rdf_dataset);
     }
 
-    canonicalize_with_cdt_links(collected, max_blank_nodes, max_ambiguous_group)
+    canonicalize_with_cdt_links(collected, max_quads, max_blank_nodes, max_ambiguous_group)
 }
 
 fn term_has_cdt_bnode(t: &Term) -> bool {
@@ -1548,21 +2075,30 @@ struct CdtEncoder {
     kind_pred: NamedNode,
     list_kind: Term,
     map_kind: Term,
-    null_term: Term,
+    null_marker: Term,
     entry_pred: NamedNode,
     key_pred: NamedNode,
     val_pred: NamedNode,
+    null_val_pred: NamedNode,
     used_labels: HashSet<String>,
     next_id: u64,
     synth_quads: Vec<Quad>,
+    base_quads: usize,
+    max_quads: usize,
+    max_blank_nodes: usize,
 }
 
 impl CdtEncoder {
-    fn new(quads: &[Quad]) -> Self {
+    fn new(quads: &[Quad], max_quads: usize, max_blank_nodes: usize) -> GitResult<Self> {
         let mut used_labels = HashSet::new();
         let mut existing_graphs = HashSet::new();
         for q in quads {
             collect_quad_bnodes(q, &mut used_labels);
+            if used_labels.len() > max_blank_nodes {
+                return Err(GitError::Format(format!(
+                    "dataset exceeds canonicalization blank-node limit ({max_blank_nodes})"
+                )));
+            }
             if let GraphName::NamedNode(n) = &q.graph_name {
                 existing_graphs.insert(n.as_str().to_string());
             }
@@ -1573,129 +2109,202 @@ impl CdtEncoder {
             suffix += 1;
             synth_graph_iri = format!("{CDT_SYNTH_NS}graph-{suffix}");
         }
-        Self {
+        Ok(Self {
             synth_graph: GraphName::NamedNode(NamedNode::new_unchecked(synth_graph_iri)),
             kind_pred: NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}kind")),
             list_kind: Term::NamedNode(NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}list"))),
             map_kind: Term::NamedNode(NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}map"))),
-            null_term: Term::NamedNode(NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}null"))),
+            // Only ever placed as the object of `null-idx/{idx}` or `null-val` inside
+            // `synth_graph`; real RDF terms always use `idx/{idx}` / `val` so no RDF IRI
+            // can ever collide with CDT null.
+            null_marker: Term::NamedNode(NamedNode::new_unchecked(format!(
+                "{CDT_SYNTH_NS}null-marker"
+            ))),
             entry_pred: NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}entry")),
             key_pred: NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}key")),
             val_pred: NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}val")),
+            null_val_pred: NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}null-val")),
             used_labels,
             next_id: 0,
             synth_quads: Vec::new(),
-        }
+            base_quads: quads.len(),
+            max_quads,
+            max_blank_nodes,
+        })
     }
 
-    fn fresh_bnode(&mut self) -> BlankNode {
+    fn check_quad_headroom(&self, additional: usize) -> GitResult<()> {
+        let total = self
+            .base_quads
+            .saturating_add(self.synth_quads.len())
+            .saturating_add(additional);
+        if total > self.max_quads {
+            return Err(GitError::Format(format!(
+                "dataset exceeds canonicalization quad limit ({}) during composite literal expansion",
+                self.max_quads
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_bnode_headroom(&self, additional: usize) -> GitResult<()> {
+        let total = self.used_labels.len().saturating_add(additional);
+        if total > self.max_blank_nodes {
+            return Err(GitError::Format(format!(
+                "dataset exceeds canonicalization blank-node limit ({}) during composite literal expansion",
+                self.max_blank_nodes
+            )));
+        }
+        Ok(())
+    }
+
+    fn push_synth_quad(&mut self, quad: Quad) -> GitResult<()> {
+        self.check_quad_headroom(1)?;
+        self.synth_quads.push(quad);
+        Ok(())
+    }
+
+    fn fresh_bnode(&mut self) -> GitResult<BlankNode> {
+        self.check_bnode_headroom(1)?;
         loop {
             let candidate = format!("spkcdt{}", self.next_id);
             self.next_id += 1;
             if self.used_labels.insert(candidate.clone()) {
-                return BlankNode::new_unchecked(candidate);
+                return Ok(BlankNode::new_unchecked(candidate));
             }
         }
     }
 
-    fn encode_term(&mut self, t: Term) -> Term {
+    fn encode_term(&mut self, t: Term) -> GitResult<Term> {
         match t {
             Term::Literal(ref lit) if cdt::may_name_bnodes(lit) => {
                 let dt = lit.datatype().as_str();
                 if dt == cdt::LIST
                     && let Some(elems) = cdt::parse_list(lit.value())
                 {
-                    let holder = self.fresh_bnode();
-                    self.synth_quads.push(Quad::new(
+                    self.check_bnode_headroom(1)?;
+                    self.check_quad_headroom(1usize.saturating_add(elems.len()))?;
+                    let holder = self.fresh_bnode()?;
+                    self.push_synth_quad(Quad::new(
                         holder.clone(),
                         self.kind_pred.clone(),
                         self.list_kind.clone(),
                         self.synth_graph.clone(),
-                    ));
+                    ))?;
                     for (idx, elem) in elems.into_iter().enumerate() {
-                        let encoded = self.encode_elem(elem);
-                        let idx_pred = NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}idx/{idx}"));
-                        self.synth_quads.push(Quad::new(
-                            holder.clone(),
-                            idx_pred,
-                            encoded,
-                            self.synth_graph.clone(),
-                        ));
+                        match elem {
+                            cdt::Elem::Null => {
+                                let null_pred = NamedNode::new_unchecked(format!(
+                                    "{CDT_SYNTH_NS}null-idx/{idx}"
+                                ));
+                                self.push_synth_quad(Quad::new(
+                                    holder.clone(),
+                                    null_pred,
+                                    self.null_marker.clone(),
+                                    self.synth_graph.clone(),
+                                ))?;
+                            }
+                            cdt::Elem::Term(inner) => {
+                                let encoded = self.encode_term(inner)?;
+                                let idx_pred =
+                                    NamedNode::new_unchecked(format!("{CDT_SYNTH_NS}idx/{idx}"));
+                                self.push_synth_quad(Quad::new(
+                                    holder.clone(),
+                                    idx_pred,
+                                    encoded,
+                                    self.synth_graph.clone(),
+                                ))?;
+                            }
+                        }
                     }
-                    return Term::BlankNode(holder);
+                    return Ok(Term::BlankNode(holder));
                 }
                 if dt == cdt::MAP
                     && let Some(entries) = cdt::parse_map(lit.value())
                 {
-                    let holder = self.fresh_bnode();
-                    self.synth_quads.push(Quad::new(
+                    self.check_bnode_headroom(1usize.saturating_add(entries.len()))?;
+                    self.check_quad_headroom(
+                        1usize.saturating_add(entries.len().saturating_mul(3)),
+                    )?;
+                    let holder = self.fresh_bnode()?;
+                    self.push_synth_quad(Quad::new(
                         holder.clone(),
                         self.kind_pred.clone(),
                         self.map_kind.clone(),
                         self.synth_graph.clone(),
-                    ));
+                    ))?;
                     for (k, v) in entries {
-                        let entry_bn = self.fresh_bnode();
-                        let enc_k = self.encode_term(k);
-                        let enc_v = self.encode_elem(v);
-                        self.synth_quads.push(Quad::new(
+                        let entry_bn = self.fresh_bnode()?;
+                        let enc_k = self.encode_term(k)?;
+                        self.push_synth_quad(Quad::new(
                             holder.clone(),
                             self.entry_pred.clone(),
                             entry_bn.clone(),
                             self.synth_graph.clone(),
-                        ));
-                        self.synth_quads.push(Quad::new(
+                        ))?;
+                        self.push_synth_quad(Quad::new(
                             entry_bn.clone(),
                             self.key_pred.clone(),
                             enc_k,
                             self.synth_graph.clone(),
-                        ));
-                        self.synth_quads.push(Quad::new(
-                            entry_bn,
-                            self.val_pred.clone(),
-                            enc_v,
-                            self.synth_graph.clone(),
-                        ));
+                        ))?;
+                        match v {
+                            cdt::Elem::Null => {
+                                self.push_synth_quad(Quad::new(
+                                    entry_bn,
+                                    self.null_val_pred.clone(),
+                                    self.null_marker.clone(),
+                                    self.synth_graph.clone(),
+                                ))?;
+                            }
+                            cdt::Elem::Term(inner) => {
+                                let enc_v = self.encode_term(inner)?;
+                                self.push_synth_quad(Quad::new(
+                                    entry_bn,
+                                    self.val_pred.clone(),
+                                    enc_v,
+                                    self.synth_graph.clone(),
+                                ))?;
+                            }
+                        }
                     }
-                    return Term::BlankNode(holder);
+                    return Ok(Term::BlankNode(holder));
                 }
-                t
+                Ok(t)
             }
             Term::Triple(tr) => {
-                let obj = self.encode_term(tr.object);
-                Term::Triple(Box::new(Triple::new(tr.subject, tr.predicate, obj)))
+                let obj = self.encode_term(tr.object)?;
+                Ok(Term::Triple(Box::new(Triple::new(
+                    tr.subject,
+                    tr.predicate,
+                    obj,
+                ))))
             }
-            other => other,
-        }
-    }
-
-    fn encode_elem(&mut self, e: cdt::Elem) -> Term {
-        match e {
-            cdt::Elem::Null => self.null_term.clone(),
-            cdt::Elem::Term(t) => self.encode_term(t),
+            other => Ok(other),
         }
     }
 }
 
 fn canonicalize_with_cdt_links(
     quads: Vec<Quad>,
+    max_quads: usize,
     max_blank_nodes: usize,
     max_ambiguous_group: usize,
 ) -> GitResult<RdfDataset> {
-    let mut enc = CdtEncoder::new(&quads);
+    let mut enc = CdtEncoder::new(&quads, max_quads, max_blank_nodes)?;
     let mut augmented = Vec::with_capacity(quads.len());
     for q in quads {
-        let obj = enc.encode_term(q.object);
+        let obj = enc.encode_term(q.object)?;
         augmented.push(Quad::new(q.subject, q.predicate, obj, q.graph_name));
     }
     let synth_graph = enc.synth_graph.clone();
     let kind_pred = enc.kind_pred.clone();
     let list_kind = enc.list_kind.clone();
     let map_kind = enc.map_kind.clone();
-    let null_term = enc.null_term.clone();
     let entry_pred = enc.entry_pred.clone();
     let key_pred = enc.key_pred.clone();
     let val_pred = enc.val_pred.clone();
+    let null_val_pred = enc.null_val_pred.clone();
 
     if enc.synth_quads.is_empty() {
         // Every candidate CDT literal was ill-formed, so no links exist.
@@ -1706,6 +2315,11 @@ fn canonicalize_with_cdt_links(
     }
 
     augmented.extend(enc.synth_quads);
+    if augmented.len() > max_quads {
+        return Err(GitError::Format(format!(
+            "dataset exceeds canonicalization quad limit ({max_quads}) during composite literal expansion"
+        )));
+    }
     check_canonicalization_budget(&augmented, max_blank_nodes, max_ambiguous_group)?;
 
     let mut rdf_dataset: RdfDataset = augmented.into_iter().collect();
@@ -1714,13 +2328,14 @@ fn canonicalize_with_cdt_links(
     // Partition canonicalized quads back into real quads and synthetic CDT descriptors.
     let mut real_quads: Vec<Quad> = Vec::new();
     let mut cdt_kinds: HashMap<String, bool> = HashMap::new(); // true = list, false = map
-    let mut list_elems: HashMap<String, BTreeMap<usize, Term>> = HashMap::new();
+    let mut list_elems: HashMap<String, BTreeMap<usize, Option<Term>>> = HashMap::new();
     let mut map_entries: HashMap<String, Vec<String>> = HashMap::new();
     let mut entry_keys: HashMap<String, Term> = HashMap::new();
-    let mut entry_vals: HashMap<String, Term> = HashMap::new();
+    let mut entry_vals: HashMap<String, Option<Term>> = HashMap::new();
     let mut synth_bnodes: HashSet<String> = HashSet::new();
 
     let idx_prefix = format!("{CDT_SYNTH_NS}idx/");
+    let null_idx_prefix = format!("{CDT_SYNTH_NS}null-idx/");
 
     for qref in rdf_dataset.iter() {
         let q = qref.into_owned();
@@ -1742,7 +2357,14 @@ fn canonicalize_with_cdt_links(
             }
         } else if let Some(idx_str) = q.predicate.as_str().strip_prefix(&idx_prefix) {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                list_elems.entry(subj).or_default().insert(idx, q.object);
+                list_elems
+                    .entry(subj)
+                    .or_default()
+                    .insert(idx, Some(q.object));
+            }
+        } else if let Some(idx_str) = q.predicate.as_str().strip_prefix(&null_idx_prefix) {
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                list_elems.entry(subj).or_default().insert(idx, None);
             }
         } else if q.predicate == entry_pred {
             if let Term::BlankNode(ebn) = q.object {
@@ -1753,7 +2375,9 @@ fn canonicalize_with_cdt_links(
         } else if q.predicate == key_pred {
             entry_keys.insert(subj, q.object);
         } else if q.predicate == val_pred {
-            entry_vals.insert(subj, q.object);
+            entry_vals.insert(subj, Some(q.object));
+        } else if q.predicate == null_val_pred {
+            entry_vals.insert(subj, None);
         }
     }
 
@@ -1765,11 +2389,14 @@ fn canonicalize_with_cdt_links(
         collect_real_bnodes_from_quad(q, &synth_bnodes, &mut seen_real, &mut real_bnode_labels);
     }
     for elems in list_elems.values() {
-        for t in elems.values() {
+        for t in elems.values().flatten() {
             collect_real_bnodes_from_term(t, &synth_bnodes, &mut seen_real, &mut real_bnode_labels);
         }
     }
-    for t in entry_keys.values().chain(entry_vals.values()) {
+    for t in entry_keys
+        .values()
+        .chain(entry_vals.values().filter_map(Option::as_ref))
+    {
         collect_real_bnodes_from_term(t, &synth_bnodes, &mut seen_real, &mut real_bnode_labels);
     }
     real_bnode_labels.sort_by(|a, b| c14n_sort_key(a).cmp(&c14n_sort_key(b)));
@@ -1781,11 +2408,10 @@ fn canonicalize_with_cdt_links(
 
     struct CdtDecoder<'a> {
         cdt_kinds: &'a HashMap<String, bool>,
-        list_elems: &'a HashMap<String, BTreeMap<usize, Term>>,
+        list_elems: &'a HashMap<String, BTreeMap<usize, Option<Term>>>,
         map_entries: &'a HashMap<String, Vec<String>>,
         entry_keys: &'a HashMap<String, Term>,
-        entry_vals: &'a HashMap<String, Term>,
-        null_term: &'a Term,
+        entry_vals: &'a HashMap<String, Option<Term>>,
         remap: &'a HashMap<String, BlankNode>,
     }
 
@@ -1799,8 +2425,8 @@ fn canonicalize_with_cdt_links(
                             let elems_map = self.list_elems.get(label);
                             let mut elems = Vec::new();
                             if let Some(m) = elems_map {
-                                for term in m.values() {
-                                    elems.push(self.decode_elem(term.clone())?);
+                                for term_opt in m.values() {
+                                    elems.push(self.decode_elem(term_opt.clone())?);
                                 }
                             }
                             let lex = cdt::list_lexical(&elems);
@@ -1833,12 +2459,9 @@ fn canonicalize_with_cdt_links(
                                     pairs.push((self.decode_term(k)?, self.decode_elem(v)?));
                                 }
                             }
-                            // Serialize then re-parse via `cdt::parse_map` so entries are
-                            // sorted in Sparkles' canonical `cdt::key_cmp` order.
-                            let raw_lex = cdt::map_lexical(&pairs);
-                            let canonical_lex = cdt::parse_map(&raw_lex)
-                                .map(|sorted_map| cdt::map_lexical(&sorted_map))
-                                .unwrap_or(raw_lex);
+                            // Sort entries directly in Sparkles' canonical `cdt::key_cmp` order.
+                            pairs.sort_by(|a, b| cdt::key_cmp(&a.0, &b.0));
+                            let canonical_lex = cdt::map_lexical(&pairs);
                             return Ok(Term::Literal(Literal::new_typed_literal(
                                 canonical_lex,
                                 NamedNode::new_unchecked(cdt::MAP),
@@ -1862,11 +2485,10 @@ fn canonicalize_with_cdt_links(
             }
         }
 
-        fn decode_elem(&self, t: Term) -> GitResult<cdt::Elem> {
-            if &t == self.null_term {
-                Ok(cdt::Elem::Null)
-            } else {
-                Ok(cdt::Elem::Term(self.decode_term(t)?))
+        fn decode_elem(&self, t: Option<Term>) -> GitResult<cdt::Elem> {
+            match t {
+                None => Ok(cdt::Elem::Null),
+                Some(term) => Ok(cdt::Elem::Term(self.decode_term(term)?)),
             }
         }
     }
@@ -1877,7 +2499,6 @@ fn canonicalize_with_cdt_links(
         map_entries: &map_entries,
         entry_keys: &entry_keys,
         entry_vals: &entry_vals,
-        null_term: &null_term,
         remap: &remap,
     };
 
@@ -2000,6 +2621,12 @@ fn check_canonicalization_budget(
     max_blank_nodes: usize,
     max_ambiguous_group: usize,
 ) -> GitResult<()> {
+    const ROLE_S: u8 = 0;
+    const ROLE_O: u8 = 1;
+    const ROLE_G: u8 = 2;
+    const ROLE_OS: u8 = 3;
+    const ROLE_OO: u8 = 4;
+
     let mut bnode_ids: HashMap<&str, usize> = HashMap::new();
     let mut incident: Vec<Vec<usize>> = Vec::new();
 
@@ -2029,6 +2656,85 @@ fn check_canonicalization_budget(
         Ok(())
     }
 
+    fn intern_term_bnodes<'a>(
+        term: &'a Term,
+        bnode_ids: &mut HashMap<&'a str, usize>,
+        incident: &mut Vec<Vec<usize>>,
+        qidx: usize,
+        max_blank_nodes: usize,
+    ) -> GitResult<()> {
+        match term {
+            Term::BlankNode(b) => {
+                intern_bnode(b.as_str(), bnode_ids, incident, qidx, max_blank_nodes)
+            }
+            Term::Triple(tr) => {
+                if let NamedOrBlankNode::BlankNode(b) = &tr.subject {
+                    intern_bnode(b.as_str(), bnode_ids, incident, qidx, max_blank_nodes)?;
+                }
+                intern_term_bnodes(&tr.object, bnode_ids, incident, qidx, max_blank_nodes)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn format_subject_first_degree(subj: &NamedOrBlankNode, me: &str) -> String {
+        match subj {
+            NamedOrBlankNode::NamedNode(n) => format!("<{}>", n.as_str()),
+            NamedOrBlankNode::BlankNode(b) => {
+                if b.as_str() == me {
+                    "_:a".to_string()
+                } else {
+                    "_:z".to_string()
+                }
+            }
+        }
+    }
+
+    fn format_term_first_degree(term: &Term, me: &str) -> String {
+        match term {
+            Term::BlankNode(b) => {
+                if b.as_str() == me {
+                    "_:a".to_string()
+                } else {
+                    "_:z".to_string()
+                }
+            }
+            Term::Triple(tr) => {
+                let s = format_subject_first_degree(&tr.subject, me);
+                let o = format_term_first_degree(&tr.object, me);
+                format!("<<( {s} <{}> {o} )>>", tr.predicate.as_str())
+            }
+            other => other.to_string(),
+        }
+    }
+
+    fn collect_triple_neighbors(
+        tr: &Triple,
+        u: usize,
+        bnode_ids: &HashMap<&str, usize>,
+        is_ambiguous: &[bool],
+        out: &mut Vec<(u8, usize)>,
+    ) {
+        if let NamedOrBlankNode::BlankNode(b) = &tr.subject {
+            let id = bnode_ids[b.as_str()];
+            if id != u && is_ambiguous[id] {
+                out.push((ROLE_OS, id));
+            }
+        }
+        match &tr.object {
+            Term::BlankNode(b) => {
+                let id = bnode_ids[b.as_str()];
+                if id != u && is_ambiguous[id] {
+                    out.push((ROLE_OO, id));
+                }
+            }
+            Term::Triple(inner) => {
+                collect_triple_neighbors(inner, u, bnode_ids, is_ambiguous, out);
+            }
+            _ => {}
+        }
+    }
+
     for (qidx, q) in quads.iter().enumerate() {
         if let NamedOrBlankNode::BlankNode(b) = &q.subject {
             intern_bnode(
@@ -2039,24 +2745,13 @@ fn check_canonicalization_budget(
                 max_blank_nodes,
             )?;
         }
-        if let Term::BlankNode(b) = &q.object {
-            intern_bnode(
-                b.as_str(),
-                &mut bnode_ids,
-                &mut incident,
-                qidx,
-                max_blank_nodes,
-            )?;
-        } else if let Term::Triple(_) = &q.object {
-            // Check blank nodes inside triple terms for the count limit too.
-            let mut tmp = HashSet::new();
-            collect_term_bnodes(&q.object, &mut tmp);
-            if bnode_ids.len().saturating_add(tmp.len()) > max_blank_nodes {
-                return Err(GitError::Format(format!(
-                    "dataset exceeds canonicalization blank-node limit ({max_blank_nodes})"
-                )));
-            }
-        }
+        intern_term_bnodes(
+            &q.object,
+            &mut bnode_ids,
+            &mut incident,
+            qidx,
+            max_blank_nodes,
+        )?;
         if let GraphName::BlankNode(b) = &q.graph_name {
             intern_bnode(
                 b.as_str(),
@@ -2073,7 +2768,8 @@ fn check_canonicalization_budget(
         return Ok(());
     }
 
-    // 1. Compute 1-hop signature per blank node (mirroring RDFC-1.0 hash_first_degree_quads).
+    // 1. Compute 1-hop signature per blank node (mirroring oxrdf's RDFC-1.0
+    //    `hash_first_degree_quads`, including RDF 1.2 triple terms).
     let mut sigs: Vec<String> = Vec::with_capacity(n_bnodes);
     let mut labels_by_id: Vec<&str> = vec![""; n_bnodes];
     for (&label, &id) in &bnode_ids {
@@ -2086,26 +2782,8 @@ fn check_canonicalization_budget(
         let mut lines: Vec<String> = Vec::with_capacity(qidxs.len());
         for &qi in qidxs {
             let q = &quads[qi];
-            let s = match &q.subject {
-                NamedOrBlankNode::NamedNode(n) => format!("<{}>", n.as_str()),
-                NamedOrBlankNode::BlankNode(b) => {
-                    if b.as_str() == me {
-                        "_:a".to_string()
-                    } else {
-                        "_:z".to_string()
-                    }
-                }
-            };
-            let o = match &q.object {
-                Term::BlankNode(b) => {
-                    if b.as_str() == me {
-                        "_:a".to_string()
-                    } else {
-                        "_:z".to_string()
-                    }
-                }
-                other => other.to_string(),
-            };
+            let s = format_subject_first_degree(&q.subject, me);
+            let o = format_term_first_degree(&q.object, me);
             let g = match &q.graph_name {
                 GraphName::DefaultGraph => String::new(),
                 GraphName::NamedNode(n) => format!(" <{}>", n.as_str()),
@@ -2136,52 +2814,53 @@ fn check_canonicalization_budget(
     }
 
     // 2. For every blank node, check the size of each indistinguishable ambiguous-neighbor
-    //    bucket (matching the `blank_node_list` passed to `generate_permutations`), and
-    //    build the ambiguous-to-ambiguous adjacency graph for component sizing.
+    //    bucket (matching oxrdf's `hash_related_blank_node` keys: `(position, predicate_if_not_g,
+    //    related_1hop_sig)` without `u`'s role), and build the ambiguous-to-ambiguous
+    //    adjacency graph for component sizing.
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n_bnodes];
+    let mut others: Vec<(u8, usize)> = Vec::new();
     for (u, qidxs) in incident.iter().enumerate() {
-        let mut buckets: HashMap<(u8, u8, &str, &str), HashSet<usize>> = HashMap::new();
+        let mut buckets: HashMap<(u8, &str, &str), HashSet<usize>> = HashMap::new();
         for &qi in qidxs {
             let q = &quads[qi];
-            let mut roles_u = [false; 3];
-            let mut others: [(u8, usize); 3] = [(0, 0); 3];
-            let mut other_len = 0usize;
+            others.clear();
 
             if let NamedOrBlankNode::BlankNode(b) = &q.subject {
                 let id = bnode_ids[b.as_str()];
-                if id == u {
-                    roles_u[0] = true;
-                } else if is_ambiguous[id] {
-                    others[other_len] = (0, id);
-                    other_len += 1;
+                if id != u && is_ambiguous[id] {
+                    others.push((ROLE_S, id));
                 }
             }
-            if let Term::BlankNode(b) = &q.object {
-                let id = bnode_ids[b.as_str()];
-                if id == u {
-                    roles_u[1] = true;
-                } else if is_ambiguous[id] {
-                    others[other_len] = (1, id);
-                    other_len += 1;
+            match &q.object {
+                Term::BlankNode(b) => {
+                    let id = bnode_ids[b.as_str()];
+                    if id != u && is_ambiguous[id] {
+                        others.push((ROLE_O, id));
+                    }
                 }
+                Term::Triple(tr) => {
+                    collect_triple_neighbors(tr, u, &bnode_ids, &is_ambiguous, &mut others);
+                }
+                _ => {}
             }
             if let GraphName::BlankNode(b) = &q.graph_name {
                 let id = bnode_ids[b.as_str()];
-                if id == u {
-                    roles_u[2] = true;
-                } else if is_ambiguous[id] {
-                    others[other_len] = (2, id);
-                    other_len += 1;
+                if id != u && is_ambiguous[id] {
+                    others.push((ROLE_G, id));
                 }
             }
-            let u_mask =
-                (u8::from(roles_u[0])) | (u8::from(roles_u[1]) << 1) | (u8::from(roles_u[2]) << 2);
-            for &(v_role, v) in &others[..other_len] {
+
+            for &(v_role, v) in &others {
                 if is_ambiguous[u] {
                     adj[u].push(v);
                 }
+                let pred_key = if v_role == ROLE_G {
+                    ""
+                } else {
+                    q.predicate.as_str()
+                };
                 let set = buckets
-                    .entry((u_mask, v_role, q.predicate.as_str(), sigs[v].as_str()))
+                    .entry((v_role, pred_key, sigs[v].as_str()))
                     .or_default();
                 set.insert(v);
                 if set.len() > max_ambiguous_group {

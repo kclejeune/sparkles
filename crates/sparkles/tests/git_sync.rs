@@ -1,7 +1,7 @@
 //! Integration tests for F25 Phase 1 (versioned canonical git serialization profile) and
 //! Phase 2 (git export of a branch).
 
-use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Triple};
+use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term, Triple};
 use sparkles::Dataset;
 use sparkles::branch::{BranchOptions, MergeOptions};
 use sparkles::git::{
@@ -9,8 +9,8 @@ use sparkles::git::{
     GitExportMode, GitExportOptions, MANIFEST_FORMAT_VERSION, MANIFEST_PROFILE_NAME,
     MANIFEST_REL_PATH, MAPPING_FORMAT_VERSION, ReadOptions, WriteOptions, collect_dataset_quads,
     dataset_matches_tree, datasets_isomorphic, default_mapping_path, import_git_tree,
-    import_git_tree_with, read_git_tree, read_git_tree_with, verify_git_tree, verify_git_tree_with,
-    write_git_tree,
+    import_git_tree_with, read_git_tree, read_git_tree_with, try_datasets_isomorphic,
+    verify_git_tree, verify_git_tree_with, write_git_tree,
 };
 use sparkles::guard::WriteOptions as StoreWriteOptions;
 use std::collections::BTreeMap;
@@ -1767,4 +1767,1048 @@ fn strict_verify_rejects_layout_violations_and_range_and_metadata_edge_cases() {
         ],
     );
     assert_eq!(msg2.trim(), "# leading hash subject");
+}
+
+// ================================================================================
+// Round 2 regression tests (R2-1 through R2-16)
+// ================================================================================
+
+#[cfg(unix)]
+#[test]
+fn root_symlink_aliases_with_trailing_slash_or_dot_are_rejected_everywhere() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel.txt");
+    fs::write(&sentinel, b"UNTOUCHED").unwrap();
+    let outside_tree = tempfile::tempdir().unwrap();
+    let q = Quad::new(
+        nn("http://example.org/s"),
+        nn("http://example.org/p"),
+        Literal::from(1i64),
+        GraphName::DefaultGraph,
+    );
+    write_git_tree(
+        vec![q.clone()],
+        &BTreeMap::new(),
+        outside_tree.path(),
+        &WriteOptions::default(),
+    )
+    .unwrap();
+
+    let holder = tempfile::tempdir().unwrap();
+    let link_write = holder.path().join("link-write");
+    symlink(outside.path(), &link_write).unwrap();
+    let link_read = holder.path().join("link-read");
+    symlink(outside_tree.path(), &link_read).unwrap();
+
+    // Create a real subdir inside `outside` to test `link/sub/..` alias too.
+    fs::create_dir(outside.path().join("sub")).unwrap();
+
+    for alias in [
+        format!("{}/", link_write.display()),
+        format!("{}/.", link_write.display()),
+        format!("{}/./", link_write.display()),
+        format!("{}/sub/..", link_write.display()),
+        format!("{}/new-child", link_write.display()),
+    ] {
+        let p = std::path::PathBuf::from(&alias);
+        let err = write_git_tree(
+            vec![q.clone()],
+            &BTreeMap::new(),
+            &p,
+            &WriteOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GitError::UnsafePath { .. }),
+            "write_git_tree must reject symlink alias {alias:?}, got {err:?}"
+        );
+    }
+    assert!(!outside.path().join(".sparkles-git").exists());
+    assert!(!outside.path().join("graphs").exists());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"UNTOUCHED");
+
+    for alias in [
+        format!("{}/", link_read.display()),
+        format!("{}/.", link_read.display()),
+    ] {
+        let err = verify_git_tree(Path::new(&alias)).unwrap_err();
+        assert!(
+            matches!(err, GitError::UnsafePath { .. }),
+            "verify_git_tree must reject symlink alias {alias:?}, got {err:?}"
+        );
+    }
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    for alias in [
+        format!("{}/", link_write.display()),
+        format!("{}/.", link_write.display()),
+    ] {
+        let err = ds
+            .export_git(Path::new(&alias), &GitExportOptions::default())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink") || err.to_string().contains("unsafe path"),
+            "export_git must reject symlink alias {alias:?}, got {err}"
+        );
+    }
+    assert!(!outside.path().join(".git").exists());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"UNTOUCHED");
+}
+
+#[test]
+fn write_and_export_refuse_unmanaged_collisions_noncanonical_prior_and_unsupported_manifest() {
+    let q = Quad::new(
+        nn("http://example.org/s"),
+        nn("http://example.org/p"),
+        Literal::from(1i64),
+        GraphName::DefaultGraph,
+    );
+
+    // 1. Fresh directory with unmanaged `graphs/default.ttl` must refuse overwrite.
+    let dir_unmanaged = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir_unmanaged.path().join("graphs")).unwrap();
+    fs::write(
+        dir_unmanaged.path().join("graphs/default.ttl"),
+        "# user-owned unmanaged file\n",
+    )
+    .unwrap();
+    let err = write_git_tree(
+        vec![q.clone()],
+        &BTreeMap::new(),
+        dir_unmanaged.path(),
+        &WriteOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, GitError::UnsafePath { .. }), "{err:?}");
+    assert_eq!(
+        fs::read_to_string(dir_unmanaged.path().join("graphs/default.ttl")).unwrap(),
+        "# user-owned unmanaged file\n"
+    );
+    assert!(!dir_unmanaged.path().join(".sparkles-git").exists());
+
+    // 2. Git export into directory with unmanaged `graphs/default.ttl` must refuse without
+    //    overwriting or committing it.
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    let repo_unmanaged = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo_unmanaged.path().join("graphs")).unwrap();
+    fs::write(
+        repo_unmanaged.path().join("graphs/default.ttl"),
+        "# precious unmanaged\n",
+    )
+    .unwrap();
+    assert!(
+        ds.export_git(repo_unmanaged.path(), &GitExportOptions::default())
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(repo_unmanaged.path().join("graphs/default.ttl")).unwrap(),
+        "# precious unmanaged\n"
+    );
+
+    // 3. Prior manifest naming a non-canonical path (`graphs/precious.ttl`) must be refused
+    //    and must NOT prune `graphs/precious.ttl`.
+    let dir_noncanon = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir_noncanon.path().join(".sparkles-git")).unwrap();
+    fs::create_dir_all(dir_noncanon.path().join("graphs")).unwrap();
+    fs::write(
+        dir_noncanon.path().join("graphs/precious.ttl"),
+        "# do not delete\n",
+    )
+    .unwrap();
+    let crafted = serde_json::json!({
+        "format_version": 1,
+        "profile": MANIFEST_PROFILE_NAME,
+        "syntax": "turtle",
+        "canonicalization": CANONICALIZATION_ALGORITHM,
+        "prefixes": {},
+        "graphs": [{
+            "kind": "default",
+            "path": "graphs/precious.ttl",
+            "quads": 1,
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }]
+    });
+    fs::write(
+        dir_noncanon.path().join(MANIFEST_REL_PATH),
+        serde_json::to_vec_pretty(&crafted).unwrap(),
+    )
+    .unwrap();
+    let err = write_git_tree(
+        Vec::<Quad>::new(),
+        &BTreeMap::new(),
+        dir_noncanon.path(),
+        &WriteOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, GitError::InvalidManifest(_)), "{err:?}");
+    assert!(dir_noncanon.path().join("graphs/precious.ttl").is_file());
+
+    // 4. Unsupported prior manifest version (`format_version: 99`) must be refused without
+    //    overwriting it.
+    let dir_future = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir_future.path().join(".sparkles-git")).unwrap();
+    fs::write(
+        dir_future.path().join(MANIFEST_REL_PATH),
+        r#"{"format_version": 99}"#,
+    )
+    .unwrap();
+    let err = write_git_tree(
+        vec![q],
+        &BTreeMap::new(),
+        dir_future.path(),
+        &WriteOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            GitError::UnsupportedFormatVersion {
+                found: 99,
+                supported: 1,
+                ..
+            }
+        ),
+        "expected UnsupportedFormatVersion(99), got {err:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir_future.path().join(MANIFEST_REL_PATH)).unwrap(),
+        r#"{"format_version": 99}"#
+    );
+}
+
+#[test]
+fn cdt_null_encoding_never_collides_with_internal_namespace_iri() {
+    let cdt_list = nn("http://w3id.org/awslabs/neptune/SPARQL-CDTs/List");
+    let cdt_map = nn("http://w3id.org/awslabs/neptune/SPARQL-CDTs/Map");
+    let tricky_iri = "urn:sparkles-internal:git-cdt-canon:null";
+    let bn = BlankNode::new("shared").unwrap();
+
+    let quads_with_iri = vec![
+        Quad::new(
+            nn("http://example.org/s"),
+            nn("http://example.org/ref"),
+            bn.clone(),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            nn("http://example.org/holder"),
+            nn("http://example.org/list"),
+            Literal::new_typed_literal(
+                format!("[_:shared, <{tricky_iri}>, null]"),
+                cdt_list.clone(),
+            ),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            nn("http://example.org/holder"),
+            nn("http://example.org/map"),
+            Literal::new_typed_literal(
+                format!("{{\"a\" : <{tricky_iri}>, \"b\" : null, \"c\" : _:shared}}"),
+                cdt_map.clone(),
+            ),
+            GraphName::DefaultGraph,
+        ),
+    ];
+
+    let quads_all_null = vec![
+        Quad::new(
+            nn("http://example.org/s"),
+            nn("http://example.org/ref"),
+            bn,
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            nn("http://example.org/holder"),
+            nn("http://example.org/list"),
+            Literal::new_typed_literal("[_:shared, null, null]", cdt_list.clone()),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            nn("http://example.org/holder"),
+            nn("http://example.org/map"),
+            Literal::new_typed_literal(
+                "{\"a\" : null, \"b\" : null, \"c\" : _:shared}",
+                cdt_map.clone(),
+            ),
+            GraphName::DefaultGraph,
+        ),
+    ];
+
+    // Isomorphism helper must distinguish the tricky IRI from CDT null.
+    assert!(
+        !try_datasets_isomorphic(quads_with_iri.clone(), quads_all_null).unwrap(),
+        "dataset with <urn:sparkles-internal:git-cdt-canon:null> must NOT be isomorphic to null"
+    );
+
+    for syntax in [CanonicalSyntax::Turtle, CanonicalSyntax::NQuads] {
+        let dir = tempfile::tempdir().unwrap();
+        write_git_tree(
+            quads_with_iri.clone(),
+            &BTreeMap::new(),
+            dir.path(),
+            &WriteOptions {
+                syntax,
+                ..WriteOptions::default()
+            },
+        )
+        .unwrap();
+        let tree = read_git_tree(dir.path()).unwrap();
+
+        // Inspect decoded literals directly (independent of `try_datasets_isomorphic`).
+        let mut saw_list = false;
+        let mut saw_map = false;
+        for q in &tree.quads {
+            if let Term::Literal(l) = &q.object {
+                if l.datatype() == cdt_list.as_ref() {
+                    assert!(
+                        l.value().contains(&format!("<{tricky_iri}>")),
+                        "list lost IRI in {syntax:?}: {}",
+                        l.value()
+                    );
+                    assert!(
+                        l.value().contains("null"),
+                        "list lost null in {syntax:?}: {}",
+                        l.value()
+                    );
+                    saw_list = true;
+                } else if l.datatype() == cdt_map.as_ref() {
+                    assert!(
+                        l.value().contains(&format!("\"a\" : <{tricky_iri}>")),
+                        "map lost IRI in {syntax:?}: {}",
+                        l.value()
+                    );
+                    assert!(
+                        l.value().contains("\"b\" : null"),
+                        "map lost null in {syntax:?}: {}",
+                        l.value()
+                    );
+                    saw_map = true;
+                }
+            }
+        }
+        assert!(saw_list && saw_map);
+    }
+}
+
+#[test]
+fn export_refuses_bare_repo_linked_worktree_in_progress_merge_and_head_branch() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+
+    // 1. Bare repository must be refused cleanly without mutating it.
+    let bare = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "--bare", bare.path().to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let err = ds
+        .export_git(bare.path(), &GitExportOptions::default())
+        .unwrap_err();
+    assert!(err.to_string().contains("bare"), "got: {err}");
+    assert!(!bare.path().join(".git").exists());
+    assert!(!bare.path().join(".sparkles-git").exists());
+    assert!(!bare.path().join("graphs").exists());
+
+    // 2. Linked worktree must be refused cleanly.
+    let parent_repo = tempfile::tempdir().unwrap();
+    ds.export_git(parent_repo.path(), &GitExportOptions::default())
+        .unwrap();
+    let wt_holder = tempfile::tempdir().unwrap();
+    let linked_wt = wt_holder.path().join("linked");
+    assert!(
+        Command::new("git")
+            .args([
+                "-C",
+                parent_repo.path().to_str().unwrap(),
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt-branch",
+                linked_wt.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let wt_err = ds
+        .export_git(
+            &linked_wt,
+            &GitExportOptions {
+                git_branch: Some("wt-branch".into()),
+                ..GitExportOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        wt_err.to_string().contains("worktree") || wt_err.to_string().contains("gitfile"),
+        "expected linked worktree refusal, got: {wt_err}"
+    );
+
+    // 3. Clean-tree in-progress merge (`MERGE_HEAD` present with no diff) must be refused.
+    let merge_repo = tempfile::tempdir().unwrap();
+    let r1 = ds
+        .export_git(merge_repo.path(), &GitExportOptions::default())
+        .unwrap();
+    // Simulate a clean-tree in-progress merge state (no staged/unstaged diff, MERGE_HEAD set).
+    fs::write(
+        merge_repo.path().join(".git/MERGE_HEAD"),
+        format!("{}\n", r1.head_git_sha),
+    )
+    .unwrap();
+    let merge_err = ds
+        .export_git(merge_repo.path(), &GitExportOptions::default())
+        .unwrap_err();
+    assert!(
+        merge_err.to_string().contains("MERGE_HEAD"),
+        "expected MERGE_HEAD refusal, got: {merge_err}"
+    );
+
+    // 4. Reserved Git branch name `HEAD` rejected on both a fresh repo and an existing
+    //    unborn repo on another branch.
+    let fresh_head = tempfile::tempdir().unwrap();
+    assert!(
+        ds.export_git(
+            fresh_head.path(),
+            &GitExportOptions {
+                git_branch: Some("HEAD".into()),
+                ..GitExportOptions::default()
+            }
+        )
+        .is_err()
+    );
+    let unborn_repo = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args([
+                "init",
+                "-q",
+                "-b",
+                "other",
+                unborn_repo.path().to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ds.export_git(
+            unborn_repo.path(),
+            &GitExportOptions {
+                git_branch: Some("HEAD".into()),
+                ..GitExportOptions::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(!unborn_repo.path().join(".git/refs/heads/HEAD").exists());
+}
+
+#[test]
+fn gitattributes_filters_never_corrupt_worktree_across_branch_switch_or_noop_export() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:main ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    ds.create_branch("feat", &BranchOptions::default()).unwrap();
+    let feat = ds.branch("feat").unwrap();
+    feat.load_str(
+        "PREFIX ex: <http://example.org/> ex:feat ex:p 2 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    // Pre-initialize with a repo-local CRLF rule in `.gitattributes`.
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main", repo.path().to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(repo.path().join(".gitattributes"), "*.ttl text eol=crlf\n").unwrap();
+
+    // Export `main`, then `feat`, then re-export `main` (up-to-date no-op branch switch).
+    ds.export_git(repo.path(), &GitExportOptions::default())
+        .unwrap();
+    verify_git_tree(repo.path()).unwrap();
+    assert!(
+        !fs::read(repo.path().join("graphs/default.ttl"))
+            .unwrap()
+            .contains(&b'\r')
+    );
+
+    ds.export_git(
+        repo.path(),
+        &GitExportOptions {
+            branch: Some("feat".into()),
+            ..GitExportOptions::default()
+        },
+    )
+    .unwrap();
+    verify_git_tree(repo.path()).unwrap();
+    assert!(
+        !fs::read(repo.path().join("graphs/default.ttl"))
+            .unwrap()
+            .contains(&b'\r')
+    );
+
+    let noop = ds
+        .export_git(repo.path(), &GitExportOptions::default())
+        .unwrap();
+    assert_eq!(noop.commits_exported, 0);
+    verify_git_tree(repo.path()).unwrap();
+    assert!(
+        !fs::read(repo.path().join("graphs/default.ttl"))
+            .unwrap()
+            .contains(&b'\r'),
+        "no-op branch switch must keep LF-exact bytes despite .gitattributes eol=crlf"
+    );
+}
+
+#[test]
+fn deleted_branch_handle_refuses_export_after_name_reuse() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:base ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    ds.create_branch("topic", &BranchOptions::default())
+        .unwrap();
+    let stale_handle = ds.branch("topic").unwrap();
+    stale_handle
+        .load_str(
+            "PREFIX ex: <http://example.org/> ex:oldTopic ex:p 2 .",
+            sparkles::io::RdfFormat::Turtle,
+        )
+        .unwrap();
+
+    // Delete `topic` and create a brand-new `topic` with different data.
+    ds.delete_branch("topic", true).unwrap();
+    ds.create_branch("topic", &BranchOptions::default())
+        .unwrap();
+    let new_handle = ds.branch("topic").unwrap();
+    new_handle
+        .load_str(
+            "PREFIX ex: <http://example.org/> ex:newTopic ex:p 3 .",
+            sparkles::io::RdfFormat::Turtle,
+        )
+        .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    let err = stale_handle
+        .export_git(repo.path(), &GitExportOptions::default())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no longer exists"),
+        "expected deleted-branch refusal, got: {err}"
+    );
+}
+
+#[test]
+fn squash_continuation_enforces_monotonic_progression_and_empty_default_export_grows() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+
+    // 1. Default per-commit export on a fresh empty store (commit 0 only), then grow with
+    //    commit 1 using the same default options.
+    let empty_repo = tempfile::tempdir().unwrap();
+    let r0 = ds
+        .export_git(empty_repo.path(), &GitExportOptions::default())
+        .unwrap();
+    assert_eq!(r0.commits_exported, 1);
+    assert_eq!(r0.mapping.entries[0].sparkles_seq, 0);
+
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    let r1 = ds
+        .export_git(empty_repo.path(), &GitExportOptions::default())
+        .unwrap();
+    assert_eq!(r1.commits_skipped, 1);
+    assert_eq!(r1.commits_exported, 1);
+    assert_eq!(r1.mapping.entries.len(), 2);
+    assert_eq!(r1.mapping.entries[0].sparkles_seq, 0);
+    assert_eq!(r1.mapping.entries[1].sparkles_seq, 1);
+
+    // Add commits 2 and 3 for squash continuation checks.
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 2 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 3 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+
+    let sq_repo = tempfile::tempdir().unwrap();
+    let sq1 = ds
+        .export_git(
+            sq_repo.path(),
+            &GitExportOptions {
+                mode: GitExportMode::Squash,
+                ..GitExportOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(sq1.commits_exported, 1);
+    assert_eq!(sq1.mapping.entries[0].sparkles_seq, 3);
+
+    // Older `to_seq` must be refused.
+    assert!(
+        ds.export_git(
+            sq_repo.path(),
+            &GitExportOptions {
+                mode: GitExportMode::Squash,
+                to_seq: Some(2),
+                ..GitExportOptions::default()
+            }
+        )
+        .is_err()
+    );
+
+    // Same head with shifted `from_seq` must be refused.
+    assert!(
+        ds.export_git(
+            sq_repo.path(),
+            &GitExportOptions {
+                mode: GitExportMode::Squash,
+                from_seq: Some(2),
+                to_seq: Some(3),
+                ..GitExportOptions::default()
+            }
+        )
+        .is_err()
+    );
+
+    // Valid forward squash (`seq 3 -> seq 4`) succeeds and appends 1 commit.
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 4 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    let sq2 = ds
+        .export_git(
+            sq_repo.path(),
+            &GitExportOptions {
+                mode: GitExportMode::Squash,
+                ..GitExportOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(sq2.commits_exported, 1);
+    assert_eq!(sq2.mapping.entries.len(), 2);
+    assert_eq!(sq2.mapping.entries[1].sparkles_seq, 4);
+}
+
+#[test]
+fn import_aborts_before_publishing_quads_when_prefix_persistence_fails() {
+    let tree_dir = tempfile::tempdir().unwrap();
+    let prefixes = BTreeMap::from([("p".to_string(), "http://example.org/p/".to_string())]);
+    let bn = BlankNode::new("b0").unwrap();
+    let quads = vec![
+        Quad::new(
+            bn.clone(),
+            nn("http://example.org/p/name"),
+            Literal::from("node"),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            nn("http://example.org/p/root"),
+            nn("http://example.org/p/ref"),
+            bn,
+            GraphName::DefaultGraph,
+        ),
+    ];
+    write_git_tree(quads, &prefixes, tree_dir.path(), &WriteOptions::default()).unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("db");
+    let ds = Dataset::open(&db_path).unwrap();
+
+    // Block `prefixes.json` persistence by creating a directory at `prefixes.json`.
+    let prefixes_path = db_path.join("prefixes.json");
+    if prefixes_path.exists() {
+        fs::remove_file(&prefixes_path).unwrap();
+    }
+    fs::create_dir(&prefixes_path).unwrap();
+
+    let err = import_git_tree(&ds, tree_dir.path()).unwrap_err();
+    assert!(matches!(err, GitError::Store(_)), "{err:?}");
+    assert!(
+        collect_dataset_quads(&ds).unwrap().is_empty(),
+        "failed prefix persistence must NOT leave committed quads behind"
+    );
+    assert!(!ds.prefixes().contains_key("p"));
+
+    // Remove the blocking directory and retry: exactly one set of blank nodes is imported.
+    fs::remove_dir(&prefixes_path).unwrap();
+    let receipt = import_git_tree(&ds, tree_dir.path()).unwrap();
+    assert!(receipt.committed);
+    assert_eq!(collect_dataset_quads(&ds).unwrap().len(), 2);
+    assert_eq!(
+        ds.prefixes().get("p").map(String::as_str),
+        Some("http://example.org/p/")
+    );
+}
+
+#[test]
+fn corrupt_changelog_segment_fails_export_before_publishing_instead_of_dropping_authors() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("db");
+    let ds = Dataset::open(&db_path).unwrap();
+    for (i, author) in [
+        (1i64, "Alice <alice@example.org>"),
+        (2i64, "Bob <bob@example.org>"),
+        (3i64, "Carol <carol@example.org>"),
+    ] {
+        ds.transaction_receipt_with(
+            StoreWriteOptions {
+                author: Some(Arc::from(author)),
+                message: Some(Arc::from(format!("Commit {i}"))),
+                ..Default::default()
+            },
+            |tx| {
+                tx.insert(
+                    Quad::new(
+                        nn(&format!("http://example.org/s{i}")),
+                        nn("http://example.org/p"),
+                        Literal::from(i),
+                        GraphName::DefaultGraph,
+                    )
+                    .as_ref(),
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+    ds.store().flush_change_log().unwrap();
+
+    // Corrupt the flushed change-log segment file on disk (`<db>/changes/*.log`).
+    let cl_dir = db_path.join("changes");
+    let mut corrupted = false;
+    for entry in fs::read_dir(&cl_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|s| s.to_str()) == Some("log") {
+            let mut bytes = fs::read(&path).unwrap();
+            for b in &mut bytes {
+                *b ^= 0xff;
+            }
+            fs::write(&path, bytes).unwrap();
+            corrupted = true;
+        }
+    }
+    assert!(corrupted, "expected a flushed .log file under changes/");
+
+    let repo = tempfile::tempdir().unwrap();
+    let err = ds
+        .export_git(repo.path(), &GitExportOptions::default())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("corrupt")
+            || err.to_string().contains("change-log")
+            || err.to_string().contains("EOF")
+            || err.to_string().contains("invalid"),
+        "expected change-log metadata error, got: {err}"
+    );
+    // Must not have published any Git commits.
+    let head = Command::new("git")
+        .args([
+            "-C",
+            repo.path().to_str().unwrap(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !head.status.success(),
+        "export must fail before publishing commits when change-log metadata is corrupt"
+    );
+}
+
+#[test]
+fn canonicalization_budget_catches_graph_position_distinct_predicates_triple_terms_and_cdt_expansion()
+ {
+    // 1. Cyclic bipartite graph: 10 ambiguous subject blank nodes `u0..u9` linked to 10
+    //    indistinguishable ambiguous blank-node graphs `v0..v9` via 10 DISTINCT predicates
+    //    `ex:p0..ex:p9`: `Quad(u_i, p_k, "x", v_{(i + k) % 10})`.
+    //    Every `u_i` shares one 1-hop signature and every `v_j` shares one 1-hop signature.
+    //    In oxrdf, `position == "g"` omits the predicate, so all 10 `v_j` merge into one
+    //    permutation bucket (`10!`) even though each edge from `u_i` has a distinct predicate.
+    let mut g_poison = Vec::new();
+    for i in 0..10usize {
+        let u = BlankNode::new(format!("u{i}")).unwrap();
+        for k in 0..10usize {
+            let v = BlankNode::new(format!("v{}", (i + k) % 10)).unwrap();
+            g_poison.push(Quad::new(
+                u.clone(),
+                nn(&format!("http://example.org/p{k}")),
+                Literal::from("x"),
+                GraphName::BlankNode(v),
+            ));
+        }
+    }
+    let dir1 = tempfile::tempdir().unwrap();
+    let err1 = write_git_tree(
+        g_poison,
+        &BTreeMap::new(),
+        dir1.path(),
+        &WriteOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err1, GitError::Format(ref m) if m.contains("budget exceeded")),
+        "expected g-position bucket refusal, got: {err1:?}"
+    );
+
+    // 2. Symmetric K_10 clique nested inside RDF 1.2 triple terms must be caught in preflight.
+    let mut t_poison = Vec::new();
+    let root = nn("http://example.org/r");
+    let edge = nn("http://example.org/e");
+    let inner_p = nn("http://example.org/p");
+    for i in 0..10 {
+        for j in 0..10 {
+            if i != j {
+                let tr = Triple::new(
+                    BlankNode::new(format!("k{i}")).unwrap(),
+                    inner_p.clone(),
+                    BlankNode::new(format!("k{j}")).unwrap(),
+                );
+                t_poison.push(Quad::new(
+                    root.clone(),
+                    edge.clone(),
+                    Term::Triple(Box::new(tr)),
+                    GraphName::DefaultGraph,
+                ));
+            }
+        }
+    }
+    let dir2 = tempfile::tempdir().unwrap();
+    let err2 = write_git_tree(
+        t_poison,
+        &BTreeMap::new(),
+        dir2.path(),
+        &WriteOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err2, GitError::Format(ref m) if m.contains("budget exceeded")),
+        "expected RDF 1.2 triple-term budget refusal, got: {err2:?}"
+    );
+
+    // 3. Single quad whose `cdt:List` expands beyond `WriteOptions::max_quads` must refuse
+    //    during CDT expansion.
+    let cdt_list = nn("http://w3id.org/awslabs/neptune/SPARQL-CDTs/List");
+    let elems = (0..20)
+        .map(|i| i.to_string())
+        .chain(std::iter::once("_:b0".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cdt_quad = Quad::new(
+        nn("http://example.org/s"),
+        nn("http://example.org/list"),
+        Literal::new_typed_literal(format!("[{elems}]"), cdt_list),
+        GraphName::DefaultGraph,
+    );
+    let dir3 = tempfile::tempdir().unwrap();
+    let err3 = write_git_tree(
+        vec![cdt_quad],
+        &BTreeMap::new(),
+        dir3.path(),
+        &WriteOptions {
+            max_quads: 5,
+            ..WriteOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err3, GitError::Format(ref m) if m.contains("quad limit")),
+        "expected CDT expansion quad-limit refusal, got: {err3:?}"
+    );
+}
+
+#[test]
+fn write_and_mapping_byte_limits_refuse_cleanly_before_publishing() {
+    let q = Quad::new(
+        nn("http://example.org/s"),
+        nn("http://example.org/p"),
+        Literal::from("a payload longer than sixteen bytes"),
+        GraphName::DefaultGraph,
+    );
+
+    // 1. Per-graph write limit leaves no partial files behind.
+    let dir_g = tempfile::tempdir().unwrap();
+    let err_g = write_git_tree(
+        vec![q.clone()],
+        &BTreeMap::new(),
+        dir_g.path(),
+        &WriteOptions {
+            max_graph_file_bytes: 16,
+            ..WriteOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err_g, GitError::Format(_)), "{err_g:?}");
+    assert!(!dir_g.path().join("graphs/default.ttl").exists());
+    assert!(!dir_g.path().join(MANIFEST_REL_PATH).exists());
+
+    // 2. Manifest write limit leaves no graph or manifest files persisted.
+    let dir_m = tempfile::tempdir().unwrap();
+    let err_m = write_git_tree(
+        vec![q],
+        &BTreeMap::new(),
+        dir_m.path(),
+        &WriteOptions {
+            max_manifest_bytes: 16,
+            ..WriteOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err_m, GitError::Format(_)), "{err_m:?}");
+    assert!(!dir_m.path().join("graphs/default.ttl").exists());
+    assert!(!dir_m.path().join(MANIFEST_REL_PATH).exists());
+
+    // 3. Mapping byte ceiling refuses export BEFORE moving the Git ref.
+    let db_dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(db_dir.path().join("db")).unwrap();
+    ds.load_str(
+        "PREFIX ex: <http://example.org/> ex:s ex:p 1 .",
+        sparkles::io::RdfFormat::Turtle,
+    )
+    .unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let err_map = ds
+        .export_git(
+            repo.path(),
+            &GitExportOptions {
+                max_mapping_bytes: 64,
+                ..GitExportOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        err_map.to_string().contains("maximum mapping size"),
+        "expected mapping size limit error, got: {err_map}"
+    );
+    let head = Command::new("git")
+        .args([
+            "-C",
+            repo.path().to_str().unwrap(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !head.status.success(),
+        "over-limit mapping must refuse BEFORE moving refs/heads/main"
+    );
+}
+
+#[test]
+fn strict_verify_rejects_noncanonical_blank_node_labels_in_graph_and_quads() {
+    // 1. Noncanonical blank-node label `_:local0` in subject position with matching SHA-256
+    //    and quad count must still be rejected by strict verification.
+    let dir = tempfile::tempdir().unwrap();
+    let bn = BlankNode::new("x").unwrap();
+    let q = Quad::new(
+        bn,
+        nn("http://example.org/p"),
+        Literal::from(1i64),
+        GraphName::DefaultGraph,
+    );
+    write_git_tree(
+        vec![q],
+        &BTreeMap::new(),
+        dir.path(),
+        &WriteOptions::default(),
+    )
+    .unwrap();
+    let ttl_path = dir.path().join("graphs/default.ttl");
+    let noncanon_bytes = b"_:local0 <http://example.org/p> 1 .\n";
+    fs::write(&ttl_path, noncanon_bytes).unwrap();
+    let mut sha = sparkles_core::jobs::Sha256Stream::new();
+    sha.update(noncanon_bytes);
+    let digest = sha.finalize_hex();
+    let mf_path = dir.path().join(MANIFEST_REL_PATH);
+    let mut mf: serde_json::Value = serde_json::from_slice(&fs::read(&mf_path).unwrap()).unwrap();
+    mf["graphs"][0]["sha256"] = serde_json::Value::String(digest);
+    fs::write(&mf_path, serde_json::to_vec_pretty(&mf).unwrap()).unwrap();
+
+    let err = verify_git_tree(dir.path()).unwrap_err();
+    assert!(
+        matches!(err, GitError::InvalidManifest(ref m) if m.contains("non-canonical blank-node")),
+        "expected non-canonical blank-node label refusal, got: {err:?}"
+    );
+
+    // 2. Leading-zero blank-node graph label `c14n00` rejected by strict manifest check.
+    let dir2 = tempfile::tempdir().unwrap();
+    let q2 = Quad::new(
+        nn("http://example.org/s"),
+        nn("http://example.org/p"),
+        Literal::from(1i64),
+        GraphName::BlankNode(BlankNode::new("bg").unwrap()),
+    );
+    write_git_tree(
+        vec![q2],
+        &BTreeMap::new(),
+        dir2.path(),
+        &WriteOptions::default(),
+    )
+    .unwrap();
+    let mf2_path = dir2.path().join(MANIFEST_REL_PATH);
+    let mut mf2: serde_json::Value = serde_json::from_slice(&fs::read(&mf2_path).unwrap()).unwrap();
+    let mut h = sparkles_core::jobs::Sha256Stream::new();
+    h.update(b"c14n00");
+    let ghash = h.finalize_hex();
+    let old_path = dir2.path().join(mf2["graphs"][0]["path"].as_str().unwrap());
+    let new_rel = format!("graphs/bnode-c14n00-{}.ttl", &ghash[..16]);
+    fs::rename(&old_path, dir2.path().join(&new_rel)).unwrap();
+    mf2["graphs"][0]["label"] = serde_json::Value::String("c14n00".into());
+    mf2["graphs"][0]["path"] = serde_json::Value::String(new_rel);
+    fs::write(&mf2_path, serde_json::to_vec_pretty(&mf2).unwrap()).unwrap();
+
+    let err2 = verify_git_tree(dir2.path()).unwrap_err();
+    assert!(
+        matches!(err2, GitError::InvalidManifest(ref m) if m.contains("non-canonical blank-node")),
+        "expected c14n00 rejection, got: {err2:?}"
+    );
 }

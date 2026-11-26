@@ -282,4 +282,55 @@ fn cli_git_supports_branch_option_and_scrubs_git_env() {
     let ver_json: serde_json::Value = serde_json::from_slice(&ver.stdout).unwrap();
     assert_eq!(ver_json["format_version"], 1);
     assert_eq!(ver_json["quads"], 2);
+
+    // 5. Bare relative `--mapping mapping.json` (empty parent component) succeeds and is
+    //    cleanly resumable on retry.
+    let rel_work = tempfile::tempdir().unwrap();
+    let rel_repo = rel_work.path().join("rel-repo");
+    let rel_exp = Command::new(BIN)
+        .current_dir(rel_work.path())
+        .args([
+            "git",
+            "export",
+            "--loc",
+            db.to_str().unwrap(),
+            "--out",
+            rel_repo.to_str().unwrap(),
+            "--mapping",
+            "mapping.json",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rel_exp.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rel_exp.stderr)
+    );
+    assert!(rel_work.path().join("mapping.json").is_file());
+    let rel_exp2 = Command::new(BIN)
+        .current_dir(rel_work.path())
+        .args([
+            "git",
+            "export",
+            "--loc",
+            db.to_str().unwrap(),
+            "--out",
+            rel_repo.to_str().unwrap(),
+            "--mapping",
+            "mapping.json",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rel_exp2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rel_exp2.stderr)
+    );
+    let rel_json2: serde_json::Value = serde_json::from_slice(&rel_exp2.stdout).unwrap();
+    assert_eq!(rel_json2["commits_exported"], 0);
+    assert_eq!(rel_json2["commits_skipped"], 1);
 }

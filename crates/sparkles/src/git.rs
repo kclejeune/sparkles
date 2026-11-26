@@ -15,8 +15,9 @@ pub mod export;
 pub mod profile;
 
 pub use export::{
-    CommitMapping, CommitMappingEntry, GitExportMode, GitExportOptions, GitExportReport,
-    MAPPING_FORMAT_VERSION, MAPPING_PROFILE_NAME, default_mapping_path, export_branch_to_git,
+    CommitMapping, CommitMappingEntry, DEFAULT_MAX_MAPPING_BYTES, GitExportMode, GitExportOptions,
+    GitExportReport, MAPPING_FORMAT_VERSION, MAPPING_PROFILE_NAME, default_mapping_path,
+    export_branch_to_git,
 };
 pub use profile::{
     CANONICALIZATION_ALGORITHM, CanonicalGraphEntry, CanonicalGraphKind, CanonicalManifest,
