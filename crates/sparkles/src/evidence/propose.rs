@@ -602,8 +602,41 @@ pub fn propose(
     // The caller's reads decide every reference, before anything is written.
     let refs = references(input, &plan, prepared.requirements())?;
     if !refs.is_empty() {
+        if let Some(expected) = options.if_head {
+            let live = store.snapshot().commit;
+            if live != expected {
+                return Err(managed(
+                    ManagedErrorKind::HeadChanged,
+                    format!("ifHead: the head of the branch is commit {live}, not {expected}"),
+                ));
+            }
+        }
         let mut resolution = Resolution::new(control.clone())?;
-        resolution.all(catalog, main, logical, &refs, read)?;
+        if let Some(expected) = options.if_head {
+            resolution.pin_commit(main, logical, expected);
+        }
+        if let Err(e) = resolution.all(catalog, main, logical, &refs, read) {
+            if let Some(expected) = options.if_head
+                && matches!(
+                    &e,
+                    Error::Managed(m)
+                        if matches!(
+                            m.kind,
+                            ManagedErrorKind::EvidenceUnavailable
+                                | ManagedErrorKind::OriginNotReproduced
+                        )
+                )
+            {
+                let live = store.snapshot().commit;
+                if live != expected {
+                    return Err(managed(
+                        ManagedErrorKind::HeadChanged,
+                        format!("ifHead: the head of the branch is commit {live}, not {expected}"),
+                    ));
+                }
+            }
+            return Err(e);
+        }
     }
     // The hold is durable before the commit that records it.
     let commits: Vec<crate::branch::CommitRef> = plan

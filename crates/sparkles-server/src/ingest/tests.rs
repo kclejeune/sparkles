@@ -3993,7 +3993,7 @@ async fn claims_lineage_treats_unattributable_shared_c18_transition_as_ambiguous
         hide_inferences: false,
     });
     let protections = Arc::new(Protections {
-        list: vec![("org".into(), hide_a)],
+        list: vec![("org".into(), hide_a.clone())],
         limits: Default::default(),
     });
     let caller = user_principal(
@@ -4050,6 +4050,145 @@ async fn claims_lineage_treats_unattributable_shared_c18_transition_as_ambiguous
         )
         .await,
         "must not publish prov:wasRevisionOf via another source's shared transition"
+    );
+
+    // Subcase 2: Same fixture on a fresh C18 graph, but a Query protection pattern also
+    // hides S2's prov:wasDerivedFrom membership on X (leaving S1's memberships on X and B,
+    // S2's membership on B, and B prov:wasRevisionOf X visible). Even though the visible
+    // membership intersection shrinks to S1, C18 has no positive source-specific proof of
+    // B->X under a view that can hide competing memberships, so prov:wasRevisionOf must
+    // still be omitted.
+    let g_masked = "https://example.org/notes/shared-endpoints-masked-s2";
+    let vx2 = ingest(
+        &app,
+        claims(json!({ "text": text_x, "format": "text/markdown", "graph": g_masked, "iri": s1 })),
+    )
+    .await;
+    assert_eq!(vx2["status"], "done", "{vx2}");
+    let rend_x2 = vx2["result"]["rendition"].as_str().unwrap().to_string();
+    let (s, reg_a2) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_masked, "iri": s1, "format": "text/markdown", "text": text_a }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_a2}");
+    let rend_a2 = unangle(reg_a2["rendition"].as_str().unwrap()).to_string();
+    let (s, reg_b2) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_masked, "iri": s1, "format": "text/markdown", "text": text_b }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_b2}");
+    let (s, _) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_masked, "iri": s2, "format": "text/markdown", "text": text_x }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g_masked, "iri": s2, "format": "text/markdown", "text": text_b }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let upd = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(format!(
+            "INSERT DATA {{ GRAPH <{g_masked}> {{ <{rend_a2}> a <urn:test:HiddenHop> }} }}"
+        )))
+        .unwrap();
+    let (s, body) = send(&app, upd).await;
+    assert!(s.is_success(), "{s} {body}");
+
+    let hide_s2_on_x = Arc::new(sparkles::access::Protection {
+        name: "hide_s2_on_x".into(),
+        predicates: Some(vec!["http://www.w3.org/ns/prov#wasDerivedFrom".into()]),
+        classes: None,
+        subclasses: false,
+        graphs: None,
+        pattern: Some(format!(
+            "?s <http://www.w3.org/ns/prov#wasDerivedFrom> ?o . FILTER(?s != <{rend_x2}> || ?o != <{s2}>)"
+        )),
+        prefixes: Default::default(),
+        hide_inferences: false,
+    });
+    let protections_masked = Arc::new(Protections {
+        list: vec![("org".into(), hide_a), ("org".into(), hide_s2_on_x)],
+        limits: Default::default(),
+    });
+    let caller_masked = user_principal(
+        "s1_caller_masked",
+        Grants {
+            protections: Some(protections_masked),
+            restricted: vec![
+                Restricted {
+                    dataset: "org".into(),
+                    level: Level::Write,
+                    graphs: None,
+                    endpoints: Some(vec![Endpoint::Update]),
+                    lifts: vec!["hide_a".into(), "hide_s2_on_x".into()],
+                    branches: None,
+                    server_models: false,
+                },
+                Restricted {
+                    dataset: "org".into(),
+                    level: Level::Read,
+                    graphs: None,
+                    endpoints: Some(vec![Endpoint::Query]),
+                    lifts: Vec::new(),
+                    branches: None,
+                    server_models: false,
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let mut req_d2 = claims_request(&text_d);
+    req_d2.graph = Some(g_masked.into());
+    req_d2.iri = Some(s1.into());
+    let st2 = st.clone();
+    let vd2 = tokio::task::spawn_blocking(move || {
+        run_direct_as(
+            &st2,
+            &caller_masked,
+            req_d2,
+            Arc::new(AtomicBool::new(false)),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let rev_d2 = vd2["revision"].as_str().unwrap().to_string();
+    assert!(
+        vd2.get("previousRevision").is_none(),
+        "masked S2 membership must not make S2's B->X edge look exclusive to S1: {vd2}"
+    );
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_d2}> <http://www.w3.org/ns/prov#wasRevisionOf> ?p }} }}"
+            )
+        )
+        .await,
+        "must not store prov:wasRevisionOf when Query protection can hide competing memberships"
     );
 }
 
@@ -4833,6 +4972,549 @@ async fn claims_source_mode_and_upload_pin_head_across_concurrent_registration()
             &app,
             &format!(
                 "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_c3}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rev_a3}> }} }}"
+            )
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn claims_predecessor_lookup_charges_candidate_and_rendition_keys_to_memory_cap() {
+    let m = proposals_mock();
+    let build_state = |mem_cap: u64| {
+        let mut s = AppState::standalone(Default::default(), Duration::from_secs(30));
+        s.models = arc_swap::ArcSwapOption::from_pointee(Models::new(
+            ModelsConfig::parse(
+                &json!({
+                    "providers": {
+                        "cheap": { "kind": "openai", "endpoint": m.url(), "requestTimeoutSecs": 5,
+                                   "allowedModels": ["m"], "structuredOutput": "json-schema",
+                                   "pricing": { "inputPerMTok": 1.0, "outputPerMTok": 2.0 } }
+                    },
+                    "roles": { "extract": [{ "provider": "cheap", "model": "m" }] }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+            Default::default(),
+            sparkles::outbound::OutboundPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        ));
+        s.limits.query_memory_bytes = Some(mem_cap);
+        let s = Arc::new(s);
+        let ds = s.attach("org", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                ORG.as_bytes().to_vec(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let router = crate::http::router(s.clone());
+        (s, router)
+    };
+
+    // Subcase A: Multiple ~1 KiB candidate revision IRIs in EV_SOURCES stay well within a
+    // generous 2 MiB lookup cap, while a tight 100 KiB cap rejects decoding and copying
+    // them with 422 incomplete-evidence.
+    let g_cand = "https://example.org/notes/tight-cap-candidate";
+    let sk_framed = json!([
+        "ingest-claims-source",
+        1,
+        g_cand,
+        g_cand,
+        EV_SOURCES,
+        EV_CLAIMS
+    ])
+    .to_string();
+    let sk = format!(
+        "ingest-claims-source:1:{}",
+        sparkles::evidence::Sha256Digest::of_bytes(
+            sk_framed.as_bytes(),
+            &sparkles::task::Control::none()
+        )
+        .unwrap()
+    );
+    let cand_pad = "x".repeat(1_000);
+    for (cap, expect_ok) in [(100 * 1024, false), (2 * 1024 * 1024, true)] {
+        let (st, app) = build_state(cap);
+        enable(&app).await;
+        evidence(&app).await;
+        put_org_profile(&app, "default").await;
+
+        let (s, _) = send(
+            &app,
+            req(
+                "POST",
+                "/org/sources",
+                json!({ "graph": g_cand, "iri": g_cand, "format": "text/markdown", "text": "# Tight cap v1\n" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        // Plant 40 ~1 KiB SourceRevision subjects in EV_SOURCES while detached, then re-protect.
+        let (s, _) = send(
+            &app,
+            req(
+                "POST",
+                "/$/evidence/org/detach",
+                json!({ "graph": EV_SOURCES }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let mut ins = format!("INSERT DATA {{ GRAPH <{EV_SOURCES}> {{\n");
+        for i in 0..40 {
+            ins.push_str(&format!(
+                "  <urn:test:long-rev:{i:02}:{cand_pad}> a <urn:x-sparkles:evidence:SourceRevision> ;\n\
+                   <urn:x-sparkles:evidence:sourceKey> \"{sk}\" ;\n\
+                   <http://www.w3.org/ns/prov#specializationOf> <{g_cand}> .\n"
+            ));
+        }
+        ins.push_str("} }");
+        let upd = Request::post("/org/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(ins))
+            .unwrap();
+        let (s, body) = send(&app, upd).await;
+        assert!(s.is_success(), "{s} {body}");
+        evidence(&app).await;
+
+        let mut req_v2 = claims_request("# Tight cap v2\n");
+        req_v2.graph = Some(g_cand.into());
+        req_v2.iri = Some(g_cand.into());
+        let st2 = st.clone();
+        let res = tokio::task::spawn_blocking(move || run_direct(&st2, req_v2))
+            .await
+            .unwrap();
+        if expect_ok {
+            let v = res.unwrap_or_else(|e| panic!("cap={cap} should succeed: {e}"));
+            assert_eq!(v["outcome"], "no-facts", "{v}");
+        } else {
+            let err = res.expect_err("tight cap must reject overflowing candidate lookup");
+            assert_eq!(err["code"], "incomplete-evidence", "{err}");
+            assert_eq!(err["status"], 422, "{err}");
+        }
+    }
+
+    // Subcase B: A ~4 KiB intermediate C18 rendition IRI encountered during lineage
+    // traversal (never passed through C18's 500-char display truncation) stays within a
+    // 2 MiB lookup cap and links `rev1`, while a tight 400 KiB cap rejects it with 422
+    // incomplete-evidence.
+    let g_rend = "https://example.org/notes/tight-cap-rendition";
+    let long_rend = format!("urn:test:long-rend:{}", "r".repeat(4_000));
+    for (cap, expect_ok) in [(400 * 1024, false), (2 * 1024 * 1024, true)] {
+        let (st, app) = build_state(cap);
+        enable(&app).await;
+        evidence(&app).await;
+        put_org_profile(&app, "default").await;
+
+        let v1 = ingest(
+            &app,
+            claims(json!({ "text": "# Rend cap v1\n", "format": "text/markdown", "graph": g_rend, "iri": g_rend })),
+        )
+        .await;
+        assert_eq!(v1["status"], "done", "{v1}");
+        let rev1 = v1["result"]["revision"].as_str().unwrap().to_string();
+        let rend1 = v1["result"]["rendition"].as_str().unwrap().to_string();
+
+        let (s, reg2) = send(
+            &app,
+            req(
+                "POST",
+                "/org/sources",
+                json!({ "graph": g_rend, "iri": g_rend, "format": "text/markdown", "text": "# Rend cap v2\n" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{reg2}");
+        let rend2 = unangle(reg2["rendition"].as_str().unwrap()).to_string();
+
+        let upd_q = format!(
+            "DELETE DATA {{ GRAPH <{g_rend}> {{ <{rend2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{rend1}> }} }} ; \
+             INSERT DATA {{ GRAPH <{g_rend}> {{ \
+               <{long_rend}> a <urn:x-sparkles:TextRendition> ; \
+                 <http://www.w3.org/ns/prov#wasDerivedFrom> <{g_rend}> ; \
+                 <http://www.w3.org/ns/prov#wasRevisionOf> <{rend1}> . \
+               <{rend2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{long_rend}> . \
+             }} }}"
+        );
+        let upd = Request::post("/org/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(upd_q))
+            .unwrap();
+        let (s, body) = send(&app, upd).await;
+        assert!(s.is_success(), "{s} {body}");
+
+        let mut req_v3 = claims_request("# Rend cap v3\n");
+        req_v3.graph = Some(g_rend.into());
+        req_v3.iri = Some(g_rend.into());
+        let st2 = st.clone();
+        let res = tokio::task::spawn_blocking(move || run_direct(&st2, req_v3))
+            .await
+            .unwrap();
+        if expect_ok {
+            let v = res.unwrap_or_else(|e| panic!("cap={cap} should succeed: {e}"));
+            assert_eq!(v["previousRevision"], rev1, "{v}");
+        } else {
+            let err = res.expect_err("tight cap must reject overflowing rendition lookup");
+            assert_eq!(err["code"], "incomplete-evidence", "{err}");
+            assert_eq!(err["status"], 422, "{err}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn claims_source_retry_refuses_masked_byte_update_digest() {
+    use crate::auth::{Endpoint, Grants, Level, Protections, Restricted};
+    use base64::Engine;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    put_org_profile(&app, "default").await;
+
+    let g = "https://example.org/notes/masked-byte-update";
+    let text_lf = format!("{NOTES}\nByte digest check.\n");
+    let text_crlf = text_lf.replace('\n', "\r\n");
+    let crlf_digest = sparkles::evidence::Sha256Digest::of_bytes(
+        text_crlf.as_bytes(),
+        &sparkles::task::Control::none(),
+    )
+    .unwrap()
+    .to_string();
+    let orig_b64 = base64::engine::general_purpose::STANDARD.encode(text_crlf.as_bytes());
+
+    // Initial LF registration: recorded spk:contentDigest equals the normalized text hash.
+    let (s, reg_lf) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g, "iri": g, "format": "text/markdown", "text": text_lf }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_lf}");
+
+    // Query protection hides ONLY the replacement CRLF spk:contentDigest, leaving the
+    // original LF digest visible at initial read and omitting `digest` from `list_sources`
+    // after the concurrent CRLF registration updates the same normalized rendition.
+    let hide_crlf_digest = Arc::new(sparkles::access::Protection {
+        name: "hide_crlf_digest".into(),
+        predicates: Some(vec!["urn:x-sparkles:contentDigest".into()]),
+        classes: None,
+        subclasses: false,
+        graphs: None,
+        pattern: Some(format!(
+            "?s <urn:x-sparkles:contentDigest> ?o . FILTER(?o != \"{crlf_digest}\")"
+        )),
+        prefixes: Default::default(),
+        hide_inferences: false,
+    });
+    let protections = Arc::new(Protections {
+        list: vec![("org".into(), hide_crlf_digest)],
+        limits: Default::default(),
+    });
+    let caller = user_principal(
+        "lf_reader",
+        Grants {
+            protections: Some(protections),
+            restricted: vec![
+                Restricted {
+                    dataset: "org".into(),
+                    level: Level::Write,
+                    graphs: None,
+                    endpoints: Some(vec![Endpoint::Update]),
+                    lifts: vec!["hide_crlf_digest".into()],
+                    branches: None,
+                    server_models: false,
+                },
+                Restricted {
+                    dataset: "org".into(),
+                    level: Level::Read,
+                    graphs: None,
+                    endpoints: Some(vec![Endpoint::Query]),
+                    lifts: Vec::new(),
+                    branches: None,
+                    server_models: false,
+                },
+            ],
+            ..Default::default()
+        },
+    );
+
+    // Concurrent registration after extraction updates the same normalized rendition to CRLF bytes.
+    let st_fp = st.clone();
+    let g_fp = g.to_string();
+    let text_lf_fp = text_lf.clone();
+    let orig_b64_fp = orig_b64.clone();
+    let fired = Arc::new(AtomicUsize::new(0));
+    let fired_fp = fired.clone();
+    st.get("org").unwrap().store.set_failpoint(
+        "ingest-claims-after-extract",
+        Some(Arc::new(move |_| {
+            if fired_fp.fetch_add(1, Ordering::SeqCst) == 0 {
+                let cfg = crate::mcp::rest::config(&st_fp, crate::mcp::rest::Mode::Write);
+                let server = crate::mcp::McpServer::new(st_fp.clone(), cfg);
+                let mut call = crate::mcp::Call {
+                    principal: crate::auth::Principal::local(),
+                    arrived: std::time::Instant::now(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    request_id: String::new(),
+                    headers: None,
+                    held: None,
+                    grant: None,
+                    preparation: None,
+                };
+                let args = json!({
+                    "dataset": "org",
+                    "graph": g_fp,
+                    "iri": g_fp,
+                    "format": "text/markdown",
+                    "text": text_lf_fp,
+                    "original": orig_b64_fp,
+                })
+                .as_object()
+                .unwrap()
+                .clone();
+                server
+                    .run_now("register_converted", args, &mut call)
+                    .unwrap();
+            }
+        })),
+    );
+
+    let rev_count_query = format!(
+        "SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{EV_SOURCES}> {{ ?r a <urn:x-sparkles:evidence:SourceRevision> }} }}"
+    );
+    let before_revisions = count(&app, &rev_count_query).await;
+    let req_src = super::pipeline::Request {
+        dataset: "org".into(),
+        mode: super::pipeline::Mode::Claims,
+        source: Some(g.into()),
+        ..Default::default()
+    };
+    let st2 = st.clone();
+    let err = tokio::task::spawn_blocking(move || {
+        run_direct_as(&st2, &caller, req_src, Arc::new(AtomicBool::new(false)))
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    st.get("org")
+        .unwrap()
+        .store
+        .set_failpoint("ingest-claims-after-extract", None);
+
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+    assert_eq!(err["code"], "head-changed", "{err}");
+    assert_eq!(err["status"], 409, "{err}");
+    let after_revisions = count(&app, &rev_count_query).await;
+    assert_eq!(
+        after_revisions, before_revisions,
+        "masked byte-update retry must not publish an LF revision against the CRLF head"
+    );
+}
+
+#[tokio::test]
+async fn claims_before_publish_head_move_masking_predecessor_retries_cleanly() {
+    use crate::auth::{Endpoint, Grants, Level, Protections, Restricted};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    put_org_profile(&app, "default").await;
+
+    let hide_pred = Arc::new(sparkles::access::Protection {
+        name: "hide_pred".into(),
+        predicates: None,
+        classes: Some(vec!["urn:test:HiddenPredecessor".into()]),
+        subclasses: false,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    });
+    let protections = Arc::new(Protections {
+        list: vec![("org".into(), hide_pred)],
+        limits: Default::default(),
+    });
+    let make_caller = |name: &str| {
+        user_principal(
+            name,
+            Grants {
+                protections: Some(protections.clone()),
+                restricted: vec![
+                    Restricted {
+                        dataset: "org".into(),
+                        level: Level::Write,
+                        graphs: None,
+                        endpoints: Some(vec![Endpoint::Update]),
+                        lifts: vec!["hide_pred".into()],
+                        branches: None,
+                        server_models: false,
+                    },
+                    Restricted {
+                        dataset: "org".into(),
+                        level: Level::Read,
+                        graphs: None,
+                        endpoints: Some(vec![Endpoint::Query]),
+                        lifts: Vec::new(),
+                        branches: None,
+                        server_models: false,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+    };
+
+    let text_a = format!("{NOTES}\nBefore-publish A.\n");
+    let text_b = format!("{NOTES}\nBefore-publish B.\n");
+
+    // Subcase 1: Registered-source mode. After lineage selects rev1, the head advances
+    // before propose_ingested by tagging rev1 with the Query-protected class (leaving the
+    // registered source's live rendition and digest intact). Publication must treat this as
+    // a moved head, retry at the new head, omit prov:wasRevisionOf, and succeed.
+    let g1 = "https://example.org/notes/before-publish-source";
+    let va1 = ingest(
+        &app,
+        claims(json!({ "text": text_a, "format": "text/markdown", "graph": g1, "iri": g1 })),
+    )
+    .await;
+    assert_eq!(va1["status"], "done", "{va1}");
+    let rev_a1 = va1["result"]["revision"].as_str().unwrap().to_string();
+    let (s, reg_b1) = send(
+        &app,
+        req(
+            "POST",
+            "/org/sources",
+            json!({ "graph": g1, "iri": g1, "format": "text/markdown", "text": text_b }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{reg_b1}");
+
+    let st_fp = st.clone();
+    let rev_a1_fp = rev_a1.clone();
+    let fired1 = Arc::new(AtomicUsize::new(0));
+    let fired1_fp = fired1.clone();
+    st.get("org").unwrap().store.set_failpoint(
+        "ingest-claims-before-publish",
+        Some(Arc::new(move |_| {
+            if fired1_fp.fetch_add(1, Ordering::SeqCst) == 0 {
+                let ds = st_fp.get("org").unwrap();
+                ds.dataset
+                    .update(&format!(
+                        "INSERT DATA {{ GRAPH <urn:tags> {{ <{rev_a1_fp}> a <urn:test:HiddenPredecessor> }} }}"
+                    ))
+                    .unwrap();
+            }
+        })),
+    );
+    let req_src = super::pipeline::Request {
+        dataset: "org".into(),
+        mode: super::pipeline::Mode::Claims,
+        source: Some(g1.into()),
+        ..Default::default()
+    };
+    let caller1 = make_caller("pub_retry_src");
+    let st2 = st.clone();
+    let ok_src = tokio::task::spawn_blocking(move || {
+        run_direct_as(&st2, &caller1, req_src, Arc::new(AtomicBool::new(false)))
+    })
+    .await
+    .unwrap()
+    .unwrap_or_else(|e| panic!("registered-source before-publish head move must retry: {e}"));
+    st.get("org")
+        .unwrap()
+        .store
+        .set_failpoint("ingest-claims-before-publish", None);
+    assert_eq!(
+        fired1.load(Ordering::SeqCst),
+        2,
+        "expected initial attempt + retry"
+    );
+    let rev_b1 = ok_src["revision"].as_str().unwrap().to_string();
+    assert!(
+        ok_src.get("previousRevision").is_none(),
+        "retried run must omit newly masked predecessor: {ok_src}"
+    );
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_b1}> <http://www.w3.org/ns/prov#wasRevisionOf> ?p }} }}"
+            )
+        )
+        .await
+    );
+
+    // Subcase 2: Upload mode with the same before-publish head move masking rev_a2.
+    let g2 = "https://example.org/notes/before-publish-upload";
+    let va2 = ingest(
+        &app,
+        claims(json!({ "text": text_a, "format": "text/markdown", "graph": g2, "iri": g2 })),
+    )
+    .await;
+    assert_eq!(va2["status"], "done", "{va2}");
+    let rev_a2 = va2["result"]["revision"].as_str().unwrap().to_string();
+
+    let st_fp = st.clone();
+    let rev_a2_fp = rev_a2.clone();
+    let fired2 = Arc::new(AtomicUsize::new(0));
+    let fired2_fp = fired2.clone();
+    st.get("org").unwrap().store.set_failpoint(
+        "ingest-claims-before-publish",
+        Some(Arc::new(move |_| {
+            if fired2_fp.fetch_add(1, Ordering::SeqCst) == 0 {
+                let ds = st_fp.get("org").unwrap();
+                ds.dataset
+                    .update(&format!(
+                        "INSERT DATA {{ GRAPH <urn:tags> {{ <{rev_a2_fp}> a <urn:test:HiddenPredecessor> }} }}"
+                    ))
+                    .unwrap();
+            }
+        })),
+    );
+    let mut req_up = claims_request(&text_b);
+    req_up.graph = Some(g2.into());
+    req_up.iri = Some(g2.into());
+    let caller2 = make_caller("pub_retry_up");
+    let st2 = st.clone();
+    let ok_up = tokio::task::spawn_blocking(move || {
+        run_direct_as(&st2, &caller2, req_up, Arc::new(AtomicBool::new(false)))
+    })
+    .await
+    .unwrap()
+    .unwrap_or_else(|e| panic!("upload before-publish head move must retry: {e}"));
+    st.get("org")
+        .unwrap()
+        .store
+        .set_failpoint("ingest-claims-before-publish", None);
+    assert_eq!(
+        fired2.load(Ordering::SeqCst),
+        2,
+        "expected initial attempt + retry"
+    );
+    let rev_b2 = ok_up["revision"].as_str().unwrap().to_string();
+    assert!(
+        ok_up.get("previousRevision").is_none(),
+        "retried upload must omit newly masked predecessor: {ok_up}"
+    );
+    assert!(
+        !ask(
+            &app,
+            &format!(
+                "ASK {{ GRAPH <{EV_SOURCES}> {{ <{rev_b2}> <http://www.w3.org/ns/prov#wasRevisionOf> ?p }} }}"
             )
         )
         .await

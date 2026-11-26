@@ -1293,3 +1293,85 @@ fn source_revision_was_revision_of_authenticates_and_refuses_invalid_predecessor
     );
     assert_eq!(ds.store().head_commit().seq, head);
 }
+
+#[test]
+fn if_head_refuses_stale_head_before_resolving_newly_masked_predecessor() {
+    use sparkles::access::{Caller, Limits, Protection, Rule, TripleRules};
+
+    let ds = Dataset::memory();
+    configured(&ds);
+
+    let p1 = propose(&ds, &small("c1", proposition()), &options()).unwrap();
+    let rev1 = iri_of(&p1, "rev");
+    let expected_head = ds.store().head_commit().seq;
+
+    // A triple-level read protection hides subjects typed as <urn:test:HiddenPred>.
+    let hide_pred = Arc::new(Protection {
+        name: "hide_pred".into(),
+        predicates: None,
+        classes: Some(vec!["urn:test:HiddenPred".into()]),
+        subclasses: false,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    });
+    let masked_read = Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: hide_pred,
+                read: Graphs::none(),
+                write: Graphs::All,
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    ));
+
+    // Advance the head by tagging rev1 with the protected class in an ordinary graph.
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <urn:tags> {{ <{}> a <urn:test:HiddenPred> }} }}",
+        rev1.as_str()
+    ))
+    .unwrap();
+    let moved_head = ds.store().head_commit().seq;
+    assert_ne!(moved_head, expected_head);
+
+    let mut input = small("c2", proposition());
+    input.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v2") };
+    input.revisions[0].was_revision_of = Some(RecordRef::Existing(rev1));
+
+    // With stale if_head, propose must report head-changed rather than evidence-unavailable
+    // from resolving against the newer masked snapshot.
+    let mut stale = options();
+    stale.if_head = Some(expected_head);
+    let stale_res = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &input,
+        &stale,
+        &mut |_, _| Some(masked_read.clone()),
+        &Control::none(),
+    );
+    assert_eq!(code(stale_res), "head-changed");
+    assert_eq!(ds.store().head_commit().seq, moved_head);
+
+    // At the current head (where rev1 is genuinely masked), propose still returns
+    // evidence-unavailable.
+    let mut current = options();
+    current.if_head = Some(moved_head);
+    let current_res = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &input,
+        &current,
+        &mut |_, _| Some(masked_read.clone()),
+        &Control::none(),
+    );
+    assert_eq!(code(current_res), "evidence-unavailable");
+    assert_eq!(ds.store().head_commit().seq, moved_head);
+}

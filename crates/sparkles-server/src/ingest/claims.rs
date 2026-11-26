@@ -349,13 +349,16 @@ fn source_key(t: &Target, source: &str, graph: &str) -> Result<String, Failed> {
     ))
 }
 
+/// Parse a concrete SHA-256 content digest observed in a C18 source record, returning
+/// `None` when the digest is absent or unparseable.
+fn observed_digest(v: &Value) -> Option<Sha256Digest> {
+    v.as_str().and_then(|s| s.parse::<Sha256Digest>().ok())
+}
+
 /// The revision digest: the content digest that the C18 registration records, which is
 /// the normalized text's unless the registration retained other original bytes.
 fn recorded_digest(v: &Value, text: &Sha256Digest) -> Sha256Digest {
-    match v.as_str().map(str::parse::<Sha256Digest>) {
-        Some(Ok(d)) => d,
-        _ => *text,
-    }
+    observed_digest(v).unwrap_or(*text)
 }
 
 /// Whether the caller's operation of `key` is recorded in the evidence graphs of the
@@ -410,17 +413,25 @@ fn verify_record(
     iri: &NamedNode,
     kind: RecordKind,
 ) -> Result<Verify, Failed> {
-    match res.record(
+    let mut req_held = res.preparation().reserve(0).map_err(resolve_err)?;
+    let req_iri = NamedNode::new_unchecked(
+        res.preparation()
+            .copy_string(iri.as_str(), &mut req_held)
+            .map_err(resolve_err)?,
+    );
+    let out = res.record(
         "predecessor",
         &t.main.dataset,
         &t.logical.dataset,
         Some(access.clone()),
         &sparkles::evidence::resolve::RecordRequest {
-            iri: iri.clone(),
+            iri: req_iri,
             kinds: vec![kind],
             content_digest: None,
         },
-    ) {
+    );
+    drop(req_held);
+    match out {
         Ok(v) => Ok(Verify::Verified(Box::new(v))),
         Err(sparkles::Error::Managed(m))
             if matches!(
@@ -677,6 +688,34 @@ enum C18Predecessors {
     Ambiguous,
 }
 
+/// Whether `access` carries a triple-level read protection with a pattern that could
+/// selectively hide a competing `prov:wasDerivedFrom` membership in `graph` while
+/// leaving the requested source's own membership visible.
+///
+/// Rules without a `pattern` depend only on `(subject, predicate, graph)`, so for any
+/// given rendition they hide either all of its `prov:wasDerivedFrom` triples in `graph`
+/// (already rejected by membership checks) or none of them.
+fn may_hide_competing_membership(
+    access: &sparkles::access::GraphAccess,
+    graph: &NamedNode,
+) -> bool {
+    let Some(rules) = &access.triples else {
+        return false;
+    };
+    let g_term = Term::NamedNode(graph.clone());
+    rules.rules.iter().any(|rule| {
+        !rule.read.is_all()
+            && !rule.read.allows(Some(&g_term))
+            && rule.protection.pattern.is_some()
+            && rule.protection.covers_predicate(PROV_WAS_DERIVED_FROM)
+            && rule
+                .protection
+                .graphs
+                .as_ref()
+                .is_none_or(|gs| gs.may_allow(Some(&g_term)))
+    })
+}
+
 /// Resolve the source revision and predecessor link for a claims ingestion of `source` in
 /// `c18_graph` at the exact branch commit `at_commit`, bounded by the server's query
 /// memory and row limits, task deadline, and cancellation, and strictly enforced under
@@ -783,7 +822,11 @@ fn predecessor_revision(
                 )?,
                 Verify::Verified(_)
             ) {
-            Some(prev.clone())
+            let prev_copy = resolution
+                .preparation()
+                .copy_string(prev.as_str(), &mut held)
+                .map_err(resolve_err)?;
+            Some(NamedNode::new_unchecked(prev_copy))
         } else {
             None
         };
@@ -912,9 +955,16 @@ fn predecessor_revision(
         if !matches_source {
             continue;
         }
-        if RecordKey::new(rev.as_str()).is_err() {
+        if RecordKey::validate(rev.as_str()).is_err() {
             continue;
         }
+        let mut rev_term_held = resolution.preparation().reserve(0).map_err(resolve_err)?;
+        let rev_term = Term::NamedNode(NamedNode::new_unchecked(
+            resolution
+                .preparation()
+                .copy_string(rev.as_str(), &mut rev_term_held)
+                .map_err(resolve_err)?,
+        ));
         let ev_rends = resolution
             .subjects_in_graph(
                 "predecessor",
@@ -923,11 +973,13 @@ fn predecessor_revision(
                 &access,
                 &t.source_graph,
                 &prov_was_derived_from,
-                &Term::NamedNode(rev.clone()),
+                &rev_term,
                 candidate_limit,
                 &mut remaining_scans,
             )
             .map_err(resolve_err)?;
+        drop(rev_term);
+        drop(rev_term_held);
         if ev_rends.is_truncated() {
             return Err(incomplete_lineage());
         }
@@ -1037,16 +1089,32 @@ fn predecessor_revision(
                            rend_iri: &NamedNode,
                            exclude_digest: Option<Sha256Digest>|
      -> Result<Vec<MatchedRev>, Failed> {
-        let Ok(rend_key) = RecordKey::new(rend_iri.as_str()) else {
+        if RecordKey::validate(rend_iri.as_str()).is_err() {
             return Ok(Vec::new());
-        };
+        }
+        let mut rend_held = resolution.preparation().reserve(0).map_err(resolve_err)?;
+        let rend_key = RecordKey::new(
+            resolution
+                .preparation()
+                .copy_string(rend_iri.as_str(), &mut rend_held)
+                .map_err(resolve_err)?,
+        )
+        .expect("validated record key");
         let mut matched = Vec::new();
         for cand in &candidates {
             resolution.preparation().check().map_err(resolve_err)?;
-            let expected = IdentityNamespace::new(dataset_id, cand.rend_who.clone())
+            let mut who_held = resolution.preparation().reserve(0).map_err(resolve_err)?;
+            let who = NamedNode::new_unchecked(
+                resolution
+                    .preparation()
+                    .copy_string(cand.rend_who.as_str(), &mut who_held)
+                    .map_err(resolve_err)?,
+            );
+            let expected = IdentityNamespace::new(dataset_id, who)
                 .map_err(resolve_err)?
                 .record_id(RecordKind::Rendition, &cand.rev_key, &rend_key, &control)
                 .map_err(resolve_err)?;
+            drop(who_held);
             if expected != cand.ev_rend {
                 continue;
             }
@@ -1118,9 +1186,12 @@ fn predecessor_revision(
 
     // Read all query-visible C18 prov:wasRevisionOf predecessors of `rend` that are
     // unambiguously attributable to `source` in `c18_g`. If a predecessor belongs to
-    // `source` and shares another visible source with `rend`, C18's unqualified edge
-    // cannot distinguish which source made the transition and is treated as ambiguous.
+    // `source` and shares another visible source with `rend`, or if a query protection
+    // pattern can selectively hide competing `prov:wasDerivedFrom` memberships in
+    // `c18_g`, C18's unqualified edge cannot prove `source` made the transition and is
+    // treated as ambiguous.
     let edge_limit = limits.max_rows.min(MAX_C18_EDGES_PER_NODE);
+    let may_hide_competing = may_hide_competing_membership(&access, &c18_g);
     let c18_predecessors = |resolution: &mut sparkles::evidence::resolve::Resolution,
                             remaining_scans: &mut u64,
                             rend: &NamedNode|
@@ -1186,6 +1257,7 @@ fn predecessor_revision(
                 continue;
             }
             let shared_with_other = !rend_has_source
+                || may_hide_competing
                 || prev_sources
                     .iter()
                     .any(|ps| ps != source && rend_sources.iter().any(|rs| rs == ps));
@@ -1825,11 +1897,11 @@ enum ReplanMode<'a> {
     /// the new planned head.
     Upload { reg: &'a Map<String, Value> },
     /// Registered-source mode: confirm the source still points to the same live
-    /// rendition and digest at the new head before recomputing lineage; if the source
-    /// changed, refuse with `409 head-changed`.
+    /// rendition and observed digest at the new head before recomputing lineage; if the
+    /// source changed or its digest is not provably equal, refuse with `409 head-changed`.
     Source {
         rendition: &'a str,
-        rendition_digest: Sha256Digest,
+        observed_digest: Option<Sha256Digest>,
     },
 }
 
@@ -1863,27 +1935,29 @@ fn publish(
     let control = control_of(r);
     let mut attempt = 0;
 
-    let refresh_for_moved_head =
-        |planned: &mut Option<Planned>, head: &mut u64| -> Result<(), Failed> {
-            match &replan.mode {
-                ReplanMode::Upload { reg } => {
-                    let replanned = plan(r, reg, t)?;
-                    *head = replanned.head;
-                    *planned = Some(replanned);
-                    Ok(())
-                }
-                ReplanMode::Source {
-                    rendition,
-                    rendition_digest,
-                } => {
-                    let branch = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
-                    let listed = r.tool(
-                        "list_sources",
-                        json!({ "graphs": [format!("<{}>", replan.c18_graph)], "limit": 50 }),
-                        branch,
-                    )?;
-                    let prefixes = &listed["prefixes"];
-                    let still_current = listed["sources"]
+    let refresh_for_moved_head = |planned: &mut Option<Planned>,
+                                  head: &mut u64|
+     -> Result<(), Failed> {
+        match &replan.mode {
+            ReplanMode::Upload { reg } => {
+                let replanned = plan(r, reg, t)?;
+                *head = replanned.head;
+                *planned = Some(replanned);
+                Ok(())
+            }
+            ReplanMode::Source {
+                rendition,
+                observed_digest: initial_digest,
+            } => {
+                let branch = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
+                let listed = r.tool(
+                    "list_sources",
+                    json!({ "graphs": [format!("<{}>", replan.c18_graph)], "limit": 50 }),
+                    branch,
+                )?;
+                let prefixes = &listed["prefixes"];
+                let still_current = initial_digest.is_some()
+                    && listed["sources"]
                         .as_array()
                         .into_iter()
                         .flatten()
@@ -1895,23 +1969,22 @@ fn publish(
                             g == replan.c18_graph
                                 && i == replan.source.as_str()
                                 && rd == *rendition
-                                && recorded_digest(&s["digest"], rendition_digest)
-                                    == replan.revision_digest
+                                && observed_digest(&s["digest"]) == *initial_digest
                         });
-                    if !still_current {
-                        return Err(failed(
-                            "head-changed",
-                            409,
-                            "the registered source changed while claims were extracted",
-                        ));
-                    }
-                    *head = listed["commit"]
-                        .as_u64()
-                        .unwrap_or_else(|| t.logical.store.snapshot().commit);
-                    Ok(())
+                if !still_current {
+                    return Err(failed(
+                        "head-changed",
+                        409,
+                        "the registered source changed while claims were extracted",
+                    ));
                 }
+                *head = listed["commit"]
+                    .as_u64()
+                    .unwrap_or_else(|| t.logical.store.snapshot().commit);
+                Ok(())
             }
-        };
+        }
+    };
 
     loop {
         r.check()?;
@@ -2393,7 +2466,8 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     let read = super::pipeline::read_source(r, source, on)?;
     let profile = req.profile.clone().unwrap_or_else(|| "default".into());
     let rendition_digest = sha(read.text.as_bytes())?;
-    let revision_digest = recorded_digest(&read.found["digest"], &rendition_digest);
+    let observed_source_digest = observed_digest(&read.found["digest"]);
+    let revision_digest = observed_source_digest.unwrap_or(rendition_digest);
     let source_iri = expand_iri(read.found["source"].as_str().unwrap_or(""), &read.prefixes);
     let key = idempotency_key(
         &t,
@@ -2476,7 +2550,7 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
         revision_template: rev_template,
         mode: ReplanMode::Source {
             rendition: &read.rendition,
-            rendition_digest,
+            observed_digest: observed_source_digest,
         },
     };
     let (proposed, _, final_link) =

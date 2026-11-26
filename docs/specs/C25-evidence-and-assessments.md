@@ -1947,10 +1947,11 @@ predecessors so restorations and byte-only updates both resolve chronologically.
 multiple candidates survive, chronology is recovered from authenticated evidence
 `prov:wasRevisionOf` ancestry across configured evidence graphs and branch commit order,
 and `wasRevisionOf` is omitted when lineage remains ambiguous, encounters an
-unattributable transition shared with another source, or would otherwise choose from a
-partial frontier past the 64-rendition walk bound. For registered-source runs whose branch
-head moves before publication, publication retries at the new head only while the source
-still resolves to the same live rendition and digest, and otherwise refuses with
+unattributable transition shared with another source or under a query protection that can
+hide competing source memberships, or would otherwise choose from a partial frontier past
+the 64-rendition walk bound. For registered-source runs whose branch head moves before
+publication, publication retries at the new head only while the source still resolves to
+the same live rendition and provably equal observed digest, and otherwise refuses with
 `head-changed` without writing. When the same source revision already exists as an
 authenticated record in the target source-record graph, re-ingestion under another profile
 references that existing revision directly so its immutable record is preserved without
