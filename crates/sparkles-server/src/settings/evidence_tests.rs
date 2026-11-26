@@ -321,6 +321,7 @@ async fn declared_evidence_drift_refuses_all_typed_operations_until_reconciled()
     });
     let withdraw_body = json!({ "withdrawals": [] });
     let identities_body = json!({ "policy": "people", "entities": ["urn:e1"] });
+    let rebuild_body = json!({ "policy": "people" });
     let dependents_body = json!({ "changed": ["urn:c1"] });
 
     for (path, body) in [
@@ -329,6 +330,7 @@ async fn declared_evidence_drift_refuses_all_typed_operations_until_reconciled()
         ("/ev/claims/review", review_body),
         ("/ev/claims/withdraw", withdraw_body),
         ("/ev/claims/identities", identities_body.clone()),
+        ("/$/evidence/ev/identities/rebuild", rebuild_body),
         ("/ev/claims/dependents", dependents_body.clone()),
     ] {
         let (s, v, _) = send(&app, req("POST", path, Some(body))).await;

@@ -1226,6 +1226,62 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
         ),
     );
     put(
+        "EvidenceIdentitiesRebuild",
+        doc(
+            closed(
+                &["policy"],
+                json!({
+                    "policy": with_desc(string(), "The name of a matching policy of the evidence settings."),
+                    "policyVersion": with_desc(int(), "Optional expected policy version, else `409 policy-changed`."),
+                    "ifHead": commit("Publish only while this commit is the branch head, else `409 head-changed`."),
+                    "idempotencyKey": key("Makes a retry with the same payload answer the first receipt."),
+                    "dryRun": with_desc(boolean(), "Check and preview the rebuild without committing it."),
+                    "message": with_desc(string(), "The commit message."),
+                }),
+            ),
+            "Administered rebuild of a matching policy's resolution map in its current boundary.",
+            "evidence-identities",
+        ),
+    );
+    put(
+        "EvidenceIdentitiesRebuildResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "policy",
+                    "policyVersion",
+                    "revision",
+                    "number",
+                    "previous",
+                    "boundary",
+                    "changed",
+                ],
+                json!({
+                    "operation": iri("The operation, the rebuilt revision's availability receipt."),
+                    "committed": with_desc(boolean(), "Whether this request published a commit."),
+                    "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload, whose receipt this is."),
+                    "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
+                    "branchId": uuid("The branch the commit published on."),
+                    "policy": iri("The matching policy."),
+                    "policyVersion": with_desc(int(), "The matching policy version recorded on the revision."),
+                    "revision": iri("The resolution map revision published by the rebuild, also for a replay."),
+                    "number": with_desc(int(), "The revision number, from 1."),
+                    "previous": with_desc(or_null(string()), "The previous authenticated revision it follows, or `null` when none existed or earlier revisions no longer authenticate."),
+                    "boundary": with_desc(array(string()), "The protected identity graphs of the policy's boundary recorded on the revision, sorted."),
+                    "changed": changed(),
+                    "dryRun": dry_run(),
+                }),
+            ),
+            "The outcome of rebuilding a matching policy's resolution map.",
+            "evidence-identities",
+        ),
+    );
+    put(
         "EvidenceDependents",
         doc(
             closed(

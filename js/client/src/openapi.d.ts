@@ -1062,6 +1062,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/evidence/{ds}/identities/rebuild": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rebuild a resolution map
+         * @description Needs unrestricted `admin` on the dataset or branch. Recomputes the clusters of the matching policy's current authenticated accepted decisions in its current protected identity-graph boundary, rewrites its output graph atomically and records the new protections and boundary in a fresh `ev:ResolutionMap` revision, restoring reviews and reads that answered `503 projection-unavailable`. Refusals write nothing: `400` for a malformed request or unknown matching policy, `403` for a read-only server or missing unrestricted admin grant, `409 policy-changed`, `409 head-changed`, `409 identity-conflict`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile`, `409 evidence-settings-drift`, `422 incomplete-evidence` and `503 authority-changed`.
+         */
+        post: operations["rebuildIdentityMap"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/evidence/{ds}/settings": {
         parameters: {
             query?: never;
@@ -7346,6 +7366,86 @@ export interface components {
             entities: string[];
             /** @description The name of a matching policy of the evidence settings. */
             policy: string;
+        };
+        /** @description Administered rebuild of a matching policy's resolution map in its current boundary. */
+        EvidenceIdentitiesRebuild: {
+            /** @description Check and preview the rebuild without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
+            ifHead?: number;
+            /** @description The commit message. */
+            message?: string;
+            /** @description The name of a matching policy of the evidence settings. */
+            policy: string;
+            /** @description Optional expected policy version, else `409 policy-changed`. */
+            policyVersion?: number;
+        };
+        /** @description The outcome of rebuilding a matching policy's resolution map. */
+        EvidenceIdentitiesRebuildResult: {
+            /** @description The protected identity graphs of the policy's boundary recorded on the revision, sorted. */
+            boundary: string[];
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The revision number, from 1. */
+            number: number;
+            /** @description The operation, the rebuilt revision's availability receipt. */
+            operation: string;
+            /** @description The matching policy. */
+            policy: string;
+            /** @description The matching policy version recorded on the revision. */
+            policyVersion: number;
+            /** @description The previous authenticated revision it follows, or `null` when none existed or earlier revisions no longer authenticate. */
+            previous: string | null;
+            /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
+            /** @description The resolution map revision published by the rebuild, also for a replay. */
+            revision: string;
         };
         /** @description What the current resolution map selects for each entity. */
         EvidenceIdentitiesResult: {
@@ -16897,6 +16997,44 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    rebuildIdentityMap: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceIdentitiesRebuild"];
+            };
+        };
+        responses: {
+            /** @description The rebuilt resolution map revision and what changed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceIdentitiesRebuildResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
             503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };

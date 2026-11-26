@@ -837,3 +837,102 @@ async fn evidence_settings_reads_use_admin_middleware() {
         }
     }
 }
+
+/// `POST /$/evidence/{ds}/identities/rebuild` requires unrestricted `admin` on `{ds}`:
+/// anonymous callers get `401`, non-admin writers and readers get `403`, and an admin
+/// succeeds.
+#[tokio::test]
+async fn identity_map_rebuild_requires_admin() {
+    let s = proposal_server();
+    let alice = b("alice");
+    let evw = basic("evw", "evw-pw");
+    let bob = b("bob");
+    let body = serde_json::json!({
+        "format": 1, "profile": 1, "enabled": true,
+        "sourceRecords": ["urn:ev:sources"], "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "identity": ["urn:ev:identity", "urn:ev:maps"],
+        "projections": ["urn:ev:map"],
+        "matchingPolicies": {"people": {
+            "version": 1,
+            "boundary": ["urn:ev:identity", "urn:ev:claims"],
+            "decisions": "urn:ev:decisions",
+            "maps": "urn:ev:maps",
+            "output": "urn:ev:map"
+        }}
+    })
+    .to_string();
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/evidence/ev/settings",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    let req_body = serde_json::json!({"policy": "people"}).to_string();
+    // Anonymous -> 401
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/identities/rebuild",
+        &[("content-type", "application/json")],
+        &req_body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+
+    // Writer (non-admin) -> 403
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/identities/rebuild",
+        &[
+            ("authorization", &evw),
+            ("content-type", "application/json"),
+        ],
+        &req_body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+
+    // Reader/unrelated user -> 403 or 404
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/identities/rebuild",
+        &[
+            ("authorization", &bob),
+            ("content-type", "application/json"),
+        ],
+        &req_body,
+    )
+    .await;
+    assert!(
+        matches!(r.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+        "{}: {}",
+        r.status,
+        r.text()
+    );
+
+    // Unrestricted admin -> 200
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/identities/rebuild",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &req_body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["committed"], true);
+    assert_eq!(r.json()["number"], 1);
+}
