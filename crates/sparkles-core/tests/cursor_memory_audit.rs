@@ -1439,6 +1439,18 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
             ),
         ),
         (
+            "shortest const weighted maxLength wide-weight fallback",
+            format!(
+                "{P}SELECT ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:weight <urn:w> ; path:maxLength 3 ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "allShortest const weighted maxLength wide-weight fallback",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:maxLength 3 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
             "shortest variable target",
             format!(
                 "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:n:0> ; path:target ?t ; path:predicate <urn:e> ; path:length ?l }} }}"

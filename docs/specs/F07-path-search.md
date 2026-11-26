@@ -266,10 +266,18 @@ triple term `<<( s p o )>>`. The weight is the value of `ex:w` on a reifier `r` 
 used. An edge without one has `path:defaultWeight`. A weight that is not a number, is
 negative or is NaN fails the query.
 
-With weights, `path:shortest` and `path:allShortest` use Dijkstra's algorithm and
-`path:kShortest` uses Yen's algorithm with Dijkstra's as its inner search. Lengths still
-count edges, and `path:maxLength` and `path:minLength` filter the paths the search
-enumerates in cost order.
+Without `path:maxLength`, `path:shortest` and `path:allShortest` use Dijkstra's algorithm
+and `path:kShortest` uses Yen's algorithm with Dijkstra's as its inner search, while
+`path:minLength` filters the paths enumerated in cost order. With `path:maxLength`,
+weighted `path:shortest` and Yen's weighted spurs in `path:kShortest` and `path:allShortest`
+run a Pareto-pruned search over `(node, length)` pairs that bounds each search by
+`path:maxLength` instead of enumerating longer paths. Single-pair searches and Yen's spurs
+split the edge budget into `ceil(L / 2)` forward and `floor(L / 2)` backward halves and
+fall back to a source-order bounded search when wide weights or overflow could affect
+ranking. Unbound ends in weighted `path:shortest` with `path:maxLength` run a one-ended
+Pareto-pruned search, while weighted `path:allShortest` with `path:maxLength` requires both
+ends bound because it enumerates tied short paths through Yen's algorithm. Lengths still
+count edges.
 
 The cost of a path is the sum of its weights, added in double-double arithmetic, and
 `path:cost` is that sum rounded to the nearest double. Two paths tie in the shortest modes
@@ -291,10 +299,15 @@ the ones a caller would get on a dataset that held only the visible triples.
 
 Each search counts the nodes it visits. A search that visits more than
 `path:maxVisited` fails with an error that names the parameter, rather than returning a
-partial answer. The visited sets and parent lists are charged to the query's memory
-budget, the rows to its row budgets, and the search checks the timeout and cancellation
-at every level of its frontier. Enumeration in `path:allShortest` and `path:all` can
-produce exponentially many paths, which `path:limit` and the row budget bound.
+partial answer. In a length-bounded weighted search, each settled `(node, length)` label
+counts as one visit, so a node can count more than once at distinct non-dominated lengths.
+Unexpanded half-length boundary labels in bidirectional pair searches are charged to the
+query's memory budget without counting as settled visits, while one-ended searches count
+each settled label up to `path:maxLength`. The visited sets, Pareto frontiers, and parent
+lists are charged to the query's memory budget, the rows to its row budgets, and the search
+checks the timeout and cancellation across frontier steps and edge relaxations. Enumeration
+in `path:allShortest` and `path:all` can produce exponentially many paths, which
+`path:limit` and the row budget bound.
 
 ### 4.8 Errors
 
@@ -917,16 +930,19 @@ both the eager engine and the streaming cursor reader.
 * **Single pairs and Yen's spurs.** `Engine::dijkstra_pair_bounded` and
   `SearchContext::run_dijkstra_pair_bounded` run a bidirectional Pareto-pruned search from
   both ends, splitting the edge budget `L` into `ceil(L / 2)` forward and `floor(L / 2)`
-  backward (including cycles through the source via the virtual end id). Each side keeps a
-  node's reached `(length, cost)` labels sorted by strictly increasing length and strictly
-  decreasing cost, discarding any label when another label at the same node is both
-  cheaper-or-equal and shorter-or-equal. Labels at a side's half-length boundary record
-  their least cost in `bounds[side]` without entering that side's heap, and the search
-  stops once `min(top[0] + min(top[1], bound[1]), top[1] + min(top[0], bound[0]))` reaches
-  the cheapest valid meeting (or becomes empty). `path:shortest` with bound ends runs this
-  search directly, and Yen's algorithm passes the remaining length `maxLength - i` into
-  this search for every weighted spur in both `path:kShortest` and length-bounded
-  `path:allShortest`.
+  backward halves, including cycles through the source via the virtual end id. Each side
+  keeps a node's reached `(length, cost)` labels sorted by strictly increasing length and
+  strictly decreasing cost, discarding any label when another label at the same node is
+  both cheaper-or-equal and shorter-or-equal. Labels at a side's half-length boundary
+  record their least cost in `bounds[side]` without entering that side's heap, and the
+  search stops once `min(top[0] + min(top[1], bound[1]), top[1] + min(top[0], bound[0]))`
+  reaches the cheapest valid meeting or becomes empty. When `L > 1` and edge weights span
+  more than 2²⁸, exceed the exact double-double span for `L`, or overflow to infinity, both
+  engines release their bidirectional state and fall back to a source-order one-ended
+  bounded Pareto search so candidate ranking agrees with Yen's source-order `exact_cost`.
+  `path:shortest` with bound ends runs this search directly, and Yen's algorithm passes the
+  remaining length `maxLength - i` into this search for every weighted spur in both
+  `path:kShortest` and length-bounded `path:allShortest`.
 * **Unbound ends in `path:shortest`.** `Engine::dijkstra_bounded` and
   `SearchContext::run_dijkstra_bounded` (streamed by `BoundedShortestJob`) run a
   one-ended Pareto-pruned search over `(node, length)` up to `maxLength`, so weighted
@@ -934,15 +950,22 @@ both the eager engine and the streaming cursor reader.
   well as bound pairs. Weighted `path:allShortest` with `path:maxLength` continues to run
   Yen's algorithm with length-bounded spurs and therefore still requires both ends bound.
 * **Tests.** `pathsearch.rs` adds unit tests for Pareto frontier pruning and lower-bound
-  arithmetic. `crates/sparkles-core/tests/path_search.rs` adds
-  `weighted_shortest_under_max_length_skips_many_cheap_long_paths` (262,144 cheap
-  length-7 paths beside dearer short paths under `path:maxVisited 500`),
-  `weighted_bounded_edge_cases` (`maxLength` 0 and 1, equal cost at different lengths,
-  zero-weight edges and cycles, `minLength > 1` in `kShortest`, unbound target and source,
-  negative weight refusal, and `path:maxVisited` enforcement), and
-  `random_weighted_bounded_against_brute_force` (45 random graphs across all directions,
-  excluded predicates, hubs, zero and decimal weights, and lengths 1 to 5).
-  `crates/sparkles-core/tests/cursor_pathsearch.rs` verifies eager/streaming parity and
-  counter equality across bound pairs, cycles, unbound ends, `VALUES`, `kShortest`, and
-  `allShortest`, and `crates/sparkles-core/tests/cursor_memory_audit.rs` audits bounded
-  weighted `shortest` (bound and unbound ends) and `kShortest` at `Allowance::EXACT`.
+  arithmetic. In `crates/sparkles-core/tests/path_search.rs`,
+  `weighted_shortest_under_max_length_skips_many_cheap_long_paths` verifies that 262,144
+  cheap length-7 paths beside dearer short paths stay under `path:maxVisited 500`.
+  `weighted_bounded_edge_cases` covers `maxLength` 0 and 1, equal costs at different
+  lengths, zero-weight edges and cycles, `minLength > 1` in `kShortest`, unbound target
+  and reverse Pareto unbound-source queries, `minLength 0` with `path:limit 1` and
+  `path:maxVisited 1`, negative weight refusal, and `path:maxVisited` enforcement.
+  `random_weighted_bounded_against_brute_force` compares 45 random graphs across all
+  directions, excluded predicates, hubs, zero and decimal weights, and lengths 1 to 5
+  against brute-force enumeration for bound pairs, unbound targets, unbound sources,
+  `path:allShortest`, and `path:kShortest`. Additional regressions verify wide-weight
+  four-edge cycle ranking, eager frontier memory pre-admission and release across repeated
+  pairs, single-visit `VIRT` pruning, and eager mid-relaxation cancellation.
+  `crates/sparkles-core/tests/cursor_pathsearch.rs` verifies eager and streaming parity,
+  counter equality across `maxLength` 0 and 1, cycles, unbound ends, `VALUES`, `kShortest`,
+  and `allShortest`, and memory release after bounded weighted admission failure, early
+  close, and cancellation. `crates/sparkles-core/tests/cursor_memory_audit.rs` audits
+  bounded weighted `shortest` on bound and unbound ends and `kShortest` at
+  `Allowance::EXACT`.

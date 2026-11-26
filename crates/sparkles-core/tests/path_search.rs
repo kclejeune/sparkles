@@ -1760,6 +1760,77 @@ fn weighted_bounded_edge_cases() {
         ])
     );
 
+    // 4b. Reverse Pareto fixture: s->x (0), x->a->t (0+0), x->t (5) with fixed target t and
+    // maxLength 2 must keep the dearer shorter label at x so s reaches t at cost 5.
+    let rev_pareto = store_of(
+        "ex:s ex:p ex:x {| ex:w 0 |} . ex:x ex:p ex:a {| ex:w 0 |} . \
+         ex:a ex:p ex:t {| ex:w 0 |} . ex:x ex:p ex:t {| ex:w 5 |} .",
+    );
+    for lim in ["", " ; path:limit 10"] {
+        let got: BTreeMap<String, (f64, String)> = rows(
+            &rev_pareto,
+            &format!(
+                "SELECT ?s ?c ?len WHERE {{ SERVICE path:search {{ [] path:source ?s ; \
+                 path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; path:maxLength 2{lim} ; \
+                 path:cost ?c ; path:length ?len }} }}"
+            ),
+        )
+        .into_iter()
+        .map(|r| (r["s"].clone(), (r["c"].parse().unwrap(), r["len"].clone())))
+        .collect();
+        assert_eq!(
+            got,
+            BTreeMap::from([
+                ("a".into(), (0.0, "1".into())),
+                ("x".into(), (0.0, "2".into())),
+                ("s".into(), (5.0, "2".into())),
+            ])
+        );
+    }
+
+    // 4c. Eager minLength 0 + path:limit 1 + maxVisited 1 returns the empty path without
+    // opening the bounded search, for both unbound target and unbound source, and multi-target
+    // VALUES short-circuits once path:limit is satisfied.
+    let single_edge = store_of("ex:s ex:p ex:t . ex:t ex:p ex:u .");
+    let fwd_empty = rows(
+        &single_edge,
+        "SELECT ?t ?len WHERE { SERVICE path:search { [] path:source ex:s ; path:target ?t ; \
+         path:predicate ex:p ; path:weight ex:w ; path:minLength 0 ; path:maxLength 1 ; \
+         path:limit 1 ; path:maxVisited 1 ; path:length ?len } }",
+    );
+    assert_eq!(fwd_empty.len(), 1);
+    assert_eq!(
+        (fwd_empty[0]["t"].as_str(), fwd_empty[0]["len"].as_str()),
+        ("s", "0")
+    );
+
+    let bwd_empty = rows(
+        &single_edge,
+        "SELECT ?s ?len WHERE { SERVICE path:search { [] path:source ?s ; path:target ex:t ; \
+         path:predicate ex:p ; path:weight ex:w ; path:minLength 0 ; path:maxLength 1 ; \
+         path:limit 1 ; path:maxVisited 1 ; path:length ?len } }",
+    );
+    assert_eq!(bwd_empty.len(), 1);
+    assert_eq!(
+        (bwd_empty[0]["s"].as_str(), bwd_empty[0]["len"].as_str()),
+        ("t", "0")
+    );
+
+    let multi_target_short_circuit = rows(
+        &single_edge,
+        "SELECT ?t ?len WHERE { VALUES ?t { ex:s ex:u } SERVICE path:search { \
+         [] path:source ex:s ; path:target ?t ; path:predicate ex:p ; path:weight ex:w ; \
+         path:minLength 0 ; path:maxLength 2 ; path:limit 1 ; path:maxVisited 1 ; path:length ?len } }",
+    );
+    assert_eq!(multi_target_short_circuit.len(), 1);
+    assert_eq!(
+        (
+            multi_target_short_circuit[0]["t"].as_str(),
+            multi_target_short_circuit[0]["len"].as_str()
+        ),
+        ("s", "0")
+    );
+
     // 5. allShortest with weight + maxLength still requires bound target / source.
     let e = error(
         &u,
@@ -1899,6 +1970,45 @@ fn random_weighted_bounded_against_brute_force() {
         })
         .collect();
 
+        // Check unbound source in weighted path:shortest + maxLength against brute force.
+        let tgt = r.below(n);
+        let unbound_bwd: BTreeMap<usize, f64> = rows(
+            &s,
+            &format!(
+                "SELECT ?s ?c WHERE {{ SERVICE path:search {{ [] path:source ?s ; \
+                 path:target ex:n{tgt} ; path:weight ex:w ; {extra} ; path:cost ?c }} }}"
+            ),
+        )
+        .into_iter()
+        .map(|row| {
+            let s_id = row["s"]
+                .trim_start_matches(|c: char| !c.is_ascii_digit())
+                .parse::<usize>()
+                .unwrap();
+            (s_id, row["c"].parse::<f64>().unwrap())
+        })
+        .collect();
+        for s_i in 0..n {
+            let bwd_ctx = format!("case {case} {extra} n{s_i}→n{tgt} (unbound source)");
+            let least_bwd = brute(&adj, s_i, max_len)
+                .into_iter()
+                .filter(|(end, p)| {
+                    *end == tgt && {
+                        let ns = nodes_of(s_i, p);
+                        ns[1..ns.len() - 1]
+                            .iter()
+                            .all(|&x| max_degree.is_none_or(|l| degree(x) <= l))
+                    }
+                })
+                .map(|(_, p)| p.iter().map(weight).sum::<i128>())
+                .min();
+            assert_eq!(
+                unbound_bwd.get(&s_i).copied(),
+                least_bwd.map(rounded),
+                "{bwd_ctx}"
+            );
+        }
+
         let extract_paths = |q: &str| -> Vec<(Vec<E>, f64)> {
             let mut by: BTreeMap<usize, (BTreeMap<usize, E>, f64)> = BTreeMap::new();
             for row in rows(&s, q) {
@@ -1989,5 +2099,289 @@ fn random_weighted_bounded_against_brute_force() {
                 assert!(all_valid.contains(p), "{ctx}: kShortest invalid path {p:?}");
             }
         }
+    }
+}
+
+/// Regression for Sol r1 P2: with wide finite weights where bidirectional split sums round
+/// differently from source-order sums, bounded pair shortest and Yen must fall back to
+/// source-order accumulation and return the strictly cheaper cycle P before cycle Q.
+#[test]
+fn weighted_bounded_wide_weight_cycle_ranking() {
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let delta = d / 4.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let ttl = format!(
+        "ex:s ex:p ex:p1 {{| ex:w {} |}} . ex:p1 ex:p ex:p2 {{| ex:w {} |}} . \
+         ex:p2 ex:p ex:p3 {{| ex:w {} |}} . ex:p3 ex:p ex:s {{| ex:w {} |}} . \
+         ex:s ex:p ex:q1 {{| ex:w {} |}} . ex:q1 ex:p ex:q2 {{| ex:w {} |}} . \
+         ex:q2 ex:p ex:q3 {{| ex:w {} |}} . ex:q3 ex:p ex:s {{| ex:w {} |}} . \
+         ex:s ex:p ex:d1 {{| ex:w {} |}} . ex:s ex:p ex:d2 {{| ex:w {} |}} . \
+         ex:s ex:p ex:d3 {{| ex:w {} |}} .",
+        dbl(1.0),
+        dbl(m),
+        dbl(e),
+        dbl(e),
+        dbl(0.5),
+        dbl(0.5 + m),
+        dbl(d),
+        dbl(delta),
+        dbl(2.0),
+        dbl(2.0),
+        dbl(2.0),
+    );
+    let s = store_of(&ttl);
+    let cycle_p = vec![
+        "s".to_string(),
+        "p1".to_string(),
+        "p2".to_string(),
+        "p3".to_string(),
+        "s".to_string(),
+    ];
+    let cycle_q = vec![
+        "s".to_string(),
+        "q1".to_string(),
+        "q2".to_string(),
+        "q3".to_string(),
+        "s".to_string(),
+    ];
+
+    for lim in ["", " ; path:limit 10"] {
+        // Pair shortest selects P.
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:s ; path:predicate ex:p ; path:weight ex:w ; path:minLength 1 ; \
+                 path:maxLength 5{lim} ; path:pathIndex ?path ; path:edgeIndex ?i ; \
+                 path:edgeSubject ?s ; path:edgeObject ?o }} }}"
+            ),
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 1, "shortest ({lim}): {paths:?}");
+        assert_eq!(paths["0"], cycle_p, "shortest ({lim}) must pick cycle P");
+
+        // allShortest selects only P (does not accept both Q and P).
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:s ; path:predicate ex:p ; path:weight ex:w ; \
+                 path:algorithm path:allShortest ; path:minLength 1 ; path:maxLength 5{lim} ; \
+                 path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; \
+                 path:edgeObject ?o }} }}"
+            ),
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 1, "allShortest ({lim}): {paths:?}");
+        assert_eq!(paths["0"], cycle_p, "allShortest ({lim}) must keep only P");
+
+        // kShortest k=1 returns P.
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:s ; path:predicate ex:p ; path:weight ex:w ; \
+                 path:algorithm path:kShortest ; path:k 1 ; path:minLength 1 ; \
+                 path:maxLength 5{lim} ; path:pathIndex ?path ; path:edgeIndex ?i ; \
+                 path:edgeSubject ?s ; path:edgeObject ?o }} }}"
+            ),
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 1, "kShortest k=1 ({lim}): {paths:?}");
+        assert_eq!(paths["0"], cycle_p, "kShortest k=1 ({lim}) must pick P");
+
+        // kShortest k=2 returns P first, then Q.
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:s ; path:predicate ex:p ; path:weight ex:w ; \
+                 path:algorithm path:kShortest ; path:k 2 ; path:minLength 1 ; \
+                 path:maxLength 5{lim} ; path:pathIndex ?path ; path:edgeIndex ?i ; \
+                 path:edgeSubject ?s ; path:edgeObject ?o }} }}"
+            ),
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 2, "kShortest k=2 ({lim}): {paths:?}");
+        assert_eq!(paths["0"], cycle_p, "kShortest k=2 ({lim}) path 0");
+        assert_eq!(paths["1"], cycle_q, "kShortest k=2 ({lim}) path 1");
+    }
+}
+
+/// Regression for Sol r1 P1: eager bounded searches pre-admit frontier, Pareto vector,
+/// parent, heap, and adjacency scan allocations under a search-scoped `Charge`, and
+/// release that charge between repeated bound pairs.
+#[test]
+fn weighted_bounded_eager_frontier_memory_and_release() {
+    let mut ttl = String::from("ex:z ex:p ex:t .\n");
+    for i in 0..10_000 {
+        ttl += &format!("ex:s ex:p ex:l{i} .\n");
+    }
+    let s = store_of(&ttl);
+    let q_pair = format!(
+        "{PREFIXES}SELECT ?len WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+         path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; path:maxLength 2 ; \
+         path:maxVisited 2 ; path:limit 1 ; path:length ?len }} }}"
+    );
+    let uncached = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    let res = query(s.snapshot(), &q_pair, &uncached).unwrap();
+    // Old flat debit was ~240 KiB (2*48 + 10_000*24); real live allocations exceed 1 MiB.
+    assert!(
+        res.mem_peak_bytes > 1_000_000,
+        "expected eager pair frontier peak > 1 MB, got {}",
+        res.mem_peak_bytes
+    );
+    let tight = QueryOptions {
+        max_memory_bytes: Some(512 * 1024),
+        no_cache: true,
+        ..Default::default()
+    };
+    match query(s.snapshot(), &q_pair, &tight) {
+        Err(sparkles_core::Error::BudgetExceeded(b)) => {
+            assert_eq!(b.kind, sparkles_core::BudgetKind::Memory);
+        }
+        Err(e) => panic!("expected memory budget refusal on eager pair frontier, got {e:?}"),
+        Ok(_) => panic!("expected memory budget refusal on eager pair frontier, got Ok"),
+    }
+
+    // One-ended eager bounded search also pre-admits its frontier.
+    let q_unbound = format!(
+        "{PREFIXES}SELECT ?t WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+         path:target ?t ; path:predicate ex:p ; path:weight ex:w ; path:maxLength 1 ; \
+         path:maxVisited 20000 ; path:limit 1 }} }}"
+    );
+    let unbound_res = query(s.snapshot(), &q_unbound, &uncached).unwrap();
+    assert!(unbound_res.mem_peak_bytes > 1_000_000);
+    match query(s.snapshot(), &q_unbound, &tight) {
+        Err(sparkles_core::Error::BudgetExceeded(b)) => {
+            assert_eq!(b.kind, sparkles_core::BudgetKind::Memory);
+        }
+        Err(e) => panic!("expected memory budget refusal on eager unbound frontier, got {e:?}"),
+        Ok(_) => panic!("expected memory budget refusal on eager unbound frontier, got Ok"),
+    }
+
+    // Repeated bound pairs release their search-scoped working memory between searches.
+    let mut multi_ttl = String::new();
+    let mut vals = String::new();
+    for g in 0..40 {
+        multi_ttl += &format!("ex:z{g} ex:p ex:t{g} .\n");
+        for i in 0..250 {
+            multi_ttl += &format!("ex:s{g} ex:p ex:m{g}_{i} .\n");
+        }
+        vals += &format!("(ex:s{g} ex:t{g}) ");
+    }
+    let ms = store_of(&multi_ttl);
+    let q_one = format!(
+        "{PREFIXES}SELECT ?len WHERE {{ SERVICE path:search {{ [] path:source ex:s0 ; \
+         path:target ex:t0 ; path:predicate ex:p ; path:weight ex:w ; path:maxLength 2 ; \
+         path:limit 1 ; path:length ?len }} }}"
+    );
+    let one_peak = query(ms.snapshot(), &q_one, &uncached)
+        .unwrap()
+        .mem_peak_bytes;
+    let q_many = format!(
+        "{PREFIXES}SELECT ?s ?t ?len WHERE {{ VALUES (?s ?t) {{ {vals} }} SERVICE path:search {{ \
+         [] path:source ?s ; path:target ?t ; path:predicate ex:p ; path:weight ex:w ; \
+         path:maxLength 2 ; path:limit 1 ; path:length ?len }} }}"
+    );
+    let many_opts = QueryOptions {
+        max_memory_bytes: Some(one_peak * 4),
+        no_cache: true,
+        ..Default::default()
+    };
+    let many_res = query(ms.snapshot(), &q_many, &many_opts)
+        .expect("40 sequential pairs must release search-scoped frontier charges between pairs");
+    assert!(
+        many_res.mem_peak_bytes < one_peak * 4,
+        "40 pairs peak {} should stay well below cumulative 40 * {}",
+        many_res.mem_peak_bytes,
+        one_peak
+    );
+}
+
+/// Regression for Sol r1 P2 #3: eager bounded relaxations poll cancellation periodically
+/// while relaxing a high-degree node with default weights.
+#[test]
+fn weighted_bounded_eager_cancels_during_edge_relaxation() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let mut ttl = String::from("ex:z ex:p ex:t .\n");
+    for i in 0..10_000 {
+        ttl += &format!("ex:s ex:p ex:l{i} .\n");
+    }
+    let s = store_of(&ttl);
+
+    for q_body in [
+        "SELECT ?len WHERE { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; \
+         path:predicate ex:p ; path:weight ex:w ; path:maxLength 2 ; path:maxVisited 2 ; \
+         path:limit 1 ; path:length ?len } }",
+        "SELECT ?t WHERE { SERVICE path:search { [] path:source ex:s ; path:target ?t ; \
+         path:predicate ex:p ; path:weight ex:w ; path:maxLength 2 ; path:maxVisited 20000 ; \
+         path:limit 1 } }",
+    ] {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let cancel_hook = cancel.clone();
+        let polls_hook = polls.clone();
+        let _guard = sparkles_core::sparql::pathsearch::test_hooks::on_traversal_poll(move || {
+            let n = polls_hook.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 2 {
+                cancel_hook.store(true, Ordering::Release);
+            }
+        });
+        let opts = QueryOptions {
+            cancel: Some(cancel),
+            no_cache: true,
+            ..Default::default()
+        };
+        let res = query(s.snapshot(), &format!("{PREFIXES}{q_body}"), &opts).err();
+        drop(_guard);
+        assert!(
+            matches!(res, Some(sparkles_core::Error::Cancelled)),
+            "expected cancellation during edge relaxation, got {res:?}"
+        );
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            2,
+            "expected abort immediately on relaxation poll #2"
+        );
+    }
+}
+
+/// Regression for Neon r1 P3-2: one-ended bounded search settles `VIRT` at most once even
+/// when shorter, more expensive cycles exist beside a longer, cheaper cycle.
+#[test]
+fn weighted_bounded_virt_visited_once() {
+    let s = store_of(
+        "ex:s ex:p ex:a1 {| ex:w 0.1 |} . ex:a1 ex:p ex:a2 {| ex:w 0.1 |} . \
+         ex:a2 ex:p ex:a3 {| ex:w 0.1 |} . ex:a3 ex:p ex:s {| ex:w 0.1 |} . \
+         ex:s ex:p ex:b1 {| ex:w 1.0 |} . ex:b1 ex:p ex:b2 {| ex:w 1.0 |} . \
+         ex:b2 ex:p ex:s {| ex:w 1.0 |} . \
+         ex:s ex:p ex:c1 {| ex:w 5.0 |} . ex:c1 ex:p ex:s {| ex:w 5.0 |} . \
+         ex:s ex:p ex:s {| ex:w 20.0 |} .",
+    );
+    // 7 real nodes (s, a1, a2, a3, b1, b2, c1) + 1 VIRT visit = 8 visits total.
+    // Without VIRT pruning, VIRT would be popped 4 times (11 visits) and fail maxVisited 8.
+    for lim in ["", " ; path:limit 100"] {
+        let got: BTreeMap<String, f64> = rows(
+            &s,
+            &format!(
+                "SELECT ?t ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ?t ; path:predicate ex:p ; path:weight ex:w ; path:maxLength 4 ; \
+                 path:maxVisited 8{lim} ; path:cost ?c }} }}"
+            ),
+        )
+        .into_iter()
+        .map(|r| (r["t"].clone(), r["c"].parse().unwrap()))
+        .collect();
+        assert!(
+            (got["s"] - 0.4).abs() < 1e-12,
+            "cycle cost ({lim}): {got:?}"
+        );
     }
 }

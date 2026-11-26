@@ -847,6 +847,34 @@ fn path_search_item_1122_all_shortest_and_variable_end_parity() {
     );
     assert_parity_batches(
         &snap,
+        "SELECT ?t ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:minLength 0 ; path:maxLength 0 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?s ?c ?len { SERVICE path:search { [] path:source ?s ; path:target ex:d3 ; path:predicate ex:e ; path:weight ex:w ; path:minLength 0 ; path:maxLength 0 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ex:d0 ; path:predicate ex:e ; path:weight ex:w ; path:minLength 0 ; path:maxLength 0 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
+        "SELECT ?t ?c ?len { SERVICE path:search { [] path:source ex:d0 ; path:target ?t ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 1 ; path:cost ?c ; path:length ?len } }",
+        &opts,
+        true,
+        false,
+    );
+    assert_parity_batches(
+        &snap,
         "SELECT ?s ?c ?len { SERVICE path:search { [] path:source ?s ; path:target ex:d3 ; path:predicate ex:e ; path:weight ex:w ; path:maxLength 4 ; path:cost ?c ; path:length ?len } }",
         &opts,
         true,
@@ -1444,4 +1472,79 @@ fn path_search_r1_parity_cancellation_and_release() {
     );
     drop(c);
     assert_eq!(meter.live_bytes(), 0);
+
+    // 5. Bounded weighted cursor (item 275): early close, mid-pull cancellation, and
+    //    admission failure while frontier state is live all release charged memory to 0.
+    let star = Store::in_memory(StoreOptions::default());
+    let mut star_data = String::from("<urn:z> <urn:p> <urn:t> .\n");
+    for i in 0..400 {
+        star_data.push_str(&format!(
+            "<urn:s> <urn:p> <urn:l:{i}> .\n<urn:l:{i}> <urn:p> <urn:m:{i}> .\n"
+        ));
+    }
+    load(&star, &star_data, RdfFormat::Turtle);
+    let star_snap = star.snapshot();
+    let q_bounded_unbound = format!(
+        "{P}SELECT ?t ?c ?l {{ SERVICE path:search {{ [] path:source <urn:s> ; path:target ?t ; path:predicate <urn:p> ; path:weight <urn:w> ; path:maxLength 2 ; path:cost ?c ; path:length ?l }} }}"
+    );
+    let q_bounded_pair = format!(
+        "{P}SELECT ?c ?l {{ SERVICE path:search {{ [] path:source <urn:s> ; path:target <urn:t> ; path:predicate <urn:p> ; path:weight <urn:w> ; path:maxLength 2 ; path:cost ?c ; path:length ?l }} }}"
+    );
+
+    // 5a. Early close after one batch releases all bounded-search memory.
+    let mut c = select_cursor(star_snap.clone(), &q_bounded_unbound, &opts, &strict).unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().unwrap().is_some());
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 5b. Mid-pull cancellation after first batch releases all bounded-search memory.
+    let b_cancel = Arc::new(AtomicBool::new(false));
+    let b_cancel_opts = QueryOptions {
+        no_cache: true,
+        cancel: Some(b_cancel.clone()),
+        ..Default::default()
+    };
+    let mut c = select_cursor(
+        star_snap.clone(),
+        &q_bounded_unbound,
+        &b_cancel_opts,
+        &strict,
+    )
+    .unwrap();
+    let meter = c.memory_meter();
+    assert!(c.next_batch().unwrap().is_some());
+    b_cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(c.next_batch(), Err(Error::Cancelled)));
+    drop(c);
+    assert_eq!(meter.live_bytes(), 0);
+
+    // 5c. Admission failure while bounded Pareto frontier state is live (both pair and
+    //     one-ended searches) returns Memory BudgetExceeded and releases every charged byte.
+    for (label, q) in [
+        ("bounded pair", &q_bounded_pair),
+        ("bounded unbound", &q_bounded_unbound),
+    ] {
+        let probe = select_cursor(star_snap.clone(), q, &opts, &strict).unwrap();
+        let open_bytes = probe.memory_meter().live_bytes();
+        drop(probe);
+        let tight = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: Some(open_bytes + 4096),
+            ..Default::default()
+        };
+        let mut c = select_cursor(star_snap.clone(), q, &tight, &strict).unwrap();
+        let meter = c.memory_meter();
+        let res = c.next_batch().map(|b| b.is_some());
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+            "{label}: expected memory admission failure while frontier is live, got {res:?}"
+        );
+        drop(c);
+        assert_eq!(
+            meter.live_bytes(),
+            0,
+            "{label}: live bytes not released after admission failure"
+        );
+    }
 }
