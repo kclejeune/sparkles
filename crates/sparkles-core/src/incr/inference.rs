@@ -11,10 +11,8 @@
 //! inferences, the entries of the default graph also match the inferred graph.
 
 use super::compile::pattern_footprint;
-use super::footprint::{Entry, FGraph, Footprint, Resolved};
-use super::pass::Vis;
+use super::footprint::{Entry, FGraph, Footprint};
 use crate::error::Result;
-use crate::id::Id;
 use crate::sparql::rdfs::{RdfsOnRead, SchemaSource, rewrite};
 use crate::store::Snapshot;
 use oxrdf::vocab::rdfs;
@@ -97,7 +95,7 @@ impl Inference {
 
     /// The entries a change of the schema matches: the schema predicates in the graph a
     /// schema graph source reads. A fixed schema changes only with the setting.
-    fn schema_footprint(&self) -> Footprint {
+    pub(crate) fn schema_footprint(&self) -> Footprint {
         let mut fp = Footprint::default();
         let Some(SchemaSource::Graph(g)) = self.rdfs.as_ref().map(|r| &r.source) else {
             return fp;
@@ -123,8 +121,17 @@ impl Inference {
     }
 
     /// The footprint of `pattern` read with these settings at `snap`, whose schema must
-    /// be the one before the changes it is checked against.
-    fn footprint(&self, pattern: &GraphPattern, snap: &Snapshot) -> Result<Footprint> {
+    /// be the one before the changes it is checked against. When `whole` is set (a query
+    /// with a dataset clause), every quad matches.
+    pub(crate) fn data_footprint(
+        &self,
+        pattern: &GraphPattern,
+        whole: bool,
+        snap: &Snapshot,
+    ) -> Result<Footprint> {
+        if whole {
+            return Ok(Footprint::all());
+        }
         let gp = match &self.rdfs {
             Some(r) => Cow::Owned(rewrite(pattern, &*r.schema(snap)?)),
             None => Cow::Borrowed(pattern),
@@ -146,57 +153,5 @@ impl Inference {
             }
         }
         Ok(fp)
-    }
-}
-
-/// A circuit's footprint over inferred data, resolved against the latest snapshot.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct InferredFootprint {
-    schema: Option<Resolved>,
-    data: Option<Resolved>,
-}
-
-impl InferredFootprint {
-    /// Whether the changes from the circuit's snapshot to `snap` can change the result
-    /// of `pattern` read with `inf`. A schema change always can, and makes the footprint
-    /// of the data be read again for the new schema. `whole` is set for a query whose
-    /// footprint is every quad (a dataset clause).
-    #[allow(clippy::too_many_arguments)]
-    pub fn touches(
-        &mut self,
-        inf: &Inference,
-        pattern: &GraphPattern,
-        whole: bool,
-        snap: &Snapshot,
-        added: &[[Id; 4]],
-        removed: &[[Id; 4]],
-        vis: &Vis,
-    ) -> Result<bool> {
-        if added.is_empty() && removed.is_empty() {
-            return Ok(false);
-        }
-        if !self.schema.as_ref().is_some_and(|r| r.current(snap)) {
-            self.schema = Some(inf.schema_footprint().resolve(snap));
-        }
-        let schema = self.schema.as_ref().expect("resolved above");
-        if schema.touches(added.iter().chain(removed.iter())) {
-            // the schema the data's footprint was read with is gone
-            self.data = None;
-            return Ok(true);
-        }
-        if whole {
-            return Ok(true);
-        }
-        if !self.data.as_ref().is_some_and(|r| r.current(snap)) {
-            // no schema change: the schema at `snap` is the one before the changes
-            self.data = Some(inf.footprint(pattern, snap)?.resolve(snap));
-        }
-        let data = self.data.as_ref().expect("resolved above");
-        Ok(data.touches(
-            added
-                .iter()
-                .chain(removed.iter())
-                .filter(|q| vis.visible(snap, q)),
-        ))
     }
 }

@@ -4,7 +4,7 @@
 use super::budget::ViewBudget;
 use super::compile::{Compiled, Kind};
 use super::footprint::{Footprint, Resolved};
-use super::inference::{Inference, InferredFootprint};
+use super::inference::Inference;
 use super::ops::{Node, Op, PlanNode};
 use super::pass::{Pass, PassStats, Vis};
 use super::persist::{Reader, Writer};
@@ -300,7 +300,8 @@ pub struct Circuit {
     /// the query's pattern and dataset clause
     pub pattern: spargebra::algebra::GraphPattern,
     pub dataset: Option<spargebra::algebra::QueryDataset>,
-    inferred: InferredFootprint,
+    /// resolved schema footprint when `inference` is set
+    schema_resolved: Option<Resolved>,
     /// Whether the circuit keeps its result. A sink that consumes only the changes,
     /// such as an internal circuit's accumulator, sets it to `false`: the result then
     /// stays empty, and the operators keep only the state they need.
@@ -528,7 +529,7 @@ impl Circuit {
             aggregate_errors: None,
             pattern: c.pattern,
             dataset: c.dataset,
-            inferred: InferredFootprint::default(),
+            schema_resolved: None,
             keep_result: true,
             version: None,
             version_pool: None,
@@ -598,7 +599,7 @@ impl Circuit {
         self.ann = AnnMap::default();
         self.facts.clear();
         self.resolved = None;
-        self.inferred = InferredFootprint::default();
+        self.schema_resolved = None;
         self.snap = None;
         self.version = None;
         self.budget.clear_state();
@@ -1335,7 +1336,8 @@ impl Circuit {
         self.facts.clear();
         self.version = None;
         // the schema may have changed in changes no pass saw
-        self.inferred = InferredFootprint::default();
+        self.resolved = None;
+        self.schema_resolved = None;
         self.budget.shrink_state_to(0);
         let vis = Vis::new(self.access.as_ref(), &snap);
         let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
@@ -1469,7 +1471,7 @@ impl Circuit {
         }
         self.snap = Some(snap.clone());
         self.resolved = None;
-        self.inferred = InferredFootprint::default();
+        self.schema_resolved = None;
         if let Err(e) = self.publish_fresh_version_budgeted() {
             self.clear_state();
             return Err(e);
@@ -1725,15 +1727,43 @@ impl Circuit {
         let whole = super::runtime::whole_reason(self.access.as_ref()).is_some();
         if whole || self.inference.is_some() {
             let skip = match &self.inference {
-                Some(inf) if !whole => !self.inferred.touches(
-                    inf,
-                    &self.pattern,
-                    self.dataset.is_some(),
-                    &snap,
-                    &d.added,
-                    &d.removed,
-                    &vis,
-                )?,
+                Some(inf) if !whole => {
+                    if d.added.is_empty() && d.removed.is_empty() {
+                        true
+                    } else {
+                        if !self
+                            .schema_resolved
+                            .as_ref()
+                            .is_some_and(|r| r.current(&snap))
+                        {
+                            self.schema_resolved = Some(inf.schema_footprint().resolve(&snap));
+                        }
+                        let schema = self.schema_resolved.as_ref().expect("resolved above");
+                        if schema.touches(d.added.iter().chain(d.removed.iter())) {
+                            // the schema the data's footprint was read with is gone
+                            self.resolved = None;
+                            false
+                        } else if self.dataset.is_some() {
+                            false
+                        } else {
+                            if !self.resolved.as_ref().is_some_and(|r| r.current(&snap)) {
+                                // no schema change: the schema at `snap` is the one before
+                                // the changes
+                                self.resolved = Some(
+                                    inf.data_footprint(&self.pattern, false, &snap)?
+                                        .resolve(&snap),
+                                );
+                            }
+                            let data = self.resolved.as_ref().expect("resolved above");
+                            !data.touches(
+                                d.added
+                                    .iter()
+                                    .chain(d.removed.iter())
+                                    .filter(|q| vis.visible(&snap, q)),
+                            )
+                        }
+                    }
+                }
                 _ => d.added.is_empty() && d.removed.is_empty(),
             };
             if skip {

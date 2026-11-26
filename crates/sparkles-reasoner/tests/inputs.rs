@@ -410,8 +410,19 @@ fn imports_in_the_dataset() {
         "{:?}",
         rep.warnings
     );
-    let watched = rep.inputs.as_ref().unwrap().watched();
+    let resolved = rep.inputs.as_ref().unwrap();
+    let watched = resolved.watched();
     assert!(watched.contains(&GraphRef::Named(format!("{EX}missing"))));
+    let fp = resolved.footprint();
+    assert_eq!(fp.entries.len(), watched.len());
+    let snap = s.snapshot();
+    let rfp = fp.resolve(&snap);
+    assert!(rfp.matches(&[
+        sparkles_core::id::Id(1),
+        sparkles_core::id::Id(2),
+        sparkles_core::id::Id(3),
+        sparkles_core::id::Id::DEFAULT_GRAPH,
+    ]));
     let since = rep.receipt.unwrap().commit.seq;
     ttl(
         &s,
