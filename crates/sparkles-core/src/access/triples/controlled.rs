@@ -694,17 +694,6 @@ fn hidden(
                 )
             })
             .transpose()?;
-        let pass = match &protection.pattern {
-            Some(pattern) => Some(passes(
-                snap,
-                protection,
-                pattern,
-                &rules.caller,
-                &rules.limits,
-                preparation,
-            )?),
-            None => None,
-        };
         let exact_protected = match &protection.graphs {
             Some(graphs) => exact_named_graph_ids(graphs, snap, preparation)?,
             None => None,
@@ -712,6 +701,7 @@ fn hidden(
         let covers_all_named = protection.graphs.as_ref().is_none_or(Graphs::is_all);
         let rule_allows_none = is_empty_graphs(&rule.read);
         let mut by_graph = Map::new(preparation)?;
+        let mut pass: Option<Pass> = None;
         let mut visit = |quad: [Id; 4]| -> Result<bool> {
             preparation.check()?;
             let graph = quad[3];
@@ -802,7 +792,23 @@ fn hidden(
                 by_graph.insert(graph.0, hide)?;
                 hide
             };
-            if hide && !pass.as_ref().is_some_and(|pass| pass.passes(&quad)) {
+            if hide {
+                if let Some(pattern) = &protection.pattern {
+                    let resolved = match &mut pass {
+                        Some(pass) => pass,
+                        None => pass.insert(passes(
+                            snap,
+                            protection,
+                            pattern,
+                            &rules.caller,
+                            &rules.limits,
+                            preparation,
+                        )?),
+                    };
+                    if resolved.passes(&quad) {
+                        return Ok(!matches!(resolved, Pass::All));
+                    }
+                }
                 if hidden.len() as u64 >= rules.limits.max_hidden {
                     return Err(too_many(
                         &rules.limits,
@@ -816,20 +822,36 @@ fn hidden(
         match (&members, &predicates) {
             (Some(members), predicates) => {
                 for &subject in members.keys() {
+                    let mut stop = false;
                     preparation.scan(snap, Perm::Spo, &[subject], |quad| {
                         if predicates
                             .as_ref()
                             .is_none_or(|ids| ids.contains_key(&quad[1].0))
+                            && !visit(quad)?
                         {
-                            visit(quad)?;
+                            stop = true;
+                            return Ok(false);
                         }
                         Ok(true)
                     })?;
+                    if stop {
+                        break;
+                    }
                 }
             }
             (None, Some(predicates)) => {
                 for &predicate in predicates.keys() {
-                    preparation.scan(snap, Perm::Pso, &[predicate], &mut visit)?;
+                    let mut stop = false;
+                    preparation.scan(snap, Perm::Pso, &[predicate], |quad| {
+                        if !visit(quad)? {
+                            stop = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    })?;
+                    if stop {
+                        break;
+                    }
                 }
             }
             (None, None) => preparation.scan(snap, Perm::Gspo, &[], &mut visit)?,
@@ -979,9 +1001,9 @@ fn hex_escape(c: char, out: &mut [u8; 6]) -> &str {
 }
 
 /// Evaluate a protection's pattern as [`super::passes`] does, with every graph merged
-/// into the default graph and `GRAPH` for the named ones. The query text, the list of
-/// named graphs and the pattern's query are charged to `preparation`, and the query
-/// runs under its controls on the unmasked snapshot.
+/// into the default graph by graph ID and `GRAPH` for the named ones. The query text,
+/// the default graph ID set and the pattern's query are charged to `preparation`, and
+/// the query runs under its controls on the unmasked snapshot without copying graph IRIs.
 fn passes(
     snap: &Arc<Snapshot>,
     protection: &Protection,
@@ -996,29 +1018,7 @@ fn passes(
         return Ok(Pass::None);
     };
     let (text, _text_held) = text.finish()?;
-    // The named graphs are merged into the default graph, as the legacy pattern reads
-    // them. Each name's storage is admitted before it is allocated.
-    let mut named = Buffer::new(preparation)?;
-    let mut names_held = preparation.reserve(0)?;
-    snap.for_each_graph_id_checked(
-        || preparation.check(),
-        |graph| {
-            preparation.with_iri(snap, graph, |iri| {
-                if let Some(iri) = iri {
-                    names_held.merge(preparation.reserve(iri.len() as u64)?);
-                    let mut name = String::new();
-                    name.try_reserve_exact(iri.len())
-                        .map_err(|_| preparation.exhausted())?;
-                    name.push_str(iri);
-                    named.push(name)?;
-                }
-                Ok(())
-            })
-        },
-    )?;
-    let (named, _named_held) = named.into_parts();
     let opts = crate::sparql::QueryOptions {
-        default_graph_extra: named,
         max_rows: Some(usize::try_from(limits.max_pattern_rows).unwrap_or(usize::MAX)),
         ..preparation.nested_query_options()
     };
@@ -1030,8 +1030,8 @@ fn passes(
         })
     };
     let view = GraphAccess::all().masked_controlled(snap, preparation)?;
-    let result = crate::sparql::query_prepared_source(view.read_source(), &text, &opts).map_err(
-        |error| match error {
+    let result = crate::sparql::query_prepared_pattern_source(view.read_source(), &text, &opts)
+        .map_err(|error| match error {
             Error::BudgetExceeded(Budget {
                 kind: BudgetKind::Rows,
                 ..
@@ -1041,8 +1041,7 @@ fn passes(
                 protection.name
             )),
             error => error,
-        },
-    )?;
+        })?;
     let table = result.table();
     if table.len() as u64 > limits.max_pattern_rows {
         return Err(rows_refused(table.len() as u64));
@@ -1731,6 +1730,177 @@ mod tests {
         let (a, _a_held) = cache_key(&alice, alice.triples.as_ref().unwrap(), &prep).unwrap();
         let (b, _b_held) = cache_key(&bob, bob.triples.as_ref().unwrap(), &prep).unwrap();
         assert_ne!(a, b, "a pattern's mask is keyed by its caller");
+    }
+
+    #[test]
+    fn pattern_preparation_skips_unreadable_rules_and_uses_graph_ids_for_cross_graph_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let g_readable = "urn:g:readable";
+        let g_empty_ok = "urn:g:empty-ok";
+        let g_meta = "urn:g:meta";
+        {
+            let store = crate::store::Store::open(dir.path(), Default::default()).unwrap();
+            let mut trig = format!(
+                "<urn:d1> <urn:secret:p> \"1\" .\n\
+                 <urn:d2> <urn:secret:p> \"2\" .\n\
+                 <urn:r1> <urn:approved> \"alice\" .\n\
+                 GRAPH <{g_readable}> {{\n\
+                     <urn:r1> <urn:secret:p> \"1\" .\n\
+                     <urn:r2> <urn:secret:p> \"2\" .\n\
+                 }}\n\
+                 GRAPH <{g_empty_ok}> {{\n\
+                     <urn:e1> <urn:plain:p> \"ok\" .\n\
+                 }}\n\
+                 GRAPH <{g_meta}> {{\n\
+                     <urn:d1> <urn:approved> \"alice\" .\n\
+                     <{g_meta}> <urn:enabled> \"yes\" .\n\
+                 }}\n"
+            );
+            // 16 denied graphs * 64 KiB = ~1 MiB of denied graph IRIs, well above the
+            // 512 KiB preparation budget used below.
+            let pad = "x".repeat(64 * 1024);
+            for i in 0..16 {
+                trig.push_str(&format!(
+                    "GRAPH <urn:g:denied-{i:02}-{pad}> {{\n\
+                         <urn:hidden:{i}> <urn:only-denied:p> \"x\" ; <urn:secret:p> \"x\" .\n\
+                     }}\n"
+                ));
+            }
+            crate::sparql::update::update(
+                &store,
+                &format!("INSERT DATA {{ {trig} }}"),
+                &Default::default(),
+            )
+            .unwrap();
+            store.compact().unwrap();
+        }
+
+        let store = crate::store::Store::open(dir.path(), Default::default()).unwrap();
+        let snap = store.snapshot();
+        assert!(snap.delta.is_empty(), "expected compacted base-only store");
+
+        // 1. No readable covered candidate: pattern evaluation is skipped completely.
+        //    Even with `max_pattern_rows: 0` and ~1 MiB of denied graph IRIs, a narrow
+        //    exact allowlist succeeds under a 512 KiB cap.
+        let skip_access = GraphAccess::with_triples(
+            Graphs::Only(GraphRule::new([g_empty_ok], &[])),
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "skip-unreadable".into(),
+                        predicates: Some(vec!["urn:only-denied:p".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: Some("FILTER(false)".into()),
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits {
+                    max_pattern_rows: 0,
+                    ..Limits::default()
+                },
+            },
+        );
+        let skip_prep = Preparation::new(Control::none(), 512 << 10).unwrap();
+        let skip_view = skip_access.masked_controlled(&snap, &skip_prep).unwrap();
+        assert!(
+            skip_view
+                .snapshot()
+                .mask
+                .as_ref()
+                .unwrap()
+                .hidden
+                .is_empty()
+        );
+
+        // 2. Active cross-graph pattern: default-graph fact unlocks named-graph triple,
+        //    named-graph fact unlocks default-graph triple, and explicit `GRAPH <g_meta>`
+        //    works via graph-ID dataset setup without copying the ~1 MiB of denied IRIs.
+        let mut readable_rule = GraphRule::new([g_readable], &[]);
+        readable_rule.default_graph = true;
+        let active_access = GraphAccess::with_triples(
+            Graphs::Only(readable_rule.clone()),
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "cross-graph-pattern".into(),
+                        predicates: Some(vec!["urn:secret:p".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: Some(format!(
+                            "?s <urn:approved> ?user . GRAPH <{g_meta}> {{ <{g_meta}> <urn:enabled> \"yes\" }}"
+                        )),
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller {
+                    user: Some("alice".into()),
+                    ..Caller::default()
+                },
+                limits: Limits::default(),
+            },
+        );
+        let active_prep = Preparation::new(Control::none(), 512 << 10).unwrap();
+        let active_view = active_access
+            .masked_controlled(&snap, &active_prep)
+            .unwrap();
+        let legacy = active_access.masked(&snap).unwrap();
+        assert_eq!(quads(active_view.snapshot()), quads(&legacy));
+        // Exactly `<urn:d2>` (default graph) and `<urn:r2>` (`g_readable`) are hidden.
+        assert_eq!(
+            active_view.snapshot().mask.as_ref().unwrap().hidden.len(),
+            2
+        );
+
+        // 3. Zero-variable pattern returning `Pass::All` stops early and hides nothing.
+        let pass_all_access = GraphAccess::with_triples(
+            Graphs::Only(readable_rule),
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "pass-all-pattern".into(),
+                        predicates: Some(vec!["urn:secret:p".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: Some(format!(
+                            "GRAPH <{g_meta}> {{ <{g_meta}> <urn:enabled> \"yes\" }}"
+                        )),
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        );
+        let pass_all_prep = Preparation::new(Control::none(), 512 << 10).unwrap();
+        let pass_all_view = pass_all_access
+            .masked_controlled(&snap, &pass_all_prep)
+            .unwrap();
+        assert!(
+            pass_all_view
+                .snapshot()
+                .mask
+                .as_ref()
+                .unwrap()
+                .hidden
+                .is_empty()
+        );
     }
 
     #[test]

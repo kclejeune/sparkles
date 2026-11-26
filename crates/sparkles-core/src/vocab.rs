@@ -1702,6 +1702,86 @@ impl Vocab {
         Ok(result)
     }
 
+    /// Exact controlled search over the base vocabulary whose work and scratch stay
+    /// bounded by `key`: compares directly against `key` using the sorted front-coding
+    /// invariant without allocating a reconstruction buffer for sibling entries.
+    pub(crate) fn find_exact_controlled(
+        &self,
+        key: &[u8],
+        mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
+    ) -> crate::error::Result<std::result::Result<u64, u64>> {
+        let (mut lo, mut hi) = (0usize, self.num_blocks());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if compare_prepared_bytes(self.block_first(mid), key, &mut checkpoint)?.is_le() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            checkpoint("completed vocabulary search")?;
+            return Ok(Err(0));
+        }
+        let b = lo - 1;
+        let _timer = ioacct::timer(Phase::VocabRead);
+        let data = self.data.as_slice();
+        let mut position = self.block_offset(b);
+        let count = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
+        ioacct::vocab_blocks_scanned(1);
+        self.touch_block(b);
+        // For every `at > 0`, the previous key was strictly less than `key` and
+        // `div = LCP(K_{at-1}, key) < key.len()`. Any subsequent entry with
+        // `entry.shared > div` inherits the mismatch byte at `div` (`< key[div]`)
+        // and stays strictly less than `key` with the same `div`.
+        let mut div = 0usize;
+        for at in 0..count {
+            checkpoint("comparing vocabulary entry")?;
+            let entry = if self.fsst.is_some() {
+                self.entry::<true>(data, &mut position, at == 0)
+            } else {
+                self.entry::<false>(data, &mut position, at == 0)
+            };
+            if at == 0 && entry.shared != 0 {
+                return Err(crate::error::Error::Corrupt(
+                    "first vocabulary block entry has non-zero shared prefix".into(),
+                ));
+            }
+            if at > 0 && entry.shared > div {
+                continue;
+            }
+            let rem = &key[entry.shared..];
+            let suffix = &data[entry.start..entry.start + entry.len];
+            let (order, matched) = if entry.coded {
+                let id = (b * FC_BLOCK + at) as u64;
+                let table = self
+                    .fsst
+                    .as_ref()
+                    .expect("coded vocabulary metadata")
+                    .table(id);
+                table.compare_controlled(suffix, rem, &mut checkpoint)?
+            } else {
+                compare_prepared_prefix(suffix, rem, &mut checkpoint)?
+            };
+            match order {
+                std::cmp::Ordering::Less => {
+                    div = entry.shared + matched;
+                    debug_assert!(div < key.len());
+                }
+                std::cmp::Ordering::Equal => {
+                    checkpoint("completed vocabulary search")?;
+                    return Ok(Ok((b * FC_BLOCK + at) as u64));
+                }
+                std::cmp::Ordering::Greater => {
+                    checkpoint("completed vocabulary search")?;
+                    return Ok(Err((b * FC_BLOCK + at) as u64));
+                }
+            }
+        }
+        checkpoint("completed vocabulary search")?;
+        Ok(Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64))
+    }
+
     /// A serializer that already prefetched these blocks does not need dense hints
     /// or a per-block bitmap check on its decode's hot path.
     #[inline]
@@ -2895,6 +2975,32 @@ fn compare_prepared_bytes<E>(
     }
     checkpoint("completed vocabulary comparison")?;
     Ok(left.len().cmp(&right.len()))
+}
+
+fn compare_prepared_prefix<E>(
+    left: &[u8],
+    right: &[u8],
+    checkpoint: &mut impl FnMut(&'static str) -> std::result::Result<(), E>,
+) -> std::result::Result<(std::cmp::Ordering, usize), E> {
+    let common = left.len().min(right.len());
+    let mut offset = 0usize;
+    while offset < common {
+        let end = (offset + 1024).min(common);
+        checkpoint("comparing vocabulary bytes")?;
+        let l = &left[offset..end];
+        let r = &right[offset..end];
+        if l != r {
+            let diff = l
+                .iter()
+                .zip(r)
+                .position(|(a, b)| a != b)
+                .expect("chunks differ");
+            return Ok((l[diff].cmp(&r[diff]), offset + diff));
+        }
+        offset = end;
+    }
+    checkpoint("completed vocabulary comparison")?;
+    Ok((left.len().cmp(&right.len()), common))
 }
 
 impl AppendVocab {
@@ -4572,12 +4678,20 @@ mod tests {
                         .unwrap(),
                     vocab.find(key)
                 );
+                assert_eq!(
+                    vocab.find_exact_controlled(key, |_| Ok(())).unwrap(),
+                    vocab.find(key)
+                );
                 let mut absent = key.clone();
                 absent.push(0);
                 assert_eq!(
                     vocab
                         .find_with_controlled(&absent, |_| Ok(()), |_| Ok(()))
                         .unwrap(),
+                    vocab.find(&absent)
+                );
+                assert_eq!(
+                    vocab.find_exact_controlled(&absent, |_| Ok(())).unwrap(),
                     vocab.find(&absent)
                 );
             }
@@ -4592,6 +4706,64 @@ mod tests {
                     .unwrap(),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn find_exact_controlled_skips_oversized_preceding_siblings_for_plain_and_fsst() {
+        let pad_a = "a".repeat(256 * 1024);
+        let pad_b = "a".repeat(256 * 1024) + "b";
+        let mut keys: Vec<Vec<u8>> = vec![
+            b"<urn:g:0".to_vec(),
+            b"<urn:g:a".to_vec(),
+            format!("<urn:g:a-{pad_a}").into_bytes(),
+            format!("<urn:g:a-{pad_b}").into_bytes(),
+            b"<urn:g:b".to_vec(),
+            b"<urn:g:bb".to_vec(),
+            b"<urn:g:c".to_vec(),
+        ];
+        for i in 0..FC_BLOCK * 2 {
+            keys.push(format!("<urn:g:z-{i:03}-{}", "q".repeat(64)).into_bytes());
+        }
+        keys.sort();
+        keys.dedup();
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let vocab = Vocab::open(dir.path()).unwrap();
+            assert_eq!(vocab.is_fsst(), fsst);
+            for key in &keys {
+                let mut checks = 0usize;
+                let got = vocab
+                    .find_exact_controlled(key, |_| {
+                        checks += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(got, vocab.find(key));
+                if key.len() < 64 {
+                    // Searching for a short key must not scan through the 256 KiB sibling.
+                    assert!(
+                        checks < 64,
+                        "short key lookup ran {checks} checkpoints (fsst={fsst})"
+                    );
+                }
+            }
+            for probe in [
+                b"".as_slice(),
+                b"<urn:a",
+                b"<urn:g:a-",
+                b"<urn:g:a-b",
+                b"<urn:g:ba",
+                b"<urn:g:zzz",
+            ] {
+                assert_eq!(
+                    vocab.find_exact_controlled(probe, |_| Ok(())).unwrap(),
+                    vocab.find(probe),
+                    "probe={:?} fsst={fsst}",
+                    String::from_utf8_lossy(probe)
+                );
+            }
         }
     }
 

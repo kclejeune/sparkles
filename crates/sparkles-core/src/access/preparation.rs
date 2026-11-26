@@ -1043,12 +1043,11 @@ impl Preparation {
     }
 
     fn lookup_vocab_key(&self, snap: &Snapshot, key: &[u8]) -> Result<Option<Id>> {
-        let mut workspace = self.reserve(0)?;
-        if let Ok(id) = snap.generation.vocab.find_with_controlled(
-            key,
-            |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
-            |phase| self.checkpoint(phase),
-        )? {
+        if let Ok(id) = snap
+            .generation
+            .vocab
+            .find_exact_controlled(key, |phase| self.checkpoint(phase))?
+        {
             self.check()?;
             return Ok(Some(Id::vocab(id)));
         }

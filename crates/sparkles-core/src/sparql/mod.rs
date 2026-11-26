@@ -701,6 +701,16 @@ fn make_ctx_input(
     make_ctx_input_policy(snap, opts, dataset, base, source, None, None, None, None)
 }
 
+pub(super) enum DefaultDatasetOverride<'a> {
+    /// Validation/selector query: default graph is the selected graph IDs and
+    /// named graphs are empty (`selector_default_only = true`).
+    Selector(&'a GraphSel),
+    /// Protection pattern query (C12b §2.3): default graph is the union of the
+    /// default graph and every named graph resolved by graph ID through the
+    /// controlled distinct-graph iterator, while `GRAPH` reaches all named graphs.
+    AllGraphsWithNamed,
+}
+
 // Only the application root which just prepared this policy supplies the override.
 // Checked public sources retain the existing exact-policy replacement refusal.
 #[allow(clippy::too_many_arguments)]
@@ -712,7 +722,7 @@ fn make_ctx_input_policy(
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
     parent: Option<sparkles_budget::ParentHandle>,
-    selector_graphs: Option<&GraphSel>,
+    default_override: Option<DefaultDatasetOverride<'_>>,
     inherited: Option<&ViewExecution>,
 ) -> Result<Ctx> {
     #[cfg(feature = "geo")]
@@ -783,7 +793,7 @@ fn make_ctx_input_policy(
         Some(r) => Some(r.schema_in_ctx(&ctx)?),
         None => None,
     };
-    ctx.use_cache = !opts.no_cache && selector_graphs.is_none();
+    ctx.use_cache = !opts.no_cache && default_override.is_none();
     ctx.plan_patterns = !opts.no_plan_patterns;
     ctx.algo_projections = opts.algo_projections.clone();
     ctx.views = opts.views.clone();
@@ -799,10 +809,17 @@ fn make_ctx_input_policy(
     ctx.aggregate_errors = opts.aggregate_errors.unwrap_or(ctx.snap.aggregate_errors);
     ctx.base_iri = base.cloned();
     let mut ds = DatasetSpec::default();
-    if let Some(graphs) = selector_graphs {
-        ds.default = Some(resolve_selector_graphs(&mut ctx, graphs)?);
-        ds.named = Some(Vec::new());
-        ctx.selector_default_only = true;
+    if let Some(override_mode) = default_override {
+        match override_mode {
+            DefaultDatasetOverride::Selector(graphs) => {
+                ds.default = Some(resolve_selector_graphs(&mut ctx, graphs)?);
+                ds.named = Some(Vec::new());
+                ctx.selector_default_only = true;
+            }
+            DefaultDatasetOverride::AllGraphsWithNamed => {
+                ds.default = Some(resolve_selector_graphs(&mut ctx, &GraphSel::All)?);
+            }
+        }
     } else if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
         if opts
             .default_graph_uris
@@ -1356,8 +1373,8 @@ pub fn query_snapshot_prepared(
 }
 
 /// Run query text over a source that this crate has just prepared, without the store
-/// instance check of [`query_source`]. Permission preparation evaluates the patterns of
-/// protections this way, so that their work is charged to the same preparation.
+/// instance check of [`query_source`].
+#[cfg(test)]
 pub(crate) fn query_prepared_source(
     source: crate::store::BoundReadSource,
     q: &str,
@@ -1366,6 +1383,25 @@ pub(crate) fn query_prepared_source(
     source.query_input().2.check()?;
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     execute_retained_source(source, &parsed, opts, 0.0, None)
+}
+
+/// Run a protection pattern query (C12b §2.3) over an unmasked prepared source with
+/// every physical graph of the snapshot merged into the default dataset by graph ID,
+/// while `GRAPH` still reaches all named graphs.
+pub(crate) fn query_prepared_pattern_source(
+    source: crate::store::BoundReadSource,
+    q: &str,
+    opts: &QueryOptions,
+) -> Result<QueryResult> {
+    source.query_input().2.check()?;
+    let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
+    execute_retained_source(
+        source,
+        &parsed,
+        opts,
+        0.0,
+        Some(DefaultDatasetOverride::AllGraphsWithNamed),
+    )
 }
 
 /// Execute an already parsed query using a genuine physical source and the
@@ -1388,7 +1424,7 @@ fn execute_retained_source(
     parsed: &Query,
     opts: &QueryOptions,
     parse_ms: f64,
-    selector_graphs: Option<&GraphSel>,
+    default_override: Option<DefaultDatasetOverride<'_>>,
 ) -> Result<QueryResult> {
     source.query_input().2.check()?;
     let stack = depth::check_query(parsed)?;
@@ -1404,7 +1440,7 @@ fn execute_retained_source(
             Some(source),
             None,
             None,
-            selector_graphs,
+            default_override,
             None,
         )?;
         let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1700,7 +1736,7 @@ fn prepare_query_input_policy(
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
     parent: Option<sparkles_budget::ParentHandle>,
-    selector_graphs: Option<&GraphSel>,
+    default_override: Option<DefaultDatasetOverride<'_>>,
     inherited: Option<&ViewExecution>,
 ) -> Result<PreparedQuery> {
     if let Some(preparation) = inherited.and_then(|view| view.preparation.as_ref()) {
@@ -1717,7 +1753,7 @@ fn prepare_query_input_policy(
         source,
         prepared_policy,
         parent,
-        selector_graphs,
+        default_override,
         inherited,
     )?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {

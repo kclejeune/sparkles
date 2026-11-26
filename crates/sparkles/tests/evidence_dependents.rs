@@ -2485,3 +2485,234 @@ fn combined_graph_restriction_and_triple_mask_skip_oversized_unreadable_graph() 
         assert!(res.reports.is_empty());
     }
 }
+
+/// Combined graph restrictions and pattern-based triple masks at both `find_dependents`
+/// and `find_dependents_at` must not retain denied report graph IRIs before evaluating
+/// protection patterns, while preserving C12b cross-graph pattern semantics across
+/// readable proposal graphs and admitted report graphs.
+#[test]
+fn combined_graph_restriction_and_pattern_mask_bound_denied_report_graphs() {
+    use sparkles::access::{Decider, triples};
+
+    let ds = Dataset::memory();
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    evidence::configure(&ds, &settings(), &Control::none()).unwrap();
+
+    let c = claim(&ds, "advisory");
+    let a_ok = assess_in(&ds, CLAIMS, "a-visible", &c.0, &[]);
+    let a_secret = assess(&ds, "a-secret", &c.0, &[]);
+    add_report(
+        &ds,
+        REPORTS,
+        "urn:report:ok",
+        Some("urn:comm:1"),
+        &[c.0.as_str()],
+    );
+    add_report(
+        &ds,
+        REPORTS,
+        "urn:report:secret",
+        Some("urn:comm:2"),
+        &[c.0.as_str()],
+    );
+
+    let witness = "urn:x-sparkles:witness";
+    let mut insert = format!(
+        "INSERT DATA {{\n\
+            GRAPH <{REPORTS}> {{\n\
+                <urn:report:ok> <urn:secret:tag> \"guarded\" .\n\
+                <urn:report:secret> <urn:secret:tag> \"guarded\" .\n\
+            }}\n\
+            GRAPH <{witness}> {{\n\
+                <{a_ok}> <urn:visible-to> \"alice\" .\n\
+                <urn:report:ok> <urn:visible-to> \"alice\" .\n\
+                <{witness}> <urn:active> \"true\" .\n\
+            }}\n",
+        a_ok = a_ok.as_str(),
+    );
+    // 125 denied report graphs * 140 KiB = ~17.5 MiB of graph IRIs, exceeding the
+    // 16 MiB dependents budget if pattern preparation retained denied graph names.
+    let pad = "p".repeat(140 * 1024);
+    for i in 0..125 {
+        insert.push_str(&format!(
+            "GRAPH <urn:x-sparkles:graphrag:denied-{i:03}-{pad}> {{\n\
+                 <urn:hidden:rep:{i}> <{RDF_TYPE}> <{GR}Report> ; \
+                     <urn:only-denied:tag> \"x\" ; \
+                     <urn:secret:tag> \"x\" .\n\
+             }}\n"
+        ));
+    }
+    insert.push('}');
+    ds.update(&insert).unwrap();
+
+    let seq = ds.store().head_commit().seq;
+    let view = ds
+        .store()
+        .evidence_view(&sparkles::history::At::Commit(seq), &prep)
+        .unwrap();
+
+    // 1. Narrow exact allowlist + `FILTER(false)` pattern on a predicate that only
+    //    exists in denied graphs: skips pattern evaluation and succeeds at both entry points.
+    let skip_policy = Arc::new(GraphAccess::with_triples(
+        Graphs::Only(GraphRule::new([CLAIMS, ANALYSES], &[])),
+        Graphs::none(),
+        triples::TripleRules {
+            rules: vec![triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "denied-only-pattern".into(),
+                    predicates: Some(vec!["urn:only-denied:tag".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: Some("FILTER(false)".into()),
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: triples::Caller::default(),
+            limits: triples::Limits::default(),
+        },
+    ));
+    for res in [
+        evidence::find_dependents(
+            &ds,
+            &ds,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(skip_policy.clone()),
+            &Control::none(),
+        )
+        .unwrap(),
+        evidence::find_dependents_at(
+            &view,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(skip_policy),
+            &Control::none(),
+        )
+        .unwrap(),
+    ] {
+        let found: Vec<_> = res
+            .dependents
+            .iter()
+            .map(|d| d.assessment.clone())
+            .collect();
+        assert_eq!(res.dependents.len(), 2);
+        assert!(found.contains(&a_ok));
+        assert!(found.contains(&a_secret));
+        assert!(res.reports.is_empty());
+    }
+
+    // 2. Active cross-graph pattern protections under both narrow exact allowlist and
+    //    guarded wildcard policy: witness triples live in `<witness>` (outside the
+    //    caller's allowlist) and are read through the unmasked default dataset + `GRAPH`.
+    let pattern_rules = || triples::TripleRules {
+        rules: vec![
+            triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "pattern-conclusion".into(),
+                    predicates: Some(vec!["urn:x-sparkles:evidence:conclusion".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: Some(format!(
+                        "?s <urn:visible-to> ?user . GRAPH <{witness}> {{ <{witness}> <urn:active> \"true\" }}"
+                    )),
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            },
+            triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "pattern-secret-tag".into(),
+                    predicates: Some(vec!["urn:secret:tag".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: Some(format!(
+                        "?s <urn:visible-to> ?user . GRAPH <{witness}> {{ <{witness}> <urn:active> \"true\" }}"
+                    )),
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            },
+        ],
+        caller: triples::Caller {
+            user: Some("alice".into()),
+            ..triples::Caller::default()
+        },
+        limits: triples::Limits::default(),
+    };
+
+    let exact_pattern = Arc::new(GraphAccess::with_triples(
+        Graphs::Only(GraphRule::new([CLAIMS, ANALYSES], &[])),
+        Graphs::none(),
+        pattern_rules(),
+    ));
+    for res in [
+        evidence::find_dependents(
+            &ds,
+            &ds,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(exact_pattern.clone()),
+            &Control::none(),
+        )
+        .unwrap(),
+        evidence::find_dependents_at(
+            &view,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(exact_pattern),
+            &Control::none(),
+        )
+        .unwrap(),
+    ] {
+        assert_eq!(res.dependents.len(), 1);
+        assert_eq!(res.dependents[0].assessment, a_ok);
+        assert!(res.reports.is_empty());
+    }
+
+    let guarded_pattern = Arc::new(GraphAccess::with_triples(
+        Graphs::All.guarded_by(
+            "urn:x-sparkles:graphrag:*",
+            Decider(Arc::new(FixedGuard(vec![REPORTS.into()]))),
+        ),
+        Graphs::none(),
+        pattern_rules(),
+    ));
+    for res in [
+        evidence::find_dependents(
+            &ds,
+            &ds,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(guarded_pattern.clone()),
+            &Control::none(),
+        )
+        .unwrap(),
+        evidence::find_dependents_at(
+            &view,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(guarded_pattern),
+            &Control::none(),
+        )
+        .unwrap(),
+    ] {
+        assert_eq!(res.dependents.len(), 1);
+        assert_eq!(res.dependents[0].assessment, a_ok);
+        assert_eq!(res.reports.len(), 1);
+        assert_eq!(res.reports[0].report.as_str(), "urn:report:ok");
+        assert_eq!(res.reports[0].graph.as_str(), REPORTS);
+    }
+}

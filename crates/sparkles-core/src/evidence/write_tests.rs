@@ -741,7 +741,7 @@ fn admitted_graph_ids_skip_oversized_unreadable_graphs_and_check_object_type() {
 }
 
 /// Mask preparation admits graphs before full term decoding: an exact allowlist rejects
-/// a 256 KiB unreadable graph by ID under a 200 KiB budget (smaller than the IRI itself),
+/// a 512 KiB unreadable graph by ID under a 400 KiB budget (smaller than the IRI itself),
 /// and a guarded wildcard rule checks it with `with_iri` instead of `decode_term`'s 128x
 /// multiplier.
 #[test]
@@ -772,7 +772,7 @@ fn mask_preparation_admits_graphs_before_full_decoding() {
 
     let s = Store::in_memory(StoreOptions::default());
     let g_ok = "urn:x-sparkles:graphrag:ok";
-    let g_huge_unreadable = format!("urn:x-sparkles:graphrag:secret-{}", "z".repeat(256 * 1024));
+    let g_huge_unreadable = format!("urn:x-sparkles:graphrag:secret-{}", "z".repeat(512 * 1024));
     let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
     let report_cls = "urn:x-sparkles:graphrag#Report";
     let secret_pred = "urn:secret:tag";
@@ -814,9 +814,10 @@ fn mask_preparation_admits_graphs_before_full_decoding() {
         limits: triples::Limits::default(),
     };
 
-    // 1. Exact allowlist rejects the 256 KiB unreadable graph by ID under a 200 KiB cap
-    //    (smaller than the unreadable graph IRI itself).
-    let exact_prep = Preparation::new(crate::task::Control::none(), 200 << 10).unwrap();
+    // 1. Exact allowlist rejects the 512 KiB unreadable graph by ID under a 400 KiB cap
+    //    (smaller than the unreadable graph IRI itself, while comfortably covering the
+    //    7-way parallel permutation headroom of `apply_controlled`).
+    let exact_prep = Preparation::new(crate::task::Control::none(), 400 << 10).unwrap();
     let exact_access = GraphAccess::with_triples(
         Graphs::Only(GraphRule::new([g_ok], &[])),
         Graphs::none(),
@@ -837,9 +838,9 @@ fn mask_preparation_admits_graphs_before_full_decoding() {
             .unwrap()
     );
 
-    // 2. Guarded wildcard rule checks the 256 KiB unreadable graph via `with_iri`
-    //    instead of `with_term` (128x charge = ~32 MiB), succeeding under 1 MiB.
-    let guard_prep = Preparation::new(crate::task::Control::none(), 1 << 20).unwrap();
+    // 2. Guarded wildcard rule checks the 512 KiB unreadable graph via `with_iri`
+    //    instead of `with_term` (128x charge = ~64 MiB), succeeding under 2 MiB.
+    let guard_prep = Preparation::new(crate::task::Control::none(), 2 << 20).unwrap();
     let guard_access = GraphAccess::with_triples(
         Graphs::All.guarded_by(
             "urn:x-sparkles:graphrag:*",
@@ -862,6 +863,122 @@ fn mask_preparation_admits_graphs_before_full_decoding() {
             .hides_subject_in_graph("urn:visible:r", g_ok)
             .unwrap()
     );
+}
+
+/// On a compacted store (both plain front-coded and FSST vocabularies), exact graph
+/// admission must not reconstruct a 512 KiB denied graph name sorting immediately before
+/// the granted graph name in the same vocabulary block, whether the denied graph holds a
+/// protected predicate or only an unrelated predicate.
+#[test]
+fn compacted_exact_graph_admission_ignores_preceding_oversized_denied_graph() {
+    use crate::access::{GraphAccess, GraphRule, Graphs, triples};
+    use crate::builder::{BuildOptions, VocabCodec};
+    use crate::id::Tag;
+    use crate::store::{Store, StoreOptions};
+    use crate::vocab::FC_BLOCK;
+    use std::sync::Arc;
+
+    let g_denied = format!(
+        "urn:x-sparkles:graphrag:a-denied-{}",
+        "z".repeat(512 * 1024)
+    );
+    let g_ok = "urn:x-sparkles:graphrag:b-ok";
+    let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let report_cls = "urn:x-sparkles:graphrag#Report";
+    let secret_pred = "urn:secret:tag";
+    let unrelated_pred = "urn:unrelated:tag";
+
+    for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+        for denied_uses_protected_pred in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = StoreOptions {
+                build: BuildOptions {
+                    vocab_codec: Some(codec),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            {
+                let s = Store::open(dir.path(), opts.clone()).unwrap();
+                let denied_triple = if denied_uses_protected_pred {
+                    format!("<urn:hidden:r> <{rdf_type}> <{report_cls}> ; <{secret_pred}> \"x\" .")
+                } else {
+                    format!("<urn:hidden:r> <{unrelated_pred}> \"x\" .")
+                };
+                crate::sparql::update::update(
+                    &s,
+                    &format!(
+                        "INSERT DATA {{ \
+                            GRAPH <{g_denied}> {{ {denied_triple} }} \
+                            GRAPH <{g_ok}> {{ \
+                                <urn:visible:r> <{rdf_type}> <{report_cls}> . \
+                                <urn:masked:r> <{rdf_type}> <{report_cls}> ; <{secret_pred}> \"x\" . \
+                            }} \
+                        }}"
+                    ),
+                    &crate::sparql::QueryOptions::default(),
+                )
+                .unwrap();
+                s.compact().unwrap();
+            }
+
+            let s = Store::open(dir.path(), opts).unwrap();
+            let snap = s.snapshot();
+            assert!(snap.delta.is_empty(), "expected compacted base-only store");
+            let denied_id = snap.lookup_iri(&g_denied).expect("denied graph in base");
+            let ok_id = snap.lookup_iri(g_ok).expect("granted graph in base");
+            assert_eq!(denied_id.tag(), Tag::Vocab);
+            assert_eq!(ok_id.tag(), Tag::Vocab);
+            assert!(
+                denied_id.payload() < ok_id.payload()
+                    && denied_id.payload() as usize / FC_BLOCK
+                        == ok_id.payload() as usize / FC_BLOCK,
+                "denied graph ({}) must sort before granted graph ({}) in the same block \
+                 (codec={codec:?}, protected={denied_uses_protected_pred})",
+                denied_id.payload(),
+                ok_id.payload()
+            );
+
+            let rules = triples::TripleRules {
+                rules: vec![triples::Rule {
+                    protection: Arc::new(triples::Protection {
+                        name: "hide-secret".into(),
+                        predicates: Some(vec![secret_pred.into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: triples::Caller::default(),
+                limits: triples::Limits::default(),
+            };
+
+            // 400 KiB cap is strictly smaller than the 512 KiB preceding denied graph IRI
+            // while comfortably covering the 7-way parallel permutation headroom.
+            let prep = Preparation::new(crate::task::Control::none(), 400 << 10).unwrap();
+            let access = GraphAccess::with_triples(
+                Graphs::Only(GraphRule::new([g_ok], &[])),
+                Graphs::none(),
+                rules,
+            );
+            let view = access
+                .masked_controlled_read_only(&snap, &prep)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "exact graph admission failed after compaction \
+                         (codec={codec:?}, protected={denied_uses_protected_pred}): {err:?}"
+                    )
+                });
+            let mut reads = Reads::from_prepared(&prep, &view);
+            assert!(reads.hides_subject_in_graph("urn:masked:r", g_ok).unwrap());
+            assert!(!reads.hides_subject_in_graph("urn:visible:r", g_ok).unwrap());
+        }
+    }
 }
 
 /// The predecessor `rdf:type` probe inside `subjects_for_typed_object_in_graphs_up_to`
