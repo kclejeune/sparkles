@@ -148,7 +148,7 @@ phase retains its spec's correctness, conformance, durability and resource gates
 
 Wave B starts with item 81 Phase 3, then items 341 and 396 and the remaining C18
 work. Item 12 can move its refresh onto an internal circuit now, and item 18 Phase 3
-builds on the reasoner witnesses of item 416. The MCP tools of item 462 also belong to Wave B, starting with the `ask` MCP tool in item 488.
+builds on the reasoner witnesses of item 416. The remaining MCP tools of item 462 also belong to Wave B.
 
 ### Wave C: ontology and data platform
 
@@ -311,7 +311,7 @@ not to every extension in a spec or to phases that have already shipped.
 | **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 reads the reasoner witnesses of 416, and item 19 Phase 3 can build on item 417's fixed-point operator, while existing explanations remain available. Item 456 completes the reasoner core through items 836, 837, 839 and 958. | F16, F17, F13, F18, F23 |
 | **Engine architecture** | 453 unifies the executors behind the gates of 469 to 473, continuing through items 829 and 534 before the merge. Item 454 follows the executor merge, and 455 continues through items 830 and 833 after 14. | X14, X15, X16, X17, X05 |
 | **Ontology and data platform** | Built on item 71's axiom model and the policy plumbing of items 480 to 483, items 457 to 461 continue the ontology workbench, resource catalog, checks and protected merges, git sync and linked-data publishing. | F21, F24, U12, C30, X18, C31, F25, C32 |
-| **Agent platform** | 462 adds tool profiles, review queues, handoff and framework adapters, starting with 488. Its data-change triggers wait for 339. | C33, C11, C17, C18 |
+| **Agent platform** | 462 adds review queues, handoff and framework adapters beside tool profiles, hybrid search and the `ask` MCP tool. Its data-change triggers wait for 339. | C33, C11, C17, C18 |
 | **Evidence and maintained analyses** | 81 and 339 can run independently, and both feed 340's shared representation and durable execution. Item 396 specializes the available evidence and temporal profiles with entity modeling and offline fixtures. Item 341 adds validity, and later incremental maintenance uses the parts of item 17. | C25, C26, A01, F22, C27, C22b |
 
 The workstreams depend on each other and on existing items as follows.
@@ -764,8 +764,7 @@ numbered item when it is ready to start.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
-| 462 | **Agent platform.** Only one MCP tool has a review path, agents poll for changes, and agent frameworks reach memory only through the generic HTTP routes, without adapters of their own. Tool profiles and a hybrid search tool exist. An approval queue, data-change resources, branch handoff, framework adapters, in-process memory APIs and A2A skills address the rest, with item 488 first. | [C33](specs/C33-agent-platform-controls/README.md) | XL |
-| 488 | **An `ask` MCP tool.** Expose the checked, self-repairing question-to-SPARQL pipeline as a tool, since MCP reaches Ask only through the `ask_graph` prompt. It belongs to item 462 and follows item 263. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#agent-platform-workstream) | S |
+| 462 | **Agent platform.** Only one MCP tool has a review path, agents poll for changes, and agent frameworks reach memory only through the generic HTTP routes, without adapters of their own. Tool profiles, a hybrid search tool and the `ask` MCP tool exist. An approval queue, data-change resources, branch handoff, framework adapters, in-process memory APIs and A2A skills address the rest. | [C33](specs/C33-agent-platform-controls/README.md) | XL |
 | 1030 | **Embedding requests under the query's deadline.** A query that embeds its search text, through `spk:vectorSearch`, `search_semantic`, `recall` or `link_entities`, checks its deadline and cancellation once before the provider call, and the call then runs under the index's own timeout and retries. A stalled provider can hold the call's slot past the MCP deadline and reports a provider error instead of a timeout. Pass the remaining deadline and the cancel flag into the embedding client and its retry waits. | [F08](specs/F08-embeddings-on-write.md#outcome) | S |
 | 1031 | **Inferred hits before the search limit.** The memory search helpers that `search_semantic`, `recall` and `link_entities` share leave out the inferred graph with a filter after the text and vector searches have taken their best 50 hits, so with `reasoning: false` strong inferred hits can push asserted ones out of the ranking. Exclude the inferred graph from the searched graphs before the limit. | [C17](specs/C17-agent-memory.md#outcome) | S |
 | 463 | **Analytics library.** The algorithm library lacks DAG tools, centralities, structural criticality, batched personalized PageRank and comparisons across commits. These extend F14, while temporal paths in F26, impact and identity primitives in F27 and ML and probabilistic integration in F28 add new capabilities. Incremental algorithm results follow the shared maintenance core of item 456. | [F14](specs/F14-graph-algorithms.md#analytics-library-workstream) | XL |
@@ -1256,6 +1255,7 @@ for them.
 
 ## Completed
 
+- **488.** An `ask` MCP tool. Exposes the server's checked, self-repairing question-to-SPARQL pipeline as the `ask` MCP tool in the `explore` profile, listed only when models are configured and a visible dataset enables asking, with `ask: true` reported by `list_datasets`. Enforces caller grants, graph visibility, branch isolation, `reviewedOnly`, MCP deadlines and cancellation, Ask token and row-egress budgets, and `serverModels`-gated provider and model overrides while running grounding, checking and execution over an internal read-only tool view. [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#an-ask-mcp-tool-item-488)
 - **508.** Declared evidence settings. `serve --settings` accepts evidence graph roles and policies with locks. Typed evidence operations refuse drift between effective and recorded settings until an administrator reconciles them, and recorded graph protection stays in force. [C25](specs/C25-evidence-and-assessments.md#declared-evidence-settings)
 - **654.** Memory estimate of a class and predicate lookup. The estimated plan for an ASK joining two graph unions now applies initial bindings before sizing its scans and join. On a fixture with unrelated quads, the bound and inlined forms have the same largest estimated table and similar charged execution peaks. [Query guide](querying/README.md#planning-and-execution)
 - **1094.** The gate's JUnit check accepts a reused Rust test pass when its receipt names the source run and the original manifest and report verify. Missing or changed source evidence fails the receipt check. [DEVELOPMENT](DEVELOPMENT.md#batch-gate)

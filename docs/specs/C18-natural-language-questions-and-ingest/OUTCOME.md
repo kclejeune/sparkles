@@ -1942,7 +1942,7 @@ record](../../benchmarks/2026-11-03-ask-effort-paid.json) holds the runs.
 
 These phases belong to [ROADMAP](../../ROADMAP.md) item 462, the agent platform workstream, whose primary spec is [C33](../C33-agent-platform-controls/README.md). Each phase gets its own numbered item when it is ready to start.
 
-**An `ask` MCP tool.** Expose the server's checked, self-repairing NL-to-SPARQL pipeline as an MCP tool. MCP reaches Ask only through the `ask_graph` prompt, so thin hosts and small models must reimplement it. It depends on items 263 and 318. Roadmap item 488 holds this phase.
+**An `ask` MCP tool.** The server now exposes its checked, self-repairing question-to-SPARQL pipeline as the `ask` MCP tool, as recorded in [An `ask` MCP tool (item 488)](#an-ask-mcp-tool-item-488).
 
 **End-to-end MCP agent evaluation harness.** Score agent tasks on trajectory and answer across tool descriptions and models. Ask-only evals miss tool-description regressions. It depends on item 6.
 
@@ -2169,3 +2169,37 @@ Playwright suites cover the turn, its folds and actions, follow-ups, history and
 format 1 record, Stop, clarification, the drawer on Browse with the keyboard alone, and
 the phone sheet. Server tests cover threads, format 1 round trips, refusal of a newer or
 damaged history, and readers with fewer grants than the asker and with masking.
+
+## An `ask` MCP tool (item 488)
+
+Delivered on 2026-11-26. The MCP server now exposes the checked, self-repairing Ask
+pipeline through the `ask` tool in `crates/sparkles-server/src/mcp/ask.rs`.
+
+- **Discovery, profiles and schema.** The tool belongs to the `explore` profile alongside
+  `why_empty` and `share_query`, carries `readOnlyHint: true` and `openWorldHint: true`,
+  and appears in `tools/list` only while the server has model providers configured and at
+  least one visible dataset enables asking. `list_datasets` marks those datasets with
+  `ask: true`. `sparkles mcp` also accepts `--model-config` and `--model-secret` for local
+  stdio sessions and refuses them when bridging through `--url`.
+- **Execution and controls.** Every call executes over an internal read-only `McpServer`
+  so `--tools ask` and narrowed profiles still run grounding, entity linking, query
+  checking and execution internally while keeping dataset patterns, query memory budgets,
+  caller grants, branch views, graph visibility and `reviewedOnly` filtering intact.
+  The tool accepts the standard Ask parameters including `dataset`, `branch`, `at`,
+  `atCommit`, `reasoning`, `mode`, `run`, `summary`, `maxRows`, `context`,
+  `clarification`, `query`, `tryHarder`, repair switches, `about`, `reviewPolicy` and
+  `matchingPolicy`, and returns structured output with `outcome`, `mode`, `result`,
+  `summary`, `clarify`, `claims`, `resolution`, `attempts`, `notes` and `usage`.
+- **Overrides, deadlines and budgets.** Optional `provider` and `model` overrides require
+  the `serverModels` grant or dataset admin access, must name a configured provider and
+  allowed model, and preserve `send` and `sendByProvider` row-egress rules. Each call
+  bounds its deadline by the tighter of the MCP request deadline and the dataset's
+  `deadlineSecs`, honors MCP cancellation, enforces `maxTokens` within the dataset's
+  per-request cap, enforces daily dataset and principal token budgets before calling a
+  model, and records usage, recent asks and history alongside `POST /{ds}/ask`.
+- **Tests.** Offline tests in `crates/sparkles-server/src/mcp/ask_tests.rs` drive mock
+  providers to verify dynamic discovery, JSON schemas, `list_datasets` flags, profile and
+  `--tools ask` gating, self-repair, citation filtering, preview and `send: "schema"`
+  modes, `tryHarder`, clarification and `unanswerable` outcomes, caller grants, graph
+  visibility, branch isolation, `reviewedOnly`, `provider`/`model` override permissions,
+  cancellation, deadlines and daily token budgets.
