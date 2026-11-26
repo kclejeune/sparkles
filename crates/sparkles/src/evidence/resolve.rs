@@ -142,6 +142,31 @@ impl Resolution {
             .record(key, main.store(), logical.store(), access.as_ref(), request)
     }
 
+    /// The shared preparation context backing this resolution's 64 MiB allowance.
+    pub(crate) fn preparation(&self) -> &sparkles_core::access::Preparation {
+        self.resolver.preparation()
+    }
+
+    /// Verify a record reference without cloning its IRI or returning a [`VerifiedRecord`].
+    pub(crate) fn verify_record(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        iri: &NamedNode,
+        kinds: &[RecordKind],
+    ) -> Result<()> {
+        self.resolver.verify_record(
+            key,
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            iri,
+            kinds,
+        )
+    }
+
     /// Resolve the caller's read access for `logical` (`main` or one of its listed
     /// branches) by its current branch name.
     pub(crate) fn logical_access(

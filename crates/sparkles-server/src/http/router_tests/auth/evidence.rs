@@ -1196,7 +1196,7 @@ async fn proposals_selecting_existing_records_verify_over_http() {
     );
     assert_eq!(non_json.json()["code"], "span-mismatch");
 
-    // Existing metadata-only revision -> 422 evidence-unavailable.
+    // Existing metadata-only revision -> 422 evidence-unavailable, matching missing byte for byte.
     let meta_only = propose(
         &s,
         &b("evw"),
@@ -1221,6 +1221,54 @@ async fn proposals_selecting_existing_records_verify_over_http() {
         meta_only.text()
     );
     assert_eq!(meta_only.json()["code"], "evidence-unavailable");
+    let missing_meta = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [{
+                "key": "s-meta",
+                "occurrenceKey": "s-meta",
+                "structured": {
+                    "revision": {"iri": missing_iri},
+                    "pointer": "/score",
+                    "method": norm,
+                    "valueDigest": sha("1.000")
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        scrub(&meta_only, &rev_meta),
+        scrub(&missing_meta, missing_iri)
+    );
+
+    // Malformed RFC 6901 pointer against an existing JSON revision -> 400 invalid-proposal
+    // (never 422 span-mismatch).
+    let bad_ptr = propose(
+        &s,
+        &b("evw"),
+        &serde_json::json!({
+            "references": [{
+                "key": "s-bad-ptr",
+                "occurrenceKey": "s-bad-ptr",
+                "structured": {
+                    "revision": {"iri": rev_json},
+                    "pointer": "/bad~2",
+                    "method": norm,
+                    "valueDigest": sha("1.000")
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        bad_ptr.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_ptr.text()
+    );
+    assert_eq!(bad_ptr.json()["code"], "invalid-proposal");
 
     // Unsupported normalization method -> 422 incomplete-evidence.
     let unsupported = propose(

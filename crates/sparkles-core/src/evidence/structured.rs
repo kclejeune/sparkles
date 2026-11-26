@@ -91,7 +91,7 @@ pub(super) fn select_json_lexical_utf8_batch_optional<'a>(
         ),
     )?;
     let trie = pointer_trie(pointers, &mut memory, control)?;
-    validate_json(source, control)?;
+    validate_json(source, &mut memory, control)?;
     let bytes = source.as_bytes();
     let mut position = whitespace(bytes, 0, control)?;
     let mut matched = Some(0);
@@ -469,7 +469,12 @@ std::thread_local! {
     pub(super) static JSON_REVISION_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn validate_json(source: &str, control: &Control) -> Result<()> {
+/// Bounded scratch allocated by `serde_json::Deserializer::ignore_value` up to
+/// `nesting::MAX_ELEMENTS` (one byte per open container, rounded up for Vec growth)
+/// plus fixed parser overhead.
+const VALIDATE_SCRATCH_BYTES: usize = nesting::MAX_ELEMENTS.next_power_of_two() * 2 + 2048;
+
+fn validate_json(source: &str, memory: &mut Memory, control: &Control) -> Result<()> {
     #[cfg(test)]
     JSON_REVISION_VALIDATIONS.with(|count| count.set(count.get() + 1));
     let mut nesting = nesting::Scanner::new(nesting::Syntax::Json, nesting::MAX_ELEMENTS);
@@ -479,6 +484,7 @@ fn validate_json(source: &str, control: &Control) -> Result<()> {
             Error::invalid("span-mismatch: JSON reference exceeds the nesting bound")
         })?;
     }
+    memory.add(VALIDATE_SCRATCH_BYTES)?;
     let mut reader = ControlledRead {
         bytes: source.as_bytes(),
         until_check: 0,
@@ -489,6 +495,7 @@ fn validate_json(source: &str, control: &Control) -> Result<()> {
         let mut parser = serde_json::Deserializer::from_reader(&mut reader);
         serde::de::IgnoredAny::deserialize(&mut parser).and_then(|_| parser.end())
     };
+    memory.remove(VALIDATE_SCRATCH_BYTES);
     if let Some(error) = reader.failure {
         return Err(error);
     }
@@ -857,5 +864,29 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn tight_budget_refuses_grammar_validation_scratch_before_parsing() {
+        let deep = format!(
+            "{}0{}",
+            "[".repeat(nesting::MAX_ELEMENTS),
+            "]".repeat(nesting::MAX_ELEMENTS)
+        );
+        // Admits the source, output slots, and one-node root pointer trie,
+        // leaving less than VALIDATE_SCRATCH_BYTES for serde_json grammar scratch.
+        let tight_limit = deep.len() + 1024;
+        assert!(matches!(
+            select_json_lexical_utf8_batch_optional(&deep, &[""], tight_limit, &Control::none()),
+            Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                ..
+            }))
+        ));
+        // Adding room for grammar scratch + traversal frames succeeds.
+        let enough = deep.len() + VALIDATE_SCRATCH_BYTES + 1024 * 1024;
+        let out = select_json_lexical_utf8_batch_optional(&deep, &[""], enough, &Control::none())
+            .unwrap();
+        assert_eq!(out[0].as_ref().unwrap().utf8, deep);
     }
 }

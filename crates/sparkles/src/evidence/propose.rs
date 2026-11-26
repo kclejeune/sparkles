@@ -23,19 +23,21 @@
 //! passed, which every published proposal runs, and a retry with the same idempotency
 //! key acquires the same hold again.
 
-use super::resolve::{ProposedPassage, ProposedStructured, Reference, Resolution, unavailable};
+use super::resolve::{
+    MAX_REFERENCES, ProposedPassage, ProposedStructured, Resolution, unavailable,
+};
 use crate::access::GraphAccess;
 use crate::managed::{ManagedError, ManagedErrorKind, OwnerKind};
 use crate::task::Control;
 use crate::{Catalog, Dataset, Error, Result};
 use oxrdf::{NamedNode, Term};
-use sparkles_core::evidence::resolve::RecordRequest;
 use sparkles_core::evidence::write::{
     self, ExistingRecord, Plan, ProposalOptions, ProtectedGraph, Reads, Stamp,
 };
 use sparkles_core::evidence::{
-    EvidenceInput, EvidenceRefTarget, JSON_LEXICAL_UTF8_V1, JSON_LEXICAL_UTF8_VERSION, RecordKind,
-    RecordRef, RenditionContent, ResolutionRequirement, Settings, Sha256Digest,
+    EvidenceInput, EvidenceRefInput, EvidenceRefTarget, JSON_LEXICAL_UTF8_V1,
+    JSON_LEXICAL_UTF8_VERSION, PassageInput, RecordKind, RecordRef, RenditionContent,
+    RenditionInput, ResolutionRequirement, Settings, Sha256Digest, StoredFactRef,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -359,256 +361,386 @@ fn verify_requirements(
     if requirements.is_empty() {
         return Ok(());
     }
-    fn resolve_ref<'a>(plan: &'a Plan, r: &'a RecordRef) -> Option<&'a NamedNode> {
-        match r {
-            RecordRef::Local(k) => plan
-                .records
-                .iter()
-                .find(|rec| rec.key == k.as_str())
-                .map(|rec| &rec.iri),
-            RecordRef::Existing(iri) => Some(iri),
-        }
-    }
-    let resolve = |r| resolve_ref(plan, r);
-    let mut refs: Vec<(String, Reference)> = Vec::new();
-    let mut passage_groups: Vec<(NamedNode, Vec<ProposedPassage<'_>>)> = Vec::new();
-    let mut passage_group_idx: BTreeMap<NamedNode, usize> = BTreeMap::new();
-    let mut queued_passages: BTreeSet<&str> = BTreeSet::new();
-    let mut passage_refs: Vec<(&str, &NamedNode, &NamedNode, &NamedNode)> = Vec::new();
-    let mut structured_groups: Vec<(NamedNode, Vec<ProposedStructured<'_>>)> = Vec::new();
-    let mut structured_group_idx: BTreeMap<NamedNode, usize> = BTreeMap::new();
-    let mut local_checks: Vec<Result<()>> = Vec::new();
-    for requirement in requirements {
-        match requirement {
-            ResolutionRequirement::ExistingRecord {
-                record,
-                expected_kinds,
-            } => {
-                // every use is resolved with its own kinds, and record IRIs never stand
-                // for the batch keys of other references
-                refs.push((
-                    record.as_str().to_string(),
-                    Reference::Record(RecordRequest {
-                        iri: record.clone(),
-                        kinds: expected_kinds.clone(),
-                        content_digest: None,
-                    }),
-                ));
-            }
-            ResolutionRequirement::StoredFact { reference_key } => {
-                let fact = input
-                    .references
-                    .iter()
-                    .find(|r| r.key.as_str() == reference_key)
-                    .and_then(|r| match &r.target {
-                        EvidenceRefTarget::StoredFact(f) => Some(f.clone()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| Error::invalid(format!("{reference_key}: no stored fact")))?;
-                refs.push((reference_key.clone(), Reference::StoredFact(fact)));
-            }
-            ResolutionRequirement::PassageIdentity { passage_key } => {
-                let passage = input
-                    .passages
-                    .iter()
-                    .find(|p| p.key.as_str() == passage_key)
-                    .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
-                match &passage.rendition {
-                    RecordRef::Local(rendition) => {
-                        let rendition = input
-                            .renditions
-                            .iter()
-                            .find(|r| r.key.as_str() == rendition.as_str())
-                            .ok_or_else(|| {
-                                Error::invalid(format!("{passage_key}: no rendition"))
-                            })?;
-                        if resolve(&rendition.revision) != resolve(&passage.revision) {
-                            local_checks.push(Err(Error::invalid(format!(
-                                "{passage_key}: the passage and its rendition name different revisions"
-                            ))));
-                        }
-                    }
-                    RecordRef::Existing(rendition) => {
-                        if queued_passages.insert(passage.key.as_str()) {
-                            let revision = resolve(&passage.revision).ok_or_else(|| {
-                                Error::invalid(format!("{passage_key}: no revision"))
-                            })?;
-                            let idx =
-                                *passage_group_idx
-                                    .entry(rendition.clone())
-                                    .or_insert_with(|| {
-                                        let i = passage_groups.len();
-                                        passage_groups.push((rendition.clone(), Vec::new()));
-                                        i
-                                    });
-                            passage_groups[idx].1.push(ProposedPassage {
-                                key: passage.key.as_str(),
-                                revision,
-                                start: passage.start,
-                                end: passage.end,
-                                text_digest: passage.text_digest,
-                                quote: passage.quote.as_deref(),
-                            });
-                        }
-                    }
-                }
-            }
-            ResolutionRequirement::RetainedPassage { passage_key } => {
-                let passage = input
-                    .passages
-                    .iter()
-                    .find(|p| p.key.as_str() == passage_key)
-                    .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
-                match &passage.rendition {
-                    RecordRef::Local(k) => {
-                        let local_text = input.renditions.iter().any(|r| {
-                            r.key.as_str() == k.as_str()
-                                && matches!(r.content, RenditionContent::NormalizedText(_))
-                        });
-                        if !local_text {
-                            local_checks.push(Err(unavailable(passage_key)));
-                        }
-                    }
-                    RecordRef::Existing(rendition) => {
-                        if queued_passages.insert(passage.key.as_str()) {
-                            let revision = resolve(&passage.revision).ok_or_else(|| {
-                                Error::invalid(format!("{passage_key}: no revision"))
-                            })?;
-                            let idx =
-                                *passage_group_idx
-                                    .entry(rendition.clone())
-                                    .or_insert_with(|| {
-                                        let i = passage_groups.len();
-                                        passage_groups.push((rendition.clone(), Vec::new()));
-                                        i
-                                    });
-                            passage_groups[idx].1.push(ProposedPassage {
-                                key: passage.key.as_str(),
-                                revision,
-                                start: passage.start,
-                                end: passage.end,
-                                text_digest: passage.text_digest,
-                                quote: passage.quote.as_deref(),
-                            });
-                        }
-                    }
-                }
-            }
-            ResolutionRequirement::PassageReferenceIdentity { reference_key } => {
-                let reference = input
-                    .references
-                    .iter()
-                    .find(|r| r.key.as_str() == reference_key)
-                    .ok_or_else(|| Error::invalid(format!("{reference_key}: no reference")))?;
-                let EvidenceRefTarget::Passage {
-                    revision,
-                    rendition,
-                    passage,
-                } = &reference.target
-                else {
-                    return Err(Error::invalid(format!("{reference_key}: no passage")));
-                };
-                match passage {
-                    RecordRef::Local(p_key) => {
-                        let local_passage = input
-                            .passages
-                            .iter()
-                            .find(|p| p.key.as_str() == p_key.as_str())
-                            .ok_or_else(|| {
-                                Error::invalid(format!("{reference_key}: no passage"))
-                            })?;
-                        if resolve(revision) != resolve(&local_passage.revision)
-                            || resolve(rendition) != resolve(&local_passage.rendition)
-                        {
-                            local_checks.push(Err(Error::invalid(format!(
-                                "{reference_key}: the reference names another revision or rendition than its passage"
-                            ))));
-                        }
-                    }
-                    RecordRef::Existing(p_iri) => {
-                        let expected_rev = resolve(revision).ok_or_else(|| {
-                            Error::invalid(format!("{reference_key}: no revision"))
-                        })?;
-                        let expected_rend = resolve(rendition).ok_or_else(|| {
-                            Error::invalid(format!("{reference_key}: no rendition"))
-                        })?;
-                        passage_refs.push((
-                            reference.key.as_str(),
-                            p_iri,
-                            expected_rev,
-                            expected_rend,
-                        ));
-                    }
-                }
-            }
-            ResolutionRequirement::StructuredValue { reference_key } => {
-                let reference = input
-                    .references
-                    .iter()
-                    .find(|r| r.key.as_str() == reference_key)
-                    .ok_or_else(|| Error::invalid(format!("{reference_key}: no reference")))?;
-                let EvidenceRefTarget::Structured {
-                    revision,
-                    pointer,
-                    method,
-                    value_digest,
-                } = &reference.target
-                else {
-                    return Err(Error::invalid(format!(
-                        "{reference_key}: no structured reference"
-                    )));
-                };
-                if method.method.as_str() != JSON_LEXICAL_UTF8_V1
-                    || method.version.as_str() != JSON_LEXICAL_UTF8_VERSION
-                {
-                    local_checks.push(Err(managed(
-                        ManagedErrorKind::IncompleteEvidence,
-                        format!(
-                            "{reference_key}: structured normalization method <{}> version `{}` is not supported by this build, so nothing was written",
-                            method.method.as_str(),
-                            method.version.as_str()
-                        ),
-                    )));
-                    continue;
-                }
-                match revision {
-                    RecordRef::Local(_) => {
-                        // A local retained revision was already verified by `prepare_input`;
-                        // a local metadata-only revision carries no retained bytes.
-                        local_checks.push(Err(unavailable(reference_key)));
-                    }
-                    RecordRef::Existing(rev_iri) => {
-                        let idx =
-                            *structured_group_idx
-                                .entry(rev_iri.clone())
-                                .or_insert_with(|| {
-                                    let i = structured_groups.len();
-                                    structured_groups.push((rev_iri.clone(), Vec::new()));
-                                    i
-                                });
-                        structured_groups[idx].1.push(ProposedStructured {
-                            key: reference.key.as_str(),
-                            pointer: pointer.as_str(),
-                            value_digest: *value_digest,
-                        });
-                    }
-                }
-            }
-        }
-    }
     let mut resolution = Resolution::new(control.clone())?;
+    let admit = |e: Error| match e {
+        Error::BudgetExceeded(_) => managed(
+            ManagedErrorKind::IncompleteEvidence,
+            "proposal requirements exceeded the resolution memory limit",
+        ),
+        e => e,
+    };
+    enum GenericReq<'a> {
+        Record(&'a NamedNode, &'a [RecordKind]),
+        Fact(&'a str, &'a StoredFactRef),
+    }
+    let mut generic_count = 0usize;
+    let mut generic_reqs: Vec<GenericReq<'_>> = Vec::new();
+    let mut passage_groups: Vec<(&NamedNode, Vec<ProposedPassage<'_>>)> = Vec::new();
+    let mut passage_refs: Vec<(&str, &NamedNode, &NamedNode, &NamedNode)> = Vec::new();
+    let mut structured_groups: Vec<(&NamedNode, Vec<ProposedStructured<'_>>)> = Vec::new();
+    let mut local_checks: Vec<Result<()>> = Vec::new();
+    let mut req_hold = resolution.preparation().reserve(0).map_err(admit)?;
+    {
+        // Build O(log N) lookup and grouping maps once upfront, charged under the
+        // shared preparation allowance, and drop them before running content verifiers.
+        let mut index_hold = resolution.preparation().reserve(0).map_err(admit)?;
+        let mut records_by_key: BTreeMap<&str, &NamedNode> = BTreeMap::new();
+        index_hold
+            .grow_by((plan.records.len() as u64).saturating_mul(64))
+            .map_err(admit)?;
+        for rec in &plan.records {
+            control.check()?;
+            records_by_key.insert(rec.key.as_str(), &rec.iri);
+        }
+        let mut renditions_by_key: BTreeMap<&str, &RenditionInput> = BTreeMap::new();
+        index_hold
+            .grow_by((input.renditions.len() as u64).saturating_mul(64))
+            .map_err(admit)?;
+        for r in &input.renditions {
+            control.check()?;
+            renditions_by_key.insert(r.key.as_str(), r);
+        }
+        let mut passages_by_key: BTreeMap<&str, &PassageInput> = BTreeMap::new();
+        index_hold
+            .grow_by((input.passages.len() as u64).saturating_mul(64))
+            .map_err(admit)?;
+        for p in &input.passages {
+            control.check()?;
+            passages_by_key.insert(p.key.as_str(), p);
+        }
+        let mut references_by_key: BTreeMap<&str, &EvidenceRefInput> = BTreeMap::new();
+        index_hold
+            .grow_by((input.references.len() as u64).saturating_mul(64))
+            .map_err(admit)?;
+        for r in &input.references {
+            control.check()?;
+            references_by_key.insert(r.key.as_str(), r);
+        }
+        fn resolve_ref<'a>(
+            records: &BTreeMap<&str, &'a NamedNode>,
+            r: &'a RecordRef,
+        ) -> Option<&'a NamedNode> {
+            match r {
+                RecordRef::Local(k) => records.get(k.as_str()).copied(),
+                RecordRef::Existing(iri) => Some(iri),
+            }
+        }
+        let resolve = |r| resolve_ref(&records_by_key, r);
+        let mut seen_records: BTreeSet<(&NamedNode, u32)> = BTreeSet::new();
+        let mut passage_group_idx: BTreeMap<&NamedNode, usize> = BTreeMap::new();
+        let mut queued_passages: BTreeSet<&str> = BTreeSet::new();
+        let mut structured_group_idx: BTreeMap<&NamedNode, usize> = BTreeMap::new();
+        for requirement in requirements {
+            control.check()?;
+            match requirement {
+                ResolutionRequirement::ExistingRecord {
+                    record,
+                    expected_kinds,
+                } => {
+                    generic_count += 1;
+                    if generic_count > MAX_REFERENCES {
+                        return Err(Error::invalid(format!(
+                            "a resolution names at most {MAX_REFERENCES} references"
+                        )));
+                    }
+                    let kinds_mask = expected_kinds.iter().fold(0u32, |mask, kind| {
+                        let bit = match kind {
+                            RecordKind::SourceRevision => 0,
+                            RecordKind::Rendition => 1,
+                            RecordKind::Passage => 2,
+                            RecordKind::EvidenceRef => 3,
+                            RecordKind::Claim => 4,
+                            RecordKind::EvidenceLink => 5,
+                            RecordKind::Assessment => 6,
+                            RecordKind::Note => 7,
+                            RecordKind::Decision => 8,
+                            RecordKind::Task => 9,
+                            RecordKind::ReviewDecision => 10,
+                            RecordKind::IdentityProposal => 11,
+                            RecordKind::AcceptanceSupport => 12,
+                            RecordKind::Withdrawal => 13,
+                            RecordKind::Projection => 14,
+                            RecordKind::ResolutionMap => 15,
+                        };
+                        mask | (1u32 << bit)
+                    });
+                    // Deduplicate identical `(record, expected_kinds)` probes while
+                    // preserving every distinct kind constraint on the same IRI.
+                    if seen_records.insert((record, kinds_mask)) {
+                        index_hold.grow_by(64).map_err(admit)?;
+                        req_hold
+                            .grow_by(std::mem::size_of::<GenericReq<'_>>() as u64 * 2)
+                            .map_err(admit)?;
+                        generic_reqs.push(GenericReq::Record(record, expected_kinds.as_slice()));
+                    }
+                }
+                ResolutionRequirement::StoredFact { reference_key } => {
+                    generic_count += 1;
+                    if generic_count > MAX_REFERENCES {
+                        return Err(Error::invalid(format!(
+                            "a resolution names at most {MAX_REFERENCES} references"
+                        )));
+                    }
+                    let fact = references_by_key
+                        .get(reference_key.as_str())
+                        .and_then(|r| match &r.target {
+                            EvidenceRefTarget::StoredFact(f) => Some(f),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            Error::invalid(format!("{reference_key}: no stored fact"))
+                        })?;
+                    req_hold
+                        .grow_by(std::mem::size_of::<GenericReq<'_>>() as u64 * 2)
+                        .map_err(admit)?;
+                    generic_reqs.push(GenericReq::Fact(reference_key.as_str(), fact));
+                }
+                ResolutionRequirement::PassageIdentity { passage_key } => {
+                    let passage = passages_by_key
+                        .get(passage_key.as_str())
+                        .copied()
+                        .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
+                    match &passage.rendition {
+                        RecordRef::Local(rendition) => {
+                            let rendition = renditions_by_key
+                                .get(rendition.as_str())
+                                .copied()
+                                .ok_or_else(|| {
+                                    Error::invalid(format!("{passage_key}: no rendition"))
+                                })?;
+                            if resolve(&rendition.revision) != resolve(&passage.revision) {
+                                req_hold.grow_by(128).map_err(admit)?;
+                                local_checks.push(Err(Error::invalid(format!(
+                                    "{passage_key}: the passage and its rendition name different revisions"
+                                ))));
+                            }
+                        }
+                        RecordRef::Existing(rendition) => {
+                            if queued_passages.insert(passage.key.as_str()) {
+                                index_hold.grow_by(64).map_err(admit)?;
+                                let revision = resolve(&passage.revision).ok_or_else(|| {
+                                    Error::invalid(format!("{passage_key}: no revision"))
+                                })?;
+                                let idx = match passage_group_idx.entry(rendition) {
+                                    std::collections::btree_map::Entry::Occupied(e) => *e.get(),
+                                    std::collections::btree_map::Entry::Vacant(e) => {
+                                        index_hold.grow_by(64).map_err(admit)?;
+                                        req_hold.grow_by(64).map_err(admit)?;
+                                        let i = passage_groups.len();
+                                        passage_groups.push((rendition, Vec::new()));
+                                        *e.insert(i)
+                                    }
+                                };
+                                req_hold
+                                    .grow_by(std::mem::size_of::<ProposedPassage<'_>>() as u64 * 2)
+                                    .map_err(admit)?;
+                                passage_groups[idx].1.push(ProposedPassage {
+                                    key: passage.key.as_str(),
+                                    revision,
+                                    start: passage.start,
+                                    end: passage.end,
+                                    text_digest: passage.text_digest,
+                                    quote: passage.quote.as_deref(),
+                                });
+                            }
+                        }
+                    }
+                }
+                ResolutionRequirement::RetainedPassage { passage_key } => {
+                    let passage = passages_by_key
+                        .get(passage_key.as_str())
+                        .copied()
+                        .ok_or_else(|| Error::invalid(format!("{passage_key}: no passage")))?;
+                    match &passage.rendition {
+                        RecordRef::Local(k) => {
+                            let local_text = renditions_by_key.get(k.as_str()).is_some_and(|r| {
+                                matches!(r.content, RenditionContent::NormalizedText(_))
+                            });
+                            if !local_text {
+                                req_hold.grow_by(128).map_err(admit)?;
+                                local_checks.push(Err(unavailable(passage_key)));
+                            }
+                        }
+                        RecordRef::Existing(rendition) => {
+                            if queued_passages.insert(passage.key.as_str()) {
+                                index_hold.grow_by(64).map_err(admit)?;
+                                let revision = resolve(&passage.revision).ok_or_else(|| {
+                                    Error::invalid(format!("{passage_key}: no revision"))
+                                })?;
+                                let idx = match passage_group_idx.entry(rendition) {
+                                    std::collections::btree_map::Entry::Occupied(e) => *e.get(),
+                                    std::collections::btree_map::Entry::Vacant(e) => {
+                                        index_hold.grow_by(64).map_err(admit)?;
+                                        req_hold.grow_by(64).map_err(admit)?;
+                                        let i = passage_groups.len();
+                                        passage_groups.push((rendition, Vec::new()));
+                                        *e.insert(i)
+                                    }
+                                };
+                                req_hold
+                                    .grow_by(std::mem::size_of::<ProposedPassage<'_>>() as u64 * 2)
+                                    .map_err(admit)?;
+                                passage_groups[idx].1.push(ProposedPassage {
+                                    key: passage.key.as_str(),
+                                    revision,
+                                    start: passage.start,
+                                    end: passage.end,
+                                    text_digest: passage.text_digest,
+                                    quote: passage.quote.as_deref(),
+                                });
+                            }
+                        }
+                    }
+                }
+                ResolutionRequirement::PassageReferenceIdentity { reference_key } => {
+                    let reference = references_by_key
+                        .get(reference_key.as_str())
+                        .copied()
+                        .ok_or_else(|| Error::invalid(format!("{reference_key}: no reference")))?;
+                    let EvidenceRefTarget::Passage {
+                        revision,
+                        rendition,
+                        passage,
+                    } = &reference.target
+                    else {
+                        return Err(Error::invalid(format!("{reference_key}: no passage")));
+                    };
+                    match passage {
+                        RecordRef::Local(p_key) => {
+                            let local_passage = passages_by_key
+                                .get(p_key.as_str())
+                                .copied()
+                                .ok_or_else(|| {
+                                    Error::invalid(format!("{reference_key}: no passage"))
+                                })?;
+                            if resolve(revision) != resolve(&local_passage.revision)
+                                || resolve(rendition) != resolve(&local_passage.rendition)
+                            {
+                                req_hold.grow_by(128).map_err(admit)?;
+                                local_checks.push(Err(Error::invalid(format!(
+                                    "{reference_key}: the reference names another revision or rendition than its passage"
+                                ))));
+                            }
+                        }
+                        RecordRef::Existing(p_iri) => {
+                            let expected_rev = resolve(revision).ok_or_else(|| {
+                                Error::invalid(format!("{reference_key}: no revision"))
+                            })?;
+                            let expected_rend = resolve(rendition).ok_or_else(|| {
+                                Error::invalid(format!("{reference_key}: no rendition"))
+                            })?;
+                            req_hold.grow_by(64).map_err(admit)?;
+                            passage_refs.push((
+                                reference.key.as_str(),
+                                p_iri,
+                                expected_rev,
+                                expected_rend,
+                            ));
+                        }
+                    }
+                }
+                ResolutionRequirement::StructuredValue { reference_key } => {
+                    let reference = references_by_key
+                        .get(reference_key.as_str())
+                        .copied()
+                        .ok_or_else(|| Error::invalid(format!("{reference_key}: no reference")))?;
+                    let EvidenceRefTarget::Structured {
+                        revision,
+                        pointer,
+                        method,
+                        value_digest,
+                    } = &reference.target
+                    else {
+                        return Err(Error::invalid(format!(
+                            "{reference_key}: no structured reference"
+                        )));
+                    };
+                    if method.method.as_str() != JSON_LEXICAL_UTF8_V1
+                        || method.version.as_str() != JSON_LEXICAL_UTF8_VERSION
+                    {
+                        req_hold.grow_by(256).map_err(admit)?;
+                        local_checks.push(Err(managed(
+                            ManagedErrorKind::IncompleteEvidence,
+                            format!(
+                                "{reference_key}: structured normalization method <{}> version `{}` is not supported by this build, so nothing was written",
+                                method.method.as_str(),
+                                method.version.as_str()
+                            ),
+                        )));
+                        continue;
+                    }
+                    match revision {
+                        RecordRef::Local(_) => {
+                            // A local retained revision was already verified by `prepare_input`;
+                            // a local metadata-only revision carries no retained bytes.
+                            req_hold.grow_by(128).map_err(admit)?;
+                            local_checks.push(Err(unavailable(reference_key)));
+                        }
+                        RecordRef::Existing(rev_iri) => {
+                            let idx = match structured_group_idx.entry(rev_iri) {
+                                std::collections::btree_map::Entry::Occupied(e) => *e.get(),
+                                std::collections::btree_map::Entry::Vacant(e) => {
+                                    index_hold.grow_by(64).map_err(admit)?;
+                                    req_hold.grow_by(64).map_err(admit)?;
+                                    let i = structured_groups.len();
+                                    structured_groups.push((rev_iri, Vec::new()));
+                                    *e.insert(i)
+                                }
+                            };
+                            req_hold
+                                .grow_by(std::mem::size_of::<ProposedStructured<'_>>() as u64 * 2)
+                                .map_err(admit)?;
+                            structured_groups[idx].1.push(ProposedStructured {
+                                key: reference.key.as_str(),
+                                pointer: pointer.as_str(),
+                                value_digest: *value_digest,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Resolve every ExistingRecord and StoredFact first so missing or unauthorized
     // records always answer identically as `evidence-unavailable` before any content
-    // or identity comparison runs.
-    if !refs.is_empty() {
-        resolution.all(catalog, main, logical, &refs, read)?;
+    // or identity comparison runs, without retaining a discarded `Vec<Verified>`.
+    let mut record_access: Option<Option<Arc<GraphAccess>>> = None;
+    for req in &generic_reqs {
+        control.check()?;
+        match req {
+            GenericReq::Fact(key, fact) => {
+                let _ = match catalog {
+                    Some(catalog) if fact.dataset != main.dataset_id() => {
+                        resolution.stored_fact(key, catalog, fact, &mut *read)?
+                    }
+                    _ => resolution.stored_fact_in(key, main, fact, &mut *read)?,
+                };
+            }
+            GenericReq::Record(iri, kinds) => {
+                let granted = match &record_access {
+                    Some(access) => access.clone(),
+                    None => {
+                        let access = resolution.logical_access(main, logical, read)?;
+                        record_access = Some(access.clone());
+                        access
+                    }
+                };
+                resolution.verify_record(iri.as_str(), main, logical, granted, iri, kinds)?;
+            }
+        }
     }
+    drop(generic_reqs);
     for check in local_checks {
+        control.check()?;
         check?;
     }
     if !(passage_groups.is_empty() && passage_refs.is_empty() && structured_groups.is_empty()) {
-        let access = resolution.logical_access(main, logical, read)?;
+        let access = match record_access {
+            Some(access) => access,
+            None => resolution.logical_access(main, logical, read)?,
+        };
         for (rendition, passages) in &passage_groups {
+            control.check()?;
             resolution.verify_proposed_passages(
                 main,
                 logical,
@@ -620,7 +752,9 @@ fn verify_requirements(
         let mut checked_passage_refs: BTreeSet<(&NamedNode, &NamedNode, &NamedNode)> =
             BTreeSet::new();
         for (ref_key, passage, expected_rev, expected_rend) in passage_refs {
+            control.check()?;
             if checked_passage_refs.insert((passage, expected_rev, expected_rend)) {
+                req_hold.grow_by(64).map_err(admit)?;
                 resolution.verify_passage_reference(
                     ref_key,
                     main,
@@ -633,6 +767,7 @@ fn verify_requirements(
             }
         }
         for (revision, structured) in &structured_groups {
+            control.check()?;
             resolution.verify_structured_references(
                 main,
                 logical,
@@ -642,6 +777,7 @@ fn verify_requirements(
             )?;
         }
     }
+    drop(req_hold);
     Ok(())
 }
 

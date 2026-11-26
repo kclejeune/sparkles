@@ -941,4 +941,944 @@ fn existing_record_verifiers_enforce_memory_cancellation_and_triple_masks() {
         )),
         "evidence-unavailable"
     );
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&hide_pred(&format!("{EV}contentDigest"))),
+            &rev,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/payload",
+                value_digest: val_digest,
+            }],
+        )),
+        "evidence-unavailable"
+    );
+}
+
+#[test]
+fn masked_missing_and_metadata_only_selections_have_full_body_parity() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:parity");
+    let rev1 = iri("urn:rev:1");
+    let rev2 = iri("urn:rev:2");
+    let rev_meta = iri("urn:rev:meta");
+    let rend1 = iri("urn:rend:1");
+    let rend2 = iri("urn:rend:2");
+    let rend_meta = iri("urn:rend:meta");
+    let pass1 = iri("urn:pass:1");
+    let sel1 = iri("urn:pass:1#sel");
+    let missing_iri = iri("urn:missing:target");
+
+    let json_bytes = r#"{"k":"v"}"#;
+    let json_digest = Sha256Digest::of_bytes(json_bytes.as_bytes(), &Control::none()).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json_bytes.as_bytes());
+    let val_digest = Sha256Digest::of_bytes(b"\"v\"", &Control::none()).unwrap();
+    let text = "hello world";
+    let span_digest = Sha256Digest::of_bytes(b"world", &Control::none()).unwrap();
+
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+    let auth = |sub: &NamedNode, kind: RecordKind| {
+        vec![
+            q(sub, RDF_TYPE, iri(kind_iri(kind)).into()),
+            q(sub, &format!("{EV}availabilityReceipt"), op.clone().into()),
+            q(
+                sub,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+        ]
+    };
+
+    let mut quads = vec![
+        q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+        q(
+            &op,
+            &format!("{EV}datasetId"),
+            lit(&s.dataset_id().to_string()),
+        ),
+        q(
+            &op,
+            &format!("{EV}branchId"),
+            lit(&s.branch_id().to_string()),
+        ),
+        q(&op, &format!("{EV}commit"), int_lit(1)),
+        q(
+            &op,
+            &format!("{EV}graphProtection"),
+            lit(&nonce.to_string()),
+        ),
+    ];
+    quads.extend(auth(&rev1, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev1,
+        &format!("{EV}contentDigest"),
+        lit(&json_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev1,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(b64, iri(XSD_BASE64_BINARY))),
+    ));
+    quads.extend(auth(&rev2, RecordKind::SourceRevision));
+    quads.extend(auth(&rev_meta, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_meta,
+        &format!("{EV}contentDigest"),
+        lit(&json_digest.to_string()),
+    ));
+
+    quads.extend(auth(&rend1, RecordKind::Rendition));
+    quads.push(q(&rend1, PROV_WAS_DERIVED_FROM, rev1.clone().into()));
+    quads.push(q(&rend1, &format!("{EV}normalizedText"), lit(text)));
+
+    quads.extend(auth(&rend2, RecordKind::Rendition));
+    quads.push(q(&rend2, PROV_WAS_DERIVED_FROM, rev2.clone().into()));
+    quads.push(q(&rend2, &format!("{EV}normalizedText"), lit(text)));
+
+    quads.extend(auth(&rend_meta, RecordKind::Rendition));
+    quads.push(q(&rend_meta, PROV_WAS_DERIVED_FROM, rev1.clone().into()));
+
+    quads.extend(auth(&pass1, RecordKind::Passage));
+    quads.push(q(
+        &pass1,
+        &format!("{EV}sourceRevision"),
+        rev1.clone().into(),
+    ));
+    quads.push(q(&pass1, &format!("{OA}hasSource"), rend1.clone().into()));
+    quads.push(q(&pass1, &format!("{OA}hasSelector"), sel1.clone().into()));
+    quads.push(q(&sel1, &format!("{OA}start"), int_lit(6)));
+    quads.push(q(&sel1, &format!("{OA}end"), int_lit(11)));
+    quads.push(q(
+        &pass1,
+        &format!("{EV}textDigest"),
+        lit(&span_digest.to_string()),
+    ));
+    insert_managed_quads(&s, quads);
+
+    let hide_pred = |pred: &str| {
+        let protection = Protection {
+            name: "hidden".into(),
+            predicates: Some(vec![pred.to_string()]),
+            classes: None,
+            subclasses: false,
+            graphs: None,
+            pattern: None,
+            prefixes: Default::default(),
+            hide_inferences: false,
+        };
+        let rules = TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(protection),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Default::default(),
+            limits: Default::default(),
+        };
+        Arc::new(GraphAccess::with_triples(Graphs::All, Graphs::All, rules))
+    };
+
+    // 1. Proposed passage of existing rendition: absent vs metadata-only vs masked
+    //    ev:normalizedText / prov:wasDerivedFrom — both matching and MISMATCHED revisions.
+    let prop_err = |target: &NamedNode, rev: &NamedNode, access: Arc<GraphAccess>| {
+        let mut r = resolver();
+        let e = r
+            .verify_proposed_passages(
+                &s,
+                &s,
+                Some(&access),
+                target,
+                &[ProposedPassage {
+                    key: "p1",
+                    revision: rev,
+                    start: 6,
+                    end: 11,
+                    text_digest: span_digest,
+                    quote: Some("world"),
+                }],
+            )
+            .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string().replace(target.as_str(), "TARGET"),
+        )
+    };
+    let absent_rend = prop_err(&missing_iri, &rev2, all());
+    assert_eq!(absent_rend.0, "evidence-unavailable");
+    assert_eq!(absent_rend.1, "evidence reference `TARGET` is unavailable");
+    for rev in [&rev1, &rev2] {
+        assert_eq!(prop_err(&rend_meta, rev, all()), absent_rend);
+        assert_eq!(
+            prop_err(&rend1, rev, hide_pred(&format!("{EV}normalizedText"))),
+            absent_rend
+        );
+        assert_eq!(
+            prop_err(&rend1, rev, hide_pred(PROV_WAS_DERIVED_FROM)),
+            absent_rend
+        );
+    }
+
+    // 2. Reference to existing passage: absent vs every required link/selector masked —
+    //    both with matching and MISMATCHED revision/rendition.
+    let pass_ref_err = |target: &NamedNode,
+                        exp_rev: &NamedNode,
+                        exp_rend: &NamedNode,
+                        access: Arc<GraphAccess>| {
+        let mut r = resolver();
+        let e = r
+            .verify_passage_reference("ref1", &s, &s, Some(&access), target, exp_rev, exp_rend)
+            .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string().replace(target.as_str(), "TARGET"),
+        )
+    };
+    let absent_pass = pass_ref_err(&missing_iri, &rev2, &rend2, all());
+    assert_eq!(absent_pass.0, "evidence-unavailable");
+    assert_eq!(absent_pass.1, "evidence reference `TARGET` is unavailable");
+    for (exp_rev, exp_rend) in [(&rev1, &rend1), (&rev2, &rend1), (&rev1, &rend2)] {
+        for pred in [
+            format!("{OA}hasSource"),
+            format!("{OA}hasSelector"),
+            format!("{OA}start"),
+            format!("{OA}end"),
+            format!("{EV}textDigest"),
+            format!("{EV}sourceRevision"),
+            format!("{EV}normalizedText"),
+            PROV_WAS_DERIVED_FROM.to_string(),
+        ] {
+            assert_eq!(
+                pass_ref_err(&pass1, exp_rev, exp_rend, hide_pred(&pred)),
+                absent_pass,
+                "masking {pred} must match absent passage"
+            );
+        }
+    }
+
+    // 3. Structured reference: absent vs metadata-only vs masked retainedBytes/contentDigest.
+    let struct_err = |target: &NamedNode, access: Arc<GraphAccess>| {
+        let mut r = resolver();
+        let e = r
+            .verify_structured_references(
+                &s,
+                &s,
+                Some(&access),
+                target,
+                &[ProposedStructured {
+                    key: "s1",
+                    pointer: "/k",
+                    value_digest: val_digest,
+                }],
+            )
+            .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string().replace(target.as_str(), "TARGET"),
+        )
+    };
+    let absent_rev = struct_err(&missing_iri, all());
+    assert_eq!(absent_rev.0, "evidence-unavailable");
+    assert_eq!(absent_rev.1, "evidence reference `TARGET` is unavailable");
+    assert_eq!(struct_err(&rev_meta, all()), absent_rev);
+    assert_eq!(
+        struct_err(&rev1, hide_pred(&format!("{EV}retainedBytes"))),
+        absent_rev
+    );
+    assert_eq!(
+        struct_err(&rev1, hide_pred(&format!("{EV}contentDigest"))),
+        absent_rev
+    );
+}
+
+#[test]
+fn structured_content_digest_pointer_validation_and_ambiguous_conflicts() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:conflicts");
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+    let auth = |sub: &NamedNode, kind: RecordKind| {
+        vec![
+            q(sub, RDF_TYPE, iri(kind_iri(kind)).into()),
+            q(sub, &format!("{EV}availabilityReceipt"), op.clone().into()),
+            q(
+                sub,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+        ]
+    };
+
+    let json = r#"{"a":1}"#;
+    let good_digest = Sha256Digest::of_bytes(json.as_bytes(), &Control::none()).unwrap();
+    let wrong_digest = Sha256Digest::of_bytes(b"different", &Control::none()).unwrap();
+    let val_digest = Sha256Digest::of_bytes(b"1", &Control::none()).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let text = "hello";
+    let text_digest = Sha256Digest::of_bytes(b"he", &Control::none()).unwrap();
+
+    let rev_ok = iri("urn:rev:ok");
+    let rev_no_digest = iri("urn:rev:no-digest");
+    let rev_wrong_digest = iri("urn:rev:wrong-digest");
+    let rev_bad_b64 = iri("urn:rev:bad-b64");
+    let rev_multi_bytes = iri("urn:rev:multi-bytes");
+    let rend_multi_rev = iri("urn:rend:multi-rev");
+    let rend_multi_text = iri("urn:rend:multi-text");
+    let rend_ok = iri("urn:rend:ok");
+    let pass_multi_rev = iri("urn:pass:multi-rev");
+    let pass_multi_src = iri("urn:pass:multi-src");
+    let sel_mr = iri("urn:pass:multi-rev#sel");
+    let sel_ms = iri("urn:pass:multi-src#sel");
+
+    let mut quads = vec![
+        q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+        q(
+            &op,
+            &format!("{EV}datasetId"),
+            lit(&s.dataset_id().to_string()),
+        ),
+        q(
+            &op,
+            &format!("{EV}branchId"),
+            lit(&s.branch_id().to_string()),
+        ),
+        q(&op, &format!("{EV}commit"), int_lit(1)),
+        q(
+            &op,
+            &format!("{EV}graphProtection"),
+            lit(&nonce.to_string()),
+        ),
+    ];
+    // rev_ok: valid JSON revision
+    quads.extend(auth(&rev_ok, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_ok,
+        &format!("{EV}contentDigest"),
+        lit(&good_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev_ok,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(&b64, iri(XSD_BASE64_BINARY))),
+    ));
+    // rev_no_digest: retainedBytes without ev:contentDigest
+    quads.extend(auth(&rev_no_digest, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_no_digest,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(&b64, iri(XSD_BASE64_BINARY))),
+    ));
+    // rev_wrong_digest: present ev:contentDigest disagrees with retainedBytes
+    quads.extend(auth(&rev_wrong_digest, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_wrong_digest,
+        &format!("{EV}contentDigest"),
+        lit(&wrong_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev_wrong_digest,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(&b64, iri(XSD_BASE64_BINARY))),
+    ));
+    // rev_bad_b64: corrupted base64
+    quads.extend(auth(&rev_bad_b64, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_bad_b64,
+        &format!("{EV}contentDigest"),
+        lit(&good_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev_bad_b64,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(
+            "!!!not-base64!!!",
+            iri(XSD_BASE64_BINARY),
+        )),
+    ));
+    // rev_multi_bytes: multiple ev:retainedBytes
+    quads.extend(auth(&rev_multi_bytes, RecordKind::SourceRevision));
+    quads.push(q(
+        &rev_multi_bytes,
+        &format!("{EV}contentDigest"),
+        lit(&good_digest.to_string()),
+    ));
+    quads.push(q(
+        &rev_multi_bytes,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal(&b64, iri(XSD_BASE64_BINARY))),
+    ));
+    quads.push(q(
+        &rev_multi_bytes,
+        &format!("{EV}retainedBytes"),
+        Term::Literal(Literal::new_typed_literal("e30=", iri(XSD_BASE64_BINARY))),
+    ));
+    // rend_ok
+    quads.extend(auth(&rend_ok, RecordKind::Rendition));
+    quads.push(q(&rend_ok, PROV_WAS_DERIVED_FROM, rev_ok.clone().into()));
+    quads.push(q(&rend_ok, &format!("{EV}normalizedText"), lit(text)));
+    // rend_multi_rev: multiple prov:wasDerivedFrom
+    quads.extend(auth(&rend_multi_rev, RecordKind::Rendition));
+    quads.push(q(
+        &rend_multi_rev,
+        PROV_WAS_DERIVED_FROM,
+        rev_ok.clone().into(),
+    ));
+    quads.push(q(
+        &rend_multi_rev,
+        PROV_WAS_DERIVED_FROM,
+        rev_no_digest.clone().into(),
+    ));
+    quads.push(q(
+        &rend_multi_rev,
+        &format!("{EV}normalizedText"),
+        lit(text),
+    ));
+    // rend_multi_text: multiple ev:normalizedText
+    quads.extend(auth(&rend_multi_text, RecordKind::Rendition));
+    quads.push(q(
+        &rend_multi_text,
+        PROV_WAS_DERIVED_FROM,
+        rev_ok.clone().into(),
+    ));
+    quads.push(q(
+        &rend_multi_text,
+        &format!("{EV}normalizedText"),
+        lit(text),
+    ));
+    quads.push(q(
+        &rend_multi_text,
+        &format!("{EV}normalizedText"),
+        lit("other"),
+    ));
+    // pass_multi_rev: multiple ev:sourceRevision
+    quads.extend(auth(&pass_multi_rev, RecordKind::Passage));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{EV}sourceRevision"),
+        rev_ok.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{EV}sourceRevision"),
+        rev_no_digest.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{OA}hasSource"),
+        rend_ok.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{OA}hasSelector"),
+        sel_mr.clone().into(),
+    ));
+    quads.push(q(&sel_mr, &format!("{OA}start"), int_lit(0)));
+    quads.push(q(&sel_mr, &format!("{OA}end"), int_lit(2)));
+    quads.push(q(
+        &pass_multi_rev,
+        &format!("{EV}textDigest"),
+        lit(&text_digest.to_string()),
+    ));
+    // pass_multi_src: multiple oa:hasSource
+    quads.extend(auth(&pass_multi_src, RecordKind::Passage));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{EV}sourceRevision"),
+        rev_ok.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{OA}hasSource"),
+        rend_ok.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{OA}hasSource"),
+        rend_multi_rev.clone().into(),
+    ));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{OA}hasSelector"),
+        sel_ms.clone().into(),
+    ));
+    quads.push(q(&sel_ms, &format!("{OA}start"), int_lit(0)));
+    quads.push(q(&sel_ms, &format!("{OA}end"), int_lit(2)));
+    quads.push(q(
+        &pass_multi_src,
+        &format!("{EV}textDigest"),
+        lit(&text_digest.to_string()),
+    ));
+    insert_managed_quads(&s, quads);
+
+    let mut r = resolver();
+    // Missing ev:contentDigest -> evidence-unavailable.
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev_no_digest,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/a",
+                value_digest: val_digest,
+            }],
+        )),
+        "evidence-unavailable"
+    );
+    // Mismatched ev:contentDigest -> span-mismatch (per C25).
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev_wrong_digest,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/a",
+                value_digest: val_digest,
+            }],
+        )),
+        "span-mismatch"
+    );
+    // Corrupted base64 -> immutable-record-conflict.
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev_bad_b64,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/a",
+                value_digest: val_digest,
+            }],
+        )),
+        "immutable-record-conflict"
+    );
+    // Malformed RFC 6901 pointers in direct Rust API -> Error::Invalid (not span-mismatch).
+    for bad_ptr in ["/bad~2", "/bad~", "no-leading-slash"] {
+        let err = r
+            .verify_structured_references(
+                &s,
+                &s,
+                Some(&all()),
+                &rev_ok,
+                &[ProposedStructured {
+                    key: "s1",
+                    pointer: bad_ptr,
+                    value_digest: val_digest,
+                }],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(_)),
+            "pointer {bad_ptr:?} should return Error::Invalid, got {err:?}"
+        );
+    }
+    // Multi-valued predicates -> immutable-record-conflict.
+    assert_eq!(
+        code(r.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev_multi_bytes,
+            &[ProposedStructured {
+                key: "s1",
+                pointer: "/a",
+                value_digest: val_digest,
+            }],
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(
+        code(r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&all()),
+            &rend_multi_rev,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev_ok,
+                start: 0,
+                end: 2,
+                text_digest,
+                quote: Some("he"),
+            }],
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(
+        code(r.verify_proposed_passages(
+            &s,
+            &s,
+            Some(&all()),
+            &rend_multi_text,
+            &[ProposedPassage {
+                key: "p1",
+                revision: &rev_ok,
+                start: 0,
+                end: 2,
+                text_digest,
+                quote: Some("he"),
+            }],
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(
+        code(r.verify_passage_reference(
+            "ref1",
+            &s,
+            &s,
+            Some(&all()),
+            &pass_multi_rev,
+            &rev_ok,
+            &rend_ok,
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(
+        code(r.verify_passage_reference(
+            "ref2",
+            &s,
+            &s,
+            Some(&all()),
+            &pass_multi_src,
+            &rev_ok,
+            &rend_ok,
+        )),
+        "immutable-record-conflict"
+    );
+}
+
+#[test]
+fn compacted_large_json_revision_tight_grammar_scratch_and_midstream_cancel() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:large");
+    let rev_large = iri("urn:rev:large");
+    let rev_deep = iri("urn:rev:deep");
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+    // 13 MiB JSON revision (~17.33 MiB base64) compacted into Vocab: previously
+    // exceeded the 64 MiB allowance when with_typed_literal held ~3x base64 workspace
+    // across JSON selection.
+    let big_json = format!(
+        r#"{{"tail":"ok","blob":"{}"}}"#,
+        "a".repeat(13 * 1024 * 1024)
+    );
+    let big_digest = Sha256Digest::of_bytes(big_json.as_bytes(), &Control::none()).unwrap();
+    let big_b64 = base64::engine::general_purpose::STANDARD.encode(big_json.as_bytes());
+    let ok_digest = Sha256Digest::of_bytes(b"\"ok\"", &Control::none()).unwrap();
+
+    // Deeply nested JSON (1024 levels) for grammar scratch budget admission test.
+    let deep_json = format!(
+        "{}0{}",
+        "[".repeat(crate::nesting::MAX_ELEMENTS),
+        "]".repeat(crate::nesting::MAX_ELEMENTS)
+    );
+    let deep_digest = Sha256Digest::of_bytes(deep_json.as_bytes(), &Control::none()).unwrap();
+    let deep_b64 = base64::engine::general_purpose::STANDARD.encode(deep_json.as_bytes());
+
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_large,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_large,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_large,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_large,
+                &format!("{EV}contentDigest"),
+                lit(&big_digest.to_string()),
+            ),
+            q(
+                &rev_large,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(big_b64, iri(XSD_BASE64_BINARY))),
+            ),
+            q(
+                &rev_deep,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_deep,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_deep,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev_deep,
+                &format!("{EV}contentDigest"),
+                lit(&deep_digest.to_string()),
+            ),
+            q(
+                &rev_deep,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(deep_b64, iri(XSD_BASE64_BINARY))),
+            ),
+        ],
+    );
+    s.compact().unwrap();
+
+    // 13 MiB compacted JSON revision succeeds under the standard 64 MiB allowance.
+    let mut r = resolver();
+    r.verify_structured_references(
+        &s,
+        &s,
+        Some(&all()),
+        &rev_large,
+        &[ProposedStructured {
+            key: "big",
+            pointer: "/tail",
+            value_digest: ok_digest,
+        }],
+    )
+    .unwrap();
+
+    // Mid-stream cancellation during chunked base64 decoding propagates Error::Cancelled.
+    let mut c = Resolver::new(Control::none(), MEMORY_BYTES).unwrap();
+    CANCEL_BASE64_AT_CHUNK.with(|at| at.set(Some(2)));
+    let cancelled = c.verify_structured_references(
+        &s,
+        &s,
+        Some(&all()),
+        &rev_large,
+        &[ProposedStructured {
+            key: "big",
+            pointer: "/tail",
+            value_digest: ok_digest,
+        }],
+    );
+    CANCEL_BASE64_AT_CHUNK.with(|at| at.set(None));
+    assert!(matches!(cancelled, Err(Error::Cancelled)));
+
+    // Tight preparation budget that admits vocabulary reconstruction + decoded bytes +
+    // root pointer trie, then refuses grammar validation scratch with incomplete-evidence.
+    let mut probe = resolver();
+    probe
+        .record(
+            "probe",
+            &s,
+            &s,
+            Some(&all()),
+            &RecordRequest {
+                iri: rev_deep.clone(),
+                kinds: vec![RecordKind::SourceRevision],
+                content_digest: None,
+            },
+        )
+        .unwrap();
+    let baseline = probe.preparation().inner_used();
+    // Leave room for the ~2.7 KiB settled vocab workspace + ~2 KiB decoded JSON +
+    // ~1 KiB overhead, which is enough to decode and build the 1-node trie, while
+    // leaving less than VALIDATE_SCRATCH_BYTES (4 KiB) after workspace drops?
+    // Actually after workspace drops, only decoded (~2 KiB) stays live, so setting
+    // limit = baseline + 5600 admits vocab (~2.7 KiB + 256) + decoded (~2 KiB) = ~5 KiB
+    // during decode, and after workspace drops leaves ~3.5 KiB < VALIDATE_SCRATCH_BYTES!
+    let tight_limit = baseline + 5600;
+    let mut tight = Resolver::new(Control::none(), tight_limit).unwrap();
+    assert_eq!(
+        code(tight.verify_structured_references(
+            &s,
+            &s,
+            Some(&all()),
+            &rev_deep,
+            &[ProposedStructured {
+                key: "deep",
+                pointer: "",
+                value_digest: deep_digest,
+            }],
+        )),
+        "incomplete-evidence"
+    );
+}
+
+#[test]
+fn repeated_passage_references_scan_rendition_text_once() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:scan");
+    let rev = iri("urn:rev:scan");
+    let rend = iri("urn:rend:scan");
+    let pass = iri("urn:pass:scan");
+    let sel = iri("urn:pass:scan#sel");
+    let text = "abcdefgh".repeat(4096);
+    let tail = &text[text.len() - 4..];
+    let span_digest = Sha256Digest::of_bytes(tail.as_bytes(), &Control::none()).unwrap();
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &rev,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(&rev, &format!("{EV}availabilityReceipt"), op.clone().into()),
+            q(
+                &rev,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, RDF_TYPE, iri(kind_iri(RecordKind::Rendition)).into()),
+            q(
+                &rend,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, PROV_WAS_DERIVED_FROM, rev.clone().into()),
+            q(&rend, &format!("{EV}normalizedText"), lit(&text)),
+            q(&pass, RDF_TYPE, iri(kind_iri(RecordKind::Passage)).into()),
+            q(
+                &pass,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &pass,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&pass, &format!("{EV}sourceRevision"), rev.clone().into()),
+            q(&pass, &format!("{OA}hasSource"), rend.clone().into()),
+            q(&pass, &format!("{OA}hasSelector"), sel.clone().into()),
+            q(
+                &sel,
+                &format!("{OA}start"),
+                int_lit((text.len() - 4) as u64),
+            ),
+            q(&sel, &format!("{OA}end"), int_lit(text.len() as u64)),
+            q(
+                &pass,
+                &format!("{EV}textDigest"),
+                lit(&span_digest.to_string()),
+            ),
+        ],
+    );
+
+    PASSAGE_TEXT_SCANS.with(|count| count.set(0));
+    let mut r = resolver();
+    for i in 0..5 {
+        r.record(
+            &format!("rec-{i}"),
+            &s,
+            &s,
+            Some(&all()),
+            &RecordRequest {
+                iri: pass.clone(),
+                kinds: vec![RecordKind::Passage],
+                content_digest: None,
+            },
+        )
+        .unwrap();
+        r.verify_passage_reference(
+            &format!("ref-{i}"),
+            &s,
+            &s,
+            Some(&all()),
+            &pass,
+            &rev,
+            &rend,
+        )
+        .unwrap();
+    }
+    assert_eq!(PASSAGE_TEXT_SCANS.with(std::cell::Cell::get), 1);
+
+    // Re-protecting the graph invalidates the cached passage on the same Resolver.
+    let settings = super::super::Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        ..Default::default()
+    };
+    let canonical = settings.canonical(&Control::none()).unwrap();
+    let entry = crate::managed::OwnerEntry::for_settings(
+        settings.profile,
+        settings.managed_graphs(),
+        canonical.bytes(),
+    );
+    let reg_rev = s
+        .detach_managed(OwnerKind::Evidence, "urn:ev:sources")
+        .unwrap()
+        .revision;
+    s.enable_managed_at(OwnerKind::Evidence, entry, canonical.bytes(), reg_rev)
+        .unwrap();
+    assert_eq!(
+        code(r.verify_passage_reference("ref-stale", &s, &s, Some(&all()), &pass, &rev, &rend)),
+        "origin-not-reproduced"
+    );
 }

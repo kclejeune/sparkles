@@ -1115,10 +1115,14 @@ impl Preparation {
     }
 
     /// The lexical form of a stored typed literal with `datatype`, borrowed for `each`
-    /// without decoding it as a term. Only the key's own bytes and the reconstruction
-    /// workspace are charged, so large retained bytes can be read within an allowance
-    /// that would not hold a decoded term of them. `None` for any other term or
-    /// datatype.
+    /// without decoding it as a term. Only non-inlined, non-`xsd:string` typed literals
+    /// stored in `Vocab` or `Delta` (such as `xsd:base64Binary`) are matched; inline
+    /// datatypes (`xsd:integer`, `xsd:double`, `xsd:boolean`, `xsd:decimal`,
+    /// `xsd:dateTime`, `xsd:date`), `xsd:string` (stored as a simple literal for
+    /// [`with_simple_literal`](Self::with_simple_literal)), and any other term or
+    /// datatype pass `None`. On `Vocab`, reconstruction growth is settled to the
+    /// reconstructed key capacity before `each` runs so large retained literals do not
+    /// over-charge the allowance.
     pub fn with_typed_literal<R>(
         &self,
         snap: &Snapshot,
@@ -1130,31 +1134,47 @@ impl Preparation {
         let mut each = Some(each);
         let mut call = |key: &[u8]| -> Result<R> {
             let each = each.take().expect("called once");
-            let _held = self.reserve((key.len() as u64).saturating_add(64))?;
             let lexical = match crate::id::TextKey::parse(key) {
                 Some(crate::id::TextKey::Typed(text, dt)) if dt == datatype => Some(text),
                 _ => None,
             };
             each(lexical)
         };
-        let mut workspace = self.reserve(0)?;
+        let workspace = std::cell::RefCell::new(self.reserve(0)?);
         let result = match id.tag() {
-            Tag::Vocab => snap.generation.vocab.get_with_controlled(
+            Tag::Vocab => snap.generation.vocab.get_with_controlled_capacity_checked(
                 id.payload(),
-                |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
+                |old, new| {
+                    workspace
+                        .borrow_mut()
+                        .grow_to((old as u64).saturating_add(new as u64).saturating_add(256))
+                },
+                |cap| {
+                    workspace
+                        .borrow_mut()
+                        .release_to((cap as u64).saturating_add(256));
+                    Ok(())
+                },
                 |phase| self.checkpoint(phase),
-                &mut call,
+                |key| call(key),
             )?,
             Tag::Delta => snap.generation.dvocab.with_prepared(self, |vocab| {
                 if id.payload() >= snap.dvocab_len {
                     return Ok(None);
                 }
-                Ok(vocab.get(id.payload()).map(&mut call))
+                vocab
+                    .get(id.payload())
+                    .map(|key| {
+                        let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+                        call(key)
+                    })
+                    .transpose()
             })?,
             _ => None,
         };
+        drop(workspace);
         let result = match result {
-            Some(result) => result?,
+            Some(result) => result,
             None => (each.take().expect("not called"))(None)?,
         };
         self.check()?;
