@@ -23,6 +23,7 @@ pub mod evidence;
 pub mod fmt;
 pub mod forms;
 pub mod gate;
+pub mod git;
 pub mod handles;
 pub mod jobs;
 mod lookup;
