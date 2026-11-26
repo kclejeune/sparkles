@@ -902,9 +902,8 @@ write access through the update endpoint. The HTTP routes and the Communities ta
 main only, and the tab tells a reader on another branch to switch to main. The metrics hold the
 figures of the runs and reviews since the server started. The byte bound's default
 allowances are unmeasured, and measuring them needs paid provider runs. Global Ask and
-memory integration are the first part of Phase 2 below, and automatic refresh remains
-Phase 3.
-[ROADMAP](../ROADMAP.md) item 12 tracks this work.
+memory integration are the first part of Phase 2 below, and automatic refresh is
+implemented in Phase 3 below.
 
 Phase 2 is partly implemented. Ask takes `mode` of `auto`, `local` or `global`. In
 `auto` mode a question that names an entity linked exactly stays local, and otherwise
@@ -944,10 +943,10 @@ Phase 3 is implemented. With `refresh.mode: "auto"`, a loop on the server looks 
 dataset once a second and follows the debounce of §5. For every enabled dataset with a
 build on `main`, the server attaches an internal F13 accumulator circuit
 (`graphrag-refresh`, F13 §3.6) over the projection's graphs and predicates, read through
-the settings' principal's `InternalAccess` view. Exact graph lists compile to per-graph
+the settings' principal's `InternalAccess` view. Exact graph lists of up to 16 distinct IRIs compile to per-graph
 patterns so commits to unrelated graphs are skipped by the circuit's footprint, while
-wildcard patterns filter named graphs and exclude the guarded namespace and any
-non-output evidence graphs under `reviewPolicy`. Because the refresh circuit uses only
+larger exact lists, wildcard patterns and `urn:x-arq:` IRIs filter physical named graphs
+and exclude the guarded namespace and any non-output evidence graphs under `reviewPolicy`. Because the refresh circuit uses only
 stateless operators, building or resetting it scans no existing quads. The views worker
 advances the accumulator incrementally on each commit, keeps counts bounded by its memory
 cap (64 MiB, or `--views-memory` when lower), and checkpoints its state under
@@ -962,9 +961,13 @@ stored community to a member, or when the accumulator cannot cover every commit 
 commit, a change-log gap, memory eviction, a circuit failure or data-dependent
 protections on the principal's view). When a build or refresh saves its state on `main`,
 the server discards the acted-on counts through that commit. Switching to manual refresh,
-disabling GraphRAG, deleting a dataset or replacing it on restore detaches the internal
-circuit, and changing settings or reloading access policies replaces it after collecting
-the old handle. Under `reviewPolicy`, uncounted ranges still route to the private check
+disabling GraphRAG, revoking the configured principal, renaming or deleting a dataset, or
+replacing it on restore detaches the internal circuit, and changing settings or reloading
+access policies replaces it after collecting the old handle. Attaching the internal
+circuit activates F13's commit-path change ring on datasets with automatic refresh; the
+prior ~4% commit-path cost measured on two-quad commits on atlas is accepted for now and
+tracked for a pinned forge measurement and cheaper copy under [ROADMAP](../ROADMAP.md)
+item 226. Under `reviewPolicy`, uncounted ranges still route to the private check
 of C25 so hidden evidence changes never surface as visible refresh triggers. Tests with
 stub providers cover the debounce, incremental insertions, deletions and replacements
 across multiple communities, entity joining, principal graph and predicate isolation,
