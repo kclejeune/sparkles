@@ -307,6 +307,27 @@ impl Node {
         own + self.children().iter().map(|c| c.bytes()).sum::<u64>()
     }
 
+    /// Whether this node and every child keep no operator state across passes.
+    pub fn is_stateless(&self) -> bool {
+        match &self.op {
+            Op::Bgp(_)
+            | Op::Filter(_)
+            | Op::Extend(_)
+            | Op::Project(_)
+            | Op::Union(_)
+            | Op::Values(_) => self.children().iter().all(|c| c.is_stateless()),
+            Op::Join(_)
+            | Op::Match(_)
+            | Op::Distinct(_)
+            | Op::Exists(_)
+            | Op::Group(_)
+            | Op::Recompute(_)
+            | Op::Template(_)
+            | Op::Path(_)
+            | Op::Window(_) => false,
+        }
+    }
+
     /// Free all operator state in this node and its children while keeping the compiled
     /// plan structure intact for a future build.
     pub fn clear(&mut self) {

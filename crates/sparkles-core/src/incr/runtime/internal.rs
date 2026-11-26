@@ -154,6 +154,14 @@ impl InternalCircuit {
             if self.commit() >= commit {
                 return true;
             }
+            if self
+                .cell
+                .state
+                .try_lock()
+                .is_some_and(|st| matches!(st.status, Status::Failed { .. }))
+            {
+                return false;
+            }
             let Some(rt) = self.rt.upgrade() else {
                 return false;
             };

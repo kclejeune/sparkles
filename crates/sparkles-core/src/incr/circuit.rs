@@ -1337,6 +1337,16 @@ impl Circuit {
         // the schema may have changed in changes no pass saw
         self.inferred = InferredFootprint::default();
         self.budget.shrink_state_to(0);
+        // An accumulator over stateless operators keeps neither result rows nor
+        // operator state, so building it needs no full scan of the store.
+        if !self.keep_result && self.prov.is_none() && self.root.is_stateless() {
+            control.check()?;
+            self.resolved = None;
+            self.applied = snap.commit;
+            self.snap = Some(snap);
+            self.last = PassStats::default();
+            return Ok(());
+        }
         let vis = Vis::new(self.access.as_ref(), &snap);
         let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
         let width = root.schema.len();

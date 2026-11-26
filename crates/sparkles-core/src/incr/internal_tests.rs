@@ -1006,3 +1006,60 @@ fn provenance_survives_a_restart_in_format_2() {
         );
     }
 }
+
+/// A stateless accumulator skips scanning existing quads on attach and reset while still
+/// counting every subsequent commit identically to the change feed.
+#[test]
+fn stateless_accumulator_build_scans_no_quads() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    for i in 0..2000 {
+        upd(&s, &format!("INSERT DATA {{ :p{i} :age {i} }}"));
+    }
+    let rt = runtime(&s, None);
+    let c = rt
+        .attach_internal(
+            &s,
+            InternalSpec::accumulator("stateless", FACTS, ["s"]).with_memory(16 << 10),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    assert_eq!(c.bytes(), 0, "stateless accumulator keeps no build state");
+    let start = c.commit();
+    for u in WORKLOAD {
+        upd(&s, u);
+    }
+    rt.round(&s);
+    assert_eq!(counts(&c, start), feed_counts(&s, start));
+}
+
+/// `InternalCircuit::wait` returns promptly when a circuit has failed instead of
+/// spinning until its timeout expires.
+#[test]
+fn wait_returns_promptly_when_circuit_failed() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s, None);
+    let c = rt
+        .attach_internal(
+            &s,
+            InternalSpec::rows("tiny", FACTS).with_memory(1024),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    let mut big = String::from("INSERT DATA { ");
+    for i in 0..200 {
+        big.push_str(&format!(":k{i} :p \"{}\" . ", "v".repeat(64)));
+    }
+    big.push('}');
+    upd(&s, &big);
+    rt.round(&s);
+    let head = s.snapshot().commit;
+    assert!(c.rows().is_err(), "circuit should have failed over-budget");
+    let started = std::time::Instant::now();
+    assert!(!c.wait(head, std::time::Duration::from_secs(10)));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "wait took {:?}",
+        started.elapsed()
+    );
+}
