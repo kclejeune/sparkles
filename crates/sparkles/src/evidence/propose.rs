@@ -24,13 +24,15 @@
 //! key acquires the same hold again.
 
 use super::resolve::{
-    MAX_REFERENCES, ProposedPassage, ProposedStructured, Resolution, unavailable,
+    MAX_REFERENCES, MEMORY_BYTES, ProposedPassage, ProposedStructured, Resolution,
+    SelectionRequirements, unavailable,
 };
 use crate::access::GraphAccess;
 use crate::managed::{ManagedError, ManagedErrorKind, OwnerKind};
 use crate::task::Control;
 use crate::{Catalog, Dataset, Error, Result};
 use oxrdf::{NamedNode, Term};
+use sparkles_core::access::{Preparation, Reservation};
 use sparkles_core::evidence::write::{
     self, ExistingRecord, Plan, ProposalOptions, ProtectedGraph, Reads, Stamp,
 };
@@ -39,6 +41,7 @@ use sparkles_core::evidence::{
     JSON_LEXICAL_UTF8_VERSION, PassageInput, RecordKind, RecordRef, RenditionContent,
     RenditionInput, ResolutionRequirement, Settings, Sha256Digest, StoredFactRef,
 };
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -344,6 +347,172 @@ fn replay(
     })
 }
 
+/// Conservative byte charge for inserting a new entry into a `BTreeMap`/`BTreeSet`.
+/// The first insertion allocates a full leaf node (up to 11 entries plus node metadata);
+/// subsequent insertions cover the entry and amortized node-split overhead.
+fn btree_insert_charge<K, V>(empty: bool) -> u64 {
+    const BTREE_NODE_KEYS: u64 = 11;
+    let entry = (std::mem::size_of::<K>() as u64)
+        .saturating_add(std::mem::size_of::<V>() as u64)
+        .saturating_add(16);
+    if empty {
+        BTREE_NODE_KEYS.saturating_mul(entry).saturating_add(128)
+    } else {
+        entry.saturating_mul(2).saturating_add(64)
+    }
+}
+
+/// Vector whose heap capacity is admitted under a [`Preparation`] before growth and
+/// released when dropped. Storage is declared before `held` so it drops first.
+struct AdmittedVec<T> {
+    values: Vec<T>,
+    held: Reservation,
+}
+
+impl<T> AdmittedVec<T> {
+    fn new(prep: &Preparation, admit: &impl Fn(Error) -> Error) -> Result<Self> {
+        Ok(Self {
+            values: Vec::new(),
+            held: prep.reserve(0).map_err(admit)?,
+        })
+    }
+
+    fn push(
+        &mut self,
+        prep: &Preparation,
+        value: T,
+        admit: &impl Fn(Error) -> Error,
+    ) -> Result<()> {
+        prep.check().map_err(admit)?;
+        if self.values.len() == self.values.capacity() {
+            let next_cap = self
+                .values
+                .capacity()
+                .checked_mul(2)
+                .map(|n| n.max(1))
+                .ok_or_else(|| admit(prep.exhausted()))?;
+            let bytes = next_cap
+                .checked_mul(std::mem::size_of::<T>())
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(|| admit(prep.exhausted()))?;
+            // Admit the replacement buffer while `self.held` still covers the old one,
+            // then drop the old buffer before releasing its reservation.
+            let mut new_held = prep.reserve(bytes).map_err(admit)?;
+            let mut next = Vec::new();
+            next.try_reserve_exact(next_cap)
+                .map_err(|_| admit(prep.exhausted()))?;
+            if std::mem::size_of::<T>() != 0 && next.capacity() > next_cap {
+                let extra = (next.capacity() - next_cap)
+                    .checked_mul(std::mem::size_of::<T>())
+                    .and_then(|n| u64::try_from(n).ok())
+                    .ok_or_else(|| admit(prep.exhausted()))?;
+                new_held.grow_by(extra).map_err(admit)?;
+            }
+            for item in self.values.drain(..) {
+                prep.check().map_err(admit)?;
+                next.push(item);
+            }
+            let old = std::mem::replace(&mut self.values, next);
+            drop(old);
+            self.held = new_held;
+        }
+        self.values.push(value);
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[T] {
+        &self.values
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.values
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+/// Set whose node allocations are admitted before insertion and released when dropped.
+/// Storage is declared before `held` so it drops first.
+struct AdmittedSet<T> {
+    values: BTreeSet<T>,
+    held: Reservation,
+}
+
+impl<T: Ord> AdmittedSet<T> {
+    fn new(prep: &Preparation, admit: &impl Fn(Error) -> Error) -> Result<Self> {
+        Ok(Self {
+            values: BTreeSet::new(),
+            held: prep.reserve(0).map_err(admit)?,
+        })
+    }
+
+    fn insert(&mut self, value: T, admit: &impl Fn(Error) -> Error) -> Result<bool> {
+        if self.values.contains(&value) {
+            return Ok(false);
+        }
+        self.held
+            .grow_by(btree_insert_charge::<T, ()>(self.values.is_empty()))
+            .map_err(admit)?;
+        self.values.insert(value);
+        Ok(true)
+    }
+}
+
+/// Map whose node allocations are admitted before insertion and released when dropped.
+/// Storage is declared before `held` so it drops first.
+struct AdmittedMap<K, V> {
+    values: BTreeMap<K, V>,
+    held: Reservation,
+}
+
+impl<K: Ord, V> AdmittedMap<K, V> {
+    fn new(prep: &Preparation, admit: &impl Fn(Error) -> Error) -> Result<Self> {
+        Ok(Self {
+            values: BTreeMap::new(),
+            held: prep.reserve(0).map_err(admit)?,
+        })
+    }
+
+    fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
+        self.values.get(key)
+    }
+
+    fn insert(&mut self, key: K, value: V, admit: &impl Fn(Error) -> Error) -> Result<Option<V>> {
+        if let Some(existing) = self.values.get_mut(&key) {
+            return Ok(Some(std::mem::replace(existing, value)));
+        }
+        self.held
+            .grow_by(btree_insert_charge::<K, V>(self.values.is_empty()))
+            .map_err(admit)?;
+        Ok(self.values.insert(key, value))
+    }
+
+    fn get_or_insert_with(
+        &mut self,
+        key: K,
+        make: impl FnOnce() -> Result<V>,
+        admit: &impl Fn(Error) -> Error,
+    ) -> Result<&mut V> {
+        if self.values.contains_key(&key) {
+            return Ok(self.values.get_mut(&key).expect("present key"));
+        }
+        self.held
+            .grow_by(btree_insert_charge::<K, V>(self.values.is_empty()))
+            .map_err(admit)?;
+        let value = make()?;
+        Ok(self.values.entry(key).or_insert(value))
+    }
+}
+
 /// Verify every requirement of a proposal under one shared [`Resolution`] (64 MiB
 /// preparation allowance, request deadline and cancellation) through the caller's read
 /// access before any source hold is acquired or commit is written.
@@ -358,10 +527,34 @@ fn verify_requirements(
     read: &mut dyn FnMut(&Dataset, &str) -> Option<Arc<GraphAccess>>,
     control: &Control,
 ) -> Result<()> {
+    verify_requirements_with_memory(
+        catalog,
+        main,
+        logical,
+        input,
+        plan,
+        requirements,
+        read,
+        control,
+        MEMORY_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_requirements_with_memory(
+    catalog: Option<&Catalog>,
+    main: &Dataset,
+    logical: &Dataset,
+    input: &EvidenceInput,
+    plan: &Plan,
+    requirements: &[ResolutionRequirement],
+    read: &mut dyn FnMut(&Dataset, &str) -> Option<Arc<GraphAccess>>,
+    control: &Control,
+    memory_bytes: u64,
+) -> Result<()> {
     if requirements.is_empty() {
         return Ok(());
     }
-    let mut resolution = Resolution::new(control.clone())?;
     let admit = |e: Error| match e {
         Error::BudgetExceeded(_) => managed(
             ManagedErrorKind::IncompleteEvidence,
@@ -369,55 +562,48 @@ fn verify_requirements(
         ),
         e => e,
     };
+    let mut resolution = Resolution::with_memory(control.clone(), memory_bytes).map_err(admit)?;
+    let prep = resolution.preparation().clone();
     enum GenericReq<'a> {
-        Record(&'a NamedNode, &'a [RecordKind]),
+        Record(&'a NamedNode, &'a [RecordKind], SelectionRequirements),
         Fact(&'a str, &'a StoredFactRef),
     }
     let mut generic_count = 0usize;
-    let mut generic_reqs: Vec<GenericReq<'_>> = Vec::new();
-    let mut passage_groups: Vec<(&NamedNode, Vec<ProposedPassage<'_>>)> = Vec::new();
-    let mut passage_refs: Vec<(&str, &NamedNode, &NamedNode, &NamedNode)> = Vec::new();
-    let mut structured_groups: Vec<(&NamedNode, Vec<ProposedStructured<'_>>)> = Vec::new();
-    let mut local_checks: Vec<Result<()>> = Vec::new();
-    let mut req_hold = resolution.preparation().reserve(0).map_err(admit)?;
+    let mut generic_reqs: AdmittedVec<GenericReq<'_>> = AdmittedVec::new(&prep, &admit)?;
+    let mut passage_groups: AdmittedVec<(&NamedNode, AdmittedVec<ProposedPassage<'_>>)> =
+        AdmittedVec::new(&prep, &admit)?;
+    let mut passage_refs: AdmittedVec<(&str, &NamedNode, &NamedNode, &NamedNode)> =
+        AdmittedVec::new(&prep, &admit)?;
+    let mut structured_groups: AdmittedVec<(&NamedNode, AdmittedVec<ProposedStructured<'_>>)> =
+        AdmittedVec::new(&prep, &admit)?;
     {
         // Build O(log N) lookup and grouping maps once upfront, charged under the
-        // shared preparation allowance, and drop them before running content verifiers.
-        let mut index_hold = resolution.preparation().reserve(0).map_err(admit)?;
-        let mut records_by_key: BTreeMap<&str, &NamedNode> = BTreeMap::new();
-        index_hold
-            .grow_by((plan.records.len() as u64).saturating_mul(64))
-            .map_err(admit)?;
+        // shared preparation allowance, and drop them before Phase 1 runs.
+        let mut records_by_key: AdmittedMap<&str, &NamedNode> = AdmittedMap::new(&prep, &admit)?;
         for rec in &plan.records {
             control.check()?;
-            records_by_key.insert(rec.key.as_str(), &rec.iri);
+            records_by_key.insert(rec.key.as_str(), &rec.iri, &admit)?;
         }
-        let mut renditions_by_key: BTreeMap<&str, &RenditionInput> = BTreeMap::new();
-        index_hold
-            .grow_by((input.renditions.len() as u64).saturating_mul(64))
-            .map_err(admit)?;
+        let mut renditions_by_key: AdmittedMap<&str, &RenditionInput> =
+            AdmittedMap::new(&prep, &admit)?;
         for r in &input.renditions {
             control.check()?;
-            renditions_by_key.insert(r.key.as_str(), r);
+            renditions_by_key.insert(r.key.as_str(), r, &admit)?;
         }
-        let mut passages_by_key: BTreeMap<&str, &PassageInput> = BTreeMap::new();
-        index_hold
-            .grow_by((input.passages.len() as u64).saturating_mul(64))
-            .map_err(admit)?;
+        let mut passages_by_key: AdmittedMap<&str, &PassageInput> =
+            AdmittedMap::new(&prep, &admit)?;
         for p in &input.passages {
             control.check()?;
-            passages_by_key.insert(p.key.as_str(), p);
+            passages_by_key.insert(p.key.as_str(), p, &admit)?;
         }
-        let mut references_by_key: BTreeMap<&str, &EvidenceRefInput> = BTreeMap::new();
-        index_hold
-            .grow_by((input.references.len() as u64).saturating_mul(64))
-            .map_err(admit)?;
+        let mut references_by_key: AdmittedMap<&str, &EvidenceRefInput> =
+            AdmittedMap::new(&prep, &admit)?;
         for r in &input.references {
             control.check()?;
-            references_by_key.insert(r.key.as_str(), r);
+            references_by_key.insert(r.key.as_str(), r, &admit)?;
         }
         fn resolve_ref<'a>(
-            records: &BTreeMap<&str, &'a NamedNode>,
+            records: &AdmittedMap<&str, &'a NamedNode>,
             r: &'a RecordRef,
         ) -> Option<&'a NamedNode> {
             match r {
@@ -426,10 +612,14 @@ fn verify_requirements(
             }
         }
         let resolve = |r| resolve_ref(&records_by_key, r);
-        let mut seen_records: BTreeSet<(&NamedNode, u32)> = BTreeSet::new();
-        let mut passage_group_idx: BTreeMap<&NamedNode, usize> = BTreeMap::new();
-        let mut queued_passages: BTreeSet<&str> = BTreeSet::new();
-        let mut structured_group_idx: BTreeMap<&NamedNode, usize> = BTreeMap::new();
+        let mut seen_records: AdmittedSet<(&NamedNode, u32)> = AdmittedSet::new(&prep, &admit)?;
+        let mut passage_group_idx: AdmittedMap<&NamedNode, usize> =
+            AdmittedMap::new(&prep, &admit)?;
+        let mut queued_passages: AdmittedSet<&str> = AdmittedSet::new(&prep, &admit)?;
+        let mut structured_group_idx: AdmittedMap<&NamedNode, usize> =
+            AdmittedMap::new(&prep, &admit)?;
+        let mut selection_needs: AdmittedMap<&NamedNode, SelectionRequirements> =
+            AdmittedMap::new(&prep, &admit)?;
         for requirement in requirements {
             control.check()?;
             match requirement {
@@ -466,12 +656,16 @@ fn verify_requirements(
                     });
                     // Deduplicate identical `(record, expected_kinds)` probes while
                     // preserving every distinct kind constraint on the same IRI.
-                    if seen_records.insert((record, kinds_mask)) {
-                        index_hold.grow_by(64).map_err(admit)?;
-                        req_hold
-                            .grow_by(std::mem::size_of::<GenericReq<'_>>() as u64 * 2)
-                            .map_err(admit)?;
-                        generic_reqs.push(GenericReq::Record(record, expected_kinds.as_slice()));
+                    if seen_records.insert((record, kinds_mask), &admit)? {
+                        generic_reqs.push(
+                            &prep,
+                            GenericReq::Record(
+                                record,
+                                expected_kinds.as_slice(),
+                                SelectionRequirements::default(),
+                            ),
+                            &admit,
+                        )?;
                     }
                 }
                 ResolutionRequirement::StoredFact { reference_key } => {
@@ -490,10 +684,11 @@ fn verify_requirements(
                         .ok_or_else(|| {
                             Error::invalid(format!("{reference_key}: no stored fact"))
                         })?;
-                    req_hold
-                        .grow_by(std::mem::size_of::<GenericReq<'_>>() as u64 * 2)
-                        .map_err(admit)?;
-                    generic_reqs.push(GenericReq::Fact(reference_key.as_str(), fact));
+                    generic_reqs.push(
+                        &prep,
+                        GenericReq::Fact(reference_key.as_str(), fact),
+                        &admit,
+                    )?;
                 }
                 ResolutionRequirement::PassageIdentity { passage_key } => {
                     let passage = passages_by_key
@@ -509,39 +704,45 @@ fn verify_requirements(
                                     Error::invalid(format!("{passage_key}: no rendition"))
                                 })?;
                             if resolve(&rendition.revision) != resolve(&passage.revision) {
-                                req_hold.grow_by(128).map_err(admit)?;
-                                local_checks.push(Err(Error::invalid(format!(
+                                return Err(Error::invalid(format!(
                                     "{passage_key}: the passage and its rendition name different revisions"
-                                ))));
+                                )));
                             }
                         }
                         RecordRef::Existing(rendition) => {
-                            if queued_passages.insert(passage.key.as_str()) {
-                                index_hold.grow_by(64).map_err(admit)?;
-                                let revision = resolve(&passage.revision).ok_or_else(|| {
-                                    Error::invalid(format!("{passage_key}: no revision"))
-                                })?;
-                                let idx = match passage_group_idx.entry(rendition) {
-                                    std::collections::btree_map::Entry::Occupied(e) => *e.get(),
-                                    std::collections::btree_map::Entry::Vacant(e) => {
-                                        index_hold.grow_by(64).map_err(admit)?;
-                                        req_hold.grow_by(64).map_err(admit)?;
+                            let revision = resolve(&passage.revision).ok_or_else(|| {
+                                Error::invalid(format!("{passage_key}: no revision"))
+                            })?;
+                            selection_needs
+                                .get_or_insert_with(
+                                    rendition,
+                                    || Ok(SelectionRequirements::default()),
+                                    &admit,
+                                )?
+                                .rendition_content = true;
+                            if queued_passages.insert(passage.key.as_str(), &admit)? {
+                                let idx = *passage_group_idx.get_or_insert_with(
+                                    rendition,
+                                    || {
                                         let i = passage_groups.len();
-                                        passage_groups.push((rendition, Vec::new()));
-                                        *e.insert(i)
-                                    }
-                                };
-                                req_hold
-                                    .grow_by(std::mem::size_of::<ProposedPassage<'_>>() as u64 * 2)
-                                    .map_err(admit)?;
-                                passage_groups[idx].1.push(ProposedPassage {
-                                    key: passage.key.as_str(),
-                                    revision,
-                                    start: passage.start,
-                                    end: passage.end,
-                                    text_digest: passage.text_digest,
-                                    quote: passage.quote.as_deref(),
-                                });
+                                        let group = AdmittedVec::new(&prep, &admit)?;
+                                        passage_groups.push(&prep, (rendition, group), &admit)?;
+                                        Ok(i)
+                                    },
+                                    &admit,
+                                )?;
+                                passage_groups.as_mut_slice()[idx].1.push(
+                                    &prep,
+                                    ProposedPassage {
+                                        key: passage.key.as_str(),
+                                        revision,
+                                        start: passage.start,
+                                        end: passage.end,
+                                        text_digest: passage.text_digest,
+                                        quote: passage.quote.as_deref(),
+                                    },
+                                    &admit,
+                                )?;
                             }
                         }
                     }
@@ -557,37 +758,43 @@ fn verify_requirements(
                                 matches!(r.content, RenditionContent::NormalizedText(_))
                             });
                             if !local_text {
-                                req_hold.grow_by(128).map_err(admit)?;
-                                local_checks.push(Err(unavailable(passage_key)));
+                                return Err(unavailable(passage_key));
                             }
                         }
                         RecordRef::Existing(rendition) => {
-                            if queued_passages.insert(passage.key.as_str()) {
-                                index_hold.grow_by(64).map_err(admit)?;
-                                let revision = resolve(&passage.revision).ok_or_else(|| {
-                                    Error::invalid(format!("{passage_key}: no revision"))
-                                })?;
-                                let idx = match passage_group_idx.entry(rendition) {
-                                    std::collections::btree_map::Entry::Occupied(e) => *e.get(),
-                                    std::collections::btree_map::Entry::Vacant(e) => {
-                                        index_hold.grow_by(64).map_err(admit)?;
-                                        req_hold.grow_by(64).map_err(admit)?;
+                            let revision = resolve(&passage.revision).ok_or_else(|| {
+                                Error::invalid(format!("{passage_key}: no revision"))
+                            })?;
+                            selection_needs
+                                .get_or_insert_with(
+                                    rendition,
+                                    || Ok(SelectionRequirements::default()),
+                                    &admit,
+                                )?
+                                .rendition_content = true;
+                            if queued_passages.insert(passage.key.as_str(), &admit)? {
+                                let idx = *passage_group_idx.get_or_insert_with(
+                                    rendition,
+                                    || {
                                         let i = passage_groups.len();
-                                        passage_groups.push((rendition, Vec::new()));
-                                        *e.insert(i)
-                                    }
-                                };
-                                req_hold
-                                    .grow_by(std::mem::size_of::<ProposedPassage<'_>>() as u64 * 2)
-                                    .map_err(admit)?;
-                                passage_groups[idx].1.push(ProposedPassage {
-                                    key: passage.key.as_str(),
-                                    revision,
-                                    start: passage.start,
-                                    end: passage.end,
-                                    text_digest: passage.text_digest,
-                                    quote: passage.quote.as_deref(),
-                                });
+                                        let group = AdmittedVec::new(&prep, &admit)?;
+                                        passage_groups.push(&prep, (rendition, group), &admit)?;
+                                        Ok(i)
+                                    },
+                                    &admit,
+                                )?;
+                                passage_groups.as_mut_slice()[idx].1.push(
+                                    &prep,
+                                    ProposedPassage {
+                                        key: passage.key.as_str(),
+                                        revision,
+                                        start: passage.start,
+                                        end: passage.end,
+                                        text_digest: passage.text_digest,
+                                        quote: passage.quote.as_deref(),
+                                    },
+                                    &admit,
+                                )?;
                             }
                         }
                     }
@@ -616,10 +823,9 @@ fn verify_requirements(
                             if resolve(revision) != resolve(&local_passage.revision)
                                 || resolve(rendition) != resolve(&local_passage.rendition)
                             {
-                                req_hold.grow_by(128).map_err(admit)?;
-                                local_checks.push(Err(Error::invalid(format!(
+                                return Err(Error::invalid(format!(
                                     "{reference_key}: the reference names another revision or rendition than its passage"
-                                ))));
+                                )));
                             }
                         }
                         RecordRef::Existing(p_iri) => {
@@ -629,13 +835,18 @@ fn verify_requirements(
                             let expected_rend = resolve(rendition).ok_or_else(|| {
                                 Error::invalid(format!("{reference_key}: no rendition"))
                             })?;
-                            req_hold.grow_by(64).map_err(admit)?;
-                            passage_refs.push((
-                                reference.key.as_str(),
-                                p_iri,
-                                expected_rev,
-                                expected_rend,
-                            ));
+                            selection_needs
+                                .get_or_insert_with(
+                                    p_iri,
+                                    || Ok(SelectionRequirements::default()),
+                                    &admit,
+                                )?
+                                .passage_lineage = true;
+                            passage_refs.push(
+                                &prep,
+                                (reference.key.as_str(), p_iri, expected_rev, expected_rend),
+                                &admit,
+                            )?;
                         }
                     }
                 }
@@ -658,54 +869,68 @@ fn verify_requirements(
                     if method.method.as_str() != JSON_LEXICAL_UTF8_V1
                         || method.version.as_str() != JSON_LEXICAL_UTF8_VERSION
                     {
-                        req_hold.grow_by(256).map_err(admit)?;
-                        local_checks.push(Err(managed(
+                        return Err(managed(
                             ManagedErrorKind::IncompleteEvidence,
                             format!(
                                 "{reference_key}: structured normalization method <{}> version `{}` is not supported by this build, so nothing was written",
                                 method.method.as_str(),
                                 method.version.as_str()
                             ),
-                        )));
-                        continue;
+                        ));
                     }
                     match revision {
                         RecordRef::Local(_) => {
                             // A local retained revision was already verified by `prepare_input`;
                             // a local metadata-only revision carries no retained bytes.
-                            req_hold.grow_by(128).map_err(admit)?;
-                            local_checks.push(Err(unavailable(reference_key)));
+                            return Err(unavailable(reference_key));
                         }
                         RecordRef::Existing(rev_iri) => {
-                            let idx = match structured_group_idx.entry(rev_iri) {
-                                std::collections::btree_map::Entry::Occupied(e) => *e.get(),
-                                std::collections::btree_map::Entry::Vacant(e) => {
-                                    index_hold.grow_by(64).map_err(admit)?;
-                                    req_hold.grow_by(64).map_err(admit)?;
+                            selection_needs
+                                .get_or_insert_with(
+                                    rev_iri,
+                                    || Ok(SelectionRequirements::default()),
+                                    &admit,
+                                )?
+                                .structured_content = true;
+                            let idx = *structured_group_idx.get_or_insert_with(
+                                rev_iri,
+                                || {
                                     let i = structured_groups.len();
-                                    structured_groups.push((rev_iri, Vec::new()));
-                                    *e.insert(i)
-                                }
-                            };
-                            req_hold
-                                .grow_by(std::mem::size_of::<ProposedStructured<'_>>() as u64 * 2)
-                                .map_err(admit)?;
-                            structured_groups[idx].1.push(ProposedStructured {
-                                key: reference.key.as_str(),
-                                pointer: pointer.as_str(),
-                                value_digest: *value_digest,
-                            });
+                                    let group = AdmittedVec::new(&prep, &admit)?;
+                                    structured_groups.push(&prep, (rev_iri, group), &admit)?;
+                                    Ok(i)
+                                },
+                                &admit,
+                            )?;
+                            structured_groups.as_mut_slice()[idx].1.push(
+                                &prep,
+                                ProposedStructured {
+                                    key: reference.key.as_str(),
+                                    pointer: pointer.as_str(),
+                                    value_digest: *value_digest,
+                                },
+                                &admit,
+                            )?;
                         }
                     }
                 }
             }
         }
+        for req in generic_reqs.as_mut_slice() {
+            control.check()?;
+            if let GenericReq::Record(iri, _, selection) = req
+                && let Some(needs) = selection_needs.get(iri)
+            {
+                *selection = *needs;
+            }
+        }
     }
-    // Resolve every ExistingRecord and StoredFact first so missing or unauthorized
-    // records always answer identically as `evidence-unavailable` before any content
-    // or identity comparison runs, without retaining a discarded `Vec<Verified>`.
+    // Phase 1: resolve every ExistingRecord (with any selection-target availability
+    // requirements attached) and every StoredFact first so missing, graph-denied,
+    // metadata-only and triple-masked targets always share identical precedence before
+    // any identity or content comparison runs.
     let mut record_access: Option<Option<Arc<GraphAccess>>> = None;
-    for req in &generic_reqs {
+    for req in generic_reqs.as_slice() {
         control.check()?;
         match req {
             GenericReq::Fact(key, fact) => {
@@ -716,7 +941,7 @@ fn verify_requirements(
                     _ => resolution.stored_fact_in(key, main, fact, &mut *read)?,
                 };
             }
-            GenericReq::Record(iri, kinds) => {
+            GenericReq::Record(iri, kinds, selection) => {
                 let granted = match &record_access {
                     Some(access) => access.clone(),
                     None => {
@@ -725,36 +950,56 @@ fn verify_requirements(
                         access
                     }
                 };
-                resolution.verify_record(iri.as_str(), main, logical, granted, iri, kinds)?;
+                resolution.verify_record_with_selection(
+                    iri.as_str(),
+                    main,
+                    logical,
+                    granted,
+                    iri,
+                    kinds,
+                    *selection,
+                )?;
             }
         }
     }
     drop(generic_reqs);
-    for check in local_checks {
-        control.check()?;
-        check?;
-    }
-    if !(passage_groups.is_empty() && passage_refs.is_empty() && structured_groups.is_empty()) {
-        let access = match record_access {
-            Some(access) => access,
-            None => resolution.logical_access(main, logical, read)?,
+    // Phase 2: run content and identity comparisons, dropping each phase's admitted
+    // buffer as soon as it finishes so its reservation is released before the next.
+    if !passage_groups.is_empty() {
+        let access = match &record_access {
+            Some(access) => access.clone(),
+            None => {
+                let access = resolution.logical_access(main, logical, read)?;
+                record_access = Some(access.clone());
+                access
+            }
         };
-        for (rendition, passages) in &passage_groups {
+        for (rendition, passages) in passage_groups.as_slice() {
             control.check()?;
             resolution.verify_proposed_passages(
                 main,
                 logical,
                 access.clone(),
                 rendition,
-                passages,
+                passages.as_slice(),
             )?;
         }
-        let mut checked_passage_refs: BTreeSet<(&NamedNode, &NamedNode, &NamedNode)> =
-            BTreeSet::new();
-        for (ref_key, passage, expected_rev, expected_rend) in passage_refs {
+    }
+    drop(passage_groups);
+    if !passage_refs.is_empty() {
+        let access = match &record_access {
+            Some(access) => access.clone(),
+            None => {
+                let access = resolution.logical_access(main, logical, read)?;
+                record_access = Some(access.clone());
+                access
+            }
+        };
+        let mut checked_passage_refs: AdmittedSet<(&NamedNode, &NamedNode, &NamedNode)> =
+            AdmittedSet::new(&prep, &admit)?;
+        for (ref_key, passage, expected_rev, expected_rend) in passage_refs.as_slice() {
             control.check()?;
-            if checked_passage_refs.insert((passage, expected_rev, expected_rend)) {
-                req_hold.grow_by(64).map_err(admit)?;
+            if checked_passage_refs.insert((*passage, *expected_rev, *expected_rend), &admit)? {
                 resolution.verify_passage_reference(
                     ref_key,
                     main,
@@ -766,18 +1011,26 @@ fn verify_requirements(
                 )?;
             }
         }
-        for (revision, structured) in &structured_groups {
+        drop(checked_passage_refs);
+    }
+    drop(passage_refs);
+    if !structured_groups.is_empty() {
+        let access = match record_access {
+            Some(access) => access,
+            None => resolution.logical_access(main, logical, read)?,
+        };
+        for (revision, structured) in structured_groups.as_slice() {
             control.check()?;
             resolution.verify_structured_references(
                 main,
                 logical,
                 access.clone(),
                 revision,
-                structured,
+                structured.as_slice(),
             )?;
         }
     }
-    drop(req_hold);
+    drop(structured_groups);
     Ok(())
 }
 
@@ -1157,4 +1410,206 @@ pub fn reconcile_operation_holds(main: &Dataset, grace_ms: i64) -> Result<Vec<Uu
         }
         Ok(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparkles_core::evidence::{MethodRef, RecordKey, RecordVersion, prepare_input};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn iri(s: &str) -> NamedNode {
+        NamedNode::new(s).unwrap()
+    }
+
+    fn key(s: &str) -> RecordKey {
+        RecordKey::new(s).unwrap()
+    }
+
+    #[test]
+    fn admitted_containers_charge_exact_singleton_capacity_before_insert_and_release_on_drop() {
+        let admit = |e: Error| e;
+        let prep = Preparation::new(Control::none(), 64 * 1024).unwrap();
+        let baseline = prep.available_bytes();
+        let digest = Sha256Digest::of_bytes(b"1", &Control::none()).unwrap();
+
+        // Singleton AdmittedVec allocates exact capacity 1 and charges its exact bytes.
+        {
+            let mut vec: AdmittedVec<ProposedStructured<'_>> =
+                AdmittedVec::new(&prep, &admit).unwrap();
+            vec.push(
+                &prep,
+                ProposedStructured {
+                    key: "s0",
+                    pointer: "/a",
+                    value_digest: digest,
+                },
+                &admit,
+            )
+            .unwrap();
+            assert_eq!(vec.values.capacity(), 1);
+            assert_eq!(
+                baseline - prep.available_bytes(),
+                std::mem::size_of::<ProposedStructured<'_>>() as u64
+            );
+            // Second push grows capacity 1 -> 2 and settles to 2 slots after dropping old.
+            vec.push(
+                &prep,
+                ProposedStructured {
+                    key: "s1",
+                    pointer: "/b",
+                    value_digest: digest,
+                },
+                &admit,
+            )
+            .unwrap();
+            assert_eq!(vec.values.capacity(), 2);
+            assert_eq!(
+                baseline - prep.available_bytes(),
+                (std::mem::size_of::<ProposedStructured<'_>>() * 2) as u64
+            );
+        }
+        assert_eq!(prep.available_bytes(), baseline);
+
+        // AdmittedSet and AdmittedMap refuse before inserting when budget is too small.
+        let tiny = Preparation::new(Control::none(), 320).unwrap();
+        let mut set: AdmittedSet<&str> = AdmittedSet::new(&tiny, &admit).unwrap();
+        assert!(matches!(
+            set.insert("first", &admit),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert!(set.values.is_empty());
+
+        let mut map: AdmittedMap<&str, usize> = AdmittedMap::new(&tiny, &admit).unwrap();
+        assert!(matches!(
+            map.insert("first", 0, &admit),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert!(map.values.is_empty());
+    }
+
+    #[test]
+    fn singleton_structured_groups_and_long_input_errors_respect_preparation_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let principal = iri("urn:agent:budget");
+        let digest = Sha256Digest::of_bytes(b"1", &Control::none()).unwrap();
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            ..Default::default()
+        };
+        let opts = ProposalOptions {
+            principal: &principal,
+            idempotency_key: None,
+            source_graph: None,
+            proposal_graph: None,
+            identity_graph: None,
+        };
+
+        // 1. 64 singleton structured groups require admitting outer Vec, 64 inner
+        //    singleton Vecs, index maps, and generic_reqs; a tight 8 KiB budget refuses
+        //    with `incomplete-evidence` before any store access runs.
+        let refs: Vec<EvidenceRefInput> = (0..64)
+            .map(|i| EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key(&format!("sr-{i}")),
+                occurrence_key: key(&format!("sr-{i}")),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(iri(&format!("urn:rev:singleton-{i}"))),
+                    pointer: "/x".into(),
+                    method: MethodRef {
+                        method: iri(JSON_LEXICAL_UTF8_V1),
+                        version: key(JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: digest,
+                },
+            })
+            .collect();
+        let input = EvidenceInput {
+            references: refs,
+            ..Default::default()
+        };
+        let prepared = prepare_input(&input, &Control::none()).unwrap();
+        let plan = write::plan(
+            &prepared,
+            ds.dataset_id(),
+            &settings,
+            &opts,
+            &Control::none(),
+        )
+        .unwrap();
+        let reads = AtomicUsize::new(0);
+        let err = verify_requirements_with_memory(
+            None,
+            &ds,
+            &ds,
+            &input,
+            &plan,
+            prepared.requirements(),
+            &mut |_, _| {
+                reads.fetch_add(1, Ordering::Relaxed);
+                Some(Arc::new(GraphAccess::all()))
+            },
+            &Control::none(),
+            8 * 1024,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "incomplete-evidence");
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+
+        // 2. Unsupported normalization method carrying a long method IRI fails
+        //    immediately with the input-only error without buffering deferred errors
+        //    or reading the store, even under a tight 4 KiB budget.
+        let long_method = iri(&format!(
+            "urn:example:unsupported-{}",
+            "m".repeat(16 * 1024)
+        ));
+        let long_input = EvidenceInput {
+            references: vec![EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("long-unsup"),
+                occurrence_key: key("long-unsup"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(iri("urn:rev:missing")),
+                    pointer: "/x".into(),
+                    method: MethodRef {
+                        method: long_method,
+                        version: key("v1"),
+                    },
+                    value_digest: digest,
+                },
+            }],
+            ..Default::default()
+        };
+        let long_prepared = prepare_input(&long_input, &Control::none()).unwrap();
+        let long_plan = write::plan(
+            &long_prepared,
+            ds.dataset_id(),
+            &settings,
+            &opts,
+            &Control::none(),
+        )
+        .unwrap();
+        let long_reads = AtomicUsize::new(0);
+        let long_err = verify_requirements_with_memory(
+            None,
+            &ds,
+            &ds,
+            &long_input,
+            &long_plan,
+            long_prepared.requirements(),
+            &mut |_, _| {
+                long_reads.fetch_add(1, Ordering::Relaxed);
+                Some(Arc::new(GraphAccess::all()))
+            },
+            &Control::none(),
+            4 * 1024,
+        )
+        .unwrap_err();
+        assert_eq!(long_err.code(), "incomplete-evidence");
+        assert!(long_err.to_string().contains("not supported by this build"));
+        assert_eq!(long_reads.load(Ordering::Relaxed), 0);
+    }
 }

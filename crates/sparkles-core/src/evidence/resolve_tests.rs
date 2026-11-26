@@ -1567,7 +1567,6 @@ fn compacted_large_json_revision_tight_grammar_scratch_and_midstream_cancel() {
     let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
     let op = iri("urn:op:large");
     let rev_large = iri("urn:rev:large");
-    let rev_deep = iri("urn:rev:deep");
     let q =
         |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
     let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
@@ -1584,15 +1583,6 @@ fn compacted_large_json_revision_tight_grammar_scratch_and_midstream_cancel() {
     let big_digest = Sha256Digest::of_bytes(big_json.as_bytes(), &Control::none()).unwrap();
     let big_b64 = base64::engine::general_purpose::STANDARD.encode(big_json.as_bytes());
     let ok_digest = Sha256Digest::of_bytes(b"\"ok\"", &Control::none()).unwrap();
-
-    // Deeply nested JSON (1024 levels) for grammar scratch budget admission test.
-    let deep_json = format!(
-        "{}0{}",
-        "[".repeat(crate::nesting::MAX_ELEMENTS),
-        "]".repeat(crate::nesting::MAX_ELEMENTS)
-    );
-    let deep_digest = Sha256Digest::of_bytes(deep_json.as_bytes(), &Control::none()).unwrap();
-    let deep_b64 = base64::engine::general_purpose::STANDARD.encode(deep_json.as_bytes());
 
     insert_managed_quads(
         &s,
@@ -1639,31 +1629,6 @@ fn compacted_large_json_revision_tight_grammar_scratch_and_midstream_cancel() {
                 &format!("{EV}retainedBytes"),
                 Term::Literal(Literal::new_typed_literal(big_b64, iri(XSD_BASE64_BINARY))),
             ),
-            q(
-                &rev_deep,
-                RDF_TYPE,
-                iri(kind_iri(RecordKind::SourceRevision)).into(),
-            ),
-            q(
-                &rev_deep,
-                &format!("{EV}availabilityReceipt"),
-                op.clone().into(),
-            ),
-            q(
-                &rev_deep,
-                &format!("{EV}graphProtection"),
-                lit(&nonce.to_string()),
-            ),
-            q(
-                &rev_deep,
-                &format!("{EV}contentDigest"),
-                lit(&deep_digest.to_string()),
-            ),
-            q(
-                &rev_deep,
-                &format!("{EV}retainedBytes"),
-                Term::Literal(Literal::new_typed_literal(deep_b64, iri(XSD_BASE64_BINARY))),
-            ),
         ],
     );
     s.compact().unwrap();
@@ -1700,45 +1665,114 @@ fn compacted_large_json_revision_tight_grammar_scratch_and_midstream_cancel() {
     CANCEL_BASE64_AT_CHUNK.with(|at| at.set(None));
     assert!(matches!(cancelled, Err(Error::Cancelled)));
 
-    // Tight preparation budget that admits vocabulary reconstruction + decoded bytes +
-    // root pointer trie, then refuses grammar validation scratch with incomplete-evidence.
+    // Separate store for the shallow JSON grammar-scratch budget test so the 17 MiB
+    // literal above cannot share a front-coded Vocab block with the shallow literal.
+    let (s_shallow, nonce_shallow) = configured_evidence_store();
+    let rev_shallow = iri("urn:rev:shallow");
+    let shallow_json = r#"{"a":1}"#;
+    let shallow_digest = Sha256Digest::of_bytes(shallow_json.as_bytes(), &Control::none()).unwrap();
+    let shallow_b64 = base64::engine::general_purpose::STANDARD.encode(shallow_json.as_bytes());
+    insert_managed_quads(
+        &s_shallow,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s_shallow.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s_shallow.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce_shallow.to_string()),
+            ),
+            q(
+                &rev_shallow,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::SourceRevision)).into(),
+            ),
+            q(
+                &rev_shallow,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rev_shallow,
+                &format!("{EV}graphProtection"),
+                lit(&nonce_shallow.to_string()),
+            ),
+            q(
+                &rev_shallow,
+                &format!("{EV}contentDigest"),
+                lit(&shallow_digest.to_string()),
+            ),
+            q(
+                &rev_shallow,
+                &format!("{EV}retainedBytes"),
+                Term::Literal(Literal::new_typed_literal(
+                    shallow_b64,
+                    iri(XSD_BASE64_BINARY),
+                )),
+            ),
+        ],
+    );
+    s_shallow.compact().unwrap();
+
+    // Tight preparation budget that admits record-graph decoding (~66 KiB peak),
+    // record authentication (~10.4 KiB peak), vocabulary reconstruction, decoded bytes,
+    // 256 root pointers (~86.2 KiB), and shallow traversal (< 0.5 KiB), then refuses
+    // strictly at `VALIDATE_SCRATCH_BYTES` (4 KiB) grammar validation scratch.
     let mut probe = resolver();
     probe
         .record(
             "probe",
-            &s,
-            &s,
+            &s_shallow,
+            &s_shallow,
             Some(&all()),
             &RecordRequest {
-                iri: rev_deep.clone(),
+                iri: rev_shallow.clone(),
                 kinds: vec![RecordKind::SourceRevision],
                 content_digest: None,
             },
         )
         .unwrap();
     let baseline = probe.preparation().inner_used();
-    // Leave room for the ~2.7 KiB settled vocab workspace + ~2 KiB decoded JSON +
-    // ~1 KiB overhead, which is enough to decode and build the 1-node trie, while
-    // leaving less than VALIDATE_SCRATCH_BYTES (4 KiB) after workspace drops?
-    // Actually after workspace drops, only decoded (~2 KiB) stays live, so setting
-    // limit = baseline + 5600 admits vocab (~2.7 KiB + 256) + decoded (~2 KiB) = ~5 KiB
-    // during decode, and after workspace drops leaves ~3.5 KiB < VALIDATE_SCRATCH_BYTES!
-    let tight_limit = baseline + 5600;
+    let shallow_refs: Vec<ProposedStructured<'_>> = (0..256)
+        .map(|_| ProposedStructured {
+            key: "shallow",
+            pointer: "",
+            value_digest: shallow_digest,
+        })
+        .collect();
+    let tight_limit = baseline + 88_000;
     let mut tight = Resolver::new(Control::none(), tight_limit).unwrap();
     assert_eq!(
         code(tight.verify_structured_references(
-            &s,
-            &s,
+            &s_shallow,
+            &s_shallow,
             Some(&all()),
-            &rev_deep,
-            &[ProposedStructured {
-                key: "deep",
-                pointer: "",
-                value_digest: deep_digest,
-            }],
+            &rev_shallow,
+            &shallow_refs,
         )),
         "incomplete-evidence"
     );
+    // Adding room for `VALIDATE_SCRATCH_BYTES` lets the shallow selection succeed.
+    let mut enough = Resolver::new(Control::none(), tight_limit + 4096).unwrap();
+    enough
+        .verify_structured_references(
+            &s_shallow,
+            &s_shallow,
+            Some(&all()),
+            &rev_shallow,
+            &shallow_refs,
+        )
+        .unwrap();
 }
 
 #[test]
@@ -1880,5 +1914,158 @@ fn repeated_passage_references_scan_rendition_text_once() {
     assert_eq!(
         code(r.verify_passage_reference("ref-stale", &s, &s, Some(&all()), &pass, &rev, &rend)),
         "origin-not-reproduced"
+    );
+}
+
+#[test]
+fn direct_verify_passage_reference_refuses_duplicate_or_malformed_record_digests() {
+    let (s, nonce) = configured_evidence_store();
+    let sg = oxrdf::GraphName::NamedNode(iri("urn:ev:sources"));
+    let op = iri("urn:op:digest-conflict");
+    let rev = iri("urn:rev:dc");
+    let rend = iri("urn:rend:dc");
+    let pass_dup = iri("urn:pass:dc-dup");
+    let sel_dup = iri("urn:pass:dc-dup#sel");
+    let pass_bad = iri("urn:pass:dc-bad");
+    let sel_bad = iri("urn:pass:dc-bad#sel");
+    let text = "hello world";
+    let span_digest = Sha256Digest::of_bytes(b"hello", &Control::none()).unwrap();
+    let d1 = Sha256Digest::of_bytes(b"rec-1", &Control::none()).unwrap();
+    let d2 = Sha256Digest::of_bytes(b"rec-2", &Control::none()).unwrap();
+    let q =
+        |sub: &NamedNode, p: &str, o: Term| oxrdf::Quad::new(sub.clone(), iri(p), o, sg.clone());
+    let lit = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+    let int_lit =
+        |n: u64| Term::Literal(Literal::new_typed_literal(n.to_string(), iri(XSD_INTEGER)));
+
+    insert_managed_quads(
+        &s,
+        vec![
+            q(&op, RDF_TYPE, iri(&format!("{EV}Operation")).into()),
+            q(
+                &op,
+                &format!("{EV}datasetId"),
+                lit(&s.dataset_id().to_string()),
+            ),
+            q(
+                &op,
+                &format!("{EV}branchId"),
+                lit(&s.branch_id().to_string()),
+            ),
+            q(&op, &format!("{EV}commit"), int_lit(1)),
+            q(
+                &op,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, RDF_TYPE, iri(kind_iri(RecordKind::Rendition)).into()),
+            q(
+                &rend,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &rend,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(&rend, PROV_WAS_DERIVED_FROM, rev.clone().into()),
+            q(&rend, &format!("{EV}normalizedText"), lit(text)),
+            // Passage 1: valid span and lineage, but two visible ev:recordDigest values.
+            q(
+                &pass_dup,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Passage)).into(),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}sourceRevision"),
+                rev.clone().into(),
+            ),
+            q(&pass_dup, &format!("{OA}hasSource"), rend.clone().into()),
+            q(
+                &pass_dup,
+                &format!("{OA}hasSelector"),
+                sel_dup.clone().into(),
+            ),
+            q(&sel_dup, &format!("{OA}start"), int_lit(0)),
+            q(&sel_dup, &format!("{OA}end"), int_lit(5)),
+            q(
+                &pass_dup,
+                &format!("{EV}textDigest"),
+                lit(&span_digest.to_string()),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}recordDigest"),
+                lit(&d1.to_string()),
+            ),
+            q(
+                &pass_dup,
+                &format!("{EV}recordDigest"),
+                lit(&d2.to_string()),
+            ),
+            // Passage 2: valid span and lineage, but malformed ev:contentDigest.
+            q(
+                &pass_bad,
+                RDF_TYPE,
+                iri(kind_iri(RecordKind::Passage)).into(),
+            ),
+            q(
+                &pass_bad,
+                &format!("{EV}availabilityReceipt"),
+                op.clone().into(),
+            ),
+            q(
+                &pass_bad,
+                &format!("{EV}graphProtection"),
+                lit(&nonce.to_string()),
+            ),
+            q(
+                &pass_bad,
+                &format!("{EV}sourceRevision"),
+                rev.clone().into(),
+            ),
+            q(&pass_bad, &format!("{OA}hasSource"), rend.clone().into()),
+            q(
+                &pass_bad,
+                &format!("{OA}hasSelector"),
+                sel_bad.clone().into(),
+            ),
+            q(&sel_bad, &format!("{OA}start"), int_lit(0)),
+            q(&sel_bad, &format!("{OA}end"), int_lit(5)),
+            q(
+                &pass_bad,
+                &format!("{EV}textDigest"),
+                lit(&span_digest.to_string()),
+            ),
+            q(
+                &pass_bad,
+                &format!("{EV}contentDigest"),
+                lit("not-a-digest"),
+            ),
+        ],
+    );
+
+    // Cold-cache direct calls must reject both passages with immutable-record-conflict.
+    let mut r_dup = resolver();
+    assert_eq!(
+        code(r_dup.verify_passage_reference("dup", &s, &s, Some(&all()), &pass_dup, &rev, &rend,)),
+        "immutable-record-conflict"
+    );
+    let mut r_bad = resolver();
+    assert_eq!(
+        code(r_bad.verify_passage_reference("bad", &s, &s, Some(&all()), &pass_bad, &rev, &rend,)),
+        "immutable-record-conflict"
     );
 }

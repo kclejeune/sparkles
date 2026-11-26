@@ -2606,3 +2606,471 @@ fn propose_masked_and_metadata_only_selections_match_missing_and_deduplicate_pas
     assert!(batch.committed);
     assert_eq!(batch.records.len(), 25);
 }
+
+#[test]
+fn propose_mixed_batches_preserve_masked_vs_missing_parity_and_input_order() {
+    let (_dir, ds) = retained();
+    const SOURCES_TWO: &str = "urn:ev:sources-two";
+    let settings = Settings {
+        enabled: true,
+        source_records: vec![SOURCES.into(), SOURCES_TWO.into()],
+        proposals: vec![CLAIMS.into()],
+        ..Default::default()
+    };
+    evidence::configure(&ds, &settings, &Control::none()).unwrap();
+    let opts_in = |sg: &str| {
+        let mut o = options();
+        o.source_graph = Some(iri(sg));
+        o
+    };
+
+    let json_doc = r#"{"score":1.000}"#;
+    let seed1 = propose(
+        &ds,
+        &EvidenceInput {
+            revisions: vec![
+                SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("rev1"),
+                    source: iri("urn:doc:mix-1"),
+                    source_key: key("doc-mix-1"),
+                    upstream_version: None,
+                    content: SourceContent::Retained {
+                        bytes: json_doc.as_bytes().to_vec(),
+                        expected_digest: None,
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                },
+                SourceRevisionInput {
+                    version: RecordVersion::V1,
+                    key: key("rev-meta"),
+                    source: iri("urn:doc:mix-meta"),
+                    source_key: key("doc-mix-meta"),
+                    upstream_version: None,
+                    content: SourceContent::MetadataOnly {
+                        digest: sha(json_doc),
+                    },
+                    metadata: Default::default(),
+                    times: Default::default(),
+                    lineage: Default::default(),
+                },
+            ],
+            renditions: vec![RenditionInput {
+                version: RecordVersion::V1,
+                key: key("rend1"),
+                revision: local("rev1"),
+                occurrence_key: key("rend1-occ"),
+                conversion: method("urn:method:identity"),
+                media_type: "text/plain".into(),
+                language: None,
+                content: RenditionContent::NormalizedText(TEXT.into()),
+                expected_digest: None,
+            }],
+            ..Default::default()
+        },
+        &opts_in(SOURCES),
+    )
+    .unwrap();
+    let rev1 = iri_of(&seed1, "rev1");
+    let rev_meta = iri_of(&seed1, "rev-meta");
+    let rend1 = iri_of(&seed1, "rend1");
+
+    // Seed a second rendition, metadata-only rendition, and passage in SOURCES_TWO so
+    // graph-scoped triple masks can mask target B while leaving rend1 readable.
+    let seed2 = propose(
+        &ds,
+        &EvidenceInput {
+            renditions: vec![
+                RenditionInput {
+                    version: RecordVersion::V1,
+                    key: key("rend2"),
+                    revision: RecordRef::Existing(rev1.clone()),
+                    occurrence_key: key("rend2-occ"),
+                    conversion: method("urn:method:identity-2"),
+                    media_type: "text/plain".into(),
+                    language: None,
+                    content: RenditionContent::NormalizedText(TEXT.into()),
+                    expected_digest: None,
+                },
+                RenditionInput {
+                    version: RecordVersion::V1,
+                    key: key("rend2-meta"),
+                    revision: RecordRef::Existing(rev1.clone()),
+                    occurrence_key: key("rend2-meta-occ"),
+                    conversion: method("urn:method:meta-2"),
+                    media_type: "text/plain".into(),
+                    language: None,
+                    content: RenditionContent::MetadataOnly(sha(TEXT)),
+                    expected_digest: None,
+                },
+            ],
+            passages: vec![PassageInput {
+                version: RecordVersion::V1,
+                key: key("pass2"),
+                revision: RecordRef::Existing(rev1.clone()),
+                rendition: local("rend2"),
+                occurrence_key: key("pass2-occ"),
+                start: 0,
+                end: 11,
+                text_digest: sha("Release 1.2"),
+                quote: Some("Release 1.2".into()),
+            }],
+            ..Default::default()
+        },
+        &opts_in(SOURCES_TWO),
+    )
+    .unwrap();
+    let rend2 = iri_of(&seed2, "rend2");
+    let rend2_meta = iri_of(&seed2, "rend2-meta");
+    let pass2 = iri_of(&seed2, "pass2");
+    let missing_b = iri("urn:uuid:00000000-0000-4000-8000-0000000000b1");
+    let missing_c = iri("urn:uuid:00000000-0000-4000-8000-0000000000c2");
+
+    let hide_pred = |pred: &str, graph_scope: Option<&str>| {
+        let protection = Protection {
+            name: "hidden".into(),
+            predicates: Some(vec![pred.to_string()]),
+            classes: None,
+            subclasses: false,
+            graphs: graph_scope.map(|g| Graphs::Only(GraphRule::new([g], &[]))),
+            pattern: None,
+            prefixes: Default::default(),
+            hide_inferences: false,
+        };
+        let rules = TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(protection),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Default::default(),
+            limits: Default::default(),
+        };
+        Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            rules,
+        )))
+    };
+
+    let run_err = |input: &EvidenceInput, target: &NamedNode, access: Option<Arc<GraphAccess>>| {
+        let mut o = options();
+        if !input.revisions.is_empty() || !input.renditions.is_empty() || !input.passages.is_empty()
+        {
+            o.source_graph = Some(iri(SOURCES));
+        }
+        let e = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            input,
+            &o,
+            &mut |_, _| access.clone(),
+            &Control::none(),
+        )
+        .unwrap_err();
+        (
+            e.code().to_string(),
+            e.to_string().replace(target.as_str(), "TARGET"),
+        )
+    };
+
+    // 1. Mixed batch: failing proposed passage on readable rend1 (mismatched readable
+    //    revision rev_meta) + supported structured reference to revision B.
+    //    Absent B, metadata-only B, masked ev:retainedBytes and masked ev:contentDigest
+    //    must all answer identically with `evidence-unavailable` naming B (never 400).
+    let mixed_passage_and_struct = |target_rev: &NamedNode| EvidenceInput {
+        passages: vec![PassageInput {
+            version: RecordVersion::V1,
+            key: key("p-bad-rev"),
+            revision: RecordRef::Existing(rev_meta.clone()),
+            rendition: RecordRef::Existing(rend1.clone()),
+            occurrence_key: key("p-bad-rev"),
+            start: 0,
+            end: 11,
+            text_digest: sha("Release 1.2"),
+            quote: Some("Release 1.2".into()),
+        }],
+        references: vec![EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: key("s-target"),
+            occurrence_key: key("s-target"),
+            target: EvidenceRefTarget::Structured {
+                revision: RecordRef::Existing(target_rev.clone()),
+                pointer: "/score".into(),
+                method: MethodRef {
+                    method: iri(sparkles::evidence::JSON_LEXICAL_UTF8_V1),
+                    version: key(sparkles::evidence::JSON_LEXICAL_UTF8_VERSION),
+                },
+                value_digest: sha("1.000"),
+            },
+        }],
+        ..Default::default()
+    };
+    let absent_struct = run_err(&mixed_passage_and_struct(&missing_b), &missing_b, all());
+    assert_eq!(absent_struct.0, "evidence-unavailable");
+    assert_eq!(
+        absent_struct.1,
+        "evidence reference `TARGET` is unavailable"
+    );
+    assert_eq!(
+        run_err(&mixed_passage_and_struct(&rev_meta), &rev_meta, all()),
+        absent_struct
+    );
+    assert_eq!(
+        run_err(
+            &mixed_passage_and_struct(&rev1),
+            &rev1,
+            hide_pred("urn:x-sparkles:evidence:retainedBytes", None),
+        ),
+        absent_struct
+    );
+    assert_eq!(
+        run_err(
+            &mixed_passage_and_struct(&rev1),
+            &rev1,
+            hide_pred("urn:x-sparkles:evidence:contentDigest", None),
+        ),
+        absent_struct
+    );
+
+    // 2. Mixed batch: structured reference to B followed by a reference to missing C.
+    //    Masked and metadata-only B must fail on B (never advance to missing C).
+    let struct_before_missing_c = |target_rev: &NamedNode| EvidenceInput {
+        references: vec![
+            EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-first"),
+                occurrence_key: key("s-first"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(target_rev.clone()),
+                    pointer: "/score".into(),
+                    method: MethodRef {
+                        method: iri(sparkles::evidence::JSON_LEXICAL_UTF8_V1),
+                        version: key(sparkles::evidence::JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: sha("1.000"),
+                },
+            },
+            EvidenceRefInput {
+                version: RecordVersion::V1,
+                key: key("s-second"),
+                occurrence_key: key("s-second"),
+                target: EvidenceRefTarget::Structured {
+                    revision: RecordRef::Existing(missing_c.clone()),
+                    pointer: "/score".into(),
+                    method: MethodRef {
+                        method: iri(sparkles::evidence::JSON_LEXICAL_UTF8_V1),
+                        version: key(sparkles::evidence::JSON_LEXICAL_UTF8_VERSION),
+                    },
+                    value_digest: sha("1.000"),
+                },
+            },
+        ],
+        ..Default::default()
+    };
+    let absent_before_c = run_err(&struct_before_missing_c(&missing_b), &missing_b, all());
+    assert_eq!(absent_before_c, absent_struct);
+    assert_eq!(
+        run_err(&struct_before_missing_c(&rev_meta), &rev_meta, all()),
+        absent_before_c
+    );
+    assert_eq!(
+        run_err(
+            &struct_before_missing_c(&rev1),
+            &rev1,
+            hide_pred("urn:x-sparkles:evidence:retainedBytes", None),
+        ),
+        absent_before_c
+    );
+
+    // 3. Mixed batch: failing proposed passage on readable rend1 + proposed passage on
+    //    second rendition R2 (absent vs metadata-only vs graph-scoped masked predicates).
+    let mixed_two_renditions = |target_rend: &NamedNode| EvidenceInput {
+        passages: vec![
+            PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-bad-1"),
+                revision: RecordRef::Existing(rev_meta.clone()),
+                rendition: RecordRef::Existing(rend1.clone()),
+                occurrence_key: key("p-bad-1"),
+                start: 0,
+                end: 11,
+                text_digest: sha("Release 1.2"),
+                quote: Some("Release 1.2".into()),
+            },
+            PassageInput {
+                version: RecordVersion::V1,
+                key: key("p-target-2"),
+                revision: RecordRef::Existing(rev1.clone()),
+                rendition: RecordRef::Existing(target_rend.clone()),
+                occurrence_key: key("p-target-2"),
+                start: 0,
+                end: 11,
+                text_digest: sha("Release 1.2"),
+                quote: Some("Release 1.2".into()),
+            },
+        ],
+        ..Default::default()
+    };
+    let absent_rend2 = run_err(&mixed_two_renditions(&missing_b), &missing_b, all());
+    assert_eq!(absent_rend2, absent_struct);
+    assert_eq!(
+        run_err(&mixed_two_renditions(&rend2_meta), &rend2_meta, all()),
+        absent_rend2
+    );
+    assert_eq!(
+        run_err(
+            &mixed_two_renditions(&rend2),
+            &rend2,
+            hide_pred("urn:x-sparkles:evidence:normalizedText", Some(SOURCES_TWO)),
+        ),
+        absent_rend2
+    );
+    assert_eq!(
+        run_err(
+            &mixed_two_renditions(&rend2),
+            &rend2,
+            hide_pred(
+                "http://www.w3.org/ns/prov#wasDerivedFrom",
+                Some(SOURCES_TWO)
+            ),
+        ),
+        absent_rend2
+    );
+
+    // 4. Mixed batch: failing proposed passage on readable rend1 + passage reference to
+    //    pass2 (absent vs masked ev:sourceRevision vs masked rendition prov:wasDerivedFrom).
+    let mixed_passage_and_ref = |target_pass: &NamedNode| EvidenceInput {
+        passages: vec![PassageInput {
+            version: RecordVersion::V1,
+            key: key("p-bad-3"),
+            revision: RecordRef::Existing(rev_meta.clone()),
+            rendition: RecordRef::Existing(rend1.clone()),
+            occurrence_key: key("p-bad-3"),
+            start: 0,
+            end: 11,
+            text_digest: sha("Release 1.2"),
+            quote: Some("Release 1.2".into()),
+        }],
+        references: vec![EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: key("r-target-2"),
+            occurrence_key: key("r-target-2"),
+            target: EvidenceRefTarget::Passage {
+                revision: RecordRef::Existing(rev1.clone()),
+                rendition: RecordRef::Existing(rend2.clone()),
+                passage: RecordRef::Existing(target_pass.clone()),
+            },
+        }],
+        ..Default::default()
+    };
+    let absent_pass2 = run_err(&mixed_passage_and_ref(&missing_b), &missing_b, all());
+    assert_eq!(absent_pass2, absent_struct);
+    assert_eq!(
+        run_err(
+            &mixed_passage_and_ref(&pass2),
+            &pass2,
+            hide_pred("urn:x-sparkles:evidence:sourceRevision", Some(SOURCES_TWO)),
+        ),
+        absent_pass2
+    );
+    assert_eq!(
+        run_err(
+            &mixed_passage_and_ref(&pass2),
+            &pass2,
+            hide_pred(
+                "http://www.w3.org/ns/prov#wasDerivedFrom",
+                Some(SOURCES_TWO)
+            ),
+        ),
+        absent_pass2
+    );
+
+    // 5. Input-only checks run before store lookups so unsupported normalization methods
+    //    and mismatched local passages answer identically regardless of target store state.
+    let unsup_for = |target_rev: &NamedNode| EvidenceInput {
+        references: vec![EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: key("s-unsup"),
+            occurrence_key: key("s-unsup"),
+            target: EvidenceRefTarget::Structured {
+                revision: RecordRef::Existing(target_rev.clone()),
+                pointer: "/score".into(),
+                method: method("urn:example:unsupported-norm"),
+                value_digest: sha("1.000"),
+            },
+        }],
+        ..Default::default()
+    };
+    let unsup_present = run_err(&unsup_for(&rev1), &rev1, all());
+    assert_eq!(unsup_present.0, "incomplete-evidence");
+    assert_eq!(
+        run_err(&unsup_for(&missing_b), &missing_b, all()),
+        unsup_present
+    );
+    assert_eq!(
+        run_err(&unsup_for(&rev_meta), &rev_meta, all()),
+        unsup_present
+    );
+    assert_eq!(
+        run_err(
+            &unsup_for(&rev1),
+            &rev1,
+            hide_pred("urn:x-sparkles:evidence:retainedBytes", None),
+        ),
+        unsup_present
+    );
+
+    let local_mismatch_with_struct = |target_rev: &NamedNode| EvidenceInput {
+        renditions: vec![RenditionInput {
+            version: RecordVersion::V1,
+            key: key("local-rend"),
+            revision: RecordRef::Existing(rev1.clone()),
+            occurrence_key: key("local-rend-occ"),
+            conversion: method("urn:method:local"),
+            media_type: "text/plain".into(),
+            language: None,
+            content: RenditionContent::NormalizedText(TEXT.into()),
+            expected_digest: None,
+        }],
+        passages: vec![PassageInput {
+            version: RecordVersion::V1,
+            key: key("local-p-bad"),
+            revision: RecordRef::Existing(rev_meta.clone()),
+            rendition: local("local-rend"),
+            occurrence_key: key("local-p-bad"),
+            start: 0,
+            end: 11,
+            text_digest: sha("Release 1.2"),
+            quote: Some("Release 1.2".into()),
+        }],
+        references: vec![EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: key("s-with-local-bad"),
+            occurrence_key: key("s-with-local-bad"),
+            target: EvidenceRefTarget::Structured {
+                revision: RecordRef::Existing(target_rev.clone()),
+                pointer: "/score".into(),
+                method: MethodRef {
+                    method: iri(sparkles::evidence::JSON_LEXICAL_UTF8_V1),
+                    version: key(sparkles::evidence::JSON_LEXICAL_UTF8_VERSION),
+                },
+                value_digest: sha("1.000"),
+            },
+        }],
+        ..Default::default()
+    };
+    let local_bad_absent = run_err(&local_mismatch_with_struct(&missing_b), &missing_b, all());
+    assert_eq!(local_bad_absent.0, "invalid");
+    assert_eq!(
+        run_err(
+            &local_mismatch_with_struct(&rev1),
+            &rev1,
+            hide_pred("urn:x-sparkles:evidence:retainedBytes", None),
+        ),
+        local_bad_absent
+    );
+}

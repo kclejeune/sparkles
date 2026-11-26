@@ -868,25 +868,22 @@ mod tests {
 
     #[test]
     fn tight_budget_refuses_grammar_validation_scratch_before_parsing() {
-        let deep = format!(
-            "{}0{}",
-            "[".repeat(nesting::MAX_ELEMENTS),
-            "]".repeat(nesting::MAX_ELEMENTS)
-        );
-        // Admits the source, output slots, and one-node root pointer trie,
-        // leaving less than VALIDATE_SCRATCH_BYTES for serde_json grammar scratch.
-        let tight_limit = deep.len() + 1024;
+        // A shallow root document whose traversal requires well under 1 KiB, so a 2 KiB
+        // budget would succeed without `VALIDATE_SCRATCH_BYTES` (4 KiB) admission and
+        // fails strictly at grammar-scratch admission.
+        let shallow = r#"{"a":1}"#;
+        let tight_limit = 2048;
         assert!(matches!(
-            select_json_lexical_utf8_batch_optional(&deep, &[""], tight_limit, &Control::none()),
+            select_json_lexical_utf8_batch_optional(shallow, &[""], tight_limit, &Control::none()),
             Err(Error::BudgetExceeded(Budget {
                 kind: BudgetKind::Memory,
                 ..
             }))
         ));
-        // Adding room for grammar scratch + traversal frames succeeds.
-        let enough = deep.len() + VALIDATE_SCRATCH_BYTES + 1024 * 1024;
-        let out = select_json_lexical_utf8_batch_optional(&deep, &[""], enough, &Control::none())
+        // Adding room for grammar scratch succeeds.
+        let enough = tight_limit + VALIDATE_SCRATCH_BYTES;
+        let out = select_json_lexical_utf8_batch_optional(shallow, &[""], enough, &Control::none())
             .unwrap();
-        assert_eq!(out[0].as_ref().unwrap().utf8, deep);
+        assert_eq!(out[0].as_ref().unwrap().utf8, shallow);
     }
 }

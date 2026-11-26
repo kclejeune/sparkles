@@ -13,7 +13,8 @@
 
 pub use sparkles_core::evidence::resolve::{
     MAX_REFERENCES, MEMORY_BYTES, ProposedPassage, ProposedStructured, Receipt, RecordRequest,
-    VerifiedFact, VerifiedRecord, VerifiedSpan, check_anchor, kind_iri, unavailable,
+    SelectionRequirements, VerifiedFact, VerifiedRecord, VerifiedSpan, check_anchor, kind_iri,
+    unavailable,
 };
 pub use sparkles_core::evidence::{BlankAnchor, GraphIdentity, RecordKind, StoredFactRef};
 
@@ -147,8 +148,10 @@ impl Resolution {
         self.resolver.preparation()
     }
 
-    /// Verify a record reference without cloning its IRI or returning a [`VerifiedRecord`].
-    pub(crate) fn verify_record(
+    /// Verify a record reference without cloning its IRI or returning a [`VerifiedRecord`],
+    /// optionally checking selection-target availability predicates in the same pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_record_with_selection(
         &mut self,
         key: &str,
         main: &Dataset,
@@ -156,14 +159,16 @@ impl Resolution {
         access: Option<Arc<GraphAccess>>,
         iri: &NamedNode,
         kinds: &[RecordKind],
+        selection: SelectionRequirements,
     ) -> Result<()> {
-        self.resolver.verify_record(
+        self.resolver.verify_record_with_selection(
             key,
             main.store(),
             logical.store(),
             access.as_ref(),
             iri,
             kinds,
+            selection,
         )
     }
 

@@ -1114,15 +1114,15 @@ impl Preparation {
         Ok(result)
     }
 
-    /// The lexical form of a stored typed literal with `datatype`, borrowed for `each`
-    /// without decoding it as a term. Only non-inlined, non-`xsd:string` typed literals
-    /// stored in `Vocab` or `Delta` (such as `xsd:base64Binary`) are matched; inline
-    /// datatypes (`xsd:integer`, `xsd:double`, `xsd:boolean`, `xsd:decimal`,
-    /// `xsd:dateTime`, `xsd:date`), `xsd:string` (stored as a simple literal for
-    /// [`with_simple_literal`](Self::with_simple_literal)), and any other term or
-    /// datatype pass `None`. On `Vocab`, reconstruction growth is settled to the
-    /// reconstructed key capacity before `each` runs so large retained literals do not
-    /// over-charge the allowance.
+    /// The lexical form of a vocabulary-stored typed literal with `datatype`, borrowed
+    /// for `each` without decoding it as a term. Only literals stored under `Tag::Vocab`
+    /// or `Tag::Delta` as `TextKey::Typed` keys match, including `xsd:base64Binary` and
+    /// any non-inlined lexical form of a datatype that can otherwise be inlined. Literals
+    /// stored under an inline tag, `xsd:string` literals stored as simple literal keys
+    /// for [`with_simple_literal`](Self::with_simple_literal), and any other term or
+    /// mismatched datatype pass `None`. On `Vocab`, reconstruction growth is settled to
+    /// the reconstructed key capacity before `each` runs so large retained literals do
+    /// not over-charge the allowance.
     pub fn with_typed_literal<R>(
         &self,
         snap: &Snapshot,
