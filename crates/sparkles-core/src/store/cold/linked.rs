@@ -86,7 +86,7 @@ pub(in crate::store) fn open_link_vocabulary<C: BudgetControl>(
         drop(source.value);
         control.release(source.charge);
     }
-    let vocab = control.open_dvocab_layered(&prefix, &dir.join("delta.vocab"), true)?;
+    let vocab = DeltaVocab::open_layered_with(&prefix, &dir.join("delta.vocab"), true, control)?;
     control.drop_vec(prefix);
     control.release(prefix_paths);
     Ok(OpenedVocabulary { base, vocab })
@@ -107,7 +107,7 @@ pub(crate) fn head_vocabulary_controlled(
     budget.charge(path_scratch)?;
     let result = (|| {
         let Some(file) = link::read_link_with(dir, budget)? else {
-            return budget.open_dvocab_ro(&dir.join("delta.vocab"));
+            return DeltaVocab::open_read_only_with(&dir.join("delta.vocab"), budget);
         };
         let root_charge = branch_root.as_os_str().len() as u64 + 64;
         budget.charge(root_charge)?;

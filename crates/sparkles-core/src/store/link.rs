@@ -244,10 +244,11 @@ impl Generation {
                     .iter()
                     .map(|s| (s.dir(&dataset_root).join("delta.vocab"), s.dvocab_len))
                     .collect();
-                let vocab = control.open_dvocab_layered(
+                let vocab = crate::vocab::DeltaVocab::open_layered_with(
                     &prefix,
                     &gen_dir.join("delta.vocab"),
                     read_only,
+                    control,
                 )?;
                 (base, vocab)
             };

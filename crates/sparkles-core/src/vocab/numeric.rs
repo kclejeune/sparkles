@@ -231,7 +231,10 @@ impl NumColumn {
     /// `0..literals`. `None` when the file is missing, or does not describe this
     /// vocabulary (then numbers are decoded from their keys).
     pub(super) fn open(dir: &Path, len: u64, literals: u64) -> Option<NumColumn> {
-        Self::open_inner(dir, len, literals, None).ok().flatten()
+        Self::open_with(dir, len, literals, &mut crate::budgeted::Unlimited)
+            .ok()
+            .flatten()
+            .map(|loaded| loaded.value)
     }
 
     /// Whether `dir/vocab.num` already holds a valid current-format numeric column for
@@ -292,36 +295,14 @@ impl NumColumn {
         next.1 == positions
     }
 
-    pub(super) fn open_controlled(
+    pub(super) fn open_with<C: crate::budgeted::BudgetControl>(
         dir: &Path,
         len: u64,
         literals: u64,
-        budget: &mut crate::store::cold::ColdBudget<'_>,
+        control: &mut C,
     ) -> Result<Option<crate::store::cold::Loaded<NumColumn>>> {
-        budget.check()?;
-        let start = budget.used();
-        match Self::open_inner(dir, len, literals, Some(budget)) {
-            Ok(Some(value)) => Ok(Some(crate::store::cold::Loaded {
-                value,
-                charge: budget.used() - start,
-            })),
-            Ok(None) => {
-                budget.release(budget.used() - start);
-                Ok(None)
-            }
-            Err(error) => {
-                budget.release(budget.used() - start);
-                Err(error)
-            }
-        }
-    }
-
-    fn open_inner(
-        dir: &Path,
-        len: u64,
-        literals: u64,
-        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
-    ) -> Result<Option<NumColumn>> {
+        control.check(0)?;
+        let start = control.used();
         let mut failure = None;
         macro_rules! admit {
             ($expression:expr) => {
@@ -357,11 +338,11 @@ impl NumColumn {
                 if end != b.len() {
                     return None;
                 }
-                let list: Box<[Segment]> = if let Some(budget) = budget.as_deref_mut() {
+                let list: Box<[Segment]> = if C::ACCOUNTS {
                     let mut list = Vec::new();
-                    admit!(budget.reserve(&mut list, nsegs as usize));
+                    admit!(control.reserve(&mut list, nsegs as usize));
                     for index in 0..nsegs as usize {
-                        admit!(budget.check());
+                        admit!(control.check(0));
                         let at = segs + index * 24;
                         list.push((word(b, at), word(b, at + 8), word(b, at + 16)));
                     }
@@ -377,8 +358,8 @@ impl NumColumn {
                 // ascending, apart, inside the literals, and their ids are the positions
                 let mut next = (0, 0);
                 for &(lo, hi, base) in &list {
-                    if let Some(budget) = budget.as_deref_mut() {
-                        admit!(budget.check());
+                    if C::ACCOUNTS {
+                        admit!(control.check(0));
                     }
                     if lo < next.0 || hi <= lo || hi > covered || base != next.1 {
                         return None;
@@ -399,8 +380,8 @@ impl NumColumn {
                 return None;
             };
             let head = if values <= RESIDENT {
-                if let Some(budget) = budget.as_deref_mut() {
-                    Some(admit!(budget.read_from(&mut f, values as u64)).into_boxed_slice())
+                if C::ACCOUNTS {
+                    Some(admit!(control.read_from(&mut f, values as u64)).into_boxed_slice())
                 } else {
                     let mut head = vec![0u8; values];
                     (&f).read_exact(&mut head)
@@ -411,13 +392,7 @@ impl NumColumn {
                 None
             };
             let chunks = b.len().div_ceil(HINT_CHUNK);
-            let hinted = if let Some(budget) = budget.as_deref_mut() {
-                admit!(budget.filled(chunks.div_ceil(64)))
-            } else {
-                (0..chunks.div_ceil(64))
-                    .map(|_| AtomicU64::new(0))
-                    .collect()
-            };
+            let hinted = admit!(control.filled(chunks.div_ceil(64)));
             Some(NumColumn {
                 head,
                 hinted,
@@ -430,8 +405,20 @@ impl NumColumn {
             })
         })();
         match failure {
-            Some(error) => Err(error),
-            None => Ok(value),
+            Some(error) => {
+                control.release(control.used() - start);
+                Err(error)
+            }
+            None => match value {
+                Some(value) => Ok(Some(crate::store::cold::Loaded {
+                    value,
+                    charge: control.used() - start,
+                })),
+                None => {
+                    control.release(control.used() - start);
+                    Ok(None)
+                }
+            },
         }
     }
 
