@@ -3223,7 +3223,13 @@ fn keyed_replay_finds_operation_after_supports_becomes_dedicated_output() {
     }
 }
 
-enum LegacyLink {
+enum LegacyChange {
+    WithdrawMetadata(&'static str),
+    ReplaceCommit,
+    ProjectExtraCommit,
+    ConflictingCommit,
+    ConflictingKey,
+    KeyOnProjection,
     WithdrawGeneration,
     WithdrawLink,
     ProjectReceipt,
@@ -3231,20 +3237,70 @@ enum LegacyLink {
 
 #[test]
 fn legacy_replay_refuses_a_withdrawn_shared_reuse_link() {
-    check_keyed_replay_in_former_supports(true, Some(LegacyLink::WithdrawLink));
+    check_keyed_replay_in_former_supports(true, Some(LegacyChange::WithdrawLink));
+}
+
+#[test]
+fn legacy_replay_refuses_a_withdrawn_shared_commit() {
+    check_keyed_replay_in_former_supports(
+        true,
+        Some(LegacyChange::WithdrawMetadata("ev:commit ?o")),
+    );
+}
+
+#[test]
+fn legacy_replay_refuses_a_live_projected_replacement_commit() {
+    check_keyed_replay_in_former_supports(true, Some(LegacyChange::ReplaceCommit));
+}
+
+#[test]
+fn legacy_replay_ignores_an_additional_live_projected_commit() {
+    check_keyed_replay_in_former_supports(true, Some(LegacyChange::ProjectExtraCommit));
+}
+
+#[test]
+fn legacy_replay_refuses_conflicting_stamps_after_supports_reset() {
+    check_keyed_replay_in_former_supports(true, Some(LegacyChange::ConflictingCommit));
+}
+
+#[test]
+fn legacy_replay_reserves_a_stored_key_even_on_a_different_operation_iri() {
+    check_keyed_replay_in_former_supports(true, Some(LegacyChange::ConflictingKey));
+}
+
+#[test]
+fn legacy_replay_ignores_a_key_on_a_non_operation_record() {
+    check_keyed_replay_in_former_supports(true, Some(LegacyChange::KeyOnProjection));
+}
+
+#[test]
+fn legacy_replay_requires_each_shared_operation_field() {
+    for field in [
+        "a ev:Operation",
+        "a prov:Activity",
+        "prov:wasAssociatedWith ?o",
+        "prov:endedAtTime ?o",
+        "ev:datasetId ?o",
+        "ev:branchId ?o",
+        "ev:payloadDigest ?o",
+        "ev:graphProtection ?o",
+        "ev:idempotencyKey ?o",
+    ] {
+        check_keyed_replay_in_former_supports(true, Some(LegacyChange::WithdrawMetadata(field)));
+    }
 }
 
 #[test]
 fn legacy_replay_prefers_intact_reuse_link_to_projected_receipt() {
-    check_keyed_replay_in_former_supports(true, Some(LegacyLink::ProjectReceipt));
+    check_keyed_replay_in_former_supports(true, Some(LegacyChange::ProjectReceipt));
 }
 
 #[test]
 fn legacy_replay_recovers_created_projection_after_generation_edge_withdrawal() {
-    check_keyed_replay_in_former_supports(false, Some(LegacyLink::WithdrawGeneration));
+    check_keyed_replay_in_former_supports(false, Some(LegacyChange::WithdrawGeneration));
 }
 
-fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<LegacyLink>) {
+fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<LegacyChange>) {
     use sparkles::managed::OwnerKind;
 
     let dir = tempfile::tempdir().unwrap();
@@ -3299,6 +3355,14 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
     assert!(first.committed && !first.replayed);
     assert_eq!(first.policy_version, 1);
     assert_eq!(first.output.as_str(), OUTPUT);
+
+    if legacy.is_none() {
+        let mut second = opts.clone();
+        second.principal = iri("urn:principal:other-reviewer");
+        let independent = reconcile(&ds, "main", None, &second).unwrap();
+        assert!(independent.committed);
+        assert_ne!(independent.operation, first.operation);
+    }
 
     let op = &first.operation;
     let projection = &first.projection;
@@ -3370,17 +3434,56 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
         drop(ds);
         let ds = legacy_projection_writer(&root, SUPPORTS);
         let triples = match case {
-            LegacyLink::WithdrawGeneration => vec![Triple::new(
+            LegacyChange::WithdrawMetadata(field) => {
+                let result = ds
+                    .construct(&format!(
+                    "PREFIX ev: <{EV}> PREFIX prov: <http://www.w3.org/ns/prov#>
+                     CONSTRUCT {{ {op} {field} }} WHERE {{ GRAPH <{SUPPORTS}> {{ {op} {field} }} }}"
+                ))
+                    .unwrap();
+                assert_eq!(result.len(), 1, "{field}");
+                result.triples().to_vec()
+            }
+            LegacyChange::ConflictingKey | LegacyChange::KeyOnProjection => vec![Triple::new(
+                if matches!(case, LegacyChange::KeyOnProjection) {
+                    projection.clone()
+                } else {
+                    op.clone()
+                },
+                iri(&format!("{EV}idempotencyKey")),
+                oxrdf::Literal::new_simple_literal("extra-key"),
+            )],
+            LegacyChange::ReplaceCommit
+            | LegacyChange::ProjectExtraCommit
+            | LegacyChange::ConflictingCommit => {
+                let stamp = |seq: u64| {
+                    Triple::new(
+                        op.clone(),
+                        iri(&format!("{EV}commit")),
+                        oxrdf::Literal::new_typed_literal(
+                            seq.to_string(),
+                            oxrdf::vocab::xsd::INTEGER,
+                        ),
+                    )
+                };
+                let mut triples = vec![];
+                if matches!(case, LegacyChange::ReplaceCommit) {
+                    triples.push(stamp(first.commit));
+                }
+                triples.push(stamp(first.commit + 100));
+                triples
+            }
+            LegacyChange::WithdrawGeneration => vec![Triple::new(
                 projection.clone(),
                 iri("http://www.w3.org/ns/prov#wasGeneratedBy"),
                 op.clone(),
             )],
-            LegacyLink::WithdrawLink => vec![Triple::new(
+            LegacyChange::WithdrawLink => vec![Triple::new(
                 op.clone(),
                 iri("http://www.w3.org/ns/prov#used"),
                 projection.clone(),
             )],
-            LegacyLink::ProjectReceipt => {
+            LegacyChange::ProjectReceipt => {
                 let shadow = iri("urn:legacy:shadow:projection");
                 use oxrdf::Literal;
                 vec![
@@ -3417,37 +3520,81 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                 ]
             }
         };
+        let shared = triples[0].clone();
         let claims = project_legacy_triples(&ds, "other", triples);
         drop(ds);
         legacy_settings(&root, &s2);
         let ds = Dataset::open(&root).unwrap();
-        if matches!(case, LegacyLink::WithdrawLink) {
-            // While live, the support makes even this genuine reuse edge
-            // indistinguishable from a projection of the same quad.
+        if matches!(case, LegacyChange::KeyOnProjection) {
+            opts.idempotency_key = Some("extra-key".into());
+            assert!(reconcile(&ds, "main", None, &opts).unwrap().committed);
+            return;
+        }
+        let assert_conflict = |opts: &ReviewOptions| {
             let head = ds.store().head_commit().seq;
-            assert_eq!(
-                code(reconcile(&ds, "main", None, &opts)),
-                "immutable-record-conflict"
-            );
-            assert_eq!(ds.store().head_commit().seq, head);
-            withdraw(&ds, &claims[0]);
-            assert!(
-                !ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {link} }} }}"))
-                    .unwrap()
-            );
-            let head = ds.store().head_commit().seq;
-            assert_eq!(
-                code(reconcile(&ds, "main", None, &opts)),
-                "immutable-record-conflict"
-            );
+            let err = reconcile(&ds, "main", None, opts).unwrap_err();
+            assert_eq!(err.code(), "immutable-record-conflict");
+            assert!(matches!(err, sparkles::Error::Managed(e) if e.status() == 409));
             assert_eq!(ds.store().head_commit().seq, head);
             assert!(
                 !ds.ask(&format!("ASK {{ GRAPH <{supports2}> {{ ?s ?p ?o }} }}"))
                     .unwrap()
             );
+        };
+        if matches!(
+            case,
+            LegacyChange::ConflictingCommit | LegacyChange::ConflictingKey
+        ) {
+            evidence::detach(&ds, supports3).unwrap();
+            evidence::configure(&ds, &s2, &Control::none()).unwrap();
+            if matches!(case, LegacyChange::ConflictingKey) {
+                opts.idempotency_key = Some("extra-key".into());
+            }
+            assert_conflict(&opts);
             return;
         }
-        if matches!(case, LegacyLink::WithdrawGeneration) {
+        if matches!(
+            case,
+            LegacyChange::WithdrawMetadata(_) | LegacyChange::ReplaceCommit
+        ) {
+            assert_conflict(&opts);
+            withdraw(&ds, &claims[0]);
+            assert!(
+                !ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {shared} }} }}"))
+                    .unwrap()
+            );
+            assert!(
+                ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {link} }} }}"))
+                    .unwrap()
+            );
+            if !matches!(case, LegacyChange::WithdrawMetadata("ev:idempotencyKey ?o")) {
+                assert!(ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {op} <{EV}idempotencyKey> \"dedicated-output-replay-key\" }} }}")).unwrap());
+            }
+            if matches!(case, LegacyChange::ReplaceCommit) {
+                assert!(
+                    ds.ask(&format!(
+                        "ASK {{ GRAPH <{SUPPORTS}> {{ {op} <{EV}commit> {} }} }}",
+                        first.commit + 100
+                    ))
+                    .unwrap()
+                );
+            }
+            assert_conflict(&opts);
+            return;
+        }
+        if matches!(case, LegacyChange::WithdrawLink) {
+            // While live, the support makes even this genuine reuse edge
+            // indistinguishable from a projection of the same quad.
+            assert_conflict(&opts);
+            withdraw(&ds, &claims[0]);
+            assert!(
+                !ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {link} }} }}"))
+                    .unwrap()
+            );
+            assert_conflict(&opts);
+            return;
+        }
+        if matches!(case, LegacyChange::WithdrawGeneration) {
             withdraw(&ds, &claims[0]);
             assert!(!ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {projection} <http://www.w3.org/ns/prov#wasGeneratedBy> {op} }} }}")).unwrap());
         }

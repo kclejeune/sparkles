@@ -2380,8 +2380,8 @@ authenticate, so the output graph is emptied.
 Before item 581, a format 2 registry could keep the same protection nonce while a
 graph served first as a record graph and then as a projection output. A projected
 triple identical to a published triple occupies the same RDF quad. Withdrawing its
-last support can therefore remove a publication link. Format 2 records the owner
-and nonce but has no per-triple origin or history of graph roles.
+last support can therefore remove a publication link or receipt field. Format 2 records the
+owner and nonce but has no per-triple origin or history of graph roles.
 
 On upgrade, the store checks every branch in the family before marking a dedicated
 output as `projectionOnly`. An `ev:Operation` and a record naming it as its
@@ -2399,20 +2399,27 @@ and read-grant checks decide replay. Statements in a legacy output cannot add a
 payload conflict, a read grant or a projection to that receipt.
 
 If the operation is absent from current record-role graphs, replay checks former
-record graphs among the unmarked outputs. A candidate must have record history under
-its current nonce and the named operation's stored key and description for this
-dataset. An unrelated record receipt establishes graph history only. Finding a
-candidate reserves the key even when its original link has disappeared. Replay
-requires one candidate graph, an identifiable branch and commit, a matching payload
-and read access to that graph. It looks for an authenticated projection of the
-requested policy through `prov:wasGeneratedBy` or `prov:used`. The operation can
+record graphs among the unmarked outputs. In a graph with receipt history under its
+current nonce, a surviving description at the deterministic operation IRI reserves
+the key even if the stored key, commit or publication link has disappeared. A
+protected `ev:Operation` bearing the stored key must also be accounted for. The dataset,
+principal and stored key determine its operation IRI, so another principal can use
+the same key independently. An unrelated record receipt establishes graph history only.
+
+Replay excludes every triple owned by a live support of the output's current review
+policy from the receipt evidence. The remaining operation description must contain
+both activity types, the principal, end time, dataset, branch, commit, payload digest,
+key and current protection nonce. Each required field must have its expected type
+and cardinality. A projected replacement for a missing field cannot supply it.
+Replay requires one candidate graph, a matching payload and read access to that
+graph. It looks for an authenticated projection of the requested policy through
+`prov:wasGeneratedBy` or `prov:used`. The operation can
 name at most one reuse target, and qualifying links must agree on the projection.
 A generating edge must agree with the record's receipt. If neither link identifies
 a projection, replay checks `ev:availabilityReceipt` to recover a created
-projection whose generating edge was withdrawn. A link owned by a live support
-of the output's current review policy cannot identify the publication on its own. After support
-records have been cleared, format 2 cannot distinguish a fully copied publication
-from the original. Both are subject to the same replay checks.
+projection whose generating edge was withdrawn. After support records have been
+cleared, format 2 cannot distinguish a fully copied publication from the original.
+Both are subject to the same replay checks.
 
 A different payload returns `409 idempotency-conflict`. Ambiguous legacy publishers,
 a missing or ambiguous projection association, or missing or ambiguous receipt

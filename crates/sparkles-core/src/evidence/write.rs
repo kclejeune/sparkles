@@ -1607,6 +1607,29 @@ impl<'a> Reads<'a> {
         let Some(gid) = self.id(g)? else {
             return Ok((Vec::new(), false));
         };
+        self.quads_by_prefix(&[gid.0], limit, held)
+    }
+
+    /// The bounded, charged quads of one subject in one graph.
+    pub fn subject_quads_up_to(
+        &mut self,
+        s: &str,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<StoredQuad>, bool)> {
+        let (Some(g), Some(s)) = (self.id(g)?, self.id(s)?) else {
+            return Ok((Vec::new(), false));
+        };
+        self.quads_by_prefix(&[g.0, s.0], limit, held)
+    }
+
+    fn quads_by_prefix(
+        &self,
+        prefix: &[u64],
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<StoredQuad>, bool)> {
         const ROW: u64 = std::mem::size_of::<[Id; 4]>() as u64;
         const CHUNK: usize = 4096;
         const OUT_ROW: u64 = std::mem::size_of::<StoredQuad>() as u64;
@@ -1614,24 +1637,26 @@ impl<'a> Reads<'a> {
         let mut rows_held = self.preparation.reserve(0)?;
         let mut rows: Vec<[Id; 4]> = Vec::new();
         let mut more = false;
-        self.preparation
-            .scan(self.snap, Perm::Gspo, &[gid.0], |q| {
-                if rows.len() == limit {
-                    more = true;
-                    return Ok(false);
-                }
-                if rows.len() == rows.capacity() {
-                    rows_held.grow_by(CHUNK as u64 * ROW)?;
-                    rows.reserve_exact(CHUNK);
-                }
-                rows.push(q);
-                Ok(true)
-            })?;
+        self.preparation.scan(self.snap, Perm::Gspo, prefix, |q| {
+            if rows.len() == limit {
+                more = true;
+                return Ok(false);
+            }
+            if rows.len() == rows.capacity() {
+                let add = limit.saturating_sub(rows.len()).clamp(1, CHUNK);
+                rows_held.grow_by(add as u64 * ROW)?;
+                rows.reserve_exact(add);
+            }
+            rows.push(q);
+            Ok(true)
+        })?;
         let mut out: Vec<StoredQuad> = Vec::new();
+        let total = rows.len();
         for q in rows {
             if out.len() == out.capacity() {
-                held.grow_by(OUT_CHUNK as u64 * OUT_ROW)?;
-                out.reserve_exact(OUT_CHUNK);
+                let add = total.saturating_sub(out.len()).clamp(1, OUT_CHUNK);
+                held.grow_by(add as u64 * OUT_ROW)?;
+                out.reserve_exact(add);
             }
             let subject = self.preparation.with_term(self.snap, q[0], |t| match t {
                 Some(Term::NamedNode(n)) => {
@@ -2066,25 +2091,6 @@ impl<'a> Reads<'a> {
                 payload_digest_pred,
                 |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::STRING && l.value().parse::<Sha256Digest>().is_ok()),
             )?)
-    }
-
-    /// Whether this output has record history and could be the former publisher of
-    /// the keyed operation. Withdrawal of a shared link can leave just its description.
-    pub fn has_keyed_operation_in_output(
-        &mut self,
-        op: &NamedNode,
-        key: &str,
-        graph: &str,
-        nonce: Option<Uuid>,
-        dataset_id: Uuid,
-    ) -> Result<bool> {
-        Ok(self.contains(
-            op.as_str(),
-            &format!("{EV}idempotencyKey"),
-            &string(key),
-            graph,
-        )? && self.described_output_operation(graph, nonce, dataset_id, op)?
-            && self.has_published_operation_in_output(graph, nonce)?)
     }
 
     /// Whether the named record bears a receipt for an operation in this graph.
