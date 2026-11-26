@@ -414,9 +414,19 @@ pub fn ask(
     } else if let Some(c) = a.claims.take()
         && out["outcome"] == "answered"
     {
-        out["claims"] = c["claims"].clone();
+        let mut policy = serde_json::Map::new();
+        if !c["claims"].is_null() {
+            out["claims"] = c["claims"].clone();
+            policy.insert("claims".into(), c["claims"].clone());
+        }
         if !c["resolution"].is_null() {
             out["resolution"] = c["resolution"].clone();
+            policy.insert("resolution".into(), c["resolution"].clone());
+        }
+        // when no summary event ran, publish the checked policy metadata on a terminal
+        // event so SSE streams receive claims and resolution before usage (C25)
+        if out.get("summary").is_none() && !policy.is_empty() {
+            (a.on)("policy", &Value::Object(policy));
         }
     }
     // an event stream learns of the endings without their own event here
@@ -2304,16 +2314,19 @@ impl Asking<'_, '_> {
         } else {
             None
         };
-        let listed: Vec<String> = claims
-            .as_ref()
-            .map(|c| prompts::claim_ids(&c["claims"]))
-            .unwrap_or_default();
-        if let Some(c) = &claims
-            && !c["claims"].is_null()
-        {
+        let has_claims = claims.as_ref().is_some_and(|c| !c["claims"].is_null());
+        let listed: Vec<String> = if has_claims {
+            claims
+                .as_ref()
+                .map(|c| prompts::claim_ids(&c["claims"]))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if has_claims && let Some(c) = &claims {
             user.push_str(&prompts::claims_context(&c["claims"]));
         }
-        let schema = if claims.is_some() {
+        let schema = if has_claims {
             prompts::summary_with_claims()
         } else {
             prompts::summary()
@@ -2322,7 +2335,7 @@ impl Asking<'_, '_> {
         let called = self.call(
             Role::Summarize,
             &Prompt::plain(
-                if claims.is_some() {
+                if has_claims {
                     prompts::SUMMARY_WITH_CLAIMS_SYSTEM
                 } else {
                     prompts::SUMMARY_SYSTEM
@@ -2341,7 +2354,7 @@ impl Asking<'_, '_> {
                 let raw = value["text"].as_str().unwrap_or("");
                 let mut text = prompts::drop_markers(raw, sent.max(1));
                 if claims.is_some() {
-                    // a claim marker names a listed occurrence or is removed
+                    // a claim marker names a listed occurrence or is removed (C25)
                     text = prompts::drop_claim_markers(&text, &listed);
                 }
                 let mut citations: Vec<u64> = prompts::markers(&text);
@@ -2362,20 +2375,22 @@ impl Asking<'_, '_> {
                     "model": pair.model,
                 });
                 if let Some(c) = &claims {
-                    let mut cited: Vec<String> = prompts::claim_markers(&text)
-                        .into_iter()
-                        .filter(|id| listed.contains(id))
-                        .collect();
-                    for id in value["claimCitations"].as_array().into_iter().flatten() {
-                        if let Some(id) = id.as_str()
-                            && listed.iter().any(|l| l == id)
-                            && !cited.iter().any(|x| x == id)
-                            && text.contains(&format!("[{id}]"))
-                        {
-                            cited.push(id.to_string());
+                    if has_claims {
+                        let mut cited: Vec<String> = prompts::claim_markers(&text)
+                            .into_iter()
+                            .filter(|id| listed.contains(id))
+                            .collect();
+                        for id in value["claimCitations"].as_array().into_iter().flatten() {
+                            if let Some(id) = id.as_str()
+                                && listed.iter().any(|l| l == id)
+                                && !cited.iter().any(|x| x == id)
+                                && text.contains(&format!("[{id}]"))
+                            {
+                                cited.push(id.to_string());
+                            }
                         }
+                        s["claimCitations"] = json!(cited);
                     }
-                    s["claimCitations"] = json!(cited);
                     // the same view, read again with the caller's grants of now: any
                     // difference withholds the answer before it is published
                     let seeds = self.claim_seeds.clone();
@@ -2386,7 +2401,12 @@ impl Asking<'_, '_> {
                             return None;
                         }
                     }
-                    s["claims"] = c["claims"].clone();
+                    if has_claims {
+                        s["claims"] = c["claims"].clone();
+                    }
+                    if !c["resolution"].is_null() {
+                        s["resolution"] = c["resolution"].clone();
+                    }
                     self.claims = Some(c.clone());
                 }
                 if citations.is_empty() {
@@ -2394,10 +2414,11 @@ impl Asking<'_, '_> {
                     self.notes.push("the summary cites no row".into());
                 }
                 self.emit("summary", &s);
-                if claims.is_some()
-                    && let Some(m) = s.as_object_mut()
-                {
-                    m.remove("claims");
+                if let Some(m) = s.as_object_mut() {
+                    if has_claims {
+                        m.remove("claims");
+                    }
+                    m.remove("resolution");
                 }
                 Some(s)
             }
