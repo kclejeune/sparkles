@@ -19,6 +19,7 @@ pub(crate) struct Shared<'a> {
     pub aggregate_errors: crate::sparql::AggregateErrors,
     pub geo_op_vertices: u64,
     pub change_log: Option<Arc<ChangeLog>>,
+    pub managed: Option<Arc<arc_swap::ArcSwapOption<crate::managed::ManagedState>>>,
 }
 
 /// A [`Snapshot`] under construction (see the module documentation).
@@ -55,6 +56,8 @@ impl SnapshotBuilder {
             mask: None,
             history_charge: None,
             change_log: shared.change_log,
+            managed: shared.managed,
+            pinned_evidence: None,
         })
     }
 
@@ -84,6 +87,8 @@ impl SnapshotBuilder {
             mask: None,
             history_charge: None,
             change_log: base.change_log.clone(),
+            managed: base.managed.clone(),
+            pinned_evidence: None,
         })
     }
 
@@ -165,6 +170,7 @@ impl Store {
             aggregate_errors: self.opts.aggregate_errors,
             geo_op_vertices: self.opts.geo_op_vertices,
             change_log: self.changelog.clone(),
+            managed: Some(self.family.managed.clone()),
         }
     }
 

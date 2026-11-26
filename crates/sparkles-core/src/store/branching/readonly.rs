@@ -821,6 +821,7 @@ impl Store {
                     aggregate_errors: set.opts.aggregate_errors,
                     geo_op_vertices: set.opts.geo_op_vertices,
                     change_log: Some(log.value),
+                    managed: Some(self.family.managed.clone()),
                 },
                 generation,
                 metadata.seq,

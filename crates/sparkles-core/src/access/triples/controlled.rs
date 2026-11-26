@@ -195,12 +195,22 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
             }
         }
     }
-    let Some(rules) = access.triples.as_ref().filter(|_| hides) else {
+    let rules = access.triples.as_ref().filter(|_| hides);
+    let ev_config = snap.evidence_projection_config();
+    let ev_active = match &ev_config {
+        Some(cfg) => cfg.has_applicable_output(&access, snap, preparation)?,
+        None => false,
+    };
+    if rules.is_none() && !ev_active {
         // A policy that hides no triples keeps an existing mask, which only hides more.
         preparation.check()?;
         return finish(access, snap.clone(), held, preparation, input);
-    };
-    let (key, key_held) = cache_key(&access, rules, preparation)?;
+    }
+    let ev_fp = ev_active
+        .then(|| ev_config.as_ref().map(|c| c.fingerprint.as_str()))
+        .flatten();
+    let (key, key_held) =
+        cache_key_with_evidence(&access, rules.map(Arc::as_ref), ev_fp, preparation)?;
     if let Some(mask) = &snap.mask {
         // A mask left by another policy could show triples this policy hides, so only
         // this exact policy's own mask can be returned as its prepared view.
@@ -232,7 +242,46 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
     }
     // Build outside the slot lock. User progress and controlled provider helpers
     // never execute while this cache lock is owned. A cold race may build twice.
-    let hidden = hidden(&access, rules, snap, preparation)?;
+    let mut hidden = match rules {
+        Some(rules) => hidden(&access, rules, snap, preparation)?,
+        None => Buffer::new(preparation)?,
+    };
+    if ev_active && let Some(cfg) = &ev_config {
+        let limits = rules.map_or_else(Limits::default, |r| r.limits);
+        let mut extra = Buffer::new(preparation)?;
+        evidence::append_hidden(
+            &access,
+            &hidden,
+            cfg,
+            snap,
+            &limits,
+            preparation,
+            &mut extra,
+        )?;
+        if !extra.is_empty() {
+            if hidden.len().saturating_add(extra.len()) as u64 > limits.max_hidden {
+                return Err(too_many(
+                    &limits,
+                    hidden.len().saturating_add(extra.len()) as u64,
+                ));
+            }
+            for &k in extra.iter() {
+                hidden.push(k)?;
+            }
+            drop(extra);
+            preparation.stage("ordering permission mask")?;
+            crate::access::preparation::sort_keys(&mut hidden, preparation)?;
+            let mut kept = 0;
+            for index in 0..hidden.len() {
+                preparation.check()?;
+                if kept == 0 || hidden[kept - 1] != hidden[index] {
+                    hidden.swap(kept, index);
+                    kept += 1;
+                }
+            }
+            hidden.truncate(kept);
+        }
+    }
     let (snapshot, derived) = apply_controlled(snap, hidden, &key, preparation)?;
     held.merge(derived);
     preparation.check()?;
@@ -489,12 +538,13 @@ fn bind_graphs(
     Ok((Graphs::Only(rule), held))
 }
 
-fn cache_key(
+fn cache_key_with_evidence(
     access: &GraphAccess,
-    rules: &TripleRules,
+    rules: Option<&TripleRules>,
+    evidence_fingerprint: Option<&str>,
     preparation: &Preparation,
 ) -> Result<(String, Reservation)> {
-    key::serialize(access, rules, preparation)
+    key::serialize_with_evidence(access, rules, evidence_fingerprint, preparation)
 }
 
 fn closure(
@@ -1114,6 +1164,14 @@ mod tests {
     use crate::task::{Control, Progress};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    fn cache_key(
+        access: &GraphAccess,
+        rules: &TripleRules,
+        preparation: &Preparation,
+    ) -> Result<(String, Reservation)> {
+        cache_key_with_evidence(access, Some(rules), None, preparation)
+    }
 
     fn view() -> GraphAccess {
         GraphAccess::with_triples(

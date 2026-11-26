@@ -362,16 +362,14 @@ impl super::Store {
         // grant can take the free granules first, so a refused estimate retries
         // once with the room the grant already covers.
         let (allowance, mut held) = selection.reserve_available()?;
-        let (snapshot, charge) = if inherited {
+        let (snapshot, resolved_seq, charge) = if inherited {
             let (snapshot, resolved, _, charge) =
                 self.snapshot_at_prepared(logical, at, &selection, allowance)?;
-            drop(resolved);
-            (snapshot, charge)
+            (snapshot, resolved.commit.seq, charge)
         } else {
             let (snapshot, resolved, charge) =
                 logical.snapshot_at_inner(at, &selection, Some(allowance))?;
-            drop(resolved);
-            (snapshot, charge)
+            (snapshot, resolved.commit.seq, charge)
         };
         if snapshot.mask.is_some() {
             return Err(Error::invalid(
@@ -394,6 +392,11 @@ impl super::Store {
         // Read temporaries are gone. Keep the actual selected snapshot and its
         // remaining credit coupled before any permission-mask construction.
         held.release_to(retained);
+        let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+            self.pin_historical_evidence(logical, at, resolved_seq, snapshot, &selection)?
+        } else {
+            snapshot
+        };
         let selected = PreparedRead {
             snapshot,
             identity: Arc::downgrade(&policy),

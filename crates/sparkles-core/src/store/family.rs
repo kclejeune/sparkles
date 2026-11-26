@@ -17,8 +17,9 @@ pub(crate) struct Family {
     pub(crate) gate: Arc<FamilyGate>,
     /// The managed-graph registry every member admits its commits against (see
     /// [`crate::managed`]). One registry serves main and every branch, including those
-    /// created before it was enabled, so they cannot diverge.
-    pub(crate) managed: arc_swap::ArcSwapOption<crate::managed::ManagedState>,
+    /// created before it was enabled, so they cannot diverge. Shared with snapshots via
+    /// `Arc` without retaining `Family` or its root process lock.
+    pub(crate) managed: Arc<arc_swap::ArcSwapOption<crate::managed::ManagedState>>,
     /// The durable source holds of main and every branch (see [`crate::holds`]).
     pub(crate) holds: crate::holds::FamilyHolds,
     /// Selection made under this opening's actual root process exclusion. This
@@ -36,7 +37,7 @@ impl Family {
         }
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
-            managed: arc_swap::ArcSwapOption::empty(),
+            managed: Arc::new(arc_swap::ArcSwapOption::empty()),
             holds: Default::default(),
             origin,
             _owner_lock: owner_lock,

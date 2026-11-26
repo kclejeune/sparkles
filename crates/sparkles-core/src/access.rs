@@ -783,9 +783,16 @@ impl GraphAccess {
     /// Prefer [`crate::store::Store::prepare_read`] or [`Self::masked_controlled`] for
     /// budgeted read paths so mask storage stays bound to a [`Preparation`].
     pub fn masked(&self, snap: &Arc<Snapshot>) -> Result<Arc<Snapshot>> {
-        match self.triples.as_ref().filter(|t| t.hides()) {
-            Some(t) if snap.mask.is_none() => triples::masked(self, t, snap),
-            _ => Ok(snap.clone()),
+        if snap.mask.is_some() {
+            return Ok(snap.clone());
+        }
+        let rules = self.triples.as_ref().filter(|t| t.hides());
+        if rules.is_some()
+            || (!self.reads_everything() && snap.evidence_projection_config().is_some())
+        {
+            triples::masked(self, rules.map(Arc::as_ref), snap)
+        } else {
+            Ok(snap.clone())
         }
     }
 

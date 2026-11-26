@@ -662,6 +662,12 @@ pub struct Snapshot {
     pub(crate) history_charge: Option<Arc<caches::BudgetHold>>,
     /// the store's change log, which history queries read (see [`ChangeLog`])
     pub change_log: Option<Arc<ChangeLog>>,
+    /// Live family managed-graph registry, shared without holding `Family` or its lock.
+    pub(crate) managed: Option<Arc<arc_swap::ArcSwapOption<crate::managed::ManagedState>>>,
+    /// Pinned historical evidence visibility config resolved from configuration history.
+    /// `Some(None)` means the historical configuration had no active review policies.
+    pub(crate) pinned_evidence:
+        Option<Option<Arc<crate::access::triples::evidence::ProjectionConfig>>>,
 }
 
 /// The kind of term an id stands for (see [`Snapshot::term_kind`]).
@@ -718,6 +724,20 @@ pub enum Chunk<'a> {
 }
 
 impl Snapshot {
+    /// Active evidence review-policy configuration governing support-aware visibility of
+    /// accepted projections on this snapshot, if any.
+    pub(crate) fn evidence_projection_config(
+        &self,
+    ) -> Option<Arc<crate::access::triples::evidence::ProjectionConfig>> {
+        if let Some(pinned) = &self.pinned_evidence {
+            return pinned.clone();
+        }
+        let state = self.managed.as_ref()?.load_full()?;
+        match state.as_ref() {
+            crate::managed::ManagedState::Installed(installed) => installed.evidence_visibility(),
+            crate::managed::ManagedState::Unavailable { .. } => None,
+        }
+    }
     /// Whether this snapshot carries a triple-level access mask.
     pub fn has_mask(&self) -> bool {
         self.mask.is_some()
@@ -2413,6 +2433,7 @@ impl Store {
                         aggregate_errors: opts.aggregate_errors,
                         geo_op_vertices: opts.geo_op_vertices,
                         change_log: changelog.clone(),
+                        managed: Some(family.managed.clone()),
                     },
                     gen_,
                     root.seq,
@@ -2960,6 +2981,7 @@ impl Store {
                         aggregate_errors: opts.aggregate_errors,
                         geo_op_vertices: opts.geo_op_vertices,
                         change_log: changelog.clone(),
+                        managed: Some(family.managed.clone()),
                     },
                     gen_,
                     head.seq,
@@ -3375,6 +3397,20 @@ impl Store {
         o: &crate::history::HistoryOptions,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
         let (snap, resolved, _) = self.snapshot_at_inner(at, o, None)?;
+        let snap = if !matches!(at, crate::history::At::Head) && self.configuration_activated() {
+            let control = crate::task::Control {
+                deadline: o.deadline,
+                ..o.cancel.clone().map_or_else(
+                    crate::task::Control::none,
+                    crate::task::Control::with_cancel,
+                )
+            };
+            let prep =
+                crate::access::Preparation::new(control, crate::evidence::resolve::MEMORY_BYTES)?;
+            self.pin_historical_evidence(self, at, resolved.commit.seq, snap, &prep)?
+        } else {
+            snap
+        };
         Ok((snap, resolved))
     }
 
@@ -8832,6 +8868,7 @@ pub(crate) fn replay_wal(
             aggregate_errors: Default::default(),
             geo_op_vertices: StoreOptions::default().geo_op_vertices,
             change_log: None,
+            managed: None,
         },
         from.generation.clone(),
         0,

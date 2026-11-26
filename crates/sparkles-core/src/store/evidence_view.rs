@@ -314,13 +314,23 @@ impl Store {
             managed_history::resolve_memory(published, configuration, &selection)?
         };
         selection.check()?;
+        let pinned = crate::access::triples::evidence::ProjectionConfig::from_generation(
+            configuration,
+            &document.value.owners,
+            &document.value.owner_settings,
+            &selection,
+        )?;
+        let snapshot = Arc::new(Snapshot {
+            pinned_evidence: Some(pinned),
+            ..(*pair.snapshot).clone()
+        });
         Ok(BoundEvidenceView {
             inner: Arc::new(BoundInner {
                 family: Arc::downgrade(&self.family),
                 dataset_id: self.owner_dataset_id(),
                 logical_branch: pair.logical_branch,
                 serving_branch: pair.serving_branch,
-                snapshot: pair.snapshot,
+                snapshot,
                 commit: pair.commit,
                 requested: pair.requested,
                 selected_by: pair.selected_by,
@@ -536,6 +546,103 @@ impl Store {
         Err(managed_history::unavailable(
             "configuration origin has no acyclic retained source",
         ))
+    }
+
+    /// When configuration history is activated and `at` selects a historical state or
+    /// named snapshot, pin the resolved historical evidence visibility configuration onto
+    /// `snapshot` so support-aware projection visibility uses the exact policies and
+    /// protection nonces recorded at that state rather than current live settings.
+    pub(super) fn pin_historical_evidence(
+        &self,
+        store: &Store,
+        at: &At,
+        seq: u64,
+        snapshot: Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<Arc<Snapshot>> {
+        if matches!(at, At::Head) || !self.configuration_activated() {
+            return Ok(snapshot);
+        }
+        let Some(state) = self.managed_state_shared() else {
+            return Ok(snapshot);
+        };
+        let ManagedState::Installed(installed) = state.as_ref() else {
+            return Ok(snapshot);
+        };
+        let Some(history) = installed.configuration_history.as_ref() else {
+            return Ok(snapshot);
+        };
+        let binding = match at {
+            At::Snapshot(name) => {
+                let pinned = if let Some(h) = &store.history {
+                    let h = preparation.lock(h)?;
+                    h.pins.get(name).and_then(|pin| pin.configuration.clone())
+                } else if let Some(h) = &store.mem_history {
+                    let h = preparation.lock(h)?;
+                    h.pins
+                        .get(name)
+                        .and_then(|(pin, _)| pin.configuration.clone())
+                } else {
+                    None
+                };
+                match pinned {
+                    Some(cfg) => cfg.binding,
+                    None => ConfigurationBinding::LegacyUnbound,
+                }
+            }
+            At::Commit(_) | At::Time(_) => {
+                let result = if !self.is_branch() {
+                    self.configuration_of_branch(store, seq, preparation)
+                } else {
+                    store.configuration_binding_at(seq, preparation)
+                };
+                match result {
+                    Ok(b) => b,
+                    Err(e @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
+                        return Err(e);
+                    }
+                    Err(_) => return Ok(snapshot),
+                }
+            }
+            At::Head => return Ok(snapshot),
+        };
+        let Some(configuration) = binding.configuration() else {
+            return Ok(snapshot);
+        };
+        let document = if let Some(root) = self.managed_root() {
+            managed_history::resolve(
+                &root,
+                self.owner_dataset_id(),
+                history,
+                configuration,
+                preparation,
+            )
+        } else if let Some(published) = installed.history_memory.as_ref() {
+            if published.prepared.identity == history.identity(self.owner_dataset_id()) {
+                managed_history::resolve_memory(published, configuration, preparation)
+            } else {
+                return Ok(snapshot);
+            }
+        } else {
+            return Ok(snapshot);
+        };
+        let document = match document {
+            Ok(doc) => doc,
+            Err(e @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
+                return Err(e);
+            }
+            Err(_) => return Ok(snapshot),
+        };
+        let pinned = crate::access::triples::evidence::ProjectionConfig::from_generation(
+            configuration,
+            &document.value.owners,
+            &document.value.owner_settings,
+            preparation,
+        )?;
+        Ok(Arc::new(Snapshot {
+            pinned_evidence: Some(pinned),
+            ..(*snapshot).clone()
+        }))
     }
 }
 
