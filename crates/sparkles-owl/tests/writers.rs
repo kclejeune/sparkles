@@ -787,7 +787,7 @@ fn obo_lossy_reporting_and_strict_refusal() {
     .unwrap_err();
     assert!(matches!(err, WriteError::Unsupported(_)), "{err:?}");
 
-    // Carriage return in tag text refused cleanly
+    // Carriage return in tag text refused in strict mode and skipped cleanly in lenient mode
     let cr_ax = [
         Axiom::declaration(Entity::Class(cls("A"))),
         Axiom::new(AxiomKind::AnnotationAssertion(
@@ -800,10 +800,19 @@ fn obo_lossy_reporting_and_strict_refusal() {
         &r,
         &Header::default(),
         cr_ax.iter(),
-        WriteOptions::default(),
+        WriteOptions { strict: true },
     )
     .unwrap_err();
     assert!(matches!(err, WriteError::Unsupported(_)), "{err:?}");
+    let (cr_obo, cr_rep) = obo::document(
+        &r,
+        &Header::default(),
+        cr_ax.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(cr_rep.skipped_count, 1, "{cr_rep:?}");
+    assert!(obo::parse(&cr_obo).is_ok());
 }
 
 // ============================================================ OBO Graphs JSON ===
@@ -1314,10 +1323,12 @@ fn manchester_w3c_syntax_undeclared_data_props_prefixes_and_edge_cases() {
     }
 }
 
-/// Independent validator for OBO 1.4 stanza single-cardinality and header subsetdef/synonymtypedef rules.
+/// Independent validator for OBO 1.4 stanza single-cardinality, unique stanza IDs across
+/// frame types, URL-as-ID scheme rules, and header subsetdef/synonymtypedef declarations.
 fn assert_valid_obo_structure(obo_text: &str) {
     let mut header_subsets = BTreeSet::new();
     let mut header_syn_types = BTreeSet::new();
+    let mut seen_stanza_ids = BTreeSet::new();
     let mut in_stanza = false;
     let mut single_counts: std::collections::BTreeMap<String, usize> = Default::default();
     for line in obo_text.lines() {
@@ -1342,6 +1353,12 @@ fn assert_valid_obo_structure(obo_text: &str) {
                 header_syn_types.insert(id.to_string());
             }
         } else {
+            if tag == "id" {
+                assert!(
+                    seen_stanza_ids.insert(val.to_string()),
+                    "OBO 1.4 stanza ID '{val}' duplicated across stanzas:\n{obo_text}"
+                );
+            }
             if matches!(
                 tag,
                 "name"
@@ -1350,6 +1367,8 @@ fn assert_valid_obo_structure(obo_text: &str) {
                     | "comment"
                     | "created_by"
                     | "creation_date"
+                    | "domain"
+                    | "range"
                     | "instance_of"
             ) {
                 let c = single_counts.entry(tag.to_string()).or_insert(0);
@@ -1425,8 +1444,12 @@ fn obo_asymmetry_shadowing_cardinality_escaping_typedef_and_strictness() {
             )))
     );
 
-    // 2. IDSPACE shadowing OBO PURL + standard prefix shadowing + non-http/https/urn IRIs + .obo header IRI
-    let custom_r = Renderer::new([("GO", "https://example.org/go/")]);
+    // 2. IDSPACE shadowing OBO PURL + standard prefix shadowing + idspace-backed doi + .obo header IRI
+    let custom_r = Renderer::new([
+        ("GO", "https://example.org/go/"),
+        ("DOI", "doi:"),
+        ("EXURL", "http://example.org/"),
+    ]);
     let mut header = Header {
         iri: Some(iri(obo_iri("test.obo"))),
         ..Default::default()
@@ -1453,17 +1476,21 @@ fn obo_asymmetry_shadowing_cardinality_escaping_typedef_and_strictness() {
     let go_obo = Class::new(obo_iri("GO_0000001"));
     let go_custom = Class::new("https://example.org/go/0000001");
     let rdf_obo = Class::new(obo_iri("rdf_1"));
-    let ftp_cls = Class::new("ftp://example.org/cls/1");
-    let file_cls = Class::new("file:///tmp/onto#C1");
+    let doi_obo = Class::new(obo_iri("doi_1"));
+    let data_obo = Class::new(obo_iri("data_0006"));
+    let geo_obo = Class::new(obo_iri("geo_0001"));
     let doi_cls = Class::new("doi:10.1234/abc");
+    let nested_scheme_cls = Class::new("http://example.org/ref/http://other");
     let bang_cls = Class::new("https://example.org/A!B");
     let shadow_axioms = vec![
         Axiom::declaration(Entity::Class(go_obo.clone())),
         Axiom::declaration(Entity::Class(go_custom.clone())),
         Axiom::declaration(Entity::Class(rdf_obo.clone())),
-        Axiom::declaration(Entity::Class(ftp_cls.clone())),
-        Axiom::declaration(Entity::Class(file_cls.clone())),
+        Axiom::declaration(Entity::Class(doi_obo.clone())),
+        Axiom::declaration(Entity::Class(data_obo.clone())),
+        Axiom::declaration(Entity::Class(geo_obo.clone())),
         Axiom::declaration(Entity::Class(doi_cls.clone())),
+        Axiom::declaration(Entity::Class(nested_scheme_cls.clone())),
         Axiom::declaration(Entity::Class(bang_cls.clone())),
         Axiom::sub_class_of(go_obo.clone(), go_custom.clone()),
         Axiom::sub_class_of(bang_cls.clone(), rdf_obo.clone()),
@@ -1874,20 +1901,34 @@ fn obographs_property_types_punning_strict_values_io_error_and_bounds() {
     assert_eq!(hdr_rep.skipped_header_count, 1);
     assert!(!hdr_rep.is_lossless());
 
-    // 4. WriteError::Io preserved on failing Write sink
-    struct FailWriter;
-    impl Write for FailWriter {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "simulated broken pipe",
-            ))
+    // 4. WriteError::Io preserved when failing INSIDE serde_json::to_writer
+    struct FailAfter {
+        remaining: usize,
+        failed: bool,
+    }
+    impl Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                self.failed = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated broken pipe inside serde_json",
+                ));
+            }
+            let take = buf.len().min(self.remaining);
+            self.remaining -= take;
+            Ok(take)
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let mut fw = FailWriter;
+    // "{\n  \"graphs\" : [ {\n    \"id\" : " is 31 bytes; failing at byte 34 triggers inside
+    // write_json_str's serde_json::to_writer call writing "\"http://ex.org/g\"".
+    let mut fw = FailAfter {
+        remaining: 34,
+        failed: false,
+    };
     let err = obographs::write_document(
         &mut fw,
         &renderer(),
@@ -1899,9 +1940,10 @@ fn obographs_property_types_punning_strict_values_io_error_and_bounds() {
         WriteOptions::default(),
     )
     .unwrap_err();
+    assert!(fw.failed);
     assert!(
         matches!(err, WriteError::Io(_)),
-        "expected WriteError::Io, got {err:?}"
+        "expected WriteError::Io from serde_json::to_writer, got {err:?}"
     );
 
     // 5. MAX_REPORTED_SKIPPED bound & deep unsupported axiom bound
@@ -1933,4 +1975,665 @@ fn obographs_property_types_punning_strict_values_io_error_and_bounds() {
         .unwrap_err();
         assert!(matches!(err, WriteError::Unsupported(_)), "{err:?}");
     }
+}
+
+// ================================================== Round 2 Regression Tests ===
+
+#[test]
+fn owx_pn_prefix_unicode_boundary_and_doctype_comments_and_trailing_declaration() {
+    // 1. U+00AA ('ª') is Unicode alphabetic but outside W3C PN_CHARS_BASE (starts at U+00C0);
+    // U+00C0 ('À') is valid PN_CHARS_BASE.
+    let r = Renderer::new([
+        ("\u{00AA}", "http://invalid-pn.example/"),
+        ("\u{00C0}", "http://valid-pn.example/"),
+    ]);
+    let axioms = [
+        Axiom::declaration(Entity::Class(Class::new("http://invalid-pn.example/Thing"))),
+        Axiom::declaration(Entity::Class(Class::new("http://valid-pn.example/Thing"))),
+    ];
+    let xml = owx::document(&r, &Header::default(), axioms.iter()).unwrap();
+    assert!(
+        !xml.contains("name=\"\u{00AA}\""),
+        "U+00AA must not be emitted as <Prefix>: {xml}"
+    );
+    assert!(
+        xml.contains("IRI=\"http://invalid-pn.example/Thing\""),
+        "invalid prefix IRI must fall back to full IRI: {xml}"
+    );
+    assert!(
+        xml.contains("name=\"\u{00C0}\""),
+        "U+00C0 is valid PN_PREFIX: {xml}"
+    );
+    assert!(xml.contains("abbreviatedIRI=\"\u{00C0}:Thing\""), "{xml}");
+    let back = owx::parse(&xml).unwrap();
+    assert_eq!(back.axioms, axioms);
+
+    // 2. DTD internal subset containing a comment with an apostrophe must parse cleanly.
+    let dtd_comment = r#"<!DOCTYPE Ontology [<!-- that's fine -->]><Ontology xmlns="http://www.w3.org/2002/07/owl#"/>"#;
+    assert!(
+        owx::parse(dtd_comment).is_ok(),
+        "apostrophe inside DTD comment must not start a quoted literal"
+    );
+
+    // 3. Trailing <!DOCTYPE>, in-element <!DOCTYPE>, and duplicate prolog <!DOCTYPE> must be rejected.
+    let trailing_dtd = r#"<Ontology xmlns="http://www.w3.org/2002/07/owl#"/><!DOCTYPE Ontology>"#;
+    assert!(owx::parse(trailing_dtd).is_err());
+    let inner_dtd =
+        r#"<Ontology xmlns="http://www.w3.org/2002/07/owl#"><!DOCTYPE Ontology></Ontology>"#;
+    assert!(owx::parse(inner_dtd).is_err());
+    let dup_dtd = r#"<!DOCTYPE Ontology><!DOCTYPE Ontology><Ontology xmlns="http://www.w3.org/2002/07/owl#"/>"#;
+    assert!(owx::parse(dup_dtd).is_err());
+}
+
+#[test]
+fn manchester_punned_object_keys_depth_boundary_prefixes_and_blank_nodes() {
+    // 1. Undeclared IRI punned as ObjectProperty + DataProperty:
+    // (a) Object-only HasKey(:C (:p) ()) + DataSomeValuesFrom(:p xsd:string) must not turn into data key.
+    let obj_key_pun = [
+        Axiom::new(AxiomKind::HasKey(
+            cls("C").into(),
+            [op("p").into()].into_iter().collect(),
+            BTreeSet::new(),
+        )),
+        Axiom::sub_class_of(
+            cls("D"),
+            ClassExpression::DataSomeValuesFrom(
+                vec![dp("p")],
+                DataRange::Datatype(Datatype::new(vocab::XSD_STRING)),
+            ),
+        ),
+    ];
+    assert!(matches!(
+        manchester::document(
+            &renderer(),
+            &Header::default(),
+            obj_key_pun.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (omn_k, rep_k) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        obj_key_pun.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_k.skipped_count, 1, "{rep_k:?}");
+    let back_k = manchester::parse_document(&omn_k).unwrap();
+    assert!(
+        !back_k
+            .axioms
+            .iter()
+            .any(|a| matches!(a.kind, AxiomKind::HasKey(_, _, ref dps) if !dps.is_empty())),
+        "object key must never silently become a data key:\n{omn_k}"
+    );
+
+    // (b) Unqualified ObjectMinCardinality(1, :p, None) + DataHasValue(:p "x") must not turn into DataMinCardinality.
+    let obj_card_pun = [
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::ObjectMinCardinality(1, op("p").into(), None),
+        ),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::DataHasValue(dp("p"), Literal::simple("x")),
+        ),
+    ];
+    assert!(matches!(
+        manchester::document(
+            &renderer(),
+            &Header::default(),
+            obj_card_pun.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (omn_c, rep_c) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        obj_card_pun.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_c.skipped_count, 1, "{rep_c:?}");
+    let back_c = manchester::parse_document(&omn_c).unwrap();
+    assert!(
+        !back_c.axioms.iter().any(|a| matches!(
+            a.kind,
+            AxiomKind::SubClassOf(_, ClassExpression::DataMinCardinality(..))
+        )),
+        "ObjectMinCardinality must never corrupt to DataMinCardinality:\n{omn_c}"
+    );
+
+    // (c) N-ary EquivalentObjectProperties + DataHasValue on all members must not corrupt to EquivalentDataProperties.
+    let nary_obj_pun = [
+        Axiom::new(AxiomKind::EquivalentObjectProperties(
+            [op("p1").into(), op("p2").into(), op("p3").into()]
+                .into_iter()
+                .collect(),
+        )),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::DataHasValue(dp("p1"), Literal::simple("a")),
+        ),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::DataHasValue(dp("p2"), Literal::simple("b")),
+        ),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::DataHasValue(dp("p3"), Literal::simple("c")),
+        ),
+    ];
+    assert!(matches!(
+        manchester::document(
+            &renderer(),
+            &Header::default(),
+            nary_obj_pun.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+
+    // (d) Unambiguous ObjectSomeValuesFrom(:p :D) + DataHasValue(:p "x") with NO declarations must
+    // synthesize both ObjectProperty: :p and DataProperty: :p frames and parse cleanly.
+    let unambig_pun = [
+        Axiom::sub_class_of(cls("C"), ClassExpression::some(op("p"), cls("D"))),
+        Axiom::sub_class_of(
+            cls("C"),
+            ClassExpression::DataHasValue(dp("p"), Literal::simple("x")),
+        ),
+    ];
+    let (omn_u, rep_u) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        unambig_pun.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep_u.is_lossless(), "{rep_u:?}");
+    assert!(omn_u.contains("ObjectProperty: :p"), "{omn_u}");
+    assert!(omn_u.contains("DataProperty: :p"), "{omn_u}");
+    let back_u = manchester::parse_document(&omn_u).unwrap();
+    for expected in &unambig_pun {
+        assert!(
+            back_u.axioms.contains(expected),
+            "missing {expected:?} in:\n{omn_u}"
+        );
+    }
+
+    // 2. 64/65-complement (and 127-complement MAX_NESTING) boundary for class & data expressions
+    for n in [64usize, 65, 127] {
+        let mut ce = ClassExpression::Class(cls("A"));
+        let mut dr = DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER));
+        for _ in 0..n {
+            ce = ClassExpression::not(ce);
+            dr = DataRange::ComplementOf(Box::new(dr));
+        }
+        let axioms = [
+            Axiom::declaration(Entity::Class(cls("A"))),
+            Axiom::declaration(Entity::Class(cls("B"))),
+            Axiom::declaration(Entity::DataProperty(dp("d"))),
+            Axiom::sub_class_of(cls("B"), ce),
+            Axiom::new(AxiomKind::DataPropertyRange(dp("d"), dr)),
+        ];
+        let (omn, rep) = manchester::document(
+            &renderer(),
+            &Header::default(),
+            axioms.iter(),
+            WriteOptions { strict: true },
+        )
+        .unwrap();
+        assert!(rep.is_lossless(), "n={n}: {rep:?}");
+        let back = manchester::parse_document(&omn)
+            .unwrap_or_else(|e| panic!("n={n} failed to parse back: {e}"));
+        assert_eq!(
+            Document::new(back.header, back.axioms),
+            Document::new(Header::default(), axioms.to_vec()),
+            "n={n}"
+        );
+    }
+    // 128 complements = model depth 129 > MAX_NESTING must be refused
+    let mut over_ce = ClassExpression::Class(cls("A"));
+    for _ in 0..128 {
+        over_ce = ClassExpression::not(over_ce);
+    }
+    let over_ax = Axiom::sub_class_of(cls("B"), over_ce);
+    assert!(matches!(
+        manchester::document(
+            &renderer(),
+            &Header::default(),
+            [&over_ax],
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+
+    // 3. Non-ASCII prefix U+00AA dropped + rebound standard prefix `xsd` retains standard binding
+    let bad_pref_r = Renderer::new([
+        ("\u{00AA}", "http://invalid-pn.example/"),
+        ("xsd", "https://example.org/"),
+    ]);
+    let pref_axioms = [
+        Axiom::declaration(Entity::Class(Class::new("http://invalid-pn.example/Thing"))),
+        Axiom::declaration(Entity::Class(Class::new("https://example.org/Thing"))),
+        Axiom::new(AxiomKind::DataPropertyRange(
+            dp("age"),
+            DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+        )),
+    ];
+    let (omn_p, rep_p) = manchester::document(
+        &bad_pref_r,
+        &Header::default(),
+        pref_axioms.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep_p.is_lossless());
+    assert!(!omn_p.contains("Prefix: \u{00AA}:"), "{omn_p}");
+    assert!(
+        omn_p.contains("Prefix: xsd: <http://www.w3.org/2001/XMLSchema#>"),
+        "{omn_p}"
+    );
+    assert!(
+        !omn_p.contains("Prefix: xsd: <https://example.org/>"),
+        "{omn_p}"
+    );
+    assert!(omn_p.contains("<https://example.org/Thing>"), "{omn_p}");
+    let back_p = manchester::parse_document(&omn_p).unwrap();
+    assert!(
+        back_p
+            .axioms
+            .contains(&Axiom::declaration(Entity::Class(Class::new(
+                "https://example.org/Thing"
+            ))))
+    );
+
+    // 4. Blank node labels: `a` vs `a#b` (comment stripping collision), `a/b`, `a.`, and header anon lenient skip
+    let bnode_collide = [
+        Axiom::class_assertion(cls("C"), Individual::anonymous("a")),
+        Axiom::class_assertion(cls("C"), Individual::anonymous("a#b")),
+        Axiom::class_assertion(cls("C"), Individual::anonymous("a/b")),
+        Axiom::class_assertion(cls("C"), Individual::anonymous("a.")),
+    ];
+    assert!(matches!(
+        manchester::document(
+            &renderer(),
+            &Header::default(),
+            bnode_collide.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (omn_bn, rep_bn) = manchester::document(
+        &renderer(),
+        &Header::default(),
+        bnode_collide.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_bn.written_axioms, 1, "{rep_bn:?}");
+    assert_eq!(rep_bn.skipped_count, 3, "{rep_bn:?}");
+    let back_bn = manchester::parse_document(&omn_bn).unwrap();
+    assert!(back_bn.axioms.contains(&Axiom::class_assertion(
+        cls("C"),
+        Individual::anonymous("a")
+    )));
+    assert!(!omn_bn.contains("a#b") && !omn_bn.contains("a/b") && !omn_bn.contains("a."));
+
+    let mut bad_hdr = Header::default();
+    bad_hdr.annotations.insert(Annotation::new(
+        AnnotationProperty::new(vocab::RDFS_SEE_ALSO),
+        AnnotationValue::Anonymous(AnonymousIndividual::new("a#b")),
+    ));
+    bad_hdr.annotations.insert(Annotation::comment("keep me"));
+    assert!(matches!(
+        manchester::document(
+            &renderer(),
+            &bad_hdr,
+            std::iter::empty::<&Axiom>(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (omn_hdr, rep_hdr) = manchester::document(
+        &renderer(),
+        &bad_hdr,
+        std::iter::empty::<&Axiom>(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_hdr.skipped_header_count, 1, "{rep_hdr:?}");
+    assert!(!rep_hdr.is_lossless());
+    let back_hdr = manchester::parse_document(&omn_hdr).unwrap();
+    assert!(
+        back_hdr
+            .header
+            .annotations
+            .contains(&Annotation::comment("keep me"))
+    );
+}
+
+#[test]
+fn obo_interoperable_ids_typedef_cardinality_escaping_entity_kinds_and_headers() {
+    // 1. Non-HTTP(S) IRIs without a matching idspace must be refused/skipped (OBO 1.4 §5.9.2).
+    for raw in [
+        "doi:10.1234/abc",
+        "ftp://example.org/cls/1",
+        "file:///tmp/onto#C1",
+    ] {
+        let ax = [Axiom::declaration(Entity::Class(Class::new(raw)))];
+        assert!(
+            matches!(
+                obo::document(
+                    &renderer(),
+                    &Header::default(),
+                    ax.iter(),
+                    WriteOptions { strict: true },
+                ),
+                Err(WriteError::Unsupported(_))
+            ),
+            "{raw} must be refused without idspace"
+        );
+        let (_, rep) = obo::document(
+            &renderer(),
+            &Header::default(),
+            ax.iter(),
+            WriteOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rep.skipped_count, 1, "{raw}: {rep:?}");
+    }
+
+    // 2. [Typedef] single-cardinality domain and range (ObjectProperty & AnnotationProperty)
+    let multi_dom_rng_cases = [
+        vec![
+            Axiom::declaration(Entity::ObjectProperty(op("p"))),
+            Axiom::new(AxiomKind::ObjectPropertyDomain(
+                op("p").into(),
+                cls("A").into(),
+            )),
+            Axiom::new(AxiomKind::ObjectPropertyDomain(
+                op("p").into(),
+                cls("B").into(),
+            )),
+        ],
+        vec![
+            Axiom::declaration(Entity::ObjectProperty(op("p"))),
+            Axiom::new(AxiomKind::ObjectPropertyRange(
+                op("p").into(),
+                cls("A").into(),
+            )),
+            Axiom::new(AxiomKind::ObjectPropertyRange(
+                op("p").into(),
+                cls("B").into(),
+            )),
+        ],
+        vec![
+            Axiom::declaration(Entity::AnnotationProperty(ap("a"))),
+            Axiom::new(AxiomKind::AnnotationPropertyDomain(ap("a"), iri(ex("A")))),
+            Axiom::new(AxiomKind::AnnotationPropertyDomain(ap("a"), iri(ex("B")))),
+        ],
+        vec![
+            Axiom::declaration(Entity::AnnotationProperty(ap("a"))),
+            Axiom::new(AxiomKind::AnnotationPropertyRange(ap("a"), iri(ex("A")))),
+            Axiom::new(AxiomKind::AnnotationPropertyRange(ap("a"), iri(ex("B")))),
+        ],
+    ];
+    for case in &multi_dom_rng_cases {
+        assert!(matches!(
+            obo::document(
+                &renderer(),
+                &Header::default(),
+                case.iter(),
+                WriteOptions { strict: true },
+            ),
+            Err(WriteError::Unsupported(_))
+        ));
+        let (obo_text, rep) = obo::document(
+            &renderer(),
+            &Header::default(),
+            case.iter(),
+            WriteOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rep.skipped_count, 1, "{rep:?}");
+        assert_valid_obo_structure(&obo_text);
+    }
+
+    // 3. NBSP boundaries, empty nested dbxref, and carriage return (\r) in strict and lenient modes
+    let nbsp_and_empty_xref = vec![
+        Axiom::declaration(Entity::Class(cls("C"))),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(vocab::RDFS_LABEL),
+            AnnotationSubject::Iri(iri(ex("C"))),
+            AnnotationValue::Literal(Literal::simple("\u{00A0}padded\u{00A0}")),
+        )),
+        Axiom {
+            kind: AxiomKind::AnnotationAssertion(
+                AnnotationProperty::new(IAO_DEFINITION),
+                AnnotationSubject::Iri(iri(ex("C"))),
+                AnnotationValue::Literal(Literal::simple("def with empty xref")),
+            ),
+            annotations: [Annotation::new(
+                AnnotationProperty::new(OIO_HAS_DBXREF),
+                AnnotationValue::Literal(Literal::simple("")),
+            )]
+            .into_iter()
+            .collect(),
+        },
+    ];
+    let (obo_esc, rep_esc) = obo::document(
+        &renderer(),
+        &Header::default(),
+        nbsp_and_empty_xref.iter(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep_esc.is_lossless(), "{rep_esc:?}");
+    let back_esc = obo::parse(&obo_esc).unwrap();
+    assert_eq!(
+        Document::new(back_esc.header, back_esc.axioms),
+        Document::new(Header::default(), nbsp_and_empty_xref)
+    );
+
+    let cr_axioms = [
+        Axiom::declaration(Entity::Class(cls("C"))),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            AnnotationProperty::new(vocab::RDFS_LABEL),
+            AnnotationSubject::Iri(iri(ex("C"))),
+            AnnotationValue::Literal(Literal::simple("bad\rlabel")),
+        )),
+    ];
+    assert!(matches!(
+        obo::document(
+            &renderer(),
+            &Header::default(),
+            cr_axioms.iter(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (obo_cr, rep_cr) = obo::document(
+        &renderer(),
+        &Header::default(),
+        cr_axioms.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_cr.skipped_count, 1, "{rep_cr:?}");
+    assert!(obo::parse(&obo_cr).is_ok());
+
+    // 4. Cross-stanza entity-kind conflicts: Class+NamedIndividual, ObjectProperty+AnnotationProperty,
+    // and same-axiom ClassAssertion(:X :X)
+    let kind_conflicts: Vec<Vec<Axiom>> = vec![
+        vec![
+            Axiom::declaration(Entity::Class(cls("X"))),
+            Axiom::declaration(Entity::NamedIndividual(NamedIndividual::new(ex("X")))),
+        ],
+        vec![
+            Axiom::declaration(Entity::ObjectProperty(op("p"))),
+            Axiom::declaration(Entity::AnnotationProperty(ap("p"))),
+        ],
+        vec![Axiom::class_assertion(cls("X"), ind("X"))],
+        vec![Axiom::new(AxiomKind::ObjectPropertyDomain(
+            op("p").into(),
+            cls("p").into(),
+        ))],
+    ];
+    for case in &kind_conflicts {
+        assert!(matches!(
+            obo::document(
+                &renderer(),
+                &Header::default(),
+                case.iter(),
+                WriteOptions { strict: true },
+            ),
+            Err(WriteError::Unsupported(_))
+        ));
+        let (obo_k, rep_k) = obo::document(
+            &renderer(),
+            &Header::default(),
+            case.iter(),
+            WriteOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rep_k.skipped_count, 1, "{case:?}: {rep_k:?}");
+        assert_valid_obo_structure(&obo_k);
+    }
+
+    // 5. Reserved header fields: URL-shaped owl:versionInfo, hasOBOFormatVersion "1.4",
+    // non-HTTP(S) versionIRI, and non-HTTP(S) ontology IRI (`did:example:demo`)
+    let mut hdr_ok = Header {
+        iri: Some(iri("https://example.org/onto")),
+        ..Default::default()
+    };
+    hdr_ok.annotations.insert(Annotation::new(
+        AnnotationProperty::new(vocab::OWL_VERSION_INFO),
+        AnnotationValue::Literal(Literal::simple("https://example.org/releases/v2")),
+    ));
+    hdr_ok.annotations.insert(Annotation::new(
+        AnnotationProperty::new(obo::OIO_HAS_OBO_FORMAT_VERSION),
+        AnnotationValue::Literal(Literal::simple("1.4")),
+    ));
+    let (obo_h, rep_h) = obo::document(
+        &renderer(),
+        &hdr_ok,
+        std::iter::empty::<&Axiom>(),
+        WriteOptions { strict: true },
+    )
+    .unwrap();
+    assert!(rep_h.is_lossless(), "{rep_h:?}");
+    let back_h = obo::parse(&obo_h).unwrap();
+    assert_eq!(back_h.header, hdr_ok, "{obo_h}");
+
+    for bad_hdr in [
+        Header {
+            iri: Some(iri("did:example:demo")),
+            ..Default::default()
+        },
+        Header {
+            iri: Some(iri("https://example.org/onto")),
+            version_iri: Some(iri("urn:example:v2")),
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            obo::document(
+                &renderer(),
+                &bad_hdr,
+                std::iter::empty::<&Axiom>(),
+                WriteOptions { strict: true },
+            ),
+            Err(WriteError::Unsupported(_))
+        ));
+        let (_, rep_bad) = obo::document(
+            &renderer(),
+            &bad_hdr,
+            std::iter::empty::<&Axiom>(),
+            WriteOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rep_bad.skipped_header_count, 1, "{rep_bad:?}");
+        assert!(!rep_bad.is_lossless());
+    }
+}
+
+#[test]
+fn obographs_same_axiom_punning_stub_nodes_and_reserved_imports_header() {
+    // 1. Same-axiom kind collisions: ClassAssertion(:X :X) and ObjectPropertyDomain(:p :p)
+    for case in [
+        vec![Axiom::class_assertion(cls("X"), ind("X"))],
+        vec![Axiom::new(AxiomKind::ObjectPropertyDomain(
+            op("p").into(),
+            cls("p").into(),
+        ))],
+    ] {
+        assert!(matches!(
+            obographs::document(
+                &renderer(),
+                &Header::default(),
+                case.iter(),
+                WriteOptions { strict: true },
+            ),
+            Err(WriteError::Unsupported(_))
+        ));
+        let (json_text, rep) = obographs::document(
+            &renderer(),
+            &Header::default(),
+            case.iter(),
+            WriteOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rep.skipped_count, 1, "{case:?}: {rep:?}");
+        assert_valid_obographs_schema(&json_text);
+        let parsed = obographs::parse(&json_text).unwrap();
+        assert!(parsed.axioms.is_empty(), "{json_text}");
+    }
+
+    // 2. Lenient skipped AnnotationAssertion on undeclared IRI must not leave an empty stub node
+    let undecl_typed = [Axiom::new(AxiomKind::AnnotationAssertion(
+        ap("count"),
+        AnnotationSubject::Iri(iri(ex("Ghost"))),
+        AnnotationValue::Literal(Literal::typed("7", vocab::XSD_INTEGER)),
+    ))];
+    let (json_stub, rep_stub) = obographs::document(
+        &renderer(),
+        &Header::default(),
+        undecl_typed.iter(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_stub.skipped_count, 1);
+    assert!(
+        !json_stub.contains("Ghost"),
+        "skipped annotation on undeclared IRI must not create a stub node:\n{json_stub}"
+    );
+
+    // 3. Header annotation with reserved predicate owl:imports must not silently become an import
+    let mut imp_hdr = Header::default();
+    imp_hdr.annotations.insert(Annotation::new(
+        AnnotationProperty::new(vocab::OWL_IMPORTS),
+        AnnotationValue::Literal(Literal::simple("not an iri")),
+    ));
+    assert!(matches!(
+        obographs::document(
+            &renderer(),
+            &imp_hdr,
+            std::iter::empty::<&Axiom>(),
+            WriteOptions { strict: true },
+        ),
+        Err(WriteError::Unsupported(_))
+    ));
+    let (json_imp, rep_imp) = obographs::document(
+        &renderer(),
+        &imp_hdr,
+        std::iter::empty::<&Axiom>(),
+        WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(rep_imp.skipped_header_count, 1, "{rep_imp:?}");
+    let back_imp = obographs::parse(&json_imp).unwrap();
+    assert!(back_imp.header.imports.is_empty());
 }

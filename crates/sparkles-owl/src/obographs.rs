@@ -344,6 +344,30 @@ fn node_compatible(
     true
 }
 
+fn nodes_compatible(
+    nodes: &BTreeMap<String, NodeEntry>,
+    reqs: &[(&str, NodeType, Option<PropertyType>)],
+) -> bool {
+    for (i, &(id, ty, pt)) in reqs.iter().enumerate() {
+        if !node_compatible(nodes, id, ty, pt) {
+            return false;
+        }
+        for &(oid, oty, opt) in &reqs[i + 1..] {
+            if id == oid {
+                if ty != oty {
+                    return false;
+                }
+                if let (Some(a), Some(b)) = (pt, opt)
+                    && a != b
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn ensure_node_typed(
     nodes: &mut BTreeMap<String, NodeEntry>,
     id: &str,
@@ -492,15 +516,14 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                if !node_compatible(&nodes, sub.as_str(), NodeType::Class, None)
-                    || !node_compatible(
-                        &nodes,
-                        p.as_str(),
-                        NodeType::Property,
-                        Some(PropertyType::Object),
-                    )
-                    || !node_compatible(&nodes, target.as_str(), NodeType::Class, None)
-                {
+                if !nodes_compatible(
+                    &nodes,
+                    &[
+                        (sub.as_str(), NodeType::Class, None),
+                        (p.as_str(), NodeType::Property, Some(PropertyType::Object)),
+                        (target.as_str(), NodeType::Class, None),
+                    ],
+                ) {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -616,20 +639,20 @@ pub fn write_document<'a>(
                             _ => ok = false,
                         }
                         if ok && (!genus_ids.is_empty() || !restrictions.is_empty()) {
-                            let kinds_ok =
-                                node_compatible(&nodes, c.as_str(), NodeType::Class, None)
-                                    && genus_ids
-                                        .iter()
-                                        .all(|g| node_compatible(&nodes, g, NodeType::Class, None))
-                                    && restrictions.iter().all(|(p, f)| {
-                                        node_compatible(
-                                            &nodes,
-                                            p,
-                                            NodeType::Property,
-                                            Some(PropertyType::Object),
-                                        ) && node_compatible(&nodes, f, NodeType::Class, None)
-                                    });
-                            if !kinds_ok {
+                            let mut reqs: Vec<(&str, NodeType, Option<PropertyType>)> =
+                                vec![(c.as_str(), NodeType::Class, None)];
+                            for g in &genus_ids {
+                                reqs.push((g.as_str(), NodeType::Class, None));
+                            }
+                            for (p, f) in &restrictions {
+                                reqs.push((
+                                    p.as_str(),
+                                    NodeType::Property,
+                                    Some(PropertyType::Object),
+                                ));
+                                reqs.push((f.as_str(), NodeType::Class, None));
+                            }
+                            if !nodes_compatible(&nodes, &reqs) {
                                 report.skip_or_err(
                                     options,
                                     renderer,
@@ -870,13 +893,13 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                if !node_compatible(
+                if !nodes_compatible(
                     &nodes,
-                    p.as_str(),
-                    NodeType::Property,
-                    Some(PropertyType::Object),
-                ) || !node_compatible(&nodes, c.as_str(), NodeType::Class, None)
-                {
+                    &[
+                        (p.as_str(), NodeType::Property, Some(PropertyType::Object)),
+                        (c.as_str(), NodeType::Class, None),
+                    ],
+                ) {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -913,13 +936,13 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                if !node_compatible(
+                if !nodes_compatible(
                     &nodes,
-                    p.as_str(),
-                    NodeType::Property,
-                    Some(PropertyType::Object),
-                ) || !node_compatible(&nodes, c.as_str(), NodeType::Class, None)
-                {
+                    &[
+                        (p.as_str(), NodeType::Property, Some(PropertyType::Object)),
+                        (c.as_str(), NodeType::Class, None),
+                    ],
+                ) {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -953,9 +976,13 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                if !node_compatible(&nodes, i.as_str(), NodeType::Individual, None)
-                    || !node_compatible(&nodes, c.as_str(), NodeType::Class, None)
-                {
+                if !nodes_compatible(
+                    &nodes,
+                    &[
+                        (i.as_str(), NodeType::Individual, None),
+                        (c.as_str(), NodeType::Class, None),
+                    ],
+                ) {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -988,15 +1015,14 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                if !node_compatible(&nodes, a.as_str(), NodeType::Individual, None)
-                    || !node_compatible(
-                        &nodes,
-                        p.as_str(),
-                        NodeType::Property,
-                        Some(PropertyType::Object),
-                    )
-                    || !node_compatible(&nodes, b.as_str(), NodeType::Individual, None)
-                {
+                if !nodes_compatible(
+                    &nodes,
+                    &[
+                        (a.as_str(), NodeType::Individual, None),
+                        (p.as_str(), NodeType::Property, Some(PropertyType::Object)),
+                        (b.as_str(), NodeType::Individual, None),
+                    ],
+                ) {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -1049,21 +1075,33 @@ pub fn write_document<'a>(
             )?;
             continue;
         };
-        let node = nodes
-            .entry(siri.as_str().to_string())
-            .or_insert_with(|| NodeEntry {
+        if let Some(node) = nodes.get_mut(siri.as_str()) {
+            if apply_node_annotation(node, p, val, &ax.annotations) {
+                report.written_axioms += 1;
+            } else {
+                report.skip_or_err(
+                    options,
+                    renderer,
+                    ax,
+                    "OBO Graphs JSON cannot represent this AnnotationAssertion",
+                )?;
+            }
+        } else {
+            let mut candidate = NodeEntry {
                 id: siri.as_str().to_string(),
                 ..Default::default()
-            });
-        if apply_node_annotation(node, p, val, &ax.annotations) {
-            report.written_axioms += 1;
-        } else {
-            report.skip_or_err(
-                options,
-                renderer,
-                ax,
-                "OBO Graphs JSON cannot represent this AnnotationAssertion",
-            )?;
+            };
+            if apply_node_annotation(&mut candidate, p, val, &ax.annotations) {
+                nodes.insert(siri.as_str().to_string(), candidate);
+                report.written_axioms += 1;
+            } else {
+                report.skip_or_err(
+                    options,
+                    renderer,
+                    ax,
+                    "OBO Graphs JSON cannot represent this AnnotationAssertion",
+                )?;
+            }
         }
     }
 
@@ -1080,7 +1118,14 @@ pub fn write_document<'a>(
         });
     }
     for ann in &header.annotations {
-        if ann.property.as_str() == vocab::RDFS_COMMENT
+        if ann.property.as_str() == vocab::OWL_IMPORTS {
+            report.skip_header_or_err(
+                options,
+                renderer,
+                ann,
+                "OBO Graphs JSON reserves owl:imports in graph meta basicPropertyValues for ontology imports",
+            )?;
+        } else if ann.property.as_str() == vocab::RDFS_COMMENT
             && ann.annotations.is_empty()
             && let Some(s) = plain_str(&ann.value)
         {

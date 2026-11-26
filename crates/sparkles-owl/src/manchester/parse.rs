@@ -12,6 +12,9 @@ type K = EntityKind;
 
 /// How deeply expressions may nest, as the RDF reader allows.
 const MAX_DEPTH: usize = crate::read::MAX_NESTING;
+/// Syntax-level cap on nested grouping parentheses so pathological `((...))` inputs are
+/// bounded without penalizing semantic depth for parenthesized complements or sub-expressions.
+const MAX_SYNTAX_DEPTH: usize = MAX_DEPTH * 2;
 
 /// The words that are part of the grammar of class expressions and data ranges.
 pub const KEYWORDS: [&str; 14] = [
@@ -65,6 +68,7 @@ pub struct Parser<'v> {
     len: usize,
     v: &'v Vocabulary,
     depth: usize,
+    paren_depth: usize,
 }
 
 impl<'v> Parser<'v> {
@@ -81,6 +85,7 @@ impl<'v> Parser<'v> {
             len,
             v,
             depth: 0,
+            paren_depth: 0,
         }
     }
 
@@ -189,6 +194,17 @@ impl<'v> Parser<'v> {
             return Err(Error::syntax(
                 self.here(),
                 format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn nest_paren(&mut self) -> Result<(), Error> {
+        self.paren_depth += 1;
+        if self.paren_depth > MAX_SYNTAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_SYNTAX_DEPTH} parentheses deep"),
             ));
         }
         Ok(())
@@ -380,32 +396,47 @@ impl<'v> Parser<'v> {
 
     /// `conjunction or conjunction …`
     pub fn description(&mut self) -> Result<Ce, Error> {
-        self.nest()?;
         let first = self.conjunction()?;
-        let mut all = vec![first];
-        while self.eat_word("or") {
-            all.push(self.conjunction()?);
+        if !self.eat_word("or") {
+            return Ok(first);
         }
+        self.nest()?;
+        let mut all = vec![first];
+        let res = (|| {
+            loop {
+                all.push(self.conjunction()?);
+                if !self.eat_word("or") {
+                    break;
+                }
+            }
+            Ok(collapse(all.into_iter().collect(), Ce::ObjectUnionOf))
+        })();
         self.depth -= 1;
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), Ce::ObjectUnionOf)
-        })
+        res
     }
 
     /// `primary and primary …`, with `that` read as `and`.
     fn conjunction(&mut self) -> Result<Ce, Error> {
         let first = self.primary()?;
-        let mut all = vec![first];
-        while self.eat_word("and") || self.eat_word("that") {
-            all.push(self.primary()?);
+        if !(self.eat_word("and") || self.eat_word("that")) {
+            return Ok(first);
         }
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), Ce::ObjectIntersectionOf)
-        })
+        self.nest()?;
+        let mut all = vec![first];
+        let res = (|| {
+            loop {
+                all.push(self.primary()?);
+                if !(self.eat_word("and") || self.eat_word("that")) {
+                    break;
+                }
+            }
+            Ok(collapse(
+                all.into_iter().collect(),
+                Ce::ObjectIntersectionOf,
+            ))
+        })();
+        self.depth -= 1;
+        res
     }
 
     /// Whether a restriction starts at the next token: a property, then a restriction
@@ -428,36 +459,43 @@ impl<'v> Parser<'v> {
     }
 
     fn primary(&mut self) -> Result<Ce, Error> {
+        if self.peek() == Some(&Tok::LParen) {
+            self.nest_paren()?;
+            self.bump();
+            let res = self.description().and_then(|d| {
+                self.expect(Tok::RParen, "')' to close the parenthesis")?;
+                Ok(d)
+            });
+            self.paren_depth -= 1;
+            return res;
+        }
         self.nest()?;
-        let out = if self.eat_word("not") {
-            Ce::ObjectComplementOf(Box::new(self.primary()?))
-        } else if self.peek() == Some(&Tok::LParen) {
-            self.bump();
-            let d = self.description()?;
-            self.expect(Tok::RParen, "')' to close the parenthesis")?;
-            d
-        } else if self.peek() == Some(&Tok::LBrace) {
-            self.bump();
-            let mut is = BTreeSet::new();
-            loop {
-                is.insert(self.individual()?);
-                if self.peek() == Some(&Tok::Comma) {
-                    self.bump();
-                    continue;
+        let res = (|| {
+            if self.eat_word("not") {
+                Ok(Ce::ObjectComplementOf(Box::new(self.primary()?)))
+            } else if self.peek() == Some(&Tok::LBrace) {
+                self.bump();
+                let mut is = BTreeSet::new();
+                loop {
+                    is.insert(self.individual()?);
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                        continue;
+                    }
+                    self.expect(Tok::RBrace, "',' or '}'")?;
+                    break;
                 }
-                self.expect(Tok::RBrace, "',' or '}'")?;
-                break;
+                Ok(Ce::ObjectOneOf(is))
+            } else if self.restriction_ahead() {
+                self.restriction()
+            } else if self.is_name(self.pos) {
+                Ok(Ce::Class(self.class()?))
+            } else {
+                Err(self.expected("a class, a restriction, 'not', '(' or '{'"))
             }
-            Ce::ObjectOneOf(is)
-        } else if self.restriction_ahead() {
-            self.restriction()?
-        } else if self.is_name(self.pos) {
-            Ce::Class(self.class()?)
-        } else {
-            return Err(self.expected("a class, a restriction, 'not', '(' or '{'"));
-        };
+        })();
         self.depth -= 1;
-        Ok(out)
+        res
     }
 
     /// Whether a data range rather than a class expression starts at token `k`.
@@ -596,76 +634,100 @@ impl<'v> Parser<'v> {
 
     /// `dataConjunction or dataConjunction …`
     pub fn data_range(&mut self) -> Result<DataRange, Error> {
-        self.nest()?;
-        let mut all = vec![self.data_conjunction()?];
-        while self.eat_word("or") {
-            all.push(self.data_conjunction()?);
+        let first = self.data_conjunction()?;
+        if !self.eat_word("or") {
+            return Ok(first);
         }
+        self.nest()?;
+        let mut all = vec![first];
+        let res = (|| {
+            loop {
+                all.push(self.data_conjunction()?);
+                if !self.eat_word("or") {
+                    break;
+                }
+            }
+            Ok(collapse(all.into_iter().collect(), DataRange::UnionOf))
+        })();
         self.depth -= 1;
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), DataRange::UnionOf)
-        })
+        res
     }
 
     fn data_conjunction(&mut self) -> Result<DataRange, Error> {
-        let mut all = vec![self.data_primary()?];
-        while self.eat_word("and") {
-            all.push(self.data_primary()?);
+        let first = self.data_primary()?;
+        if !self.eat_word("and") {
+            return Ok(first);
         }
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), DataRange::IntersectionOf)
-        })
+        self.nest()?;
+        let mut all = vec![first];
+        let res = (|| {
+            loop {
+                all.push(self.data_primary()?);
+                if !self.eat_word("and") {
+                    break;
+                }
+            }
+            Ok(collapse(
+                all.into_iter().collect(),
+                DataRange::IntersectionOf,
+            ))
+        })();
+        self.depth -= 1;
+        res
     }
 
     fn data_primary(&mut self) -> Result<DataRange, Error> {
+        if self.peek() == Some(&Tok::LParen) {
+            self.nest_paren()?;
+            self.bump();
+            let res = self.data_range().and_then(|r| {
+                self.expect(Tok::RParen, "')' to close the parenthesis")?;
+                Ok(r)
+            });
+            self.paren_depth -= 1;
+            return res;
+        }
         self.nest()?;
-        let out = if self.eat_word("not") {
-            DataRange::ComplementOf(Box::new(self.data_primary()?))
-        } else if self.peek() == Some(&Tok::LParen) {
-            self.bump();
-            let r = self.data_range()?;
-            self.expect(Tok::RParen, "')' to close the parenthesis")?;
-            r
-        } else if self.peek() == Some(&Tok::LBrace) {
-            self.bump();
-            let mut ls = BTreeSet::new();
-            loop {
-                ls.insert(self.literal()?);
-                if self.peek() == Some(&Tok::Comma) {
-                    self.bump();
-                    continue;
-                }
-                self.expect(Tok::RBrace, "',' or '}'")?;
-                break;
-            }
-            DataRange::OneOf(ls)
-        } else if self.is_name(self.pos) {
-            let d = self.datatype()?;
-            if self.peek() == Some(&Tok::LBracket) {
+        let res = (|| {
+            if self.eat_word("not") {
+                Ok(DataRange::ComplementOf(Box::new(self.data_primary()?)))
+            } else if self.peek() == Some(&Tok::LBrace) {
                 self.bump();
-                let mut fs = BTreeSet::new();
+                let mut ls = BTreeSet::new();
                 loop {
-                    fs.insert(self.facet()?);
+                    ls.insert(self.literal()?);
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                         continue;
                     }
-                    self.expect(Tok::RBracket, "',' or ']'")?;
+                    self.expect(Tok::RBrace, "',' or '}'")?;
                     break;
                 }
-                DataRange::DatatypeRestriction(d, fs)
+                Ok(DataRange::OneOf(ls))
+            } else if self.is_name(self.pos) {
+                let d = self.datatype()?;
+                if self.peek() == Some(&Tok::LBracket) {
+                    self.bump();
+                    let mut fs = BTreeSet::new();
+                    loop {
+                        fs.insert(self.facet()?);
+                        if self.peek() == Some(&Tok::Comma) {
+                            self.bump();
+                            continue;
+                        }
+                        self.expect(Tok::RBracket, "',' or ']'")?;
+                        break;
+                    }
+                    Ok(DataRange::DatatypeRestriction(d, fs))
+                } else {
+                    Ok(DataRange::Datatype(d))
+                }
             } else {
-                DataRange::Datatype(d)
+                Err(self.expected("a datatype, 'not', '(' or '{'"))
             }
-        } else {
-            return Err(self.expected("a datatype, 'not', '(' or '{'"));
-        };
+        })();
         self.depth -= 1;
-        Ok(out)
+        res
     }
 
     fn facet(&mut self) -> Result<FacetRestriction, Error> {

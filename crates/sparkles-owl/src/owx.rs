@@ -100,19 +100,12 @@ fn write_xml_attr(w: &mut dyn Write, s: &str) -> Result<(), WriteError> {
 
 /// Whether `s` is a safe abbreviatedIRI local name (matching [`Renderer::iri`]).
 fn is_local_name(s: &str) -> bool {
-    !s.is_empty()
-        && !s.ends_with('.')
-        && !s.starts_with(['-', '.'])
-        && s.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c))
+    crate::write_common::is_pn_local(s)
 }
 
-/// Whether `s` is a valid OWL/XML `<Prefix name="..."/>` name (`""` or a `PN_PREFIX`
-/// starting with a letter and not ending with `.`).
+/// Whether `s` is a valid OWL/XML `<Prefix name="..."/>` name (`""` or a W3C `PN_PREFIX`).
 fn is_owx_prefix(s: &str) -> bool {
-    s.is_empty()
-        || (s.chars().next().is_some_and(char::is_alphabetic)
-            && !s.ends_with('.')
-            && s.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c)))
+    s.is_empty() || crate::write_common::is_pn_prefix(s)
 }
 
 /// XML 1.0 Namespaces `NCNameStartChar` (`NameStartChar - ':'`).
@@ -815,6 +808,7 @@ enum Event {
     },
     End(String),
     Text(String),
+    Doctype,
     Eof,
 }
 
@@ -1013,7 +1007,33 @@ impl<'a> XmlReader<'a> {
                 let mut depth = 0usize;
                 let mut in_quote: Option<char> = None;
                 let mut closed = false;
-                while let Some(c) = self.bump() {
+                while self.pos < self.src.len() {
+                    if in_quote.is_none() {
+                        if self.starts_with("<!--") {
+                            self.eat("<!--");
+                            while !self.starts_with("-->") {
+                                if self.bump().is_none() {
+                                    return Err(self.err("unterminated XML comment in <!DOCTYPE>"));
+                                }
+                            }
+                            self.eat("-->");
+                            continue;
+                        }
+                        if self.starts_with("<?") {
+                            self.eat("<?");
+                            while !self.starts_with("?>") {
+                                if self.bump().is_none() {
+                                    return Err(self
+                                        .err("unterminated processing instruction in <!DOCTYPE>"));
+                                }
+                            }
+                            self.eat("?>");
+                            continue;
+                        }
+                    }
+                    let Some(c) = self.bump() else {
+                        break;
+                    };
                     if let Some(q) = in_quote {
                         if c == q {
                             in_quote = None;
@@ -1034,7 +1054,7 @@ impl<'a> XmlReader<'a> {
                 if !closed {
                     return Err(self.err("unterminated <!DOCTYPE> declaration"));
                 }
-                continue;
+                return Ok(Event::Doctype);
             }
             if self.starts_with("</") {
                 self.eat("</");
@@ -1156,9 +1176,15 @@ impl<'a> XmlReader<'a> {
     }
 
     fn parse_ontology(&mut self) -> Result<Document, ParseError> {
-        let (attrs, empty) = match self.next_non_ws_event()? {
-            Event::Start { name, attrs, empty } if name == "Ontology" => (attrs, empty),
-            ev => return Err(self.err(format!("expected <Ontology>, got {ev:?}"))),
+        let mut seen_doctype = false;
+        let (attrs, empty) = loop {
+            match self.next_non_ws_event()? {
+                Event::Doctype if !seen_doctype => {
+                    seen_doctype = true;
+                }
+                Event::Start { name, attrs, empty } if name == "Ontology" => break (attrs, empty),
+                ev => return Err(self.err(format!("expected <Ontology>, got {ev:?}"))),
+            }
         };
         if let Some((_, b)) = attrs.iter().find(|(k, _)| k == "xml:base") {
             self.base = oxiri::Iri::parse(b.clone()).ok();

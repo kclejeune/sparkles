@@ -71,25 +71,16 @@ fn is_obo_prefix(s: &str) -> bool {
 
 fn is_obo_local(s: &str) -> bool {
     !s.is_empty()
+        && !s.contains("://")
         && !s.chars().any(|c| {
             c.is_whitespace() || matches!(c, '!' | '{' | '}' | '[' | ']' | '"' | '\\' | ',')
         })
 }
 
-/// Well-known non-hierarchical URI schemes (without `://`) treated as full IRIs rather
-/// than OBO `PREFIX:LOCAL` abbreviations when not declared in `idspaces`.
-fn is_non_hierarchical_iri_scheme(prefix: &str) -> bool {
-    matches!(
-        prefix,
-        "urn" | "mailto" | "tag" | "doi" | "uuid" | "info" | "geo" | "tel" | "data"
-    )
-}
-
-fn is_full_iri_str(id: &str, idspaces: &FxHashMap<String, String>) -> bool {
-    id.contains("://")
-        || id
-            .split_once(':')
-            .is_some_and(|(p, _)| !idspaces.contains_key(p) && is_non_hierarchical_iri_scheme(p))
+/// OBO 1.4 §5.9.2 URL-as-ID: only `http://` and `https://` URLs are valid unprefixed
+/// absolute-IRI identifiers in interoperable OBO 1.4 documents.
+fn is_obo_url_as_id(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
 }
 
 /// Convert an IRI to an OBO 1.4 identifier using standard OBO PURL contraction and
@@ -119,9 +110,9 @@ pub fn iri_to_obo_id(iri: &str, idspaces: &[(String, String)]) -> String {
 }
 
 /// Expand an OBO 1.4 identifier to an IRI using declared `idspace` prefixes and the
-/// standard OBO PURL convention.
+/// standard OBO 1.4 §5.9.2 URL-as-ID (`http://` / `https://`) and OBO PURL rules.
 pub fn obo_id_to_iri(id: &str, idspaces: &FxHashMap<String, String>) -> Result<Iri, String> {
-    if id.contains("://") {
+    if is_obo_url_as_id(id) {
         return parse_iri(id).map_err(|e| e.0);
     }
     if let Some((prefix, local)) = id.split_once(':') {
@@ -132,9 +123,6 @@ pub fn obo_id_to_iri(id: &str, idspaces: &FxHashMap<String, String>) -> Result<I
             if sp == prefix {
                 return parse_iri(&format!("{sns}{local}")).map_err(|e| e.0);
             }
-        }
-        if is_non_hierarchical_iri_scheme(prefix) {
-            return parse_iri(id).map_err(|e| e.0);
         }
         if is_obo_prefix(prefix) && !local.is_empty() {
             return parse_iri(&format!("{OBO_PURL}{prefix}_{local}")).map_err(|e| e.0);
@@ -147,6 +135,26 @@ fn obo_id_roundtrips(iri: &str, obo_id: &str, idspaces: &FxHashMap<String, Strin
     obo_id_to_iri(obo_id, idspaces)
         .ok()
         .is_some_and(|back| back.as_str() == iri)
+}
+
+/// Convert `iri` into an interoperable OBO 1.4 identifier that round-trips back to `iri`,
+/// falling back to the full HTTP(S) URL-as-ID if an abbreviation fails the identity check.
+fn checked_obo_id(
+    iri: &str,
+    match_spaces: &[(String, String)],
+    idspace_map: &FxHashMap<String, String>,
+) -> Option<String> {
+    if iri.contains(['\r', '\n']) {
+        return None;
+    }
+    let id = iri_to_obo_id(iri, match_spaces);
+    if !id.contains(['\r', '\n']) && obo_id_roundtrips(iri, &id, idspace_map) {
+        return Some(id);
+    }
+    if is_obo_url_as_id(iri) && obo_id_roundtrips(iri, iri, idspace_map) {
+        return Some(iri.to_string());
+    }
+    None
 }
 
 /// Derive the OBO `ontology:` short identifier from an ontology IRI only when the IRI
@@ -164,12 +172,33 @@ fn ontology_short_id(iri: &str) -> String {
 }
 
 fn expand_ontology_id(raw: &str) -> Result<Iri, String> {
-    let empty = FxHashMap::default();
-    if is_full_iri_str(raw, &empty) {
+    if is_obo_url_as_id(raw) {
         parse_iri(raw).map_err(|e| e.0)
     } else {
         parse_iri(&format!("{OBO_PURL}{raw}.owl")).map_err(|e| e.0)
     }
+}
+
+fn is_obo_representable_str(s: &str) -> bool {
+    !s.contains('\r')
+}
+
+fn is_non_ascii_whitespace(c: char) -> bool {
+    c.is_whitespace() && !matches!(c, ' ' | '\t' | '\n')
+}
+
+/// Whether `s` can be written losslessly as an unquoted OBO tag value: no carriage return,
+/// and no leading or trailing non-ASCII Unicode whitespace that Unicode-aware trimming
+/// would strip.
+fn is_obo_unquoted_safe(s: &str) -> bool {
+    is_obo_representable_str(s)
+        && !s.chars().next().is_some_and(is_non_ascii_whitespace)
+        && !s.chars().next_back().is_some_and(is_non_ascii_whitespace)
+}
+
+/// Whether `s` can be written losslessly inside a `[xref1, xref2]` dbxref list.
+fn is_obo_xref_safe(s: &str) -> bool {
+    !s.is_empty() && is_obo_unquoted_safe(s)
 }
 
 // ------------------------------------------------------------------ escaping -----
@@ -406,6 +435,42 @@ struct TermStanza {
     creation_date: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OboEntityKind {
+    Term,
+    ObjectTypedef,
+    AnnotationTypedef,
+    Instance,
+}
+
+fn obo_kinds_compatible(
+    entity_kinds: &BTreeMap<String, OboEntityKind>,
+    reqs: &[(&str, OboEntityKind)],
+) -> bool {
+    for (i, &(id, kind)) in reqs.iter().enumerate() {
+        if let Some(&existing) = entity_kinds.get(id)
+            && existing != kind
+        {
+            return false;
+        }
+        for &(other_id, other_kind) in &reqs[i + 1..] {
+            if id == other_id && kind != other_kind {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn register_obo_kinds(
+    entity_kinds: &mut BTreeMap<String, OboEntityKind>,
+    reqs: &[(&str, OboEntityKind)],
+) {
+    for &(id, kind) in reqs {
+        entity_kinds.entry(id.to_string()).or_insert(kind);
+    }
+}
+
 #[derive(Default)]
 struct TypedefStanza {
     id: String,
@@ -418,8 +483,8 @@ struct TypedefStanza {
     subsets: Vec<String>,
     synonyms: Vec<SynonymEntry>,
     xrefs: Vec<String>,
-    domains: Vec<String>,
-    ranges: Vec<String>,
+    domain: Option<String>,
+    range: Option<String>,
     is_asymmetric: bool,
     is_reflexive: bool,
     is_symmetric: bool,
@@ -465,16 +530,18 @@ fn annotations_to_qualifiers(
         let key = if a.property.as_str() == OIO_IS_INFERRED {
             "is_inferred".to_string()
         } else {
-            let k = iri_to_obo_id(a.property.as_str(), idspaces);
-            if !obo_id_roundtrips(a.property.as_str(), &k, idspace_map) {
-                return None;
-            }
-            k
+            checked_obo_id(a.property.as_str(), idspaces, idspace_map)?
         };
         // OBO 1.4 trailing qualifiers carry quoted string values with no datatype or IRI
-        // tag, so only plain xsd:string literals round-trip without losing value kind.
-        let value = plain_string(&a.value)?.to_string();
-        out.push(Qualifier { key, value });
+        // tag, so only plain xsd:string literals without carriage return round-trip.
+        let value = plain_string(&a.value)?;
+        if !is_obo_representable_str(value) {
+            return None;
+        }
+        out.push(Qualifier {
+            key,
+            value: value.to_string(),
+        });
     }
     out.sort();
     Some(out)
@@ -516,26 +583,17 @@ fn annotation_to_pv(
     idspace_map: &FxHashMap<String, String>,
 ) -> Option<PropertyValue> {
     let qualifiers = annotations_to_qualifiers(anns, idspaces, idspace_map)?;
-    let prop = iri_to_obo_id(p.as_str(), idspaces);
-    if !obo_id_roundtrips(p.as_str(), &prop, idspace_map) {
-        return None;
-    }
+    let prop = checked_obo_id(p.as_str(), idspaces, idspace_map)?;
     let val = match v {
         AnnotationValue::Iri(i) => {
-            let id = iri_to_obo_id(i.as_str(), idspaces);
-            if !obo_id_roundtrips(i.as_str(), &id, idspace_map) {
-                return None;
-            }
+            let id = checked_obo_id(i.as_str(), idspaces, idspace_map)?;
             PvValue::Iri(id)
         }
         AnnotationValue::Literal(l) => {
-            if l.language().is_some() {
+            if l.language().is_some() || !is_obo_representable_str(l.value()) {
                 return None;
             }
-            let dt = iri_to_obo_id(l.datatype(), idspaces);
-            if !obo_id_roundtrips(l.datatype(), &dt, idspace_map) {
-                return None;
-            }
+            let dt = checked_obo_id(l.datatype(), idspaces, idspace_map)?;
             PvValue::Literal(l.value().to_string(), dt)
         }
         AnnotationValue::Anonymous(_) => return None,
@@ -584,15 +642,14 @@ pub fn write_document<'a>(
     match_spaces.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
 
     let mut report = WriteReport::default();
+    let mut entity_kinds: BTreeMap<String, OboEntityKind> = BTreeMap::new();
     let mut terms: BTreeMap<String, TermStanza> = BTreeMap::new();
     let mut typedefs: BTreeMap<String, TypedefStanza> = BTreeMap::new();
     let mut instances: BTreeMap<String, InstanceStanza> = BTreeMap::new();
     let mut pending_annotations: Vec<&'a Axiom> = Vec::new();
 
-    let checked_id = |iri: &str| -> Option<String> {
-        let id = iri_to_obo_id(iri, &match_spaces);
-        obo_id_roundtrips(iri, &id, &idspace_map).then_some(id)
-    };
+    let checked_id =
+        |iri: &str| -> Option<String> { checked_obo_id(iri, &match_spaces, &idspace_map) };
 
     // First pass: register declared entities.
     for &ax in &axioms {
@@ -617,6 +674,16 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
+                    if !obo_kinds_compatible(&entity_kinds, &[(&id, OboEntityKind::Term)]) {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                        )?;
+                        continue;
+                    }
+                    register_obo_kinds(&mut entity_kinds, &[(&id, OboEntityKind::Term)]);
                     terms.entry(id.clone()).or_insert_with(|| TermStanza {
                         id,
                         ..Default::default()
@@ -633,6 +700,17 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
+                    if !obo_kinds_compatible(&entity_kinds, &[(&id, OboEntityKind::ObjectTypedef)])
+                    {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                        )?;
+                        continue;
+                    }
+                    register_obo_kinds(&mut entity_kinds, &[(&id, OboEntityKind::ObjectTypedef)]);
                     typedefs.entry(id.clone()).or_insert_with(|| TypedefStanza {
                         id,
                         ..Default::default()
@@ -658,11 +736,40 @@ pub fn write_document<'a>(
                             )?;
                             continue;
                         };
+                        if !obo_kinds_compatible(
+                            &entity_kinds,
+                            &[(&id, OboEntityKind::AnnotationTypedef)],
+                        ) {
+                            report.skip_or_err(
+                                options,
+                                renderer,
+                                ax,
+                                "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                            )?;
+                            continue;
+                        }
+                        register_obo_kinds(
+                            &mut entity_kinds,
+                            &[(&id, OboEntityKind::AnnotationTypedef)],
+                        );
                         let td = typedefs.entry(id.clone()).or_insert_with(|| TypedefStanza {
                             id,
                             ..Default::default()
                         });
                         td.is_metadata_tag = true;
+                    } else if let Some(id) = checked_id(p.as_str())
+                        && !obo_kinds_compatible(
+                            &entity_kinds,
+                            &[(&id, OboEntityKind::AnnotationTypedef)],
+                        )
+                    {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                        )?;
+                        continue;
                     }
                     report.written_axioms += 1;
                 }
@@ -676,6 +783,16 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
+                    if !obo_kinds_compatible(&entity_kinds, &[(&id, OboEntityKind::Instance)]) {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                        )?;
+                        continue;
+                    }
+                    register_obo_kinds(&mut entity_kinds, &[(&id, OboEntityKind::Instance)]);
                     instances
                         .entry(id.clone())
                         .or_insert_with(|| InstanceStanza {
@@ -722,6 +839,20 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [
+                    (sid.as_str(), OboEntityKind::Term),
+                    (sup_id.as_str(), OboEntityKind::Term),
+                ];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 terms
                     .entry(sid.clone())
                     .or_insert_with(|| TermStanza {
@@ -764,6 +895,21 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [
+                    (sid.as_str(), OboEntityKind::Term),
+                    (pid.as_str(), OboEntityKind::ObjectTypedef),
+                    (tid.as_str(), OboEntityKind::Term),
+                ];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 terms
                     .entry(sid.clone())
                     .or_insert_with(|| TermStanza {
@@ -806,6 +952,20 @@ pub fn write_document<'a>(
                             )?;
                             continue;
                         };
+                        let reqs = [
+                            (aid.as_str(), OboEntityKind::Term),
+                            (bid.as_str(), OboEntityKind::Term),
+                        ];
+                        if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                            report.skip_or_err(
+                                options,
+                                renderer,
+                                ax,
+                                "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                            )?;
+                            continue;
+                        }
+                        register_obo_kinds(&mut entity_kinds, &reqs);
                         terms
                             .entry(aid.clone())
                             .or_insert_with(|| TermStanza {
@@ -876,18 +1036,36 @@ pub fn write_document<'a>(
                                     )?;
                                     continue;
                                 }
-                                let entry =
-                                    terms.entry(cid.clone()).or_insert_with(|| TermStanza {
-                                        id: cid,
-                                        ..Default::default()
-                                    });
-                                if entry.has_intersection {
+                                let mut reqs: Vec<(&str, OboEntityKind)> =
+                                    vec![(cid.as_str(), OboEntityKind::Term)];
+                                for (rel, target) in &parsed {
+                                    if let Some(r) = rel {
+                                        reqs.push((r.as_str(), OboEntityKind::ObjectTypedef));
+                                    }
+                                    reqs.push((target.as_str(), OboEntityKind::Term));
+                                }
+                                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                                    report.skip_or_err(
+                                        options,
+                                        renderer,
+                                        ax,
+                                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                                    )?;
+                                    continue;
+                                }
+                                if terms.get(&cid).is_some_and(|e| e.has_intersection) {
                                     report.skip_or_err(options, renderer,
                                         ax,
                                         "OBO 1.4 supports at most one intersection_of logical definition per term",
                                     )?;
                                     continue;
                                 }
+                                register_obo_kinds(&mut entity_kinds, &reqs);
+                                let entry =
+                                    terms.entry(cid.clone()).or_insert_with(|| TermStanza {
+                                        id: cid,
+                                        ..Default::default()
+                                    });
                                 entry.has_intersection = true;
                                 parsed.sort();
                                 entry.intersection_of = parsed;
@@ -924,12 +1102,21 @@ pub fn write_document<'a>(
                                     )?;
                                     continue;
                                 }
-                                let entry =
-                                    terms.entry(cid.clone()).or_insert_with(|| TermStanza {
-                                        id: cid,
-                                        ..Default::default()
-                                    });
-                                if entry.has_union {
+                                let mut reqs: Vec<(&str, OboEntityKind)> =
+                                    vec![(cid.as_str(), OboEntityKind::Term)];
+                                for id in &parsed {
+                                    reqs.push((id.as_str(), OboEntityKind::Term));
+                                }
+                                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                                    report.skip_or_err(
+                                        options,
+                                        renderer,
+                                        ax,
+                                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                                    )?;
+                                    continue;
+                                }
+                                if terms.get(&cid).is_some_and(|e| e.has_union) {
                                     report.skip_or_err(
                                         options,
                                         renderer,
@@ -938,6 +1125,12 @@ pub fn write_document<'a>(
                                     )?;
                                     continue;
                                 }
+                                register_obo_kinds(&mut entity_kinds, &reqs);
+                                let entry =
+                                    terms.entry(cid.clone()).or_insert_with(|| TermStanza {
+                                        id: cid,
+                                        ..Default::default()
+                                    });
                                 entry.has_union = true;
                                 parsed.sort();
                                 entry.union_of = parsed;
@@ -994,6 +1187,20 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
+                    let reqs = [
+                        (aid.as_str(), OboEntityKind::Term),
+                        (bid.as_str(), OboEntityKind::Term),
+                    ];
+                    if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                        )?;
+                        continue;
+                    }
+                    register_obo_kinds(&mut entity_kinds, &reqs);
                     terms
                         .entry(aid.clone())
                         .or_insert_with(|| TermStanza {
@@ -1043,6 +1250,20 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [
+                    (aid.as_str(), OboEntityKind::ObjectTypedef),
+                    (bid.as_str(), OboEntityKind::ObjectTypedef),
+                ];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 typedefs
                     .entry(aid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -1086,6 +1307,21 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
+                    let reqs = [
+                        (sid.as_str(), OboEntityKind::ObjectTypedef),
+                        (p1id.as_str(), OboEntityKind::ObjectTypedef),
+                        (p2id.as_str(), OboEntityKind::ObjectTypedef),
+                    ];
+                    if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                        )?;
+                        continue;
+                    }
+                    register_obo_kinds(&mut entity_kinds, &reqs);
                     typedefs
                         .entry(sid.clone())
                         .or_insert_with(|| TypedefStanza {
@@ -1140,6 +1376,20 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
+                    let reqs = [
+                        (aid.as_str(), OboEntityKind::ObjectTypedef),
+                        (bid.as_str(), OboEntityKind::ObjectTypedef),
+                    ];
+                    if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                        )?;
+                        continue;
+                    }
+                    register_obo_kinds(&mut entity_kinds, &reqs);
                     typedefs
                         .entry(aid.clone())
                         .or_insert_with(|| TypedefStanza {
@@ -1186,6 +1436,20 @@ pub fn write_document<'a>(
                         )?;
                         continue;
                     };
+                    let reqs = [
+                        (aid.as_str(), OboEntityKind::ObjectTypedef),
+                        (bid.as_str(), OboEntityKind::ObjectTypedef),
+                    ];
+                    if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                        report.skip_or_err(
+                            options,
+                            renderer,
+                            ax,
+                            "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                        )?;
+                        continue;
+                    }
+                    register_obo_kinds(&mut entity_kinds, &reqs);
                     typedefs
                         .entry(aid.clone())
                         .or_insert_with(|| TypedefStanza {
@@ -1229,6 +1493,20 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [
+                    (aid.as_str(), OboEntityKind::ObjectTypedef),
+                    (bid.as_str(), OboEntityKind::ObjectTypedef),
+                ];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 typedefs
                     .entry(aid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -1253,14 +1531,36 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [
+                    (pid.as_str(), OboEntityKind::ObjectTypedef),
+                    (cid.as_str(), OboEntityKind::Term),
+                ];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                if typedefs.get(&pid).is_some_and(|td| td.domain.is_some()) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 [Typedef] supports at most one domain tag",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
                         id: pid,
                         ..Default::default()
                     })
-                    .domains
-                    .push(cid);
+                    .domain = Some(cid);
                 report.written_axioms += 1;
             }
             K::ObjectPropertyRange(
@@ -1277,14 +1577,36 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [
+                    (pid.as_str(), OboEntityKind::ObjectTypedef),
+                    (cid.as_str(), OboEntityKind::Term),
+                ];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                if typedefs.get(&pid).is_some_and(|td| td.range.is_some()) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 [Typedef] supports at most one range tag",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
                         id: pid,
                         ..Default::default()
                     })
-                    .ranges
-                    .push(cid);
+                    .range = Some(cid);
                 report.written_axioms += 1;
             }
             K::FunctionalObjectProperty(ObjectPropertyExpression::Property(p))
@@ -1304,6 +1626,17 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [(pid.as_str(), OboEntityKind::ObjectTypedef)];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 let td = typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -1343,6 +1676,20 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [
+                    (aid.as_str(), OboEntityKind::AnnotationTypedef),
+                    (bid.as_str(), OboEntityKind::AnnotationTypedef),
+                ];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 let td = typedefs
                     .entry(aid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -1365,6 +1712,26 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [(pid.as_str(), OboEntityKind::AnnotationTypedef)];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                if typedefs.get(&pid).is_some_and(|td| td.domain.is_some()) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 [Typedef] supports at most one domain tag",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 let td = typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -1373,7 +1740,7 @@ pub fn write_document<'a>(
                         ..Default::default()
                     });
                 td.is_metadata_tag = true;
-                td.domains.push(did);
+                td.domain = Some(did);
                 report.written_axioms += 1;
             }
             K::AnnotationPropertyRange(p, r) if ax.annotations.is_empty() => {
@@ -1387,6 +1754,26 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [(pid.as_str(), OboEntityKind::AnnotationTypedef)];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                if typedefs.get(&pid).is_some_and(|td| td.range.is_some()) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 [Typedef] supports at most one range tag",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 let td = typedefs
                     .entry(pid.clone())
                     .or_insert_with(|| TypedefStanza {
@@ -1395,7 +1782,7 @@ pub fn write_document<'a>(
                         ..Default::default()
                     });
                 td.is_metadata_tag = true;
-                td.ranges.push(rid);
+                td.range = Some(rid);
                 report.written_axioms += 1;
             }
             K::ClassAssertion(ClassExpression::Class(c), Individual::Named(i)) => {
@@ -1420,13 +1807,23 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
-                let inst = instances
-                    .entry(iid.clone())
-                    .or_insert_with(|| InstanceStanza {
-                        id: iid,
-                        ..Default::default()
-                    });
-                if inst.instance_of.is_some() {
+                let reqs = [
+                    (iid.as_str(), OboEntityKind::Instance),
+                    (cid.as_str(), OboEntityKind::Term),
+                ];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                if instances
+                    .get(&iid)
+                    .is_some_and(|inst| inst.instance_of.is_some())
+                {
                     report.skip_or_err(
                         options,
                         renderer,
@@ -1435,6 +1832,13 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 }
+                register_obo_kinds(&mut entity_kinds, &reqs);
+                let inst = instances
+                    .entry(iid.clone())
+                    .or_insert_with(|| InstanceStanza {
+                        id: iid,
+                        ..Default::default()
+                    });
                 inst.instance_of = Some((cid, qs));
                 report.written_axioms += 1;
             }
@@ -1467,6 +1871,21 @@ pub fn write_document<'a>(
                     )?;
                     continue;
                 };
+                let reqs = [
+                    (aid.as_str(), OboEntityKind::Instance),
+                    (pid.as_str(), OboEntityKind::ObjectTypedef),
+                    (bid.as_str(), OboEntityKind::Instance),
+                ];
+                if !obo_kinds_compatible(&entity_kinds, &reqs) {
+                    report.skip_or_err(
+                        options,
+                        renderer,
+                        ax,
+                        "OBO 1.4 prohibits using the same stanza ID for conflicting entity kinds",
+                    )?;
+                    continue;
+                }
+                register_obo_kinds(&mut entity_kinds, &reqs);
                 instances
                     .entry(aid.clone())
                     .or_insert_with(|| InstanceStanza {
@@ -1577,10 +1996,41 @@ pub fn write_document<'a>(
         }
     }
 
-    // --- Stream header ---
-    writeln!(w, "format-version: 1.4")?;
-    let mut header_data_version: Option<String> =
-        header.version_iri.as_ref().map(|v| v.as_str().to_string());
+    // --- Validate & prepare header ---
+    let mut header_data_version: Option<String> = None;
+    if let Some(ver) = &header.version_iri {
+        if is_obo_url_as_id(ver.as_str()) {
+            header_data_version = Some(ver.as_str().to_string());
+        } else {
+            let msg = format!(
+                "OBO 1.4 cannot preserve non-HTTP(S) versionIRI <{}> in data-version:",
+                ver.as_str()
+            );
+            if options.strict {
+                return Err(WriteError::Unsupported(msg));
+            }
+            report.record_skipped_header(msg);
+        }
+    }
+    let mut header_ontology: Option<String> = None;
+    if let Some(iri) = &header.iri {
+        let short = ontology_short_id(iri.as_str());
+        if expand_ontology_id(&short)
+            .ok()
+            .is_some_and(|back| back.as_str() == iri.as_str())
+        {
+            header_ontology = Some(short);
+        } else {
+            let msg = format!(
+                "OBO 1.4 cannot preserve non-HTTP(S) ontology IRI <{}> in ontology:",
+                iri.as_str()
+            );
+            if options.strict {
+                return Err(WriteError::Unsupported(msg));
+            }
+            report.record_skipped_header(msg);
+        }
+    }
     let mut header_date: Option<String> = None;
     let mut header_saved_by: Option<String> = None;
     let mut header_auto_gen: Option<String> = None;
@@ -1591,28 +2041,37 @@ pub fn write_document<'a>(
     for ann in &header.annotations {
         let handled = if ann.annotations.is_empty() {
             match (ann.property.as_str(), plain_string(&ann.value)) {
-                (OIO_HAS_OBO_FORMAT_VERSION, Some("1.4")) => true,
-                (vocab::OWL_VERSION_INFO, Some(s)) if header_data_version.is_none() => {
+                // Only map owl:versionInfo to data-version: when it will not be misread as
+                // a versionIRI (HTTP(S) URL-as-ID) and is safe unquoted.
+                (vocab::OWL_VERSION_INFO, Some(s))
+                    if header_data_version.is_none()
+                        && is_obo_unquoted_safe(s)
+                        && !is_obo_url_as_id(s) =>
+                {
                     header_data_version = Some(s.to_string());
                     true
                 }
-                (OIO_DATE, Some(s)) if header_date.is_none() => {
+                (OIO_DATE, Some(s)) if header_date.is_none() && is_obo_unquoted_safe(s) => {
                     header_date = Some(s.to_string());
                     true
                 }
-                (OIO_SAVED_BY, Some(s)) if header_saved_by.is_none() => {
+                (OIO_SAVED_BY, Some(s)) if header_saved_by.is_none() && is_obo_unquoted_safe(s) => {
                     header_saved_by = Some(s.to_string());
                     true
                 }
-                (OIO_AUTO_GENERATED_BY, Some(s)) if header_auto_gen.is_none() => {
+                (OIO_AUTO_GENERATED_BY, Some(s))
+                    if header_auto_gen.is_none() && is_obo_unquoted_safe(s) =>
+                {
                     header_auto_gen = Some(s.to_string());
                     true
                 }
-                (OIO_DEFAULT_NAMESPACE, Some(s)) if header_default_ns.is_none() => {
+                (OIO_DEFAULT_NAMESPACE, Some(s))
+                    if header_default_ns.is_none() && is_obo_unquoted_safe(s) =>
+                {
                     header_default_ns = Some(s.to_string());
                     true
                 }
-                (vocab::RDFS_COMMENT, Some(s)) => {
+                (vocab::RDFS_COMMENT, Some(s)) if is_obo_unquoted_safe(s) => {
                     header_remarks.push(s.to_string());
                     true
                 }
@@ -1640,6 +2099,9 @@ pub fn write_document<'a>(
             }
         }
     }
+
+    // --- Stream header ---
+    writeln!(w, "format-version: 1.4")?;
     if let Some(dv) = &header_data_version {
         writeln!(w, "data-version: {}", escape_obo_text(dv)?)?;
     }
@@ -1671,12 +2133,8 @@ pub fn write_document<'a>(
     for r in &header_remarks {
         writeln!(w, "remark: {}", escape_obo_text(r)?)?;
     }
-    if let Some(iri) = &header.iri {
-        writeln!(
-            w,
-            "ontology: {}",
-            escape_obo_id(&ontology_short_id(iri.as_str()))?
-        )?;
+    if let Some(onto) = &header_ontology {
+        writeln!(w, "ontology: {}", escape_obo_id(onto)?)?;
     }
     header_pvs.sort();
     for pv in &header_pvs {
@@ -1846,12 +2304,10 @@ pub fn write_document<'a>(
         for x in &td.xrefs {
             writeln!(w, "xref: {}", escape_obo_text(x)?)?;
         }
-        td.domains.sort();
-        for d in &td.domains {
+        if let Some(d) = &td.domain {
             writeln!(w, "domain: {}", escape_obo_id(d)?)?;
         }
-        td.ranges.sort();
-        for r in &td.ranges {
+        if let Some(r) = &td.range {
             writeln!(w, "range: {}", escape_obo_id(r)?)?;
         }
         if td.is_asymmetric {
@@ -2016,6 +2472,7 @@ fn extract_xrefs(anns: &BTreeSet<Annotation>) -> Option<Vec<String>> {
         if a.property.as_str() == OIO_HAS_DBXREF
             && a.annotations.is_empty()
             && let Some(s) = plain_string(&a.value)
+            && is_obo_xref_safe(s)
         {
             xrefs.push(s.to_string());
         } else {
@@ -2049,16 +2506,14 @@ fn parse_synonym_annotations(
         }
         if a.property.as_str() == OIO_HAS_DBXREF
             && let Some(x) = plain_string(&a.value)
+            && is_obo_xref_safe(x)
         {
             xrefs.push(x.to_string());
         } else if a.property.as_str() == OIO_HAS_SYNONYM_TYPE
             && syn_type.is_none()
             && let AnnotationValue::Iri(i) = &a.value
         {
-            let id = iri_to_obo_id(i.as_str(), idspaces);
-            if !obo_id_roundtrips(i.as_str(), &id, idspace_map) {
-                return None;
-            }
+            let id = checked_obo_id(i.as_str(), idspaces, idspace_map)?;
             syn_type = Some(id);
         } else {
             return None;
@@ -2081,6 +2536,7 @@ fn apply_term_annotation(
     }
     if let Some(scope) = synonym_scope(p.as_str())
         && let Some(text) = plain_string(v)
+        && is_obo_representable_str(text)
         && let Some((xrefs, syn_type)) = parse_synonym_annotations(anns, idspaces, idspace_map)
     {
         t.synonyms.push(SynonymEntry {
@@ -2094,6 +2550,7 @@ fn apply_term_annotation(
     if p.as_str() == IAO_DEFINITION
         && t.def.is_none()
         && let Some(text) = plain_string(v)
+        && is_obo_representable_str(text)
         && let Some(xrefs) = extract_xrefs(anns)
     {
         t.def = Some(DefEntry {
@@ -2104,30 +2561,35 @@ fn apply_term_annotation(
     }
     if anns.is_empty() {
         match (p.as_str(), v) {
-            (vocab::RDFS_LABEL, _) if t.name.is_none() && plain_string(v).is_some() => {
+            (vocab::RDFS_LABEL, _)
+                if t.name.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 t.name = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_HAS_OBO_NAMESPACE, _) if t.namespace.is_none() && plain_string(v).is_some() => {
+            (OIO_HAS_OBO_NAMESPACE, _)
+                if t.namespace.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 t.namespace = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_HAS_ALT_ID, _) if plain_string(v).is_some() => {
+            (OIO_HAS_ALT_ID, _) if plain_string(v).is_some_and(is_obo_unquoted_safe) => {
                 t.alt_ids.push(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (vocab::RDFS_COMMENT, _) if t.comment.is_none() && plain_string(v).is_some() => {
+            (vocab::RDFS_COMMENT, _)
+                if t.comment.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 t.comment = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
             (OIO_IN_SUBSET, AnnotationValue::Iri(i)) => {
-                let id = iri_to_obo_id(i.as_str(), idspaces);
-                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                if let Some(id) = checked_obo_id(i.as_str(), idspaces, idspace_map) {
                     t.subsets.push(id);
                     return true;
                 }
             }
-            (OIO_HAS_DBXREF, _) if plain_string(v).is_some() => {
+            (OIO_HAS_DBXREF, _) if plain_string(v).is_some_and(is_obo_unquoted_safe) => {
                 t.xrefs.push(plain_string(v).unwrap().to_string());
                 return true;
             }
@@ -2138,24 +2600,27 @@ fn apply_term_annotation(
                 return true;
             }
             (IAO_REPLACED_BY, AnnotationValue::Iri(i)) => {
-                let id = iri_to_obo_id(i.as_str(), idspaces);
-                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                if let Some(id) = checked_obo_id(i.as_str(), idspaces, idspace_map) {
                     t.replaced_by.push(id);
                     return true;
                 }
             }
             (OIO_CONSIDER, AnnotationValue::Iri(i)) => {
-                let id = iri_to_obo_id(i.as_str(), idspaces);
-                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                if let Some(id) = checked_obo_id(i.as_str(), idspaces, idspace_map) {
                     t.consider.push(id);
                     return true;
                 }
             }
-            (OIO_CREATED_BY, _) if t.created_by.is_none() && plain_string(v).is_some() => {
+            (OIO_CREATED_BY, _)
+                if t.created_by.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 t.created_by = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_CREATION_DATE, _) if t.creation_date.is_none() && plain_string(v).is_some() => {
+            (OIO_CREATION_DATE, _)
+                if t.creation_date.is_none()
+                    && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 t.creation_date = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
@@ -2182,6 +2647,7 @@ fn apply_typedef_annotation(
     }
     if let Some(scope) = synonym_scope(p.as_str())
         && let Some(text) = plain_string(v)
+        && is_obo_representable_str(text)
         && let Some((xrefs, syn_type)) = parse_synonym_annotations(anns, idspaces, idspace_map)
     {
         td.synonyms.push(SynonymEntry {
@@ -2195,6 +2661,7 @@ fn apply_typedef_annotation(
     if p.as_str() == IAO_DEFINITION
         && td.def.is_none()
         && let Some(text) = plain_string(v)
+        && is_obo_representable_str(text)
         && let Some(xrefs) = extract_xrefs(anns)
     {
         td.def = Some(DefEntry {
@@ -2205,30 +2672,35 @@ fn apply_typedef_annotation(
     }
     if anns.is_empty() {
         match (p.as_str(), v) {
-            (vocab::RDFS_LABEL, _) if td.name.is_none() && plain_string(v).is_some() => {
+            (vocab::RDFS_LABEL, _)
+                if td.name.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 td.name = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_HAS_OBO_NAMESPACE, _) if td.namespace.is_none() && plain_string(v).is_some() => {
+            (OIO_HAS_OBO_NAMESPACE, _)
+                if td.namespace.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 td.namespace = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_HAS_ALT_ID, _) if plain_string(v).is_some() => {
+            (OIO_HAS_ALT_ID, _) if plain_string(v).is_some_and(is_obo_unquoted_safe) => {
                 td.alt_ids.push(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (vocab::RDFS_COMMENT, _) if td.comment.is_none() && plain_string(v).is_some() => {
+            (vocab::RDFS_COMMENT, _)
+                if td.comment.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 td.comment = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
             (OIO_IN_SUBSET, AnnotationValue::Iri(i)) => {
-                let id = iri_to_obo_id(i.as_str(), idspaces);
-                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                if let Some(id) = checked_obo_id(i.as_str(), idspaces, idspace_map) {
                     td.subsets.push(id);
                     return true;
                 }
             }
-            (OIO_HAS_DBXREF, _) if plain_string(v).is_some() => {
+            (OIO_HAS_DBXREF, _) if plain_string(v).is_some_and(is_obo_unquoted_safe) => {
                 td.xrefs.push(plain_string(v).unwrap().to_string());
                 return true;
             }
@@ -2239,24 +2711,27 @@ fn apply_typedef_annotation(
                 return true;
             }
             (IAO_REPLACED_BY, AnnotationValue::Iri(i)) => {
-                let id = iri_to_obo_id(i.as_str(), idspaces);
-                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                if let Some(id) = checked_obo_id(i.as_str(), idspaces, idspace_map) {
                     td.replaced_by.push(id);
                     return true;
                 }
             }
             (OIO_CONSIDER, AnnotationValue::Iri(i)) => {
-                let id = iri_to_obo_id(i.as_str(), idspaces);
-                if obo_id_roundtrips(i.as_str(), &id, idspace_map) {
+                if let Some(id) = checked_obo_id(i.as_str(), idspaces, idspace_map) {
                     td.consider.push(id);
                     return true;
                 }
             }
-            (OIO_CREATED_BY, _) if td.created_by.is_none() && plain_string(v).is_some() => {
+            (OIO_CREATED_BY, _)
+                if td.created_by.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 td.created_by = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_CREATION_DATE, _) if td.creation_date.is_none() && plain_string(v).is_some() => {
+            (OIO_CREATION_DATE, _)
+                if td.creation_date.is_none()
+                    && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 td.creation_date = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
@@ -2283,19 +2758,26 @@ fn apply_instance_annotation(
     }
     if anns.is_empty() {
         match (p.as_str(), v) {
-            (vocab::RDFS_LABEL, _) if inst.name.is_none() && plain_string(v).is_some() => {
+            (vocab::RDFS_LABEL, _)
+                if inst.name.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 inst.name = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_HAS_OBO_NAMESPACE, _) if inst.namespace.is_none() && plain_string(v).is_some() => {
+            (OIO_HAS_OBO_NAMESPACE, _)
+                if inst.namespace.is_none()
+                    && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 inst.namespace = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (vocab::RDFS_COMMENT, _) if inst.comment.is_none() && plain_string(v).is_some() => {
+            (vocab::RDFS_COMMENT, _)
+                if inst.comment.is_none() && plain_string(v).is_some_and(is_obo_unquoted_safe) =>
+            {
                 inst.comment = Some(plain_string(v).unwrap().to_string());
                 return true;
             }
-            (OIO_HAS_DBXREF, _) if plain_string(v).is_some() => {
+            (OIO_HAS_DBXREF, _) if plain_string(v).is_some_and(is_obo_unquoted_safe) => {
                 inst.xrefs.push(plain_string(v).unwrap().to_string());
                 return true;
             }
@@ -2374,7 +2856,7 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
                 }
                 "data-version" => {
                     let unesc = unescape_obo(&val);
-                    if is_full_iri_str(&unesc, &idspaces)
+                    if is_obo_url_as_id(&unesc)
                         && let Ok(iri) = parse_iri(&unesc)
                     {
                         header.version_iri = Some(iri);

@@ -5,7 +5,9 @@
 //! frames (`Prefix:`, `Ontology:`, `Import:`, `Annotations:`, `AnnotationProperty:`,
 //! `Datatype:`, `ObjectProperty:`, `DataProperty:`, `Class:`, `Individual:` and the
 //! six misc frames `EquivalentClasses:`, `DisjointClasses:`, `EquivalentProperties:`,
-//! `DisjointProperties:`, `SameIndividual:` and `DifferentIndividuals:`).
+//! `DisjointProperties:`, `SameIndividual:` and `DifferentIndividuals:`). Entity frames
+//! are emitted in sorted IRI order while entries within frame sections and miscellaneous
+//! frames preserve input order, so output is repeatable for a given input order.
 //!
 //! Axioms that Manchester frame syntax cannot represent cleanly—such as general class
 //! inclusions with an anonymous subclass, `HasKey` on an anonymous class expression,
@@ -165,17 +167,14 @@ fn axiom_has_nary_data(ax: &AxiomKind) -> bool {
     }
 }
 
-/// Whether `s` is a valid Manchester prefix name (`""` or a `PN_PREFIX` starting with a
-/// letter so it never lexes as a number).
+/// Whether `s` is a valid Manchester prefix name (`""` or a W3C `PN_PREFIX`).
 fn is_manchester_prefix(s: &str) -> bool {
-    s.is_empty()
-        || (s.chars().next().is_some_and(char::is_alphabetic)
-            && !s.ends_with('.')
-            && s.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c)))
+    s.is_empty() || crate::write_common::is_pn_prefix(s)
 }
 
+/// Whether `label` satisfies W3C SPARQL 1.1 `BLANK_NODE_LABEL` (after `_:`).
 fn is_valid_anon_label(label: &str) -> bool {
-    !label.is_empty() && !label.contains(lex::ends_word)
+    crate::write_common::is_blank_node_label(label)
 }
 
 fn ind_has_invalid_anon(i: &Individual) -> bool {
@@ -272,143 +271,181 @@ fn collect_dr_datatypes(r: &DataRange, dts: &mut BTreeSet<Datatype>) {
     }
 }
 
-fn collect_ce_refs(
-    c: &ClassExpression,
-    ops: &mut BTreeSet<Iri>,
-    dps: &mut BTreeSet<DataProperty>,
-    dts: &mut BTreeSet<Datatype>,
-) {
+#[derive(Default)]
+struct AxiomEntityRefs {
+    classes: BTreeSet<Class>,
+    obj_props: BTreeSet<ObjectProperty>,
+    data_props: BTreeSet<DataProperty>,
+    datatypes: BTreeSet<Datatype>,
+    individuals: BTreeSet<NamedIndividual>,
+}
+
+fn collect_ce_entity_refs(c: &ClassExpression, refs: &mut AxiomEntityRefs) {
     use ClassExpression as C;
     match c {
-        C::Class(_) | C::ObjectOneOf(_) => {}
-        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
-            for x in cs {
-                collect_ce_refs(x, ops, dps, dts);
+        C::Class(cl) => {
+            if !Entity::Class(cl.clone()).is_builtin() {
+                refs.classes.insert(cl.clone());
             }
         }
-        C::ObjectComplementOf(x) => collect_ce_refs(x, ops, dps, dts),
-        C::ObjectSomeValuesFrom(p, f) | C::ObjectAllValuesFrom(p, f) => {
-            ops.insert(p.named().0.clone());
-            collect_ce_refs(f, ops, dps, dts);
+        C::ObjectOneOf(is) => {
+            for i in is {
+                if let Individual::Named(ni) = i {
+                    refs.individuals.insert(ni.clone());
+                }
+            }
         }
-        C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => {
-            ops.insert(p.named().0.clone());
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            for x in cs {
+                collect_ce_entity_refs(x, refs);
+            }
+        }
+        C::ObjectComplementOf(x) => collect_ce_entity_refs(x, refs),
+        C::ObjectSomeValuesFrom(p, f) | C::ObjectAllValuesFrom(p, f) => {
+            let np = p.named();
+            if !Entity::ObjectProperty(np.clone()).is_builtin() {
+                refs.obj_props.insert(np.clone());
+            }
+            collect_ce_entity_refs(f, refs);
+        }
+        C::ObjectHasValue(p, ind) => {
+            let np = p.named();
+            if !Entity::ObjectProperty(np.clone()).is_builtin() {
+                refs.obj_props.insert(np.clone());
+            }
+            if let Individual::Named(ni) = ind {
+                refs.individuals.insert(ni.clone());
+            }
+        }
+        C::ObjectHasSelf(p) => {
+            let np = p.named();
+            if !Entity::ObjectProperty(np.clone()).is_builtin() {
+                refs.obj_props.insert(np.clone());
+            }
         }
         C::ObjectMinCardinality(_, p, f)
         | C::ObjectMaxCardinality(_, p, f)
         | C::ObjectExactCardinality(_, p, f) => {
-            ops.insert(p.named().0.clone());
+            let np = p.named();
+            if !Entity::ObjectProperty(np.clone()).is_builtin() {
+                refs.obj_props.insert(np.clone());
+            }
             if let Some(f) = f {
-                collect_ce_refs(f, ops, dps, dts);
+                collect_ce_entity_refs(f, refs);
             }
         }
         C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
             for p in ps {
-                dps.insert(p.clone());
+                if !Entity::DataProperty(p.clone()).is_builtin() {
+                    refs.data_props.insert(p.clone());
+                }
             }
-            collect_dr_datatypes(r, dts);
+            collect_dr_datatypes(r, &mut refs.datatypes);
         }
         C::DataHasValue(p, _) => {
-            dps.insert(p.clone());
+            if !Entity::DataProperty(p.clone()).is_builtin() {
+                refs.data_props.insert(p.clone());
+            }
         }
         C::DataMinCardinality(_, p, r)
         | C::DataMaxCardinality(_, p, r)
         | C::DataExactCardinality(_, p, r) => {
-            dps.insert(p.clone());
+            if !Entity::DataProperty(p.clone()).is_builtin() {
+                refs.data_props.insert(p.clone());
+            }
             if let Some(r) = r {
-                collect_dr_datatypes(r, dts);
+                collect_dr_datatypes(r, &mut refs.datatypes);
             }
         }
     }
 }
 
-fn ce_has_punned_unqualified_data_card(c: &ClassExpression, obj_iris: &BTreeSet<Iri>) -> bool {
-    use ClassExpression as C;
-    match c {
-        C::Class(_)
-        | C::ObjectOneOf(_)
-        | C::ObjectHasValue(..)
-        | C::ObjectHasSelf(_)
-        | C::DataSomeValuesFrom(..)
-        | C::DataAllValuesFrom(..)
-        | C::DataHasValue(..) => false,
-        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs
-            .iter()
-            .any(|x| ce_has_punned_unqualified_data_card(x, obj_iris)),
-        C::ObjectComplementOf(x) | C::ObjectSomeValuesFrom(_, x) | C::ObjectAllValuesFrom(_, x) => {
-            ce_has_punned_unqualified_data_card(x, obj_iris)
-        }
-        C::ObjectMinCardinality(_, _, f)
-        | C::ObjectMaxCardinality(_, _, f)
-        | C::ObjectExactCardinality(_, _, f) => f
-            .as_deref()
-            .is_some_and(|x| ce_has_punned_unqualified_data_card(x, obj_iris)),
-        C::DataMinCardinality(_, p, None)
-        | C::DataMaxCardinality(_, p, None)
-        | C::DataExactCardinality(_, p, None) => obj_iris.contains(&p.0),
-        C::DataMinCardinality(_, _, Some(_))
-        | C::DataMaxCardinality(_, _, Some(_))
-        | C::DataExactCardinality(_, _, Some(_)) => false,
+fn add_obj_prop_ref(p: &ObjectPropertyExpression, ops: &mut BTreeSet<ObjectProperty>) {
+    let np = p.named();
+    if !Entity::ObjectProperty(np.clone()).is_builtin() {
+        ops.insert(np.clone());
     }
 }
 
-fn collect_axiom_obj_props(ax: &AxiomKind, ops: &mut BTreeSet<Iri>) {
+fn collect_axiom_entity_refs(ax: &AxiomKind, refs: &mut AxiomEntityRefs) {
     use AxiomKind as K;
-    let mut dummy_dp = BTreeSet::new();
-    let mut dummy_dt = BTreeSet::new();
     match ax {
-        K::Declaration(Entity::ObjectProperty(p)) => {
-            ops.insert(p.0.clone());
+        K::Declaration(Entity::Class(c)) => {
+            if !Entity::Class(c.clone()).is_builtin() {
+                refs.classes.insert(c.clone());
+            }
         }
+        K::Declaration(Entity::ObjectProperty(p)) => {
+            if !Entity::ObjectProperty(p.clone()).is_builtin() {
+                refs.obj_props.insert(p.clone());
+            }
+        }
+        K::Declaration(Entity::DataProperty(p)) => {
+            if !Entity::DataProperty(p.clone()).is_builtin() {
+                refs.data_props.insert(p.clone());
+            }
+        }
+        K::Declaration(Entity::Datatype(d)) => {
+            if !is_builtin_manchester_datatype(d.as_str()) {
+                refs.datatypes.insert(d.clone());
+            }
+        }
+        K::Declaration(Entity::NamedIndividual(i)) => {
+            refs.individuals.insert(i.clone());
+        }
+        K::Declaration(Entity::AnnotationProperty(_)) => {}
         K::SubClassOf(a, b) => {
-            collect_ce_refs(a, ops, &mut dummy_dp, &mut dummy_dt);
-            collect_ce_refs(b, ops, &mut dummy_dp, &mut dummy_dt);
+            collect_ce_entity_refs(a, refs);
+            collect_ce_entity_refs(b, refs);
         }
         K::EquivalentClasses(cs) => {
             for c in cs {
-                collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+                collect_ce_entity_refs(c, refs);
             }
         }
         K::DisjointClasses(cs) => {
             for c in cs {
-                collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+                collect_ce_entity_refs(c, refs);
             }
         }
-        K::DisjointUnion(_, cs) => {
-            for c in cs {
-                collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+        K::DisjointUnion(c, cs) => {
+            if !Entity::Class(c.clone()).is_builtin() {
+                refs.classes.insert(c.clone());
+            }
+            for x in cs {
+                collect_ce_entity_refs(x, refs);
             }
         }
         K::SubObjectPropertyOf(sub, sup) => {
             match sub {
                 SubObjectPropertyExpression::Expression(p) => {
-                    ops.insert(p.named().0.clone());
+                    add_obj_prop_ref(p, &mut refs.obj_props);
                 }
                 SubObjectPropertyExpression::Chain(chain) => {
                     for p in chain {
-                        ops.insert(p.named().0.clone());
+                        add_obj_prop_ref(p, &mut refs.obj_props);
                     }
                 }
             }
-            ops.insert(sup.named().0.clone());
+            add_obj_prop_ref(sup, &mut refs.obj_props);
         }
         K::EquivalentObjectProperties(ps) => {
             for p in ps {
-                ops.insert(p.named().0.clone());
+                add_obj_prop_ref(p, &mut refs.obj_props);
             }
         }
         K::DisjointObjectProperties(ps) => {
             for p in ps {
-                ops.insert(p.named().0.clone());
+                add_obj_prop_ref(p, &mut refs.obj_props);
             }
         }
         K::InverseObjectProperties(a, b) => {
-            ops.insert(a.named().0.clone());
-            ops.insert(b.named().0.clone());
+            add_obj_prop_ref(a, &mut refs.obj_props);
+            add_obj_prop_ref(b, &mut refs.obj_props);
         }
         K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
-            ops.insert(p.named().0.clone());
-            collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
+            add_obj_prop_ref(p, &mut refs.obj_props);
+            collect_ce_entity_refs(c, refs);
         }
         K::FunctionalObjectProperty(p)
         | K::InverseFunctionalObjectProperty(p)
@@ -416,48 +453,188 @@ fn collect_axiom_obj_props(ax: &AxiomKind, ops: &mut BTreeSet<Iri>) {
         | K::IrreflexiveObjectProperty(p)
         | K::SymmetricObjectProperty(p)
         | K::AsymmetricObjectProperty(p)
-        | K::TransitiveObjectProperty(p) => {
-            ops.insert(p.named().0.clone());
-        }
-        K::DataPropertyDomain(_, c) | K::ClassAssertion(c, _) => {
-            collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
-        }
-        K::HasKey(c, key_ops, _) => {
-            collect_ce_refs(c, ops, &mut dummy_dp, &mut dummy_dt);
-            for p in key_ops {
-                ops.insert(p.named().0.clone());
+        | K::TransitiveObjectProperty(p) => add_obj_prop_ref(p, &mut refs.obj_props),
+        K::SubDataPropertyOf(a, b) => {
+            if !Entity::DataProperty(a.clone()).is_builtin() {
+                refs.data_props.insert(a.clone());
+            }
+            if !Entity::DataProperty(b.clone()).is_builtin() {
+                refs.data_props.insert(b.clone());
             }
         }
-        K::ObjectPropertyAssertion(p, _, _) | K::NegativeObjectPropertyAssertion(p, _, _) => {
-            ops.insert(p.named().0.clone());
+        K::EquivalentDataProperties(ps) => {
+            for p in ps {
+                if !Entity::DataProperty(p.clone()).is_builtin() {
+                    refs.data_props.insert(p.clone());
+                }
+            }
+        }
+        K::DisjointDataProperties(ps) => {
+            for p in ps {
+                if !Entity::DataProperty(p.clone()).is_builtin() {
+                    refs.data_props.insert(p.clone());
+                }
+            }
+        }
+        K::DataPropertyDomain(p, c) => {
+            if !Entity::DataProperty(p.clone()).is_builtin() {
+                refs.data_props.insert(p.clone());
+            }
+            collect_ce_entity_refs(c, refs);
+        }
+        K::DataPropertyRange(p, dr) => {
+            if !Entity::DataProperty(p.clone()).is_builtin() {
+                refs.data_props.insert(p.clone());
+            }
+            collect_dr_datatypes(dr, &mut refs.datatypes);
+        }
+        K::FunctionalDataProperty(p) => {
+            if !Entity::DataProperty(p.clone()).is_builtin() {
+                refs.data_props.insert(p.clone());
+            }
+        }
+        K::DatatypeDefinition(_, dr) => collect_dr_datatypes(dr, &mut refs.datatypes),
+        K::HasKey(c, key_ops, key_dps) => {
+            collect_ce_entity_refs(c, refs);
+            for p in key_ops {
+                add_obj_prop_ref(p, &mut refs.obj_props);
+            }
+            for p in key_dps {
+                if !Entity::DataProperty(p.clone()).is_builtin() {
+                    refs.data_props.insert(p.clone());
+                }
+            }
+        }
+        K::ClassAssertion(c, i) => {
+            collect_ce_entity_refs(c, refs);
+            if let Individual::Named(ni) = i {
+                refs.individuals.insert(ni.clone());
+            }
+        }
+        K::SameIndividual(is) => {
+            for i in is {
+                if let Individual::Named(ni) = i {
+                    refs.individuals.insert(ni.clone());
+                }
+            }
+        }
+        K::DifferentIndividuals(is) => {
+            for i in is {
+                if let Individual::Named(ni) = i {
+                    refs.individuals.insert(ni.clone());
+                }
+            }
+        }
+        K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => {
+            add_obj_prop_ref(p, &mut refs.obj_props);
+            if let Individual::Named(ni) = a {
+                refs.individuals.insert(ni.clone());
+            }
+            if let Individual::Named(ni) = b {
+                refs.individuals.insert(ni.clone());
+            }
+        }
+        K::DataPropertyAssertion(p, a, _) | K::NegativeDataPropertyAssertion(p, a, _) => {
+            if !Entity::DataProperty(p.clone()).is_builtin() {
+                refs.data_props.insert(p.clone());
+            }
+            if let Individual::Named(ni) = a {
+                refs.individuals.insert(ni.clone());
+            }
         }
         _ => {}
     }
 }
 
-fn axiom_has_punned_data_ambiguity(ax: &AxiomKind, obj_iris: &BTreeSet<Iri>) -> bool {
+fn dr_leading_datatype_punned_with_class(r: &DataRange, class_iris: &BTreeSet<Iri>) -> bool {
+    match r {
+        DataRange::Datatype(d) => class_iris.contains(&d.0),
+        DataRange::ComplementOf(inner) => dr_leading_datatype_punned_with_class(inner, class_iris),
+        DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => rs
+            .iter()
+            .next()
+            .is_some_and(|first| dr_leading_datatype_punned_with_class(first, class_iris)),
+        DataRange::OneOf(_) | DataRange::DatatypeRestriction(..) => false,
+    }
+}
+
+fn ce_has_punned_property_ambiguity(
+    c: &ClassExpression,
+    obj_iris: &BTreeSet<Iri>,
+    data_iris: &BTreeSet<Iri>,
+    class_iris: &BTreeSet<Iri>,
+) -> bool {
+    use ClassExpression as C;
+    match c {
+        C::Class(_)
+        | C::ObjectOneOf(_)
+        | C::ObjectHasValue(..)
+        | C::ObjectHasSelf(_)
+        | C::DataHasValue(..) => false,
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs
+            .iter()
+            .any(|x| ce_has_punned_property_ambiguity(x, obj_iris, data_iris, class_iris)),
+        C::ObjectComplementOf(x) | C::ObjectSomeValuesFrom(_, x) | C::ObjectAllValuesFrom(_, x) => {
+            ce_has_punned_property_ambiguity(x, obj_iris, data_iris, class_iris)
+        }
+        C::ObjectMinCardinality(_, p, None)
+        | C::ObjectMaxCardinality(_, p, None)
+        | C::ObjectExactCardinality(_, p, None) => {
+            matches!(p, ObjectPropertyExpression::Property(op) if data_iris.contains(&op.0))
+        }
+        C::ObjectMinCardinality(_, _, Some(f))
+        | C::ObjectMaxCardinality(_, _, Some(f))
+        | C::ObjectExactCardinality(_, _, Some(f)) => {
+            ce_has_punned_property_ambiguity(f, obj_iris, data_iris, class_iris)
+        }
+        C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
+            ps.iter().any(|p| obj_iris.contains(&p.0))
+                && dr_leading_datatype_punned_with_class(r, class_iris)
+        }
+        C::DataMinCardinality(_, p, None)
+        | C::DataMaxCardinality(_, p, None)
+        | C::DataExactCardinality(_, p, None) => obj_iris.contains(&p.0),
+        C::DataMinCardinality(_, p, Some(r))
+        | C::DataMaxCardinality(_, p, Some(r))
+        | C::DataExactCardinality(_, p, Some(r)) => {
+            obj_iris.contains(&p.0) && dr_leading_datatype_punned_with_class(r, class_iris)
+        }
+    }
+}
+
+fn axiom_has_punned_property_ambiguity(
+    ax: &AxiomKind,
+    obj_iris: &BTreeSet<Iri>,
+    data_iris: &BTreeSet<Iri>,
+    class_iris: &BTreeSet<Iri>,
+) -> bool {
     use AxiomKind as K;
     match ax {
         K::SubClassOf(a, b) => {
-            ce_has_punned_unqualified_data_card(a, obj_iris)
-                || ce_has_punned_unqualified_data_card(b, obj_iris)
+            ce_has_punned_property_ambiguity(a, obj_iris, data_iris, class_iris)
+                || ce_has_punned_property_ambiguity(b, obj_iris, data_iris, class_iris)
         }
         K::EquivalentClasses(cs) => cs
             .iter()
-            .any(|c| ce_has_punned_unqualified_data_card(c, obj_iris)),
+            .any(|c| ce_has_punned_property_ambiguity(c, obj_iris, data_iris, class_iris)),
         K::DisjointClasses(cs) => cs
             .iter()
-            .any(|c| ce_has_punned_unqualified_data_card(c, obj_iris)),
+            .any(|c| ce_has_punned_property_ambiguity(c, obj_iris, data_iris, class_iris)),
         K::DisjointUnion(_, cs) => cs
             .iter()
-            .any(|c| ce_has_punned_unqualified_data_card(c, obj_iris)),
+            .any(|c| ce_has_punned_property_ambiguity(c, obj_iris, data_iris, class_iris)),
         K::ObjectPropertyDomain(_, c)
         | K::ObjectPropertyRange(_, c)
         | K::DataPropertyDomain(_, c)
-        | K::ClassAssertion(c, _) => ce_has_punned_unqualified_data_card(c, obj_iris),
-        K::HasKey(c, _, dps) => {
-            ce_has_punned_unqualified_data_card(c, obj_iris)
+        | K::ClassAssertion(c, _) => {
+            ce_has_punned_property_ambiguity(c, obj_iris, data_iris, class_iris)
+        }
+        K::HasKey(c, ops, dps) => {
+            ce_has_punned_property_ambiguity(c, obj_iris, data_iris, class_iris)
                 || dps.iter().any(|dp| obj_iris.contains(&dp.0))
+                || ops
+                    .iter()
+                    .any(|op| matches!(op, ObjectPropertyExpression::Property(p) if data_iris.contains(&p.0)))
         }
         K::EquivalentDataProperties(ps) if ps.len() > 2 => {
             ps.iter().any(|dp| obj_iris.contains(&dp.0))
@@ -465,68 +642,13 @@ fn axiom_has_punned_data_ambiguity(ax: &AxiomKind, obj_iris: &BTreeSet<Iri>) -> 
         K::DisjointDataProperties(ps) if ps.len() > 2 || ps.has_duplicates() => {
             ps.iter().any(|dp| obj_iris.contains(&dp.0))
         }
+        K::EquivalentObjectProperties(ps) if ps.len() > 2 => ps
+            .iter()
+            .all(|op| matches!(op, ObjectPropertyExpression::Property(p) if data_iris.contains(&p.0))),
+        K::DisjointObjectProperties(ps) if ps.len() > 2 || ps.has_duplicates() => ps
+            .iter()
+            .all(|op| matches!(op, ObjectPropertyExpression::Property(p) if data_iris.contains(&p.0))),
         _ => false,
-    }
-}
-
-fn collect_axiom_data_refs(
-    ax: &AxiomKind,
-    dps: &mut BTreeSet<DataProperty>,
-    dts: &mut BTreeSet<Datatype>,
-) {
-    use AxiomKind as K;
-    let mut dummy_ops = BTreeSet::new();
-    match ax {
-        K::SubClassOf(a, b) => {
-            collect_ce_refs(a, &mut dummy_ops, dps, dts);
-            collect_ce_refs(b, &mut dummy_ops, dps, dts);
-        }
-        K::EquivalentClasses(cs) => {
-            for c in cs {
-                collect_ce_refs(c, &mut dummy_ops, dps, dts);
-            }
-        }
-        K::DisjointClasses(cs) => {
-            for c in cs {
-                collect_ce_refs(c, &mut dummy_ops, dps, dts);
-            }
-        }
-        K::DisjointUnion(_, cs) => {
-            for c in cs {
-                collect_ce_refs(c, &mut dummy_ops, dps, dts);
-            }
-        }
-        K::ObjectPropertyDomain(_, c)
-        | K::ObjectPropertyRange(_, c)
-        | K::DataPropertyDomain(_, c)
-        | K::ClassAssertion(c, _) => {
-            collect_ce_refs(c, &mut dummy_ops, dps, dts);
-        }
-        K::DataPropertyRange(p, dr) => {
-            dps.insert(p.clone());
-            collect_dr_datatypes(dr, dts);
-        }
-        K::DatatypeDefinition(_, dr) => collect_dr_datatypes(dr, dts),
-        K::HasKey(c, _, key_dps) => {
-            collect_ce_refs(c, &mut dummy_ops, dps, dts);
-            for p in key_dps {
-                dps.insert(p.clone());
-            }
-        }
-        K::EquivalentDataProperties(ps) => {
-            for p in ps {
-                dps.insert(p.clone());
-            }
-        }
-        K::DisjointDataProperties(ps) => {
-            for p in ps {
-                dps.insert(p.clone());
-            }
-        }
-        K::DataPropertyAssertion(p, _, _) | K::NegativeDataPropertyAssertion(p, _, _) => {
-            dps.insert(p.clone());
-        }
-        _ => {}
     }
 }
 
@@ -540,19 +662,17 @@ pub fn write_document<'a>(
 ) -> Result<WriteReport, WriteError> {
     let axioms: Vec<&'a Axiom> = axioms.into_iter().collect();
     check_header_depth(header, "Manchester")?;
-    for a in &header.annotations {
-        if ann_has_invalid_anon(a) {
-            return Err(WriteError::Unsupported(
-                "Manchester syntax cannot represent empty or delimiter-containing anonymous individual labels in header annotations".into(),
-            ));
-        }
-    }
 
-    // Filter and deduplicate prefix declarations to valid Manchester prefix names so
-    // prefix headers and emitted contractions stay 1-to-1 and never lex as numbers.
+    // Filter and deduplicate prefix declarations to valid Manchester PN_PREFIX names and
+    // retain the W3C Manchester reserved standard bindings (rdf, rdfs, xsd, owl).
     let mut valid_prefixes: BTreeMap<String, String> = BTreeMap::new();
     for (p, n) in ofn.prefixes() {
-        if is_manchester_prefix(p) && !n.is_empty() {
+        if is_manchester_prefix(p)
+            && !n.is_empty()
+            && !STANDARD_PREFIXES
+                .iter()
+                .any(|(sp, sn)| *sp == p && *sn != n)
+        {
             valid_prefixes.insert(p.to_string(), n.to_string());
         }
     }
@@ -560,6 +680,20 @@ pub fn write_document<'a>(
     let r = Renderer::new(valid_prefixes.iter().map(|(p, n)| (p.as_str(), n.as_str())));
     let ofn = &clean_ofn;
     let mut report = WriteReport::default();
+
+    let mut kept_header_annotations: Vec<&Annotation> = Vec::new();
+    for a in &header.annotations {
+        if ann_has_invalid_anon(a) {
+            report.skip_header_or_err(
+                options,
+                ofn,
+                a,
+                "Manchester syntax cannot represent invalid anonymous individual labels in header annotations",
+            )?;
+        } else {
+            kept_header_annotations.push(a);
+        }
+    }
 
     let mut classes: BTreeMap<Class, ClassFrame<'a>> = BTreeMap::new();
     let mut datatypes: BTreeMap<Datatype, DatatypeFrame<'a>> = BTreeMap::new();
@@ -569,12 +703,12 @@ pub fn write_document<'a>(
     let mut individuals: BTreeMap<Individual, IndividualFrame<'a>> = BTreeMap::new();
     let mut misc: Vec<MiscFrame<'a>> = Vec::new();
     let mut pending_ann_assertions: Vec<&'a Axiom> = Vec::new();
-    let mut all_obj_prop_iris: BTreeSet<Iri> = BTreeSet::new();
+    let mut all_refs = AxiomEntityRefs::default();
 
-    // First pass: check depth, record all object-property IRIs, and collect declarations.
+    // First pass: check depth, record all entity kind IRIs, and collect declarations.
     for &ax in &axioms {
         check_axiom_depth(ax, "Manchester")?;
-        collect_axiom_obj_props(&ax.kind, &mut all_obj_prop_iris);
+        collect_axiom_entity_refs(&ax.kind, &mut all_refs);
         if let AxiomKind::Declaration(e) = &ax.kind {
             if !ax.annotations.is_empty() {
                 if options.strict {
@@ -614,9 +748,13 @@ pub fn write_document<'a>(
         }
     }
 
+    let all_obj_prop_iris: BTreeSet<Iri> = all_refs.obj_props.iter().map(|p| p.0.clone()).collect();
+    let all_data_prop_iris: BTreeSet<Iri> =
+        all_refs.data_props.iter().map(|p| p.0.clone()).collect();
+    let all_class_iris: BTreeSet<Iri> = all_refs.classes.iter().map(|c| c.0.clone()).collect();
+
     // Second pass: classify remaining axioms into entity frames or misc frames.
-    let mut referenced_data_props: BTreeSet<DataProperty> = BTreeSet::new();
-    let mut referenced_datatypes: BTreeSet<Datatype> = BTreeSet::new();
+    let mut written_refs = AxiomEntityRefs::default();
     for &ax in &axioms {
         if matches!(ax.kind, AxiomKind::Declaration(_)) {
             continue;
@@ -626,7 +764,7 @@ pub fn write_document<'a>(
                 options,
                 ofn,
                 ax,
-                "Manchester syntax cannot represent empty or delimiter-containing anonymous individual labels",
+                "Manchester syntax cannot represent invalid anonymous individual labels",
             )?;
             continue;
         }
@@ -639,7 +777,12 @@ pub fn write_document<'a>(
             )?;
             continue;
         }
-        if axiom_has_punned_data_ambiguity(&ax.kind, &all_obj_prop_iris) {
+        if axiom_has_punned_property_ambiguity(
+            &ax.kind,
+            &all_obj_prop_iris,
+            &all_data_prop_iris,
+            &all_class_iris,
+        ) {
             report.skip_or_err(
                 options,
                 ofn,
@@ -1143,22 +1286,54 @@ pub fn write_document<'a>(
             }
         }
         if report.written_axioms > written_before {
-            collect_axiom_data_refs(
-                &ax.kind,
-                &mut referenced_data_props,
-                &mut referenced_datatypes,
-            );
+            collect_axiom_entity_refs(&ax.kind, &mut written_refs);
         }
     }
 
     // Ensure every referenced DataProperty and non-builtin Datatype has an entity frame
     // so Manchester consumers never misclassify undeclared data properties as object
     // properties (e.g. in unqualified data cardinalities, HasKey, or n-ary misc frames).
-    for dp in referenced_data_props {
+    for dp in written_refs.data_props {
         data_props.entry(dp).or_default();
     }
-    for dt in referenced_datatypes {
+    for dt in written_refs.datatypes {
         datatypes.entry(dt).or_default();
+    }
+    // Synthesize matching frames for referenced ObjectProperties, Classes and
+    // NamedIndividuals whenever their IRI collides with another emitted frame kind so
+    // the reader's vocabulary never shadows or rejects unambiguous punned expressions.
+    for op in written_refs.obj_props {
+        let iri = &op.0;
+        let collides = data_props.contains_key(&DataProperty(iri.clone()))
+            || classes.contains_key(&Class(iri.clone()))
+            || datatypes.contains_key(&Datatype(iri.clone()))
+            || ann_props.contains_key(&AnnotationProperty(iri.clone()))
+            || individuals.contains_key(&Individual::Named(NamedIndividual(iri.clone())));
+        if collides {
+            obj_props.entry(op).or_default();
+        }
+    }
+    for c in written_refs.classes {
+        let iri = &c.0;
+        let collides = datatypes.contains_key(&Datatype(iri.clone()))
+            || obj_props.contains_key(&ObjectProperty(iri.clone()))
+            || data_props.contains_key(&DataProperty(iri.clone()))
+            || ann_props.contains_key(&AnnotationProperty(iri.clone()))
+            || individuals.contains_key(&Individual::Named(NamedIndividual(iri.clone())));
+        if collides {
+            classes.entry(c).or_default();
+        }
+    }
+    for ind in written_refs.individuals {
+        let iri = &ind.0;
+        let collides = classes.contains_key(&Class(iri.clone()))
+            || datatypes.contains_key(&Datatype(iri.clone()))
+            || obj_props.contains_key(&ObjectProperty(iri.clone()))
+            || data_props.contains_key(&DataProperty(iri.clone()))
+            || ann_props.contains_key(&AnnotationProperty(iri.clone()));
+        if collides {
+            individuals.entry(Individual::Named(ind)).or_default();
+        }
     }
 
     // Attach AnnotationAssertions to an existing frame for their subject, or to an
@@ -1229,9 +1404,9 @@ pub fn write_document<'a>(
     for imp in &header.imports {
         writeln!(w, "Import: <{}>", imp.as_str())?;
     }
-    if !header.annotations.is_empty() {
+    if !kept_header_annotations.is_empty() {
         writeln!(w, "\nAnnotations:")?;
-        write_annotation_list(w, ofn, &r, &header.annotations, 4)?;
+        write_annotation_list(w, ofn, &r, &kept_header_annotations, 4)?;
         writeln!(w)?;
     }
 
@@ -1539,7 +1714,7 @@ fn write_annotation_list(
     w: &mut dyn Write,
     ofn: &OfnRenderer,
     r: &Renderer<'_>,
-    anns: &BTreeSet<Annotation>,
+    anns: &[&Annotation],
     indent: usize,
 ) -> Result<(), WriteError> {
     for (i, a) in anns.iter().enumerate() {

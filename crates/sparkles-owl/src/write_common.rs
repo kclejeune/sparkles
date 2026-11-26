@@ -214,6 +214,85 @@ pub(crate) fn check_axiom_depth(ax: &Axiom, syntax: &str) -> Result<(), WriteErr
     Ok(())
 }
 
+/// W3C SPARQL 1.1 / OWL 2 `PN_CHARS_BASE` production.
+pub(crate) fn is_pn_chars_base(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x41..=0x5A
+            | 0x61..=0x7A
+            | 0xC0..=0xD6
+            | 0xD8..=0xF6
+            | 0xF8..=0x2FF
+            | 0x370..=0x37D
+            | 0x37F..=0x1FFF
+            | 0x200C..=0x200D
+            | 0x2070..=0x218F
+            | 0x2C00..=0x2FEF
+            | 0x3001..=0xD7FF
+            | 0xF900..=0xFDCF
+            | 0xFDF0..=0xFFFD
+            | 0x10000..=0xEFFFF
+    )
+}
+
+/// W3C SPARQL 1.1 / OWL 2 `PN_CHARS_U` (`PN_CHARS_BASE | '_'`).
+pub(crate) fn is_pn_chars_u(c: char) -> bool {
+    is_pn_chars_base(c) || c == '_'
+}
+
+/// W3C SPARQL 1.1 / OWL 2 `PN_CHARS`.
+pub(crate) fn is_pn_chars(c: char) -> bool {
+    is_pn_chars_u(c)
+        || matches!(
+            c as u32,
+            0x2D | 0x30..=0x39 | 0xB7 | 0x0300..=0x036F | 0x203F..=0x2040
+        )
+}
+
+/// W3C SPARQL 1.1 / OWL 2 `PN_PREFIX`: `PN_CHARS_BASE ((PN_CHARS | '.')* PN_CHARS)?`.
+pub(crate) fn is_pn_prefix(s: &str) -> bool {
+    let mut cs = s.chars();
+    let Some(first) = cs.next() else {
+        return false;
+    };
+    if !is_pn_chars_base(first) {
+        return false;
+    }
+    let mut last = first;
+    for c in cs {
+        if !(is_pn_chars(c) || c == '.') {
+            return false;
+        }
+        last = c;
+    }
+    last != '.'
+}
+
+/// W3C simplified `PN_LOCAL`: `(PN_CHARS_U | [0-9]) ((PN_CHARS | '.')* PN_CHARS)?`.
+pub(crate) fn is_pn_local(s: &str) -> bool {
+    let mut cs = s.chars();
+    let Some(first) = cs.next() else {
+        return false;
+    };
+    if !(is_pn_chars_u(first) || first.is_ascii_digit()) {
+        return false;
+    }
+    let mut last = first;
+    for c in cs {
+        if !(is_pn_chars(c) || c == '.') {
+            return false;
+        }
+        last = c;
+    }
+    last != '.'
+}
+
+/// W3C SPARQL 1.1 `BLANK_NODE_LABEL` body (the part after `_:`):
+/// `(PN_CHARS_U | [0-9]) ((PN_CHARS | '.')* PN_CHARS)?`.
+pub(crate) fn is_blank_node_label(s: &str) -> bool {
+    is_pn_local(s)
+}
+
 /// An error from an ontology syntax writer.
 #[derive(Debug)]
 pub enum WriteError {
