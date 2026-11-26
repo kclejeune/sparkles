@@ -93,6 +93,69 @@ pub fn is_float_lexical(lex: &str) -> bool {
     mantissa_ok && exponent_ok
 }
 
+/// The datatype that supplied a computed spelling, before a lexical constructor
+/// discarded or replaced the datatype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum NumericKind {
+    Integer,
+    Decimal,
+    Float,
+    Double,
+}
+
+impl NumericKind {
+    pub(super) fn of(t: &Term) -> Option<Self> {
+        let Term::Literal(l) = t else {
+            return None;
+        };
+        Some(match l.datatype() {
+            xsd::INTEGER => Self::Integer,
+            xsd::DECIMAL => Self::Decimal,
+            xsd::FLOAT => Self::Float,
+            xsd::DOUBLE => Self::Double,
+            _ => return None,
+        })
+    }
+
+    pub(super) fn lexical_key(self, lex: &str) -> Option<String> {
+        match self {
+            Self::Integer | Self::Decimal => self.exact_key(lex),
+            Self::Float | Self::Double if !is_float_lexical(lex) => None,
+            Self::Float => Float::from_str(lex)
+                .ok()
+                .map(|f| Num::Flt(f32::from(f)).canonical_lexical()),
+            Self::Double => Double::from_str(lex)
+                .ok()
+                .map(|f| Num::Dbl(f64::from(f)).canonical_lexical()),
+        }
+    }
+
+    /// Compare an integer or decimal without rounding or bounding the digit count.
+    fn exact_key(self, lex: &str) -> Option<String> {
+        let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+        let (whole, fraction) = match body.split_once('.') {
+            Some(parts) if self == Self::Decimal => parts,
+            _ => (body, ""),
+        };
+        if (whole.is_empty() && fraction.is_empty())
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let whole = whole.trim_start_matches('0');
+        let fraction = fraction.trim_end_matches('0');
+        let sign = if lex.starts_with('-') && !(whole.is_empty() && fraction.is_empty()) {
+            "-"
+        } else {
+            ""
+        };
+        Some(format!("{sign}{whole}.{fraction}"))
+    }
+}
+
 /// Whether [`numeric`] read an integer or decimal with more than 16 digits since the last
 /// call, which XSD 1.1 section 5.4 lets an implementation limit. The call resets it.
 pub fn take_beyond_minimum_precision() -> bool {
@@ -497,6 +560,15 @@ pub fn string_term(s: impl Into<String>) -> Term {
     Term::Literal(Literal::new_simple_literal(s))
 }
 
+/// The simple literal that STR reads from an IRI or literal.
+pub(super) fn lexical_string(term: &Term) -> Option<Term> {
+    match term {
+        Term::NamedNode(n) => Some(string_term(n.as_str())),
+        Term::Literal(l) => Some(string_term(l.value())),
+        _ => None,
+    }
+}
+
 pub fn int_term(i: i128) -> Term {
     Num::Int(i).to_term()
 }
@@ -530,6 +602,11 @@ fn class(t: Option<&Term>) -> u8 {
         Some(Term::Literal(_)) => 3,
         Some(Term::Triple(_)) => 4,
     }
+}
+
+/// The ORDER BY term class of a bound RDF term.
+pub(crate) fn term_class(t: &Term) -> u8 {
+    class(Some(t))
 }
 
 /// The order of two decimal numerals, such as `-12.50`, by their values.

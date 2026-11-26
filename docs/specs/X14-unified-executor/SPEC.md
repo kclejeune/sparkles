@@ -359,32 +359,49 @@ not project. The seeded queries of `tests/query_cursor.rs` compare the eager ans
 the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a compacted base, a
 pending delta, several index blocks and a masked view, and the optimizer, index-join and
 string-filter tests compare `Optimizations::ALL` with it as well as with
-`Optimizations::NONE`. Both go through one comparison, which passes no answer that the specification
-forbids and, where it cannot decide, reports a partial or unordered comparison instead.
+`Optimizations::NONE`. Both use the same comparison of terms, numeric values and ordering.
+It reports when it can check only part of an answer.
 An open column is compared only by its place in the rows, which makes the comparison
-partial. A column that only computed values bind compares numbers by datatype and value,
-and a column that only copied terms bind compares them exactly. Arithmetic, the numeric
-functions, a cast to a number and the COUNT, SUM and AVG aggregates compute values. A
-variable, a constant, IF, COALESCE, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and SAMPLE
-aggregates pass on the terms or lexical forms they are given, and any other operator
-counts as both. A string or constructor that shows the lexical form of a computed number,
-such as `STR(1.0 + 1.0)` or `STRDT(STR(1.0 + 1.0), xsd:decimal)`, still compares exactly,
-so an engine that writes that number in another allowed form would fail the comparison. A column bound by both,
-such as a COALESCE over a variable and a constant, compares exactly, and a number that
-differs there only in its lexical form makes the comparison partial. An ordered or sliced
-answer must be a slice, at the query's offset, of an order that ORDER BY allows, and an
-answer with open rows is left uncompared. A sort key stops before the first condition
-that reads an open value. The conditions after it can still order the rows that tie
-before it, so the key only finds an answer that the earlier conditions forbid, and
-otherwise the order is unchecked and a slice of it is left uncompared. A slice that passes
-the checks against each other row is compared when the reference's other rows, placed
-around it in their own order, complete it to an order that ORDER BY allows. When that
-completion breaks a constraint between two rows, or the order of a slice is otherwise not
-established, the slice is left uncompared. Where DISTINCT keeps a row whose copies have different sort
-keys, the order is unchecked and a slice of it is open. The order check tests the strict
-order between every two blocks of equal keys that it meets, gives up past 50 million key
-comparisons, and where equal rows with different keys make its matching ambiguous it
-reports the order unchecked rather than fail. Whether an open value is bound is open too,
+partial. The evaluator records how each binding was produced. Copied terms and constants
+compare exactly. Arithmetic, numeric functions, numeric casts and COUNT, SUM and AVG
+produce numbers that compare by datatype and value. Variables, IF, COALESCE, MIN, MAX
+and SAMPLE retain the provenance of the binding they return.
+
+STR, STRDT, STRLANG and STRLANGDIR can carry the spelling of a computed number. An exact
+match compares fully. A different spelling of the same value in the source number's
+datatype compares partially if the result's datatype, language tag and base direction
+match. An xsd:string cast from a number has a prescribed spelling. A cast that copies a
+string can carry its provenance. String transformations compare exactly. The comparison
+uses the reference's spelling for expressions that select rows or aggregate values.
+
+An ordered or sliced answer must follow an order that ORDER BY allows. The comparison
+uses the engine's spelling for a key it can recover from the returned bindings.
+A key stops before the first open value or spelling it cannot recover. This includes
+a hidden aggregate key whose inputs, selection or distinct solution count depend on
+spelling, or a variable whose BIND may be unbound under a different spelling. A
+distinct solution count stays fixed when fixed bindings, fixed presence or distinct
+fixed metadata already separate every spelling-dependent pair within the evaluator's
+proof budget. That budget bounds both recursive bucket refinement and pairwise
+distinctness checks across the evaluation, and the count keeps its spelling dependency
+if the budget runs out. In MIN and MAX, a
+guaranteed candidate in a strictly better RDF term class rules out lexical-only
+candidates in worse classes. Metadata reads such as LANG and DATATYPE keep their
+place when the remaining input can change only lexically, as with UCASE on a computed
+string or a selection aggregate whose winning-class candidates share their RDF
+metadata. Earlier conditions can still rule out an order or slice.
+
+When several reference rows match a returned row, the comparison uses the observed
+keys of those candidates to check for inversions. A slice must have room on either side
+for omitted rows whose order is forced across the candidate keys, counting each
+returned row at most once across the groups it can match. The comparison reports the
+order unchecked when it cannot establish the order from these constraints and leaves a
+slice of it uncompared. It also leaves an answer with open rows uncompared.
+A slice that passes the checks against each other row is compared when the reference's
+other rows, placed around it in their own order, complete it to an order that ORDER BY
+allows. Otherwise the slice is left uncompared. DISTINCT retains the common sort key
+prefix of a row's copies. The order check tests the strict order between every two
+blocks of equal keys it meets and gives up past 50 million key comparisons.
+Whether an open value is bound is open too,
 so BOUND, EXISTS, a join, DISTINCT, a LATERAL join and a GRAPH pattern whose name is a
 variable that its inner pattern binds make the rows open when that variable holds open
 values. Numbers sort by their exact values, which keeps the sort

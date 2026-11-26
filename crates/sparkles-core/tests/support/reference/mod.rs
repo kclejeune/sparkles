@@ -35,8 +35,8 @@ mod path;
 pub mod value;
 
 use oxiri::Iri;
+use oxrdf::Variable;
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
-use oxrdf::{Variable, vocab::xsd};
 use oxsdatatypes::DateTime;
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, Function, GraphPattern, OrderExpression,
@@ -49,8 +49,169 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use value::{ebv, int_term, total_order};
 
-/// A solution mapping.
-pub type Solution = BTreeMap<Variable, Term>;
+/// The comparison policy for a particular binding. Only the lexical constructors can
+/// carry the spelling of a computed number into a term with different RDF metadata.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+enum Origin {
+    #[default]
+    Exact,
+    ComputedNumber,
+    NumericLexical(value::NumericKind),
+}
+
+impl Origin {
+    fn shared(self, other: Self) -> Self {
+        if self == other { self } else { Self::Exact }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum SpellingDependency {
+    #[default]
+    None,
+    /// Only the lexical form can change. The term's metadata and presence are fixed.
+    Lexical,
+    /// The spelling can also affect the term's metadata or presence.
+    Term,
+}
+
+#[derive(Clone)]
+struct Binding {
+    term: Term,
+    origin: Origin,
+    spelling: SpellingDependency,
+}
+
+impl Binding {
+    fn exact(term: Term) -> Self {
+        Self {
+            term,
+            origin: Origin::Exact,
+            spelling: SpellingDependency::None,
+        }
+    }
+
+    fn number(term: Term) -> Self {
+        Self {
+            term,
+            origin: Origin::ComputedNumber,
+            spelling: SpellingDependency::None,
+        }
+    }
+
+    fn spelling(&self) -> SpellingDependency {
+        if matches!(self.origin, Origin::NumericLexical(_)) {
+            self.spelling.max(SpellingDependency::Lexical)
+        } else {
+            self.spelling
+        }
+    }
+}
+
+/// A solution mapping with provenance attached to its bindings. RDF equality, joins
+/// and duplicate detection still use the terms themselves.
+#[derive(Clone, Default)]
+pub(crate) struct Solution {
+    terms: BTreeMap<Variable, Term>,
+    origins: BTreeMap<Variable, Origin>,
+    /// Includes unbound variables whose expression may succeed under another spelling.
+    spelling: BTreeMap<Variable, SpellingDependency>,
+}
+
+impl std::ops::Deref for Solution {
+    type Target = BTreeMap<Variable, Term>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.terms
+    }
+}
+
+impl Solution {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn origin(&self, v: &Variable) -> Origin {
+        self.origins.get(v).copied().unwrap_or_default()
+    }
+
+    fn spelling(&self, v: &Variable) -> SpellingDependency {
+        self.spelling.get(v).copied().unwrap_or_default()
+    }
+
+    fn binding(&self, v: &Variable) -> Option<Binding> {
+        Some(Binding {
+            term: self.get(v)?.clone(),
+            origin: self.origin(v),
+            spelling: self.spelling(v),
+        })
+    }
+
+    fn insert(&mut self, v: Variable, term: Term) {
+        self.bind(v, Binding::exact(term));
+    }
+
+    fn bind(&mut self, v: Variable, binding: Binding) {
+        if binding.origin == Origin::Exact {
+            self.origins.remove(&v);
+        } else {
+            self.origins.insert(v.clone(), binding.origin);
+        }
+        if binding.spelling == SpellingDependency::None {
+            self.spelling.remove(&v);
+        } else {
+            self.spelling.insert(v.clone(), binding.spelling);
+        }
+        self.terms.insert(v, binding.term);
+    }
+
+    fn project(&mut self, variables: &[Variable]) {
+        self.terms.retain(|v, _| variables.contains(v));
+        self.origins.retain(|v, _| variables.contains(v));
+        self.spelling.retain(|v, _| variables.contains(v));
+    }
+
+    fn has_visible_spelling(&self) -> bool {
+        self.origins
+            .iter()
+            .any(|(v, o)| !is_hidden(v) && matches!(o, Origin::NumericLexical(_)))
+            || self
+                .spelling
+                .iter()
+                .any(|(v, &s)| !is_hidden(v) && s != SpellingDependency::None)
+    }
+
+    fn var_spelling(&self, v: &Variable) -> SpellingDependency {
+        let spelling = self.spelling(v);
+        if matches!(self.origin(v), Origin::NumericLexical(_)) {
+            spelling.max(SpellingDependency::Lexical)
+        } else {
+            spelling
+        }
+    }
+
+    fn visible_binding(&self, v: &Variable) -> VisibleBinding<'_> {
+        match self.get(v) {
+            Some(term) => match self.var_spelling(v) {
+                SpellingDependency::None => VisibleBinding::FixedBound(term),
+                SpellingDependency::Lexical => VisibleBinding::LexicalBound(term),
+                SpellingDependency::Term => VisibleBinding::Unstable,
+            },
+            None => match self.spelling(v) {
+                SpellingDependency::None => VisibleBinding::FixedUnbound,
+                SpellingDependency::Lexical | SpellingDependency::Term => VisibleBinding::Unstable,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VisibleBinding<'a> {
+    FixedBound(&'a Term),
+    FixedUnbound,
+    LexicalBound(&'a Term),
+    Unstable,
+}
 
 /// Why a query got no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,10 +593,12 @@ pub(crate) struct Evaluator<'a> {
     pub chose: Cell<bool>,
     pub notes: Cell<Notes>,
     work: Cell<u64>,
+    distinct_proof_work: Cell<u64>,
     /// The variables that hold open values somewhere in the evaluation.
     pub open_vars: RefCell<HashSet<Variable>>,
     /// Whether the expression being evaluated read an open value.
     pub read_open: Cell<bool>,
+    read_spelling: Cell<bool>,
 }
 
 /// The readings of the aggregates where SPARQL, Jena and the engine differ, roadmap item
@@ -499,237 +662,10 @@ pub struct Selected {
     /// For each column, whether its values are open, such as a SAMPLE, a RAND or a new
     /// blank node, so that only their place in the rows can be compared.
     pub open: Vec<bool>,
-    /// For each column, whether the query computes its values, where an implementation
-    /// chooses the lexical form of a number, or copies terms, which keep theirs.
-    pub computed: Vec<Provenance>,
+    /// The sources of the expected cells, including rows outside a top-level slice.
+    origins: Vec<Vec<Origin>>,
     /// The order and slice of the answer, when the query orders or slices it.
     pub order: Option<TopOrder>,
-    /// The answer is ordered, and DISTINCT kept a row whose copies have different sort
-    /// keys, so the order is not checked.
-    pub order_unchecked: bool,
-}
-
-/// Where the values of a column come from, by the patterns and expressions that bind
-/// its variable anywhere in the query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provenance {
-    /// Only terms of the data or the query, copied, which keep their lexical form.
-    Copied,
-    /// Only values that an operator or function computed, whose lexical form is the
-    /// implementation's.
-    Computed,
-    /// Both, so a cell's lexical form may be fixed or free.
-    Mixed,
-}
-
-/// The provenance of each variable that `p` binds. A variable is copied where a basic
-/// graph pattern, a path, VALUES or a GRAPH name binds it, or an expression whose
-/// outermost operator passes a term through or keeps the lexical form it is given: a
-/// variable, a constant, COALESCE, IF, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and
-/// SAMPLE aggregates. It is computed where arithmetic,
-/// a numeric function, a cast to a number or the COUNT, SUM and AVG aggregates bind it,
-/// whose numbers take the implementation's lexical form. Any other operator binds it
-/// both ways, so that its numbers compare exactly and a difference only in their
-/// lexical form makes the comparison partial.
-fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
-    #[derive(Default)]
-    struct Site {
-        copied: bool,
-        computed: bool,
-        from: Vec<Variable>,
-    }
-    fn expr_site(e: &Expression, site: &mut Site) {
-        match e {
-            Expression::Variable(v) => site.from.push(v.clone()),
-            Expression::NamedNode(_) | Expression::Literal(_) => site.copied = true,
-            Expression::Coalesce(list) => list.iter().for_each(|x| expr_site(x, site)),
-            Expression::If(_, a, b) => {
-                expr_site(a, site);
-                expr_site(b, site);
-            }
-            Expression::Add(..)
-            | Expression::Subtract(..)
-            | Expression::Multiply(..)
-            | Expression::Divide(..)
-            | Expression::UnaryPlus(_)
-            | Expression::UnaryMinus(_) => site.computed = true,
-            Expression::FunctionCall(f, _) => match f {
-                Function::Abs
-                | Function::Ceil
-                | Function::Floor
-                | Function::Round
-                | Function::Rand
-                | Function::StrLen
-                | Function::Year
-                | Function::Month
-                | Function::Day
-                | Function::Hours
-                | Function::Minutes
-                | Function::Seconds => site.computed = true,
-                Function::Custom(n)
-                    if [xsd::INTEGER, xsd::DECIMAL, xsd::FLOAT, xsd::DOUBLE]
-                        .iter()
-                        .any(|d| d.as_str() == n.as_str()) =>
-                {
-                    site.computed = true
-                }
-                Function::StrDt | Function::StrLang | Function::StrLangDir => site.copied = true,
-                _ => {
-                    site.copied = true;
-                    site.computed = true;
-                }
-            },
-            _ => {
-                site.copied = true;
-                site.computed = true;
-            }
-        }
-    }
-    fn term_vars(t: &TermPattern, out: &mut Vec<Variable>) {
-        match t {
-            TermPattern::Variable(v) => out.push(v.clone()),
-            TermPattern::Triple(tr) => {
-                term_vars(&tr.subject, out);
-                if let NamedNodePattern::Variable(v) = &tr.predicate {
-                    out.push(v.clone());
-                }
-                term_vars(&tr.object, out);
-            }
-            _ => {}
-        }
-    }
-    fn walk(p: &GraphPattern, sites: &mut Vec<(Variable, Site)>) {
-        let copied = |v: Variable| {
-            (
-                v,
-                Site {
-                    copied: true,
-                    ..Site::default()
-                },
-            )
-        };
-        match p {
-            GraphPattern::Bgp { patterns } => {
-                let mut vs = Vec::new();
-                for tp in patterns {
-                    term_vars(&tp.subject, &mut vs);
-                    if let NamedNodePattern::Variable(v) = &tp.predicate {
-                        vs.push(v.clone());
-                    }
-                    term_vars(&tp.object, &mut vs);
-                }
-                sites.extend(vs.into_iter().map(copied));
-            }
-            GraphPattern::Path {
-                subject, object, ..
-            } => {
-                let mut vs = Vec::new();
-                term_vars(subject, &mut vs);
-                term_vars(object, &mut vs);
-                sites.extend(vs.into_iter().map(copied));
-            }
-            GraphPattern::Values { variables, .. } => {
-                sites.extend(variables.iter().cloned().map(copied));
-            }
-            GraphPattern::Graph { name, inner } => {
-                if let NamedNodePattern::Variable(v) = name {
-                    sites.push(copied(v.clone()));
-                }
-                walk(inner, sites);
-            }
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => {
-                let mut site = Site::default();
-                expr_site(expression, &mut site);
-                sites.push((variable.clone(), site));
-                walk(inner, sites);
-            }
-            GraphPattern::Group {
-                inner, aggregates, ..
-            } => {
-                for (v, a) in aggregates {
-                    let mut site = Site::default();
-                    match a {
-                        AggregateExpression::FunctionCall {
-                            name:
-                                AggregateFunction::Min
-                                | AggregateFunction::Max
-                                | AggregateFunction::Sample,
-                            expr,
-                            ..
-                        } => expr_site(expr, &mut site),
-                        AggregateExpression::CountSolutions { .. }
-                        | AggregateExpression::FunctionCall {
-                            name:
-                                AggregateFunction::Count
-                                | AggregateFunction::Sum
-                                | AggregateFunction::Avg,
-                            ..
-                        } => site.computed = true,
-                        _ => {
-                            site.copied = true;
-                            site.computed = true;
-                        }
-                    }
-                    sites.push((v.clone(), site));
-                }
-                walk(inner, sites);
-            }
-            GraphPattern::Join { left, right }
-            | GraphPattern::LeftJoin { left, right, .. }
-            | GraphPattern::Lateral { left, right }
-            | GraphPattern::Union { left, right }
-            | GraphPattern::Minus { left, right } => {
-                walk(left, sites);
-                walk(right, sites);
-            }
-            GraphPattern::Filter { inner, .. }
-            | GraphPattern::OrderBy { inner, .. }
-            | GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. } => walk(inner, sites),
-            // the patterns that the evaluator does not evaluate
-            _ => {}
-        }
-    }
-    let mut sites = Vec::new();
-    walk(p, &mut sites);
-    // a variable that copies another takes its provenance, to a fixed point
-    let mut of: HashMap<Variable, (bool, bool)> = HashMap::new();
-    loop {
-        let mut changed = false;
-        for (v, site) in &sites {
-            let mut c = (site.copied, site.computed);
-            for f in &site.from {
-                // a variable that nothing binds is unbound, which copies nothing
-                let (a, b) = of.get(f).copied().unwrap_or((false, false));
-                c = (c.0 || a, c.1 || b);
-            }
-            let old = of.entry(v.clone()).or_default();
-            let new = (old.0 || c.0, old.1 || c.1);
-            if new != *old {
-                *old = new;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    of.into_iter()
-        .map(|(v, c)| {
-            let p = match c {
-                (_, false) => Provenance::Copied,
-                (false, true) => Provenance::Computed,
-                (true, true) => Provenance::Mixed,
-            };
-            (v, p)
-        })
-        .collect()
 }
 
 /// The rows of an ordered or sliced answer before its slice, in the order of ORDER BY,
@@ -755,17 +691,50 @@ struct Keyed {
     solutions: Vec<Solution>,
     /// The key of each solution, `None` where its place is open.
     keys: Option<(Vec<Option<SortKey>>, Vec<bool>)>,
-    /// Whether DISTINCT kept a row whose copies have different keys, so that the order
-    /// places it in one of several ranges, which the keys do not describe.
-    unplaced: bool,
-    /// Whether a key ends before a condition that read an open value.
+    /// Whether a key ends before a condition that read an open value or differs
+    /// across DISTINCT copies.
     open_conditions: bool,
 }
 
 /// The values of the ORDER BY conditions for one solution, unbound where a condition is
 /// an error or unbound. The key ends before the first condition that read an open
 /// value, since that condition and the ones after it do not fix the row's place.
-pub type SortKey = Vec<Option<Term>>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SortKey {
+    terms: Vec<Option<Term>>,
+    /// Conditions that read a spelling and how to recover them from the engine's rows.
+    spelling: Vec<Option<SpellingKey>>,
+}
+
+impl SortKey {
+    /// Keep the conditions that put all DISTINCT copies in the same place.
+    fn keep_common_prefix(&mut self, other: &Self) -> bool {
+        let prefix = self
+            .terms
+            .iter()
+            .zip(&other.terms)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let differs = prefix < self.terms.len() || prefix < other.terms.len();
+        self.terms.truncate(prefix);
+        self.spelling.truncate(prefix);
+        // Both keys come from the same ORDER BY expression at each position.
+        // If either evaluation needs an observed spelling, so does the merged key.
+        for (source, other) in self.spelling.iter_mut().zip(&other.spelling) {
+            if source.is_none() {
+                source.clone_from(other);
+            }
+        }
+        differs
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SpellingKey {
+    Variable(Variable),
+    StrOf(Variable),
+    Unobserved,
+}
 
 /// Whether the specification puts the key `a` strictly before `b`. Two different terms
 /// with equal values, such as `1` and `1.0`, are equal under the specification's text,
@@ -818,11 +787,219 @@ pub(crate) fn compatible(a: &Solution, b: &Solution) -> bool {
 }
 
 /// A solution without the evaluator's own variables.
-fn visible(s: &Solution) -> Solution {
+fn visible(s: &Solution) -> BTreeMap<Variable, Term> {
     s.iter()
         .filter(|(k, _)| !is_hidden(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TermMetadata<'a> {
+    NamedNode,
+    BlankNode,
+    Triple,
+    Literal(&'a str, Option<&'a str>, Option<u8>),
+}
+
+fn term_metadata(t: &Term) -> TermMetadata<'_> {
+    match t {
+        Term::NamedNode(_) => TermMetadata::NamedNode,
+        Term::BlankNode(_) => TermMetadata::BlankNode,
+        Term::Triple(_) => TermMetadata::Triple,
+        Term::Literal(l) => TermMetadata::Literal(
+            l.datatype().as_str(),
+            l.language(),
+            l.direction().map(|d| match d {
+                oxrdf::BaseDirection::Ltr => 0,
+                oxrdf::BaseDirection::Rtl => 1,
+            }),
+        ),
+    }
+}
+
+fn same_metadata(a: &Term, b: &Term) -> bool {
+    term_metadata(a) == term_metadata(b)
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum FixedBucketValue<'a> {
+    Term(&'a Term),
+    Metadata(TermMetadata<'a>),
+}
+
+fn always_distinct_on(a: &Solution, b: &Solution, v: &Variable) -> bool {
+    match (a.visible_binding(v), b.visible_binding(v)) {
+        (VisibleBinding::FixedBound(x), VisibleBinding::FixedBound(y)) => x != y,
+        (VisibleBinding::FixedBound(_), VisibleBinding::FixedUnbound)
+        | (VisibleBinding::FixedUnbound, VisibleBinding::FixedBound(_))
+        | (VisibleBinding::LexicalBound(_), VisibleBinding::FixedUnbound)
+        | (VisibleBinding::FixedUnbound, VisibleBinding::LexicalBound(_)) => true,
+        (VisibleBinding::LexicalBound(x), VisibleBinding::FixedBound(y))
+        | (VisibleBinding::FixedBound(x), VisibleBinding::LexicalBound(y))
+        | (VisibleBinding::LexicalBound(x), VisibleBinding::LexicalBound(y)) => {
+            !same_metadata(x, y)
+        }
+        _ => false,
+    }
+}
+
+fn always_distinct(a: &Solution, b: &Solution, budget: &mut u64) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    for v in a.terms.keys() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if !is_hidden(v) && always_distinct_on(a, b, v) {
+            return true;
+        }
+    }
+    for v in b.terms.keys() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if !is_hidden(v) && !a.terms.contains_key(v) && always_distinct_on(a, b, v) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Maximum work units used across a query to prove `COUNT(DISTINCT *)`
+/// independent of computed numeric spellings before falling back conservatively.
+/// Covers both recursive bucket refinement and pairwise distinctness checks.
+const DISTINCT_COUNT_PROOF_BUDGET: u64 = 100_000;
+
+fn charge_distinct_refinement(members: &[&Solution], budget: &mut u64) -> bool {
+    if (members.len() as u64) > *budget {
+        return false;
+    }
+    let mut pass_cost = 0u64;
+    for (visited, s) in members.iter().enumerate() {
+        let row_cost = 1u64
+            .saturating_add(s.terms.len() as u64)
+            .saturating_add(s.spelling.len() as u64);
+        pass_cost = pass_cost.saturating_add(row_cost);
+        if pass_cost > *budget {
+            *budget = budget.saturating_sub((visited + 1) as u64);
+            return false;
+        }
+    }
+    *budget -= pass_cost;
+    true
+}
+
+fn distinct_count_depends_on_spelling(members: &[Solution], budget: &mut u64) -> bool {
+    if members.len() <= 1 || !members.iter().any(Solution::has_visible_spelling) {
+        return false;
+    }
+    if (members.len() as u64) > *budget {
+        return true;
+    }
+    let refs: Vec<&Solution> = members.iter().collect();
+    distinct_count_bucket_depends_on_spelling(&refs, budget)
+}
+
+fn distinct_count_bucket_depends_on_spelling(members: &[&Solution], budget: &mut u64) -> bool {
+    use SpellingDependency as Spelling;
+    if members.len() <= 1 {
+        return false;
+    }
+    if !charge_distinct_refinement(members, budget) {
+        return true;
+    }
+    let mut stability: HashMap<&Variable, Spelling> = HashMap::new();
+    let mut has_spelling = Vec::with_capacity(members.len());
+    for &s in members {
+        let mut dep = false;
+        for v in s.terms.keys().filter(|v| !is_hidden(v)) {
+            let sp = s.var_spelling(v);
+            if sp != Spelling::None {
+                dep = true;
+            }
+            let entry = stability.entry(v).or_default();
+            *entry = (*entry).max(sp);
+        }
+        for (v, &sp) in &s.spelling {
+            if !is_hidden(v) && !s.terms.contains_key(v) && sp != Spelling::None {
+                dep = true;
+                stability.insert(v, Spelling::Term);
+            }
+        }
+        has_spelling.push(dep);
+    }
+    if !has_spelling.iter().any(|&dep| dep) {
+        return false;
+    }
+    let mut bucket_index: HashMap<Vec<(&Variable, FixedBucketValue<'_>)>, usize> = HashMap::new();
+    let mut buckets: Vec<(Vec<&Solution>, bool)> = Vec::new();
+    for (&s, &dep) in members.iter().zip(&has_spelling) {
+        let key = s
+            .terms
+            .iter()
+            .filter(|(v, _)| !is_hidden(v))
+            .filter_map(
+                |(v, term)| match stability.get(v).copied().unwrap_or_default() {
+                    Spelling::None => Some((v, FixedBucketValue::Term(term))),
+                    Spelling::Lexical => Some((v, FixedBucketValue::Metadata(term_metadata(term)))),
+                    Spelling::Term => None,
+                },
+            )
+            .collect();
+        let idx = *bucket_index.entry(key).or_insert_with(|| {
+            let idx = buckets.len();
+            buckets.push((Vec::new(), false));
+            idx
+        });
+        buckets[idx].0.push(s);
+        buckets[idx].1 |= dep;
+    }
+    drop(bucket_index);
+    drop(stability);
+    if buckets.len() > 1 {
+        drop(has_spelling);
+        return buckets.into_iter().any(|(group, group_has_spelling)| {
+            group.len() > 1
+                && group_has_spelling
+                && distinct_count_bucket_depends_on_spelling(&group, budget)
+        });
+    }
+    drop(buckets);
+    let mut dep = Vec::new();
+    let mut fixed = Vec::new();
+    for (&s, &is_dep) in members.iter().zip(&has_spelling) {
+        if is_dep {
+            dep.push(s);
+        } else {
+            fixed.push(s);
+        }
+    }
+    let dep_len = dep.len() as u64;
+    let fixed_len = fixed.len() as u64;
+    let dep_pairs = dep_len.saturating_mul(dep_len.saturating_sub(1)) / 2;
+    let cross_pairs = dep_len.saturating_mul(fixed_len);
+    let needed_pairs = dep_pairs.saturating_add(cross_pairs);
+    if needed_pairs > *budget {
+        return true;
+    }
+    for (i, &a) in dep.iter().enumerate() {
+        for &b in &dep[i + 1..] {
+            if !always_distinct(a, b, budget) {
+                return true;
+            }
+        }
+        for &b in &fixed {
+            if !always_distinct(a, b, budget) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The solutions of `right` that can be compatible with a solution of `left`, found by
@@ -872,8 +1049,26 @@ impl Candidates {
 
 pub(crate) fn merge(a: &Solution, b: &Solution) -> Solution {
     let mut out = a.clone();
-    for (k, v) in b {
-        out.insert(k.clone(), v.clone());
+    for (k, v) in b.iter() {
+        let mut origin = b.origin(k);
+        let mut spelling = b.spelling(k);
+        if a.get(k) == Some(v) {
+            origin = origin.shared(a.origin(k));
+            spelling = spelling.max(a.spelling(k));
+        }
+        out.bind(
+            k.clone(),
+            Binding {
+                term: v.clone(),
+                origin,
+                spelling,
+            },
+        );
+    }
+    for (v, &spelling) in &b.spelling {
+        if !out.contains_key(v) {
+            out.spelling.insert(v.clone(), spelling);
+        }
     }
     // The merge keeps the number that BNODE reads only where it is the numbered solution
     // itself, the other side binding nothing new. Otherwise it is a new solution, which a
@@ -887,7 +1082,7 @@ pub(crate) fn merge(a: &Solution, b: &Solution) -> Solution {
                 .all(|k| is_hidden(k) || numbered.contains_key(k))
     };
     if !(keeps(a, b) || keeps(b, a)) {
-        out.remove(&row);
+        out.terms.remove(&row);
         if let (Some(x), Some(y)) = (a.get(&row), b.get(&row))
             && x == y
         {
@@ -982,8 +1177,10 @@ impl<'a> Evaluator<'a> {
             chose: Cell::new(false),
             notes: Cell::new(Notes::default()),
             work: Cell::new(0),
+            distinct_proof_work: Cell::new(0),
             open_vars: RefCell::new(HashSet::new()),
             read_open: Cell::new(false),
+            read_spelling: Cell::new(false),
         }
     }
 
@@ -1057,6 +1254,20 @@ impl<'a> Evaluator<'a> {
                 unsupported(format!("more than {limit} intermediate solutions"))
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Remaining proof budget for proving `COUNT(DISTINCT *)` independent of
+    /// computed numeric spellings within this evaluation.
+    fn distinct_proof_budget(&self) -> u64 {
+        let spent = self.distinct_proof_work.get();
+        let cap = DISTINCT_COUNT_PROOF_BUDGET.saturating_sub(spent);
+        match self.data.work_limit {
+            Some(limit) => {
+                let total_used = self.work.get().saturating_add(spent);
+                cap.min(limit.saturating_sub(total_used))
+            }
+            None => cap,
         }
     }
 
@@ -1194,14 +1405,23 @@ impl<'a> Evaluator<'a> {
                         let n = self.fresh_id();
                         s.insert(row_variable(), int_term(n as i128));
                     }
-                    let (v, read_open) = self.tracking(|| self.soft(self.expr(expression, cx, &s)));
+                    let ((v, read_open), reads_spelling) = self.tracking_spelling(|| {
+                        self.tracking(|| self.soft(self.binding(expression, cx, &s)))
+                    });
                     open |= read_open;
-                    if let Some(v) = v? {
-                        if s.get(variable).is_some_and(|old| *old != v) {
+                    if let Some(mut v) = v? {
+                        if s.get(variable).is_some_and(|old| *old != v.term) {
                             // a variable already in scope cannot be extended
                             return unsupported("BIND of a variable that is in scope");
                         }
-                        s.insert(variable.clone(), v);
+                        if s.contains_key(variable) {
+                            v.origin = v.origin.shared(s.origin(variable));
+                            v.spelling = v.spelling.max(s.spelling(variable));
+                        }
+                        s.bind(variable.clone(), v);
+                    } else if reads_spelling && !s.contains_key(variable) {
+                        s.spelling
+                            .insert(variable.clone(), SpellingDependency::Term);
                     }
                     out.push(s);
                 }
@@ -1293,7 +1513,7 @@ impl<'a> Evaluator<'a> {
         to: usize,
     ) {
         let n = solutions.len();
-        let visible_rows: Vec<Solution> = solutions.iter().map(visible).collect();
+        let visible_rows: Vec<_> = solutions.iter().map(visible).collect();
         for cut in [from, to] {
             if cut == 0 || cut == n {
                 continue;
@@ -1302,9 +1522,12 @@ impl<'a> Evaluator<'a> {
                 (cut..n).all(|j| {
                     visible_rows[i] == visible_rows[j]
                         || keys.is_some_and(|(k, d)| match (&k[i], &k[j]) {
-                            (Some(a), Some(b)) => {
-                                strictly_before(a, b, d, !self.data.spec_readings.get())
-                            }
+                            (Some(a), Some(b)) => strictly_before(
+                                &a.terms,
+                                &b.terms,
+                                d,
+                                !self.data.spec_readings.get(),
+                            ),
                             _ => false,
                         })
                 })
@@ -1336,15 +1559,11 @@ impl<'a> Evaluator<'a> {
         let Keyed {
             solutions,
             keys,
-            unplaced,
             open_conditions,
         } = self.eval_keyed(inner, &cx)?;
         // A top slice's cuts are the comparison's to check, so they do not make the rows
-        // open. A row that DISTINCT kept from copies with different keys has a place that
-        // the keys do not describe, so a slice of the rows is open, and their order is not
-        // checked.
-        let rows_open = self.chose.get() || unplaced && slice.is_some();
-        let order_unchecked = unplaced && keys.is_some();
+        // open.
+        let rows_open = self.chose.get();
         let n = solutions.len();
         let (from, to) = match slice {
             Some((start, length)) => {
@@ -1359,7 +1578,7 @@ impl<'a> Evaluator<'a> {
         let row_of = |s: &Solution| -> Vec<Option<Term>> {
             variables.iter().map(|v| s.get(v).cloned()).collect()
         };
-        let order = if (keys.is_some() || slice.is_some()) && !order_unchecked {
+        let order = if keys.is_some() || slice.is_some() {
             let (ks, descending) = keys.unwrap_or_else(|| (vec![None; n], Vec::new()));
             Some(TopOrder {
                 items: solutions
@@ -1378,19 +1597,18 @@ impl<'a> Evaluator<'a> {
         };
         let rows = solutions[from..to].iter().map(row_of).collect();
         let open_vars = self.open_vars.borrow();
-        let provenance = provenance(p);
+        let origins = solutions
+            .iter()
+            .map(|s| variables.iter().map(|v| s.origin(v)).collect())
+            .collect();
         Ok(Selected {
             variables: variables.iter().map(|v| v.as_str().to_string()).collect(),
             rows,
             notes: Notes::default(),
             rows_open,
             open: variables.iter().map(|v| open_vars.contains(v)).collect(),
-            computed: variables
-                .iter()
-                .map(|v| provenance.get(v).copied().unwrap_or(Provenance::Copied))
-                .collect(),
+            origins,
             order,
-            order_unchecked,
         })
     }
 
@@ -1440,6 +1658,12 @@ impl<'a> Evaluator<'a> {
         (r, open)
     }
 
+    fn tracking_spelling<T>(&self, f: impl FnOnce() -> T) -> (T, bool) {
+        let outer = self.read_spelling.replace(false);
+        let result = f();
+        (result, self.read_spelling.replace(outer))
+    }
+
     /// Note that `v` holds open values.
     fn mark_open(&self, v: &Variable) {
         self.open_vars.borrow_mut().insert(v.clone());
@@ -1454,24 +1678,41 @@ impl<'a> Evaluator<'a> {
                 let mut keyed = Vec::new();
                 for s in sols {
                     let mut keys = Vec::new();
+                    let mut spelling = Vec::new();
                     // the conditions from the first that reads an open value on do not fix
                     // the row's place
                     let mut fixed = expression.len();
                     for (i, o) in expression.iter().enumerate() {
                         let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
-                        let (k, open) = self.tracking(|| self.soft(self.expr(e, cx, &s)));
+                        let ((k, open), reads_spelling) = self.tracking_spelling(|| {
+                            self.tracking(|| self.soft(self.expr(e, cx, &s)))
+                        });
+                        let source = if reads_spelling {
+                            let observed = match e {
+                                Expression::Variable(v) => SpellingKey::Variable(v.clone()),
+                                Expression::FunctionCall(Function::Str, args) => match &args[..] {
+                                    [Expression::Variable(v)] => SpellingKey::StrOf(v.clone()),
+                                    _ => SpellingKey::Unobserved,
+                                },
+                                _ => SpellingKey::Unobserved,
+                            };
+                            Some(observed)
+                        } else {
+                            None
+                        };
+                        spelling.push(source);
                         keys.push(k?);
                         if open && fixed == expression.len() {
                             fixed = i;
                         }
                     }
-                    keyed.push((keys, fixed, s));
+                    keyed.push((keys, spelling, fixed, s));
                 }
                 let descending: Vec<bool> = expression
                     .iter()
                     .map(|o| matches!(o, OrderExpression::Desc(_)))
                     .collect();
-                keyed.sort_by(|(a, _, _), (b, _, _)| {
+                keyed.sort_by(|(a, _, _, _), (b, _, _, _)| {
                     for (i, desc) in descending.iter().enumerate() {
                         let mut c = total_order(a[i].as_ref(), b[i].as_ref());
                         if *desc {
@@ -1483,93 +1724,81 @@ impl<'a> Evaluator<'a> {
                     }
                     std::cmp::Ordering::Equal
                 });
-                let open_conditions = keyed.iter().any(|(_, fixed, _)| *fixed < expression.len());
+                let open_conditions = keyed
+                    .iter()
+                    .any(|(_, _, fixed, _)| *fixed < expression.len());
                 let (keys, solutions) = keyed
                     .into_iter()
-                    .map(|(mut k, fixed, s)| {
-                        k.truncate(fixed);
-                        (Some(k), s)
+                    .map(|(mut terms, mut spelling, fixed, s)| {
+                        terms.truncate(fixed);
+                        spelling.truncate(fixed);
+                        (Some(SortKey { terms, spelling }), s)
                     })
                     .unzip();
                 Ok(Keyed {
                     solutions,
                     keys: Some((keys, descending)),
-                    unplaced: false,
                     open_conditions,
                 })
             }
             GraphPattern::Project { inner, variables } => {
                 // A sub-SELECT's variables that it does not project are its own, so the
                 // solution that a LATERAL join or EXISTS substitutes stops at them.
-                let env: Solution = cx
-                    .env
-                    .iter()
-                    .filter(|(v, _)| variables.contains(v))
-                    .map(|(v, t)| (v.clone(), t.clone()))
-                    .collect();
+                let mut env = cx.env.clone();
+                env.project(variables);
                 let inner_cx = Cx {
                     graph: cx.graph,
                     env: &env,
                 };
                 let mut k = self.eval_keyed(inner, &inner_cx)?;
-                k.solutions = k
-                    .solutions
-                    .into_iter()
-                    .map(|s| {
-                        s.into_iter()
-                            .filter(|(k, _)| variables.contains(k))
-                            .collect()
-                    })
-                    .collect();
+                for s in &mut k.solutions {
+                    s.project(variables);
+                }
                 Ok(k)
             }
             GraphPattern::Distinct { inner } => {
                 let Keyed {
                     solutions,
-                    keys,
-                    unplaced: unplaced_any,
-                    open_conditions,
+                    mut keys,
+                    mut open_conditions,
                 } = self.eval_keyed(inner, cx)?;
                 // open values may be equal or not in another answer
                 if self.binds_open(inner) {
                     self.chose.set(true);
                 }
-                let mut first: HashMap<Solution, usize> = HashMap::new();
+                let mut first: HashMap<BTreeMap<Variable, Term>, usize> = HashMap::new();
                 let mut kept = Vec::new();
-                let mut unplaced = HashSet::new();
-                for (i, s) in solutions.iter().enumerate() {
-                    match first.get(&visible(s)) {
+                let mut distinct: Vec<Solution> = Vec::new();
+                for (i, s) in solutions.into_iter().enumerate() {
+                    match first.get(&visible(&s)) {
                         None => {
-                            first.insert(visible(s), i);
+                            first.insert(visible(&s), kept.len());
                             kept.push(i);
+                            distinct.push(s);
                         }
-                        // Which copy DISTINCT keeps is open, and it places the row
-                        // differently when the copies have different keys, so the kept
-                        // row's key does not fix its place.
-                        Some(&f) => {
-                            if let Some((k, _)) = &keys
-                                && k[f] != k[i]
+                        Some(&slot) => {
+                            // If an exact term also produced this row, it must still be
+                            // represented even if the computed binding changes spelling.
+                            distinct[slot].origins.retain(|v, o| *o == s.origin(v));
+                            for (v, spelling) in s.spelling {
+                                let own = distinct[slot].spelling.entry(v).or_default();
+                                *own = (*own).max(spelling);
+                            }
+                            let f = kept[slot];
+                            if let Some((k, _)) = &mut keys
+                                && let Some(other) = k[i].take()
+                                && let Some(first) = &mut k[f]
                             {
-                                unplaced.insert(f);
+                                open_conditions |= first.keep_common_prefix(&other);
                             }
                         }
                     }
                 }
                 Ok(Keyed {
-                    unplaced: unplaced_any || !unplaced.is_empty(),
                     open_conditions,
-                    solutions: kept.iter().map(|&i| solutions[i].clone()).collect(),
-                    keys: keys.map(|(k, d)| {
-                        let k = kept
-                            .iter()
-                            .map(|&i| {
-                                if unplaced.contains(&i) {
-                                    None
-                                } else {
-                                    k[i].clone()
-                                }
-                            })
-                            .collect();
+                    solutions: distinct,
+                    keys: keys.map(|(mut k, d)| {
+                        let k = kept.into_iter().map(|i| k[i].take()).collect();
                         (k, d)
                     }),
                 })
@@ -1587,7 +1816,6 @@ impl<'a> Evaluator<'a> {
             _ => Ok(Keyed {
                 solutions: self.eval(p, cx)?,
                 keys: None,
-                unplaced: false,
                 open_conditions: false,
             }),
         }
@@ -1845,7 +2073,8 @@ impl<'a> Evaluator<'a> {
         });
         if numbers {
             for s in &mut sols {
-                s.entry(row_variable())
+                s.terms
+                    .entry(row_variable())
                     .or_insert_with(|| int_term(self.fresh_id() as i128));
             }
         }
@@ -1875,13 +2104,36 @@ impl<'a> Evaluator<'a> {
             let members = &groups[&key];
             let mut row = Solution::new();
             for (v, t) in variables.iter().zip(&key) {
+                let spelling = members
+                    .iter()
+                    .map(|s| s.spelling(v))
+                    .max()
+                    .unwrap_or_default();
                 if let Some(t) = t {
-                    row.insert(v.clone(), t.clone());
+                    let origin = members
+                        .iter()
+                        .map(|s| s.origin(v))
+                        .reduce(Origin::shared)
+                        .unwrap_or_default();
+                    row.bind(
+                        v.clone(),
+                        Binding {
+                            term: t.clone(),
+                            origin,
+                            spelling,
+                        },
+                    );
+                } else if spelling != SpellingDependency::None {
+                    row.spelling.insert(v.clone(), spelling);
                 }
             }
             for (v, a) in aggregates {
-                if let Some(t) = self.aggregate(v, a, members, inner_open, cx)? {
-                    row.insert(v.clone(), t);
+                let (result, reads_spelling) =
+                    self.tracking_spelling(|| self.aggregate(v, a, members, inner_open, cx));
+                if let Some(t) = result? {
+                    row.bind(v.clone(), t);
+                } else if reads_spelling {
+                    row.spelling.insert(v.clone(), SpellingDependency::Term);
                 }
             }
             out.push(row);
@@ -1899,11 +2151,12 @@ impl<'a> Evaluator<'a> {
         members: &[Solution],
         inner_open: bool,
         cx: &Cx,
-    ) -> R<Option<Term>> {
+    ) -> R<Option<Binding>> {
+        use SpellingDependency as Spelling;
         use value::*;
         let (name, expr, distinct) = match a {
             AggregateExpression::CountSolutions { distinct } => {
-                let n = if *distinct {
+                let binding = if *distinct {
                     if members
                         .iter()
                         .any(|m| m.keys().any(|k| k.as_str().starts_with(":bnode:")))
@@ -1916,11 +2169,24 @@ impl<'a> Evaluator<'a> {
                     if inner_open {
                         self.mark_open(out);
                     }
-                    members.iter().map(visible).collect::<HashSet<_>>().len()
+                    let n = members.iter().map(visible).collect::<HashSet<_>>().len();
+                    let mut binding = Binding::number(int_term(n as i128));
+                    let initial_budget = self.distinct_proof_budget();
+                    let mut budget = initial_budget;
+                    let depends = distinct_count_depends_on_spelling(members, &mut budget);
+                    self.distinct_proof_work.set(
+                        self.distinct_proof_work
+                            .get()
+                            .saturating_add(initial_budget - budget),
+                    );
+                    if depends {
+                        binding.spelling = Spelling::Lexical;
+                    }
+                    binding
                 } else {
-                    members.len()
+                    Binding::number(int_term(members.len() as i128))
                 };
-                return Ok(Some(int_term(n as i128)));
+                return Ok(Some(binding));
             }
             AggregateExpression::FunctionCall {
                 name,
@@ -1935,36 +2201,62 @@ impl<'a> Evaluator<'a> {
         // ListEval: the value of the expression for each solution, an error as `None`.
         // BNODE(label) gives each solution its own blank node.
         let numbers = reads_bnode(expr);
-        let mut values: Vec<Option<Term>> = Vec::new();
-        let (r, open) = self.tracking(|| -> R<()> {
-            for s in members {
-                let v = if numbers && !s.contains_key(&row_variable()) {
-                    let mut s = s.clone();
-                    s.insert(row_variable(), int_term(self.fresh_id() as i128));
-                    self.soft(self.expr(expr, cx, &s))?
-                } else {
-                    self.soft(self.expr(expr, cx, s))?
-                };
-                values.push(v);
-            }
-            Ok(())
+        let mut values = Vec::new();
+        let ((r, open), spelling_error) = self.tracking_spelling(|| {
+            self.tracking(|| -> R<()> {
+                for s in members {
+                    let v = if numbers && !s.contains_key(&row_variable()) {
+                        let mut s = s.clone();
+                        s.insert(row_variable(), int_term(self.fresh_id() as i128));
+                        self.soft(self.binding(expr, cx, &s))?
+                    } else {
+                        self.soft(self.binding(expr, cx, s))?
+                    };
+                    values.push(v);
+                }
+                Ok(())
+            })
         });
         r?;
         if open {
             self.mark_open(out);
         }
+        let inputs = values
+            .iter()
+            .flatten()
+            .map(Binding::spelling)
+            .max()
+            .unwrap_or_default();
+        let reads_spelling = spelling_error || inputs != Spelling::None;
+        // An unbound aggregate result may become bound under another spelling.
+        self.read_spelling.set(reads_spelling);
         if distinct {
             let mut seen = HashSet::new();
+            // Different producers of an equal term share its stricter cell policy,
+            // and any of their values can change when the spelling changes.
+            let mut provenance: HashMap<_, (Origin, Spelling)> = HashMap::new();
+            for b in values.iter().flatten() {
+                provenance
+                    .entry(b.term.clone())
+                    .and_modify(|(origin, spelling)| {
+                        *origin = origin.shared(b.origin);
+                        *spelling = (*spelling).max(b.spelling());
+                    })
+                    .or_insert((b.origin, b.spelling()));
+            }
+            for b in values.iter_mut().flatten() {
+                (b.origin, b.spelling) = provenance[&b.term];
+            }
             values.retain(|v| match v {
-                Some(t) => seen.insert(t.clone()),
+                Some(b) => seen.insert(b.term.clone()),
                 None => true,
             });
         }
         let has_error = values.iter().any(Option::is_none);
-        let terms: Vec<Term> = values.iter().flatten().cloned().collect();
-        Ok(match name {
-            // Count removes the errors
-            AggregateFunction::Count => Some(int_term(terms.len() as i128)),
+        let terms: Vec<&Term> = values.iter().flatten().map(|b| &b.term).collect();
+        let mut result = match name {
+            // Count removes the errors.
+            AggregateFunction::Count => Some(Binding::number(int_term(terms.len() as i128))),
             AggregateFunction::Sum | AggregateFunction::Avg => {
                 // Avg is zero where Count, which removes the errors, is zero, and Sum
                 // adds every value, so an error makes it an error
@@ -1977,13 +2269,17 @@ impl<'a> Evaluator<'a> {
                             return Ok(None);
                         }
                     }
-                    return Ok(Some(int_term(0)));
+                    let mut zero = Binding::number(int_term(0));
+                    if reads_spelling {
+                        zero.spelling = Spelling::Term;
+                    }
+                    return Ok(Some(zero));
                 }
                 if has_error {
                     return Ok(None);
                 }
                 let mut sum = value::Num::Int(0);
-                for t in &terms {
+                for &t in &terms {
                     let Some(n) = numeric_term(t) else {
                         return Ok(None);
                     };
@@ -1993,10 +2289,10 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 if matches!(name, AggregateFunction::Sum) {
-                    Some(sum.to_term())
+                    Some(Binding::number(sum.to_term()))
                 } else {
                     sum.arith(Arith::Div, value::Num::Int(terms.len() as i128))
-                        .map(Num::to_term)
+                        .map(|n| Binding::number(n.to_term()))
                 }
             }
             AggregateFunction::Min | AggregateFunction::Max => {
@@ -2017,7 +2313,7 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 let mut best: Option<&Term> = None;
-                for t in &terms {
+                for &t in &terms {
                     best = Some(match best {
                         None => t,
                         Some(b) => {
@@ -2040,12 +2336,31 @@ impl<'a> Evaluator<'a> {
                     };
                     if terms
                         .iter()
-                        .any(|t| t != b && value::spec_order(Some(t), Some(b)) != Some(worse))
+                        .any(|&t| t != b && value::spec_order(Some(t), Some(b)) != Some(worse))
                     {
                         self.mark_open(out);
                     }
                 }
-                best.cloned()
+                best.map(|term| {
+                    let origin = values
+                        .iter()
+                        .flatten()
+                        .filter(|b| &b.term == term)
+                        .map(|b| b.origin)
+                        .reduce(Origin::shared)
+                        .unwrap_or_default();
+                    Binding {
+                        term: term.clone(),
+                        origin,
+                        spelling: values
+                            .iter()
+                            .flatten()
+                            .filter(|b| &b.term == term)
+                            .map(Binding::spelling)
+                            .max()
+                            .unwrap_or_default(),
+                    }
+                })
             }
             AggregateFunction::Sample => {
                 // any element of the values, an error among them
@@ -2053,7 +2368,7 @@ impl<'a> Evaluator<'a> {
                 {
                     self.mark_open(out);
                 }
-                terms.first().cloned()
+                values.iter().flatten().next().cloned()
             }
             AggregateFunction::GroupConcat { separator } => {
                 if has_error {
@@ -2063,7 +2378,7 @@ impl<'a> Evaluator<'a> {
                 // reads the lexical form of any value.
                 let sep = separator.clone().unwrap_or_else(|| " ".to_string());
                 let mut parts = Vec::new();
-                for t in &terms {
+                for &t in &terms {
                     let string = matches!(t, Term::Literal(l) if is_string_literal(l));
                     if !string {
                         let mut notes = self.notes.get();
@@ -2085,10 +2400,78 @@ impl<'a> Evaluator<'a> {
                 }
                 // CONCAT with the separator, or with "" for one value, makes a simple
                 // string whatever the languages of the values
-                Some(string_term(parts.join(&sep)))
+                Some(Binding::exact(string_term(parts.join(&sep))))
             }
             AggregateFunction::Custom(_) => unreachable!(),
-        })
+        };
+        if let Some(binding) = &mut result {
+            let spelling = match name {
+                AggregateFunction::Count
+                    if spelling_error || inputs == Spelling::Term || distinct && reads_spelling =>
+                {
+                    Spelling::Lexical
+                }
+                AggregateFunction::Sum | AggregateFunction::Avg if reads_spelling => Spelling::Term,
+                AggregateFunction::Min | AggregateFunction::Max => {
+                    if spelling_error || inputs == Spelling::Term {
+                        Spelling::Term
+                    } else if inputs == Spelling::Lexical {
+                        let classes = values.iter().flatten().map(|b| value::term_class(&b.term));
+                        let best_class = if matches!(name, AggregateFunction::Min) {
+                            classes.min()
+                        } else {
+                            classes.max()
+                        };
+                        let mut contenders = values
+                            .iter()
+                            .flatten()
+                            .filter(|b| Some(value::term_class(&b.term)) == best_class);
+                        if let Some(first) = contenders.next() {
+                            let mut dep = first.spelling();
+                            let mut mixed_metadata = false;
+                            for b in contenders {
+                                dep = dep.max(b.spelling());
+                                if !same_metadata(&first.term, &b.term) {
+                                    mixed_metadata = true;
+                                }
+                            }
+                            if dep == Spelling::None {
+                                Spelling::None
+                            } else if mixed_metadata {
+                                Spelling::Term
+                            } else {
+                                Spelling::Lexical
+                            }
+                        } else {
+                            Spelling::None
+                        }
+                    } else {
+                        Spelling::None
+                    }
+                }
+                AggregateFunction::Sample => {
+                    if spelling_error || inputs == Spelling::Term {
+                        Spelling::Term
+                    } else if inputs == Spelling::Lexical {
+                        let mixed_metadata = terms
+                            .first()
+                            .is_some_and(|first| terms.iter().any(|t| !same_metadata(first, t)));
+                        if mixed_metadata {
+                            Spelling::Term
+                        } else {
+                            Spelling::Lexical
+                        }
+                    } else {
+                        Spelling::None
+                    }
+                }
+                AggregateFunction::GroupConcat { .. } if !spelling_error => inputs,
+                _ if spelling_error => Spelling::Term,
+                _ => Spelling::None,
+            };
+            binding.spelling = binding.spelling.max(spelling);
+        }
+        Ok(result)
     }
 
     // ------------------------------------------------------------------ CONSTRUCT ------

@@ -28,8 +28,9 @@ contracts and decisions.
 
 Use [SPARQL Query and Update](querying/README.md#sparql-queries-and-updates),
 including supported ARQ extensions, federation, query plans and incremental views.
-The guide also covers [standards conformance](querying/README.md#standards-conformance),
-the [command line](querying/README.md#command-line) and
+[Standards conformance](querying/README.md#standards-conformance) describes the reference
+evaluator and its differential comparisons. The guide also covers the
+[command line](querying/README.md#command-line) and
 [formatting and editor support](querying/README.md#formatter-and-editor-support).
 How MIN, MAX, AVG and GROUP_CONCAT treat errors is a setting with Jena's answers as its
 default, described under [aggregate errors](querying/README.md#aggregate-errors).

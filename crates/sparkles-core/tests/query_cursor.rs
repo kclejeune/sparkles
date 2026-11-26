@@ -6548,16 +6548,22 @@ fn reference_evaluator_review_round_3_cases() {
     check(!compared(&o2), format!("2: {o2:?}"));
     let o2b = check_select(&s2, &vars(&["x"]), &col(vec![xsd("16777219.5", "double")]));
     check(compared(&o2b), format!("2 allowed: {o2b:?}"));
-    // a weaker outcome of the comparison by value in a mixed column stays as weak
+    // Open order still permits another spelling of the computed cell.
     let s2c = selected(
         "SELECT ?y WHERE { { VALUES ?y { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } } \
          UNION { BIND(1 + 1 AS ?y) } } ORDER BY ?y RAND()",
     );
-    let o2c = check_select(&s2c, &vars(&["y"]), &col(vec![int(1), int(2)]));
+    let o2c = check_select(
+        &s2c,
+        &vars(&["y"]),
+        &col(vec![xsd("01", "integer"), xsd("+2", "integer")]),
+    );
     check(
         matches!(o2c, Ok(Outcome::OrderUnchecked(_))),
         format!("2 mixed: {o2c:?}"),
     );
+    let o2d = check_select(&s2c, &vars(&["y"]), &col(vec![int(1), int(2)]));
+    check(o2d.is_err(), format!("2 changed copied term: {o2d:?}"));
 
     // 3: STRDT keeps the lexical form of its argument
     let s3 = selected(
@@ -6577,6 +6583,1782 @@ fn reference_evaluator_review_round_3_cases() {
     let o4b = check_select(&s4, &vars(&["g"]), &col(vec![Some(iri("urn:g1").into())]));
     check(o4b.is_ok(), format!("4 allowed: {o4b:?}"));
     assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// An expected cell can carry the spelling of a computed number through `STR`, `STRDT`,
+/// `STRLANG` and `STRLANGDIR`. Another valid spelling gives a partial comparison, while
+/// constant and copied arguments keep exact comparison.
+#[test]
+fn reference_evaluator_str_computed_numbers_1093() {
+    use oxrdf::{BaseDirection, Literal, NamedNode};
+    use reference::check::{Outcome, check_select};
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let string = |v: &str| Some(Term::Literal(Literal::new_simple_literal(v)));
+    let typed = |v: &str, dt: &str| Some(Term::Literal(Literal::new_typed_literal(v, iri(dt))));
+    let xsd = |v: &str, name: &str| typed(v, &format!("http://www.w3.org/2001/XMLSchema#{name}"));
+    let lang = |v: &str, l: &str| {
+        Some(Term::Literal(
+            Literal::new_language_tagged_literal(v, l).unwrap(),
+        ))
+    };
+    let lang_dir = |v: &str, l: &str, d: BaseDirection| {
+        Some(Term::Literal(
+            Literal::new_directional_language_tagged_literal(v, l, d).unwrap(),
+        ))
+    };
+    let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let one = |t: Option<Term>| vec![vec![t]];
+    let r = reference::Reference::new(Vec::new());
+    let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
+
+    // 1: STR over computed numbers (inline, via variable, via aggregate, scientific, INF)
+    for q in [
+        "SELECT (STR(1.0 + 1.0) AS ?s) WHERE {}",
+        "SELECT (STR(?x) AS ?s) WHERE { BIND(1.0 + 1.0 AS ?x) }",
+        "SELECT (STR(SUM(?v)) AS ?s) WHERE { VALUES ?v { 1.0 1.0 } }",
+        "SELECT (STR(IF(true, 1.0 + 1.0, \"01\")) AS ?s) WHERE {}",
+        "SELECT (COALESCE(?u, STR(1.0 + 1.0)) AS ?s) WHERE { VALUES ?u { UNDEF } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["s"]), &one(string("2"))),
+            Ok(Outcome::Compared),
+            "exact match: {q}"
+        );
+        for alt in ["2.0", "+2.00", "02"] {
+            assert!(
+                matches!(
+                    check_select(&s, &vars(&["s"]), &one(string(alt))),
+                    Ok(Outcome::Partial(_))
+                ),
+                "allowed lexical {alt}: {q}"
+            );
+        }
+        for bad in [
+            string("3"),
+            string("2.1"),
+            string("two"),
+            string(" 2"),
+            xsd("2.0", "decimal"),
+            lang("2.0", "en"),
+        ] {
+            assert!(
+                check_select(&s, &vars(&["s"]), &one(bad.clone())).is_err(),
+                "must fail for {bad:?}: {q}"
+            );
+        }
+    }
+
+    // Scientific notation and special floats through STR
+    let s_dbl = selected("SELECT (STR(1.0e0 + 1.0e0) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_dbl, &vars(&["s"]), &s_dbl.rows),
+        Ok(Outcome::Compared)
+    );
+    for alt in ["2.0E0", "2.0e+0", "2.0", "2E0"] {
+        let res = check_select(&s_dbl, &vars(&["s"]), &one(string(alt)));
+        assert!(
+            matches!(res, Ok(Outcome::Compared | Outcome::Partial(_))),
+            "double lexical {alt}: {res:?}"
+        );
+    }
+    assert!(
+        matches!(
+            check_select(&s_dbl, &vars(&["s"]), &one(string("2.00E+0"))),
+            Ok(Outcome::Partial(_))
+        ),
+        "distinct double lexical must be partial"
+    );
+
+    let s_inf = selected("SELECT (STR(1.0e0 / 0.0e0) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_inf, &vars(&["s"]), &one(string("INF"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(matches!(
+        check_select(&s_inf, &vars(&["s"]), &one(string("+INF"))),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_select(&s_inf, &vars(&["s"]), &one(string("inf"))).is_err());
+    assert!(check_select(&s_inf, &vars(&["s"]), &one(string("-INF"))).is_err());
+
+    // 16-digit computed integer past f64's 2^53 precision does not collapse via f64
+    let s_big = selected("SELECT (STR(9007199254740992 + 1) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_big, &vars(&["s"]), &one(string("9007199254740993"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(matches!(
+        check_select(&s_big, &vars(&["s"]), &one(string("+9007199254740993"))),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(
+        check_select(&s_big, &vars(&["s"]), &one(string("9007199254740992"))).is_err(),
+        "off-by-one 16-digit integer past 2^53 must fail"
+    );
+
+    // 2: STR over constants and purely copied variables stays exact
+    for (q, exact, alt) in [
+        (
+            "SELECT (STR(\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>) AS ?s) WHERE {}",
+            "01",
+            "1",
+        ),
+        ("SELECT (STR(1.0) AS ?s) WHERE {}", "1.0", "1"),
+        (
+            "SELECT (STR(?x) AS ?s) WHERE { VALUES ?x { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } }",
+            "01",
+            "1",
+        ),
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["s"]), &one(string(exact))),
+            Ok(Outcome::Compared),
+            "copied exact: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["s"]), &one(string(alt))).is_err(),
+            "copied STR must reject {alt}: {q}"
+        );
+    }
+
+    // 3: STRDT over computed numbers (xsd:decimal, xsd:integer, custom datatype, via variable)
+    for q in [
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(STR(1.0 + 1.0), xsd:decimal) AS ?x) WHERE {}",
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(?s, xsd:decimal) AS ?x) WHERE { BIND(STR(1.0 + 1.0) AS ?s) }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(xsd("2", "decimal"))),
+            Ok(Outcome::Compared),
+            "STRDT exact: {q}"
+        );
+        assert!(
+            matches!(
+                check_select(&s, &vars(&["x"]), &one(xsd("2.0", "decimal"))),
+                Ok(Outcome::Partial(_))
+            ),
+            "STRDT partial: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["x"]), &one(xsd("2", "integer"))).is_err(),
+            "STRDT wrong datatype: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["x"]), &one(xsd("3.0", "decimal"))).is_err(),
+            "STRDT wrong value: {q}"
+        );
+    }
+
+    // STRDT with custom datatype and with xsd:integer (where "2.0"^^xsd:integer is ill-formed)
+    let s_dt_custom = selected("SELECT (STRDT(STR(1.0 + 1.0), <urn:custom>) AS ?x) WHERE {}");
+    assert_eq!(
+        check_select(&s_dt_custom, &vars(&["x"]), &one(typed("2", "urn:custom"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(matches!(
+        check_select(
+            &s_dt_custom,
+            &vars(&["x"]),
+            &one(typed("2.0", "urn:custom"))
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_select(&s_dt_custom, &vars(&["x"]), &one(typed("2.0", "urn:other"))).is_err());
+
+    let s_dt_int = selected(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(STR(1.0 + 1.0), xsd:integer) AS ?x) WHERE {}",
+    );
+    assert!(matches!(
+        check_select(&s_dt_int, &vars(&["x"]), &one(xsd("2.0", "integer"))),
+        Ok(Outcome::Partial(_))
+    ));
+
+    // STRDT over constant, copied variable, and STR of copied variable stays exact
+    for q in [
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(\"01\", xsd:integer) AS ?x) WHERE {}",
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(?s, xsd:integer) AS ?x) WHERE { VALUES ?s { \"01\" } }",
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(STR(?n), xsd:integer) AS ?x) WHERE { VALUES ?n { \"01\"^^xsd:integer } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(xsd("01", "integer"))),
+            Ok(Outcome::Compared),
+            "STRDT copied exact: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["x"]), &one(xsd("1", "integer"))).is_err(),
+            "STRDT copied must reject different lexical: {q}"
+        );
+    }
+
+    // 4: STRLANG over computed numbers vs constants and copied variables
+    for q in [
+        "SELECT (STRLANG(STR(1.0 + 1.0), \"en\") AS ?x) WHERE {}",
+        "SELECT (STRLANG(?s, \"en\") AS ?x) WHERE { BIND(STR(1.0 + 1.0) AS ?s) }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(lang("2", "en"))),
+            Ok(Outcome::Compared),
+            "STRLANG exact: {q}"
+        );
+        assert!(
+            matches!(
+                check_select(&s, &vars(&["x"]), &one(lang("2.0", "en"))),
+                Ok(Outcome::Partial(_))
+            ),
+            "STRLANG partial: {q}"
+        );
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("2.0", "fr"))).is_err());
+        assert!(check_select(&s, &vars(&["x"]), &one(string("2.0"))).is_err());
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("3.0", "en"))).is_err());
+    }
+    for q in [
+        "SELECT (STRLANG(\"01\", \"en\") AS ?x) WHERE {}",
+        "SELECT (STRLANG(?s, \"en\") AS ?x) WHERE { VALUES ?s { \"01\" } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(lang("01", "en"))),
+            Ok(Outcome::Compared)
+        );
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("1", "en"))).is_err());
+    }
+
+    // 5: STRLANGDIR over computed numbers vs constants and copied variables
+    for q in [
+        "SELECT (STRLANGDIR(STR(1.0 + 1.0), \"en\", \"ltr\") AS ?x) WHERE {}",
+        "SELECT (STRLANGDIR(?s, \"en\", \"ltr\") AS ?x) WHERE { BIND(STR(1.0 + 1.0) AS ?s) }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("2", "en", BaseDirection::Ltr))
+            ),
+            Ok(Outcome::Compared),
+            "STRLANGDIR exact: {q}"
+        );
+        assert!(
+            matches!(
+                check_select(
+                    &s,
+                    &vars(&["x"]),
+                    &one(lang_dir("2.0", "en", BaseDirection::Ltr))
+                ),
+                Ok(Outcome::Partial(_))
+            ),
+            "STRLANGDIR partial: {q}"
+        );
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("2.0", "en", BaseDirection::Rtl))
+            )
+            .is_err()
+        );
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("2.0", "fr", BaseDirection::Ltr))
+            )
+            .is_err()
+        );
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("2.0", "en"))).is_err());
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("3.0", "en", BaseDirection::Ltr))
+            )
+            .is_err()
+        );
+    }
+    for q in [
+        "SELECT (STRLANGDIR(\"01\", \"en\", \"ltr\") AS ?x) WHERE {}",
+        "SELECT (STRLANGDIR(?s, \"en\", \"ltr\") AS ?x) WHERE { VALUES ?s { \"01\" } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("01", "en", BaseDirection::Ltr))
+            ),
+            Ok(Outcome::Compared)
+        );
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("1", "en", BaseDirection::Ltr))
+            )
+            .is_err()
+        );
+    }
+
+    // 6: Isolation — xsd:string cast canonical form (item 1077) and copied sibling columns
+    // remain strictly exact, and weaker order outcomes stay as weak.
+    let s_cast = selected("SELECT (<http://www.w3.org/2001/XMLSchema#string>(1e6) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_cast, &vars(&["s"]), &one(string("1.0E6"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(
+        check_select(&s_cast, &vars(&["s"]), &one(string("1000000"))).is_err(),
+        "xsd:string(1e6) must not relax canonical form"
+    );
+
+    let s_two = selected(
+        "SELECT (STR(\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>) AS ?a) \
+         (STR(1.0 + 1.0) AS ?b) WHERE {}",
+    );
+    assert!(matches!(
+        check_select(
+            &s_two,
+            &vars(&["a", "b"]),
+            &[vec![string("01"), string("2.0")]]
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(
+        check_select(
+            &s_two,
+            &vars(&["a", "b"]),
+            &[vec![string("1"), string("2.0")]]
+        )
+        .is_err(),
+        "sibling copied column must stay exact"
+    );
+
+    let s_ord =
+        selected("SELECT (STR(1.0 + 1.0) AS ?s) WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND()");
+    assert!(matches!(
+        check_select(
+            &s_ord,
+            &vars(&["s"]),
+            &[vec![string("2.0")], vec![string("2.0")]]
+        ),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+fn check_str_1093(query: &str, rows: &[&[&str]]) -> Result<reference::check::Outcome, String> {
+    let oracle = reference::Reference::new(Vec::new());
+    let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+    let expected = oracle
+        .run_selected(&query, None)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .unwrap();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|text| Some(text.parse::<Term>().unwrap()))
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    reference::check::check_select(&expected, &expected.variables, &rows)
+}
+
+#[test]
+fn reference_str_1093_tracks_the_selected_cell() {
+    use reference::check::Outcome;
+    for expression in [
+        r#"IF(?i = 0, "02", STR(1 + 1))"#,
+        r#"IF(?i = 0, ?v, STR(1 + 1))"#,
+        r#"COALESCE(?v, STR(1 + 1))"#,
+    ] {
+        let query = format!(
+            "SELECT ?i ({expression} AS ?s) {{ VALUES (?i ?v) {{ (0 \"02\") (1 UNDEF) }} }}"
+        );
+        let fixed = r#""02""#;
+        let computed = r#""+2""#;
+        assert!(matches!(
+            check_str_1093(&query, &[&["1", computed], &["0", fixed]]),
+            Ok(Outcome::Partial(_))
+        ));
+        assert!(check_str_1093(&query, &[&["0", r#""2""#], &["1", computed]]).is_err());
+    }
+
+    // The first got row can match either branch, and the second can only match the computed one.
+    let duplicates = r#"SELECT (IF(?i = 0, STR(1 + 1), "2") AS ?s) { VALUES ?i { 0 1 } }"#;
+    assert!(matches!(
+        check_str_1093(duplicates, &[&[r#""2""#], &[r#""+2""#]]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(duplicates, &[&[r#""+2""#], &[r#""+2""#]]).is_err());
+
+    let distinct = r#"SELECT DISTINCT (IF(?i = 0, STR(1 + 1), "2") AS ?s)
+        { VALUES ?i { 0 1 } }"#;
+    assert_eq!(
+        check_str_1093(distinct, &[&[r#""2""#]]),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_str_1093(distinct, &[&[r#""+2""#]]).is_err());
+}
+
+#[test]
+fn reference_str_1093_keeps_typed_numeric_lexicals_well_formed() {
+    use reference::check::Outcome;
+    let direct = r#"SELECT ?i (IF(?i = 0, STR(1.0 + 1.0), 1 + 1) AS ?s)
+        { VALUES ?i { 0 1 } }"#;
+    assert!(matches!(
+        check_str_1093(
+            direct,
+            &[
+                &["0", r#""2.0""#],
+                &["1", r#""+2"^^<http://www.w3.org/2001/XMLSchema#integer>"#]
+            ]
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(
+        check_str_1093(
+            direct,
+            &[
+                &["0", r#""2.0""#],
+                &["1", r#""2.0"^^<http://www.w3.org/2001/XMLSchema#integer>"#]
+            ]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reference_str_1093_uses_the_source_numeric_type() {
+    use reference::check::Outcome;
+    for (expression, spelling, equivalent) in [
+        ("STR(1 + 1)", r#""+02""#, true),
+        ("STR(1 + 1)", r#""2.0""#, false),
+        ("STR(1 + 1)", r#""2E0""#, false),
+        ("STR(1.0 + 1.0)", r#""2E0""#, false),
+        (
+            "STR(123456789012345.1 + 0)",
+            r#""123456789012345.1000000000000000001""#,
+            false,
+        ),
+        (
+            "STR(123456789012345.1 + 0)",
+            r#""123456789012345.1000000000000000000""#,
+            true,
+        ),
+        ("STR(0e0 / -1e0)", r#""-0.0E0""#, true),
+        ("STR(0e0 / -1e0)", r#""0""#, false),
+        (
+            "STR(0e0 / -1e0)",
+            r#""-1e-9999999999999999999999999999999999999999""#,
+            true,
+        ),
+        (
+            "STR(xsd:float(\"0.1\") + xsd:float(\"0.0\"))",
+            r#""0.10000000009""#,
+            true,
+        ),
+        ("STR(0.1e0 + 0e0)", r#""0.10000000000000001""#, true),
+        ("STR(0e0 / 0e0)", r#""NaN""#, true),
+        ("STR(0e0 / 0e0)", r#""+NaN""#, false),
+        (
+            "STR(1e0 / 0e0)",
+            r#""1e9999999999999999999999999999999999999999""#,
+            true,
+        ),
+        (
+            "STR(1e0 / 0e0)",
+            r#""-1e9999999999999999999999999999999999999999""#,
+            false,
+        ),
+        ("STR(1e0 / 0e0)", r#""1e+""#, false),
+        (
+            "STRDT(STR(16777216 + 0), xsd:float)",
+            r#""+16777216"^^<http://www.w3.org/2001/XMLSchema#float>"#,
+            true,
+        ),
+        (
+            "STRDT(STR(16777216 + 0), xsd:float)",
+            r#""16777217"^^<http://www.w3.org/2001/XMLSchema#float>"#,
+            false,
+        ),
+    ] {
+        let query = format!("SELECT ({expression} AS ?s) {{}}");
+        let result = check_str_1093(&query, &[&[spelling]]);
+        if equivalent {
+            assert!(
+                matches!(result, Ok(Outcome::Compared | Outcome::Partial(_))),
+                "{query} against {spelling}: {result:?}"
+            );
+        } else {
+            assert!(result.is_err(), "{query} against {spelling}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn reference_str_1093_keeps_string_operations_exact() {
+    use reference::check::Outcome;
+    for (query, changed) in [
+        (r#"SELECT (STR(UCASE("01")) AS ?s) {}"#, r#""1""#),
+        (r#"SELECT (STR(xsd:string(1e6)) AS ?s) {}"#, r#""1000000""#),
+        (
+            r#"SELECT (STR(?c) AS ?s) { BIND(xsd:string(1e6) AS ?c) }"#,
+            r#""1000000""#,
+        ),
+        (
+            r#"SELECT (STR(?c) AS ?s) { VALUES ?code { "007x" } BIND(SUBSTR(?code, 1, 3) AS ?c) }"#,
+            r#""7""#,
+        ),
+    ] {
+        assert!(check_str_1093(query, &[&[changed]]).is_err(), "{query}");
+    }
+    assert!(matches!(
+        check_str_1093(
+            "SELECT (STR(xsd:string(STR(1 + 0))) AS ?s) {}",
+            &[&[r#""+01""#]]
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_respects_binding_scopes() {
+    use reference::check::Outcome;
+    for (query, changed) in [
+        (
+            r#"SELECT (STR(?n) AS ?s) { VALUES ?n { "01" }
+            { SELECT ?keep { BIND(1 + 0 AS ?n) BIND(0 AS ?keep) } } }"#,
+            r#""1""#,
+        ),
+        (
+            r#"SELECT (STR(?n) AS ?s) { VALUES ?n { "01" }
+            MINUS { BIND(1 + 0 AS ?n) } }"#,
+            r#""1""#,
+        ),
+        (
+            r#"SELECT (STR(?n) AS ?s) { VALUES ?n { "01" }
+            { SELECT ?k { BIND(1 + 0 AS ?n) BIND(0 AS ?k) } GROUP BY ?k } }"#,
+            r#""1""#,
+        ),
+    ] {
+        assert!(check_str_1093(query, &[&[changed]]).is_err(), "{query}");
+    }
+    for query in [
+        "SELECT (STR(?n) AS ?s) { { SELECT ?n { BIND(1 + 0 AS ?n) } } }",
+        "SELECT (STR(MIN(?n)) AS ?s) { VALUES ?i { 1 2 } BIND(?i + 0 AS ?n) }",
+    ] {
+        assert!(
+            matches!(
+                check_str_1093(query, &[&[r#""+01""#]]),
+                Ok(Outcome::Partial(_))
+            ),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn reference_str_1093_compares_order_using_observed_spellings() {
+    use reference::check::Outcome;
+    let query = "SELECT ?n (STR(?n + 0) AS ?s) { VALUES ?n { 2 10 } }";
+    let two = &["2", r#""02""#][..];
+    let ten = &["10", r#""10""#][..];
+    let lexical = format!("{query} ORDER BY ?s");
+    assert!(matches!(
+        check_str_1093(&lexical, &[two, ten]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(&lexical, &[ten, two]).is_err());
+    let sliced = format!("{lexical} LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&sliced, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert!(check_str_1093(&sliced, &[&["3", r#""03""#]]).is_err());
+
+    let hidden = format!("{query} ORDER BY STR(?n + 0)");
+    assert!(matches!(
+        check_str_1093(&hidden, &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    let numeric = format!("{query} ORDER BY ?n ?s");
+    assert!(matches!(
+        check_str_1093(&numeric, &[two, ten]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(&numeric, &[ten, two]).is_err());
+    assert!(check_str_1093(&format!("{numeric} LIMIT 1"), &[ten]).is_err());
+    let unaffected = format!("{query} ORDER BY ?n LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&unaffected, &[two]),
+        Ok(Outcome::Partial(_))
+    ));
+
+    let raw = r#"SELECT ?n ?number { VALUES ?n { 2 10 } BIND(?n + 0 AS ?number) }
+        ORDER BY STR(?number)"#;
+    let raw_two = &["2", r#""02"^^<http://www.w3.org/2001/XMLSchema#integer>"#][..];
+    let raw_ten = &["10", "10"][..];
+    assert_eq!(
+        check_str_1093(raw, &[raw_two, raw_ten]),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_str_1093(raw, &[raw_ten, raw_two]).is_err());
+
+    let open = format!("{query} ORDER BY RAND() LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&open, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_rejects_inversions_with_ambiguous_matches() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?s {
+        { VALUES ?s { "02" "10" } } UNION { BIND(STR(2 + 0) AS ?s) }
+    } ORDER BY ?s"#;
+    let two = &[r#""02""#][..];
+    let ten = &[r#""10""#][..];
+    assert!(matches!(
+        check_str_1093(query, &[two, two, ten]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(query, &[ten, two, two]).is_err());
+}
+
+#[test]
+fn reference_str_1093_checks_slice_boundaries_with_ambiguous_matches() {
+    use reference::check::Outcome;
+    let two = &[r#""02""#][..];
+    let first = &[r#""first""#][..];
+    let priority = r#"SELECT ?s {
+        { VALUES (?s ?priority) { ("first" 0) ("02" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(1 AS ?priority) }
+    } ORDER BY ?priority ?s"#;
+    assert!(check_str_1093(&format!("{priority} LIMIT 1"), &[two]).is_err());
+    assert!(matches!(
+        check_str_1093(&format!("{priority} LIMIT 1"), &[first]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check_str_1093(
+            &priority.replace("ORDER BY ?priority ?s", "ORDER BY ?priority LIMIT 1"),
+            &[first]
+        ),
+        Ok(Outcome::Compared)
+    );
+
+    let lexical = r#"SELECT ?s {
+        { VALUES ?s { "01" "02" } } UNION { BIND(STR(2 + 0) AS ?s) }
+    }"#;
+    assert!(check_str_1093(&format!("{lexical} ORDER BY ?s LIMIT 1"), &[two]).is_err());
+    assert!(check_str_1093(&format!("{lexical} ORDER BY DESC(?s) OFFSET 2"), &[two]).is_err());
+
+    let between = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("middle" 1) ("last" 2) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s"#;
+    let last = &[r#""last""#][..];
+    assert!(check_str_1093(&format!("{between} LIMIT 2 OFFSET 1"), &[two, last]).is_err());
+
+    let surplus = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("02" 0) ("last" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 2"#;
+    assert!(check_str_1093(surplus, &[two, last]).is_err());
+
+    let unresolved = r#"SELECT ?s {
+        { VALUES ?s { "02" } } UNION { BIND(STR(2 + 0) AS ?s) }
+    } ORDER BY ?s LIMIT 1"#;
+    assert!(matches!(
+        check_str_1093(unresolved, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_tracks_failed_binds_in_order_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+        BIND(IF(?n = 10, 1, IF(?s = "2", 1 / 0, 2)) AS ?key)
+    }"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    assert!(matches!(
+        check_str_1093(&format!("{query} ORDER BY ?key"), &[ten, two]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    assert!(check_str_1093(&format!("{query} ORDER BY ?n ?key"), &[ten, two]).is_err());
+
+    let union = r#"SELECT ?n ?s {
+        VALUES ?group { 0 }
+        { VALUES (?n ?s ?key ?group) { (10 "10" 0 0) } }
+        UNION
+        { SELECT ?n ?s ?key ?group {
+            BIND(2 AS ?n) BIND(STR(2 + 0) AS ?s) BIND(0 AS ?group)
+            BIND(IF(?s = "2", 1 / 0, 1) AS ?key)
+        } }
+    } ORDER BY ?key ?n"#;
+    assert!(matches!(
+        check_str_1093(union, &[ten, two]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_tracks_boundness_in_order_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+        BIND(IF(?s = "2", 1, 1 / 0) AS ?key)
+    }"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    assert!(matches!(
+        check_str_1093(&format!("{query} ORDER BY BOUND(?key) ?n"), &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    assert!(check_str_1093(&format!("{query} ORDER BY BOUND(?s) ?n"), &[ten, two]).is_err());
+    assert!(
+        check_str_1093(
+            &format!("{query} ORDER BY DESC(?n) BOUND(?key)"),
+            &[two, ten]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reference_str_1093_tracks_aggregate_value_dependencies_in_order_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ?s"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    for aggregate in ["SUM(STRLEN(?s))", "AVG(STRLEN(?s))"] {
+        let ordered = format!("{query} ORDER BY {aggregate}");
+        assert!(
+            matches!(
+                check_str_1093(&ordered, &[ten, two]),
+                Ok(Outcome::OrderUnchecked(_))
+            ),
+            "{ordered}"
+        );
+    }
+    let ordered = format!("{query} ORDER BY GROUP_CONCAT(?s)");
+    assert!(matches!(
+        check_str_1093(&ordered, &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_tracks_aggregate_presence_and_distinct_values() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES (?n ?copy) { (2 true) (2 false) (10 true) (10 false) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ?s"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    for aggregate in [
+        r#"COUNT(IF(?copy || ?s != "2", 1, 1 / 0))"#,
+        r#"COUNT(DISTINCT IF(?copy, "2", ?s))"#,
+        "MAX(DISTINCT IF(?copy, IF(?n = 2, 1, 2), STRLEN(?s)))",
+    ] {
+        let ordered = format!("{query} ORDER BY {aggregate} DESC(?n)");
+        assert!(
+            matches!(
+                check_str_1093(&ordered, &[ten, two]),
+                Ok(Outcome::OrderUnchecked(_))
+            ),
+            "{ordered}"
+        );
+    }
+    assert!(check_str_1093(&format!("{query} ORDER BY COUNT(?s) ?n"), &[ten, two]).is_err());
+}
+
+#[test]
+fn reference_str_1093_keeps_distinct_sort_prefixes() {
+    use reference::check::Outcome;
+    let query = r#"SELECT DISTINCT ?n ?s {
+        { VALUES (?n ?s) { (0 "first") (1 "2") } }
+        UNION { BIND(1 AS ?n) BIND(STR(1 + 1) AS ?s) }
+    } ORDER BY ?n ?s"#;
+    let first = &["0", r#""first""#][..];
+    let second = &["1", r#""2""#][..];
+    assert!(check_str_1093(query, &[second, first]).is_err());
+    assert!(check_str_1093(&format!("{query} LIMIT 1"), &[second]).is_err());
+    assert_eq!(
+        check_str_1093(query, &[first, second]),
+        Ok(Outcome::Compared)
+    );
+
+    let differing_suffix = r#"SELECT DISTINCT ?n ?s {
+        VALUES (?n ?s ?suffix) { (0 "first" 0) (1 "2" 0) (1 "2" 1) }
+    } ORDER BY ?n ?suffix"#;
+    assert!(check_str_1093(differing_suffix, &[second, first]).is_err());
+    assert!(check_str_1093(&format!("{differing_suffix} LIMIT 1"), &[second]).is_err());
+    assert!(matches!(
+        check_str_1093(differing_suffix, &[first, second]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_keeps_spelling_dependencies_of_numeric_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+        BIND(STRLEN(?s) AS ?len)
+        BIND(?len + 1 AS ?key)
+    }"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    for key in ["?len", "?key"] {
+        assert!(matches!(
+            check_str_1093(&format!("{query} ORDER BY {key}"), &[ten, two]),
+            Ok(Outcome::OrderUnchecked(_))
+        ));
+        assert!(check_str_1093(&format!("{query} ORDER BY ?n {key}"), &[ten, two]).is_err());
+    }
+}
+
+#[test]
+fn reference_str_1093_keeps_order_after_spelling_invariant_metadata() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+    }"#;
+    let two = &["2", r#""2""#][..];
+    let ten = &["10", r#""10""#][..];
+    for metadata in [
+        "LANG(?s)",
+        "DATATYPE(STR(?n + 0))",
+        "LANG(UCASE(?s))",
+        "DATATYPE(LCASE(UCASE(?s)))",
+    ] {
+        let ordered = format!("{query} ORDER BY {metadata} ?n");
+        assert!(check_str_1093(&ordered, &[ten, two]).is_err());
+        assert_eq!(check_str_1093(&ordered, &[two, ten]), Ok(Outcome::Compared));
+    }
+    let dependent = format!(r#"{query} ORDER BY LANG(STRLANG("x", IF(?s = "2", "en", "fr"))) ?n"#);
+    let padded = &["2", r#""002""#][..];
+    assert!(matches!(
+        check_str_1093(&dependent, &[ten, padded]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_r4_shared_candidate_capacity_rejects_forced_omissions() {
+    use reference::check::Outcome;
+    let first = &[r#""first""#][..];
+    let two = &[r#""02""#][..];
+    let last = &[r#""last""#][..];
+
+    let leading = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("last" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 2"#;
+    assert!(check_str_1093(leading, &[two, last]).is_err());
+    assert!(matches!(
+        check_str_1093(leading, &[two, two]),
+        Ok(Outcome::Partial(_))
+    ));
+
+    let tail = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("first" 0) ("02" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(1 AS ?k) }
+    } ORDER BY ?k ?s OFFSET 1 LIMIT 2"#;
+    assert!(check_str_1093(tail, &[first, two]).is_err());
+    assert!(matches!(
+        check_str_1093(tail, &[two, two]),
+        Ok(Outcome::Partial(_))
+    ));
+
+    let between = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("first" 0) ("02" 1) ("last" 2) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(1 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 3"#;
+    assert!(check_str_1093(between, &[first, two, last]).is_err());
+
+    let spare_unresolved = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("02" 0) ("last" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 2"#;
+    assert!(matches!(
+        check_str_1093(spare_unresolved, &[two, two]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_r4_tracks_selection_aggregate_dependencies() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES (?n ?copy) { (2 true) (2 false) (10 true) (10 false) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ?s"#;
+    let two_exact = &["2", r#""2""#][..];
+    let two_padded3 = &["2", r#""002""#][..];
+    let two_padded4 = &["2", r#""0002""#][..];
+    let ten = &["10", r#""10""#][..];
+
+    for aggregate in [
+        "MAX(DISTINCT IF(?copy, IF(?n = 2, 2, 3), STRLEN(?s)))",
+        "MAX(IF(?copy, IF(?n = 2, 2, 3), STRLEN(?s))) ?n",
+    ] {
+        let ordered = format!("{query} ORDER BY {aggregate}");
+        assert!(
+            matches!(
+                check_str_1093(&ordered, &[ten, two_padded4]),
+                Ok(Outcome::OrderUnchecked(_))
+            ),
+            "{ordered}"
+        );
+    }
+
+    let min_overtaken = format!(r#"{query} ORDER BY MIN(IF(?copy, IF(?n = 2, "05", "03"), ?s))"#);
+    assert!(matches!(
+        check_str_1093(&min_overtaken, &[two_padded3, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let min_metadata =
+        format!("{query} ORDER BY DATATYPE(MIN(DISTINCT IF(?copy, 1.5, STRLEN(?s)))) ?n");
+    assert!(matches!(
+        check_str_1093(&min_metadata, &[two_padded3, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let sample = format!(r#"{query} ORDER BY SAMPLE(IF(?copy, IF(?n = 2, "2", "10"), ?s))"#);
+    assert!(matches!(
+        check_str_1093(&sample, &[two_padded3, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let fixed_metadata = format!("{query} ORDER BY DATATYPE(MIN(IF(?copy, 2, STRLEN(?s)))) ?n");
+    assert!(check_str_1093(&fixed_metadata, &[ten, two_exact]).is_err());
+    assert_eq!(
+        check_str_1093(&fixed_metadata, &[two_exact, ten]),
+        Ok(Outcome::Compared)
+    );
+
+    let leading_key =
+        format!("{query} ORDER BY ?n MAX(DISTINCT IF(?copy, IF(?n = 2, 2, 3), STRLEN(?s)))");
+    assert!(check_str_1093(&leading_key, &[ten, two_padded4]).is_err());
+}
+
+#[test]
+fn reference_str_1093_r4_tracks_count_distinct_star_dependencies() {
+    use reference::check::Outcome;
+    let two = &["2"][..];
+    let ten = &["10"][..];
+
+    let lexical = r#"SELECT ?n {
+        { VALUES (?n ?s) { (2 "02") (10 "10") } }
+        UNION { VALUES ?n { 2 10 } BIND(STR(?n + 0) AS ?s) }
+    } GROUP BY ?n"#;
+    assert!(matches!(
+        check_str_1093(
+            &format!("{lexical} ORDER BY COUNT(DISTINCT *)"),
+            &[two, ten]
+        ),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    assert!(
+        check_str_1093(
+            &format!("{lexical} ORDER BY DATATYPE(COUNT(DISTINCT *)) ?n"),
+            &[ten, two]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        check_str_1093(
+            &format!("{lexical} ORDER BY DATATYPE(COUNT(DISTINCT *)) ?n"),
+            &[two, ten]
+        ),
+        Ok(Outcome::Compared)
+    );
+
+    let unbound_bind = r#"SELECT ?n {
+        { VALUES (?n ?k) { (2 1) (10 1) (10 2) } }
+        UNION {
+            SELECT ?n ?k {
+                BIND(2 AS ?n)
+                BIND(STR(2 + 0) AS ?s)
+                BIND(IF(?s = "2", 1 / 0, 1) AS ?k)
+            }
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) DESC(?n)"#;
+    assert!(matches!(
+        check_str_1093(unbound_bind, &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let plain_count = r#"SELECT ?n {
+        { VALUES (?n ?s) { (2 "02") (10 "10") (10 "20") } }
+        UNION { VALUES ?n { 2 10 } BIND(STR(?n + 0) AS ?s) }
+    } GROUP BY ?n ORDER BY COUNT(*)"#;
+    assert!(check_str_1093(plain_count, &[ten, two]).is_err());
+    assert_eq!(
+        check_str_1093(plain_count, &[two, ten]),
+        Ok(Outcome::Compared)
+    );
+
+    let singleton = r#"SELECT ?n {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) ?n"#;
+    assert!(check_str_1093(singleton, &[ten, two]).is_err());
+    assert_eq!(
+        check_str_1093(singleton, &[two, ten]),
+        Ok(Outcome::Compared)
+    );
+
+    let projected_out = r#"SELECT ?n {
+        SELECT ?n ?tag {
+            VALUES (?n ?tag) { (2 "a") (2 "b") (10 "a") (10 "a") }
+            BIND(STR(?n + 0) AS ?s)
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *)"#;
+    assert!(check_str_1093(projected_out, &[two, ten]).is_err());
+    assert_eq!(
+        check_str_1093(projected_out, &[ten, two]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r5_keeps_count_distinct_star_fixed_with_discriminator() {
+    use reference::check::Outcome;
+    let two = &["2"][..];
+    let ten = &["10"][..];
+
+    let fixed_tag = r#"SELECT ?n WHERE {
+        VALUES (?n ?tag) { (2 "a") (10 "a") (10 "b") }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(fixed_tag, &[ten]).is_err());
+    assert_eq!(check_str_1093(fixed_tag, &[two]), Ok(Outcome::Compared));
+
+    let fixed_presence = r#"SELECT ?n WHERE {
+        VALUES (?n ?tag) { (2 "a") (10 "a") (10 UNDEF) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(fixed_presence, &[ten]).is_err());
+    assert_eq!(
+        check_str_1093(fixed_presence, &[two]),
+        Ok(Outcome::Compared)
+    );
+
+    let fixed_metadata = r#"SELECT ?n WHERE {
+        { VALUES ?n { 2 10 } BIND(STR(?n + 0) AS ?s) }
+        UNION { VALUES ?n { 10 } BIND(STRLANG(STR(?n + 0), "en") AS ?s) }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(fixed_metadata, &[ten]).is_err());
+    assert_eq!(
+        check_str_1093(fixed_metadata, &[two]),
+        Ok(Outcome::Compared)
+    );
+
+    let unbound_with_tag = r#"SELECT ?n WHERE {
+        { VALUES (?n ?tag ?k) { (2 "a" 1) (10 "a" 1) } }
+        UNION {
+            SELECT ?n ?tag ?k {
+                BIND(10 AS ?n)
+                BIND("b" AS ?tag)
+                BIND(STR(10 + 0) AS ?s)
+                BIND(IF(?s = "10", 1 / 0, 1) AS ?k)
+            }
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(unbound_with_tag, &[ten]).is_err());
+    assert_eq!(
+        check_str_1093(unbound_with_tag, &[two]),
+        Ok(Outcome::Compared)
+    );
+
+    let colliding_lexical = r#"SELECT ?n WHERE {
+        { VALUES (?n ?tag ?s) { (2 "a" "2") (10 "a" "010") } }
+        UNION { VALUES (?n ?tag) { (10 "a") } BIND(STR(?n + 0) AS ?s) }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(matches!(
+        check_str_1093(colliding_lexical, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    let colliding_unbound = r#"SELECT ?n WHERE {
+        { VALUES (?n ?k) { (2 1) (10 1) } }
+        UNION {
+            SELECT ?n ?k {
+                BIND(10 AS ?n)
+                BIND(STR(10 + 0) AS ?s)
+                BIND(IF(?s = "10", 1 / 0, 1) AS ?k)
+            }
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(matches!(
+        check_str_1093(colliding_unbound, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_r6_bounds_count_distinct_star_pair_scan() {
+    use oxrdf::{GraphName, NamedNode, Quad};
+    use reference::check::Outcome;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    let member_pred = NamedNode::new_unchecked("urn:member");
+    let group_obj = NamedNode::new_unchecked("urn:group");
+    let make_quads = |count: usize| -> Vec<Quad> {
+        (0..count)
+            .map(|i| {
+                Quad::new(
+                    NamedNode::new_unchecked(format!("urn:item:{i}")),
+                    member_pred.clone(),
+                    group_obj.clone(),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    };
+
+    let rotating_grouped_slice = r#"SELECT ?g WHERE {
+        { VALUES (?g ?a ?b ?c) { (1 <urn:only> 0 0) } }
+        UNION {
+            { ?a <urn:member> <urn:group> . BIND(0 AS ?b) BIND(0 AS ?c) }
+            UNION {
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?a)
+                BIND(1 AS ?b) BIND(1 AS ?c)
+            }
+            UNION {
+                BIND(0 AS ?a)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?b)
+                BIND(2 AS ?c)
+            }
+            UNION {
+                BIND(1 AS ?a) BIND(2 AS ?b)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?c)
+            }
+            BIND(2 AS ?g)
+        }
+        BIND(STR(1 + 0) AS ?s)
+    } GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+
+    let rotating_count_only = r#"SELECT (COUNT(DISTINCT *) AS ?count) WHERE {
+        { ?a <urn:member> <urn:group> . BIND(0 AS ?b) BIND(0 AS ?c) }
+        UNION {
+            BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?a)
+            BIND(1 AS ?b) BIND(1 AS ?c)
+        }
+        UNION {
+            BIND(0 AS ?a)
+            BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?b)
+            BIND(2 AS ?c)
+        }
+        UNION {
+            BIND(1 AS ?a) BIND(2 AS ?b)
+            BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?c)
+        }
+        BIND(STR(1 + 0) AS ?s)
+    }"#;
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+
+    // Small unsplit group (13 rows -> 78 pairs <= budget) still proves fixed.
+    let small = reference::Reference::new(make_quads(10));
+    assert!(check(&small, rotating_grouped_slice, &[two]).is_err());
+    assert_eq!(
+        check(&small, rotating_grouped_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+
+    // Tight work_limit bounds the pair scan conservatively without failing evaluation.
+    let tight = reference::Reference::new(make_quads(60)).with_work_limit(1_000);
+    assert!(matches!(
+        check(&tight, rotating_grouped_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&tight, rotating_count_only, &[&["63"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Single unsplit bucket exceeding the pair budget (503 rows -> 126,253 pairs > 100,000)
+    // retains spelling dependency conservatively and still compares without ORDER BY.
+    let over_budget = reference::Reference::new(make_quads(500));
+    assert!(matches!(
+        check(&over_budget, rotating_grouped_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&over_budget, rotating_count_only, &[&["503"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Cross-bucket budget: 50 buckets of 73 rows each (2,628 pairs per bucket,
+    // 131,400 pairs combined > 100,000) exhausts the shared budget across buckets.
+    let in_bucket = NamedNode::new_unchecked("urn:inBucket");
+    let is_bucket = NamedNode::new_unchecked("urn:isBucket");
+    let yes = NamedNode::new_unchecked("urn:yes");
+    let mut bucket_quads = Vec::with_capacity(50 * 71);
+    for b in 0..50 {
+        let bucket = NamedNode::new_unchecked(format!("urn:b:{b}"));
+        bucket_quads.push(Quad::new(
+            bucket.clone(),
+            is_bucket.clone(),
+            yes.clone(),
+            GraphName::DefaultGraph,
+        ));
+        for i in 0..70 {
+            bucket_quads.push(Quad::new(
+                NamedNode::new_unchecked(format!("urn:item:{b}:{i}")),
+                in_bucket.clone(),
+                bucket.clone(),
+                GraphName::DefaultGraph,
+            ));
+        }
+    }
+    let multi_bucket_query = r#"SELECT ?g WHERE {
+        { VALUES (?g ?k ?a ?b ?c) { (1 <urn:only> <urn:only> 0 0) } }
+        UNION {
+            { ?a <urn:inBucket> ?k . BIND(0 AS ?b) BIND(0 AS ?c) }
+            UNION {
+                ?k <urn:isBucket> <urn:yes> .
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?a)
+                BIND(1 AS ?b) BIND(1 AS ?c)
+            }
+            UNION {
+                ?k <urn:isBucket> <urn:yes> .
+                BIND(0 AS ?a)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?b)
+                BIND(2 AS ?c)
+            }
+            UNION {
+                ?k <urn:isBucket> <urn:yes> .
+                BIND(1 AS ?a) BIND(2 AS ?b)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?c)
+            }
+            BIND(2 AS ?g)
+        }
+        BIND(STR(1 + 0) AS ?s)
+    } GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    let multi_bucket = reference::Reference::new(bucket_quads);
+    assert!(matches!(
+        check(&multi_bucket, multi_bucket_query, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    // Large group matching the review query shape under the optimizer work limit.
+    let large = reference::Reference::new(make_quads(5_000)).with_work_limit(20_000_000);
+    assert_eq!(
+        check(&large, rotating_count_only, &[&["5003"]]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r7_bounds_count_distinct_star_bucket_refinement() {
+    use reference::check::Outcome;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    fn balanced_union(branches: &[String]) -> String {
+        match branches {
+            [] => unreachable!(),
+            [single] => single.clone(),
+            _ => {
+                let mid = branches.len() / 2;
+                format!(
+                    "{{ {} UNION {} }}",
+                    balanced_union(&branches[..mid]),
+                    balanced_union(&branches[mid..])
+                )
+            }
+        }
+    }
+
+    let peeling_union = |count: usize, prefix: &str| -> String {
+        let branches: Vec<String> = (1..=count)
+            .map(|i| {
+                if i < count {
+                    format!(
+                        "{{ BIND(1 AS ?{prefix}{i}) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{prefix}{}) }}",
+                        i + 1
+                    )
+                } else {
+                    format!("{{ BIND(1 AS ?{prefix}{i}) }}")
+                }
+            })
+            .collect();
+        balanced_union(&branches)
+    };
+
+    let grouped_slice = |count: usize| -> String {
+        let body = peeling_union(count, "v");
+        format!(
+            "SELECT ?g WHERE {{ \
+                {{ VALUES (?g ?x) {{ (1 1) (1 2) }} }} \
+                UNION {{ {body} BIND(2 AS ?g) }} \
+            }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+        )
+    };
+
+    let count_only = |count: usize| -> String {
+        let body = peeling_union(count, "v");
+        format!("SELECT (COUNT(DISTINCT *) AS ?count) WHERE {{ {body} }}")
+    };
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+
+    // Small peeling chain (10 rows, 9 refinement passes, 0 pair checks) fits
+    // within the proof budget and still proves COUNT(DISTINCT *) fixed.
+    let default_oracle = reference::Reference::new(Vec::new());
+    let small_slice = grouped_slice(10);
+    assert!(check(&default_oracle, &small_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &small_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+
+    // Tight work_limit bounds recursive bucket refinement conservatively without
+    // failing evaluation: 30 peeling rows evaluate well under work_limit(1_000)
+    // but need more refinement work than the remaining proof budget allows.
+    let tight = reference::Reference::new(Vec::new()).with_work_limit(1_000);
+    let medium_slice = grouped_slice(30);
+    assert!(matches!(
+        check(&tight, &medium_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&tight, &count_only(30), &[&["30"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Peeling chain exceeding the default proof budget (240 rows, 0 pair checks)
+    // retains spelling dependency conservatively and still compares without ORDER BY.
+    let over_budget_slice = grouped_slice(240);
+    assert!(matches!(
+        check(&default_oracle, &over_budget_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&default_oracle, &count_only(240), &[&["240"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Shared cross-group proof budget: a single 120-row peeling group fits within
+    // the default budget (~36k), while three such groups (~108k) exhaust it.
+    let single_120_slice = grouped_slice(120);
+    assert!(check(&default_oracle, &single_120_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &single_120_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+    let multi_group_slice = format!(
+        "SELECT ?g WHERE {{ \
+            {{ VALUES (?g ?x) {{ (1 1) (1 2) }} }} \
+            UNION {{ {} BIND(2 AS ?g) }} \
+            UNION {{ {} BIND(3 AS ?g) }} \
+            UNION {{ {} BIND(4 AS ?g) }} \
+        }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1",
+        peeling_union(120, "a"),
+        peeling_union(120, "b"),
+        peeling_union(120, "c"),
+    );
+    assert!(matches!(
+        check(&default_oracle, &multi_group_slice, &[one]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    // Large peeling chain under the optimizer work limit completes quickly and
+    // compares cleanly without ORDER BY.
+    let large = reference::Reference::new(Vec::new()).with_work_limit(20_000_000);
+    assert_eq!(
+        check(&large, &count_only(600), &[&["600"]]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r8_projects_sparse_spelling_maps_in_peeling_chain() {
+    use reference::check::Outcome;
+    use std::fmt::Write as _;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    fn balanced_union(branches: &[String]) -> String {
+        match branches {
+            [] => unreachable!(),
+            [single] => single.clone(),
+            _ => {
+                let mid = branches.len() / 2;
+                format!(
+                    "{{ {} UNION {} }}",
+                    balanced_union(&branches[..mid]),
+                    balanced_union(&branches[mid..])
+                )
+            }
+        }
+    }
+
+    fn balanced_binds(vars: &[String]) -> String {
+        if vars.len() <= 8 {
+            let mut out = String::new();
+            for v in vars {
+                let _ = write!(out, " BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{v})");
+            }
+            return format!("{{ {out} }}");
+        }
+        let mid = vars.len() / 2;
+        format!(
+            "{{ {} {} }}",
+            balanced_binds(&vars[..mid]),
+            balanced_binds(&vars[mid..])
+        )
+    }
+
+    let projected_peeling_union = |count: usize, dropped_bindings: usize, prefix: &str| -> String {
+        let drop_vars: Vec<String> = (0..dropped_bindings).map(|j| format!("drop{j}")).collect();
+        let dropped = balanced_binds(&drop_vars);
+        let branches: Vec<String> = (1..=count)
+            .map(|i| {
+                if i < count {
+                    format!(
+                        "{{ BIND(1 AS ?{prefix}{i}) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{prefix}{}) }}",
+                        i + 1
+                    )
+                } else {
+                    format!(
+                        "{{ SELECT ?{prefix}{i} ?keep WHERE {{ {{ BIND(1 AS ?{prefix}{i}) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?keep) }} {dropped} }} }}"
+                    )
+                }
+            })
+            .collect();
+        balanced_union(&branches)
+    };
+
+    let grouped_slice = |count: usize, dropped_bindings: usize| -> String {
+        let body = projected_peeling_union(count, dropped_bindings, "v");
+        format!(
+            "SELECT ?g WHERE {{ \
+                {{ VALUES (?g ?x) {{ (1 1) (1 2) }} }} \
+                UNION {{ {body} BIND(2 AS ?g) }} \
+            }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+        )
+    };
+
+    let count_only = |count: usize, dropped_bindings: usize| -> String {
+        let body = projected_peeling_union(count, dropped_bindings, "v");
+        format!("SELECT (COUNT(DISTINCT *) AS ?count) WHERE {{ {body} }}")
+    };
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+    let default_oracle = reference::Reference::new(Vec::new());
+
+    // Small peeling chain whose last row drops 300 of 301 spelling-dependent
+    // bindings via projection still proves COUNT(DISTINCT *) fixed.
+    let small_slice = grouped_slice(10, 300);
+    assert!(check(&default_oracle, &small_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &small_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+    assert_eq!(
+        check(&default_oracle, &count_only(10, 300), &[&["10"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Multi-pass peeling chain (~36k refinement units <= 100k) where the
+    // projected row survives all 119 splits with one retained spelling entry
+    // out of 501 completes quickly and proves fixed.
+    let medium_slice = grouped_slice(120, 500);
+    assert!(check(&default_oracle, &medium_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &medium_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+
+    // Over-budget peeling chain with a projected trailing row falls back
+    // conservatively while keeping the numeric count unchanged.
+    let over_budget_slice = grouped_slice(240, 300);
+    assert!(matches!(
+        check(&default_oracle, &over_budget_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&default_oracle, &count_only(240, 300), &[&["240"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Projection that drops every spelling-dependent binding leaves a
+    // spelling-free row whose COUNT(DISTINCT *) remains fixed.
+    let drop_vars: Vec<String> = (0..300).map(|j| format!("drop{j}")).collect();
+    let dropped = balanced_binds(&drop_vars);
+    let all_dropped_slice = format!(
+        "SELECT ?g WHERE {{ \
+            {{ VALUES (?g ?v) {{ (1 1) }} }} \
+            UNION {{ \
+                {{ SELECT ?v WHERE {{ {{ BIND(1 AS ?v) }} {dropped} }} }} \
+                UNION {{ SELECT ?v WHERE {{ {{ BIND(2 AS ?v) }} {dropped} }} }} \
+                BIND(2 AS ?g) \
+            }} \
+        }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+    );
+    let tight = reference::Reference::new(Vec::new()).with_work_limit(2_000);
+    assert!(check(&tight, &all_dropped_slice, &[two]).is_err());
+    assert_eq!(
+        check(&tight, &all_dropped_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r8_charges_pair_variable_visits() {
+    use oxrdf::{GraphName, NamedNode, Quad};
+    use reference::check::Outcome;
+    use std::fmt::Write as _;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    let member_pred = NamedNode::new_unchecked("urn:member");
+    let group_obj = NamedNode::new_unchecked("urn:group");
+    let make_quads = |count: usize| -> Vec<Quad> {
+        (0..count)
+            .map(|i| {
+                Quad::new(
+                    NamedNode::new_unchecked(format!("urn:item:{i}")),
+                    member_pred.clone(),
+                    group_obj.clone(),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    };
+
+    fn balanced_binds(vars: &[String]) -> String {
+        if vars.len() <= 8 {
+            let mut out = String::new();
+            for v in vars {
+                let _ = write!(out, " BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{v})");
+            }
+            return format!("{{ {out} }}");
+        }
+        let mid = vars.len() / 2;
+        format!(
+            "{{ {} {} }}",
+            balanced_binds(&vars[..mid]),
+            balanced_binds(&vars[mid..])
+        )
+    }
+
+    let wide_rotating_body = |extra_vars: usize, duplicate_fixed: bool| -> String {
+        let fixed_arm = if duplicate_fixed {
+            "{ SELECT ?a ?b ?c WHERE { ?dummy <urn:member> <urn:group> . BIND(<urn:fixed> AS ?a) BIND(0 AS ?b) BIND(0 AS ?c) } }"
+        } else {
+            "{ ?a <urn:member> <urn:group> . BIND(0 AS ?b) BIND(0 AS ?c) }"
+        };
+        let extra_names: Vec<String> = (0..extra_vars).map(|i| format!("A{i}")).collect();
+        let extra = balanced_binds(&extra_names);
+        format!(
+            "{fixed_arm} \
+            UNION {{ {{ BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?a) BIND(1 AS ?b) BIND(1 AS ?c) }} {extra} }} \
+            UNION {{ BIND(0 AS ?a) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?b) BIND(2 AS ?c) }} \
+            UNION {{ BIND(1 AS ?a) BIND(2 AS ?b) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?c) }}"
+        )
+    };
+
+    let grouped_slice = |extra_vars: usize, duplicate_fixed: bool| -> String {
+        let body = wide_rotating_body(extra_vars, duplicate_fixed);
+        format!(
+            "SELECT ?g WHERE {{ \
+                {{ VALUES (?g ?a ?b ?c) {{ (1 <urn:only> 0 0) }} }} \
+                UNION {{ {body} BIND(2 AS ?g) }} \
+            }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+        )
+    };
+
+    let count_only = |extra_vars: usize, duplicate_fixed: bool| -> String {
+        let body = wide_rotating_body(extra_vars, duplicate_fixed);
+        format!("SELECT (COUNT(DISTINCT *) AS ?count) WHERE {{ {body} }}")
+    };
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+
+    // Small wide-row group still proves COUNT(DISTINCT *) fixed within budget.
+    let small = reference::Reference::new(make_quads(5));
+    let small_slice = grouped_slice(10, false);
+    assert!(check(&small, &small_slice, &[two]).is_err());
+    assert_eq!(check(&small, &small_slice, &[one]), Ok(Outcome::Compared));
+
+    // Tight-budget case: only 63 pairs, but repeated scans across 100 extra
+    // spelling-dependent bindings on the wide row exhaust the remaining proof
+    // budget, retaining the dependency without changing the count.
+    let tight = reference::Reference::new(make_quads(20)).with_work_limit(2_000);
+    let tight_slice = grouped_slice(100, false);
+    assert!(matches!(
+        check(&tight, &tight_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&tight, &count_only(100, false), &[&["23"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Default proof budget (100,000): refinement (~2.3k) plus pair count (903)
+    // is far below 100,000, but 302 comparisons against 400 extra bindings
+    // (~121k variable visits) exhaust the default budget cleanly.
+    let wide_default = reference::Reference::new(make_quads(300));
+    let wide_slice = grouped_slice(400, false);
+    assert!(matches!(
+        check(&wide_default, &wide_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&wide_default, &count_only(400, false), &[&["303"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Duplicate fixed rows also exhaust the pair variable-visit budget while
+    // leaving the distinct count (4) unchanged.
+    let dup_slice = grouped_slice(400, true);
+    assert!(matches!(
+        check(&wide_default, &dup_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&wide_default, &count_only(400, true), &[&["4"]]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r5_keeps_min_max_fixed_across_strict_term_classes() {
+    use reference::check::Outcome;
+    let two = &["2"][..];
+    let ten = &["10"][..];
+    let base = r#"SELECT ?n WHERE {
+        VALUES (?n ?copy) { (2 true) (2 false) (10 true) (10 false) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n"#;
+
+    let min_iri = format!("{base} ORDER BY MIN(IF(?copy, <urn:fixed>, ?s)) ?n LIMIT 1");
+    assert!(check_str_1093(&min_iri, &[ten]).is_err());
+    assert_eq!(check_str_1093(&min_iri, &[two]), Ok(Outcome::Compared));
+
+    let max_triple =
+        format!("{base} ORDER BY MAX(IF(?copy, <<( <urn:s> <urn:p> <urn:o> )>>, ?s)) ?n LIMIT 1");
+    assert!(check_str_1093(&max_triple, &[ten]).is_err());
+    assert_eq!(check_str_1093(&max_triple, &[two]), Ok(Outcome::Compared));
+
+    let max_datatype =
+        format!("{base} ORDER BY DATATYPE(MAX(IF(?copy, <urn:fixed>, ?s))) ?n LIMIT 1");
+    assert!(check_str_1093(&max_datatype, &[ten]).is_err());
+    assert_eq!(check_str_1093(&max_datatype, &[two]), Ok(Outcome::Compared));
+
+    let max_literal_wins = format!("{base} ORDER BY MAX(IF(?copy, <urn:fixed>, ?s)) ?n LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&max_literal_wins, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    let min_class_can_change = format!(
+        r#"{base} ORDER BY MIN(IF(?copy, <urn:fixed>, IF(?s != "010", "a", <urn:a>))) ?n LIMIT 1"#
+    );
+    assert!(matches!(
+        check_str_1093(&min_class_can_change, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    let min_error_can_appear = format!(
+        r#"{base} ORDER BY MIN(IF(?copy, <urn:fixed>, IF(?s = "010", 1 / 0, "a"))) ?n LIMIT 1"#
+    );
+    assert!(matches!(
+        check_str_1093(&min_error_can_appear, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
 }
 
 /// The reference evaluator's own cases: the choices that it notes, the scope of the
