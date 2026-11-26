@@ -248,7 +248,6 @@ impl GroupMemory {
 
 /// Access to the pass's memory and deferred arguments during a batch fold.
 pub(crate) enum BatchBudget<'a> {
-    #[cfg(test)]
     Retain(&'a mut dyn FnMut(u64) -> Result<()>),
     Memory(&'a mut GroupMemory),
     SpillSum(SumBudget<'a>),
@@ -257,7 +256,6 @@ pub(crate) enum BatchBudget<'a> {
 impl<'a> BatchBudget<'a> {
     pub(super) fn retain(&mut self, bytes: u64) -> Result<()> {
         match self {
-            #[cfg(test)]
             Self::Retain(f) => f(bytes),
             Self::Memory(memory) => memory.retain(bytes),
             Self::SpillSum(b) => b.memory.retain(bytes),
@@ -266,7 +264,6 @@ impl<'a> BatchBudget<'a> {
 
     pub(super) fn charge_scratch<'c>(&mut self, ctx: &'c Ctx, bytes: u64) -> Result<Charge<'c>> {
         match self {
-            #[cfg(test)]
             Self::Retain(_) => ctx.charge(bytes),
             Self::Memory(memory) => memory.charge_scratch(ctx, bytes),
             Self::SpillSum(b) => b.memory.charge_scratch(ctx, bytes),
@@ -666,6 +663,7 @@ impl Grouping {
                         other => other,
                     },
                     rows: index.as_ref(),
+                    weights: None,
                     base,
                 };
                 if self.query.is_some() {

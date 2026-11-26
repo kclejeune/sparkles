@@ -150,6 +150,26 @@ impl Terms {
         self.keys.len()
     }
 
+    pub(crate) fn key_bytes(&self, index: usize) -> Option<&[u8]> {
+        self.keys.get(index).map(|k| k.bytes.as_ref())
+    }
+
+    pub(crate) fn find_local_key(&self, key: &[u8]) -> Option<u64> {
+        self.index.get(key).copied()
+    }
+
+    pub(crate) fn push_local_key(&mut self, key: Vec<u8>) -> Id {
+        self.local(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backing_ptrs(&self) -> (usize, Option<usize>) {
+        (
+            self.keys.as_ptr() as usize,
+            self.keys.first().map(|k| Arc::as_ptr(k) as usize),
+        )
+    }
+
     pub fn bytes(&self) -> u64 {
         self.bytes
     }

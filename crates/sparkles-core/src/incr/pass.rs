@@ -170,6 +170,9 @@ pub struct Pass<'a> {
     #[cfg(test)]
     pub estimated: std::cell::Cell<u64>,
     ctx: Option<Arc<Ctx>>,
+    /// Dedicated context for grouping accumulators, backed directly by `self.terms`
+    /// during each call so `Tag::Local` ids resolve and intern on demand.
+    agg_ctx: Option<Arc<Ctx>>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
 }
@@ -261,6 +264,7 @@ impl<'a> Pass<'a> {
             #[cfg(test)]
             estimated: std::cell::Cell::new(0),
             ctx: None,
+            agg_ctx: None,
             union_changes: None,
             work: 0,
         }
@@ -677,6 +681,58 @@ impl<'a> Pass<'a> {
             self.ctx = Some(c.into_shared());
         }
         Ok(self.ctx.as_deref().expect("made above"))
+    }
+
+    /// Run `f` with a [`Ctx`] backed directly by `self.terms`, so `Tag::Local` ids
+    /// resolve and intern on demand without copying historical local keys and while
+    /// enforcing the pass's memory budget, deadline, and cancellation flag.
+    pub(crate) fn with_agg_ctx<T>(&mut self, f: impl FnOnce(&Ctx) -> Result<T>) -> Result<T> {
+        if self.agg_ctx.is_none() {
+            let mut c = Ctx::new(self.new.clone());
+            c.use_cache = false;
+            c.aggregate_errors = self.aggregate_errors;
+            c.base_iri = self.base.clone();
+            c.deadline = self.control.deadline;
+            c.cancel = self.control.cancel.flag();
+            if let Some(m) = self
+                .budget
+                .as_ref()
+                .and_then(BudgetHandle::remaining_local)
+                .or(self.max_memory_bytes)
+            {
+                c.mem_limit = m;
+            }
+            if let Some(budget) = &self.budget
+                && let Some((parent, grant)) = budget.child_parent(self.pool.as_ref())?
+            {
+                c.set_grant(grant);
+                c.set_memory_parent(parent)?;
+            }
+            c.allow_service = false;
+            c.forbid_service = true;
+            self.agg_ctx = Some(c.into_shared());
+        }
+        let ctx = self.agg_ctx.as_ref().expect("made above").clone();
+        struct Restore<'a> {
+            ctx: Arc<Ctx>,
+            terms: &'a mut Terms,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                *self.terms = self.ctx.take_circuit_terms();
+            }
+        }
+        let moved = std::mem::take(self.terms);
+        ctx.swap_circuit_terms(moved);
+        let guard = Restore {
+            ctx: ctx.clone(),
+            terms: self.terms,
+        };
+        let res = f(&ctx);
+        drop(guard);
+        let val = res?;
+        ctx.check()?;
+        Ok(val)
     }
 
     /// Evaluate `e` over rows of `schema` (circuit variables): the id of each value, or

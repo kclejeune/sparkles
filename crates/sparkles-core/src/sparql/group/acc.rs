@@ -8,21 +8,30 @@
 //! the design. `init` makes room for new groups, `add_batch` folds rows into their
 //! groups, `merge` folds the groups of another accumulator that saw later rows into
 //! this one, `finish` gives a group's value, and `retract` takes rows back for a state
-//! that can, which item 418's view operator needs.
+//! that can, which the incremental view operator in `incr/ops/group.rs` calls with signed
+//! weights.
 
 use super::deferred::{Deferred, subtotal};
 use super::op::BatchBudget;
-use crate::error::Result;
-use crate::id::Id;
+use crate::error::{Error, Result};
+use crate::id::{Id, Tag};
+use crate::incr::persist::{Reader, Writer};
 use crate::sparql::ctx::{Charge, Ctx};
 use crate::sparql::exec::{AggState, ScratchAdmit, SumAdmit};
 use crate::sparql::expr::Expr;
 use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
-use crate::sparql::value::Value;
-use rustc_hash::FxHashSet;
+use crate::sparql::value::{NumOp, Value, arith, exact_sum, order_cmp};
+use oxsdatatypes::{Decimal, Double, Float};
+use rustc_hash::{FxBuildHasher, FxHashSet};
 use spargebra::algebra::AggregateFunction;
 use std::any::Any;
+use std::cmp::Ordering;
+
+type HbMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
+
+/// Largest byte length a Rust `Vec<u8>` or `String` allocation can represent.
+const MAX_ALLOC_BYTES: usize = isize::MAX as usize;
 
 /// Where an aggregate's argument comes from in a batch.
 #[derive(Clone, Copy)]
@@ -42,6 +51,9 @@ pub(crate) struct Batch<'a> {
     pub arg: Arg<'a>,
     /// The rows of each slot, when the batch holds every row of each of its groups
     pub rows: Option<&'a RowIndex>,
+    /// Signed multiplicity of each row (`None`: every row has unit weight). `add_batch`
+    /// folds positive weights and `retract` takes back rows using their weight magnitude.
+    pub weights: Option<&'a [i64]>,
     /// The row of `table` that the batch's first row is
     pub base: usize,
 }
@@ -91,12 +103,151 @@ impl Batch<'_> {
             Arg::Column(values) => Some(values[row]),
         }
     }
+
+    /// Positive multiplicity for [`Accumulator::add_batch`].
+    #[inline]
+    fn add_weight(&self, row: usize) -> u64 {
+        self.weights
+            .map_or(1, |w| u64::try_from(w[row]).unwrap_or(0))
+    }
+
+    /// Magnitude to take back for [`Accumulator::retract`] (accepts signed negative
+    /// delta weights `-k` as well as positive retraction counts `+k`).
+    #[inline]
+    fn retract_weight(&self, row: usize) -> u64 {
+        self.weights.map_or(1, |w| w[row].unsigned_abs())
+    }
+
+    /// Whether every row's retraction weight fits in `0..=i64::MAX` (rejects `i64::MIN`,
+    /// whose magnitude `2^63` overflows signed `i64` arithmetic).
+    #[inline]
+    fn retract_weights_fit_i64(&self, rows: usize) -> bool {
+        self.weights
+            .is_none_or(|w| w[..rows].iter().all(|&v| v != i64::MIN))
+    }
 }
 
-/// How one aggregate folds the rows of its groups. `merge` and `retract` have no caller
-/// in the operator yet: a parallel split of a grouping merges, and item 418's view
-/// operator retracts.
-#[allow(dead_code, reason = "merge and retract serve later callers")]
+const SHRINK_MIN_CAP: usize = 64;
+
+fn shrink_vec<T>(v: &mut Vec<T>) {
+    if v.is_empty() {
+        *v = Vec::new();
+    } else if v.capacity() >= SHRINK_MIN_CAP && v.len() * 4 <= v.capacity() {
+        v.shrink_to(v.len() * 2);
+    }
+}
+
+fn shrink_map<K: Eq + std::hash::Hash, V>(m: &mut HbMap<K, V>) {
+    let entry_bytes = size_of::<(K, V)>() + 1;
+    if m.is_empty() {
+        *m = HbMap::default();
+    } else {
+        let alloc = m.allocation_size();
+        if alloc >= SHRINK_MIN_CAP * entry_bytes
+            && m.len().saturating_mul(entry_bytes).saturating_mul(4) <= alloc
+        {
+            m.shrink_to(m.len() + m.len() / 2);
+        }
+    }
+}
+
+/// Shared finalization for `SUM` and `AVG` over a pre-evaluated result value, keeping
+/// `AggregateErrors` readings and big-number interning scratch admission consistent.
+pub(crate) fn finish_sum_avg(
+    ctx: &Ctx,
+    is_avg: bool,
+    rows: u64,
+    undef: u64,
+    value: Option<Value>,
+) -> Result<Id> {
+    // AVG is Sum over Count, and Count leaves the errors out
+    if rows > 0 && undef == rows && is_avg && ctx.aggregate_errors.avg_of_errors_zero() {
+        return Ok(ctx.intern_value(&Value::Integer(0.into())));
+    }
+    let _scratch = match value.as_ref() {
+        Some(Value::BigInteger(i)) => {
+            Some(ctx.charge(crate::sparql::bignum::intern_scratch_bytes(i.lexical_len()))?)
+        }
+        Some(Value::BigDecimal(d)) => {
+            Some(ctx.charge(crate::sparql::bignum::intern_scratch_bytes(d.lexical_len()))?)
+        }
+        _ => None,
+    };
+    let id = value.as_ref().map_or(Id::UNDEF, |v| ctx.intern_value(v));
+    drop(value);
+    drop(_scratch);
+    ctx.check()?;
+    Ok(id)
+}
+
+/// Shared finalization for `MIN` and `MAX` across one-off and retractable accumulators.
+pub(crate) fn finish_best(ctx: &Ctx, is_min: bool, errs: u64, best: Option<Id>) -> Id {
+    if errs > 0 && ctx.aggregate_errors.best_errs(is_min) {
+        Id::UNDEF
+    } else {
+        best.unwrap_or(Id::UNDEF)
+    }
+}
+
+fn concat_is_undef(ctx: &Ctx, distinct: bool, empty: bool, ok: bool) -> bool {
+    let nothing = empty && distinct && ctx.aggregate_errors.distinct_concat_of_nothing_unbound();
+    !ok || nothing
+}
+
+/// Shared finalization for `GROUP_CONCAT` across one-off and retractable accumulators.
+/// Encodes directly into a simple-literal vocabulary key without intermediate `Arc<str>`
+/// or `oxrdf::Literal` copies, admitting any scratch growth before reserving it.
+pub(crate) fn finish_concat(
+    ctx: &Ctx,
+    distinct: bool,
+    empty: bool,
+    ok: bool,
+    text: String,
+) -> Result<Id> {
+    if concat_is_undef(ctx, distinct, empty, ok) {
+        return Ok(Id::UNDEF);
+    }
+    if text.is_empty() {
+        let id = ctx.intern_key(&[b'"', crate::id::KEY_SEP]);
+        ctx.check()?;
+        return Ok(id);
+    }
+    let len = text.len();
+    let Some(key_len) = len.checked_add(2).filter(|&n| n <= MAX_ALLOC_BYTES) else {
+        return Err(Error::BudgetExceeded(crate::error::Budget {
+            kind: crate::error::BudgetKind::Memory,
+            limit: ctx.mem_limit,
+            requested: (len as u64).saturating_add(2),
+        }));
+    };
+    let mut key = text.into_bytes();
+    let _scratch = if key.capacity() < key_len {
+        let charge = ctx.charge(key_len as u64)?;
+        key.try_reserve_exact(key_len - len).map_err(|_| {
+            Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                limit: ctx.mem_limit,
+                requested: key_len as u64,
+            })
+        })?;
+        Some(charge)
+    } else {
+        None
+    };
+    key.push(0);
+    key.copy_within(0..len, 1);
+    key[0] = b'"';
+    key.push(crate::id::KEY_SEP);
+    let id = ctx.intern_key(&key);
+    drop(key);
+    drop(_scratch);
+    ctx.check()?;
+    Ok(id)
+}
+
+/// How one aggregate folds the rows of its groups. `merge` serves item 1066's parallel
+/// grouping split, and `retract` serves the incremental view operator in
+/// `incr/ops/group.rs`.
 pub(crate) trait Accumulator: Send {
     /// Add `groups` groups with empty state, after those held.
     fn init(&mut self, groups: usize);
@@ -113,6 +264,7 @@ pub(crate) trait Accumulator: Send {
     ) -> Result<()>;
 
     /// Whether [`Accumulator::merge`] gives what one accumulator over all the rows gives.
+    #[allow(dead_code, reason = "merge serves item 1066's parallel grouping")]
     fn mergeable(&self) -> bool {
         false
     }
@@ -121,6 +273,7 @@ pub(crate) trait Accumulator: Send {
     /// accumulator, into group `into[j]` of this one, for every group of `other`.
     /// `other` is of the same kind and aggregate. An accumulator that is not
     /// [`mergeable`](Accumulator::mergeable) leaves its groups as they are and fails.
+    #[allow(dead_code, reason = "merge serves item 1066's parallel grouping")]
     fn merge(
         &mut self,
         _ctx: &Ctx,
@@ -128,9 +281,7 @@ pub(crate) trait Accumulator: Send {
         _into: &[u32],
         _retain: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        Err(crate::error::Error::unsupported(
-            "this aggregate cannot be merged",
-        ))
+        Err(Error::unsupported("this aggregate cannot be merged"))
     }
 
     /// The value of group `group`, which the call takes out of the accumulator.
@@ -158,6 +309,14 @@ pub(crate) trait Accumulator: Send {
         self.finish_with(ctx, group, scratch)
     }
 
+    /// Read the current value of group `group` without destroying its state, for
+    /// persistent callers such as incremental views.
+    fn read(&mut self, _ctx: &Ctx, _group: usize) -> Result<Id> {
+        Err(Error::unsupported(
+            "this aggregate cannot be read without finishing",
+        ))
+    }
+
     /// Whether [`Accumulator::retract`] can take back every row.
     fn retractable(&self) -> bool {
         false
@@ -169,6 +328,37 @@ pub(crate) trait Accumulator: Send {
     /// to use, so the caller recomputes them from their rows.
     fn retract(&mut self, _ctx: &Ctx, _batch: &Batch<'_>, _slots: &[u32]) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Drop every group's state.
+    fn clear(&mut self) {}
+
+    /// Remove group `group` by swapping in the last group, keeping slots dense.
+    fn swap_remove(&mut self, _group: usize) {}
+
+    /// Release excess backing capacity after group deletions so view memory budgets stay
+    /// accurate without reallocating on every individual removal.
+    fn shrink_unused(&mut self) {}
+
+    /// Approximate bytes retained across all live groups and backing allocations, for
+    /// view memory budgeting.
+    fn retained_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Persist group `group`'s state to a checkpoint or remap writer.
+    fn save_group(&self, _group: usize, _w: &mut Writer) -> Result<()> {
+        Err(Error::unsupported("this aggregate cannot be checkpointed"))
+    }
+
+    /// Restore group `group`'s state from a checkpoint or remap reader.
+    fn load_group(&mut self, _group: usize, _r: &mut Reader) -> Result<()> {
+        Err(Error::unsupported("this aggregate cannot be checkpointed"))
+    }
+
+    /// Clone this accumulator as a boxed trait object when supported.
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        None
     }
 
     /// The bytes of state each new group takes, which the operator charges.
@@ -183,8 +373,46 @@ pub(crate) trait Accumulator: Send {
     fn as_any(&mut self) -> &mut dyn Any;
 }
 
+/// Construct a retractable accumulator for an incremental view aggregate.
+pub(crate) fn retractable(agg: &Agg, row_width: usize) -> Result<Box<dyn Accumulator>> {
+    match &agg.func {
+        AggregateFunction::Count => {
+            if agg.distinct {
+                let mut inner_agg = agg.clone();
+                inner_agg.distinct = false;
+                let inner: Box<dyn Accumulator> = Box::new(Running::new(&inner_agg, false));
+                Ok(Box::new(RetractableDistinct::new(
+                    inner,
+                    agg.expr.is_none(),
+                    row_width,
+                )))
+            } else {
+                Ok(Box::new(Running::new(agg, false)))
+            }
+        }
+        AggregateFunction::Sum | AggregateFunction::Avg => {
+            let mut inner_agg = agg.clone();
+            inner_agg.distinct = false;
+            let inner: Box<dyn Accumulator> = Box::new(RetractableSum::new(&inner_agg));
+            if agg.distinct {
+                Ok(Box::new(RetractableDistinct::new(inner, false, row_width)))
+            } else {
+                Ok(inner)
+            }
+        }
+        AggregateFunction::Min
+        | AggregateFunction::Max
+        | AggregateFunction::Sample
+        | AggregateFunction::GroupConcat { .. } => Ok(Box::new(Ordered::new(agg))),
+        AggregateFunction::Custom(_) => Err(Error::unsupported(
+            "custom aggregates do not have a retractable accumulator",
+        )),
+    }
+}
+
 /// The aggregates whose state is [`AggState`]: COUNT, SUM, AVG, MIN, MAX, SAMPLE and
 /// ARQ's variance and deviation aggregates.
+#[derive(Clone)]
 pub(crate) struct Running {
     agg: Agg,
     /// Whether the decoded bytes of the best values are tracked, for a charged grouping
@@ -248,7 +476,100 @@ impl Accumulator for Running {
         slots: &[u32],
         budget: &mut BatchBudget<'_>,
     ) -> Result<()> {
+        struct TrackAdmit<'a, 'b> {
+            budget: &'a mut BatchBudget<'b>,
+            track_payload: bool,
+            n_states: usize,
+            slot_idx: usize,
+            payload: &'a mut Vec<u64>,
+            growth: &'a mut u64,
+        }
+        impl ScratchAdmit for TrackAdmit<'_, '_> {
+            fn charge_scratch<'c>(&mut self, ctx: &'c Ctx, bytes: u64) -> Result<Charge<'c>> {
+                self.budget.charge_scratch(ctx, bytes)
+            }
+        }
+        impl SumAdmit for TrackAdmit<'_, '_> {
+            fn admit(&mut self, _old: u64, new_bytes: u64) -> Result<bool> {
+                if self.track_payload && new_bytes > 0 {
+                    if self.payload.len() <= self.slot_idx {
+                        self.payload.resize(self.n_states, 0);
+                    }
+                    let held = &mut self.payload[self.slot_idx];
+                    if new_bytes > *held {
+                        let delta = new_bytes - *held;
+                        self.budget.retain(delta)?;
+                        *self.growth += delta;
+                        *held = new_bytes;
+                    }
+                }
+                Ok(true)
+            }
+        }
+
         let agg = &self.agg;
+        if let Some(weights) = batch.weights {
+            match (&agg.func, batch.arg) {
+                (AggregateFunction::Count, Arg::Star) => {
+                    for (row, (&slot, &w)) in slots.iter().zip(weights).enumerate() {
+                        if row.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        if w > 0
+                            && let AggState::Count(n) = &mut self.states[slot as usize]
+                        {
+                            *n += w as u64;
+                        }
+                    }
+                }
+                (AggregateFunction::Count, Arg::Column(values)) => {
+                    for (row, ((&slot, id), &w)) in
+                        slots.iter().zip(values).zip(weights).enumerate()
+                    {
+                        if row.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        if w > 0
+                            && !id.is_undef()
+                            && let AggState::Count(n) = &mut self.states[slot as usize]
+                        {
+                            *n += w as u64;
+                        }
+                    }
+                }
+                (AggregateFunction::Count, Arg::Unbound) => {
+                    ctx.check()?;
+                }
+                _ => {
+                    let track_payload = self.track && (self.is_best() || self.is_sum());
+                    let states = &mut self.states;
+                    let n_states = states.len();
+                    let payload = &mut self.payload;
+                    let growth = &mut self.growth;
+                    for (row, &slot) in slots.iter().enumerate() {
+                        if row.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        let w = batch.add_weight(row);
+                        if w == 0 {
+                            continue;
+                        }
+                        let id = batch.value(row);
+                        let slot_idx = slot as usize;
+                        let mut admit = TrackAdmit {
+                            budget,
+                            track_payload,
+                            n_states,
+                            slot_idx,
+                            payload,
+                            growth,
+                        };
+                        states[slot_idx].add_weighted(ctx, agg, id, w, &mut admit)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
         if self.is_sum()
             && let Some(sum_budget) = budget.sum_budget()
         {
@@ -282,40 +603,6 @@ impl Accumulator for Running {
                 }
             }
             _ => {
-                struct TrackAdmit<'a, 'b> {
-                    budget: &'a mut BatchBudget<'b>,
-                    track_payload: bool,
-                    n_states: usize,
-                    slot_idx: usize,
-                    payload: &'a mut Vec<u64>,
-                    growth: &'a mut u64,
-                }
-                impl ScratchAdmit for TrackAdmit<'_, '_> {
-                    fn charge_scratch<'c>(
-                        &mut self,
-                        ctx: &'c Ctx,
-                        bytes: u64,
-                    ) -> Result<Charge<'c>> {
-                        self.budget.charge_scratch(ctx, bytes)
-                    }
-                }
-                impl SumAdmit for TrackAdmit<'_, '_> {
-                    fn admit(&mut self, _old: u64, new_bytes: u64) -> Result<bool> {
-                        if self.track_payload && new_bytes > 0 {
-                            if self.payload.len() <= self.slot_idx {
-                                self.payload.resize(self.n_states, 0);
-                            }
-                            let held = &mut self.payload[self.slot_idx];
-                            if new_bytes > *held {
-                                let delta = new_bytes - *held;
-                                self.budget.retain(delta)?;
-                                *self.growth += delta;
-                                *held = new_bytes;
-                            }
-                        }
-                        Ok(true)
-                    }
-                }
                 let track_payload = self.track && (self.is_best() || self.is_sum());
                 let states = &mut self.states;
                 let n_states = states.len();
@@ -380,9 +667,7 @@ impl Accumulator for Running {
         }
         for (state, &to) in std::mem::take(&mut other.states).into_iter().zip(into) {
             if !self.states[to as usize].merge(ctx, &self.agg, state) {
-                return Err(crate::error::Error::unsupported(
-                    "this aggregate cannot be merged",
-                ));
+                return Err(Error::unsupported("this aggregate cannot be merged"));
             }
             if self.track && self.is_sum() {
                 let held_now = self.states[to as usize].sum_heap_bytes();
@@ -443,6 +728,10 @@ impl Accumulator for Running {
         self.finish_with(ctx, group, scratch)
     }
 
+    fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        self.states[group].read(ctx, &self.agg)
+    }
+
     fn retractable(&self) -> bool {
         matches!(
             self.agg.func,
@@ -450,16 +739,79 @@ impl Accumulator for Running {
         ) && !self.agg.distinct
     }
 
-    fn retract(&mut self, _ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+    fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
         if !self.retractable() {
             return Ok(false);
         }
         for (row, &slot) in slots.iter().enumerate() {
-            if !self.states[slot as usize].retract(batch.value(row)) {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let w = batch.retract_weight(row);
+            if w == 0 {
+                continue;
+            }
+            if !self.states[slot as usize].retract(batch.value(row), w) {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    fn clear(&mut self) {
+        self.states = Vec::new();
+        self.payload = Vec::new();
+        self.growth = 0;
+    }
+
+    fn swap_remove(&mut self, group: usize) {
+        self.states.swap_remove(group);
+        if self.is_best() {
+            self.payload.swap_remove(group);
+        }
+        if self.states.is_empty() {
+            self.states = Vec::new();
+            self.payload = Vec::new();
+        }
+    }
+
+    fn shrink_unused(&mut self) {
+        shrink_vec(&mut self.states);
+        shrink_vec(&mut self.payload);
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.states.capacity() as u64 * size_of::<AggState>() as u64
+            + self.payload.capacity() as u64 * size_of::<u64>() as u64
+    }
+
+    fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
+        match &self.states[group] {
+            AggState::Count(n) => {
+                w.u64(*n);
+                Ok(())
+            }
+            _ => Err(Error::unsupported(
+                "only COUNT Running accumulators can be checkpointed",
+            )),
+        }
+    }
+
+    fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
+        match &mut self.states[group] {
+            AggState::Count(n) => {
+                *n = r.u64()?;
+                r.charge_state(8)?;
+                Ok(())
+            }
+            _ => Err(Error::unsupported(
+                "only COUNT Running accumulators can be checkpointed",
+            )),
+        }
+    }
+
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        Some(Box::new(self.clone()))
     }
 
     fn group_bytes(&self) -> u64 {
@@ -468,6 +820,1250 @@ impl Accumulator for Running {
 
     fn take_growth(&mut self) -> u64 {
         std::mem::take(&mut self.growth)
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// A 256-bit two's complement integer, for exact sums of 128-bit products.
+#[derive(Default)]
+struct Wide {
+    hi: u128,
+    lo: u128,
+}
+
+impl Wide {
+    fn add(&mut self, hi: u128, lo: u128) {
+        let (lo, carry) = self.lo.overflowing_add(lo);
+        self.lo = lo;
+        self.hi = self.hi.wrapping_add(hi).wrapping_add(u128::from(carry));
+    }
+
+    /// Add `a × b`.
+    fn add_product(&mut self, a: i128, b: i64) {
+        let negative = (a < 0) != (b < 0);
+        let (m, n) = (a.unsigned_abs(), u128::from(b.unsigned_abs()));
+        // |a| × |b| as two 128-bit limbs, from the 64-bit halves of |a|
+        let low = (m & u128::from(u64::MAX)) * n;
+        let high = (m >> 64) * n;
+        let (lo, carry) = low.overflowing_add(high << 64);
+        let hi = (high >> 64) + u128::from(carry);
+        if negative {
+            // two's complement: invert and add one
+            let (lo, carry) = (!lo).overflowing_add(1);
+            self.add((!hi).wrapping_add(u128::from(carry)), lo);
+        } else {
+            self.add(hi, lo);
+        }
+    }
+
+    /// The value when it fits in 128 bits.
+    fn to_i128(&self) -> Option<i128> {
+        let v = self.lo as i128;
+        let sign = if v < 0 { u128::MAX } else { 0 };
+        (self.hi == sign).then_some(v)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SumState {
+    rows: i64,
+    /// Arguments that were errors or not numbers, which make the sum unbound
+    errs: i64,
+    /// Arguments that were errors (`Id::UNDEF`), apart from non-numeric values, for
+    /// the reading in which AVG over only errors is zero
+    undef: i64,
+    /// The integer sum, in wrapping arithmetic so that removals stay exact
+    int: i128,
+    /// Arbitrary-precision integers and decimals as counts, allocated only when seen
+    big_ints: Option<Box<HbMap<crate::sparql::bignum::BigInt, i64>>>,
+    big_decs: Option<Box<HbMap<crate::sparql::bignum::BigDec, i64>>>,
+    /// The decimal values as counts by their 128-bit encoding
+    decs: HbMap<i128, i64>,
+    floats: HbMap<u32, i64>,
+    doubles: HbMap<u64, i64>,
+}
+
+impl SumState {
+    /// Add `w` copies of a value (`None`: an error or non-numeric value).
+    fn add(&mut self, v: Option<&Value>, w: i64) {
+        self.rows += w;
+        match v {
+            Some(Value::Integer(i)) => {
+                self.int = self
+                    .int
+                    .wrapping_add((i64::from(*i) as i128).wrapping_mul(w as i128));
+            }
+            Some(Value::BigInteger(i)) => {
+                let map = self.big_ints.get_or_insert_with(Default::default);
+                let n = map.entry((**i).clone()).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    map.remove(i.as_ref());
+                    if map.is_empty() {
+                        self.big_ints = None;
+                    } else {
+                        shrink_map(map);
+                    }
+                }
+            }
+            Some(Value::Decimal(d)) => {
+                let k = i128::from_be_bytes(d.to_be_bytes());
+                let n = self.decs.entry(k).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    self.decs.remove(&k);
+                    shrink_map(&mut self.decs);
+                }
+            }
+            Some(Value::BigDecimal(d)) => {
+                let map = self.big_decs.get_or_insert_with(Default::default);
+                let n = map.entry((**d).clone()).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    map.remove(d.as_ref());
+                    if map.is_empty() {
+                        self.big_decs = None;
+                    } else {
+                        shrink_map(map);
+                    }
+                }
+            }
+            Some(Value::Float(f)) => {
+                let b = f32::from(*f).to_bits();
+                let n = self.floats.entry(b).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    self.floats.remove(&b);
+                    shrink_map(&mut self.floats);
+                }
+            }
+            Some(Value::Double(d)) => {
+                let b = f64::from(*d).to_bits();
+                let n = self.doubles.entry(b).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    self.doubles.remove(&b);
+                    shrink_map(&mut self.doubles);
+                }
+            }
+            _ => self.errs += w,
+        }
+    }
+
+    fn sum_or_avg(&self, avg: bool) -> Option<Value> {
+        if self.errs != 0 {
+            return None;
+        }
+        if avg && self.rows == 0 {
+            return Some(Value::Integer(0.into()));
+        }
+        let has_big_int = self.big_ints.as_ref().is_some_and(|m| !m.is_empty());
+        let has_big_dec = self.big_decs.as_ref().is_some_and(|m| !m.is_empty());
+        let has_double = !self.doubles.is_empty();
+        let has_approx = !self.floats.is_empty() || has_double;
+
+        // Accumulate exact subtotals with bounded headroom so cancellation and averaging at
+        // the digit cap are evaluated on the final result rather than intermediate terms.
+        enum ExactAcc {
+            Int(crate::sparql::bignum::BigInt),
+            Dec(crate::sparql::bignum::BigDec),
+            Fixed(Value),
+        }
+
+        let exact = if has_big_dec || (has_big_int && !self.decs.is_empty()) {
+            use crate::sparql::bignum::{AGG_MAX_DEC_DIGITS, BigDec, BigInt};
+            let mut total = BigDec::from_bigint(BigInt::from_i128(self.int));
+            if let Some(map) = &self.big_ints {
+                for (bi, &n) in map.iter() {
+                    let term = BigDec::from_bigint(bi.clone())
+                        .checked_mul_i64_with_limit(n, AGG_MAX_DEC_DIGITS)?;
+                    total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
+                }
+            }
+            for (&k, &n) in &self.decs {
+                let d = BigDec::from_oxs_decimal(Decimal::from_be_bytes(k.to_be_bytes()));
+                let term = d.checked_mul_i64_with_limit(n, AGG_MAX_DEC_DIGITS)?;
+                total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
+            }
+            if let Some(map) = &self.big_decs {
+                for (bd, &n) in map.iter() {
+                    let term = bd.checked_mul_i64_with_limit(n, AGG_MAX_DEC_DIGITS)?;
+                    total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
+                }
+            }
+            ExactAcc::Dec(total)
+        } else if !self.decs.is_empty() {
+            // Summed exactly in 256 bits so values that cancel out do not overflow on
+            // the way; the integers join the decimals as a one-off evaluation promotes
+            // them.
+            let mut acc = Wide::default();
+            for (k, n) in &self.decs {
+                acc.add_product(*k, *n);
+            }
+            acc.add_product(self.int, 1_000_000_000_000_000_000);
+            if let Some(raw) = acc.to_i128() {
+                ExactAcc::Fixed(Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes())))
+            } else {
+                use crate::sparql::bignum::{AGG_MAX_DEC_DIGITS, BigDec, BigInt};
+                let mut total = BigDec::from_bigint(BigInt::from_i128(self.int));
+                for (&k, &n) in &self.decs {
+                    let d = BigDec::from_oxs_decimal(Decimal::from_be_bytes(k.to_be_bytes()));
+                    let term = d.checked_mul_i64_with_limit(n, AGG_MAX_DEC_DIGITS)?;
+                    total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
+                }
+                ExactAcc::Dec(total)
+            }
+        } else if has_big_int {
+            use crate::sparql::bignum::{AGG_MAX_INT_DIGITS, BigInt};
+            let mut total = BigInt::from_i128(self.int);
+            if let Some(map) = &self.big_ints {
+                for (bi, &n) in map.iter() {
+                    let term = bi.checked_mul_i64_with_limit(n, AGG_MAX_INT_DIGITS)?;
+                    total = total.checked_add_with_limit(&term, AGG_MAX_INT_DIGITS)?;
+                }
+            }
+            ExactAcc::Int(total)
+        } else {
+            ExactAcc::Fixed(exact_sum(self.int))
+        };
+
+        if !has_approx {
+            return match exact {
+                ExactAcc::Fixed(v) => {
+                    if avg {
+                        arith(NumOp::Div, &v, &Value::Integer(self.rows.into())).ok()
+                    } else {
+                        Some(v)
+                    }
+                }
+                ExactAcc::Int(bi) => {
+                    if avg {
+                        crate::sparql::value::avg_big_int(bi, self.rows.try_into().ok()?)
+                    } else {
+                        bi.fits_limits().then(|| Value::from_bigint(bi))
+                    }
+                }
+                ExactAcc::Dec(bd) => {
+                    if avg {
+                        crate::sparql::value::avg_big_decimal(&bd, self.rows.try_into().ok()?)
+                    } else {
+                        bd.fits_limits().then(|| Value::from_bigdec(bd))
+                    }
+                }
+            };
+        }
+
+        // Fold floats at float precision when no double is present, or widen float terms
+        // into double arithmetic when a double is present so finite sums stay finite.
+        let mut acc = match exact {
+            ExactAcc::Fixed(v) => v,
+            ExactAcc::Dec(bd) => {
+                if has_double {
+                    Value::Double(Double::from(bd.to_f64()))
+                } else {
+                    match bd.to_oxs_decimal() {
+                        Some(decimal) => Value::Decimal(decimal),
+                        None => Value::Float(Float::from(bd.to_f32())),
+                    }
+                }
+            }
+            ExactAcc::Int(bi) if has_double => Value::Double(Double::from(bi.to_f64())),
+            ExactAcc::Int(bi) => Value::Float(Float::from(bi.to_f32())),
+        };
+        let mut floats: Vec<(f32, i64)> = self
+            .floats
+            .iter()
+            .map(|(b, n)| (f32::from_bits(*b), *n))
+            .collect();
+        floats.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (f, n) in floats {
+            let term = if has_double {
+                Value::Double(Double::from(f64::from(f) * n as f64))
+            } else {
+                Value::Float(Float::from(f * n as f32))
+            };
+            acc = arith(NumOp::Add, &acc, &term).ok()?;
+        }
+        let mut doubles: Vec<(f64, i64)> = self
+            .doubles
+            .iter()
+            .map(|(b, n)| (f64::from_bits(*b), *n))
+            .collect();
+        doubles.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (d, n) in doubles {
+            acc = arith(NumOp::Add, &acc, &Value::Double(Double::from(d * n as f64))).ok()?;
+        }
+        if avg {
+            arith(NumOp::Div, &acc, &Value::Integer(self.rows.into())).ok()
+        } else {
+            Some(acc)
+        }
+    }
+
+    fn map_bytes(&self) -> u64 {
+        let big = self.big_ints.as_ref().map_or(0, |m| {
+            size_of::<HbMap<crate::sparql::bignum::BigInt, i64>>() as u64
+                + m.allocation_size() as u64
+                + m.keys().map(|k| k.heap_bytes()).sum::<u64>()
+        }) + self.big_decs.as_ref().map_or(0, |m| {
+            size_of::<HbMap<crate::sparql::bignum::BigDec, i64>>() as u64
+                + m.allocation_size() as u64
+                + m.keys().map(|k| k.heap_bytes()).sum::<u64>()
+        });
+        (self.floats.allocation_size()
+            + self.doubles.allocation_size()
+            + self.decs.allocation_size()) as u64
+            + big
+    }
+
+    fn save(&self, w: &mut Writer) {
+        w.i64(self.rows);
+        w.i64(self.errs);
+        w.i64(self.undef);
+        w.i128(self.int);
+        w.u64(self.decs.len() as u64);
+        for (k, n) in &self.decs {
+            w.i128(*k);
+            w.i64(*n);
+        }
+        w.u64(self.floats.len() as u64);
+        for (b, n) in &self.floats {
+            w.u64(*b as u64);
+            w.i64(*n);
+        }
+        w.u64(self.doubles.len() as u64);
+        for (b, n) in &self.doubles {
+            w.u64(*b);
+            w.i64(*n);
+        }
+        let big_ints_len = self.big_ints.as_ref().map_or(0, |m| m.len()) as u64;
+        w.u64(big_ints_len);
+        if let Some(m) = &self.big_ints {
+            for (bi, n) in m.iter() {
+                w.bytes(bi.to_string().as_bytes());
+                w.i64(*n);
+            }
+        }
+        let big_decs_len = self.big_decs.as_ref().map_or(0, |m| m.len()) as u64;
+        w.u64(big_decs_len);
+        if let Some(m) = &self.big_decs {
+            for (bd, n) in m.iter() {
+                w.bytes(bd.to_string().as_bytes());
+                w.i64(*n);
+            }
+        }
+    }
+
+    fn load(r: &mut Reader) -> Result<Self> {
+        r.charge_state(size_of::<Self>() as u64)?;
+        let mut s = Self {
+            rows: r.i64()?,
+            errs: r.i64()?,
+            undef: r.i64()?,
+            int: r.i128()?,
+            ..Default::default()
+        };
+        for _ in 0..r.u64()? {
+            let k = r.i128()?;
+            let c = r.i64()?;
+            r.charge_state(40)?;
+            s.decs.insert(k, c);
+        }
+        for _ in 0..r.u64()? {
+            let b = r.u64()? as u32;
+            let c = r.i64()?;
+            r.charge_state(24)?;
+            s.floats.insert(b, c);
+        }
+        for _ in 0..r.u64()? {
+            let b = r.u64()?;
+            let c = r.i64()?;
+            r.charge_state(24)?;
+            s.doubles.insert(b, c);
+        }
+        let n_bi = r.u64()?;
+        if n_bi > 0 {
+            let mut map = HbMap::default();
+            for _ in 0..n_bi {
+                let text = std::str::from_utf8(r.bytes()?)
+                    .map_err(|_| Error::Corrupt("view state holds non-UTF-8 big integer".into()))?;
+                let bi = crate::sparql::bignum::BigInt::parse(text).ok_or_else(|| {
+                    Error::Corrupt("view state holds malformed big integer".into())
+                })?;
+                let c = r.i64()?;
+                r.charge_state(40 + bi.heap_bytes())?;
+                map.insert(bi, c);
+            }
+            s.big_ints = Some(Box::new(map));
+        }
+        let n_bd = r.u64()?;
+        if n_bd > 0 {
+            let mut map = HbMap::default();
+            for _ in 0..n_bd {
+                let text = std::str::from_utf8(r.bytes()?)
+                    .map_err(|_| Error::Corrupt("view state holds non-UTF-8 big decimal".into()))?;
+                let bd = crate::sparql::bignum::BigDec::parse(text).ok_or_else(|| {
+                    Error::Corrupt("view state holds malformed big decimal".into())
+                })?;
+                let c = r.i64()?;
+                r.charge_state(48 + bd.heap_bytes())?;
+                map.insert(bd, c);
+            }
+            s.big_decs = Some(Box::new(map));
+        }
+        Ok(s)
+    }
+}
+
+/// Retractable `SUM` and `AVG` accumulator with exact integer and decimal tracking and
+/// refcounted float, double and error states.
+#[derive(Clone)]
+pub(crate) struct RetractableSum {
+    is_avg: bool,
+    groups: Vec<SumState>,
+}
+
+impl RetractableSum {
+    pub(crate) fn new(agg: &Agg) -> Self {
+        Self {
+            is_avg: matches!(agg.func, AggregateFunction::Avg),
+            groups: Vec::new(),
+        }
+    }
+
+    fn fold(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32], retract: bool) -> Result<()> {
+        for (row, &slot) in slots.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let mag = if retract {
+                batch.retract_weight(row)
+            } else {
+                batch.add_weight(row)
+            };
+            if mag == 0 {
+                continue;
+            }
+            let w = if retract { -(mag as i64) } else { mag as i64 };
+            let s = &mut self.groups[slot as usize];
+            let id = batch.value(row).unwrap_or(Id::UNDEF);
+            if id.is_undef() {
+                s.add(None, w);
+                s.undef += w;
+            } else if id.tag() == Tag::Int {
+                s.rows += w;
+                s.int = s
+                    .int
+                    .wrapping_add((id.as_i64() as i128).wrapping_mul(w as i128));
+            } else {
+                let v = ctx.value_checked(id)?;
+                s.add(v.as_ref(), w);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Accumulator for RetractableSum {
+    fn init(&mut self, groups: usize) {
+        self.groups
+            .resize_with(self.groups.len() + groups, SumState::default);
+    }
+
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        _budget: &mut BatchBudget<'_>,
+    ) -> Result<()> {
+        self.fold(ctx, batch, slots, false)
+    }
+
+    fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let id = self.read(ctx, group)?;
+        self.groups[group] = SumState::default();
+        Ok(id)
+    }
+
+    fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let s = &self.groups[group];
+        finish_sum_avg(
+            ctx,
+            self.is_avg,
+            s.rows.max(0) as u64,
+            s.undef.max(0) as u64,
+            s.sum_or_avg(self.is_avg),
+        )
+    }
+
+    fn retractable(&self) -> bool {
+        true
+    }
+
+    fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+        if !batch.retract_weights_fit_i64(slots.len()) {
+            return Ok(false);
+        }
+        self.fold(ctx, batch, slots, true)?;
+        Ok(true)
+    }
+
+    fn clear(&mut self) {
+        self.groups = Vec::new();
+    }
+
+    fn swap_remove(&mut self, group: usize) {
+        self.groups.swap_remove(group);
+        if self.groups.is_empty() {
+            self.groups = Vec::new();
+        }
+    }
+
+    fn shrink_unused(&mut self) {
+        shrink_vec(&mut self.groups);
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.groups.capacity() as u64 * size_of::<SumState>() as u64
+            + self.groups.iter().map(SumState::map_bytes).sum::<u64>()
+    }
+
+    fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
+        self.groups[group].save(w);
+        Ok(())
+    }
+
+    fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
+        self.groups[group] = SumState::load(r)?;
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        Some(Box::new(self.clone()))
+    }
+
+    fn group_bytes(&self) -> u64 {
+        96
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// The values of a group as an ordered multiset: the distinct values in the order of
+/// `ORDER BY` with their counts. Values the order does not tell apart, such as
+/// `"01"^^xsd:integer` and `"1"^^xsd:integer`, form a run in the order they entered the
+/// group, which a checkpoint and a generation switch keep, since the vector is saved and
+/// loaded in its order and the order depends on the terms and not on their ids.
+#[derive(Clone, Debug, Default)]
+struct Multiset {
+    vals: Vec<(Id, i64)>,
+    /// Count of arguments that were errors (`Id::UNDEF`), which make `GROUP_CONCAT`
+    /// unbound and `MIN` or `MAX` unbound under readings where errors propagate.
+    errs: i64,
+    /// `SAMPLE`: the value reported, kept while the group holds it
+    sample: Option<Id>,
+}
+
+impl Multiset {
+    fn position(
+        &self,
+        ctx: &Ctx,
+        v: Id,
+        value: Option<&Value>,
+    ) -> std::result::Result<usize, usize> {
+        let cmp = |x: Id| order_cmp(ctx.value(x).as_ref(), value);
+        let i = self.vals.binary_search_by(|(x, _)| cmp(*x))?;
+        let mut lo = i;
+        while lo > 0 && cmp(self.vals[lo - 1].0) == Ordering::Equal {
+            lo -= 1;
+        }
+        let mut hi = i + 1;
+        while hi < self.vals.len() && cmp(self.vals[hi].0) == Ordering::Equal {
+            hi += 1;
+        }
+        match self.vals[lo..hi].iter().position(|(x, _)| *x == v) {
+            Some(k) => Ok(lo + k),
+            None => Err(hi),
+        }
+    }
+
+    fn add(&mut self, ctx: &Ctx, v: Id, w: i64) -> Result<()> {
+        let value = ctx.value_checked(v)?;
+        match self.position(ctx, v, value.as_ref()) {
+            Ok(i) => {
+                self.vals[i].1 += w;
+                if self.vals[i].1 == 0 {
+                    self.vals.remove(i);
+                    shrink_vec(&mut self.vals);
+                }
+            }
+            Err(i) => self.vals.insert(i, (v, w)),
+        }
+        ctx.check()
+    }
+
+    fn first_of_run(&self, ctx: &Ctx, i: usize) -> Id {
+        let value = ctx.value(self.vals[i].0);
+        let mut lo = i;
+        while lo > 0
+            && self.vals[lo - 1].1 > 0
+            && order_cmp(ctx.value(self.vals[lo - 1].0).as_ref(), value.as_ref()) == Ordering::Equal
+        {
+            lo -= 1;
+        }
+        self.vals[lo].0
+    }
+
+    fn min(&self) -> Option<Id> {
+        self.vals.iter().find(|(_, n)| *n > 0).map(|(v, _)| *v)
+    }
+
+    fn max(&self, ctx: &Ctx) -> Option<Id> {
+        let i = self.vals.iter().rposition(|(_, n)| *n > 0)?;
+        Some(self.first_of_run(ctx, i))
+    }
+
+    fn settle(&mut self, ctx: &Ctx) {
+        if let Some(s) = self.sample {
+            let value = ctx.value(s);
+            if let Ok(i) = self.position(ctx, s, value.as_ref())
+                && self.vals[i].1 > 0
+            {
+                return;
+            }
+        }
+        self.sample = self.min();
+    }
+}
+
+#[derive(Clone)]
+enum OrderedKind {
+    Min,
+    Max,
+    Sample,
+    Concat { separator: String, distinct: bool },
+}
+
+/// Retractable accumulator for `MIN`, `MAX`, `SAMPLE` and `GROUP_CONCAT` (with or
+/// without `DISTINCT`), backed by an ordered [`Multiset`] per group.
+#[derive(Clone)]
+pub(crate) struct Ordered {
+    kind: OrderedKind,
+    groups: Vec<Multiset>,
+}
+
+impl Ordered {
+    pub(crate) fn new(agg: &Agg) -> Self {
+        let kind = match &agg.func {
+            AggregateFunction::Min => OrderedKind::Min,
+            AggregateFunction::Max => OrderedKind::Max,
+            AggregateFunction::Sample => OrderedKind::Sample,
+            AggregateFunction::GroupConcat { separator } => OrderedKind::Concat {
+                separator: separator.as_deref().unwrap_or(" ").to_string(),
+                distinct: agg.distinct,
+            },
+            _ => unreachable!("an ordered retractable aggregate"),
+        };
+        Self {
+            kind,
+            groups: Vec::new(),
+        }
+    }
+
+    fn fold(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32], retract: bool) -> Result<()> {
+        for (row, &slot) in slots.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let mag = if retract {
+                batch.retract_weight(row)
+            } else {
+                batch.add_weight(row)
+            };
+            if mag == 0 {
+                continue;
+            }
+            let w = if retract { -(mag as i64) } else { mag as i64 };
+            let m = &mut self.groups[slot as usize];
+            let id = batch.value(row).unwrap_or(Id::UNDEF);
+            if id.is_undef() {
+                m.errs += w;
+            } else {
+                m.add(ctx, id, w)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Accumulator for Ordered {
+    fn init(&mut self, groups: usize) {
+        self.groups
+            .resize_with(self.groups.len() + groups, Multiset::default);
+    }
+
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        _budget: &mut BatchBudget<'_>,
+    ) -> Result<()> {
+        self.fold(ctx, batch, slots, false)
+    }
+
+    fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let id = self.read(ctx, group)?;
+        self.groups[group] = Multiset::default();
+        Ok(id)
+    }
+
+    fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let m = &mut self.groups[group];
+        match &self.kind {
+            OrderedKind::Min => Ok(finish_best(ctx, true, m.errs.max(0) as u64, m.min())),
+            OrderedKind::Max => {
+                let best = m.max(ctx);
+                ctx.check()?;
+                Ok(finish_best(ctx, false, m.errs.max(0) as u64, best))
+            }
+            OrderedKind::Sample => {
+                m.settle(ctx);
+                ctx.check()?;
+                Ok(m.sample.unwrap_or(Id::UNDEF))
+            }
+            OrderedKind::Concat {
+                separator,
+                distinct,
+            } => {
+                if m.errs > 0 {
+                    return Ok(Id::UNDEF);
+                }
+                let strings = ctx.aggregate_errors.concat_strings_only();
+                let charge = ctx.charge(0)?;
+                let mut charged = 0u64;
+                let mut key: Vec<u8> = Vec::new();
+                let mut empty = true;
+                let total_vals = m.vals.len();
+                for (idx, (v, n)) in m.vals.iter().enumerate() {
+                    if *n <= 0 {
+                        continue;
+                    }
+                    let val = ctx.value_checked(*v)?;
+                    let Some(s) = val
+                        .filter(|v| !strings || v.is_string())
+                        .and_then(|v| v.lexical().ok())
+                    else {
+                        return Ok(Id::UNDEF);
+                    };
+                    let reps = if *distinct { 1u64 } else { *n as u64 };
+                    if s.is_empty() && separator.is_empty() {
+                        empty = false;
+                        continue;
+                    }
+                    let seps = if empty { reps - 1 } else { reps };
+                    let added_u64 = reps.checked_mul(s.len() as u64).and_then(|b| {
+                        seps.checked_mul(separator.len() as u64)
+                            .and_then(|sb| b.checked_add(sb))
+                    });
+                    if added_u64 == Some(0) {
+                        empty = false;
+                        continue;
+                    }
+                    let prefix_len = if key.is_empty() {
+                        1u64
+                    } else {
+                        key.len() as u64
+                    };
+                    let total_u64 = added_u64
+                        .and_then(|a| prefix_len.checked_add(a))
+                        .and_then(|n| n.checked_add(1));
+                    let Some(final_key_len) = total_u64
+                        .and_then(|n| usize::try_from(n).ok())
+                        .filter(|&n| n <= MAX_ALLOC_BYTES)
+                    else {
+                        return Err(Error::BudgetExceeded(crate::error::Budget {
+                            kind: crate::error::BudgetKind::Memory,
+                            limit: ctx.mem_limit,
+                            requested: total_u64.unwrap_or(u64::MAX),
+                        }));
+                    };
+                    let need = final_key_len as u64;
+                    if need > charged {
+                        charge.add(need - charged)?;
+                        charged = need;
+                    }
+                    let has_more_vals = idx + 1 < total_vals;
+                    let mut rem = reps;
+                    while rem > 0 {
+                        ctx.check()?;
+                        let chunk = rem.min(1024);
+                        let chunk_seps = if empty { chunk - 1 } else { chunk };
+                        let chunk_bytes =
+                            (chunk as usize) * s.len() + (chunk_seps as usize) * separator.len();
+                        let next_len =
+                            (if key.is_empty() { 1 } else { key.len() }) + chunk_bytes + 1;
+                        if next_len > key.capacity() {
+                            let doubled = key.capacity().saturating_mul(2).min(MAX_ALLOC_BYTES);
+                            let cap_bound = if rem == chunk {
+                                if has_more_vals {
+                                    let amortized = final_key_len.max(doubled);
+                                    if amortized > final_key_len {
+                                        let extra = (amortized as u64).saturating_sub(charged);
+                                        if extra == 0 || charge.add(extra).is_ok() {
+                                            charged = charged.max(amortized as u64);
+                                            amortized
+                                        } else {
+                                            final_key_len
+                                        }
+                                    } else {
+                                        final_key_len
+                                    }
+                                } else {
+                                    final_key_len
+                                }
+                            } else {
+                                next_len.max(doubled).min(final_key_len)
+                            };
+                            if cap_bound > key.capacity() {
+                                key.try_reserve_exact(cap_bound - key.len()).map_err(|_| {
+                                    Error::BudgetExceeded(crate::error::Budget {
+                                        kind: crate::error::BudgetKind::Memory,
+                                        limit: ctx.mem_limit,
+                                        requested: cap_bound as u64,
+                                    })
+                                })?;
+                            }
+                        }
+                        if key.is_empty() {
+                            key.push(b'"');
+                        }
+                        for _ in 0..chunk {
+                            if !empty {
+                                key.extend_from_slice(separator.as_bytes());
+                            }
+                            empty = false;
+                            key.extend_from_slice(s.as_bytes());
+                        }
+                        rem -= chunk;
+                    }
+                }
+                if concat_is_undef(ctx, *distinct, empty, true) {
+                    return Ok(Id::UNDEF);
+                }
+                let id = if key.is_empty() {
+                    ctx.intern_key(&[b'"', crate::id::KEY_SEP])
+                } else {
+                    key.push(crate::id::KEY_SEP);
+                    ctx.intern_key(&key)
+                };
+                drop(key);
+                drop(charge);
+                ctx.check()?;
+                Ok(id)
+            }
+        }
+    }
+
+    fn retractable(&self) -> bool {
+        true
+    }
+
+    fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+        if !batch.retract_weights_fit_i64(slots.len()) {
+            return Ok(false);
+        }
+        self.fold(ctx, batch, slots, true)?;
+        Ok(true)
+    }
+
+    fn clear(&mut self) {
+        self.groups = Vec::new();
+    }
+
+    fn swap_remove(&mut self, group: usize) {
+        self.groups.swap_remove(group);
+        if self.groups.is_empty() {
+            self.groups = Vec::new();
+        }
+    }
+
+    fn shrink_unused(&mut self) {
+        shrink_vec(&mut self.groups);
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.groups.capacity() as u64 * size_of::<Multiset>() as u64
+            + self
+                .groups
+                .iter()
+                .map(|m| m.vals.capacity() as u64 * size_of::<(Id, i64)>() as u64)
+                .sum::<u64>()
+    }
+
+    fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
+        let m = &self.groups[group];
+        w.u64(m.vals.len() as u64);
+        for (v, n) in &m.vals {
+            w.id(*v)?;
+            w.i64(*n);
+        }
+        w.i64(m.errs);
+        match m.sample {
+            Some(v) => {
+                w.u64(1);
+                w.id(v)?;
+            }
+            None => w.u64(0),
+        }
+        Ok(())
+    }
+
+    fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
+        r.charge_state(40)?;
+        let mut m = Multiset::default();
+        // The entries were written in their order, which the terms keep.
+        for _ in 0..r.u64()? {
+            let v = r.id()?;
+            let c = r.i64()?;
+            r.charge_state(16)?;
+            m.vals.push((v, c));
+        }
+        m.errs = r.i64()?;
+        m.sample = match r.u64()? {
+            0 => None,
+            _ => Some(r.id()?),
+        };
+        self.groups[group] = m;
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        Some(Box::new(self.clone()))
+    }
+
+    fn group_bytes(&self) -> u64 {
+        40
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Clone)]
+enum DistinctGroup {
+    Values(HbMap<Id, i64>),
+    Rows(HbMap<Box<[Id]>, i64>),
+}
+
+/// Retractable `DISTINCT` wrapper over any retractable accumulator. Each group counts
+/// occurrences of each distinct value (or full row for `COUNT(DISTINCT *)`), forwarding
+/// transitions across zero to `inner` and passing errors (`Id::UNDEF`) through
+/// un-deduplicated with their full weight.
+pub(crate) struct RetractableDistinct {
+    inner: Box<dyn Accumulator>,
+    groups: Vec<DistinctGroup>,
+    star: bool,
+    row_width: usize,
+}
+
+impl RetractableDistinct {
+    pub(crate) fn new(inner: Box<dyn Accumulator>, star: bool, row_width: usize) -> Self {
+        Self {
+            inner,
+            groups: Vec::new(),
+            star,
+            row_width,
+        }
+    }
+
+    fn empty_group(&self) -> DistinctGroup {
+        if self.star {
+            DistinctGroup::Rows(HbMap::default())
+        } else {
+            DistinctGroup::Values(HbMap::default())
+        }
+    }
+}
+
+impl Accumulator for RetractableDistinct {
+    fn init(&mut self, groups: usize) {
+        for _ in 0..groups {
+            self.groups.push(self.empty_group());
+        }
+        self.inner.init(groups);
+    }
+
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        budget: &mut BatchBudget<'_>,
+    ) -> Result<()> {
+        let mut keep_slots: Vec<u32> = Vec::new();
+        let mut keep_vals: Vec<Id> = Vec::new();
+        let mut keep_weights: Vec<i64> = Vec::new();
+        for (row, &slot) in slots.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let w = batch.add_weight(row) as i64;
+            if w == 0 {
+                continue;
+            }
+            match &mut self.groups[slot as usize] {
+                DistinctGroup::Rows(m) => {
+                    let key: Box<[Id]> = batch
+                        .table
+                        .cols
+                        .iter()
+                        .map(|c| c[batch.base + row])
+                        .collect();
+                    let e = m.entry(key.clone()).or_insert(0);
+                    let before = *e;
+                    *e += w;
+                    let after = *e;
+                    if after == 0 {
+                        m.remove(&key);
+                        shrink_map(m);
+                    }
+                    if before <= 0 && after > 0 {
+                        keep_slots.push(slot);
+                        keep_weights.push(1);
+                    }
+                }
+                DistinctGroup::Values(m) => {
+                    let id = batch.value(row).unwrap_or(Id::UNDEF);
+                    if id.is_undef() {
+                        // An error is never a duplicate.
+                        keep_slots.push(slot);
+                        keep_vals.push(Id::UNDEF);
+                        keep_weights.push(w);
+                    } else {
+                        let e = m.entry(id).or_insert(0);
+                        let before = *e;
+                        *e += w;
+                        let after = *e;
+                        if after == 0 {
+                            m.remove(&id);
+                            shrink_map(m);
+                        }
+                        if before <= 0 && after > 0 {
+                            keep_slots.push(slot);
+                            keep_vals.push(id);
+                            keep_weights.push(1);
+                        }
+                    }
+                }
+            }
+        }
+        if keep_slots.is_empty() {
+            return Ok(());
+        }
+        let arg = if self.star {
+            Arg::Star
+        } else {
+            Arg::Column(&keep_vals)
+        };
+        let inner = Batch {
+            table: batch.table,
+            arg,
+            rows: None,
+            weights: Some(&keep_weights),
+            base: batch.base,
+        };
+        self.inner.add_batch(ctx, &inner, &keep_slots, budget)
+    }
+
+    fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let id = self.inner.finish(ctx, group)?;
+        self.groups[group] = self.empty_group();
+        Ok(id)
+    }
+
+    fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        self.inner.read(ctx, group)
+    }
+
+    fn retractable(&self) -> bool {
+        self.inner.retractable()
+    }
+
+    fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+        if !batch.retract_weights_fit_i64(slots.len()) {
+            return Ok(false);
+        }
+        let mut drop_slots: Vec<u32> = Vec::new();
+        let mut drop_vals: Vec<Id> = Vec::new();
+        let mut drop_weights: Vec<i64> = Vec::new();
+        for (row, &slot) in slots.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let w = batch.retract_weight(row) as i64;
+            if w == 0 {
+                continue;
+            }
+            match &mut self.groups[slot as usize] {
+                DistinctGroup::Rows(m) => {
+                    let key: Box<[Id]> = batch
+                        .table
+                        .cols
+                        .iter()
+                        .map(|c| c[batch.base + row])
+                        .collect();
+                    let e = m.entry(key.clone()).or_insert(0);
+                    let before = *e;
+                    *e -= w;
+                    let after = *e;
+                    if after == 0 {
+                        m.remove(&key);
+                        shrink_map(m);
+                    }
+                    if before > 0 && after <= 0 {
+                        drop_slots.push(slot);
+                        drop_weights.push(-1);
+                    }
+                }
+                DistinctGroup::Values(m) => {
+                    let id = batch.value(row).unwrap_or(Id::UNDEF);
+                    if id.is_undef() {
+                        drop_slots.push(slot);
+                        drop_vals.push(Id::UNDEF);
+                        drop_weights.push(-w);
+                    } else {
+                        let e = m.entry(id).or_insert(0);
+                        let before = *e;
+                        *e -= w;
+                        let after = *e;
+                        if after == 0 {
+                            m.remove(&id);
+                            shrink_map(m);
+                        }
+                        if before > 0 && after <= 0 {
+                            drop_slots.push(slot);
+                            drop_vals.push(id);
+                            drop_weights.push(-1);
+                        }
+                    }
+                }
+            }
+        }
+        if drop_slots.is_empty() {
+            return Ok(true);
+        }
+        let arg = if self.star {
+            Arg::Star
+        } else {
+            Arg::Column(&drop_vals)
+        };
+        let inner = Batch {
+            table: batch.table,
+            arg,
+            rows: None,
+            weights: Some(&drop_weights),
+            base: batch.base,
+        };
+        self.inner.retract(ctx, &inner, &drop_slots)
+    }
+
+    fn clear(&mut self) {
+        self.groups = Vec::new();
+        self.inner.clear();
+    }
+
+    fn swap_remove(&mut self, group: usize) {
+        self.groups.swap_remove(group);
+        if self.groups.is_empty() {
+            self.groups = Vec::new();
+        }
+        self.inner.swap_remove(group);
+    }
+
+    fn shrink_unused(&mut self) {
+        shrink_vec(&mut self.groups);
+        self.inner.shrink_unused();
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        let outer = self.groups.capacity() as u64 * size_of::<DistinctGroup>() as u64;
+        let own: u64 = self
+            .groups
+            .iter()
+            .map(|g| match g {
+                DistinctGroup::Rows(m) => {
+                    m.len() as u64 * (self.row_width as u64 * 8) + m.allocation_size() as u64
+                }
+                DistinctGroup::Values(m) => m.allocation_size() as u64,
+            })
+            .sum();
+        outer + own + self.inner.retained_bytes()
+    }
+
+    fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
+        match &self.groups[group] {
+            DistinctGroup::Rows(m) => {
+                w.u64(m.len() as u64);
+                for (r, n) in m {
+                    w.row(r)?;
+                    w.i64(*n);
+                }
+            }
+            DistinctGroup::Values(m) => {
+                w.u64(m.len() as u64);
+                for (v, n) in m {
+                    w.id(*v)?;
+                    w.i64(*n);
+                }
+            }
+        }
+        self.inner.save_group(group, w)
+    }
+
+    fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
+        match &mut self.groups[group] {
+            DistinctGroup::Rows(m) => {
+                m.clear();
+                let inner_row = self.row_width as u64 * 8 + 48;
+                for _ in 0..r.u64()? {
+                    let row = r.row()?;
+                    r.charge_state(inner_row)?;
+                    m.insert(row, r.i64()?);
+                }
+            }
+            DistinctGroup::Values(m) => {
+                r.charge_state(48)?;
+                m.clear();
+                for _ in 0..r.u64()? {
+                    let v = r.id()?;
+                    r.charge_state(24)?;
+                    m.insert(v, r.i64()?);
+                }
+            }
+        }
+        self.inner.load_group(group, r)
+    }
+
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        let inner = self.inner.clone_box()?;
+        Some(Box::new(Self {
+            inner,
+            groups: self.groups.clone(),
+            star: self.star,
+            row_width: self.row_width,
+        }))
+    }
+
+    fn group_bytes(&self) -> u64 {
+        self.inner.group_bytes() + 96
     }
 
     fn as_any(&mut self) -> &mut dyn Any {
@@ -671,17 +2267,7 @@ impl Accumulator for Concat {
                 empty: true,
             },
         );
-        let nothing = state.empty
-            && self.distinct
-            && ctx.aggregate_errors.distinct_concat_of_nothing_unbound();
-        let id = if state.ok && !nothing {
-            // SPARQL 1.1: the result is a simple literal
-            ctx.intern_value(&Value::Str(state.text.into()))
-        } else {
-            Id::UNDEF
-        };
-        ctx.check()?;
-        Ok(id)
+        finish_concat(ctx, self.distinct, state.empty, state.ok, state.text)
     }
 
     fn group_bytes(&self) -> u64 {
@@ -789,6 +2375,7 @@ impl Accumulator for Distinct {
             table: batch.table,
             arg,
             rows: None,
+            weights: None,
             base: batch.base,
         };
         self.inner.add_batch(ctx, &inner, &keep, budget)

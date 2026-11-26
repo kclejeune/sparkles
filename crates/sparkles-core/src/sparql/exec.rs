@@ -8243,6 +8243,7 @@ impl SumAdmit for CallbackAdmit<'_> {
 /// [`super::bignum::AGG_MAX_DEC_DIGITS`]) so cancellation and averaging at the digit cap
 /// stay independent of row order, while enforcing the final value limits in
 /// [`AggState::finish`].
+#[derive(Clone)]
 pub(super) enum SumGeneric {
     Decimal(oxsdatatypes::Decimal),
     Float(oxsdatatypes::Float),
@@ -8525,6 +8526,7 @@ impl SumGeneric {
 }
 
 /// Running state of one aggregate of one group (same results as [`aggregate`]).
+#[derive(Clone)]
 pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
     Count(u64),
@@ -8833,16 +8835,117 @@ impl AggState {
         true
     }
 
-    /// Take back one row that [`AggState::add`] counted, for a state that can: a count,
-    /// and an exact sum of inline integers. `false`, with this state unchanged, for any
-    /// other, since a minimum, a sample or a sum that left the exact integers keeps no
-    /// record of the rows it would have to give up.
-    #[allow(dead_code, reason = "the parallel split and item 418's view operator")]
-    pub(super) fn retract(&mut self, id: Option<Id>) -> bool {
+    /// Add `weight` copies of one row; `id` is the aggregated column's value (`None` for COUNT(*)).
+    pub(super) fn add_weighted(
+        &mut self,
+        ctx: &Ctx,
+        agg: &Agg,
+        id: Option<Id>,
+        weight: u64,
+        admit: &mut dyn SumAdmit,
+    ) -> Result<()> {
+        if weight == 0 {
+            return Ok(());
+        }
         match self {
             AggState::Count(n) => {
                 if id.is_none_or(|id| !id.is_undef()) {
-                    *n = n.saturating_sub(1);
+                    *n += weight;
+                }
+            }
+            AggState::Best(_, _, errs) => {
+                if id.is_none_or(|id| id.is_undef()) {
+                    *errs += weight;
+                } else {
+                    let _ = self.add_admitted(ctx, agg, id, admit)?;
+                }
+            }
+            AggState::Sample(_) => {
+                let _ = self.add_admitted(ctx, agg, id, admit)?;
+            }
+            AggState::Sum {
+                ok: false,
+                rows,
+                errs,
+                ..
+            } => {
+                *rows += weight;
+                if id.is_none_or(|id| id.is_undef()) {
+                    *errs += weight;
+                }
+            }
+            AggState::Sum { ok, rows, errs, .. } if id.is_none_or(|id| id.is_undef()) => {
+                *rows += weight;
+                *errs += weight;
+                *ok = false;
+            }
+            AggState::Sum {
+                int,
+                generic: None,
+                ok: true,
+                rows,
+                ..
+            } if id.is_some_and(|id| id.tag() == crate::id::Tag::Int) => {
+                let id = id.expect("checked above");
+                if let Some(delta) = i128::from(id.as_i64()).checked_mul(i128::from(weight))
+                    && let Some(s) = int.checked_add(delta)
+                {
+                    *int = s;
+                    *rows += weight;
+                    return Ok(());
+                }
+                for i in 0..weight {
+                    if i.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    let _ = self.add_admitted(ctx, agg, Some(id), admit)?;
+                    if let AggState::Sum {
+                        ok: false, rows, ..
+                    } = self
+                    {
+                        *rows += weight - 1 - i;
+                        break;
+                    }
+                }
+            }
+            _ => {
+                for i in 0..weight {
+                    if i.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    let _ = self.add_admitted(ctx, agg, id, admit)?;
+                    if let AggState::Sum {
+                        ok: false,
+                        rows,
+                        errs,
+                        ..
+                    } = self
+                    {
+                        let rem = weight - 1 - i;
+                        *rows += rem;
+                        if id.is_none_or(|id| id.is_undef()) {
+                            *errs += rem;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Take back `weight` copies of one row that [`AggState::add`] counted, for a state
+    /// that can: a count, and an exact sum of inline integers. `false`, with this state
+    /// unchanged, for any other, since a minimum, a sample or a sum that left the exact
+    /// integers keeps no record of the rows it would have to give up.
+    pub(super) fn retract(&mut self, id: Option<Id>, weight: u64) -> bool {
+        if weight == 0 {
+            return true;
+        }
+        match self {
+            AggState::Count(n) => {
+                if id.is_none_or(|id| !id.is_undef()) {
+                    *n = n.saturating_sub(weight);
                 }
                 true
             }
@@ -8856,14 +8959,33 @@ impl AggState {
                 let Some(id) = id.filter(|id| id.tag() == crate::id::Tag::Int) else {
                     return false;
                 };
-                let Some(s) = int.checked_sub(id.as_i64().into()) else {
+                let Some(delta) = i128::from(id.as_i64()).checked_mul(i128::from(weight)) else {
+                    return false;
+                };
+                let Some(s) = int.checked_sub(delta) else {
                     return false;
                 };
                 *int = s;
-                *rows = rows.saturating_sub(1);
+                *rows = rows.saturating_sub(weight);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Read the aggregate's current value without consuming this state.
+    pub(super) fn read(&self, ctx: &Ctx, agg: &Agg) -> Result<Id> {
+        match self {
+            AggState::Count(n) => Ok(Id::from_i64(*n as i64).unwrap_or(Id::UNDEF)),
+            AggState::Sum { .. } => self.clone().finish(ctx, agg),
+            AggState::Best(best, _, errs) => Ok(super::group::acc::finish_best(
+                ctx,
+                matches!(agg.func, AggregateFunction::Min),
+                *errs,
+                *best,
+            )),
+            AggState::Sample(x) => Ok(x.unwrap_or(Id::UNDEF)),
+            AggState::Stat(arq, acc) => Ok(acc.clone().finish(ctx, *arq)),
         }
     }
 
@@ -9015,14 +9137,12 @@ impl AggState {
                 drop(scratch);
                 Ok(id)
             }
-            AggState::Best(best, _, errs) => {
-                let min = matches!(agg.func, AggregateFunction::Min);
-                Ok(if errs > 0 && ctx.aggregate_errors.best_errs(min) {
-                    Id::UNDEF
-                } else {
-                    best.unwrap_or(Id::UNDEF)
-                })
-            }
+            AggState::Best(best, _, errs) => Ok(super::group::acc::finish_best(
+                ctx,
+                matches!(agg.func, AggregateFunction::Min),
+                errs,
+                best,
+            )),
             AggState::Sample(x) => Ok(x.unwrap_or(Id::UNDEF)),
             AggState::Stat(arq, acc) => Ok(acc.finish(ctx, arq)),
         }

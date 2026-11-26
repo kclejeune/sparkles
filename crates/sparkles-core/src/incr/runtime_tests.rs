@@ -2436,7 +2436,7 @@ fn shared_exists_window_skips_old_compiler_checkpoint() {
     let old_fp =
         super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-3", &parsed, QUERY);
     let new_fp = super::runtime::checkpoint_fingerprint_for_compiler(
-        super::runtime::key::COMPILER,
+        super::runtime::COMPILER,
         &parsed,
         QUERY,
     );

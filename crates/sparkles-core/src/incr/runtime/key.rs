@@ -5,7 +5,7 @@ use super::*;
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-pub(in crate::incr) const COMPILER: &str = "f13-phase2-5";
+pub(crate) const COMPILER: &str = "f13-phase2-6";
 
 /// Whether `access` has protections that depend on the data, with the reason the
 /// whole query is then evaluated again (spec F13 §6.2).
@@ -152,6 +152,9 @@ mod compiler_tests {
         // arbitrary-precision xsd:integer and xsd:decimal semantics, transitive numeric
         // ORDER BY, and checkpointed big-number SUM/AVG state (item 1065)
         ("f13-phase2-5", "33695b11351c501e"),
+        // the group operator runs over the shared Accumulator trait with versioned
+        // per-accumulator checkpoint state (item 1073)
+        ("f13-phase2-6", "33695b11351c501e"),
     ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or

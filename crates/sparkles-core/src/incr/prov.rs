@@ -48,8 +48,10 @@ use super::persist::{Reader, Writer};
 use super::zset::Row;
 use crate::error::{Error, Result};
 use oxrdf::Term;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use sha2::{Digest, Sha256};
+
+type HbMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
 
 /// The default bound of a `why` annotation's witnesses.
 pub const DEFAULT_MAX_WITNESSES: usize = 8;
@@ -476,13 +478,13 @@ pub enum Ann {
 /// annotations, so that a state's memory is known without visiting every row.
 #[derive(Clone, Debug, Default)]
 pub struct AnnMap {
-    map: FxHashMap<Row, Ann>,
+    map: HbMap<Row, Ann>,
     /// the sum of [`Ann::bytes`] over the annotations
     bytes: u64,
 }
 
 impl std::ops::Deref for AnnMap {
-    type Target = FxHashMap<Row, Ann>;
+    type Target = HbMap<Row, Ann>;
 
     fn deref(&self) -> &Self::Target {
         &self.map
@@ -527,6 +529,22 @@ impl AnnMap {
             keep
         });
         self.bytes = bytes;
+    }
+
+    /// Release excess hash-table backing capacity after deletions.
+    pub fn shrink_unused(&mut self) {
+        const SHRINK_MIN_BUCKETS: usize = 64;
+        let entry_bytes = std::mem::size_of::<(Row, Ann)>() + 1;
+        if self.map.is_empty() {
+            self.map = HbMap::default();
+        } else {
+            let alloc = self.map.allocation_size();
+            if alloc >= SHRINK_MIN_BUCKETS * entry_bytes
+                && self.map.len().saturating_mul(entry_bytes).saturating_mul(4) <= alloc
+            {
+                self.map.shrink_to(self.map.len() + self.map.len() / 2);
+            }
+        }
     }
 }
 
@@ -1010,9 +1028,10 @@ pub fn load_map(r: &mut Reader, mode: Provenance) -> Result<AnnMap> {
     Ok(m)
 }
 
-/// The approximate memory of a state's annotations.
+/// The approximate memory of a state's annotations, including hash-table backing allocation.
 pub fn map_bytes(m: &AnnMap, width: usize) -> u64 {
-    m.bytes + m.len() as u64 * super::zset::row_bytes(width)
+    let live_rows = m.len() as u64 * (width as u64 * 8);
+    m.bytes + live_rows + m.allocation_size() as u64
 }
 
 /// Add change `d` to row `row`'s annotation in `m`, dropping it when it becomes zero,
@@ -1193,9 +1212,58 @@ mod tests {
                     }
                 }
                 let sum: u64 = m.values().map(Ann::bytes).sum();
-                let rows = m.len() as u64 * super::super::zset::row_bytes(1);
-                assert_eq!(map_bytes(&m, 1), sum + rows);
+                let live_rows = m.len() as u64 * 8;
+                let alloc = m.allocation_size() as u64;
+                assert_eq!(map_bytes(&m, 1), sum + live_rows + alloc);
             }
+            // Tombstones do not reduce the backing allocation, so `map_bytes` must keep
+            // charging the full backing table and `shrink_unused` must shrink based on
+            // backing allocation even when insertion `capacity()` falls from tombstones.
+            let mut tomb = AnnMap::default();
+            for k in 0..224i64 {
+                tomb.insert(vec![id(k)].into(), Ann::derivation(mode, vec![]));
+            }
+            let peak_alloc = tomb.allocation_size();
+            assert!(
+                peak_alloc >= 256 * std::mem::size_of::<(Row, Ann)>(),
+                "expected 256-bucket backing allocation, got {peak_alloc}"
+            );
+            for k in 0..100i64 {
+                tomb.remove(&vec![id(k)].into_boxed_slice());
+            }
+            assert_eq!(tomb.len(), 124);
+            assert_eq!(
+                tomb.allocation_size(),
+                peak_alloc,
+                "tombstone deletions must retain full backing allocation"
+            );
+            assert!(
+                map_bytes(&tomb, 1) >= peak_alloc as u64,
+                "map_bytes must charge full tombstone-bearing backing allocation"
+            );
+            for k in 100..174i64 {
+                tomb.remove(&vec![id(k)].into_boxed_slice());
+            }
+            assert_eq!(tomb.len(), 50);
+            assert_eq!(tomb.allocation_size(), peak_alloc);
+            tomb.shrink_unused();
+            assert!(
+                tomb.allocation_size() < peak_alloc,
+                "shrink_unused must shrink tombstone-heavy table ({} vs peak {peak_alloc})",
+                tomb.allocation_size()
+            );
+            // Retaining nothing leaves backing allocation charged until `shrink_unused` frees it.
+            tomb.retain(|_, _| false);
+            assert!(tomb.is_empty());
+            let empty_alloc = tomb.allocation_size();
+            assert!(
+                empty_alloc > 0,
+                "expected retained backing allocation before shrink_unused"
+            );
+            assert_eq!(map_bytes(&tomb, 1), empty_alloc as u64);
+            tomb.shrink_unused();
+            assert_eq!(tomb.allocation_size(), 0);
+            assert_eq!(map_bytes(&tomb, 1), 0);
         }
     }
 

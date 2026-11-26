@@ -502,6 +502,25 @@ impl Vocab {
         self.fsst.is_some()
     }
 
+    /// Whether entry `id` stores an FSST-coded suffix (test helper).
+    #[cfg(test)]
+    pub(crate) fn is_entry_coded(&self, id: u64) -> bool {
+        if !self.is_fsst() || id >= self.len {
+            return false;
+        }
+        let b = (id as usize) / FC_BLOCK;
+        let want = (id as usize) % FC_BLOCK;
+        let data = self.data.as_slice();
+        let mut pos = self.block_offset(b);
+        for i in 0..=want {
+            let e = self.entry::<true>(data, &mut pos, i == 0);
+            if i == want {
+                return e.coded;
+            }
+        }
+        false
+    }
+
     /// Open the vocabulary in `dir`, whose suffixes are FSST-coded when `fsst` (and then
     /// `vocab.fsst` must be there).
     pub fn open_codec(dir: &Path, fsst: bool) -> Result<Vocab> {
@@ -2340,7 +2359,8 @@ impl Vocab {
     /// with that key is above the probe, since its byte at the shared length is above the
     /// key's and so above the probe's, and a key that shares more is below it with the
     /// same `c`. Only a key that shares exactly `c` bytes has its suffix read and
-    /// compared, and only that suffix is decoded. This relies on the writer storing the
+    /// compared, and FSST-coded suffixes are compared incrementally without allocating
+    /// scratch. This relies on the writer storing the
     /// longest shared prefix, which [`VocabWriter`] does and `sparkles check` verifies.
     #[inline(always)]
     fn find_in_block<const P: bool, const F: bool>(
@@ -2365,7 +2385,6 @@ impl Vocab {
             std::cmp::Ordering::Greater => return Err(start as u64),
         }
         let mut c = lcp(first, probe);
-        let mut scratch = Vec::new();
         for i in 1..n {
             let id = (start + i) as u64;
             let e = self.entry::<F>(data, &mut pos, false);
@@ -2375,18 +2394,25 @@ impl Vocab {
             if e.shared > c {
                 continue;
             }
-            let suffix: &[u8] = if F && e.coded {
-                scratch.clear();
-                self.push_suffix::<F>(data, e, id, usize::MAX, &mut scratch, false);
-                &scratch
-            } else {
-                &data[e.start..e.start + e.len]
-            };
             let rest = &probe[c..];
-            match suffix.cmp(rest) {
-                std::cmp::Ordering::Less => c += lcp(suffix, rest),
-                std::cmp::Ordering::Equal => return Ok(id),
-                std::cmp::Ordering::Greater => return Err(id),
+            if F && e.coded
+                && let Some(t) = &self.fsst
+            {
+                let (ord, matched) = t
+                    .table(id)
+                    .cmp_with_lcp(&data[e.start..e.start + e.len], rest);
+                match ord {
+                    std::cmp::Ordering::Less => c += matched,
+                    std::cmp::Ordering::Equal => return Ok(id),
+                    std::cmp::Ordering::Greater => return Err(id),
+                }
+            } else {
+                let suffix = &data[e.start..e.start + e.len];
+                match suffix.cmp(rest) {
+                    std::cmp::Ordering::Less => c += lcp(suffix, rest),
+                    std::cmp::Ordering::Equal => return Ok(id),
+                    std::cmp::Ordering::Greater => return Err(id),
+                }
             }
         }
         Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64)
@@ -3809,6 +3835,43 @@ mod tests {
             assert!(most.get() <= SMALL, "fsst {fsst}: reserved {}", most.get());
             // a long key itself is still reserved whole
             assert!(v.get_with_checked(2, small, |_| ()).unwrap_err() > LONG);
+        }
+    }
+
+    #[test]
+    fn fsst_find_compares_long_coded_suffix_without_allocating() {
+        let long_key = format!("\"{}\0", "abcdefgh".repeat(6 * 1024)).into_bytes();
+        let keys = [b"\"a0\0".to_vec(), long_key.clone(), b"\"b\0".to_vec()];
+        let dir = tempfile::tempdir().unwrap();
+        let mut w =
+            VocabWriter::create_fsst(dir.path(), fsst::Encoder::train([&[&long_key[..]], &[]]))
+                .unwrap();
+        for k in &keys {
+            w.push(k).unwrap();
+        }
+        w.finish().unwrap();
+        let v = Vocab::open(dir.path()).unwrap();
+        assert!(v.is_fsst());
+        assert!(v.is_entry_coded(1));
+
+        let mut smaller = long_key.clone();
+        let last_lex = smaller.len() - 2;
+        smaller[last_lex] = b'a';
+        let mut larger = long_key.clone();
+        larger[last_lex] = b'z';
+
+        for (probe, expected) in [
+            (long_key.as_slice(), Ok(1)),
+            (smaller.as_slice(), Err(1)),
+            (larger.as_slice(), Err(2)),
+            (keys[2].as_slice(), Ok(2)),
+        ] {
+            let (got, stats) = crate::test_alloc::record_alloc_stats(|| v.find(probe));
+            assert_eq!(got, expected);
+            assert_eq!(
+                stats.total_alloc, 0,
+                "Vocab::find must not allocate scratch"
+            );
         }
     }
 
