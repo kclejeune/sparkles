@@ -106,7 +106,7 @@
   import WatchButton from '$components/WatchButton.svelte';
   import BulkEdit from '$components/BulkEdit.svelte';
   import OntoPatterns from '$components/OntoPatterns.svelte';
-  import { PatternCommitCoordinator } from '$lib/ontology-patterns';
+  import { PatternCommitCoordinator, patternCommitToast } from '$lib/ontology-patterns';
   import OntoImports from '$components/OntoImports.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
@@ -1167,16 +1167,11 @@
   });
   let patternPendingTargets = $state<ReadonlySet<string>>(new Set());
   const patternCommit = new PatternCommitCoordinator({
-    onCommitted: (submittedTarget, seq, notice, res) => {
+    onCommitted: (submittedTarget, seq, notice, res, handledInTab) => {
       if (!pageMounted || submittedTarget !== target) return;
       discussed(seq);
-      if (tab !== 'patterns') {
-        toasts.push(
-          res.committed ? 'success' : 'info',
-          res.committed ? 'Pattern axioms committed' : 'Pattern apply finished',
-          notice,
-        );
-      }
+      const toast = patternCommitToast(res, notice, handledInTab);
+      if (toast) toasts.push(toast.kind, toast.title, toast.detail);
     },
     onDetachedError: (submittedTarget, e) => {
       if (!pageMounted || submittedTarget !== target) return;

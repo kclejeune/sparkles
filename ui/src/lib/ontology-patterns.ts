@@ -561,13 +561,44 @@ export function formatPatternCommitNotice(res: PatternApplyResponse): string {
     : `No new axioms to commit (${fmtInt(res.present)} already present).`;
 }
 
+export type PatternCommitToast = {
+  kind: 'success' | 'info';
+  title: string;
+  detail: string;
+};
+
+/**
+ * Decide whether the owning workbench page should display a toast for a completed
+ * pattern commit. When the originating Patterns component is still mounted
+ * (`handledInTab === true`), it displays the notice inline; otherwise (including when
+ * the user switched away and reopened Patterns before settlement) the page presents a
+ * toast so neither a committed summary nor a no-change outcome disappears.
+ */
+export function patternCommitToast(
+  res: PatternApplyResponse,
+  notice: string,
+  handledInTab: boolean,
+): PatternCommitToast | null {
+  if (handledInTab) return null;
+  return {
+    kind: res.committed ? 'success' : 'info',
+    title: res.committed ? 'Pattern axioms committed' : 'Pattern apply finished',
+    detail: notice,
+  };
+}
+
 export type PatternCommitHooks = {
-  /** Called by the owning workbench whenever a commit finishes, even after the Patterns tab unmounts. */
+  /**
+   * Called by the owning workbench whenever a commit finishes, even after the Patterns
+   * tab unmounts. `handledInTab` is true only when the originating Patterns component
+   * instance remained mounted and rendered the inline notice.
+   */
   onCommitted: (
     target: string,
     seq: number | null,
     notice: string,
     res: PatternApplyResponse,
+    handledInTab: boolean,
   ) => void;
   /** Called by the owning workbench when a commit fails after the Patterns tab unmounted. */
   onDetachedError?: (target: string, error: unknown) => void;
@@ -614,10 +645,11 @@ export class PatternCommitCoordinator {
       const res = await applyPatterns(target, sel, req, { etag: opts.etag });
       const notice = formatPatternCommitNotice(res);
       const seq = res.receipt?.commit?.seq ?? null;
-      this.hooks.onCommitted(target, seq, notice, res);
-      if (tab?.isMounted()) {
-        tab.onSuccess(notice, res);
+      const handledInTab = Boolean(tab?.isMounted());
+      if (handledInTab) {
+        tab!.onSuccess(notice, res);
       }
+      this.hooks.onCommitted(target, seq, notice, res, handledInTab);
       return true;
     } catch (e) {
       if (tab?.isMounted()) {

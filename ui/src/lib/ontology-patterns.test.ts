@@ -8,6 +8,7 @@ import {
   parsePreviewHeaders,
   PATTERN_PRESETS,
   PatternCommitCoordinator,
+  patternCommitToast,
   patternInputSignature,
   previewPatterns,
 } from './ontology-patterns';
@@ -260,7 +261,38 @@ describe('ontology-patterns HTTP client', () => {
     expect((applyInit.headers as Record<string, string>)['If-Match']).toBe('W/"bio:5:owl"');
   });
 
-  it('reconciles committed writes and surfaces detached errors when Patterns tab unmounts', async () => {
+  it('reconciles committed writes and surfaces detached feedback across unmount and remount', async () => {
+    const makeResponse = (committed: boolean, seq: number) =>
+      new Response(
+        JSON.stringify({
+          added: committed ? 2 : 0,
+          present: committed ? 0 : 2,
+          removed: 0,
+          absent: [],
+          declared: [],
+          addedAxioms: [],
+          removedAxioms: [],
+          axiomsTruncated: false,
+          inserted: committed ? 3 : 0,
+          deleted: 0,
+          kept: committed ? 0 : 3,
+          committed,
+          commit: { seq },
+          pattern: {
+            delimiter: 'csv',
+            headers: ['ID'],
+            rowsProcessed: 1,
+            rowsSkipped: 0,
+            rowsWithErrors: 0,
+            generated: 2,
+            valid: true,
+            diagnostics: [],
+            diagnosticsTruncated: false,
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+
     let resolveFetch!: (res: Response) => void;
     const pendingFetch = new Promise<Response>((resolve) => {
       resolveFetch = resolve;
@@ -268,16 +300,29 @@ describe('ontology-patterns HTTP client', () => {
     const fetchMock = vi.fn().mockReturnValueOnce(pendingFetch);
     vi.stubGlobal('fetch', fetchMock);
 
-    const committed: { target: string; seq: number | null; notice: string }[] = [];
+    // Mirror the workbench page presentation gate: activeTab can return to 'patterns'
+    // after unmount, and toast presentation depends on `handledInTab`, not `activeTab`.
+    let activeTab: 'tree' | 'patterns' = 'patterns';
+    const committed: {
+      target: string;
+      seq: number | null;
+      notice: string;
+      handledInTab: boolean;
+    }[] = [];
+    const pageToasts: ReturnType<typeof patternCommitToast>[] = [];
     const detachedErrors: { target: string; error: unknown }[] = [];
     const pendingSnapshots: string[][] = [];
     const coordinator = new PatternCommitCoordinator({
-      onCommitted: (t, seq, notice) => committed.push({ target: t, seq, notice }),
+      onCommitted: (t, seq, notice, res, handledInTab) => {
+        committed.push({ target: t, seq, notice, handledInTab });
+        const toast = patternCommitToast(res, notice, handledInTab);
+        if (toast) pageToasts.push(toast);
+      },
       onDetachedError: (t, error) => detachedErrors.push({ target: t, error }),
       onPendingChange: (set) => pendingSnapshots.push([...set]),
     });
 
-    let mounted = true;
+    let origMounted = true;
     const tabSuccess = vi.fn();
     const tabSettled = vi.fn();
     const req = {
@@ -292,66 +337,103 @@ describe('ontology-patterns HTTP client', () => {
       req,
       { etag: 'W/"bio:5:owl-patterns.abc"' },
       {
-        isMounted: () => mounted,
+        isMounted: () => origMounted,
         onSuccess: tabSuccess,
         onError: vi.fn(),
         onSettled: tabSettled,
       },
     );
 
-    // While pending, duplicate submits on the same target are suppressed (e.g. if user
-    // navigates away and back to Patterns before the commit finishes).
+    // While pending, duplicate submits on the same target are suppressed.
     expect(coordinator.isPending('bio')).toBe(true);
     const dup = await coordinator.submit('bio', { graph: null, imports: true }, req);
     expect(dup).toBe(false);
 
-    // Simulate switching from Patterns to Tree tab while commit is still in flight.
-    mounted = false;
+    // User switches from Patterns to Tree (destroying the originating Patterns instance)
+    // and then reopens Patterns BEFORE settlement (activeTab === 'patterns', origMounted === false).
+    activeTab = 'tree';
+    origMounted = false;
+    activeTab = 'patterns';
+    expect(activeTab).toBe('patterns');
 
-    resolveFetch(
-      new Response(
-        JSON.stringify({
-          added: 2,
-          present: 0,
-          removed: 0,
-          absent: [],
-          declared: [],
-          addedAxioms: [],
-          removedAxioms: [],
-          axiomsTruncated: false,
-          inserted: 3,
-          deleted: 0,
-          kept: 0,
-          committed: true,
-          commit: { seq: 11 },
-          pattern: {
-            delimiter: 'csv',
-            headers: ['ID'],
-            rowsProcessed: 1,
-            rowsSkipped: 0,
-            rowsWithErrors: 0,
-            generated: 2,
-            valid: true,
-            diagnostics: [],
-            diagnosticsTruncated: false,
-          },
-        }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
-      ),
-    );
+    resolveFetch(makeResponse(true, 11));
 
     expect(await submitPromise).toBe(true);
     expect(coordinator.isPending('bio')).toBe(false);
-    expect(committed).toHaveLength(1);
-    expect(committed[0]).toEqual({
-      target: 'bio',
-      seq: 11,
-      notice: 'Committed 2 new axioms (3 triples) from 1 row.',
-    });
-    // Unmounted tab callbacks were NOT invoked, while workbench reconciliation WAS.
+    expect(committed).toEqual([
+      {
+        target: 'bio',
+        seq: 11,
+        notice: 'Committed 2 new axioms (3 triples) from 1 row.',
+        handledInTab: false,
+      },
+    ]);
+    // Unmounted originating tab callbacks were NOT invoked, while the page toast WAS emitted
+    // even though activeTab had returned to 'patterns'.
     expect(tabSuccess).not.toHaveBeenCalled();
     expect(tabSettled).not.toHaveBeenCalled();
+    expect(pageToasts).toEqual([
+      {
+        kind: 'success',
+        title: 'Pattern axioms committed',
+        detail: 'Committed 2 new axioms (3 triples) from 1 row.',
+      },
+    ]);
     expect(pendingSnapshots).toEqual([['bio'], []]);
+
+    // Remounted Patterns before a no-change (`committed: false`) settlement also surfaces
+    // an info toast instead of silently clearing the pending indicator.
+    let resolveNoChange!: (res: Response) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveNoChange = resolve;
+      }),
+    );
+    let origMountedNoChange = true;
+    const noChangePromise = coordinator.submit(
+      'bio',
+      { graph: null, imports: true },
+      req,
+      {},
+      {
+        isMounted: () => origMountedNoChange,
+        onSuccess: vi.fn(),
+        onError: vi.fn(),
+        onSettled: vi.fn(),
+      },
+    );
+    origMountedNoChange = false;
+    activeTab = 'patterns';
+    resolveNoChange(makeResponse(false, 11));
+    expect(await noChangePromise).toBe(true);
+    expect(pageToasts[1]).toEqual({
+      kind: 'info',
+      title: 'Pattern apply finished',
+      detail: 'No new axioms to commit (2 already present).',
+    });
+
+    // When the originating Patterns instance stays mounted, it handles the notice inline
+    // and the page suppresses any duplicate toast.
+    fetchMock.mockReturnValueOnce(Promise.resolve(makeResponse(true, 12)));
+    const inlineSuccess = vi.fn();
+    const inlineSettled = vi.fn();
+    expect(
+      await coordinator.submit(
+        'bio',
+        { graph: null, imports: true },
+        req,
+        {},
+        {
+          isMounted: () => true,
+          onSuccess: inlineSuccess,
+          onError: vi.fn(),
+          onSettled: inlineSettled,
+        },
+      ),
+    ).toBe(true);
+    expect(inlineSuccess).toHaveBeenCalledTimes(1);
+    expect(inlineSettled).toHaveBeenCalledTimes(1);
+    expect(pageToasts).toHaveLength(2);
 
     // Detached failure also notifies the parent workbench after unmount.
     let rejectFetch!: (err: unknown) => void;
