@@ -57,6 +57,7 @@ DEFERRED = {
     "evidence.holds",
     "evidence.propose",
     "evidence.reauthenticate",
+    "evidence.rebuild_resolution_map",
     "evidence.release_hold",
     "evidence.resolve",
     "evidence.resolve_entities",
