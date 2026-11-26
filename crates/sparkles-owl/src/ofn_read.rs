@@ -190,8 +190,8 @@ fn line_start(text: &str, at: usize) -> Option<usize> {
 /// exceed the caller's budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundedParseError {
-    Parse(ParseError),
-    Budget { attempted: usize },
+    Parse { error: ParseError, used: usize },
+    Budget { used: usize, attempted: usize },
 }
 
 /// Read one axiom, such as `SubClassOf(ex:A ex:B)`, with `prefixes` and the predefined
@@ -214,13 +214,17 @@ pub fn parse_axiom_bounded(
     r.byte_budget = Some(max_bytes);
     match r.axiom().and_then(|ax| r.end("axiom").map(|()| ax)) {
         Ok(ax) => Ok((ax, r.bytes_used)),
-        Err(e) => {
+        Err(error) => {
             if r.budget_exceeded {
                 Err(BoundedParseError::Budget {
-                    attempted: r.bytes_used,
+                    used: r.bytes_used,
+                    attempted: r.bytes_attempted,
                 })
             } else {
-                Err(BoundedParseError::Parse(e))
+                Err(BoundedParseError::Parse {
+                    error,
+                    used: r.bytes_used,
+                })
             }
         }
     }
@@ -239,18 +243,16 @@ pub fn parse_class_expression(
 }
 
 impl<'a> Reader<'a> {
-    /// A reader of one value of `text` with `prefixes` and the predefined ones.
-    fn one(text: &'a str, prefixes: &[(String, String)]) -> Reader<'a> {
+    /// A reader of one value of `text` with `prefixes` and the predefined ones, borrowing
+    /// `prefixes` directly without cloning the map.
+    fn one(text: &'a str, prefixes: &'a [(String, String)]) -> Reader<'a> {
         Reader {
             text,
             pos: 0,
             peeked: None,
             last: 0,
-            names: crate::ofn::STANDARD_PREFIXES
-                .iter()
-                .map(|(p, n)| (p.to_string(), n.to_string()))
-                .chain(prefixes.iter().cloned())
-                .collect(),
+            borrowed_names: prefixes,
+            names: Vec::new(),
             prefixes: Vec::new(),
             header: Header::default(),
             depth: 0,
@@ -259,6 +261,7 @@ impl<'a> Reader<'a> {
             rules: 0,
             byte_budget: None,
             bytes_used: 0,
+            bytes_attempted: 0,
             budget_exceeded: false,
         }
     }
@@ -326,7 +329,9 @@ pub struct Reader<'a> {
     peeked: Option<(Tok<'a>, usize)>,
     /// the start of the last token taken
     last: usize,
-    /// every prefix that resolves, the predefined ones first
+    /// caller-supplied or parent-chunk prefixes borrowed without cloning
+    borrowed_names: &'a [(String, String)],
+    /// document-declared prefixes that take precedence over `borrowed_names` and standard ones
     names: Vec<(String, String)>,
     prefixes: Vec<(String, String)>,
     header: Header,
@@ -338,6 +343,7 @@ pub struct Reader<'a> {
     /// optional cumulative byte budget for resolved IRIs during single-axiom parsing
     byte_budget: Option<usize>,
     bytes_used: usize,
+    bytes_attempted: usize,
     budget_exceeded: bool,
 }
 
@@ -350,10 +356,8 @@ impl<'a> Reader<'a> {
             pos: 0,
             peeked: None,
             last: 0,
-            names: crate::ofn::STANDARD_PREFIXES
-                .iter()
-                .map(|(p, n)| (p.to_string(), n.to_string()))
-                .collect(),
+            borrowed_names: &[],
+            names: Vec::new(),
             prefixes: Vec::new(),
             header: Header::default(),
             depth: 0,
@@ -362,6 +366,7 @@ impl<'a> Reader<'a> {
             rules: 0,
             byte_budget: None,
             bytes_used: 0,
+            bytes_attempted: 0,
             budget_exceeded: false,
         };
         r.preamble()?;
@@ -383,7 +388,8 @@ impl<'a> Reader<'a> {
             pos: start,
             peeked: None,
             last: start,
-            names: self.names.clone(),
+            borrowed_names: &self.names,
+            names: Vec::new(),
             prefixes: Vec::new(),
             header: Header::default(),
             depth: 0,
@@ -392,6 +398,7 @@ impl<'a> Reader<'a> {
             rules: 0,
             byte_budget: None,
             bytes_used: 0,
+            bytes_attempted: 0,
             budget_exceeded: false,
         };
         let mut out = Vec::new();
@@ -649,15 +656,31 @@ impl<'a> Reader<'a> {
 
     // ---- IRIs
 
+    fn lookup_prefix(&self, prefix: &str) -> Option<&str> {
+        if let Some((_, ns)) = self.names.iter().rev().find(|(p, _)| p == prefix) {
+            return Some(ns.as_str());
+        }
+        if let Some((_, ns)) = self.borrowed_names.iter().rev().find(|(p, _)| p == prefix) {
+            return Some(ns.as_str());
+        }
+        crate::ofn::STANDARD_PREFIXES
+            .iter()
+            .rev()
+            .find(|(p, _)| *p == prefix)
+            .map(|(_, ns)| *ns)
+    }
+
     fn charge_bytes(&mut self, bytes: usize) -> Result<(), ParseError> {
         if let Some(limit) = self.byte_budget {
-            self.bytes_used = self.bytes_used.saturating_add(bytes);
-            if self.bytes_used > limit {
+            let next = self.bytes_used.saturating_add(bytes);
+            if next > limit {
                 self.budget_exceeded = true;
+                self.bytes_attempted = next;
                 return Err(self.error(format!(
                     "resolved term bytes exceeded the {limit} byte budget"
                 )));
             }
+            self.bytes_used = next;
         }
         Ok(())
     }
@@ -672,12 +695,12 @@ impl<'a> Reader<'a> {
         let Some((prefix, local)) = name.split_once(':') else {
             return Err(self.error(format!("expected an IRI, found the keyword '{name}'")));
         };
-        let Some(ns_idx) = self.names.iter().rposition(|(p, _)| p == prefix) else {
+        let Some(ns_len) = self.lookup_prefix(prefix).map(str::len) else {
             return Err(self.error(format!("the prefix '{prefix}:' is not declared")));
         };
-        let est_len = self.names[ns_idx].1.len().saturating_add(local.len());
+        let est_len = ns_len.saturating_add(local.len());
         self.charge_bytes(est_len)?;
-        let ns = &self.names[ns_idx].1;
+        let ns = self.lookup_prefix(prefix).expect("checked");
         let mut s = String::with_capacity(est_len);
         s.push_str(ns);
         // the escapes of a local name (PN_LOCAL_ESC) stand for the character

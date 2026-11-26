@@ -1665,3 +1665,221 @@ fn bounded_renderers_stop_early_for_long_labels_and_prefixes() {
     assert!(crate::json::axiom_fits_bytes(&ax, 512));
     assert!(!crate::json::axiom_fits_bytes(&ax, 20));
 }
+
+#[test]
+fn failed_parses_and_per_template_refusals_debit_request_budget() {
+    // Regression test for R3-1a / R4: repeated malformed expressions or per-template
+    // refusals that resolve long IRIs via short vocabulary labels must debit the bytes
+    // spent before failing so they cannot bypass `max_total_expanded_bytes`.
+    let long_iri = format!("http://ex.org/{}/LongClass", "x".repeat(450));
+    let mut vocab = Vocabulary::new([("ex", "http://ex.org/")]);
+    vocab.add_entity(Entity::Class(Class::new(&long_iri)));
+    vocab.add_label(&long_iri, "lbl");
+
+    let tight = Limits {
+        max_expanded_bytes_per_template: 800,
+        max_total_expanded_bytes: 1_200,
+        ..Limits::default()
+    };
+
+    // 1. Malformed Manchester expression resolves `'lbl'` (~475 bytes) then fails on trailing
+    //    tokens. Three rows spend > 1,200 bytes and must trip `budget_exceeded`.
+    let malformed_manch = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::manchester("'lbl' SubClassOf 'lbl' ???")],
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let res_malformed = evaluate(
+        "r\n1\n2\n3\n4\n",
+        Delimiter::Comma,
+        &malformed_manch,
+        &vocab,
+        &tight,
+    )
+    .unwrap();
+    assert!(
+        res_malformed.budget_exceeded,
+        "repeated failed Manchester parses bypassed request budget: {res_malformed:?}"
+    );
+
+    // 2. Per-template refusal after resolving one `'lbl'` (~475 bytes) and overflowing
+    //    `max_expanded_bytes_per_template` (800) on the second `'lbl'` (~950 bytes).
+    //    Repeating across rows must still debit the spent 475 bytes per row and hit
+    //    `max_total_expanded_bytes` (1,200).
+    let per_tmpl_spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::manchester("'lbl' SubClassOf 'lbl'")],
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let res_per_tmpl = evaluate(
+        "r\n1\n2\n3\n4\n",
+        Delimiter::Comma,
+        &per_tmpl_spec,
+        &vocab,
+        &tight,
+    )
+    .unwrap();
+    assert!(
+        res_per_tmpl.budget_exceeded,
+        "repeated per-template refusals bypassed request budget: {res_per_tmpl:?}"
+    );
+
+    // 3. Malformed OFN expression with a `# "` comment-hidden prefix expansion followed by
+    //    trailing garbage must still debit bytes spent by the OFN parser before the error.
+    let mut ofn_prefixes = BTreeMap::new();
+    ofn_prefixes.insert(
+        "p".to_string(),
+        format!("http://ex.org/{}/", "y".repeat(300)),
+    );
+    let malformed_ofn = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::functional("# \"\nSubClassOf(p:A p:B) ???")],
+        },
+        base_iri: None,
+        prefixes: ofn_prefixes,
+    };
+    let res_ofn = evaluate(
+        "r\n1\n2\n3\n4\n",
+        Delimiter::Comma,
+        &malformed_ofn,
+        &vocab,
+        &tight,
+    )
+    .unwrap();
+    assert!(
+        res_ofn.budget_exceeded,
+        "repeated failed OFN parses bypassed request budget: {res_ofn:?}"
+    );
+}
+
+#[test]
+fn robot_data_property_plain_colon_string_falls_back_to_simple_literal() {
+    // Regression test for R3-1c / R4: a plain string cell like `p:reference` in a ROBOT
+    // `I <data-prop>` column is not a typed literal; even when `p:` binds a long namespace
+    // under a tight byte budget, it must fall back to `Literal::simple("p:reference")`.
+    let mut vocab = Vocabulary::new([("ex", "http://ex.org/")]);
+    vocab.add_entity(Entity::DataProperty(DataProperty::new(
+        "http://ex.org/note",
+    )));
+    let mut prefixes = BTreeMap::new();
+    prefixes.insert("ex".to_string(), "http://ex.org/".to_string());
+    prefixes.insert(
+        "p".to_string(),
+        format!("http://ex.org/{}/", "n".repeat(900)),
+    );
+
+    let tight = Limits {
+        max_expanded_bytes_per_template: 1_000,
+        max_total_expanded_bytes: 1_500,
+        ..Limits::default()
+    };
+    let spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes: prefixes.clone(),
+    };
+
+    let csv_plain = "ID,Note\nID,I ex:note\nex:i1,p:reference\nex:i2,p:reference\n";
+    let res_plain = evaluate(csv_plain, Delimiter::Comma, &spec, &vocab, &tight).unwrap();
+    assert!(
+        res_plain.is_valid(),
+        "plain string `p:reference` should fall back to simple literal: {:?}",
+        res_plain.diagnostics
+    );
+    assert!(
+        res_plain.axioms.iter().any(|g| matches!(
+            &g.axiom.kind,
+            AxiomKind::DataPropertyAssertion(_, _, lit) if lit == &Literal::simple("p:reference")
+        )),
+        "expected simple literal 'p:reference': {:?}",
+        res_plain.axioms
+    );
+
+    // An actual typed literal `"1"^^p:t` MUST still charge the datatype expansion and fail.
+    let csv_typed = "ID,Note\nID,I ex:note\nex:i1,\"\"\"1\"\"^^p:t\"\nex:i2,\"\"\"2\"\"^^p:t\"\n";
+    let res_typed = evaluate(csv_typed, Delimiter::Comma, &spec, &vocab, &tight).unwrap();
+    assert!(
+        res_typed.budget_exceeded,
+        "typed literal `\"1\"^^p:t` must still be charged against budget: {res_typed:?}"
+    );
+}
+
+#[test]
+fn ofn_pattern_borrows_prefixes_and_preserves_override_precedence() {
+    // Regression test for R3-1b / R4: OFN parsing borrows the prefix slice without cloning
+    // unused bindings and preserves caller-over-standard override precedence.
+    let mut prefixes = BTreeMap::new();
+    prefixes.insert("ex".to_string(), "http://ex.org/".to_string());
+    // Override a standard prefix to ensure borrowed_names takes precedence over STANDARD_PREFIXES.
+    prefixes.insert("owl".to_string(), "http://custom.owl.example/".to_string());
+    for i in 0..50 {
+        prefixes.insert(format!("unused{i}"), format!("http://unused.example/{i}/"));
+    }
+    let spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::functional("SubClassOf(ex:${a} owl:Custom)")],
+        },
+        base_iri: None,
+        prefixes,
+    };
+    let res = evaluate(
+        "a\nC1\nC2\n",
+        Delimiter::Comma,
+        &spec,
+        &ex_vocab(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert!(res.is_valid(), "{:?}", res.diagnostics);
+    assert_eq!(res.axioms.len(), 2);
+    assert!(res.axioms.iter().any(|g| matches!(
+        &g.axiom.kind,
+        AxiomKind::SubClassOf(ClassExpression::Class(sub), ClassExpression::Class(sup))
+            if sub.as_str() == "http://ex.org/C1" && sup.as_str() == "http://custom.owl.example/Custom"
+    )));
+}
+
+#[test]
+fn ambiguous_long_ontology_labels_produce_bounded_pattern_diagnostics() {
+    let mut vocab = Vocabulary::new([("ex", "http://ex.org/")]);
+    let huge_label = "L".repeat(20_000);
+    vocab.add_entity(Entity::Class(Class::new("http://ex.org/a/Dup")));
+    vocab.add_label("http://ex.org/a/Dup", &huge_label);
+    vocab.add_entity(Entity::Class(Class::new("http://ex.org/b/Dup")));
+    vocab.add_label("http://ex.org/b/Dup", &huge_label);
+
+    let spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let res = evaluate(
+        "ID,Parent\nID,SC %\nex:Child,Dup\n",
+        Delimiter::Comma,
+        &spec,
+        &vocab,
+        &Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(res.rows_with_errors, 1);
+    assert_eq!(res.diagnostics.len(), 1);
+    assert!(res.diagnostics[0].message.len() <= Limits::default().max_diagnostic_message_bytes);
+    assert!(
+        res.diagnostics[0].message.capacity()
+            <= Limits::default().max_diagnostic_message_bytes + 128
+    );
+}

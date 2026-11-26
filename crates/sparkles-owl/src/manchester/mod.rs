@@ -108,14 +108,15 @@ impl ErrorKind {
 /// term bytes exceed the caller's budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundedError {
-    Parse(Error),
-    Budget { attempted: usize },
+    Parse { error: Error, used: usize },
+    Budget { used: usize, attempted: usize },
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ByteBudget {
     pub limit: usize,
     pub used: usize,
+    pub attempted: usize,
     pub exceeded: bool,
 }
 
@@ -124,17 +125,49 @@ impl ByteBudget {
         Self {
             limit,
             used: 0,
+            attempted: 0,
             exceeded: false,
         }
     }
 
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), ()> {
-        self.used = self.used.saturating_add(bytes);
-        if self.used > self.limit {
+        let next = self.used.saturating_add(bytes);
+        if next > self.limit {
             self.exceeded = true;
+            self.attempted = next;
             return Err(());
         }
+        self.used = next;
         Ok(())
+    }
+}
+
+/// Bitmask of [`EntityKind`]s used by allocation-free parser lookahead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EntityKindMask(u8);
+
+impl EntityKindMask {
+    fn bit(k: EntityKind) -> u8 {
+        match k {
+            EntityKind::Class => 1 << 0,
+            EntityKind::Datatype => 1 << 1,
+            EntityKind::ObjectProperty => 1 << 2,
+            EntityKind::DataProperty => 1 << 3,
+            EntityKind::AnnotationProperty => 1 << 4,
+            EntityKind::NamedIndividual => 1 << 5,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, k: EntityKind) {
+        self.0 |= Self::bit(k);
+    }
+
+    pub(crate) fn contains(self, k: EntityKind) -> bool {
+        (self.0 & Self::bit(k)) != 0
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
     }
 }
 
@@ -481,50 +514,69 @@ impl Vocabulary {
         false
     }
 
-    /// Check whether `n` matches at least one entity of `kind` without allocating `Entity`s
-    /// (and without expanding arbitrarily long prefixed names beyond `max_expand_bytes`).
-    pub(crate) fn has_entity_kind(
+    /// Return the subset of `want` kinds that `n` matches under the same stage precedence
+    /// as [`Self::lookup`] (exact match across all wanted kinds outranks built-ins, which
+    /// outrank folded names, which outrank the empty-prefix fallback), without allocating
+    /// [`Entity`] values or expanding prefixed names beyond `max_expand_bytes`.
+    pub(crate) fn lookup_kinds(
         &self,
         n: &lex::Name,
-        kind: EntityKind,
+        want: &[EntityKind],
         max_expand_bytes: Option<usize>,
-    ) -> bool {
-        let check_iris = |iris: Option<&BTreeSet<String>>| {
-            iris.into_iter()
-                .flatten()
-                .any(|iri| self.kinds(iri).contains(&kind))
+    ) -> EntityKindMask {
+        let mask_iri = |iri: &str| {
+            let have = self.kinds(iri);
+            let mut mask = EntityKindMask::default();
+            for &k in want {
+                if have.contains(&k) {
+                    mask.insert(k);
+                }
+            }
+            mask
+        };
+        let mask_iris = |iris: Option<&BTreeSet<String>>| {
+            let mut mask = EntityKindMask::default();
+            for iri in iris.into_iter().flatten() {
+                let have = self.kinds(iri);
+                for &k in want {
+                    if have.contains(&k) {
+                        mask.insert(k);
+                    }
+                }
+            }
+            mask
         };
         let simple = match n {
-            lex::Name::Iri(i) => return self.kinds(i).contains(&kind),
+            lex::Name::Iri(i) => return mask_iri(i),
             lex::Name::Word(w) => {
                 if let Some(len) = self.expanded_len(w) {
                     if max_expand_bytes.is_none_or(|m| len <= m)
                         && let Some(iri) = self.expand(w)
                     {
                         if !self.kinds(&iri).is_empty() {
-                            return self.kinds(&iri).contains(&kind);
+                            return mask_iri(&iri);
                         }
-                        if check_iris(self.names.get(w)) {
-                            return true;
-                        }
-                        return false;
+                        return mask_iris(self.names.get(w));
                     }
-                    return check_iris(self.names.get(w));
+                    return mask_iris(self.names.get(w));
                 }
                 w.as_str()
             }
             lex::Name::Quoted(q) => q.as_str(),
         };
-        if check_iris(self.names.get(simple)) {
-            return true;
+        let exact = mask_iris(self.names.get(simple));
+        if !exact.is_empty() {
+            return exact;
         }
-        if let Some(iri) = self.builtin.get(simple)
-            && self.kinds(iri).contains(&kind)
-        {
-            return true;
+        if let Some(iri) = self.builtin.get(simple) {
+            let b = mask_iri(iri);
+            if !b.is_empty() {
+                return b;
+            }
         }
-        if check_iris(self.folded.get(&simple.to_lowercase())) {
-            return true;
+        let folded = mask_iris(self.folded.get(&simple.to_lowercase()));
+        if !folded.is_empty() {
+            return folded;
         }
         if matches!(n, lex::Name::Word(_))
             && let Some((_, ns)) = self.prefixes.iter().find(|(p, _)| p.is_empty())
@@ -534,10 +586,10 @@ impl Vocabulary {
                 let mut iri = String::with_capacity(len);
                 iri.push_str(ns);
                 iri.push_str(simple);
-                return self.kinds(&iri).contains(&kind);
+                return mask_iri(&iri);
             }
         }
-        false
+        EntityKindMask::default()
     }
 
     fn charge_names_budget<'a>(
@@ -795,7 +847,7 @@ pub fn class_expression_bounded(
     max_bytes: usize,
 ) -> Result<(ClassExpression, usize), BoundedError> {
     parse::Parser::new(text, v)
-        .map_err(BoundedError::Parse)?
+        .map_err(|error| BoundedError::Parse { error, used: 0 })?
         .with_budget(max_bytes)
         .whole_bounded(|p| p.description())
 }
@@ -822,7 +874,7 @@ pub fn literal_bounded(
     max_bytes: usize,
 ) -> Result<(Literal, usize), BoundedError> {
     parse::Parser::new(text, v)
-        .map_err(BoundedError::Parse)?
+        .map_err(|error| BoundedError::Parse { error, used: 0 })?
         .with_budget(max_bytes)
         .whole_bounded(|p| p.literal())
 }
@@ -845,7 +897,7 @@ pub fn axiom_bounded(
     max_bytes: usize,
 ) -> Result<(Axiom, usize), BoundedError> {
     parse::Parser::new(text, v)
-        .map_err(BoundedError::Parse)?
+        .map_err(|error| BoundedError::Parse { error, used: 0 })?
         .with_budget(max_bytes)
         .whole_bounded(|p| p.axiom())
 }

@@ -736,3 +736,91 @@ proptest! {
         let _ = data_range(&s, &v);
     }
 }
+
+#[test]
+fn punned_property_choose_prefers_exact_match_over_folded_across_kinds() {
+    // Regression test for R3-1 / R4: `ex:p` is both an object property and a data property;
+    // `right` matches a data property exactly while `RIGHT` matches an object property only
+    // after case folding. Exact match across all candidate property kinds must outrank a
+    // folded object-property match in both unbounded and bounded parsers.
+    let mut v = Vocabulary::new([("ex", "http://ex.org/")]);
+    v.add_entity(Entity::ObjectProperty(ObjectProperty::new(
+        "http://ex.org/p",
+    )));
+    v.add_entity(Entity::DataProperty(DataProperty::new("http://ex.org/p")));
+    v.add_entity(Entity::ObjectProperty(ObjectProperty::new(
+        "http://ex.org/RIGHT",
+    )));
+    v.add_entity(Entity::DataProperty(DataProperty::new(
+        "http://ex.org/right",
+    )));
+
+    let expected = Axiom::new(AxiomKind::SubDataPropertyOf(
+        DataProperty::new("http://ex.org/p"),
+        DataProperty::new("http://ex.org/right"),
+    ));
+    assert_eq!(axiom("ex:p SubPropertyOf right", &v).unwrap(), expected);
+    assert_eq!(
+        axiom_bounded("ex:p SubPropertyOf right", &v, 4096)
+            .unwrap()
+            .0,
+        expected
+    );
+}
+
+#[test]
+fn bounded_diagnostics_omit_candidates_and_bound_long_ontology_labels() {
+    // Regression test for R3-2 / R4: ambiguous and wrong-kind errors in bounded mode must
+    // not copy full ontology labels into the error message or clone them into `candidates`.
+    let mut v = Vocabulary::new([("ex", "http://ex.org/")]);
+    let huge_label_a = format!("Alpha {}", "A".repeat(20_000));
+    let huge_label_b = format!("Beta {}", "B".repeat(20_000));
+    v.add_entity(Entity::Class(Class::new("http://ex.org/a/Dup")));
+    v.add_label("http://ex.org/a/Dup", &huge_label_a);
+    v.add_entity(Entity::Class(Class::new("http://ex.org/b/Dup")));
+    v.add_label("http://ex.org/b/Dup", &huge_label_b);
+    v.add_entity(Entity::ObjectProperty(ObjectProperty::new(
+        "http://ex.org/ObjP",
+    )));
+    v.add_label("http://ex.org/ObjP", &huge_label_a);
+
+    // Unbounded parser retains rich candidates.
+    let rich_err = class_expression("Dup", &v).unwrap_err();
+    assert_eq!(rich_err.kind, ErrorKind::Ambiguous);
+    assert_eq!(rich_err.candidates.len(), 2);
+
+    // Bounded parser bounds message and omits unused candidates.
+    let BoundedError::Parse { error: amb_err, .. } =
+        class_expression_bounded("Dup", &v, 4096).unwrap_err()
+    else {
+        panic!("expected bounded ambiguous parse error");
+    };
+    assert_eq!(amb_err.kind, ErrorKind::Ambiguous);
+    assert!(
+        amb_err.candidates.is_empty(),
+        "bounded diagnostics must omit unused candidates"
+    );
+    assert!(
+        amb_err.message.len() <= 512,
+        "bounded ambiguous message too long: {}",
+        amb_err.message.len()
+    );
+    assert!(
+        amb_err.message.capacity() <= 640,
+        "bounded ambiguous message over-allocated: {}",
+        amb_err.message.capacity()
+    );
+
+    let BoundedError::Parse {
+        error: kind_err, ..
+    } = class_expression_bounded("ObjP", &v, 4096).unwrap_err()
+    else {
+        panic!("expected bounded kind parse error");
+    };
+    assert_eq!(kind_err.kind, ErrorKind::Kind);
+    assert!(
+        kind_err.candidates.is_empty(),
+        "bounded kind diagnostics must omit unused candidates"
+    );
+    assert!(kind_err.message.len() <= 512);
+}

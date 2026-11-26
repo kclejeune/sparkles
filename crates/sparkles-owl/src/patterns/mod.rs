@@ -1455,6 +1455,7 @@ fn finalize_parser_budget(
 }
 
 fn handle_parser_budget_exceeded(
+    used: usize,
     attempted: usize,
     precharged: usize,
     emitter: &mut Emitter,
@@ -1463,17 +1464,20 @@ fn handle_parser_budget_exceeded(
 ) -> ResolveError {
     let per_template = emitter.limits.max_expanded_bytes_per_template;
     let total_rem = emitter.remaining_expanded_bytes();
-    let extra = attempted.saturating_sub(precharged);
-    if extra > total_rem {
-        let _ = emitter.charge_expanded_bytes(extra, row, column);
+    let extra_attempted = attempted.saturating_sub(precharged);
+    if extra_attempted > total_rem {
+        let _ = emitter.charge_expanded_bytes(extra_attempted, row, column);
         return ResolveError::Budget;
     }
     if attempted > per_template {
+        if let Err(err) = finalize_parser_budget(used, precharged, emitter, row, column) {
+            return err;
+        }
         return ResolveError::Invalid(format!(
             "resolved terms ({attempted} bytes) exceed the {per_template} byte limit"
         ));
     }
-    let _ = emitter.charge_expanded_bytes(extra.max(1), row, column);
+    let _ = emitter.charge_expanded_bytes(extra_attempted.max(1), row, column);
     ResolveError::Budget
 }
 
@@ -1511,10 +1515,11 @@ pub(crate) fn parse_class_expr_fallback_charged(
             finalize_parser_budget(used, precharged, emitter, row, column)?;
             Ok(ce)
         }
-        Err(manchester::BoundedError::Budget { attempted }) => Err(handle_parser_budget_exceeded(
-            attempted, precharged, emitter, row, column,
-        )),
-        Err(manchester::BoundedError::Parse(err)) => {
+        Err(manchester::BoundedError::Budget { used, attempted }) => Err(
+            handle_parser_budget_exceeded(used, attempted, precharged, emitter, row, column),
+        ),
+        Err(manchester::BoundedError::Parse { error, used }) => {
+            finalize_parser_budget(used, precharged, emitter, row, column)?;
             // If the expression is a single token (IRI or CURIE) not yet in vocab, accept it
             // as a named Class so spreadsheets can reference external or undeclared superclasses.
             if !trimmed.contains(char::is_whitespace) && !trimmed.contains(['(', ')', '{', '}']) {
@@ -1524,7 +1529,7 @@ pub(crate) fn parse_class_expr_fallback_charged(
                     Err(ResolveError::Invalid(_)) => {}
                 }
             }
-            Err(ResolveError::Invalid(err.message))
+            Err(ResolveError::Invalid(error.message))
         }
     }
 }
@@ -1548,10 +1553,13 @@ pub(crate) fn parse_axiom_charged(
                 finalize_parser_budget(used, precharged, emitter, row, column)?;
                 Ok(ax)
             }
-            Err(manchester::BoundedError::Budget { attempted }) => Err(
-                handle_parser_budget_exceeded(attempted, precharged, emitter, row, column),
+            Err(manchester::BoundedError::Budget { used, attempted }) => Err(
+                handle_parser_budget_exceeded(used, attempted, precharged, emitter, row, column),
             ),
-            Err(manchester::BoundedError::Parse(e)) => Err(ResolveError::Invalid(e.message)),
+            Err(manchester::BoundedError::Parse { error, used }) => {
+                finalize_parser_budget(used, precharged, emitter, row, column)?;
+                Err(ResolveError::Invalid(error.message))
+            }
         },
         PatternSyntax::Functional => {
             match crate::ofn_read::parse_axiom_bounded(text, ctx.vocab.prefixes(), cap) {
@@ -1559,19 +1567,23 @@ pub(crate) fn parse_axiom_charged(
                     finalize_parser_budget(used, precharged, emitter, row, column)?;
                     Ok(ax)
                 }
-                Err(crate::ofn_read::BoundedParseError::Budget { attempted }) => Err(
-                    handle_parser_budget_exceeded(attempted, precharged, emitter, row, column),
-                ),
-                Err(crate::ofn_read::BoundedParseError::Parse(e)) => {
-                    Err(ResolveError::Invalid(e.message))
+                Err(crate::ofn_read::BoundedParseError::Budget { used, attempted }) => {
+                    Err(handle_parser_budget_exceeded(
+                        used, attempted, precharged, emitter, row, column,
+                    ))
+                }
+                Err(crate::ofn_read::BoundedParseError::Parse { error, used }) => {
+                    finalize_parser_budget(used, precharged, emitter, row, column)?;
+                    Err(ResolveError::Invalid(error.message))
                 }
             }
         }
     }
 }
 
-/// Parse a ROBOT `I <data-prop>` literal cell with pre-lexing and parser-level datatype
-/// IRI byte charging, falling back to `Literal::simple(val)` on ordinary syntax misses.
+/// Parse a ROBOT `I <data-prop>` literal cell with parser-level datatype IRI byte
+/// charging (only when the parser reaches a typed literal), falling back to
+/// `Literal::simple(val)` on ordinary syntax misses.
 pub(crate) fn parse_cell_literal_charged(
     val: &str,
     ctx: &Context,
@@ -1579,18 +1591,19 @@ pub(crate) fn parse_cell_literal_charged(
     row: usize,
     column: Option<&str>,
 ) -> Result<Literal, ResolveError> {
-    let precharged =
-        charge_prefixed_expansions(val, PatternSyntax::Manchester, ctx, emitter, row, column)?;
-    let cap = parser_byte_cap(precharged, emitter);
+    let cap = parser_byte_cap(0, emitter);
     match manchester::literal_bounded(val, &ctx.vocab, cap) {
         Ok((lit, used)) => {
-            finalize_parser_budget(used, precharged, emitter, row, column)?;
+            finalize_parser_budget(used, 0, emitter, row, column)?;
             Ok(lit)
         }
-        Err(manchester::BoundedError::Budget { attempted }) => Err(handle_parser_budget_exceeded(
-            attempted, precharged, emitter, row, column,
-        )),
-        Err(manchester::BoundedError::Parse(_)) => Ok(Literal::simple(val)),
+        Err(manchester::BoundedError::Budget { used, attempted }) => Err(
+            handle_parser_budget_exceeded(used, attempted, 0, emitter, row, column),
+        ),
+        Err(manchester::BoundedError::Parse { used, .. }) => {
+            finalize_parser_budget(used, 0, emitter, row, column)?;
+            Ok(Literal::simple(val))
+        }
     }
 }
 
