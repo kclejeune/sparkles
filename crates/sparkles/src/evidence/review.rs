@@ -713,6 +713,26 @@ impl State<'_> {
         Ok(())
     }
 
+    /// Refuse when `p.output` holds continuously authenticated evidence record history
+    /// under its unchanged protection nonce (as when a former record-role graph was
+    /// reassigned as a dedicated projection output without detaching it first).
+    fn check_output_record_history(&self, p: &PolicyGraphs) -> Result<()> {
+        if self
+            .reads
+            .has_authenticated_operation(p.output.0.as_str(), p.output.1)?
+        {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "policy {}: output graph <{}> holds continuously authenticated evidence records; detach it before reassigning it as a projection output",
+                    p.name,
+                    p.output.0.as_str()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse when an active projection record of the policy was written under
     /// protections that are no longer the current ones, so that its supports no longer
     /// authenticate while its output still holds their triples, or when the output
@@ -1846,6 +1866,7 @@ pub fn review(
             .map(|(g, n)| (g.as_str(), *n))
             .collect();
         state.check_same_version_drift(&p, policy_version, &settings, &protected_refs)?;
+        state.check_output_record_history(&p)?;
         let existing = state.check_projection(&p, Some((policy_version, &record)))?;
         batch.records.push(record);
         skip.push(existing);
@@ -1956,6 +1977,22 @@ fn protected_managed_graphs(settings: &Settings, capability: &ManagedWrite) -> V
         .managed_graphs()
         .into_iter()
         .filter_map(|g| capability.protection(&g).map(|n| (g, n)))
+        .collect()
+}
+
+/// Every managed graph of `settings` (including dedicated projections) with its
+/// current protection nonce under `capability`, so keyed reconciliation replays and
+/// identity collision checks retain visibility into former record graphs that changed
+/// roles to dedicated outputs while keeping their protection nonces.
+fn managed_graph_nonces(settings: &Settings, capability: &ManagedWrite) -> Vec<G> {
+    settings
+        .managed_graphs()
+        .into_iter()
+        .filter_map(|g| NamedNode::new(g.as_str()).ok())
+        .map(|g| {
+            let n = capability.protection(g.as_str());
+            (g, n)
+        })
         .collect()
 }
 
@@ -2552,7 +2589,7 @@ pub fn reconcile_projection_prepared(
             superseded: BTreeSet::new(),
             withdrawn: BTreeSet::new(),
         };
-        let records = record_graph_nonces(&settings, &capability);
+        let managed_records = managed_graph_nonces(&settings, &capability);
         let op_iri = operation_iri(operation);
         if options.idempotency_key.is_some() {
             let probe = Batch {
@@ -2565,23 +2602,22 @@ pub fn reconcile_projection_prepared(
                 graphs: Vec::new(),
                 records: Vec::new(),
             };
-            let found = state.reads.operation(&probe.operation_iri, &records)?;
+            let found = state
+                .reads
+                .operation(&probe.operation_iri, &managed_records)?;
             if let Some((commit, recorded_branch)) = replayed(found, &probe)? {
                 // Preserve keyed refusal semantics above, then enforce caller read
                 // authorization on every graph that recorded the replayed operation
                 // before exposing any metadata from it.
-                for (g, _) in &records {
+                for (g, _) in &managed_records {
                     if state.reads.has_operation(op_iri.as_str(), g.as_str())? {
                         readable_optional(access.as_ref(), g)?;
                     }
                 }
                 let mut search_graphs: Vec<G> = vec![p.supports.clone()];
-                for g in settings.managed_graphs() {
-                    if g != p.supports.0.as_str()
-                        && let Ok(node) = NamedNode::new(g.as_str())
-                    {
-                        let nonce = capability.protection(g.as_str());
-                        search_graphs.push((node, nonce));
+                for (g, nonce) in &managed_records {
+                    if *g != p.supports.0 {
+                        search_graphs.push((g.clone(), *nonce));
                     }
                 }
                 let mut linked: Option<(NamedNode, G)> = None;
@@ -2706,6 +2742,7 @@ pub fn reconcile_projection_prepared(
             .map(|(g, n)| (g.as_str(), *n))
             .collect();
         state.check_same_version_drift(&p, policy.version, &settings, &protected_refs)?;
+        state.check_output_record_history(&p)?;
         // Existing projection records of this policy, and which remain unsuperseded.
         let mut proj_held = preparation.reserve(0)?;
         let (existing_projections, superseded_projections) =
@@ -2968,7 +3005,7 @@ pub fn reconcile_projection_prepared(
             let iri = record.iri.clone();
             batch.records.push(record);
             let skip = [false];
-            check_identities(&mut state, &batch, &records, &skip)?;
+            check_identities(&mut state, &batch, &managed_records, &skip)?;
             iri
         };
         drop(active_projections);

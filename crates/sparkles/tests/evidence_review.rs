@@ -2954,3 +2954,424 @@ fn ordinary_review_ignores_unrelated_unreadable_supports_graph() {
     );
     assert_eq!(ds2.store().head_commit().seq, head_conflict);
 }
+
+/// Turning a former supports graph A into another policy's dedicated output while
+/// retaining A's protection nonce must not allow the new policy's reconciliation to
+/// erase A's continuously authenticated evidence history or clear the original policy's
+/// drift guard. Detaching A explicitly rotates its nonce and then allows reconciliation.
+#[test]
+fn former_supports_graph_as_dedicated_output_protects_history_and_drift() {
+    use sparkles::managed::OwnerKind;
+
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    let b = claim_of(&propose(
+        &ds,
+        &occurrence_with("s2", "urn:cve2", Polarity::Positive),
+    ));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
+    );
+
+    let nonce_before = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(SUPPORTS)
+        .copied()
+        .expect("SUPPORTS protected");
+
+    // Move `main.supports` to empty `supports2` at version 1 while removing SUPPORTS from
+    // `settings.supports` and assigning SUPPORTS as the dedicated output of a new policy.
+    let decisions2 = "urn:ev:decisions2";
+    let supports2 = "urn:ev:supports2";
+    let supports3 = "urn:ev:supports3";
+    let mut moved = settings(ConflictMode::Refuse);
+    moved.decisions.push(decisions2.into());
+    moved.supports = vec![supports2.into(), supports3.into()];
+    moved.projections.push(SUPPORTS.into());
+    moved.policies.get_mut("main").unwrap().supports = supports2.into();
+    moved.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), CLAIMS.into()],
+            decisions: decisions2.into(),
+            supports: supports3.into(),
+            output: SUPPORTS.into(),
+        },
+    );
+    evidence::configure(&ds, &moved, &Control::none()).unwrap();
+
+    let nonce_after = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(SUPPORTS)
+        .copied()
+        .expect("SUPPORTS still protected");
+    assert_eq!(nonce_after, nonce_before);
+
+    let head = ds.store().head_commit().seq;
+    // Reconciling `other` must refuse rather than erasing `SUPPORTS`'s authenticated history.
+    assert_eq!(
+        code(reconcile(&ds, "other", Some(1), &reviewer())),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{SUPPORTS}> {{ ?p a <{EV}Projection> ; <{EV}reviewPolicy> <{}> }} }}",
+            evidence::review::policy_iri("main").as_str()
+        ))
+        .unwrap(),
+        "SUPPORTS must retain main's authenticated ev:Projection history"
+    );
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{SUPPORTS}> {{ ?op a <{EV}Operation> }} }}"
+        ))
+        .unwrap(),
+        "SUPPORTS must retain its authenticated ev:Operation receipts"
+    );
+
+    // `main` must still refuse at version 1 and leave OUTPUT intact.
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("b", &b, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve1>".to_string()]
+    );
+
+    // After explicitly detaching and re-protecting SUPPORTS (rotating its nonce), `other`
+    // can reconcile SUPPORTS as a fresh empty output.
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    evidence::configure(&ds, &moved, &Control::none()).unwrap();
+    let rec = reconcile(&ds, "other", Some(1), &reviewer()).unwrap();
+    assert!(rec.committed);
+    assert!(
+        !ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ ?s ?p ?o }} }}"))
+            .unwrap()
+    );
+}
+
+/// Ordinary review's same-version drift check must be physically scoped by protection
+/// nonces so arbitrarily many ordinary `(ev:reviewPolicy, requestedPolicy)` statements in
+/// unrelated, unreadable graphs never trigger the scan's 1,024-row checkpoint work.
+#[test]
+fn ordinary_review_skips_unrelated_unreadable_policy_rows() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let decisions2 = "urn:ev:decisions2";
+    let supports2 = "urn:ev:supports2";
+    let output2 = "urn:ev:accepted2";
+    let hidden_unmanaged = "urn:unrelated:hidden";
+
+    let ds = Dataset::memory();
+    let mut s = settings(ConflictMode::Refuse);
+    s.decisions.push(decisions2.into());
+    s.supports.push(supports2.into());
+    s.projections.push(output2.into());
+    s.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), OTHER.into()],
+            decisions: decisions2.into(),
+            supports: supports2.into(),
+            output: output2.into(),
+        },
+    );
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    let b = claim_of(&propose(
+        &ds,
+        &occurrence_with("s2", "urn:cve2", Polarity::Positive),
+    ));
+
+    let main_only = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(
+            [SOURCES, CLAIMS, DECISIONS, SUPPORTS, OUTPUT],
+            &[],
+        )),
+        Graphs::Only(GraphRule::new([DECISIONS, SUPPORTS, OUTPUT], &[])),
+    ));
+
+    let mut opts = reviewer();
+    opts.if_head = Some(ds.store().head_commit().seq);
+    opts.write = Some(main_only.clone());
+    evidence::review(
+        None,
+        &ds,
+        &ds,
+        "main",
+        1,
+        &[decision("a", &a, Disposition::Accepted, None)],
+        &opts,
+        &mut |_, _| Some(main_only.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+
+    // Load 3,000 ordinary RDF rows matching `(ev:reviewPolicy, main)` into an unrelated,
+    // unreadable unmanaged graph (no `ev:Projection` type, no protection marker, no managed
+    // role) and another 3,000 unauthenticated rows into unreadable `supports2`.
+    let main_policy = evidence::review::policy_iri("main");
+    let mut nq = String::with_capacity(6_000 * 120);
+    for i in 0..3_000 {
+        nq.push_str(&format!(
+            "<urn:unrelated:noise:{i}> <{EV}reviewPolicy> <{}> <{hidden_unmanaged}> .\n",
+            main_policy.as_str()
+        ));
+    }
+    ds.load_str(&nq, oxrdfio::RdfFormat::NQuads).unwrap();
+
+    evidence::detach(&ds, supports2).unwrap();
+    let mut nq2 = String::with_capacity(3_000 * 120);
+    for i in 0..3_000 {
+        nq2.push_str(&format!(
+            "<urn:hidden:noise:{i}> <{EV}reviewPolicy> <{}> <{supports2}> .\n",
+            main_policy.as_str()
+        ));
+    }
+    ds.load_str(&nq2, oxrdfio::RdfFormat::NQuads).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    let checkpoints = Arc::new(AtomicUsize::new(0));
+    let cp = checkpoints.clone();
+    let control = Control {
+        progress: sparkles::task::Progress::new(move |_, stage| {
+            if stage == "scanning permission rows" {
+                cp.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+        ..Control::none()
+    };
+
+    opts.if_head = Some(ds.store().head_commit().seq);
+    let second = evidence::review(
+        None,
+        &ds,
+        &ds,
+        "main",
+        1,
+        &[decision("b", &b, Disposition::Accepted, None)],
+        &opts,
+        &mut |_, _| Some(main_only.clone()),
+        &control,
+    )
+    .unwrap();
+    assert!(second.committed);
+    assert!(second.decisions[0].support.is_some());
+    assert_eq!(
+        checkpoints.load(Ordering::Relaxed),
+        0,
+        "unrelated unreadable graphs must not extend ordinary review's physical scan range"
+    );
+    assert_eq!(
+        accepted(&ds),
+        vec![
+            "<urn:release> <urn:affectedBy> <urn:cve1>".to_string(),
+            "<urn:release> <urn:affectedBy> <urn:cve2>".to_string(),
+        ]
+    );
+}
+
+/// When a former supports graph A moves to another policy's dedicated output while
+/// retaining its protection nonce, keyed reconciliation replay must still discover the
+/// original operation and linked projection in A, enforce read grants and payload
+/// conflicts, and return the original receipt without advancing the branch head.
+#[test]
+fn keyed_replay_finds_operation_after_supports_becomes_dedicated_output() {
+    use sparkles::managed::OwnerKind;
+
+    let ds = Dataset::memory();
+    let decisions2 = "urn:ev:decisions2";
+    let supports2 = "urn:ev:supports2";
+    let supports3 = "urn:ev:supports3";
+    let output2 = "urn:ev:accepted2";
+    let mut s1 = settings(ConflictMode::Refuse);
+    s1.decisions.push(decisions2.into());
+    s1.supports.push(supports2.into());
+    s1.supports.push(supports3.into());
+    evidence::configure(&ds, &s1, &Control::none()).unwrap();
+
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+
+    // First keyed reconciliation with omitted policyVersion writes its operation only in SUPPORTS.
+    let mut opts = reviewer();
+    opts.idempotency_key = Some("dedicated-output-replay-key".into());
+    let first = reconcile(&ds, "main", None, &opts).unwrap();
+    assert!(first.committed && !first.replayed);
+    assert_eq!(first.policy_version, 1);
+    assert_eq!(first.output.as_str(), OUTPUT);
+
+    let nonce_before = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(SUPPORTS)
+        .copied()
+        .expect("SUPPORTS protected");
+
+    // Raise `main` to v2 with fresh `supports2` / `output2` while reassigning `SUPPORTS`
+    // from `settings.supports` to `settings.projections` as `other`'s dedicated output.
+    evidence::detach(&ds, OUTPUT).unwrap();
+    let mut s2 = s1.clone();
+    s2.supports = vec![supports2.into(), supports3.into()];
+    s2.projections = vec![output2.into(), SUPPORTS.into()];
+    {
+        let p = s2.policies.get_mut("main").unwrap();
+        p.version = 2;
+        p.supports = supports2.into();
+        p.output = output2.into();
+    }
+    s2.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), CLAIMS.into()],
+            decisions: decisions2.into(),
+            supports: supports3.into(),
+            output: SUPPORTS.into(),
+        },
+    );
+    evidence::configure(&ds, &s2, &Control::none()).unwrap();
+
+    let nonce_after = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .unwrap()
+        .owners
+        .get(&OwnerKind::Evidence)
+        .unwrap()
+        .protections
+        .get(SUPPORTS)
+        .copied()
+        .expect("SUPPORTS still protected");
+    assert_eq!(nonce_after, nonce_before);
+
+    let head = ds.store().head_commit().seq;
+
+    // Narrow grants omitting SUPPORTS: payload conflict still returns idempotency-conflict,
+    // and matching replay refuses with NotPermitted without advancing the head.
+    let narrowed = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(
+            [SOURCES, CLAIMS, OTHER, DECISIONS, supports2, output2],
+            &[],
+        )),
+        Graphs::Only(GraphRule::new([supports2, output2], &[])),
+    ));
+    let mut narrow_opts = opts.clone();
+    narrow_opts.write = Some(narrowed.clone());
+    assert_eq!(
+        code(evidence::reconcile_projection(
+            &ds,
+            &ds,
+            "main",
+            Some(2),
+            &narrow_opts,
+            Some(narrowed.clone()),
+            &Control::none(),
+        )),
+        "idempotency-conflict"
+    );
+    let err = evidence::reconcile_projection(
+        &ds,
+        &ds,
+        "main",
+        None,
+        &narrow_opts,
+        Some(narrowed),
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, sparkles::Error::NotPermitted(_)),
+        "expected NotPermitted, got {err}"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Full grants including SUPPORTS: replay discovers the original operation and linked
+    // projection in SUPPORTS, returns the v1 receipt, and leaves the head unchanged.
+    let full = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(
+            [
+                SOURCES, CLAIMS, OTHER, DECISIONS, SUPPORTS, supports2, output2,
+            ],
+            &[],
+        )),
+        Graphs::Only(GraphRule::new([supports2, output2], &[])),
+    ));
+    let mut full_opts = opts.clone();
+    full_opts.write = Some(full.clone());
+    let replayed = evidence::reconcile_projection(
+        &ds,
+        &ds,
+        "main",
+        None,
+        &full_opts,
+        Some(full),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(!replayed.committed && replayed.replayed);
+    assert_eq!(replayed.commit, first.commit);
+    assert_eq!(replayed.projection, first.projection);
+    assert_eq!(replayed.policy_version, 1);
+    assert_eq!(replayed.output.as_str(), OUTPUT);
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert!(
+        !ds.ask(&format!("ASK {{ GRAPH <{supports2}> {{ ?s ?p ?o }} }}"))
+            .unwrap(),
+        "replay must not write a duplicate operation into supports2"
+    );
+}

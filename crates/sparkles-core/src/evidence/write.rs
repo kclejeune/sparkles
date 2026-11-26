@@ -1759,12 +1759,73 @@ impl<'a> Reads<'a> {
         Ok(if duplicate { None } else { found })
     }
 
+    /// Whether `graph` holds any continuously authenticated `ev:Operation` (or
+    /// authenticated record receipted by one) under its current protection `nonce`.
+    ///
+    /// Operates directly on physical [`Id`]s keyed by `(ev:graphProtection, nonce)`
+    /// without mutating this reader's IRI cache, so a dedicated output graph that
+    /// never held authenticated evidence records matches zero rows.
+    pub fn has_authenticated_operation(&self, graph: &str, nonce: Option<Uuid>) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let nonce_term = Term::Literal(Literal::new_simple_literal(nonce.to_string()));
+        let (Some(g_id), Some(rdf_type), Some(op_class), Some(graph_prot_pred), Some(nonce_id)) = (
+            self.preparation.lookup_iri(self.snap, graph)?,
+            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation.lookup_term(self.snap, &nonce_term)?,
+        ) else {
+            return Ok(false);
+        };
+        let avail_receipt = self
+            .preparation
+            .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?;
+        let is_auth_op = |op_id: Id| -> Result<bool> {
+            let op_is_iri = self.preparation.with_term(self.snap, op_id, |t| {
+                Ok(matches!(t, Some(Term::NamedNode(_))))
+            })?;
+            Ok(op_is_iri
+                && self.snap.contains(&[op_id, rdf_type, op_class, g_id])?
+                && self.single_object_id(g_id, op_id, graph_prot_pred)? == Some(nonce_id))
+        };
+        let mut found = false;
+        self.preparation.scan(
+            self.snap,
+            Perm::Pos,
+            &[graph_prot_pred.0, nonce_id.0],
+            |q| {
+                if q[3] != g_id {
+                    return Ok(true);
+                }
+                let s = q[0];
+                if is_auth_op(s)? {
+                    found = true;
+                    return Ok(false);
+                }
+                if let Some(avail) = avail_receipt
+                    && let Some(op_id) = self.single_object_id(g_id, s, avail)?
+                    && is_auth_op(op_id)?
+                {
+                    found = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
+        Ok(found)
+    }
+
     /// Whether any continuously protected managed graph holds an active, authenticated
     /// `ev:Projection` record showing same-version drift for `(policy_iri, policy_version)`
     /// or its output `(output_graph, output_nonce)`.
     ///
-    /// Operates directly on physical [`Id`]s scoped to `policy_iri` and `output_nonce`,
-    /// without mutating this reader's IRI cache or scanning unrelated policies' projections.
+    /// Operates directly on physical [`Id`]s keyed by current protection nonces
+    /// (`ev:supportsProtection` and `ev:outputProtection`), without mutating this
+    /// reader's IRI cache or scanning unrelated graphs' rows.
     #[allow(clippy::too_many_arguments)]
     pub fn has_same_version_projection_drift(
         &self,
@@ -1811,6 +1872,7 @@ impl<'a> Reads<'a> {
 
         let mut protected: BTreeMap<Id, Id> = BTreeMap::new();
         for (g_iri, g_nonce) in managed_graphs {
+            self.preparation.check()?;
             let Some(g_id) = self.preparation.lookup_iri(self.snap, g_iri)? else {
                 continue;
             };
@@ -1843,18 +1905,25 @@ impl<'a> Reads<'a> {
             Ok(self.single_object_id(g, s, graph_prot_pred)? == Some(g_nonce_id))
         };
 
+        // Every authenticated `ev:Projection` in `g` written under `g_nonce_id` carries
+        // `(ev:supportsProtection, g_nonce_id)`, so keying the supersession check by
+        // `g_nonce_id` avoids scanning unrelated graphs' `prov:wasRevisionOf` rows.
         let is_superseded = |r: Id, g: Id, g_nonce_id: Id, target_policy_id: Id| -> Result<bool> {
             let Some(rev_pred) = was_revision_of else {
                 return Ok(false);
             };
             let mut superseded = false;
-            self.preparation
-                .scan(self.snap, Perm::Pos, &[rev_pred.0, r.0], |q| {
+            self.preparation.scan(
+                self.snap,
+                Perm::Pos,
+                &[supports_prot_pred.0, g_nonce_id.0],
+                |q| {
                     if q[3] != g {
                         return Ok(true);
                     }
                     let later = q[0];
-                    if self.snap.contains(&[later, rdf_type, proj_class, g])?
+                    if self.snap.contains(&[later, rev_pred, r, g])?
+                        && self.snap.contains(&[later, rdf_type, proj_class, g])?
                         && self
                             .snap
                             .contains(&[later, review_policy, target_policy_id, g])?
@@ -1864,51 +1933,63 @@ impl<'a> Reads<'a> {
                         return Ok(false);
                     }
                     Ok(true)
-                })?;
+                },
+            )?;
             Ok(superseded)
         };
 
         // 1. Policy moved supports out of a continuously protected graph without raising
         // its version (including when the former supports graph changed managed roles).
+        // Key each scan by `(ev:supportsProtection, g_nonce)` so unrelated graphs'
+        // ordinary `(ev:reviewPolicy, policy_iri)` statements are never visited.
         let cur_supports_id = self.preparation.lookup_iri(self.snap, supports_graph)?;
         let version_term = Term::Literal(Literal::new_simple_literal(policy_version.to_string()));
         if let (Some(policy_id), Some(version_id)) = (
             self.preparation.lookup_iri(self.snap, policy_iri)?,
             self.preparation.lookup_term(self.snap, &version_term)?,
         ) {
-            let mut drifted = false;
-            self.preparation
-                .scan(self.snap, Perm::Pos, &[review_policy.0, policy_id.0], |q| {
-                    let (r, g) = (q[0], q[3]);
-                    if Some(g) == cur_supports_id {
-                        return Ok(true);
-                    }
-                    let Some(&g_nonce_id) = protected.get(&g) else {
-                        return Ok(true);
-                    };
-                    if !self.snap.contains(&[r, rdf_type, proj_class, g])?
-                        || !self
-                            .snap
-                            .contains(&[r, supports_prot_pred, g_nonce_id, g])?
-                        || !self
-                            .snap
-                            .contains(&[r, policy_version_pred, version_id, g])?
-                        || !self.snap.contains(&[r, graph_prot_pred, g_nonce_id, g])?
-                    {
-                        return Ok(true);
-                    }
-                    if self.single_object_id(g, r, supports_prot_pred)? != Some(g_nonce_id)
-                        || self.single_object_id(g, r, policy_version_pred)? != Some(version_id)
-                        || !authenticated_id(r, g, g_nonce_id)?
-                        || is_superseded(r, g, g_nonce_id, policy_id)?
-                    {
-                        return Ok(true);
-                    }
-                    drifted = true;
-                    Ok(false)
-                })?;
-            if drifted {
-                return Ok(true);
+            for (&g_id, &g_nonce_id) in &protected {
+                if Some(g_id) == cur_supports_id {
+                    continue;
+                }
+                let mut drifted = false;
+                self.preparation.scan(
+                    self.snap,
+                    Perm::Pos,
+                    &[supports_prot_pred.0, g_nonce_id.0],
+                    |q| {
+                        if q[3] != g_id {
+                            return Ok(true);
+                        }
+                        let r = q[0];
+                        if !self.snap.contains(&[r, review_policy, policy_id, g_id])?
+                            || !self.snap.contains(&[r, rdf_type, proj_class, g_id])?
+                            || !self
+                                .snap
+                                .contains(&[r, policy_version_pred, version_id, g_id])?
+                            || !self
+                                .snap
+                                .contains(&[r, graph_prot_pred, g_nonce_id, g_id])?
+                        {
+                            return Ok(true);
+                        }
+                        if self.single_object_id(g_id, r, review_policy)? != Some(policy_id)
+                            || self.single_object_id(g_id, r, supports_prot_pred)?
+                                != Some(g_nonce_id)
+                            || self.single_object_id(g_id, r, policy_version_pred)?
+                                != Some(version_id)
+                            || !authenticated_id(r, g_id, g_nonce_id)?
+                            || is_superseded(r, g_id, g_nonce_id, policy_id)?
+                        {
+                            return Ok(true);
+                        }
+                        drifted = true;
+                        Ok(false)
+                    },
+                )?;
+                if drifted {
+                    return Ok(true);
+                }
             }
         }
 
