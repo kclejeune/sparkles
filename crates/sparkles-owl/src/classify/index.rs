@@ -1627,7 +1627,7 @@ pub enum Gap {
 /// A key: the named instances of the class that share a named individual for every
 /// object role and a data value for every data role are one individual (Structural
 /// Specification §9.5, Direct Semantics Table 9).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
     pub class: Ex,
     pub objects: Vec<Role>,
@@ -3335,8 +3335,21 @@ impl Index {
             + self.universal.capacity() * 8
             + self.nominals.capacity() * 4
             + self.anonymous.capacity() * 4
+            + self
+                .keys
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Key>())
             + self.horn.as_ref().map_or(0, |h| h.bytes())
             + self.dt.as_ref().map_or(0, |d| d.bytes());
+        for k in &self.keys {
+            tick(1)?;
+            total = total.saturating_add(
+                k.objects
+                    .capacity()
+                    .saturating_add(k.data.capacity())
+                    .saturating_mul(std::mem::size_of::<Role>()),
+            );
+        }
         for v in &self.vals {
             tick(1)?;
             total += v.owned_bytes();
@@ -3374,6 +3387,17 @@ impl Index {
             + self.universal.len() * 8
             + self.nominals.len() * 4
             + self.anonymous.len() * 4
+            + self.keys.len().saturating_mul(std::mem::size_of::<Key>())
+            + self
+                .keys
+                .iter()
+                .map(|k| {
+                    k.objects
+                        .len()
+                        .saturating_add(k.data.len())
+                        .saturating_mul(std::mem::size_of::<Role>())
+                })
+                .sum::<usize>()
             + self.roles.logical_bytes()
             + self.horn.as_ref().map_or(0, |h| h.logical_bytes())
             + self.dl.as_ref().map_or(0, |d| d.logical_bytes())

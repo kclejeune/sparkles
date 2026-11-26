@@ -62,6 +62,7 @@ impl Marks {
 struct Report {
     id: Ex,
     bytes: usize,
+    dep_bytes: usize,
     before: Marks,
 }
 
@@ -301,9 +302,10 @@ impl Probe {
         budget: &WorldBudget<'_>,
         offset: usize,
         id: Ex,
-        found: &world::Found,
+        found: &world::Found<'_, '_>,
         bytes: usize,
     ) {
+        let dep_bytes = found.dep.as_ref().map_or(0, |d| d.dep.bytes());
         let position = {
             let mut trace = self.trace.lock();
             match self.fixture {
@@ -339,7 +341,7 @@ impl Probe {
                 trace.armed = true;
                 if self.fault == Fault::Sibling {
                     trace.cap = Some((
-                        budget.base + trace.independent as usize + bytes,
+                        budget.base + trace.independent as usize + dep_bytes + bytes,
                         before.paid,
                     ));
                 }
@@ -358,6 +360,7 @@ impl Probe {
             .push(Report {
                 id,
                 bytes,
+                dep_bytes,
                 before: Marks::read(budget),
             });
     }
@@ -578,7 +581,7 @@ fn single_chunk_discard() {
     let report = trace.reports[&0][0];
     assert_eq!(trace.reports[&0].len(), 1);
     assert_eq!(trace.admitted[&0], [report.id]);
-    assert_eq!(report.before.live, INDEPENDENT);
+    assert_eq!(report.before.live, INDEPENDENT + report.dep_bytes as isize);
     assert_eq!(trace.exited, [0]);
     let (collected, marks) = trace.collected.unwrap();
     assert_eq!(collected, Err(LOCAL));
@@ -590,14 +593,14 @@ fn single_chunk_discard() {
         report
             .before
             .paid
-            .max(trace.base + INDEPENDENT as usize + report.bytes)
+            .max(trace.base + report.before.live as usize + report.bytes)
     );
     assert_eq!(
         marks.peak,
         report
             .before
             .peak
-            .max(trace.base + INDEPENDENT as usize + report.bytes)
+            .max(trace.base + report.before.live as usize + report.bytes)
     );
     assert_retired(&trace);
 }
@@ -620,9 +623,11 @@ fn late_stop(stop: Late) {
     };
     assert_eq!(trace.admitted[&0], [first.id]);
     assert_eq!(trace.exited, [0]);
-    let expected_paid = trace.base + trace.independent as usize + first.bytes;
+    let expected_live =
+        trace.independent + (first.bytes + first.dep_bytes + second.dep_bytes) as isize;
+    let expected_paid = trace.base + expected_live as usize;
     let attempted = expected_paid + second.bytes;
-    assert_eq!(second.before.live, trace.independent + first.bytes as isize);
+    assert_eq!(second.before.live, expected_live);
     assert_eq!(second.before.paid, expected_paid);
     assert_eq!(trace.requests, [second.bytes]);
     assert_eq!(
@@ -769,7 +774,10 @@ fn report_unwind(fault: Fault, observations: usize) {
         panic!("expected the second row to reach its report");
     };
     assert_eq!(trace.admitted[&0], [first.id]);
-    assert_eq!(second.before.live, INDEPENDENT + first.bytes as isize);
+    assert_eq!(
+        second.before.live,
+        INDEPENDENT + (first.bytes + first.dep_bytes + second.dep_bytes) as isize
+    );
     assert_eq!(trace.exited, [0]);
     assert!(trace.collected.is_none());
     assert_eq!(trace.row_observations, observations);
@@ -828,23 +836,24 @@ fn insertion_unwind(fault: Fault) {
             assert_eq!(subs, trace.expected[&first.id]);
             let (collected, marks) = trace.collected.unwrap();
             assert_eq!(collected, Ok(3));
+            let row_total = |r: Report| (r.bytes + r.dep_bytes) as isize;
             assert_eq!(
                 marks.live,
-                INDEPENDENT + (first.bytes + second.bytes + third.bytes) as isize
+                INDEPENDENT + row_total(first) + row_total(second) + row_total(third)
             );
             let exit = trace.exit.as_ref().unwrap();
             assert_eq!(exit.stop, Ok(()));
             assert_eq!(
                 exit.before_release,
                 Marks {
-                    live: INDEPENDENT + first.bytes as isize,
+                    live: INDEPENDENT + row_total(first),
                     ..marks
                 }
             );
             assert_eq!(
                 exit.after_release,
                 Marks {
-                    live: first.bytes as isize,
+                    live: row_total(first),
                     ..marks
                 }
             );
@@ -890,7 +899,16 @@ fn all_successful_chunks_retire_when_stop_wins_before_commit() {
     }
     let (collected, marks) = trace.collected.unwrap();
     assert_eq!(collected, Ok(CROSS_REACHERS + 1));
-    assert_eq!(marks.live, INDEPENDENT + 64 + 60 * CROSS_REACHERS as isize);
+    let dep_total: isize = trace
+        .reports
+        .values()
+        .flat_map(|rs| rs.iter())
+        .map(|r| r.dep_bytes as isize)
+        .sum();
+    assert_eq!(
+        marks.live,
+        INDEPENDENT + 64 + 60 * CROSS_REACHERS as isize + dep_total
+    );
     let exit = trace.exit.as_ref().unwrap();
     assert_eq!(exit.stop, Err(error));
     assert_eq!(
@@ -975,17 +993,24 @@ fn committed_transfer(reachers: usize, threads: usize) {
     let (collected, marks) = trace.collected.unwrap();
     let exit = trace.exit.as_ref().unwrap();
     assert_eq!(collected, Ok(reachers + 1));
-    assert_eq!(marks.live, INDEPENDENT + bytes);
+    let dep_total: isize = trace
+        .reports
+        .values()
+        .flat_map(|rs| rs.iter())
+        .map(|r| r.dep_bytes as isize)
+        .sum();
+    let total_bytes = bytes + dep_total;
+    assert_eq!(marks.live, INDEPENDENT + total_bytes);
     assert_eq!(
         *joined.lock(),
-        Some((trace.base, marks.live, bytes as usize, marks.paid))
+        Some((trace.base, marks.live, total_bytes as usize, marks.paid))
     );
     assert_eq!(exit.stop, Ok(()));
     assert_eq!(exit.before_release, marks);
     assert_eq!(
         exit.after_release,
         Marks {
-            live: bytes,
+            live: total_bytes,
             ..marks
         }
     );
@@ -1029,7 +1054,10 @@ fn checker_growth_survives_found_row_commit_and_discard() {
                 .map(|report| report.id)
                 .eq(trace.admitted[&0].iter().copied())
         );
-        let rows = reports.iter().map(|report| report.bytes).sum::<usize>();
+        let rows = reports
+            .iter()
+            .map(|report| report.bytes + report.dep_bytes)
+            .sum::<usize>();
 
         // The checker accounts from its own tables. No row or world ledger
         // measurements enter this difference.
@@ -1157,10 +1185,13 @@ fn cross_chunk_sibling_exact_headroom() {
     let sibling = trace.reports[&SECOND_CHUNK][0];
     assert_eq!(trace.admitted[&0], [first.id]);
     let (cap, _) = trace.cap.unwrap();
-    assert_eq!(cap, trace.base + trace.independent as usize + sibling.bytes);
+    assert_eq!(
+        cap,
+        trace.base + trace.independent as usize + sibling.dep_bytes + sibling.bytes
+    );
     assert_eq!(
         sibling.before.paid,
-        trace.base + trace.independent as usize + first.bytes
+        trace.base + trace.independent as usize + first.bytes + first.dep_bytes + sibling.dep_bytes
     );
     let exit = trace.exit.as_ref().unwrap();
     assert_eq!(trace.collected.unwrap().0, Err(LOCAL));
@@ -1175,10 +1206,10 @@ fn cross_chunk_sibling_exact_headroom() {
     } else {
         // This is the exact Batch 55 failure signature. The cap is implemented
         // by the caller, so the typed error still names the configured limit.
-        let inflated = cap + first.bytes;
+        let inflated = cap + first.bytes + first.dep_bytes;
         assert_eq!(
             sibling.before.live,
-            trace.independent + first.bytes as isize
+            trace.independent + (first.bytes + first.dep_bytes + sibling.dep_bytes) as isize
         );
         assert_eq!(trace.requests, [sibling.bytes]);
         assert_eq!(
@@ -1193,7 +1224,8 @@ fn cross_chunk_sibling_exact_headroom() {
         assert_eq!(exit.before_release.peak, sibling.before.peak.max(inflated));
         assert_eq!(
             exit.before_release.live,
-            trace.independent + (first.bytes + sibling.bytes) as isize
+            trace.independent
+                + (first.bytes + first.dep_bytes + sibling.bytes + sibling.dep_bytes) as isize
         );
     }
     assert_eq!(
@@ -1201,6 +1233,9 @@ fn cross_chunk_sibling_exact_headroom() {
         local_error(),
         "sibling row fits the caller's exact cap of {cap} bytes"
     );
-    assert_eq!(sibling.before.live, trace.independent);
+    assert_eq!(
+        sibling.before.live,
+        trace.independent + sibling.dep_bytes as isize
+    );
     assert_retired(&trace);
 }

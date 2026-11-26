@@ -88,6 +88,9 @@ impl View for GlobalAll<'_> {
 /// global universal fact for incremental EL invalidation (roadmap item 664).
 const MAX_UNIVERSAL_SUPPORTS: usize = 4;
 
+/// Polling cadence for cooperative cancellation checks in dependency scans.
+const DEP_POLL_STEP: usize = 4096;
+
 /// A global universal fact derived in Phase 2 together with pre-broadcast grounded
 /// `(filler, witness_ctx)` supports that held strictly before `fact` was injected.
 #[derive(Clone, Debug)]
@@ -107,66 +110,173 @@ impl UniversalSupport {
 }
 
 /// The facts of universal roles that `known` lacks and some real context now gives: a
-/// negative `∃u.F` on a universal role u holds everywhere once F has an instance.
-pub fn universal_facts(ix: &Index, view: &dyn View, known: &[Ex]) -> Vec<Ex> {
+/// negative `∃u.F` on a universal role u holds everywhere once F has an instance,
+/// polling `poll` cooperatively across contexts and rules.
+pub fn universal_facts_polled<E>(
+    ix: &Index,
+    view: &dyn View,
+    known: &[Ex],
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Vec<Ex>, E> {
     let mut out: Vec<Ex> = Vec::new();
     if ix.universal.is_empty() {
-        return out;
+        return Ok(out);
     }
+    let mut since_poll = 0usize;
+    let mut stop_err: Option<E> = None;
     for e in 0..view.len() as Ex {
+        since_poll = since_poll.saturating_add(1);
+        if since_poll >= DEP_POLL_STEP {
+            since_poll = 0;
+            poll()?;
+        }
         view.with(e, &mut |st, real| {
-            if !real {
+            if !real || stop_err.is_some() {
                 return;
             }
             for &(f, x) in &ix.universal {
+                since_poll = since_poll.saturating_add(1);
+                if since_poll >= DEP_POLL_STEP {
+                    since_poll = 0;
+                    if let Err(err) = poll() {
+                        stop_err = Some(err);
+                        return;
+                    }
+                }
                 if !known.contains(&x) && !out.contains(&x) && st.subs.contains(&f) {
                     out.push(x);
                 }
             }
         });
+        if let Some(err) = stop_err {
+            return Err(err);
+        }
     }
     out.sort_unstable();
-    out
+    Ok(out)
 }
 
-/// Like [`universal_facts`], recording up to [`MAX_UNIVERSAL_SUPPORTS`] pre-broadcast
-/// `(filler, witness_ctx)` pairs per newly derived universal fact so incremental EL
-/// runs can verify whether the fact remains grounded without cycles.
-pub fn universal_facts_with_supports(
+/// Return payload for [`universal_facts_with_supports_polled`]: mandatory universal
+/// facts paired with optional pre-admitted support witnesses and their tracked byte cost.
+pub type UniversalFactsTracked = (Vec<Ex>, Option<(Vec<UniversalSupport>, usize)>);
+
+/// Like [`universal_facts_polled`], recording up to [`MAX_UNIVERSAL_SUPPORTS`]
+/// pre-broadcast `(filler, witness_ctx)` pairs per newly derived universal fact when
+/// `try_admit` admits the optional support storage before each allocation.
+///
+/// If `try_admit` refuses an allocation, optional support tracking is dropped cleanly
+/// (`None` in the second tuple element) while the mandatory universal facts are still
+/// returned in full.
+pub fn universal_facts_with_supports_polled<E>(
     ix: &Index,
     view: &dyn View,
     known: &[Ex],
-) -> Vec<UniversalSupport> {
-    let mut out: Vec<UniversalSupport> = Vec::new();
+    poll: &mut impl FnMut() -> Result<(), E>,
+    try_admit: &mut impl FnMut(usize) -> bool,
+) -> Result<UniversalFactsTracked, E> {
+    let mut facts: Vec<Ex> = Vec::new();
+    let mut supports_out: Vec<UniversalSupport> = Vec::new();
+    let mut tracking = true;
+    let mut admitted_bytes = 0usize;
     if ix.universal.is_empty() {
-        return out;
+        return Ok((facts, Some((supports_out, 0))));
     }
+    let mut since_poll = 0usize;
+    let mut stop_err: Option<E> = None;
     for e in 0..view.len() as Ex {
+        since_poll = since_poll.saturating_add(1);
+        if since_poll >= DEP_POLL_STEP {
+            since_poll = 0;
+            poll()?;
+        }
         view.with(e, &mut |st, real| {
-            if !real {
+            if !real || stop_err.is_some() {
                 return;
             }
             for &(f, x) in &ix.universal {
+                since_poll = since_poll.saturating_add(1);
+                if since_poll >= DEP_POLL_STEP {
+                    since_poll = 0;
+                    if let Err(err) = poll() {
+                        stop_err = Some(err);
+                        return;
+                    }
+                }
                 if known.contains(&x) || !st.subs.contains(&f) {
                     continue;
                 }
-                if let Some(entry) = out.iter_mut().find(|u| u.fact == x) {
+                if !facts.contains(&x) {
+                    facts.push(x);
+                }
+                if !tracking {
+                    continue;
+                }
+                if let Some(entry) = supports_out.iter_mut().find(|u| u.fact == x) {
                     if entry.supports.len() < MAX_UNIVERSAL_SUPPORTS
                         && !entry.supports.contains(&(f, e))
                     {
                         entry.supports.push((f, e));
                     }
                 } else {
-                    out.push(UniversalSupport {
-                        fact: x,
-                        supports: vec![(f, e)],
-                    });
+                    let vec_grow = if supports_out.len() == supports_out.capacity() {
+                        supports_out.capacity().max(4)
+                    } else {
+                        0
+                    };
+                    let delta = vec_grow
+                        .saturating_mul(std::mem::size_of::<UniversalSupport>())
+                        .saturating_add(
+                            MAX_UNIVERSAL_SUPPORTS.saturating_mul(std::mem::size_of::<(Ex, Ex)>()),
+                        );
+                    if !try_admit(delta) {
+                        supports_out = Vec::new();
+                        tracking = false;
+                        continue;
+                    }
+                    if vec_grow > 0 && supports_out.try_reserve_exact(vec_grow).is_err() {
+                        supports_out = Vec::new();
+                        tracking = false;
+                        continue;
+                    }
+                    let mut supports = Vec::new();
+                    if supports.try_reserve_exact(MAX_UNIVERSAL_SUPPORTS).is_err() {
+                        supports_out = Vec::new();
+                        tracking = false;
+                        continue;
+                    }
+                    supports.push((f, e));
+                    supports_out.push(UniversalSupport { fact: x, supports });
+                    admitted_bytes = admitted_bytes.saturating_add(delta);
                 }
             }
         });
+        if let Some(err) = stop_err {
+            return Err(err);
+        }
     }
-    out.sort_unstable_by_key(|u| u.fact);
-    out
+    facts.sort_unstable();
+    if tracking {
+        supports_out.sort_unstable_by_key(|u| u.fact);
+        let actual_bytes = supports_out
+            .capacity()
+            .saturating_mul(std::mem::size_of::<UniversalSupport>())
+            .saturating_add(
+                supports_out
+                    .iter()
+                    .map(|u| {
+                        u.supports
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(Ex, Ex)>())
+                    })
+                    .sum::<usize>(),
+            );
+        Ok((
+            facts,
+            Some((supports_out, actual_bytes.max(admitted_bytes))),
+        ))
+    } else {
+        Ok((facts, None))
+    }
 }
 
 /// Reports live changes. An installed named-domain table gives its worlds direct
@@ -557,13 +667,23 @@ pub fn key_merges<'a>(
     key_merges_reported(ix, view, Reporter::Callback(bound))
 }
 
+/// Return payload for [`key_merges_with_deps`]: mandatory key merges paired with
+/// optional pre-admitted dependency witnesses and their tracked byte cost.
+pub(super) type KeyMergesTracked<'a> = (KeyMerges<'a>, Option<(Vec<KeyMergeDep>, usize)>);
+
 /// Like [`key_merges`], also returning one grounded [`KeyMergeDep`] for each distinct
-/// merged pair `(a, b)` so incremental EL invalidation can follow key dependencies.
-pub fn key_merges_with_deps<'a>(
+/// merged pair `(a, b)` when `budget` admits the optional dependency storage.
+///
+/// Optional dependency storage (deduplication set, per-key scratch, and `KeyMergeDep`
+/// records) is pre-admitted non-fatally through `budget.try_admit_optional` before
+/// allocating. On refusal, optional tracking drops cleanly (`None`) while mandatory
+/// `KeyMerges` still complete within budget.
+pub(super) fn key_merges_with_deps<'a>(
     ix: &Index,
     view: &dyn View,
     bound: &'a (dyn Fn(isize) -> bool + Sync),
-) -> Result<(KeyMerges<'a>, Vec<KeyMergeDep>), Halt> {
+    budget: &super::WorldBudget<'a>,
+) -> Result<KeyMergesTracked<'a>, Halt> {
     let reporter = Reporter::Callback(bound);
     let mut found = 0;
     for key in &ix.keys {
@@ -571,19 +691,182 @@ pub fn key_merges_with_deps<'a>(
     }
     let mut pairs = KeyStorage::new(found, reporter)?;
     let live = pairs._scratch.bytes;
+    let mut tracking = true;
     let mut deps: Vec<KeyMergeDep> = Vec::new();
-    for key in &ix.keys {
-        key_matches_with_deps(ix, view, key, live, reporter, |dep| {
-            pairs.push((dep.a, dep.b))?;
-            deps.push(dep);
-            Ok(())
-        })?;
+    let mut deps_debit = super::OptionalDebit::new(budget, 0);
+    let mut seen_pairs: FxHashSet<(Ex, Ex)> = FxHashSet::default();
+    let mut seen_debit = super::OptionalDebit::new(budget, 0);
+    if found > 0 {
+        let seen_bound =
+            super::dl_clause::hash_table_grow_bound(0, 0, found, std::mem::size_of::<(Ex, Ex)>())
+                .unwrap_or(usize::MAX);
+        match budget.try_admit_optional(seen_bound) {
+            super::OptionalAdmit::Accepted => {
+                seen_debit.add(seen_bound);
+            }
+            super::OptionalAdmit::Refused => {
+                tracking = false;
+            }
+            super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+        }
     }
+    for key in &ix.keys {
+        if !tracking {
+            key_matches(ix, view, key, live, reporter, |pair| pairs.push(pair))?;
+            continue;
+        }
+        let scratch_real_cap = 2usize
+            .saturating_add(key.objects.len().saturating_mul(2))
+            .saturating_add(key.data.len().saturating_mul(2));
+        let scratch_ctx_cap = key.objects.len().saturating_mul(2);
+        let scratch_bytes = scratch_real_cap
+            .saturating_add(scratch_ctx_cap)
+            .saturating_mul(std::mem::size_of::<Ex>());
+        let mut scratch_debit = super::OptionalDebit::new(budget, 0);
+        match budget.try_admit_optional(scratch_bytes) {
+            super::OptionalAdmit::Accepted => {
+                scratch_debit.add(scratch_bytes);
+            }
+            super::OptionalAdmit::Refused => {
+                deps = Vec::new();
+                deps_debit.retire_now();
+                seen_pairs = FxHashSet::default();
+                seen_debit.retire_now();
+                tracking = false;
+                key_matches(ix, view, key, live, reporter, |pair| pairs.push(pair))?;
+                continue;
+            }
+            super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+        }
+        let mut scratch_real: Vec<Ex> = Vec::new();
+        let mut scratch_ctx: Vec<Ex> = Vec::new();
+        if scratch_real.try_reserve_exact(scratch_real_cap).is_err()
+            || scratch_ctx.try_reserve_exact(scratch_ctx_cap).is_err()
+        {
+            drop(scratch_real);
+            drop(scratch_ctx);
+            scratch_debit.retire_now();
+            deps = Vec::new();
+            deps_debit.retire_now();
+            seen_pairs = FxHashSet::default();
+            seen_debit.retire_now();
+            tracking = false;
+            key_matches(ix, view, key, live, reporter, |pair| pairs.push(pair))?;
+            continue;
+        }
+        key_matches_with_deps(
+            ix,
+            view,
+            key,
+            live,
+            reporter,
+            &mut scratch_real,
+            &mut scratch_ctx,
+            |a, b, real_slice, ctx_slice| {
+                pairs.push((a, b))?;
+                if !tracking || !seen_pairs.insert((a, b)) {
+                    return Ok(());
+                }
+                let vec_grow = if deps.len() == deps.capacity() {
+                    deps.capacity()
+                        .max(4)
+                        .min(found.saturating_sub(deps.len()).max(1))
+                } else {
+                    0
+                };
+                let key_payload = key
+                    .objects
+                    .len()
+                    .saturating_add(key.data.len())
+                    .saturating_mul(std::mem::size_of::<Role>());
+                let dep_payload = real_slice
+                    .len()
+                    .saturating_add(ctx_slice.len())
+                    .saturating_mul(std::mem::size_of::<Ex>());
+                let delta = vec_grow
+                    .saturating_mul(std::mem::size_of::<KeyMergeDep>())
+                    .saturating_add(key_payload)
+                    .saturating_add(dep_payload);
+                match budget.try_admit_optional(delta) {
+                    super::OptionalAdmit::Accepted => {
+                        deps_debit.add(delta);
+                    }
+                    super::OptionalAdmit::Refused => {
+                        deps = Vec::new();
+                        deps_debit.retire_now();
+                        seen_pairs = FxHashSet::default();
+                        seen_debit.retire_now();
+                        tracking = false;
+                        return Ok(());
+                    }
+                    super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+                }
+                if vec_grow > 0 && deps.try_reserve_exact(vec_grow).is_err() {
+                    deps = Vec::new();
+                    deps_debit.retire_now();
+                    seen_pairs = FxHashSet::default();
+                    seen_debit.retire_now();
+                    tracking = false;
+                    return Ok(());
+                }
+                let mut objects = Vec::new();
+                let mut data = Vec::new();
+                let mut real_deps = Vec::new();
+                let mut ctx_deps = Vec::new();
+                if objects.try_reserve_exact(key.objects.len()).is_err()
+                    || data.try_reserve_exact(key.data.len()).is_err()
+                    || real_deps.try_reserve_exact(real_slice.len()).is_err()
+                    || ctx_deps.try_reserve_exact(ctx_slice.len()).is_err()
+                {
+                    deps = Vec::new();
+                    deps_debit.retire_now();
+                    seen_pairs = FxHashSet::default();
+                    seen_debit.retire_now();
+                    tracking = false;
+                    return Ok(());
+                }
+                objects.extend_from_slice(&key.objects);
+                data.extend_from_slice(&key.data);
+                real_deps.extend_from_slice(real_slice);
+                ctx_deps.extend_from_slice(ctx_slice);
+                deps.push(KeyMergeDep {
+                    key: super::index::Key {
+                        class: key.class,
+                        objects,
+                        data,
+                    },
+                    a,
+                    b,
+                    real_deps,
+                    ctx_deps,
+                });
+                Ok(())
+            },
+        )?;
+        drop(scratch_real);
+        drop(scratch_ctx);
+        scratch_debit.retire_now();
+    }
+    drop(seen_pairs);
+    seen_debit.retire_now();
     pairs.rows.sort_unstable();
     pairs.rows.dedup();
-    deps.sort_unstable_by_key(|d| (d.a, d.b));
-    deps.dedup_by_key(|d| (d.a, d.b));
-    Ok((KeyMerges { pairs }, deps))
+    if tracking {
+        deps.sort_unstable_by_key(|d| (d.a, d.b));
+        let retained_bytes = deps
+            .capacity()
+            .saturating_mul(std::mem::size_of::<KeyMergeDep>())
+            .saturating_add(
+                deps.iter()
+                    .map(|d| d.bytes().saturating_sub(std::mem::size_of::<KeyMergeDep>()))
+                    .sum::<usize>(),
+            );
+        drop(deps_debit);
+        Ok((KeyMerges { pairs }, Some((deps, retained_bytes))))
+    } else {
+        drop(deps_debit);
+        Ok((KeyMerges { pairs }, None))
+    }
 }
 
 fn key_records_with_ctx(
@@ -661,13 +944,16 @@ fn key_records_with_ctx(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn key_matches_with_deps(
     ix: &Index,
     view: &dyn View,
     key: &super::index::Key,
     live: usize,
     reporter: Reporter<'_>,
-    mut emit: impl FnMut(KeyMergeDep) -> Result<(), Halt>,
+    real_deps: &mut Vec<Ex>,
+    ctx_deps: &mut Vec<Ex>,
+    mut emit: impl FnMut(Ex, Ex, &[Ex], &[Ex]) -> Result<(), Halt>,
 ) -> Result<(), Halt> {
     let report = |delta| reporter.tell(delta);
     let bound: &(dyn Fn(isize) -> bool + Sync) = match reporter {
@@ -744,8 +1030,10 @@ fn key_matches_with_deps(
                 owned(&data.rows, b, |row| row.0),
             );
             let mut matches = true;
-            let mut real_deps = vec![a, b];
-            let mut ctx_deps: Vec<Ex> = Vec::new();
+            real_deps.clear();
+            real_deps.push(a);
+            real_deps.push(b);
+            ctx_deps.clear();
             for &role in &key.objects {
                 key_poll(bound)?;
                 if ix.is_universal(role) {
@@ -816,13 +1104,7 @@ fn key_matches_with_deps(
                 real_deps.dedup();
                 ctx_deps.sort_unstable();
                 ctx_deps.dedup();
-                emit(KeyMergeDep {
-                    key: key.clone(),
-                    a,
-                    b,
-                    real_deps,
-                    ctx_deps,
-                })?;
+                emit(a, b, real_deps.as_slice(), ctx_deps.as_slice())?;
             }
         }
     }
@@ -1620,12 +1902,19 @@ impl WorldDep {
     }
 }
 
+/// Optional incremental dependency record returned by a world together with its
+/// live budget debit so uncommitted or unwound rows retire automatically.
+pub(super) struct FoundDep<'r, 'a> {
+    pub dep: WorldDep,
+    pub debit: super::OptionalDebit<'r, 'a>,
+}
+
 /// What a world found of its class: whether it is unsatisfiable, its subsumers, and
 /// optionally its incremental dependency record.
-pub struct Found {
+pub struct Found<'r, 'a> {
     pub bottom: bool,
     pub subs: Vec<Ex>,
-    pub dep: Option<WorldDep>,
+    pub(super) dep: Option<FoundDep<'r, 'a>>,
 }
 
 impl<'a> World<'a> {
@@ -2108,13 +2397,17 @@ impl<'a> World<'a> {
     /// saturates what follows, with the facts of universal roles and the merges of keys
     /// that hold there.
     #[cfg(test)]
-    pub fn classify(self, class: Ex) -> Result<Found, Halt> {
-        self.classify_with_dep(class, false)
+    pub fn classify(self, class: Ex) -> Result<Found<'static, 'static>, Halt> {
+        self.classify_with_dep(class, None)
     }
 
-    /// Like [`World::classify`], optionally capturing a [`WorldDep`] dependency record
-    /// for incremental EL world reuse (roadmap item 664).
-    pub fn classify_with_dep(mut self, class: Ex, record_dep: bool) -> Result<Found, Halt> {
+    /// Like [`World::classify`], optionally capturing a pre-admitted [`WorldDep`]
+    /// dependency record for incremental EL world reuse (roadmap item 664).
+    pub(super) fn classify_with_dep<'r, 'b>(
+        mut self,
+        class: Ex,
+        dep_budget: Option<(&'r super::WorldBudget<'b>, &std::sync::atomic::AtomicBool)>,
+    ) -> Result<Found<'r, 'b>, Halt> {
         self.pending.push((class, Concl::Real(REAL_ROOT)));
         loop {
             self.drain();
@@ -2128,7 +2421,14 @@ impl<'a> World<'a> {
                 .chain(&self.universal)
                 .copied()
                 .collect();
-            let facts = universal_facts(self.ix, &self, &known);
+            let reporter = self.debit.reporter;
+            let facts = universal_facts_polled(self.ix, &self, &known, &mut || {
+                if reporter.tell(0) {
+                    Ok(())
+                } else {
+                    Err(Halt::Stopped)
+                }
+            })?;
             let merges = key_merges_reported(self.ix, &self, self.debit.reporter)?;
             if facts.is_empty() && merges.is_empty() {
                 break;
@@ -2169,8 +2469,10 @@ impl<'a> World<'a> {
         if !found.bottom {
             super::dt_sat::world(self.ix, self.slots.values().filter_map(|s| s.st.as_ref()));
         }
-        if record_dep {
-            found.dep = Some(self.build_dep(class, found.bottom));
+        if let Some((budget, track_active)) = dep_budget
+            && track_active.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            found.dep = self.build_dep(class, found.bottom, budget, track_active)?;
         }
         #[cfg(test)]
         if let Some(rules) = &self.ix.top_chain {
@@ -2193,31 +2495,209 @@ impl<'a> World<'a> {
         Ok(found)
     }
 
-    fn build_dep(&self, class: Ex, bottom: bool) -> WorldDep {
-        let mut used_contexts: Vec<Ex> = Vec::with_capacity(self.slots.len().max(1));
-        let mut used_exprs: Vec<Ex> = Vec::new();
-        let mut watched_keys: Vec<super::index::Key> = Vec::new();
+    fn build_dep<'r, 'b>(
+        &self,
+        class: Ex,
+        bottom: bool,
+        budget: &'r super::WorldBudget<'b>,
+        track_active: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<FoundDep<'r, 'b>>, Halt> {
+        let mut since_poll = 0usize;
+        let mut poll_step = |work: usize| -> Result<(), Halt> {
+            since_poll = since_poll.saturating_add(work);
+            if since_poll >= DEP_POLL_STEP {
+                since_poll = 0;
+                if !budget.poll_stop() {
+                    return Err(Halt::Stopped);
+                }
+            }
+            Ok(())
+        };
+        if !budget.poll_stop() {
+            return Err(Halt::Stopped);
+        }
+
+        // Track watched keys in a compact bitset so scanning `slots × keys` avoids
+        // quadratic `watched_keys.contains(key)` comparisons.
+        let key_count = self.ix.keys.len();
+        let mut inline_key_bits = [0u64; 4];
+        let mut heap_key_bits: Vec<u64> = Vec::new();
+        let mut key_bits_debit = super::OptionalDebit::new(budget, 0);
+        if key_count > inline_key_bits.len() * 64 {
+            let words = key_count.div_ceil(64);
+            let bytes = words.saturating_mul(std::mem::size_of::<u64>());
+            match budget.try_admit_optional(bytes) {
+                super::OptionalAdmit::Accepted => {
+                    key_bits_debit.add(bytes);
+                }
+                super::OptionalAdmit::Refused => {
+                    track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(None);
+                }
+                super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+            }
+            if heap_key_bits.try_reserve_exact(words).is_err() {
+                track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(None);
+            }
+            heap_key_bits.resize(words, 0);
+        }
+        let key_bits: &mut [u64] = if heap_key_bits.is_empty() {
+            &mut inline_key_bits
+        } else {
+            heap_key_bits.as_mut_slice()
+        };
+
+        // Pass 1: count exact capacities and mark touched keys while polling stop state.
+        let mut used_contexts_count = 0usize;
+        let mut used_exprs_count = 0usize;
+        let mut dt_comps_count = 0usize;
+        let mut dt_sticky_count = 0usize;
         let mut touched_named = false;
-        let mut dt_comps: Vec<u32> = Vec::new();
-        let mut dt_sticky: Vec<(u32, u8)> = Vec::new();
         let has_dt = self.ix.dt.is_some();
         let global = self.global();
+        let mut stop_err = false;
         for (&e, slot) in &self.slots {
+            poll_step(1)?;
             if (e as usize) < self.ctx.len() {
-                used_contexts.push(e);
+                used_contexts_count = used_contexts_count.saturating_add(1);
             }
             if let Some(st) = slot.st.as_ref() {
-                used_exprs.extend(st.subs.iter().copied());
+                used_exprs_count = used_exprs_count.saturating_add(st.subs.len());
                 if has_named_alias(self.ix, e, st) {
                     touched_named = true;
-                    for key in &self.ix.keys {
-                        if context_touches_key(self.ix, e, st, key) && !watched_keys.contains(key) {
-                            watched_keys.push(key.clone());
+                    for (ki, key) in self.ix.keys.iter().enumerate() {
+                        poll_step(1)?;
+                        let word = &mut key_bits[ki >> 6];
+                        let mask = 1u64 << (ki & 63);
+                        if (*word & mask) == 0 && context_touches_key(self.ix, e, st, key) {
+                            *word |= mask;
                         }
                     }
                 }
                 if has_dt && let Some(x) = st.extra.as_ref() {
+                    dt_comps_count = dt_comps_count.saturating_add(x.dt.len());
+                    if !bottom && !st.bottom {
+                        for s in &x.dt {
+                            poll_step(1)?;
+                            if s.last != super::dt_sat::FINE {
+                                dt_sticky_count = dt_sticky_count.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            } else if slot.real {
+                global.with(e, &mut |st, _| {
+                    if stop_err {
+                        return;
+                    }
+                    if has_named_alias(self.ix, e, st) {
+                        touched_named = true;
+                        for (ki, key) in self.ix.keys.iter().enumerate() {
+                            if poll_step(1).is_err() {
+                                stop_err = true;
+                                return;
+                            }
+                            let word = &mut key_bits[ki >> 6];
+                            let mask = 1u64 << (ki & 63);
+                            if (*word & mask) == 0 && context_touches_key(self.ix, e, st, key) {
+                                *word |= mask;
+                            }
+                        }
+                    }
+                });
+                if stop_err {
+                    return Err(Halt::Stopped);
+                }
+            }
+        }
+        let add_class_ctx = (class as usize) < self.ctx.len() && !self.slots.contains_key(&class);
+        if add_class_ctx {
+            used_contexts_count = used_contexts_count.saturating_add(1);
+        }
+
+        let mut watched_keys_count = 0usize;
+        let mut watched_keys_payload = 0usize;
+        for (wi, &word) in key_bits.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let tz = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let ki = wi * 64 + tz;
+                if let Some(key) = self.ix.keys.get(ki) {
+                    watched_keys_count = watched_keys_count.saturating_add(1);
+                    watched_keys_payload = watched_keys_payload.saturating_add(
+                        key.objects
+                            .len()
+                            .saturating_add(key.data.len())
+                            .saturating_mul(std::mem::size_of::<Role>()),
+                    );
+                }
+            }
+        }
+
+        let Some(dep_bytes) = (|| -> Option<usize> {
+            let mut total = std::mem::size_of::<WorldDep>();
+            total =
+                total.checked_add(used_contexts_count.checked_mul(std::mem::size_of::<Ex>())?)?;
+            total = total.checked_add(used_exprs_count.checked_mul(std::mem::size_of::<Ex>())?)?;
+            total = total.checked_add(
+                watched_keys_count.checked_mul(std::mem::size_of::<super::index::Key>())?,
+            )?;
+            total = total.checked_add(watched_keys_payload)?;
+            total = total.checked_add(dt_comps_count.checked_mul(std::mem::size_of::<u32>())?)?;
+            total = total
+                .checked_add(dt_sticky_count.checked_mul(std::mem::size_of::<(u32, u8)>())?)?;
+            Some(total)
+        })() else {
+            track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            return Ok(None);
+        };
+
+        // Pre-admit the full `WorldDep` while `self.slots` are still resident and debited.
+        let mut dep_debit = super::OptionalDebit::new(budget, 0);
+        match budget.try_admit_optional(dep_bytes) {
+            super::OptionalAdmit::Accepted => {
+                dep_debit.add(dep_bytes);
+            }
+            super::OptionalAdmit::Refused => {
+                track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(None);
+            }
+            super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
+        }
+
+        // Pass 2: allocate with exact pre-admitted capacities and populate.
+        let mut used_contexts: Vec<Ex> = Vec::new();
+        let mut used_exprs: Vec<Ex> = Vec::new();
+        let mut watched_keys: Vec<super::index::Key> = Vec::new();
+        let mut dt_comps: Vec<u32> = Vec::new();
+        let mut dt_sticky: Vec<(u32, u8)> = Vec::new();
+        if used_contexts
+            .try_reserve_exact(used_contexts_count)
+            .is_err()
+            || used_exprs.try_reserve_exact(used_exprs_count).is_err()
+            || watched_keys.try_reserve_exact(watched_keys_count).is_err()
+            || dt_comps.try_reserve_exact(dt_comps_count).is_err()
+            || dt_sticky.try_reserve_exact(dt_sticky_count).is_err()
+        {
+            track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            return Ok(None);
+        }
+
+        for (&e, slot) in &self.slots {
+            poll_step(1)?;
+            if (e as usize) < self.ctx.len() {
+                used_contexts.push(e);
+            }
+            if let Some(st) = slot.st.as_ref() {
+                for &s in &st.subs {
+                    poll_step(1)?;
+                    used_exprs.push(s);
+                }
+                if has_dt && let Some(x) = st.extra.as_ref() {
                     for s in &x.dt {
+                        poll_step(1)?;
                         dt_comps.push(s.comp);
                         if !bottom && !st.bottom && s.last != super::dt_sat::FINE {
                             if let Some(existing) = dt_sticky.iter_mut().find(|(c, _)| *c == s.comp)
@@ -2229,23 +2709,42 @@ impl<'a> World<'a> {
                         }
                     }
                 }
-            } else if slot.real {
-                global.with(e, &mut |st, _| {
-                    if has_named_alias(self.ix, e, st) {
-                        touched_named = true;
-                        for key in &self.ix.keys {
-                            if context_touches_key(self.ix, e, st, key)
-                                && !watched_keys.contains(key)
-                            {
-                                watched_keys.push(key.clone());
-                            }
-                        }
-                    }
-                });
             }
         }
-        if (class as usize) < self.ctx.len() && !used_contexts.contains(&class) {
+        if add_class_ctx {
             used_contexts.push(class);
+        }
+        for (wi, &word) in key_bits.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                poll_step(1)?;
+                let tz = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let ki = wi * 64 + tz;
+                if let Some(key) = self.ix.keys.get(ki) {
+                    let mut objects = Vec::new();
+                    let mut data = Vec::new();
+                    if objects.try_reserve_exact(key.objects.len()).is_err()
+                        || data.try_reserve_exact(key.data.len()).is_err()
+                    {
+                        track_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(None);
+                    }
+                    objects.extend_from_slice(&key.objects);
+                    data.extend_from_slice(&key.data);
+                    watched_keys.push(super::index::Key {
+                        class: key.class,
+                        objects,
+                        data,
+                    });
+                }
+            }
+        }
+        drop(heap_key_bits);
+        key_bits_debit.retire_now();
+
+        if !budget.poll_stop() {
+            return Err(Halt::Stopped);
         }
         used_contexts.sort_unstable();
         used_contexts.dedup();
@@ -2254,15 +2753,18 @@ impl<'a> World<'a> {
         dt_comps.sort_unstable();
         dt_comps.dedup();
         dt_sticky.sort_unstable_by_key(|&(c, _)| c);
-        WorldDep {
-            used_contexts,
-            used_exprs,
-            watched_keys,
-            touched_named,
-            had_world_universal: !self.universal.is_empty(),
-            dt_comps,
-            dt_sticky,
-        }
+        Ok(Some(FoundDep {
+            dep: WorldDep {
+                used_contexts,
+                used_exprs,
+                watched_keys,
+                touched_named,
+                had_world_universal: !self.universal.is_empty(),
+                dt_comps,
+                dt_sticky,
+            },
+            debit: dep_debit,
+        }))
     }
 }
 
