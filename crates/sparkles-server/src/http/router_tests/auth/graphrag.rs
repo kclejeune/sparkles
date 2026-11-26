@@ -1180,6 +1180,7 @@ async fn stored_answers_need_the_askers_view() {
 /// The internal F13 refresh accumulator respects the GraphRAG principal's graph grants
 /// and predicate protections, stays hidden from `/$/views`, and falls back cleanly when
 /// the principal's view has data-dependent protections.
+#[cfg(feature = "mcp")]
 #[tokio::test(flavor = "multi_thread")]
 async fn circuit_refresh_respects_principal_visibility_and_protections() {
     use crate::graphrag::build::{self, Mode, Run};
@@ -1427,6 +1428,7 @@ async fn circuit_refresh_respects_principal_visibility_and_protections() {
 /// Revoking the configured GraphRAG principal's query access or switching it to a
 /// data-dependent protection via an auth policy reload detaches the existing internal
 /// refresh circuit on the next idle tick, and restoring access re-attaches it cleanly.
+#[cfg(feature = "mcp")]
 #[tokio::test(flavor = "multi_thread")]
 async fn circuit_refresh_detaches_on_principal_revocation_and_protection_reload() {
     use crate::graphrag::build::{self, Mode, Run};

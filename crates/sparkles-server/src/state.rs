@@ -518,6 +518,7 @@ pub struct AppState {
     pub ingest: crate::ingest::Runtime,
     /// serializes in-place restore reservations with automatic GraphRAG task admission
     /// and private-check preparation entry
+    #[cfg(any(feature = "backup", feature = "mcp"))]
     pub(crate) restore_admission: Mutex<()>,
 }
 
@@ -840,6 +841,7 @@ impl AppState {
             watches: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
+            #[cfg(any(feature = "backup", feature = "mcp"))]
             restore_admission: Mutex::new(()),
         }
     }
@@ -913,6 +915,7 @@ impl AppState {
             watches: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
+            #[cfg(any(feature = "backup", feature = "mcp"))]
             restore_admission: Mutex::new(()),
             rate_limit: None,
             auth: None,
@@ -1362,10 +1365,10 @@ impl AppState {
         match deleted {
             Ok(deleted) => {
                 if deleted {
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "mcp"))]
                     tests::fire_delete_after_leave_hook(name);
                     self.metrics.forget(name);
-                    self.volatile.forget(name);
+                    self.volatile.forget(identity);
                     #[cfg(feature = "mcp")]
                     self.graphrag.forget(name, identity);
                 }
@@ -1440,14 +1443,16 @@ impl AppState {
         drop(leaving);
         match result {
             Ok(ds) => {
+                #[cfg(feature = "mcp")]
                 let dataset_id = ds.dataset_id();
                 drop(ds);
-                #[cfg(test)]
+                #[cfg(all(test, feature = "mcp"))]
                 tests::fire_rename_after_catalog_hook(from, to);
                 self.metrics.rename(from, to);
                 #[cfg(feature = "mcp")]
-                self.graphrag.rename(from, to, dataset_id);
-                self.volatile.rename(from, to);
+                self.graphrag.rename(from, dataset_id);
+                // Volatile in-memory files are keyed by dataset UUID, which
+                // `catalog.rename` preserves atomically.
                 self.compaction.rename(from, to);
                 if let Some(auto) = &self.auto_reason {
                     auto.rename(from, to);
@@ -1486,12 +1491,15 @@ impl AppState {
 
     /// Reserve `name` for an in-place restore, serialized against automatic GraphRAG
     /// task admission and private-check preparation entry.
+    #[cfg(any(feature = "backup", all(test, feature = "mcp")))]
     pub fn reserve_restore(
         &self,
         name: &str,
         task: &str,
     ) -> std::result::Result<Reservation, sparkles::Error> {
         let _guard = self.restore_admission.lock();
+        #[cfg(all(test, feature = "mcp"))]
+        tests::fire_reserve_restore_hook(name);
         let r = self
             .catalog
             .reserve(name, sparkles::catalog::ReservationKind::Restore, task)?;
@@ -2058,24 +2066,34 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "mcp")]
     type DeleteAfterLeaveHook = Box<dyn FnMut(&str)>;
+    #[cfg(feature = "mcp")]
     type RenameAfterCatalogHook = Box<dyn FnMut(&str, &str)>;
+    #[cfg(feature = "mcp")]
+    type ReserveRestoreHook = Box<dyn FnMut(&str)>;
 
+    #[cfg(feature = "mcp")]
     thread_local! {
         static DELETE_AFTER_LEAVE_HOOK: std::cell::RefCell<Option<DeleteAfterLeaveHook>> =
             const { std::cell::RefCell::new(None) };
         static RENAME_AFTER_CATALOG_HOOK: std::cell::RefCell<Option<RenameAfterCatalogHook>> =
             const { std::cell::RefCell::new(None) };
+        static RESERVE_RESTORE_HOOK: std::cell::RefCell<Option<ReserveRestoreHook>> =
+            const { std::cell::RefCell::new(None) };
     }
 
+    #[cfg(feature = "mcp")]
     pub(crate) struct DeleteAfterLeaveHookGuard;
 
+    #[cfg(feature = "mcp")]
     impl Drop for DeleteAfterLeaveHookGuard {
         fn drop(&mut self) {
             DELETE_AFTER_LEAVE_HOOK.with(|h| *h.borrow_mut() = None);
         }
     }
 
+    #[cfg(feature = "mcp")]
     pub(crate) fn set_delete_after_leave_hook(
         f: impl FnMut(&str) + 'static,
     ) -> DeleteAfterLeaveHookGuard {
@@ -2083,6 +2101,7 @@ pub(crate) mod tests {
         DeleteAfterLeaveHookGuard
     }
 
+    #[cfg(feature = "mcp")]
     pub(crate) fn fire_delete_after_leave_hook(name: &str) {
         let f = DELETE_AFTER_LEAVE_HOOK.with(|h| h.borrow_mut().take());
         if let Some(mut f) = f {
@@ -2095,14 +2114,17 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "mcp")]
     pub(crate) struct RenameAfterCatalogHookGuard;
 
+    #[cfg(feature = "mcp")]
     impl Drop for RenameAfterCatalogHookGuard {
         fn drop(&mut self) {
             RENAME_AFTER_CATALOG_HOOK.with(|h| *h.borrow_mut() = None);
         }
     }
 
+    #[cfg(feature = "mcp")]
     pub(crate) fn set_rename_after_catalog_hook(
         f: impl FnMut(&str, &str) + 'static,
     ) -> RenameAfterCatalogHookGuard {
@@ -2110,11 +2132,43 @@ pub(crate) mod tests {
         RenameAfterCatalogHookGuard
     }
 
+    #[cfg(feature = "mcp")]
     pub(crate) fn fire_rename_after_catalog_hook(from: &str, to: &str) {
         let f = RENAME_AFTER_CATALOG_HOOK.with(|h| h.borrow_mut().take());
         if let Some(mut f) = f {
             f(from, to);
             RENAME_AFTER_CATALOG_HOOK.with(|h| {
+                if h.borrow().is_none() {
+                    *h.borrow_mut() = Some(f);
+                }
+            });
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) struct ReserveRestoreHookGuard;
+
+    #[cfg(feature = "mcp")]
+    impl Drop for ReserveRestoreHookGuard {
+        fn drop(&mut self) {
+            RESERVE_RESTORE_HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn set_reserve_restore_hook(
+        f: impl FnMut(&str) + 'static,
+    ) -> ReserveRestoreHookGuard {
+        RESERVE_RESTORE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+        ReserveRestoreHookGuard
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn fire_reserve_restore_hook(name: &str) {
+        let f = RESERVE_RESTORE_HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut f) = f {
+            f(name);
+            RESERVE_RESTORE_HOOK.with(|h| {
                 if h.borrow().is_none() {
                     *h.borrow_mut() = Some(f);
                 }

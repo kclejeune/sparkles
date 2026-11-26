@@ -1789,8 +1789,73 @@ async fn private_check_preparation_is_ordered_with_restore_reservation() {
         drop(held_res.lock().take());
 
         // 2. Reservation acquired after private-check admission (before `prepare` scans)
-        // must succeed immediately (scan is outside `restore_admission`) and cancel the
-        // in-flight private check so no refresh task is admitted.
+        // must succeed immediately (scan is outside `restore_admission`), set the
+        // registered cancellation flag via `cancel_private_checks`, and cause
+        // `Run::private_check` itself to return `Err(RunError::Cancelled)` before any
+        // outer liveness check runs.
+        withdraw(&ds, &a);
+        let state_ds = e.s.state.get("ev").unwrap();
+        let eff_s: GraphragSettings =
+            crate::settings::effective(&e.s.state, &state_ds, &crate::settings::GRAPHRAG);
+        let direct_cancel = Arc::new(AtomicBool::new(false));
+        let direct_cancel_hook = direct_cancel.clone();
+        let direct_res: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let direct_res_hook = direct_res.clone();
+        let direct_prepare_entered = Arc::new(AtomicBool::new(false));
+        let direct_prepare_hook = direct_prepare_entered.clone();
+        let st_direct_hook = e.s.state.clone();
+        let _guard_direct = set_build_hook(move |point, name| {
+            if point == BuildHookPoint::PrivatePrepare && name == "ev" {
+                direct_prepare_hook.store(true, Ordering::SeqCst);
+                assert!(
+                    !direct_cancel_hook.load(Ordering::Acquire),
+                    "private check cancel flag must be clear before reserve_restore"
+                );
+                // Must NOT deadlock: `restore_admission` has been released before `prepare`.
+                let r = st_direct_hook
+                    .reserve_restore("ev", "c25-during-private-prepare-direct")
+                    .unwrap();
+                assert!(
+                    direct_cancel_hook.load(Ordering::Acquire),
+                    "reserve_restore must set the registered private-check cancel flag"
+                );
+                *direct_res_hook.lock() = Some(r);
+            }
+        });
+        let direct_run = Run {
+            st: &e.s.state,
+            ds: state_ds.clone(),
+            settings: eff_s,
+            mode: Mode::Refresh,
+            confirmed: true,
+            task: None,
+            task_id: String::new(),
+            cancel: direct_cancel.clone(),
+            limits: Limits::default(),
+        };
+        let direct_outcome = direct_run.private_check();
+        drop(_guard_direct);
+        assert!(
+            direct_prepare_entered.load(Ordering::SeqCst),
+            "direct private_check must reach post-admission prepare hook"
+        );
+        assert!(
+            direct_res.lock().is_some(),
+            "reserve_restore must succeed without blocking on private_check preparation"
+        );
+        assert!(
+            direct_cancel.load(Ordering::Acquire),
+            "registered private-check cancel flag must remain set after reserve_restore"
+        );
+        assert!(
+            matches!(direct_outcome, Err(RunError::Cancelled)),
+            "Run::private_check must return Err(RunError::Cancelled) when cancelled by reserve_restore, got {direct_outcome:?}"
+        );
+        drop(direct_res.lock().take());
+
+        // 3. End-to-end through `tick_once`: the same post-admission restore reservation
+        // resolves as `NotLive`, drops the watch, and spawns no refresh task.
         let held_res2: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
             Arc::new(parking_lot::Mutex::new(None));
         let prepare_entered2 = Arc::new(AtomicBool::new(false));
@@ -1800,20 +1865,18 @@ async fn private_check_preparation_is_ordered_with_restore_reservation() {
         let _guard2 = set_build_hook(move |point, name| {
             if point == BuildHookPoint::PrivatePrepare && name == "ev" {
                 prepare_hook2.store(true, Ordering::SeqCst);
-                // Must NOT deadlock: `restore_admission` has been released before `prepare`.
                 let r = st_hook2
                     .reserve_restore("ev", "c25-during-private-prepare")
                     .unwrap();
                 *held_hook2.lock() = Some(r);
             }
         });
-        withdraw(&ds, &a);
         let mut watches2: HashMap<String, Watch> = HashMap::new();
         tick_once(&e.s.state, &mut watches2, now + Duration::from_secs(5));
         drop(_guard2);
         assert!(
             prepare_entered2.load(Ordering::SeqCst),
-            "second phase must reach post-admission prepare hook"
+            "end-to-end tick_once must reach post-admission prepare hook"
         );
         assert!(
             held_res2.lock().is_some(),

@@ -110,13 +110,6 @@ pub struct Figures {
     pub anomalies: u64,
 }
 
-/// Per-dataset figures tagged with the owning dataset instance's UUID so delayed delete
-/// or rename cleanup never clears or overwrites a replacement dataset under the same name.
-struct OwnedFigures {
-    dataset_id: uuid::Uuid,
-    figures: Figures,
-}
-
 /// Canonical dataset UUID for `ds` (a branch shares its `main` dataset's identity).
 pub(crate) fn owner_id(ds: &crate::state::Dataset) -> uuid::Uuid {
     ds.main()
@@ -153,7 +146,9 @@ impl Drop for PrivateCheckGuard {
 pub struct Runtime {
     /// builds waiting for confirmation, by task id, with their dataset
     waiting: Mutex<HashMap<String, (String, Arc<Waiting>)>>,
-    figures: Mutex<BTreeMap<String, OwnedFigures>>,
+    /// per-dataset figures keyed by dataset UUID so renames carry figures atomically and
+    /// delayed cleanup never overwrites or removes another owner's figures
+    figures: Mutex<HashMap<uuid::Uuid, Figures>>,
     /// the build state and the daily ledger of datasets without a directory, keyed by
     /// dataset UUID so renames carry state atomically and deletes never cross owners
     states: Mutex<HashMap<uuid::Uuid, super::state::BuildState>>,
@@ -222,19 +217,7 @@ impl Runtime {
         if !is_registered_owner(st, dataset, dataset_id) {
             return;
         }
-        let entry = map
-            .entry(dataset.to_string())
-            .or_insert_with(|| OwnedFigures {
-                dataset_id,
-                figures: Figures::default(),
-            });
-        if entry.dataset_id != dataset_id {
-            *entry = OwnedFigures {
-                dataset_id,
-                figures: Figures::default(),
-            };
-        }
-        f(&mut entry.figures);
+        f(map.entry(dataset_id).or_default());
     }
 
     /// The build state of an in-memory dataset instance.
@@ -333,12 +316,18 @@ impl Runtime {
             .unwrap_or_default()
     }
 
-    pub fn figures(&self) -> BTreeMap<String, Figures> {
-        self.figures
-            .lock()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.figures.clone()))
-            .collect()
+    pub fn figures(&self, st: &crate::state::AppState) -> BTreeMap<String, Figures> {
+        let by_id = self.figures.lock().clone();
+        if by_id.is_empty() {
+            return BTreeMap::new();
+        }
+        let mut out = BTreeMap::new();
+        for info in st.catalog.list() {
+            if let Some(f) = by_id.get(&info.id) {
+                out.insert(info.name, f.clone());
+            }
+        }
+        out
     }
 
     /// Register an active private check's cancel flag for `dataset` until the guard drops.
@@ -362,6 +351,7 @@ impl Runtime {
     }
 
     /// Cancel any in-flight private checks for `dataset` when a restore reserves it.
+    #[cfg_attr(not(any(test, feature = "backup")), allow(dead_code))]
     pub(crate) fn cancel_private_checks(&self, dataset: &str) {
         if let Some(list) = self.private_checks.lock().get(dataset) {
             for c in list {
@@ -574,31 +564,12 @@ impl Runtime {
         }
     }
 
-    /// Detach and settle the refresh circuit of `from` belonging to `dataset_id`, and
-    /// move name-keyed `figures` belonging to `dataset_id` to `to` after a dataset rename.
-    /// Build state, daily ledgers and anomalies are keyed by `dataset_id` and are already
-    /// visible under `to` as soon as the catalog publishes the rename.
-    pub(crate) fn rename(&self, from: &str, to: &str, dataset_id: uuid::Uuid) {
+    /// Detach and settle the refresh circuit of `from` belonging to `dataset_id` after a
+    /// dataset rename. Build state, daily ledgers, anomalies and figures are keyed by
+    /// `dataset_id` and are already visible under the destination name as soon as the
+    /// catalog publishes the rename.
+    pub(crate) fn rename(&self, from: &str, dataset_id: uuid::Uuid) {
         self.detach_circuit_for_id_and_settle(from, dataset_id);
-        if from == to {
-            return;
-        }
-        let mut map = self.figures.lock();
-        let moved = if map.get(from).is_some_and(|e| e.dataset_id == dataset_id) {
-            map.remove(from)
-        } else {
-            None
-        };
-        match moved {
-            Some(v) => {
-                map.insert(to.to_string(), v);
-            }
-            None => {
-                if map.get(to).is_some_and(|e| e.dataset_id != dataset_id) {
-                    map.remove(to);
-                }
-            }
-        }
     }
 
     /// Detach the refresh circuit of `dataset` and clear its in-memory state after
@@ -612,10 +583,7 @@ impl Runtime {
         self.states.lock().remove(&id);
         self.days.lock().remove(&id);
         self.anomalies.lock().remove(&id);
-        let mut figures = self.figures.lock();
-        if figures.get(dataset).is_some_and(|e| e.dataset_id == id) {
-            figures.remove(dataset);
-        }
+        self.figures.lock().remove(&id);
     }
 
     /// Keep only refresh circuits for datasets that remain live, dropping removed handles

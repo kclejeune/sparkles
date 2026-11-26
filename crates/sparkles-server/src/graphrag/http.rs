@@ -1000,7 +1000,7 @@ pub(crate) fn inbox_member(st: &AppState, ds: &Dataset, p: &Principal) -> Option
 /// accounting anomalies, as of the last build or review since the server started.
 pub fn metrics(st: &AppState, out: &mut String) {
     use std::fmt::Write;
-    let figures = st.graphrag.figures();
+    let figures = st.graphrag.figures(st);
     if figures.is_empty() {
         return;
     }

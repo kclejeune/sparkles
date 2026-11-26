@@ -1066,7 +1066,7 @@ async fn an_anomaly_leaves_the_rest_pending() {
         assert_eq!(f.mock.requests().len(), 1);
         let ds = f.st.datasets().get("org").cloned().unwrap();
         assert_eq!(f.st.graphrag.anomalies(ds.store.dataset_id()).len(), 1);
-        assert_eq!(f.st.graphrag.figures()["org"].anomalies, 1);
+        assert_eq!(f.st.graphrag.figures(&f.st)["org"].anomalies, 1);
     })
     .await
     .unwrap();
@@ -2489,9 +2489,10 @@ async fn circuit_refresh_stale_watch_reset_does_not_detach_current_circuit() {
     .unwrap();
 }
 
-/// R3-2: `build::spawn` for an automatic refresh and `AppState::reserve_restore` share
-/// one serialization boundary through task publication, so a restore reservation cannot
-/// interleave between `spawn`'s final liveness check and `start_task_opts`.
+/// R3-2 / R4-3: `build::spawn` for an automatic refresh and `AppState::reserve_restore`
+/// share one serialization boundary (`restore_admission`) through task publication, and
+/// cancelling a queued automatic refresh task deterministically cancels it while work is
+/// still outstanding.
 #[tokio::test(flavor = "multi_thread")]
 async fn circuit_refresh_spawn_and_restore_reservation_are_serialized() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2507,12 +2508,27 @@ async fn circuit_refresh_spawn_and_restore_reservation_are_serialized() {
         f.run(s.clone(), Mode::Build).unwrap();
         let ds = f.st.datasets().get("org").cloned().unwrap();
 
+        // Hold the single task queue slot so the published automatic refresh stays
+        // queued and cannot race to completion before `cancel_auto_refresh` cancels it.
+        f.st.task_queue.set_max(1);
+        let (blocker_ready_tx, blocker_ready_rx) = mpsc::channel();
+        let (blocker_release_tx, blocker_release_rx) = mpsc::channel();
+        let blocker = f.st.start_task("restore-test-blocker", "", move |_| {
+            blocker_ready_tx.send(()).unwrap();
+            let _ = blocker_release_rx.recv_timeout(Duration::from_secs(30));
+            Ok("done".into())
+        });
+        blocker_ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
         // Pause inside `build::spawn` AFTER its final `is_live_dataset` check and BEFORE
-        // `start_task_opts` publishes the task. Attempt `reserve_restore` on another
-        // thread: it must block until `spawn` completes task publication, never interleaving.
+        // `start_task_opts` publishes the task. Deterministically probe `restore_admission`
+        // inside both `SpawnPublish` and `ReserveRestore` so either side dropping the mutex
+        // fails regardless of thread scheduling.
         let (started_tx, started_rx) = mpsc::channel();
         let reserved_early = Arc::new(AtomicBool::new(false));
         let reserved_early_cb = reserved_early.clone();
+        let reserve_hook_fired = Arc::new(AtomicBool::new(false));
+        let reserve_hook_cb = reserve_hook_fired.clone();
         let st_hook = f.st.clone();
         let join_handle: Arc<
             parking_lot::Mutex<Option<std::thread::JoinHandle<sparkles::catalog::Reservation>>>,
@@ -2524,18 +2540,31 @@ async fn circuit_refresh_spawn_and_restore_reservation_are_serialized() {
         let _guard = set_build_hook(move |point, name| {
             if point == BuildHookPoint::SpawnPublish && name == "org" {
                 hook_fired_cb.store(true, Ordering::SeqCst);
+                assert!(
+                    st_hook.restore_admission.try_lock().is_none(),
+                    "automatic build::spawn must hold restore_admission through SpawnPublish"
+                );
                 let st_t = st_hook.clone();
                 let flag = reserved_early_cb.clone();
+                let r_fired = reserve_hook_cb.clone();
                 let tx = started_tx.clone();
                 let t = std::thread::spawn(move || {
+                    let st_probe = st_t.clone();
+                    let _rguard = crate::state::tests::set_reserve_restore_hook(move |n| {
+                        if n == "org" {
+                            r_fired.store(true, Ordering::SeqCst);
+                            assert!(
+                                st_probe.restore_admission.try_lock().is_none(),
+                                "reserve_restore must hold restore_admission across catalog reservation"
+                            );
+                        }
+                    });
                     tx.send(()).unwrap();
                     let r = st_t.reserve_restore("org", "restore-serialized").unwrap();
                     flag.store(true, Ordering::SeqCst);
                     r
                 });
                 started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                // Give the restore thread time to reach `restore_admission.lock()`.
-                std::thread::sleep(Duration::from_millis(40));
                 assert!(
                     !reserved_early_cb.load(Ordering::SeqCst),
                     "reserve_restore must block until automatic build::spawn finishes task publication"
@@ -2563,20 +2592,44 @@ async fn circuit_refresh_spawn_and_restore_reservation_are_serialized() {
             .unwrap()
             .join()
             .expect("restore reservation thread must succeed after spawn publishes");
+        assert!(reserve_hook_fired.load(Ordering::SeqCst));
         assert!(reserved_early.load(Ordering::SeqCst));
-        // Cancelling the auto refresh task drops its `ds` handle promptly.
-        f.st.graphrag.cancel_auto_refresh(&f.st, "org");
-        let end = Instant::now() + Duration::from_secs(10);
-        while f.st.active_task(TASK_KIND, "org").is_some() && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+
+        // Work is deterministically still queued while the blocker occupies the worker slot.
         assert!(
             f.st.tasks
                 .lock()
                 .iter()
-                .any(|t| t.id == task.id && !t.active()),
-            "published automatic refresh task must terminate"
+                .any(|t| t.id == task.id && t.state == crate::state::task_state::QUEUED),
+            "automatic refresh task must still be queued before cancel_auto_refresh"
         );
+
+        // Cancelling the auto refresh task must explicitly cancel the queued work.
+        f.st.graphrag.cancel_auto_refresh(&f.st, "org");
+        assert!(
+            f.st.active_task(TASK_KIND, "org").is_none(),
+            "cancelled queued automatic refresh task must leave active tasks immediately"
+        );
+        assert!(
+            f.st.tasks
+                .lock()
+                .iter()
+                .any(|t| t.id == task.id && t.state == crate::state::task_state::CANCELLED),
+            "published automatic refresh task must end in cancelled state, not done"
+        );
+
+        let _ = blocker_release_tx.send(());
+        let end = Instant::now() + Duration::from_secs(10);
+        while f
+            .st
+            .tasks
+            .lock()
+            .iter()
+            .any(|t| t.id == blocker.id && t.active())
+            && Instant::now() < end
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         drop(res);
     })
     .await
@@ -2751,6 +2804,13 @@ async fn circuit_refresh_in_memory_delete_and_retired_build_do_not_clobber_repla
                     )])
                     .unwrap();
                 store_settings(&st_cb, &ds_b, &s_cb);
+                crate::settings::store_runtime(
+                    &st_cb,
+                    &ds_b,
+                    &crate::settings::ASSISTANT,
+                    &json!({ "send": "rows" }),
+                )
+                .unwrap();
                 run(&Run {
                     st: &st_cb,
                     ds: ds_b.clone(),
@@ -2784,9 +2844,24 @@ async fn circuit_refresh_in_memory_delete_and_retired_build_do_not_clobber_repla
         let ds_b = ds_b_slot.lock().take().unwrap();
         let id_b = ds_b.store.dataset_id();
         assert_ne!(id_a, id_b);
+        // R4-1: Replacement B's in-memory runtime GraphRAG settings must survive A's
+        // delayed `volatile.forget`, and the next refresh tick (before any rewrite) must
+        // keep B's circuit attached and watched.
+        let eff_b: GraphragSettings =
+            crate::settings::effective(&f.st, &ds_b, &crate::settings::GRAPHRAG);
+        assert!(
+            eff_b.enabled && eff_b.refresh.mode == crate::graphrag::settings::RefreshMode::Auto,
+            "delayed delete cleanup must not wipe replacement B's runtime GraphRAG settings: {eff_b:?}"
+        );
+        let mut watches = HashMap::new();
+        crate::graphrag::refresh::tick_once(&f.st, &mut watches, Instant::now());
+        assert!(
+            watches.contains_key("org"),
+            "next refresh tick after delayed delete cleanup must keep replacement B watched"
+        );
         assert!(
             f.st.graphrag.has_refresh_circuit("org", &ds_b),
-            "delayed delete cleanup must not detach replacement B's circuit"
+            "delayed delete cleanup and next tick must not detach replacement B's circuit"
         );
         assert!(
             state_of(&f.st, &ds_b).unwrap().last_build.is_some(),
@@ -2802,7 +2877,7 @@ async fn circuit_refresh_in_memory_delete_and_retired_build_do_not_clobber_repla
             "delayed delete cleanup must not clear replacement B's anomalies"
         );
         assert_eq!(
-            f.st.graphrag.figures()["org"].anomalies,
+            f.st.graphrag.figures(&f.st)["org"].anomalies,
             1,
             "delayed delete cleanup must not clear replacement B's figures"
         );
@@ -2811,14 +2886,8 @@ async fn circuit_refresh_in_memory_delete_and_retired_build_do_not_clobber_repla
         assert!(f.st.graphrag.anomalies(id_a).is_empty());
 
         // --- Part 2: Retired build finishing `save_state` after delete + name reuse ---
-        store_settings(&f.st, &ds_b, &s);
-        crate::settings::store_runtime(
-            &f.st,
-            &ds_b,
-            &crate::settings::ASSISTANT,
-            &json!({ "send": "rows" }),
-        )
-        .unwrap();
+        // Neither GraphRAG nor assistant runtime settings are rewritten for B here: both
+        // survived A's delayed `volatile.forget`.
         let st_cb2 = f.st.clone();
         let s_cb2 = s.clone();
         let ds_c_slot: Arc<parking_lot::Mutex<Option<Arc<Dataset>>>> =
@@ -2869,9 +2938,214 @@ async fn circuit_refresh_in_memory_delete_and_retired_build_do_not_clobber_repla
             "retired build on deleted B must not leave a circuit attached under org"
         );
         assert!(
-            !f.st.graphrag.figures().contains_key("org"),
+            !f.st.graphrag.figures(&f.st).contains_key("org"),
             "retired build on deleted B must not publish figures under org"
         );
+    })
+    .await
+    .unwrap();
+}
+
+/// R4-1 & R4-2: UUID-keyed `Volatile` runtime settings and `GraphragRuntime::figures`
+/// carry atomically across in-memory rename without racing with destination updates,
+/// source-name reuse, or destination delete-and-reuse during the rename window.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_in_memory_rename_preserves_runtime_settings_and_figures() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    use crate::graphrag::settings::RefreshMode;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mock = MockModel::start(|r, _| (200, mock::openai(&answer(r))));
+    let dir = tempfile::tempdir().unwrap();
+    let models = models_for(&mock.url(), &json!({ "provider": "p", "model": "m" }));
+    let mut st = AppState::new(dir.path(), Default::default(), Duration::from_secs(30)).unwrap();
+    st.models = arc_swap::ArcSwapOption::from_pointee(models);
+    let st = Arc::new(st);
+
+    let ds_org = st.create("org", DbType::Mem).unwrap();
+    ds_org
+        .store
+        .load(&[Source::from_bytes(
+            data(4).into_bytes(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        let _mock = mock;
+        let _dir = dir;
+        // --- Part 1: Same owner updates settings & figures at destination, while source
+        // name is recreated with distinct settings & figures during the rename hook. ---
+        let s_initial = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1 }
+        }));
+        let s_updated = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 2 }
+        }));
+        let s_disabled = settings(json!({
+            "enabled": false,
+            "projection": { "graphs": [ORG] }
+        }));
+        store_settings(&st, &ds_org, &s_initial);
+        crate::settings::store_runtime(
+            &st,
+            &ds_org,
+            &crate::settings::ASSISTANT,
+            &json!({ "send": "rows" }),
+        )
+        .unwrap();
+        run(&Run {
+            st: &st,
+            ds: ds_org.clone(),
+            settings: s_initial.clone(),
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: String::new(),
+            cancel: Default::default(),
+            limits: Default::default(),
+        })
+        .unwrap();
+        st.graphrag.record_anomaly_if_live(
+            &st,
+            &ds_org,
+            super::super::budget::Anomaly {
+                provider: "p".into(),
+                model: "m".into(),
+                source: super::super::budget::Source::ByteBound,
+                reserved: 10,
+                reported: 50,
+            },
+        );
+        let pre_tokens = st.graphrag.figures(&st)["org"].tokens["build"];
+        assert!(pre_tokens > 0);
+        drop(ds_org);
+
+        let st_cb = st.clone();
+        let s_upd_cb = s_updated.clone();
+        let s_dis_cb = s_disabled.clone();
+        let hook1_fired = Arc::new(AtomicBool::new(false));
+        let hook1_flag = hook1_fired.clone();
+        let _guard1 = crate::state::tests::set_rename_after_catalog_hook(move |from, to| {
+            if from == "org" && to == "org2" {
+                hook1_flag.store(true, Ordering::SeqCst);
+                let ds_to = st_cb.datasets().get("org2").cloned().unwrap();
+                let id_to = ds_to.store.dataset_id();
+                // Destination immediately sees carried runtime settings and pre-rename figures.
+                let eff_to: GraphragSettings =
+                    crate::settings::effective(&st_cb, &ds_to, &crate::settings::GRAPHRAG);
+                assert!(eff_to.enabled && eff_to.refresh.debounce_seconds == 1);
+                let figs_before = st_cb.graphrag.figures(&st_cb);
+                assert_eq!(figs_before["org2"].anomalies, 1);
+                assert_eq!(figs_before["org2"].tokens["build"], pre_tokens);
+
+                // Update destination's runtime settings and publish newer figures during the hook.
+                store_settings(&st_cb, &ds_to, &s_upd_cb);
+                st_cb.graphrag.update_if_live(&st_cb, "org2", id_to, |fig| {
+                    fig.stale = 7;
+                    fig.anomalies += 1;
+                    *fig.tokens.entry("refresh").or_default() += 42;
+                });
+
+                // Reuse the source name with a brand-new dataset, distinct settings and figures.
+                let ds_new_src = st_cb.create("org", DbType::Mem).unwrap();
+                store_settings(&st_cb, &ds_new_src, &s_dis_cb);
+                st_cb.graphrag.update_if_live(
+                    &st_cb,
+                    "org",
+                    ds_new_src.store.dataset_id(),
+                    |fig| {
+                        fig.stale = 99;
+                    },
+                );
+            }
+        });
+        st.rename("org", "org2").unwrap();
+        drop(_guard1);
+        assert!(hook1_fired.load(Ordering::SeqCst));
+
+        let ds_to = st.datasets().get("org2").cloned().unwrap();
+        let eff_to: GraphragSettings =
+            crate::settings::effective(&st, &ds_to, &crate::settings::GRAPHRAG);
+        assert!(
+            eff_to.enabled
+                && eff_to.refresh.mode == RefreshMode::Auto
+                && eff_to.refresh.debounce_seconds == 2,
+            "rename completion must preserve destination's hook-updated runtime settings: {eff_to:?}"
+        );
+        let figs = st.graphrag.figures(&st);
+        assert_eq!(figs["org2"].anomalies, 2);
+        assert_eq!(figs["org2"].stale, 7);
+        assert_eq!(figs["org2"].tokens["build"], pre_tokens);
+        assert_eq!(figs["org2"].tokens["refresh"], 42);
+
+        let ds_reused = st.datasets().get("org").cloned().unwrap();
+        let eff_reused: GraphragSettings =
+            crate::settings::effective(&st, &ds_reused, &crate::settings::GRAPHRAG);
+        assert!(
+            !eff_reused.enabled,
+            "rename completion must not move reused source dataset's runtime settings: {eff_reused:?}"
+        );
+        assert_eq!(figs["org"].stale, 99);
+
+        let mut watches: HashMap<String, Watch> = HashMap::new();
+        tick_once(&st, &mut watches, Instant::now());
+        assert!(
+            st.graphrag.has_refresh_circuit("org2", &ds_to),
+            "renamed destination must keep/attach its refresh circuit with surviving runtime settings"
+        );
+
+        // --- Part 2: Destination is deleted and recreated under a new UUID during the
+        // rename hook; rename completion must neither overwrite nor remove the replacement's
+        // figures or runtime settings. ---
+        let ds_src = st.create("src", DbType::Mem).unwrap();
+        store_settings(&st, &ds_src, &s_initial);
+        st.graphrag
+            .update_if_live(&st, "src", ds_src.store.dataset_id(), |fig| {
+                fig.stale = 3;
+                fig.anomalies = 1;
+            });
+        drop(ds_src);
+
+        let s_replacement = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 5 }
+        }));
+        let st_cb2 = st.clone();
+        let s_rep_cb = s_replacement.clone();
+        let hook2_fired = Arc::new(AtomicBool::new(false));
+        let hook2_flag = hook2_fired.clone();
+        let _guard2 = crate::state::tests::set_rename_after_catalog_hook(move |from, to| {
+            if from == "src" && to == "dst" {
+                hook2_flag.store(true, Ordering::SeqCst);
+                assert!(st_cb2.delete("dst").unwrap());
+                let ds_rep = st_cb2.create("dst", DbType::Mem).unwrap();
+                store_settings(&st_cb2, &ds_rep, &s_rep_cb);
+                st_cb2.graphrag.update_if_live(
+                    &st_cb2,
+                    "dst",
+                    ds_rep.store.dataset_id(),
+                    |fig| {
+                        fig.stale = 11;
+                        fig.anomalies = 4;
+                    },
+                );
+            }
+        });
+        st.rename("src", "dst").unwrap();
+        drop(_guard2);
+        assert!(hook2_fired.load(Ordering::SeqCst));
+
+        let ds_dst = st.datasets().get("dst").cloned().unwrap();
+        let eff_dst: GraphragSettings =
+            crate::settings::effective(&st, &ds_dst, &crate::settings::GRAPHRAG);
+        assert_eq!(eff_dst.refresh.debounce_seconds, 5);
+        let figs2 = st.graphrag.figures(&st);
+        assert_eq!(figs2["dst"].stale, 11);
+        assert_eq!(figs2["dst"].anomalies, 4);
     })
     .await
     .unwrap();

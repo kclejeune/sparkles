@@ -458,7 +458,7 @@ impl Run<'_> {
     }
 
     fn check(&self) -> Result<(), RunError> {
-        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
             Err(RunError::Cancelled)
         } else {
             Ok(())
@@ -589,6 +589,7 @@ impl Run<'_> {
     /// reads the evidence view's snapshot throughout (spec C25, "Reports on accepted
     /// evidence").
     fn prepare(&self, p: &Principal, previous: &BuildState) -> Result<Prepared, RunError> {
+        self.check()?;
         let opts = options_of(self.st, &self.ds, p, self.cancel.clone());
         if self.settings.review_policy.is_some() {
             crate::settings::evidence::require_reconciled(self.st, &self.ds)
@@ -629,7 +630,13 @@ impl Run<'_> {
                 &ctl,
             ),
         }
-        .map_err(failed)?;
+        .map_err(|e| {
+            if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                RunError::Cancelled
+            } else {
+                failed(e)
+            }
+        })?;
         // the footprint lists the evidence graphs whose records the citations name (§6.2)
         let mut footprint_graphs = proj.graphs.clone();
         if let Some(e) = &ev {
