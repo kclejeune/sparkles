@@ -1015,21 +1015,43 @@ fn parse_hex_u32(bytes: &[u8]) -> Option<u32> {
     Some(val)
 }
 
+/// Upper bound on decoded-to-serialized byte expansion for any valid N-Triples
+/// token: an empty plain literal `""` (2 bytes) expands to 39 bytes via its
+/// implicit `xsd:string` datatype (`39 / 2 = 19.5 < 20`), and language-tagged
+/// literals expand by at most `54 / 4 = 13.5` (`""@a`) or `57 / 9 = 6.33`
+/// (`""@a--ltr`).
+const MAX_RDF_DECODED_EXPANSION: usize = 20;
+
 /// Meter decoded UTF-8 bytes of N-Triples text against `RecordKey::MAX_BYTES` before
 /// invoking `oxrdfio`. Valid escape sequences (`\uXXXX`, `\UXXXXXXXX`, and short string
-/// escapes) are charged by their decoded UTF-8 byte width rather than serialized length.
+/// escapes) are charged by their decoded UTF-8 byte width rather than serialized length,
+/// dotted blank-node labels are charged through their final non-dot label character, and
+/// plain or language-tagged literals include their implicit datatype IRI (`xsd:string`,
+/// `rdf:langString`, or `rdf:dirLangString`) to match `term_decoded_bytes`.
 fn preflight_rdf_decoded_bytes(
     text: &str,
     already_decoded: usize,
     control: &Control,
 ) -> Result<()> {
-    if already_decoded.saturating_add(text.len()) <= RecordKey::MAX_BYTES {
+    control.check()?;
+    if already_decoded.saturating_add(text.len().saturating_mul(MAX_RDF_DECODED_EXPANSION))
+        <= RecordKey::MAX_BYTES
+    {
         return Ok(());
     }
+    let xsd_string_len = oxrdf::vocab::xsd::STRING.as_str().len();
+    let rdf_lang_string_len = oxrdf::vocab::rdf::LANG_STRING.as_str().len();
+    let rdf_dir_lang_string_len = oxrdf::vocab::rdf::DIR_LANG_STRING.as_str().len();
+    let dir_lang_delta = rdf_dir_lang_string_len - rdf_lang_string_len;
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum State {
         Outside,
+        InComment,
+        InBlankNode { started: bool, pending_dots: usize },
         InString,
+        AfterString,
+        InLangTag { saw_dash: bool, in_dir: bool },
         InIri,
     }
     let bytes = text.as_bytes();
@@ -1037,9 +1059,25 @@ fn preflight_rdf_decoded_bytes(
     let mut produced = 0usize;
     let mut i = 0usize;
     let mut next_check = 65_536usize;
+    let charge = |produced: &mut usize, add: usize| -> Result<()> {
+        if add > 0 {
+            *produced = produced.saturating_add(add);
+            let prospective = already_decoded.saturating_add(*produced);
+            if prospective > RecordKey::MAX_BYTES {
+                return Err(budget_exceeded(RecordKey::MAX_BYTES, prospective));
+            }
+        }
+        Ok(())
+    };
     while i < bytes.len() {
         if i >= next_check {
             control.check()?;
+            if control.progress.is_some() {
+                control.progress.report(
+                    i as f32 / bytes.len() as f32,
+                    "evidence.binding.rdf.preflight",
+                );
+            }
             next_check = i.saturating_add(65_536);
         }
         let b = bytes[i];
@@ -1060,13 +1098,15 @@ fn preflight_rdf_decoded_bytes(
                     0
                 }
                 b'#' => {
+                    state = State::InComment;
                     i += 1;
-                    while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
-                        i += 1;
-                    }
                     0
                 }
                 b'_' if bytes.get(i + 1) == Some(&b':') => {
+                    state = State::InBlankNode {
+                        started: false,
+                        pending_dots: 0,
+                    };
                     i += 2;
                     0
                 }
@@ -1079,6 +1119,49 @@ fn preflight_rdf_decoded_bytes(
                     1
                 }
             },
+            State::InComment => {
+                if b == b'\n' || b == b'\r' {
+                    state = State::Outside;
+                }
+                i += 1;
+                0
+            }
+            State::InBlankNode {
+                started,
+                pending_dots,
+            } => {
+                if !started {
+                    if b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii() {
+                        state = State::InBlankNode {
+                            started: true,
+                            pending_dots: 0,
+                        };
+                        i += 1;
+                        1
+                    } else {
+                        state = State::Outside;
+                        0
+                    }
+                } else if b == b'.' {
+                    state = State::InBlankNode {
+                        started: true,
+                        pending_dots: pending_dots.saturating_add(1),
+                    };
+                    i += 1;
+                    0
+                } else if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || !b.is_ascii() {
+                    state = State::InBlankNode {
+                        started: true,
+                        pending_dots: 0,
+                    };
+                    i += 1;
+                    pending_dots.saturating_add(1)
+                } else {
+                    // Trailing dots belong to punctuation (e.g. statement terminator), not the label.
+                    state = State::Outside;
+                    0
+                }
+            }
             State::InIri => match b {
                 b'>' => {
                     state = State::Outside;
@@ -1089,7 +1172,7 @@ fn preflight_rdf_decoded_bytes(
                     Some(b'u') if i + 6 <= bytes.len() => {
                         let Some(ch) = parse_hex_u32(&bytes[i + 2..i + 6]).and_then(char::from_u32)
                         else {
-                            return Ok(());
+                            break;
                         };
                         i += 6;
                         ch.len_utf8()
@@ -1098,12 +1181,12 @@ fn preflight_rdf_decoded_bytes(
                         let Some(ch) =
                             parse_hex_u32(&bytes[i + 2..i + 10]).and_then(char::from_u32)
                         else {
-                            return Ok(());
+                            break;
                         };
                         i += 10;
                         ch.len_utf8()
                     }
-                    _ => return Ok(()),
+                    _ => break,
                 },
                 _ => {
                     i += 1;
@@ -1112,7 +1195,7 @@ fn preflight_rdf_decoded_bytes(
             },
             State::InString => match b {
                 b'"' => {
-                    state = State::Outside;
+                    state = State::AfterString;
                     i += 1;
                     0
                 }
@@ -1124,7 +1207,7 @@ fn preflight_rdf_decoded_bytes(
                     Some(b'u') if i + 6 <= bytes.len() => {
                         let Some(ch) = parse_hex_u32(&bytes[i + 2..i + 6]).and_then(char::from_u32)
                         else {
-                            return Ok(());
+                            break;
                         };
                         i += 6;
                         ch.len_utf8()
@@ -1133,27 +1216,85 @@ fn preflight_rdf_decoded_bytes(
                         let Some(ch) =
                             parse_hex_u32(&bytes[i + 2..i + 10]).and_then(char::from_u32)
                         else {
-                            return Ok(());
+                            break;
                         };
                         i += 10;
                         ch.len_utf8()
                     }
-                    _ => return Ok(()),
+                    _ => break,
                 },
                 _ => {
                     i += 1;
                     1
                 }
             },
-        };
-        if add > 0 {
-            produced = produced.saturating_add(add);
-            let prospective = already_decoded.saturating_add(produced);
-            if prospective > RecordKey::MAX_BYTES {
-                return Err(budget_exceeded(RecordKey::MAX_BYTES, prospective));
+            State::AfterString => match b {
+                b' ' | b'\t' => {
+                    i += 1;
+                    0
+                }
+                b'^' if bytes.get(i + 1) == Some(&b'^') => {
+                    state = State::Outside;
+                    i += 2;
+                    0
+                }
+                b'@' => {
+                    state = State::InLangTag {
+                        saw_dash: false,
+                        in_dir: false,
+                    };
+                    i += 1;
+                    rdf_lang_string_len
+                }
+                _ => {
+                    state = State::Outside;
+                    xsd_string_len
+                }
+            },
+            State::InLangTag { saw_dash, in_dir } => {
+                if !in_dir {
+                    if b.is_ascii_alphanumeric() {
+                        state = State::InLangTag {
+                            saw_dash: false,
+                            in_dir: false,
+                        };
+                        i += 1;
+                        if saw_dash { 2 } else { 1 }
+                    } else if b == b'-' {
+                        if saw_dash {
+                            state = State::InLangTag {
+                                saw_dash: false,
+                                in_dir: true,
+                            };
+                            i += 1;
+                            dir_lang_delta
+                        } else {
+                            state = State::InLangTag {
+                                saw_dash: true,
+                                in_dir: false,
+                            };
+                            i += 1;
+                            0
+                        }
+                    } else {
+                        state = State::Outside;
+                        0
+                    }
+                } else if b.is_ascii_alphabetic() {
+                    i += 1;
+                    0
+                } else {
+                    state = State::Outside;
+                    0
+                }
             }
-        }
+        };
+        charge(&mut produced, add)?;
     }
+    if state == State::AfterString {
+        charge(&mut produced, xsd_string_len)?;
+    }
+    control.check()?;
     Ok(())
 }
 
@@ -2380,4 +2521,191 @@ pub fn find_dependents(
             "depth": d.depth,
         })).collect::<Vec<_>>(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::Progress;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn preflight_charges_dotted_blank_node_labels_and_skips_trailing_dots() {
+        let ctl = Control::none();
+
+        // 5 MiB dotted blank-node label `_:a....z` on top of 12 MiB already decoded
+        // must fail directly in preflight before invoking `oxrdfio`.
+        let dotted_5m = format!(
+            "_:a{}z <https://example.org/p> <https://example.org/o>",
+            ".".repeat(5 * 1024 * 1024)
+        );
+        let err = preflight_rdf_decoded_bytes(&dotted_5m, 12 << 20, &ctl).unwrap_err();
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded for 5 MiB dotted blank node, got {err:?}"
+        );
+
+        // Exact boundary match against `triple_decoded_bytes` for a dotted label.
+        let dotted_1k = format!("_:a{}z <urn:p> <urn:o>", ".".repeat(1_000));
+        let parsed = parse_triple("triple", &dotted_1k).unwrap();
+        let exact = triple_decoded_bytes(&parsed);
+        assert_eq!(exact, 1_002 + 5 + 5);
+        preflight_rdf_decoded_bytes(&dotted_1k, RecordKey::MAX_BYTES - exact, &ctl).unwrap();
+        let err = preflight_rdf_decoded_bytes(&dotted_1k, RecordKey::MAX_BYTES - exact + 1, &ctl)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded 1 byte past dotted label boundary, got {err:?}"
+        );
+
+        // Trailing dots belong to punctuation, not the blank-node label.
+        preflight_rdf_decoded_bytes("_:abc.", RecordKey::MAX_BYTES - 3, &ctl).unwrap();
+        let err =
+            preflight_rdf_decoded_bytes("_:abc.", RecordKey::MAX_BYTES - 2, &ctl).unwrap_err();
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded 1 byte past trailing-dot blank node, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_charges_implicit_literal_datatypes() {
+        let ctl = Control::none();
+
+        // Plain literal (`xsd:string` = 39 bytes).
+        let plain = "\"hello\"";
+        let plain_bytes = term_decoded_bytes(&parse_term_with(|| "lit", plain).unwrap());
+        assert_eq!(plain_bytes, 5 + oxrdf::vocab::xsd::STRING.as_str().len());
+        preflight_rdf_decoded_bytes(plain, RecordKey::MAX_BYTES - plain_bytes, &ctl).unwrap();
+        let err = preflight_rdf_decoded_bytes(plain, RecordKey::MAX_BYTES - plain_bytes + 1, &ctl)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded via implicit xsd:string datatype, got {err:?}"
+        );
+
+        // Plain literal followed by a trailing comment inside a triple.
+        let plain_triple = "<urn:s> <urn:p> \"hello\" # note";
+        let plain_triple_bytes =
+            triple_decoded_bytes(&parse_triple("triple", "<urn:s> <urn:p> \"hello\"").unwrap());
+        assert_eq!(plain_triple_bytes, 5 + 5 + plain_bytes);
+        preflight_rdf_decoded_bytes(
+            plain_triple,
+            RecordKey::MAX_BYTES - plain_triple_bytes,
+            &ctl,
+        )
+        .unwrap();
+        let err = preflight_rdf_decoded_bytes(
+            plain_triple,
+            RecordKey::MAX_BYTES - plain_triple_bytes + 1,
+            &ctl,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded via implicit xsd:string before comment, got {err:?}"
+        );
+
+        // Language-tagged literal (`rdf:langString` = 53 bytes + language tag).
+        let lang = "\"hello\"@en";
+        let lang_bytes = term_decoded_bytes(&parse_term_with(|| "lit", lang).unwrap());
+        assert_eq!(
+            lang_bytes,
+            5 + oxrdf::vocab::rdf::LANG_STRING.as_str().len() + 2
+        );
+        preflight_rdf_decoded_bytes(lang, RecordKey::MAX_BYTES - lang_bytes, &ctl).unwrap();
+        let err = preflight_rdf_decoded_bytes(lang, RecordKey::MAX_BYTES - lang_bytes + 1, &ctl)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded via implicit rdf:langString datatype, got {err:?}"
+        );
+
+        // Directional language-tagged literal (`rdf:dirLangString` = 56 bytes + language tag).
+        let dir_lang = "\"hello\"@en-US--ltr";
+        let dir_lang_bytes = term_decoded_bytes(&parse_term_with(|| "lit", dir_lang).unwrap());
+        assert_eq!(
+            dir_lang_bytes,
+            5 + oxrdf::vocab::rdf::DIR_LANG_STRING.as_str().len() + 5
+        );
+        preflight_rdf_decoded_bytes(dir_lang, RecordKey::MAX_BYTES - dir_lang_bytes, &ctl).unwrap();
+        let err =
+            preflight_rdf_decoded_bytes(dir_lang, RecordKey::MAX_BYTES - dir_lang_bytes + 1, &ctl)
+                .unwrap_err();
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded via implicit rdf:dirLangString datatype, got {err:?}"
+        );
+
+        // Explicitly typed literal (with and without spaces before `^^`) must not double-charge.
+        for typed in ["\"hello\"^^<urn:dt>", "\"hello\" ^^ <urn:dt>"] {
+            let typed_bytes = term_decoded_bytes(&parse_term_with(|| "lit", typed).unwrap());
+            assert_eq!(typed_bytes, 5 + 6);
+            preflight_rdf_decoded_bytes(typed, RecordKey::MAX_BYTES - typed_bytes, &ctl).unwrap();
+            let err =
+                preflight_rdf_decoded_bytes(typed, RecordKey::MAX_BYTES - typed_bytes + 1, &ctl)
+                    .unwrap_err();
+            assert!(
+                matches!(err, Error::BudgetExceeded(_)),
+                "expected BudgetExceeded 1 byte past explicit datatype boundary, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_checks_cancellation_during_long_comment_and_at_eof() {
+        // (a) Multi-megabyte comment cancels at the next 64 KiB checkpoint mid-comment.
+        let long_comment = format!("# {}\n<urn:s> <urn:p> <urn:o>", "x".repeat(4 * 1024 * 1024));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let ctl = Control {
+            progress: Progress::new({
+                let cancel = cancel.clone();
+                let checkpoints = checkpoints.clone();
+                move |_, stage| {
+                    if stage == "evidence.binding.rdf.preflight" {
+                        checkpoints.fetch_add(1, Ordering::SeqCst);
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+            }),
+            ..Control::with_cancel(cancel)
+        };
+        let err = preflight_rdf_decoded_bytes(&long_comment, 0, &ctl).unwrap_err();
+        assert!(
+            matches!(err, Error::Cancelled),
+            "expected Cancelled mid-comment, got {err:?}"
+        );
+        assert_eq!(
+            checkpoints.load(Ordering::SeqCst),
+            1,
+            "scanner must stop at the very next 64 KiB checkpoint inside the comment"
+        );
+
+        // (b) Comment ending at EOF without a newline catches cancellation in the final check
+        // even when cancelled between its last periodic 64 KiB checkpoint and EOF.
+        let eof_comment = format!("# {}", "x".repeat(100_000));
+        let eof_cancel = Arc::new(AtomicBool::new(false));
+        let eof_checkpoints = Arc::new(AtomicUsize::new(0));
+        let eof_ctl = Control {
+            progress: Progress::new({
+                let cancel = eof_cancel.clone();
+                let checkpoints = eof_checkpoints.clone();
+                move |_, stage| {
+                    if stage == "evidence.binding.rdf.preflight" {
+                        checkpoints.fetch_add(1, Ordering::SeqCst);
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+            }),
+            ..Control::with_cancel(eof_cancel)
+        };
+        let mut decoded = RecordKey::MAX_BYTES - 1024;
+        let err = parse_triple_metered("triple", &eof_comment, &mut decoded, &eof_ctl).unwrap_err();
+        assert!(
+            matches!(err, Error::Cancelled),
+            "expected Cancelled at EOF before oxrdfio parses empty comment, got {err:?}"
+        );
+        assert_eq!(eof_checkpoints.load(Ordering::SeqCst), 1);
+    }
 }
