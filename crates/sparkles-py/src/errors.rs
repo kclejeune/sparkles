@@ -65,6 +65,7 @@ pub fn engine(py: Python<'_>, e: sparkles::Error) -> PyErr {
         E::BudgetExceeded(b) => {
             let err = new_err(py, "BudgetExceededError", msg);
             let v = err.value(py);
+            let _ = v.setattr("code", code);
             let _ = v.setattr("kind", b.kind.as_str());
             let _ = v.setattr("limit", b.limit);
             let _ = v.setattr("requested", b.requested);

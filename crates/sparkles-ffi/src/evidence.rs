@@ -1,9 +1,9 @@
 //! UniFFI exports for evidence settings, holds, reference resolution, proposals,
-//! reviews, withdrawals, identity resolution and dependent lookups (spec C25, item 509).
+//! reviews, withdrawals, claim states, identity resolution and dependent lookups
+//! (spec C25, item 509).
 
-use crate::documents::{decode, encode};
+use crate::documents::encode;
 use crate::{FfiDataset, FfiOperation, FfiResult};
-use serde_json::Value;
 use sparkles::evidence::binding;
 use std::sync::Arc;
 
@@ -48,8 +48,7 @@ impl FfiDataset {
 
     pub fn evidence_acquire_hold(&self, request: Vec<u8>) -> FfiResult<Vec<u8>> {
         self.inner.check_writable()?;
-        let req: Value = decode(&request)?;
-        encode(&binding::acquire_hold(&self.inner.ds, &req)?)
+        encode(&binding::acquire_hold_bytes(&self.inner.ds, &request)?)
     }
 
     pub fn evidence_release_hold(&self, id: String) -> FfiResult<bool> {
@@ -64,11 +63,10 @@ impl FfiDataset {
         operation: Arc<FfiOperation>,
     ) -> FfiResult<Vec<u8>> {
         operation.control.check()?;
-        let req: Value = decode(&request)?;
-        encode(&binding::resolve(
+        encode(&binding::resolve_bytes(
             &self.inner.ds,
             branch.as_deref(),
-            &req,
+            &request,
             &operation.control,
         )?)
     }
@@ -83,13 +81,12 @@ impl FfiDataset {
     ) -> FfiResult<Vec<u8>> {
         self.inner.check_writable()?;
         operation.control.check()?;
-        let req: Value = decode(&request)?;
-        encode(&binding::propose(
+        encode(&binding::propose_bytes(
             &self.inner.ds,
             branch.as_deref(),
             principal.as_deref(),
             author.as_deref(),
-            &req,
+            &request,
             &operation.control,
         )?)
     }
@@ -104,13 +101,12 @@ impl FfiDataset {
     ) -> FfiResult<Vec<u8>> {
         self.inner.check_writable()?;
         operation.control.check()?;
-        let req: Value = decode(&request)?;
-        encode(&binding::review(
+        encode(&binding::review_bytes(
             &self.inner.ds,
             branch.as_deref(),
             principal.as_deref(),
             author.as_deref(),
-            &req,
+            &request,
             &operation.control,
         )?)
     }
@@ -125,13 +121,31 @@ impl FfiDataset {
     ) -> FfiResult<Vec<u8>> {
         self.inner.check_writable()?;
         operation.control.check()?;
-        let req: Value = decode(&request)?;
-        encode(&binding::withdraw(
+        encode(&binding::withdraw_bytes(
             &self.inner.ds,
             branch.as_deref(),
             principal.as_deref(),
             author.as_deref(),
-            &req,
+            &request,
+            &operation.control,
+        )?)
+    }
+
+    pub fn evidence_claim_states(
+        &self,
+        branch: Option<String>,
+        at: Option<String>,
+        policy: String,
+        claims: Vec<String>,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Vec<u8>> {
+        operation.control.check()?;
+        encode(&binding::claim_states(
+            &self.inner.ds,
+            branch.as_deref(),
+            at.as_deref(),
+            &policy,
+            &claims,
             &operation.control,
         )?)
     }

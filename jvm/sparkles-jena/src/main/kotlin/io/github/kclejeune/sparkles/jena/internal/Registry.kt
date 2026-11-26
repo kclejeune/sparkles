@@ -73,10 +73,10 @@ internal object Registry {
         }
     }
     @Synchronized
-    fun checkNoTransactionsForDataset(id: String) {
+    fun checkNoTransactionsForDataset(id: String, what: String = "branch capture") {
         for (handle in open.values) if (handle.ownerDatasetId == id) {
             handle.checkNoSink()
-            if (handle.txns.get() != null) throw org.apache.jena.sparql.JenaTransactionException("branch capture runs outside transactions on this dataset's branches")
+            if (handle.txns.get() != null) throw org.apache.jena.sparql.JenaTransactionException("$what runs outside transactions on this dataset's branches")
         }
     }
 

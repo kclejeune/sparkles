@@ -9,12 +9,12 @@
 //! withdrawal that ends it. Otherwise it answers as missing, so a reader learns nothing
 //! about hidden records, and an older decision never stands in for a hidden current one.
 
-use super::{G, PolicyGraphs, State, caller_view_evidence};
+use super::{G, PolicyGraphs, State, caller_view, caller_view_evidence, check_store};
 use crate::access::GraphAccess;
-use crate::evidence::propose::READS_BYTES;
+use crate::evidence::propose::{READS_BYTES, settings_of};
 use crate::managed::{ManagedErrorKind, OwnerKind};
 use crate::task::Control;
-use crate::{Error, Result};
+use crate::{Dataset, Error, Result};
 use oxrdf::{NamedNode, Term, Triple};
 use sparkles_core::evidence::review::{Disposition, MAX_EVIDENCE};
 use sparkles_core::evidence::write::Reads;
@@ -267,6 +267,81 @@ pub fn claim_states(
     control: &Control,
 ) -> Result<Vec<Option<ClaimOccurrence>>> {
     with_policy_claims(view, policy, access, control, |c| c.states(claims))
+}
+
+/// The states of `claims` under the review policy `policy` at the live head of `logical`
+/// (with settings and protections from `main`), for datasets whose configuration history
+/// is not activated. Returns the read commit sequence alongside one entry per claim.
+pub(crate) fn claim_states_live(
+    main: &Dataset,
+    logical: &Dataset,
+    policy: &str,
+    claims: &[NamedNode],
+    access: Option<Arc<GraphAccess>>,
+    control: &Control,
+) -> Result<(u64, Vec<Option<ClaimOccurrence>>)> {
+    control.check()?;
+    check_store(main, logical)?;
+    let head = logical.store().snapshot();
+    if let Some(a) = access.as_deref() {
+        a.validate_bound_snapshot(&head)?;
+    }
+    let (settings, _) = match settings_of(main) {
+        Ok(pair) => pair,
+        Err(Error::Managed(ref m)) if m.kind == ManagedErrorKind::UnsupportedProfile => {
+            return Err(unknown_policy(policy));
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(p) = settings.policies.get(policy).filter(|_| settings.enabled) else {
+        return Err(unknown_policy(policy));
+    };
+    for g in [&p.decisions, &p.supports, &p.output] {
+        if !can_read(access.as_ref(), g) {
+            return Err(unknown_policy(policy));
+        }
+    }
+    let registry = main.store().managed_snapshot()?;
+    let nonce = |g: &str| -> Option<Uuid> {
+        registry.as_ref().and_then(|s| {
+            s.graphs
+                .owners
+                .get(&OwnerKind::Evidence)
+                .filter(|e| e.graphs.iter().any(|x| x == g))
+                .and_then(|e| e.protections.get(g).copied())
+        })
+    };
+    let graphs = PolicyGraphs::with_nonces(policy, p, &nonce)?;
+    let claim_graphs: Vec<G> = settings
+        .proposals
+        .iter()
+        .map(|g| (NamedNode::new_unchecked(g), nonce(g)))
+        .collect();
+    let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
+    let all = access
+        .clone()
+        .or_else(|| Some(Arc::new(GraphAccess::all())));
+    let seen = caller_view(all.as_ref(), &head, &preparation)?;
+    let state = State {
+        reads: Reads::new(&preparation, &head),
+        seen: seen.as_ref().map(|v| Reads::from_prepared(&preparation, v)),
+        claim_graphs,
+        superseded: BTreeSet::new(),
+        withdrawn: BTreeSet::new(),
+    };
+    let mut policy_claims = PolicyClaims {
+        state,
+        access,
+        graphs,
+        version: p.version,
+        settings,
+        control: control.clone(),
+    };
+    policy_claims
+        .state
+        .check_projection(&policy_claims.graphs, None)?;
+    let occurrences = policy_claims.states(claims)?;
+    Ok((head.commit, occurrences))
 }
 
 impl PolicyClaims<'_> {

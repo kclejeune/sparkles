@@ -1662,6 +1662,19 @@ impl Store {
         set.table.lock().branches.iter().map(|b| b.id).collect()
     }
 
+    /// The ids and current names of `main` and every listed branch, read from the
+    /// branch table without opening any branch store or taking any writer lock.
+    pub fn listed_branch_names(&self) -> HashMap<uuid::Uuid, String> {
+        let mut names = HashMap::new();
+        names.insert(self.owner_dataset_id(), MAIN.to_string());
+        if let SetRef::Owner(set) = &self.branching.set {
+            for b in &set.table.lock().branches {
+                names.insert(b.id, b.name.clone());
+            }
+        }
+        names
+    }
+
     pub fn listed_branch_name(
         &self,
         id: uuid::Uuid,

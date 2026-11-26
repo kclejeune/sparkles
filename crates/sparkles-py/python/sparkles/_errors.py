@@ -33,6 +33,8 @@ __all__ = [
 class SparklesError(Exception):
     """The root of the engine's exceptions."""
 
+    code: str | None
+
 
 class ParseError(SparklesError, SyntaxError):
     """Text that does not parse: SPARQL, RDF, rules, shapes or a ShEx schema."""

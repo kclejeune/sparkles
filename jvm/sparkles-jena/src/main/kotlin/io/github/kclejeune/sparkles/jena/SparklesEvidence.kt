@@ -13,7 +13,7 @@ import org.apache.jena.atlas.json.JsonObject
 public class SparklesEvidence internal constructor(private val owner: DatasetGraphSparkles) {
     private fun checkWrite(what: String) {
         owner.checkNoTxn(what)
-        Registry.checkNoTransactionsForDataset(owner.handle.ownerDatasetId)
+        Registry.checkNoTransactionsForDataset(owner.handle.ownerDatasetId, what)
     }
 
     private fun checkLiveRead(what: String) {
@@ -216,6 +216,29 @@ public class SparklesEvidence internal constructor(private val owner: DatasetGra
                     operation.native,
                 )
             },
+        ).asObject
+    }
+
+    /** Read the review states, current decisions and origins of [claims] under [policy]. */
+    @JvmOverloads
+    public fun claimStates(
+        policy: String,
+        claims: List<String>,
+        branch: String? = null,
+        at: String? = null,
+    ): JsonObject = SparklesOperation().use { claimStates(policy, claims, branch, at, it) }
+
+    /** Read the review states, current decisions and origins of [claims] with an explicit [operation]. */
+    public fun claimStates(
+        policy: String,
+        claims: List<String>,
+        branch: String?,
+        at: String?,
+        operation: SparklesOperation,
+    ): JsonObject {
+        checkLiveRead("evidence.claimStates")
+        return document(
+            ffi { owner.handle.ffi.evidenceClaimStates(branch, at, policy, claims, operation.native) },
         ).asObject
     }
 

@@ -4,6 +4,8 @@ withdrawals, identity resolution and dependent lookups through Python bindings (
 from __future__ import annotations
 
 import hashlib
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -11,10 +13,14 @@ from typing import Any
 import pytest
 
 from sparkles import (
+    BudgetExceededError,
+    CancelToken,
+    CancelledError,
     ConflictError,
     Dataset,
     InvalidInputError,
     NotFoundError,
+    QueryTimeoutError,
     UnsupportedError,
 )
 
@@ -402,8 +408,11 @@ def test_evidence_closed_dataset_and_transaction_guards(tmp_path: Path) -> None:
     ds.evidence.configure(_settings())
     ds.update("INSERT DATA { <https://example.org/a> <https://example.org/p> '1' }")
 
-    # Active transaction on this thread refuses all mutating evidence operations.
+    # Active transaction on this thread refuses all mutating evidence operations,
+    # while hold listing (table-only read) succeeds without deadlocking.
     with ds.transaction():
+        holds_in_txn = ds.evidence.holds()
+        assert holds_in_txn["heldCommits"] == 0
         with pytest.raises(ConflictError, match="open transaction"):
             ds.evidence.configure(_settings())
         with pytest.raises(ConflictError, match="open transaction"):
@@ -426,7 +435,33 @@ def test_evidence_closed_dataset_and_transaction_guards(tmp_path: Path) -> None:
         with pytest.raises(ConflictError, match="open transaction"):
             ds.evidence.withdraw({"withdrawals": []})
 
-    # Closed dataset refuses both read and write evidence operations.
+    # Active transaction on a live branch refuses main-handle evidence writes without deadlocking.
+    ds.branches.create("work")
+    work = ds.branch("work")
+    with work.transaction():
+        assert ds.evidence.holds(on_branch="work")["holds"] == []
+        with pytest.raises(ConflictError, match="open transaction"):
+            ds.evidence.configure(_settings())
+        with pytest.raises(ConflictError, match="open transaction"):
+            ds.evidence.detach(ACCEPTED_G)
+        with pytest.raises(ConflictError, match="open transaction"):
+            ds.evidence.acquire_hold([{"commit": 1}])
+        with pytest.raises(ConflictError, match="open transaction"):
+            ds.evidence.propose(_claim_proposal())
+
+    # Active transaction on a retained handle of a deleted branch also refuses configure/detach.
+    ds.branches.create("ephemeral")
+    retained = ds.branch("ephemeral")
+    ds.branches.delete("ephemeral")
+    with retained.transaction():
+        with pytest.raises(ConflictError, match="open transaction"):
+            ds.evidence.configure(_settings())
+        with pytest.raises(ConflictError, match="open transaction"):
+            ds.evidence.detach(ACCEPTED_G)
+    retained.close()
+    work.close()
+
+    # Closed dataset refuses both read and write evidence operations before payload serialization.
     ev = ds.evidence
     ds.close()
     with pytest.raises(InvalidInputError, match="closed"):
@@ -438,6 +473,158 @@ def test_evidence_closed_dataset_and_transaction_guards(tmp_path: Path) -> None:
     with pytest.raises(InvalidInputError, match="closed"):
         ev.resolve([])
     with pytest.raises(InvalidInputError, match="closed"):
+        ev.propose(object())  # type: ignore[arg-type]
+    with pytest.raises(InvalidInputError, match="closed"):
+        ev.review(object())  # type: ignore[arg-type]
+    with pytest.raises(InvalidInputError, match="closed"):
+        ev.withdraw(object())  # type: ignore[arg-type]
+    with pytest.raises(InvalidInputError, match="closed"):
+        ev.claim_states("review-v1", [])
+    with pytest.raises(InvalidInputError, match="closed"):
         ev.resolve_entities("match-v1", ["https://example.org/e/a"])
     with pytest.raises(InvalidInputError, match="closed"):
         ev.find_dependents(["https://example.org/c/1"])
+
+
+def test_evidence_claim_states_branches_cancellation_and_bounds(tmp_path: Path) -> None:
+    with Dataset(tmp_path / "db") as ds:
+        ds.evidence.configure(_settings())
+        ds.branches.create("feat")
+
+        # Branch handle is refused uniformly across all evidence operations.
+        with ds.branch("feat") as br:
+            with pytest.raises(InvalidInputError):
+                br.evidence.settings()
+            with pytest.raises(InvalidInputError):
+                br.evidence.configure({"format": 1, "profile": 1, "enabled": False})
+            with pytest.raises(InvalidInputError):
+                br.evidence.holds()
+            with pytest.raises(InvalidInputError):
+                br.evidence.claim_states("review-v1", [])
+
+        # Unknown branch raises NotFoundError with code="no-such-branch".
+        with pytest.raises(NotFoundError) as exc:
+            ds.evidence.resolve([], branch="missing")
+        assert exc.value.code == "no-such-branch"
+
+        # Propose, read claim_states (unreviewed -> accepted -> withdrawn) on branch "feat".
+        prop = ds.evidence.propose(_claim_proposal(), branch="feat")
+        claim = next(r for r in prop["records"] if r["key"] == "c1")
+
+        unrev = ds.evidence.claim_states(
+            "review-v1",
+            [claim["iri"], "https://example.org/missing"],
+            branch="feat",
+        )
+        assert unrev["policy"] == "review-v1"
+        assert unrev["claims"][0]["state"] == "unreviewed"
+        assert unrev["claims"][0]["origin"] == "source"
+        assert unrev["claims"][1] is None
+
+        feat_head = prop["commit"]
+        rev = ds.evidence.review(
+            {
+                "policy": "review-v1",
+                "policyVersion": 1,
+                "ifHead": feat_head,
+                "decisions": [
+                    {
+                        "key": "d1",
+                        "target": claim["iri"],
+                        "targetDigest": claim["recordDigest"],
+                        "disposition": "accepted",
+                    }
+                ],
+            },
+            branch="feat",
+        )
+        acc = ds.evidence.claim_states("review-v1", [claim["iri"]], branch="feat")
+        assert acc["claims"][0]["state"] == "accepted"
+        assert acc["claims"][0]["decision"] == rev["decisions"][0]["iri"]
+        assert acc["claims"][0]["decisionVersion"] == 1
+
+        ds.evidence.withdraw(
+            {
+                "withdrawals": [
+                    {
+                        "key": "w1",
+                        "target": claim["iri"],
+                        "targetDigest": claim["recordDigest"],
+                    }
+                ]
+            },
+            branch="feat",
+        )
+        wd = ds.evidence.claim_states("review-v1", [claim["iri"]], branch="feat")
+        assert wd["claims"][0]["state"] == "withdrawn"
+
+        # Pre-cancelled CancelToken refuses configure, resolve, and claim_states.
+        tok = CancelToken()
+        tok.cancel()
+        with pytest.raises(CancelledError):
+            ds.evidence.configure(_settings(), cancel=tok)
+        with pytest.raises(CancelledError):
+            ds.evidence.resolve([], cancel=tok)
+        with pytest.raises(CancelledError):
+            ds.evidence.claim_states("review-v1", [claim["iri"]], cancel=tok)
+
+        # Oversized base64 payload raises BudgetExceededError carrying `.code`.
+        oversized = {
+            "revisions": [
+                {
+                    "key": "r1",
+                    "source": "https://example.org/src/big",
+                    "sourceKey": "big",
+                    "content": {"base64": "!" * 22_400_000},
+                }
+            ]
+        }
+        with pytest.raises(BudgetExceededError) as bexc:
+            ds.evidence.propose(oversized)
+        assert bexc.value.code == "budget-exceeded"
+
+
+def test_evidence_configure_timeout_before_and_after_publication(tmp_path: Path) -> None:
+    # 1. Timeout while main writer is held publishes nothing.
+    with Dataset(tmp_path / "before") as ds:
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_main() -> None:
+            with ds.transaction():
+                locked.set()
+                release.wait(5.0)
+
+        t = threading.Thread(target=hold_main)
+        t.start()
+        assert locked.wait(5.0)
+        try:
+            with pytest.raises(QueryTimeoutError):
+                ds.evidence.configure(_settings(), timeout=0.05)
+        finally:
+            release.set()
+            t.join(5.0)
+        assert ds.evidence.settings()["settings"]["enabled"] is False
+        assert ds.evidence.settings()["revision"] == 0
+
+    # 2. Timeout firing during post-publish branch barrier still preserves published status.
+    with Dataset(tmp_path / "after") as ds:
+        ds.branches.create("work")
+        br = ds.branch("work")
+        locked = threading.Event()
+
+        def hold_branch() -> None:
+            with br.transaction():
+                locked.set()
+                time.sleep(0.2)
+
+        t = threading.Thread(target=hold_branch)
+        t.start()
+        assert locked.wait(5.0)
+        try:
+            status = ds.evidence.configure(_settings(), timeout=0.05)
+            assert status["settings"]["enabled"] is True
+            assert status["revision"] == 1
+        finally:
+            t.join(5.0)
+            br.close()

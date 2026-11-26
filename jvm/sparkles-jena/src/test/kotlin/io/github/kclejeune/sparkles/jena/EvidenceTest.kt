@@ -3,6 +3,7 @@ package io.github.kclejeune.sparkles.jena
 import org.apache.jena.atlas.json.JSON
 import org.apache.jena.atlas.json.JsonArray
 import org.apache.jena.atlas.json.JsonObject
+import org.apache.jena.query.QueryCancelledException
 import org.apache.jena.query.TxnType
 import org.apache.jena.sparql.JenaTransactionException
 import org.apache.jena.sparql.exec.QueryExec
@@ -353,6 +354,14 @@ class EvidenceTest {
             )
             assertTrue(withdrawn.bool("committed"))
             assertEquals(1, withdrawn.obj("changed").arr("removed").size)
+            val wdStates = ds.evidence().claimStates(
+                "review-v1",
+                listOf(claim.str("iri"), "https://example.org/missing"),
+            )
+            assertEquals("review-v1", wdStates.str("policy"))
+            assertEquals("withdrawn", wdStates.arr("claims").get(0).asObject.str("state"))
+            assertEquals("source", wdStates.arr("claims").get(0).asObject.str("origin"))
+            assertTrue(wdStates.arr("claims").get(1).isNull)
             assertFalse(
                 QueryExec.dataset(ds)
                     .query("ASK { GRAPH <$acceptedG> { <https://example.org/rel/1> <https://example.org/affectedBy> <https://example.org/cve/1> } }")
@@ -407,6 +416,8 @@ class EvidenceTest {
 
         ds.begin(TxnType.WRITE)
         try {
+            // Table-only hold listing succeeds inside an open write transaction without deadlocking.
+            assertEquals(0L, ds.evidence().holds().get("heldCommits").asNumber.value().toLong())
             assertThrows(JenaTransactionException::class.java) { ds.evidence().configure(settingsJson()) }
             assertThrows(JenaTransactionException::class.java) { ds.evidence().detach(acceptedG) }
             assertThrows(JenaTransactionException::class.java) {
@@ -429,6 +440,54 @@ class EvidenceTest {
             ds.end()
         }
 
+        // Open transaction on a live branch refuses main-handle evidence writes with accurate message.
+        ds.branches().create("work")
+        ds.branch("work").use { br ->
+            br.begin(TxnType.WRITE)
+            try {
+                val txErr = assertThrows(JenaTransactionException::class.java) {
+                    ds.evidence().configure(settingsJson())
+                }
+                assertTrue(
+                    txErr.message?.contains("evidence.configure") == true,
+                    "expected evidence.configure in message, got: ${txErr.message}",
+                )
+            } finally {
+                br.abort()
+                br.end()
+            }
+
+            // Branch handles refuse all evidence operations uniformly with SparklesInvalidException.
+            assertThrows(SparklesInvalidException::class.java) { br.evidence().settings() }
+            assertThrows(SparklesInvalidException::class.java) { br.evidence().holds() }
+            assertThrows(SparklesInvalidException::class.java) {
+                br.evidence().configure(settingsJson(enabled = false))
+            }
+            assertThrows(SparklesInvalidException::class.java) {
+                br.evidence().claimStates("review-v1", emptyList())
+            }
+        }
+
+        // Unknown branch surfaces as SparklesNotFoundException with code="no-such-branch".
+        val missingBranch = assertThrows(SparklesNotFoundException::class.java) {
+            ds.evidence().resolve(JsonArray(), branch = "missing")
+        }
+        assertEquals("no-such-branch", missingBranch.code)
+
+        // Pre-cancelled SparklesOperation refuses controlled evidence calls.
+        SparklesOperation().use { op ->
+            op.cancel()
+            assertThrows(QueryCancelledException::class.java) {
+                ds.evidence().configure(settingsJson(), op)
+            }
+            assertThrows(QueryCancelledException::class.java) {
+                ds.evidence().resolve(JsonArray(), null, op)
+            }
+            assertThrows(QueryCancelledException::class.java) {
+                ds.evidence().claimStates("review-v1", emptyList(), null, null, op)
+            }
+        }
+
         val ev = ds.evidence()
         ds.close()
         assertThrows(SparklesInvalidException::class.java) { ev.settings() }
@@ -436,10 +495,24 @@ class EvidenceTest {
         assertThrows(SparklesInvalidException::class.java) { ev.resolve(JsonArray()) }
         assertThrows(SparklesInvalidException::class.java) { ev.configure(settingsJson()) }
         assertThrows(SparklesInvalidException::class.java) {
+            ev.claimStates("review-v1", emptyList())
+        }
+        assertThrows(SparklesInvalidException::class.java) {
             ev.resolveEntities("match-v1", listOf("https://example.org/e/a"))
         }
         assertThrows(SparklesInvalidException::class.java) {
             ev.findDependents(listOf("https://example.org/c/1"))
+        }
+
+        // Read-only dataset refuses mutating evidence operations.
+        SparklesDatasets.open(tmp.resolve("db"), SparklesOptions.builder().readOnly(true).build()).use { ro ->
+            assertTrue(ro.evidence().settings().obj("settings").bool("enabled"))
+            assertThrows(SparklesNotPermittedException::class.java) {
+                ro.evidence().configure(settingsJson())
+            }
+            assertThrows(SparklesNotPermittedException::class.java) {
+                ro.evidence().propose(proposalJson())
+            }
         }
     }
 }

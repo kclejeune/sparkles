@@ -54,6 +54,14 @@ fn err(e: EngineError) -> napi::Error {
         EngineError::Component(c) if c.code == "invalid-manchester" => "InvalidInputError",
         // a strict classification that would leave axioms out
         EngineError::Component(c) if c.component == "classifier" => "UnsupportedError",
+        EngineError::Branch(b) => match b.kind {
+            sparkles::branch::BranchErrorKind::Invalid => "InvalidInputError",
+            sparkles::branch::BranchErrorKind::Forbidden => "PermissionDeniedError",
+            sparkles::branch::BranchErrorKind::NotFound
+            | sparkles::branch::BranchErrorKind::Gone => "NotFoundError",
+            sparkles::branch::BranchErrorKind::Conflict => "ConflictError",
+            sparkles::branch::BranchErrorKind::Unsupported => "UnsupportedError",
+        },
         EngineError::Managed(m) => {
             use sparkles::managed::ManagedErrorKind as K;
             match m.kind {
@@ -108,6 +116,8 @@ fn err(e: EngineError) -> napi::Error {
             .map(|f| f.json())
             .unwrap_or_else(|| json!({})),
         EngineError::Component(c) if c.component == "classifier" => json!({ "code": c.code }),
+        EngineError::Branch(b) => json!({ "code": b.code }),
+        EngineError::HistoryGone(_) => json!({ "code": e.code() }),
         EngineError::Managed(m) => json!({ "code": m.code }),
         EngineError::Io(io) => json!({
             "errno": io.raw_os_error(),

@@ -6,7 +6,7 @@ import type {
   UpdateOptions,
   CommitReceipt,
 } from '@sparkles-rdf/common';
-import { QueryTimeoutError, decodeTerm, unsigned } from '@sparkles-rdf/common';
+import { InvalidInputError, QueryTimeoutError, decodeTerm, unsigned } from '@sparkles-rdf/common';
 export type Configuration = Record<string, unknown>;
 export interface CommitInfo {
   seq: bigint;
@@ -804,7 +804,7 @@ export interface DlQueryAnswer extends OntologyState {
 export interface EvidenceSettingsStatus {
   settings: Configuration;
   digest: string | null;
-  revision: number;
+  revision: bigint;
   managed: string[];
   detached: string[];
 }
@@ -880,7 +880,7 @@ export interface EvidenceProjectionChange {
 export interface EvidenceMapChange {
   policy: string;
   revision: string;
-  number: number;
+  number: bigint;
   previous: string | null;
   decisionsAdded: string[];
   decisionsEnded: string[];
@@ -935,9 +935,69 @@ export interface EvidenceWithdrawResult {
   changed: EvidenceChanged;
   dryRun?: EvidenceDryRun;
 }
+/** A verified stored-fact reference. */
+export interface EvidenceResolvedStoredFact {
+  key: string;
+  storedFact: {
+    datasetId: string;
+    branchId: string;
+    commit: bigint;
+    servedBy: string;
+    graph: string | null;
+    reifier: string | null;
+  };
+}
+/** Verified character span of a resolved passage record. */
+export interface EvidenceResolvedSpan {
+  rendition: string;
+  start: bigint;
+  end: bigint;
+  textDigest: string;
+}
+/** A verified authenticated evidence record reference. */
+export interface EvidenceResolvedRecord {
+  key: string;
+  record: {
+    iri: string;
+    kind: string;
+    graph: string;
+    receipt: {
+      iri: string;
+      datasetId: string;
+      branchId: string;
+      commit: bigint;
+    };
+    contentDigest: string | null;
+    recordDigest: string | null;
+    span: EvidenceResolvedSpan | null;
+  };
+}
+/** One resolved reference returned by `evidence.resolve`. */
+export type EvidenceResolvedReference = EvidenceResolvedStoredFact | EvidenceResolvedRecord;
 /** Outcome of resolving stored-fact and record references. */
 export interface EvidenceResolveResult {
-  resolved: Configuration[];
+  resolved: EvidenceResolvedReference[];
+}
+/** Review state, current decision and origin of one claim occurrence. */
+export interface EvidenceClaimOccurrence {
+  claim: string;
+  graph: string;
+  state: 'accepted' | 'rejected' | 'needs-evidence' | 'unreviewed' | 'withdrawn';
+  decision: string | null;
+  decisionVersion: number | null;
+  kind: 'reported' | 'observation' | 'hypothesis' | 'preference';
+  polarity: 'positive' | 'negative' | 'uncertain';
+  proposition: string;
+  revision: string | null;
+  source: string | null;
+  by: string | null;
+  origin: 'instructions' | 'source';
+}
+/** Outcome of reading claim states under a review policy. */
+export interface EvidenceClaimStatesResult {
+  policy: string;
+  commit: bigint;
+  claims: (EvidenceClaimOccurrence | null)[];
 }
 /** Resolution of one entity through a matching policy's resolution map. */
 export interface EvidenceResolvedEntity {
@@ -951,7 +1011,7 @@ export interface EvidenceResolvedEntity {
 export interface EvidenceEntitiesResult {
   policy: string;
   revision: string | null;
-  number: number;
+  number: bigint;
   commit: bigint;
   entities: EvidenceResolvedEntity[];
 }
@@ -1920,84 +1980,110 @@ export class Administration {
     };
     const evidenceOpts = (o?: OperationOptions): OperationOptions | undefined =>
       o ? { signal: o.signal, timeout: o.timeout } : undefined;
+    const evidenceWriteOpts = (o?: OperationOptions): OperationOptions =>
+      ({ ...(evidenceOpts(o) ?? {}), answersWhenStopped: true }) as OperationOptions;
     this.evidence = {
-      settings: (o?: OperationOptions) =>
-        call<EvidenceSettingsStatus>('evidence.settings', {}, evidenceOpts(o), false),
+      settings: () => call<EvidenceSettingsStatus>('evidence.settings', {}, undefined, false),
       configure: (settings: Configuration | string, o?: OperationOptions) =>
         call<EvidenceSettingsStatus>(
           'evidence.configure',
           typeof settings === 'string' ? { raw: settings } : { settings },
-          evidenceOpts(o),
+          evidenceWriteOpts(o),
           true,
         ),
-      detach: (graph: string, o?: OperationOptions) =>
-        call<EvidenceSettingsStatus>('evidence.detach', { graph }, evidenceOpts(o), true),
-      holds: (
-        options: OperationOptions & { onBranch?: string; after?: string; limit?: number } = {},
-      ) =>
+      detach: (graph: string) =>
+        call<EvidenceSettingsStatus>('evidence.detach', { graph }, undefined, true),
+      holds: async (options: { onBranch?: string; after?: string; limit?: number } = {}) =>
         call<EvidenceHoldsPage>(
           'evidence.holds',
-          { onBranch: options.onBranch, after: options.after, limit: options.limit },
-          evidenceOpts(options),
+          {
+            onBranch: options.onBranch,
+            after: options.after,
+            limit: options.limit === undefined ? undefined : evU32(options.limit, 'limit'),
+          },
+          undefined,
           false,
         ),
-      acquireHold: (
+      acquireHold: async (
         commits: { commit: number | bigint; branch?: string; branchId?: string }[],
-        options: OperationOptions & { id?: string } = {},
+        options: { id?: string } = {},
       ) =>
         call<EvidenceHoldAcquired>(
           'evidence.acquireHold',
-          { ...(options.id !== undefined ? { id: options.id } : {}), commits },
-          evidenceOpts(options),
+          {
+            ...(options.id !== undefined ? { id: options.id } : {}),
+            commits: validateHoldCommits(commits),
+          },
+          undefined,
           true,
         ),
-      releaseHold: (id: string, o?: OperationOptions) =>
-        call<boolean>('evidence.releaseHold', { id }, evidenceOpts(o), true),
-      resolve: (references: Configuration[] | Configuration, options: EvidenceReadOptions = {}) =>
+      releaseHold: (id: string) => call<boolean>('evidence.releaseHold', { id }, undefined, true),
+      resolve: async (
+        references: Configuration[] | Configuration,
+        options: EvidenceReadOptions = {},
+      ) =>
         call<EvidenceResolveResult>(
           'evidence.resolve',
           {
             branch: options.branch,
-            request: Array.isArray(references) ? { references } : references,
+            request: validateResolveRequest(
+              Array.isArray(references) ? { references } : references,
+            ),
           },
           evidenceOpts(options),
           false,
         ),
-      propose: (proposal: Configuration, options: EvidenceWriteOptions = {}) =>
+      propose: async (proposal: Configuration, options: EvidenceWriteOptions = {}) =>
         call<EvidenceProposeResult>(
           'evidence.propose',
           {
             branch: options.branch,
             principal: options.principal,
             author: options.author,
-            request: proposal,
+            request: validateProposeRequest(proposal),
           },
-          evidenceOpts(options),
+          evidenceWriteOpts(options),
           true,
         ),
-      review: (review: Configuration, options: EvidenceWriteOptions = {}) =>
+      review: async (review: Configuration, options: EvidenceWriteOptions = {}) =>
         call<EvidenceReviewResult>(
           'evidence.review',
           {
             branch: options.branch,
             principal: options.principal,
             author: options.author,
-            request: review,
+            request: validateReviewRequest(review),
           },
-          evidenceOpts(options),
+          evidenceWriteOpts(options),
           true,
         ),
-      withdraw: (withdrawal: Configuration, options: EvidenceWriteOptions = {}) =>
+      withdraw: async (withdrawal: Configuration, options: EvidenceWriteOptions = {}) =>
         call<EvidenceWithdrawResult>(
           'evidence.withdraw',
           {
             branch: options.branch,
             principal: options.principal,
             author: options.author,
-            request: withdrawal,
+            request: validateWithdrawRequest(withdrawal),
+          },
+          evidenceWriteOpts(options),
+          true,
+        ),
+      claimStates: async (
+        policy: string,
+        claims: string[],
+        options: EvidenceReadOptions & { at?: string | number | bigint } = {},
+      ) =>
+        call<EvidenceClaimStatesResult>(
+          'evidence.claimStates',
+          {
+            branch: options.branch,
+            at: options.at === undefined ? undefined : at(options.at),
+            policy,
+            claims,
           },
           evidenceOpts(options),
-          true,
+          false,
         ),
       resolveEntities: (policy: string, entities: string[], options: EvidenceReadOptions = {}) =>
         call<EvidenceEntitiesResult>(
@@ -2083,18 +2169,111 @@ const numbers = new Set([
   'version',
   'ifVersion',
 ]);
-export function adminResult(v: any, key = ''): any {
+const evidenceCounts = new Set([...counts, 'revision', 'number', 'start', 'end']);
+
+function evU64(value: unknown, name: string): string {
+  if (typeof value !== 'number' && typeof value !== 'bigint')
+    throw new InvalidInputError(`${name} must be a safe integer or bigint`);
+  return unsigned(value, name);
+}
+function evOptU64(value: unknown, name: string): string | undefined | null {
+  if (value === undefined || value === null) return value;
+  return evU64(value, name);
+}
+function evU32(value: unknown, name: string): number {
+  if (typeof value !== 'number' && typeof value !== 'bigint')
+    throw new InvalidInputError(`${name} must be a safe integer or bigint`);
+  const v = BigInt(unsigned(value, name));
+  if (v > 0xffffffffn) throw new InvalidInputError(`${name} is outside u32`);
+  return Number(v);
+}
+function validateStoredFact(sf: unknown, path: string): unknown {
+  if (!sf || typeof sf !== 'object' || Array.isArray(sf)) return sf;
+  const obj = sf as Configuration;
+  if (!('commit' in obj)) return sf;
+  return { ...obj, commit: evU64(obj.commit, `${path}.commit`) };
+}
+function validateHoldCommits(
+  commits: { commit: number | bigint; branch?: string; branchId?: string }[],
+): unknown {
+  if (!Array.isArray(commits)) return commits;
+  return commits.map((c, i) => {
+    if (!c || typeof c !== 'object' || !('commit' in c)) return c;
+    return { ...c, commit: evU64(c.commit, `commits[${i}].commit`) };
+  });
+}
+function validateResolveRequest(req: Configuration): Configuration {
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return req;
+  if (!Array.isArray(req.references)) return req;
+  return {
+    ...req,
+    references: req.references.map((r, i) => {
+      if (!r || typeof r !== 'object' || !('storedFact' in r)) return r;
+      const obj = r as Configuration;
+      return {
+        ...obj,
+        storedFact: validateStoredFact(obj.storedFact, `references[${i}].storedFact`),
+      };
+    }),
+  };
+}
+function validateProposeRequest(req: Configuration): Configuration {
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return req;
+  const out: Configuration = { ...req };
+  if ('ifHead' in out) out.ifHead = evOptU64(out.ifHead, 'ifHead');
+  if (Array.isArray(out.passages)) {
+    out.passages = out.passages.map((p, i) => {
+      if (!p || typeof p !== 'object' || Array.isArray(p)) return p;
+      const obj = { ...(p as Configuration) };
+      if ('start' in obj) obj.start = evU64(obj.start, `passages[${i}].start`);
+      if ('end' in obj) obj.end = evU64(obj.end, `passages[${i}].end`);
+      return obj;
+    });
+  }
+  if (Array.isArray(out.references)) {
+    out.references = out.references.map((r, i) => {
+      if (!r || typeof r !== 'object' || !('storedFact' in r)) return r;
+      const obj = r as Configuration;
+      return {
+        ...obj,
+        storedFact: validateStoredFact(obj.storedFact, `references[${i}].storedFact`),
+      };
+    });
+  }
+  return out;
+}
+function validateReviewRequest(req: Configuration): Configuration {
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return req;
+  const out: Configuration = { ...req };
+  if ('ifHead' in out) out.ifHead = evU64(out.ifHead, 'ifHead');
+  if ('policyVersion' in out) out.policyVersion = evU32(out.policyVersion, 'policyVersion');
+  return out;
+}
+function validateWithdrawRequest(req: Configuration): Configuration {
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return req;
+  const out: Configuration = { ...req };
+  if ('ifHead' in out) out.ifHead = evOptU64(out.ifHead, 'ifHead');
+  return out;
+}
+
+function decodeAdmin(v: any, key: string, countKeys: Set<string>): any {
   if (['definition', 'config', 'variables', 'data', 'default', 'settings'].includes(key)) return v;
   if (typeof v === 'string' && /^\d+$/.test(v)) {
-    if (counts.has(key)) return BigInt(v);
+    if (countKeys.has(key)) return BigInt(v);
     if (numbers.has(key)) return Number(v);
   }
   if (Array.isArray(v) && key === 'reconstructable') return v.map((pair) => pair.map(BigInt));
-  if (Array.isArray(v)) return v.map((item) => adminResult(item, key));
+  if (Array.isArray(v)) return v.map((item) => decodeAdmin(item, key, countKeys));
   if (v && typeof v === 'object') {
     const out: Record<string, unknown> = {};
-    for (const [k, value] of Object.entries(v)) out[k] = adminResult(value, k);
+    for (const [k, value] of Object.entries(v)) out[k] = decodeAdmin(value, k, countKeys);
     return out;
   }
   return v;
+}
+export function adminResult(v: any, key = ''): any {
+  return decodeAdmin(v, key, counts);
+}
+export function evidenceResult(v: any, key = ''): any {
+  return decodeAdmin(v, key, evidenceCounts);
 }

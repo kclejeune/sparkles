@@ -1659,14 +1659,35 @@ impl PyDataset {
 
 /// Dataset aliases share the transaction owner slot while any alias or transaction
 /// lives, so an alias cannot wait for a writer lock held by its own Python thread.
+/// Keying by `(state_ptr, dataset_id, owner_dataset_id)` prevents an uncollected
+/// closed handle at a reused heap address from shadowing a new dataset's family id,
+/// and lets family-wide guards detect open transactions on any live or retained
+/// deleted branch without taking store or branch-table locks.
+type SlotKey = (usize, u128, u128);
+type Slots =
+    std::collections::HashMap<SlotKey, std::sync::Weak<Mutex<Option<std::thread::ThreadId>>>>;
+
+fn slot_key(ds: &sparkles::Dataset) -> SlotKey {
+    (
+        ds.state() as *const _ as usize,
+        ds.store().dataset_id().as_u128(),
+        ds.store().owner_dataset_id().as_u128(),
+    )
+}
+
+fn writer_slots() -> std::sync::MutexGuard<'static, Slots> {
+    static SLOTS: std::sync::OnceLock<Mutex<Slots>> = std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 fn writer_slot(ds: &sparkles::Dataset) -> WriterSlot {
-    use std::sync::{OnceLock, Weak};
-    type Slots = std::collections::HashMap<usize, Weak<Mutex<Option<std::thread::ThreadId>>>>;
-    static SLOTS: OnceLock<Mutex<Slots>> = OnceLock::new();
-    let mut slots = SLOTS.get_or_init(Default::default).lock().unwrap();
+    let mut slots = writer_slots();
     slots.retain(|_, v| v.strong_count() > 0);
-    let key = ds.state() as *const _ as usize;
-    if let Some(slot) = slots.get(&key).and_then(Weak::upgrade) {
+    let key = slot_key(ds);
+    if let Some(slot) = slots.get(&key).and_then(std::sync::Weak::upgrade) {
         return slot;
     }
     let slot = Arc::new(Mutex::new(None));
@@ -1675,9 +1696,9 @@ fn writer_slot(ds: &sparkles::Dataset) -> WriterSlot {
 }
 
 /// The threads with a load or replacement from a file object in flight on each dataset,
-/// by the key of [`writer_slot`], with how many each has. Kept apart from the
-/// transaction owner, which another thread can hold while a stream write waits for it.
-type StreamCallers = std::collections::HashMap<(usize, std::thread::ThreadId), usize>;
+/// by `(slot_key, thread_id)`, with how many each has. Kept apart from the transaction
+/// owner, which another thread can hold while a stream write waits for it.
+type StreamCallers = std::collections::HashMap<(SlotKey, std::thread::ThreadId), usize>;
 
 fn stream_callers() -> std::sync::MutexGuard<'static, StreamCallers> {
     static CALLERS: std::sync::OnceLock<Mutex<StreamCallers>> = std::sync::OnceLock::new();
@@ -1694,12 +1715,12 @@ fn stream_callers() -> std::sync::MutexGuard<'static, StreamCallers> {
 /// waiting for that lock. The registration ends when this is dropped, on every path,
 /// including an error or a panic.
 struct StreamWrite {
-    key: (usize, std::thread::ThreadId),
+    key: (SlotKey, std::thread::ThreadId),
 }
 
 impl StreamWrite {
     fn begin(ds: &sparkles::Dataset) -> StreamWrite {
-        let key = (ds.state() as *const _ as usize, std::thread::current().id());
+        let key = (slot_key(ds), std::thread::current().id());
         *stream_callers().entry(key).or_insert(0) += 1;
         StreamWrite { key }
     }
@@ -1721,13 +1742,50 @@ impl Drop for StreamWrite {
 /// Checking the shared state also covers aliases obtained through a catalog.
 pub(crate) fn check_transaction(py: Python<'_>, ds: &sparkles::Dataset) -> PyResult<()> {
     let me = std::thread::current().id();
-    let streaming = stream_callers().contains_key(&(ds.state() as *const _ as usize, me));
+    let streaming = stream_callers().contains_key(&(slot_key(ds), me));
     if streaming || *writer_slot(ds).lock().unwrap() == Some(me) {
         return Err(new_err(
             py,
             "ConflictError",
             "this thread has an open transaction on the dataset, or a load or replacement from a file object: finish it before this operation",
         ));
+    }
+    Ok(())
+}
+
+/// Reject waiting for any writer lock in `ds`'s dataset family owned by this Python
+/// thread (including `main`, live branches, aliases, and retained deleted branches)
+/// without acquiring any store or branch-table lock.
+pub(crate) fn check_family_transactions(py: Python<'_>, ds: &sparkles::Dataset) -> PyResult<()> {
+    let me = std::thread::current().id();
+    let owner = ds.store().owner_dataset_id().as_u128();
+    let streaming = stream_callers()
+        .keys()
+        .any(|((_, _, family), tid)| *family == owner && *tid == me);
+    if streaming {
+        return Err(new_err(
+            py,
+            "ConflictError",
+            "this thread has an open transaction on the dataset family, or a load or replacement from a file object: finish it before this operation",
+        ));
+    }
+    let family_slots: Vec<WriterSlot> = {
+        let mut slots = writer_slots();
+        slots.retain(|_, v| v.strong_count() > 0);
+        slots
+            .iter()
+            .filter(|((_, _, family), _)| *family == owner)
+            .filter_map(|(_, weak)| weak.upgrade())
+            .collect()
+    };
+    for slot in family_slots {
+        if *slot.lock().unwrap_or_else(|e| e.into_inner()) == Some(me) {
+            return Err(new_err(
+                py,
+                "ConflictError",
+                "this thread has an open transaction on the dataset family, or a load or replacement from a file object: finish it before this operation",
+            ));
+        }
     }
     Ok(())
 }

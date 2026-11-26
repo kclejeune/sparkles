@@ -126,6 +126,14 @@ impl From<sparkles::Error> for FfiError {
             E::StorageFull(_) => ErrorKind::StorageFull,
             E::PreconditionFailed(_) => ErrorKind::PreconditionFailed,
             E::WriterBusy => ErrorKind::WriterBusy,
+            E::Branch(b) => match b.kind {
+                sparkles::branch::BranchErrorKind::Invalid => ErrorKind::Invalid,
+                sparkles::branch::BranchErrorKind::Forbidden => ErrorKind::NotPermitted,
+                sparkles::branch::BranchErrorKind::NotFound
+                | sparkles::branch::BranchErrorKind::Gone => ErrorKind::NotFound,
+                sparkles::branch::BranchErrorKind::Conflict => ErrorKind::Conflict,
+                sparkles::branch::BranchErrorKind::Unsupported => ErrorKind::Unsupported,
+            },
             E::Patch(p) => match p.kind {
                 sparkles::patch::PatchErrorKind::Syntax => ErrorKind::RdfParse,
                 sparkles::patch::PatchErrorKind::Term => ErrorKind::Invalid,

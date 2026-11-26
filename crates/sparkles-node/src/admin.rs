@@ -114,32 +114,58 @@ fn decode<T: serde::de::DeserializeOwned>(v: &Value) -> sparkles::Result<T> {
 }
 // Encode only engine uint64 metadata. Application JSON and typed config
 // documents retain their lexical/value types across the transport.
-fn meta(v: Value, key: &str) -> Value {
+fn meta_with(v: Value, key: &str, extra_u64: bool) -> Value {
     if matches!(
         key,
         "definition" | "config" | "variables" | "data" | "default" | "settings"
     ) {
         return v;
     }
+    let is_u64 =
+        u64_field(key) || (extra_u64 && matches!(key, "revision" | "number" | "start" | "end"));
     match v {
-        Value::Number(ref n) if u64_field(key) => n
+        Value::Number(ref n) if is_u64 => n
             .as_u64()
             .map(|n| Value::String(n.to_string()))
             .unwrap_or(v),
         Value::Array(a) => Value::Array(
             a.into_iter()
-                .map(|v| meta(v, if key == "reconstructable" { "seq" } else { key }))
+                .map(|v| {
+                    meta_with(
+                        v,
+                        if key == "reconstructable" { "seq" } else { key },
+                        extra_u64,
+                    )
+                })
                 .collect(),
         ),
         Value::Object(o) => Value::Object(
             o.into_iter()
                 .map(|(k, v)| {
-                    let v = meta(v, &k);
+                    let v = meta_with(v, &k, extra_u64);
                     (k, v)
                 })
                 .collect(),
         ),
         _ => v,
+    }
+}
+fn meta(v: Value, key: &str) -> Value {
+    meta_with(v, key, false)
+}
+fn evidence_meta(v: Value) -> Value {
+    meta_with(v, "", true)
+}
+fn evidence_raw_limit(op: &str) -> Option<usize> {
+    use sparkles::evidence::binding;
+    const ENVELOPE_SLACK: usize = 4096;
+    match op {
+        "evidence.configure" => Some(binding::MAX_SETTINGS_BYTES + ENVELOPE_SLACK),
+        "evidence.acquireHold" => Some(binding::MAX_HOLD_BYTES),
+        "evidence.resolve" => Some(binding::MAX_RESOLVE_BYTES + ENVELOPE_SLACK),
+        "evidence.propose" => Some(binding::MAX_CLAIMS_BYTES + ENVELOPE_SLACK),
+        "evidence.review" | "evidence.withdraw" => Some(binding::MAX_REVIEW_BYTES + ENVELOPE_SLACK),
+        _ => None,
     }
 }
 fn u64_field(k: &str) -> bool {
@@ -220,6 +246,28 @@ mod kept_metadata_tests {
         assert_eq!(encoded["result"]["classifiedCommit"], u64::MAX.to_string());
         assert_eq!(encoded["staleCommit"], u64::MAX.to_string());
         assert_eq!(encoded["page"]["offset"], 2);
+    }
+
+    #[test]
+    fn evidence_metadata_keeps_all_u64_bits_without_altering_settings_or_iris() {
+        let encoded = evidence_meta(json!({
+            "revision": u64::MAX,
+            "number": u64::MAX,
+            "commit": u64::MAX,
+            "servedBy": u64::MAX,
+            "map": { "revision": "urn:ev:map:1", "number": u64::MAX },
+            "span": { "start": u64::MAX, "end": u64::MAX },
+            "settings": { "policies": { "main": { "version": 2 } } },
+        }));
+        assert_eq!(encoded["revision"], u64::MAX.to_string());
+        assert_eq!(encoded["number"], u64::MAX.to_string());
+        assert_eq!(encoded["commit"], u64::MAX.to_string());
+        assert_eq!(encoded["servedBy"], u64::MAX.to_string());
+        assert_eq!(encoded["map"]["revision"], "urn:ev:map:1");
+        assert_eq!(encoded["map"]["number"], u64::MAX.to_string());
+        assert_eq!(encoded["span"]["start"], u64::MAX.to_string());
+        assert_eq!(encoded["span"]["end"], u64::MAX.to_string());
+        assert_eq!(encoded["settings"]["policies"]["main"]["version"], 2);
     }
 }
 fn config<T: serde::de::DeserializeOwned>(v: &Value) -> sparkles::Result<T> {
@@ -377,6 +425,7 @@ fn writes(op: &str) -> bool {
             | "evidence.settings"
             | "evidence.holds"
             | "evidence.resolve"
+            | "evidence.claimStates"
             | "evidence.resolveEntities"
             | "evidence.findDependents"
     )
@@ -509,6 +558,9 @@ impl NativeDataset {
         options: String,
         cancel: &Cancellation,
     ) -> napi::Result<String> {
+        if let Some(limit) = evidence_raw_limit(&op) {
+            sparkles::evidence::binding::check_raw_bytes(args.as_bytes(), limit).map_err(err)?;
+        }
         #[cfg(feature = "ontology")]
         let a = if let Some(ontology_op) = op.strip_prefix("ontology.") {
             sparkles::handles::ontology::wire::decode_arguments(ontology_op, args.as_bytes())
@@ -541,11 +593,17 @@ impl NativeDataset {
                 ..sparkles::task::Control::with_cancel(flag.clone())
             };
             ctl.check()?;
-            let result = run_admin(&shared.ds, &op, &a, &v, flag, &ctl)?;
+            let result = if op.starts_with("evidence.") {
+                run_evidence(&shared.ds, &op, a, &ctl)?
+            } else {
+                run_admin(&shared.ds, &op, &a, &v, flag, &ctl)?
+            };
             Ok(if op == "graphql.execute" {
                 result.to_string()
             } else if matches!(op.as_str(), "history.prune" | "reasoning.clear") {
                 Value::String(result.to_string()).to_string()
+            } else if op.starts_with("evidence.") {
+                evidence_meta(result).to_string()
             } else {
                 meta(result, "").to_string()
             })
@@ -1491,6 +1549,22 @@ fn run_admin(
             Value::Null
         }
         "backup" => value(ds.backup(text(a, "path")?)?.display().to_string())?,
+        _ => {
+            return Err(EngineError::unsupported(format!(
+                "unknown or disabled administration operation {op}"
+            )));
+        }
+    })
+}
+
+/// Evidence administration operations, taking ownership of `a` to avoid cloning request trees.
+fn run_evidence(
+    ds: &Dataset,
+    op: &str,
+    mut a: Value,
+    ctl: &sparkles::task::Control,
+) -> sparkles::Result<Value> {
+    Ok(match op {
         "evidence.settings" => sparkles::evidence::binding::settings(ds)?,
         "evidence.configure" => {
             let bytes = if let Some(raw) = a["raw"].as_str() {
@@ -1501,55 +1575,84 @@ fn run_admin(
             };
             sparkles::evidence::binding::configure(ds, &bytes, ctl)?
         }
-        "evidence.detach" => sparkles::evidence::binding::detach(ds, text(a, "graph")?)?,
+        "evidence.detach" => sparkles::evidence::binding::detach(ds, text(&a, "graph")?)?,
         "evidence.holds" => sparkles::evidence::binding::holds(
             ds,
             a["onBranch"].as_str(),
             a["after"].as_str(),
-            optional_number(a, "limit")?
+            optional_number(&a, "limit")?
                 .map(|n| usize::try_from(n).map_err(|_| EngineError::invalid("limit is too large")))
                 .transpose()?,
         )?,
-        "evidence.acquireHold" => sparkles::evidence::binding::acquire_hold(ds, a)?,
-        "evidence.releaseHold" => {
-            Value::Bool(sparkles::evidence::binding::release_hold(ds, text(a, "id")?)?)
+        "evidence.acquireHold" => sparkles::evidence::binding::acquire_hold_value(ds, a)?,
+        "evidence.releaseHold" => Value::Bool(sparkles::evidence::binding::release_hold(
+            ds,
+            text(&a, "id")?,
+        )?),
+        "evidence.resolve" => {
+            let branch = a["branch"].as_str().map(str::to_owned);
+            let req = a["request"].take();
+            sparkles::evidence::binding::resolve_value(ds, branch.as_deref(), req, ctl)?
         }
-        "evidence.resolve" => sparkles::evidence::binding::resolve(
-            ds,
-            a["branch"].as_str(),
-            &a["request"],
-            ctl,
-        )?,
-        "evidence.propose" => sparkles::evidence::binding::propose(
-            ds,
-            a["branch"].as_str(),
-            a["principal"].as_str(),
-            a["author"].as_str(),
-            &a["request"],
-            ctl,
-        )?,
-        "evidence.review" => sparkles::evidence::binding::review(
-            ds,
-            a["branch"].as_str(),
-            a["principal"].as_str(),
-            a["author"].as_str(),
-            &a["request"],
-            ctl,
-        )?,
-        "evidence.withdraw" => sparkles::evidence::binding::withdraw(
-            ds,
-            a["branch"].as_str(),
-            a["principal"].as_str(),
-            a["author"].as_str(),
-            &a["request"],
-            ctl,
-        )?,
+        "evidence.propose" => {
+            let branch = a["branch"].as_str().map(str::to_owned);
+            let principal = a["principal"].as_str().map(str::to_owned);
+            let author = a["author"].as_str().map(str::to_owned);
+            let req = a["request"].take();
+            sparkles::evidence::binding::propose_value(
+                ds,
+                branch.as_deref(),
+                principal.as_deref(),
+                author.as_deref(),
+                req,
+                ctl,
+            )?
+        }
+        "evidence.review" => {
+            let branch = a["branch"].as_str().map(str::to_owned);
+            let principal = a["principal"].as_str().map(str::to_owned);
+            let author = a["author"].as_str().map(str::to_owned);
+            let req = a["request"].take();
+            sparkles::evidence::binding::review_value(
+                ds,
+                branch.as_deref(),
+                principal.as_deref(),
+                author.as_deref(),
+                req,
+                ctl,
+            )?
+        }
+        "evidence.withdraw" => {
+            let branch = a["branch"].as_str().map(str::to_owned);
+            let principal = a["principal"].as_str().map(str::to_owned);
+            let author = a["author"].as_str().map(str::to_owned);
+            let req = a["request"].take();
+            sparkles::evidence::binding::withdraw_value(
+                ds,
+                branch.as_deref(),
+                principal.as_deref(),
+                author.as_deref(),
+                req,
+                ctl,
+            )?
+        }
+        "evidence.claimStates" => {
+            let claims: Vec<String> = decode(&a["claims"])?;
+            sparkles::evidence::binding::claim_states(
+                ds,
+                a["branch"].as_str(),
+                a["at"].as_str(),
+                text(&a, "policy")?,
+                &claims,
+                ctl,
+            )?
+        }
         "evidence.resolveEntities" => {
             let entities: Vec<String> = decode(&a["entities"])?;
             sparkles::evidence::binding::resolve_entities(
                 ds,
                 a["branch"].as_str(),
-                text(a, "policy")?,
+                text(&a, "policy")?,
                 &entities,
                 ctl,
             )?

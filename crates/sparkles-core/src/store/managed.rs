@@ -224,7 +224,13 @@ impl Store {
         entry: OwnerEntry,
         settings: &[u8],
     ) -> Result<ManagedGraphs> {
-        self.enable_managed_checked(owner, entry, settings, None)
+        self.enable_managed_checked(
+            owner,
+            entry,
+            settings,
+            None,
+            &crate::guard::WriteOptions::default(),
+        )
     }
 
     /// [`enable_managed`](Self::enable_managed) only while the registry's revision is
@@ -239,7 +245,28 @@ impl Store {
         settings: &[u8],
         expected: u64,
     ) -> Result<ManagedGraphs> {
-        self.enable_managed_checked(owner, entry, settings, Some(expected))
+        self.enable_managed_checked(
+            owner,
+            entry,
+            settings,
+            Some(expected),
+            &crate::guard::WriteOptions::default(),
+        )
+    }
+
+    /// [`enable_managed_at`](Self::enable_managed_at) honoring the cancellation flag and
+    /// deadline of `options` while waiting for the writer lock and before the first
+    /// durable registry mutation. Once the registry is published, the family barrier
+    /// still runs to completion so every previously admitted writer finishes.
+    pub fn enable_managed_at_with(
+        &self,
+        owner: OwnerKind,
+        entry: OwnerEntry,
+        settings: &[u8],
+        expected: u64,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<ManagedGraphs> {
+        self.enable_managed_checked(owner, entry, settings, Some(expected), options)
     }
 
     /// The installed registry revision, or zero before its first publication.
@@ -275,7 +302,9 @@ impl Store {
         entry: OwnerEntry,
         settings: &[u8],
         expected: Option<u64>,
+        options: &crate::guard::WriteOptions,
     ) -> Result<ManagedGraphs> {
+        options.check()?;
         if !owner.supports_profile(entry.profile) {
             return Err(ManagedError::error(
                 ManagedErrorKind::UnsupportedProfile,
@@ -312,7 +341,7 @@ impl Store {
                 owner.settings_file()
             )));
         }
-        self.change_managed(|current| {
+        self.change_managed(options, |current| {
             let revision = current.map_or(0, |i| i.graphs.revision);
             if let Some(expected) = expected
                 && expected != revision
@@ -437,7 +466,7 @@ impl Store {
         graph: &str,
         expected: Option<u64>,
     ) -> Result<ManagedGraphs> {
-        self.change_managed(|current| {
+        self.change_managed(&crate::guard::WriteOptions::default(), |current| {
             let Some(current) = current else {
                 return Err(not_enabled(owner));
             };
@@ -474,6 +503,7 @@ impl Store {
     /// owner settings file of the owner it names first.
     fn change_managed(
         &self,
+        options: &crate::guard::WriteOptions,
         change: impl FnOnce(Option<&Installed>) -> Result<(Installed, Option<OwnerKind>)>,
     ) -> Result<ManagedGraphs> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
@@ -482,11 +512,12 @@ impl Store {
                 "managed graphs are changed through the dataset's main store",
             ));
         }
-        let o = crate::guard::WriteOptions::default();
-        let w = self.lock_writer(&o)?;
+        options.check()?;
+        let w = self.lock_writer(options)?;
         if w.poisoned {
             return Err(Error::Poisoned);
         }
+        options.check()?;
         let current = self.managed_state();
         let installed = match current.as_deref() {
             None => None,
@@ -604,6 +635,7 @@ impl Store {
             self.check_memory(data)?;
             next.history_memory = Some(memory);
         }
+        options.check()?;
         // From the first registry file written until the new registry is installed,
         // the files may no longer match the installed registry. An error or unwind
         // in between leaves the family refusing every write, so that no ordinary

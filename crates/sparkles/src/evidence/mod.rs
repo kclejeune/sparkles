@@ -115,10 +115,12 @@ pub use review::{
     Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,
     WithdrawnClaim, review, withdraw,
 };
-pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
+pub use sparkles_core::evidence::review::{
+    DecisionInput, Disposition, MAX_DECISIONS, WithdrawalInput,
+};
 pub use sparkles_core::evidence::{
     ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_CLAIMS as MAX_BATCH_CLAIMS, MAX_IDENTITIES,
-    MAX_IDENTITY_ENTITIES, MIN_IDENTITY_ENTITIES, prepare_input,
+    MAX_IDENTITY_ENTITIES, MAX_LINKS, MIN_IDENTITY_ENTITIES, prepare_input,
 };
 pub use sparkles_core::evidence::{
     AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
@@ -365,8 +367,18 @@ fn configure_recorded(
         OverrideUpdate::Preserve => current.and_then(|entry| entry.evidence_overrides.clone()),
         OverrideUpdate::Replace(patch) => patch.and_then(crate::managed::EvidenceOverrides::new),
     };
-    let graphs =
-        store.enable_managed_at(OwnerKind::Evidence, entry, canonical.bytes(), revision)?;
+    let write_options = crate::guard::WriteOptions {
+        cancel: Some(control.cancel.flag()),
+        deadline: control.deadline,
+        ..Default::default()
+    };
+    let graphs = store.enable_managed_at_with(
+        OwnerKind::Evidence,
+        entry,
+        canonical.bytes(),
+        revision,
+        &write_options,
+    )?;
     status_from(Some(&graphs), Some(canonical.bytes()))
 }
 

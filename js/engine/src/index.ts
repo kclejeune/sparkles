@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import {
   Administration,
   adminResult,
+  evidenceResult,
   type AdminCall,
   type DatasetInfo,
   type Configuration,
@@ -586,6 +587,7 @@ export class Dataset extends Queryable {
     );
     if (op === 'graphql.execute') return value as T;
     if (op === 'history.prune' || op === 'reasoning.clear') return BigInt(value) as T;
+    if (op.startsWith('evidence.')) return evidenceResult(value) as T;
     return adminResult(value) as T;
   }
 

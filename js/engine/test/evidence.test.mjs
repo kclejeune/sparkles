@@ -9,7 +9,9 @@ import {
   ConflictError,
   InvalidInputError,
   NotFoundError,
+  PermissionDeniedError,
   UnsupportedError,
+  evidenceResult,
 } from '../dist/index.js';
 
 const SOURCES_G = 'https://example.org/g/sources';
@@ -157,6 +159,8 @@ test('evidence settings, configure, detach and holds lifecycle', async (t) => {
 
   const configured = await ds.evidence.configure(makeSettings());
   assert.equal(configured.settings.enabled, true);
+  assert.equal(typeof configured.revision, 'bigint');
+  assert.equal(configured.revision, 1n);
   assert.equal(typeof configured.settings.policies['review-v1'].version, 'number');
   assert.ok(configured.managed.includes(ACCEPTED_G));
   assert.deepEqual(configured.detached, []);
@@ -232,12 +236,15 @@ test('evidence propose, resolve, review, withdraw, identities and dependents', a
   const preview = await ds.evidence.propose({ ...makeProposal(), dryRun: true });
   assert.equal(preview.committed, false);
   assert.equal(preview.dryRun.wouldCommit, true);
+  assert.equal(typeof preview.dryRun.inserted, 'bigint');
+  assert.equal(typeof preview.dryRun.deleted, 'bigint');
 
   const proposed = await ds.evidence.propose(makeProposal({ idempotencyKey: 'node-batch-1' }), {
     principal: 'https://example.org/users/alice',
   });
   assert.equal(proposed.committed, true);
   assert.equal(proposed.replayed, false);
+  assert.equal(typeof proposed.commit, 'bigint');
   const byKey = Object.fromEntries(proposed.records.map((r) => [r.key, r]));
   const claim = byKey.c1;
   const assessment = byKey.a1;
@@ -264,8 +271,22 @@ test('evidence propose, resolve, review, withdraw, identities and dependents', a
     },
   ]);
   assert.equal(resolved.resolved.length, 2);
+  assert.equal(typeof resolved.resolved[0].storedFact.commit, 'bigint');
+  assert.equal(resolved.resolved[0].storedFact.servedBy, ds.id);
   assert.equal(resolved.resolved[0].storedFact.commit, factCommit);
   assert.equal(resolved.resolved[1].record.iri, claim.iri);
+  assert.equal(typeof resolved.resolved[1].record.receipt.commit, 'bigint');
+
+  // Claim states: unreviewed -> accepted -> withdrawn, plus null for unknown claims.
+  const unrev = await ds.evidence.claimStates('review-v1', [
+    claim.iri,
+    'https://example.org/missing',
+  ]);
+  assert.equal(unrev.policy, 'review-v1');
+  assert.equal(typeof unrev.commit, 'bigint');
+  assert.equal(unrev.claims[0].state, 'unreviewed');
+  assert.equal(unrev.claims[0].origin, 'source');
+  assert.equal(unrev.claims[1], null);
 
   await assert.rejects(
     ds.evidence.resolve([
@@ -368,7 +389,12 @@ test('evidence propose, resolve, review, withdraw, identities and dependents', a
     ],
   });
   assert.ok(idRev.mapRevision);
+  assert.equal(typeof idRev.changed.map.number, 'bigint');
+  assert.equal(idRev.changed.map.number, 1n);
   const ent = await ds.evidence.resolveEntities('match-v1', ['https://example.org/e/b']);
+  assert.equal(typeof ent.number, 'bigint');
+  assert.equal(ent.number, 1n);
+  assert.equal(typeof ent.commit, 'bigint');
   assert.equal(ent.entities[0].representative, 'https://example.org/e/a');
   assert.deepEqual([...ent.entities[0].members].sort(), [
     'https://example.org/e/a',
@@ -376,13 +402,18 @@ test('evidence propose, resolve, review, withdraw, identities and dependents', a
   ]);
 });
 
-test('evidence transaction-owner and closed-dataset guards', async (t) => {
+test('evidence transaction-owner, in-txn holds, branch errors, integer precision and controls', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sparkles-ev-node-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const ds = await Dataset.open(path.join(dir, 'db'));
   await ds.evidence.configure(makeSettings());
+  await ds.branches.create('feat');
 
+  // In-transaction holds() succeeds on a persistent store without deadlocking,
+  // while mutating evidence operations are refused with ConflictError.
   await ds.transaction(async () => {
+    const page = await ds.evidence.holds();
+    assert.equal(page.heldCommits, 0);
     await assert.rejects(ds.evidence.configure(makeSettings()), ConflictError);
     await assert.rejects(ds.evidence.detach(ACCEPTED_G), ConflictError);
     await assert.rejects(ds.evidence.acquireHold([{ commit: 0 }]), ConflictError);
@@ -395,14 +426,93 @@ test('evidence transaction-owner and closed-dataset guards', async (t) => {
     await assert.rejects(ds.evidence.withdraw({ withdrawals: [] }), ConflictError);
   });
 
+  // Unknown branch surfaces as NotFoundError with details.code === 'no-such-branch',
+  // and history-gone on acquireHold preserves details.code === 'history-gone'.
+  await assert.rejects(
+    ds.evidence.resolve([], { branch: 'missing' }),
+    (e) => e instanceof NotFoundError && e.details.code === 'no-such-branch',
+  );
+  await assert.rejects(
+    ds.evidence.acquireHold([{ commit: 999999n }]),
+    (e) => e instanceof NotFoundError && e.details.code === 'history-gone',
+  );
+
+  // Branch handles refuse evidence operations uniformly with InvalidInputError.
+  const br = await ds.branch('feat');
+  await assert.rejects(br.evidence.settings(), InvalidInputError);
+  await assert.rejects(br.evidence.holds(), InvalidInputError);
+  await assert.rejects(
+    br.evidence.configure({ format: 1, profile: 1, enabled: false }),
+    InvalidInputError,
+  );
+  await assert.rejects(br.evidence.claimStates('review-v1', []), InvalidInputError);
+  await br.close();
+
+  // Integer precision guards: unsafe JS numbers and u64 overflow reject with InvalidInputError.
+  const unsafeInt = Number.MAX_SAFE_INTEGER + 2;
+  const overU64 = 18446744073709551616n;
+  await assert.rejects(ds.evidence.acquireHold([{ commit: unsafeInt }]), InvalidInputError);
+  await assert.rejects(ds.evidence.acquireHold([{ commit: overU64 }]), InvalidInputError);
+  await assert.rejects(
+    ds.evidence.propose({ ...makeProposal(), ifHead: unsafeInt }),
+    InvalidInputError,
+  );
+  await assert.rejects(
+    ds.evidence.review({ policy: 'review-v1', policyVersion: 1, ifHead: unsafeInt, decisions: [] }),
+    InvalidInputError,
+  );
+  await assert.rejects(
+    ds.evidence.withdraw({ ifHead: overU64, withdrawals: [] }),
+    InvalidInputError,
+  );
+  await assert.rejects(ds.evidence.holds({ limit: 1.5 }), InvalidInputError);
+
+  // Synthetic response above JS safe integer range decodes losslessly to BigInt
+  // while leaving settings numbers and IRI revision strings unchanged.
+  const maxU64 = '18446744073709551615';
+  const decoded = evidenceResult({
+    revision: maxU64,
+    number: maxU64,
+    commit: maxU64,
+    servedBy: maxU64,
+    map: { revision: 'urn:ev:map:1', number: maxU64 },
+    span: { rendition: 'urn:ev:rend:1', start: maxU64, end: maxU64, textDigest: 'sha256:00' },
+    settings: { policies: { 'review-v1': { version: 1 } } },
+  });
+  assert.equal(decoded.revision, 18446744073709551615n);
+  assert.equal(decoded.number, 18446744073709551615n);
+  assert.equal(decoded.commit, 18446744073709551615n);
+  assert.equal(decoded.servedBy, 18446744073709551615n);
+  assert.equal(decoded.map.revision, 'urn:ev:map:1');
+  assert.equal(decoded.map.number, 18446744073709551615n);
+  assert.equal(decoded.span.start, 18446744073709551615n);
+  assert.equal(decoded.span.end, 18446744073709551615n);
+  assert.equal(decoded.settings.policies['review-v1'].version, 1);
+
+  // Pre-aborted AbortSignal refuses controlled evidence operations.
+  const ac = new AbortController();
+  ac.abort(new Error('stop-now'));
+  await assert.rejects(ds.evidence.configure(makeSettings(), { signal: ac.signal }), /stop-now/);
+  await assert.rejects(ds.evidence.resolve([], { signal: ac.signal }), /stop-now/);
+  await assert.rejects(ds.evidence.claimStates('review-v1', [], { signal: ac.signal }), /stop-now/);
+
+  // Closed dataset refuses all evidence operations.
   await ds.close();
   await assert.rejects(ds.evidence.settings(), InvalidInputError);
   await assert.rejects(ds.evidence.holds(), InvalidInputError);
   await assert.rejects(ds.evidence.resolve([]), InvalidInputError);
   await assert.rejects(ds.evidence.configure(makeSettings()), InvalidInputError);
+  await assert.rejects(ds.evidence.claimStates('review-v1', []), InvalidInputError);
   await assert.rejects(
     ds.evidence.resolveEntities('match-v1', ['https://example.org/e/a']),
     InvalidInputError,
   );
   await assert.rejects(ds.evidence.findDependents(['https://example.org/c/1']), InvalidInputError);
+
+  // Read-only dataset refuses mutating evidence operations.
+  const ro = await Dataset.open(path.join(dir, 'db'), { readOnly: true });
+  t.after(() => ro.close());
+  assert.equal((await ro.evidence.settings()).settings.enabled, true);
+  await assert.rejects(ro.evidence.configure(makeSettings()), PermissionDeniedError);
+  await assert.rejects(ro.evidence.propose(makeProposal()), PermissionDeniedError);
 });

@@ -436,6 +436,11 @@ python = "Dataset.evidence.acquire_hold"
 jvm = "DatasetGraphSparkles.evidence().acquireHold"
 node = "Dataset.evidence.acquireHold"
 
+["evidence.claim_states"]
+python = "Dataset.evidence.claim_states"
+jvm = "DatasetGraphSparkles.evidence().claimStates"
+node = "Dataset.evidence.claimStates"
+
 ["evidence.configure"]
 python = "Dataset.evidence.configure"
 jvm = "DatasetGraphSparkles.evidence().configure"
