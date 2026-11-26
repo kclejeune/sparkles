@@ -1929,10 +1929,18 @@ link, because extraction does not establish which occurrence corresponds to whic
 
 The two source revisions do correspond, because the registration replaced the current
 rendition of the same source. Both revisions name the same source through
-`prov:specializationOf`, and the C18 renditions keep their `prov:wasRevisionOf` chain.
-The source revision input has no field for a link to a predecessor revision, and adding
-one changes the record digests of revisions, so roadmap item 780 tracks a
-`prov:wasRevisionOf` link between evidence source revisions.
+`prov:specializationOf`, the C18 renditions keep their `prov:wasRevisionOf` chain, and
+the new evidence source revision carries an optional `wasRevisionOf` reference written as
+`prov:wasRevisionOf` to the prior authenticated `ev:SourceRevision` when one exists. The
+field is framed into the request payload digest only when present and omitted from the
+immutable triples when absent, so revisions without a predecessor keep their earlier
+record and payload digests. Self-links and cycles within a batch are refused, and an
+existing predecessor must resolve as an authenticated, caller-readable
+`ev:SourceRevision`. Claims ingestion sets `wasRevisionOf` automatically from the
+replaced C18 rendition's authenticated evidence source revision, walking the C18
+`prov:wasRevisionOf` chain when intermediate renditions had no claims ingestion, and
+preserves an already recorded revision's predecessor when the same revision is re-ingested
+under another profile.
 
 The rejected alternative applies the supersession of C18 §7.9 and withdraws the earlier
 occurrences that the new extraction does not repeat. A model omitting a fact is not

@@ -13590,7 +13590,11 @@ update endpoint and counts as an update. The design is in
 ```
 
 A record names another record of the batch as `{"key"}` and an existing authenticated
-record as `{"iri"}`. Content is `{"text"}`, `{"base64"}` or the `{"digest"}` of content
+record as `{"iri"}`. A source revision's optional `wasRevisionOf` names its predecessor
+`SourceRevision` the same way, is written as `prov:wasRevisionOf`, and is verified as an
+authenticated, caller-readable `SourceRevision` before publication. Self-links and cycles
+among batch revisions are refused, and a revision without `wasRevisionOf` keeps the record
+and payload digests it would have had before the field existed. Content is `{"text"}`, `{"base64"}` or the `{"digest"}` of content
 that is not retained. A proposition, scope value, rights term and conclusion is an
 N-Triples term without blank nodes. A stored fact has the form of
 [evidence resolution](#evidence-resolution). `ifHead`, `dryRun` and `message` have their
