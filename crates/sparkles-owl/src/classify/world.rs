@@ -162,6 +162,8 @@ pub fn universal_facts_polled<E>(
     if ix.universal.is_empty() {
         return Ok(out);
     }
+    #[cfg(test)]
+    super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::Universal);
     let mut since_poll = 0usize;
     let mut stop_err: Option<E> = None;
     for e in 0..view.len() as Ex {
@@ -238,6 +240,8 @@ pub fn universal_facts_with_supports_polled<E>(
     if ix.universal.is_empty() {
         return Ok((facts, Some((supports_out, 0))));
     }
+    #[cfg(test)]
+    super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::Universal);
     let mut since_poll = 0usize;
     let mut stop_err: Option<E> = None;
     for e in 0..view.len() as Ex {
@@ -722,6 +726,8 @@ pub fn context_touches_key_polled<E>(
     key: &super::index::Key,
     poll_step: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
+    #[cfg(test)]
+    super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::KeyTouch);
     if !has_named_alias_polled(ix, e, st, poll_step)? {
         return Ok(false);
     }
@@ -774,6 +780,8 @@ pub fn replay_world_dt_sticky_polled<E>(
     sticky_rows: &[(u32, u8)],
     poll_step: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<(), E> {
+    #[cfg(test)]
+    super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::StickyReplay);
     super::dt_sat::replay_sticky_polled(ix, sticky_rows, DEP_POLL_STEP, poll_step)
 }
 
@@ -930,8 +938,8 @@ pub(super) fn key_merges_with_deps<'a>(
                     super::OptionalAdmit::Stopped => return Err(Halt::Stopped),
                 }
                 if vec_grow > 0 && deps.try_reserve_exact(vec_grow).is_err() {
-                    step_debit.retire_now();
                     deps = Vec::new();
+                    step_debit.retire_now();
                     deps_debit.retire_now();
                     seen_pairs = FxHashSet::default();
                     seen_debit.retire_now();
@@ -961,8 +969,8 @@ pub(super) fn key_merges_with_deps<'a>(
                     drop(data);
                     drop(real_deps);
                     drop(ctx_deps);
-                    step_debit.retire_now();
                     deps = Vec::new();
+                    step_debit.retire_now();
                     deps_debit.retire_now();
                     seen_pairs = FxHashSet::default();
                     seen_debit.retire_now();
@@ -2057,6 +2065,13 @@ pub(super) struct FoundDep<'r, 'a> {
     pub debit: super::OptionalDebit<'r, 'a>,
 }
 
+/// Mandatory world result paired with its pre-admitted `subs` heap debit so
+/// `found.subs` drops strictly before `debit` retires its bytes.
+pub(super) struct FoundRow<'r, 'a> {
+    pub found: Found,
+    pub debit: Option<super::MandatoryDebit<'r, 'a>>,
+}
+
 /// What a world found of its class: whether it is unsatisfiable, and its subsumers.
 pub struct Found {
     pub bottom: bool,
@@ -2544,16 +2559,19 @@ impl<'a> World<'a> {
     /// that hold there.
     #[cfg(test)]
     pub fn classify(self, class: Ex) -> Result<Found, Halt> {
-        self.classify_with_dep(class, None).map(|(f, _)| f)
+        self.classify_with_dep(class, None, None)
+            .map(|(row, _)| row.found)
     }
 
-    /// Like [`World::classify`], optionally capturing a pre-admitted [`FoundDep`]
-    /// dependency record for incremental EL world reuse (roadmap item 664).
+    /// Like [`World::classify`], pre-admitting `Found::subs` before allocating it and
+    /// optionally capturing a pre-admitted [`FoundDep`] dependency record for incremental
+    /// EL world reuse (roadmap item 664).
     pub(super) fn classify_with_dep<'r, 'b>(
         mut self,
         class: Ex,
         dep_budget: Option<(&'r super::WorldBudget<'b>, &std::sync::atomic::AtomicBool)>,
-    ) -> Result<(Found, Option<FoundDep<'r, 'b>>), Halt> {
+        subs_budget: Option<&'r super::WorldBudget<'b>>,
+    ) -> Result<(FoundRow<'r, 'b>, Option<FoundDep<'r, 'b>>), Halt> {
         self.pending.push((class, Concl::Real(REAL_ROOT)));
         loop {
             self.drain();
@@ -2603,34 +2621,84 @@ impl<'a> World<'a> {
             .slots
             .values()
             .any(|s| s.real && s.st.as_ref().is_some_and(|st| st.bottom));
-        let mut found = Found {
-            bottom: clash,
-            subs: Vec::new(),
-        };
+        let mut bottom = clash;
+        let mut subs_len = 0usize;
         self.with(class, &mut |st, _| {
-            found.bottom |= st.bottom;
-            found.subs = st.subs.iter().copied().collect();
+            bottom |= st.bottom;
+            subs_len = st.subs.len();
         });
-        if !found.bottom {
+        if !bottom {
             super::dt_sat::world(self.ix, self.slots.values().filter_map(|s| s.st.as_ref()));
         }
+        // Build optional dependency metadata BEFORE allocating `Found::subs` so optional
+        // admission never observes uncharged result bytes.
         let dep = if let Some((budget, track_active)) = dep_budget
             && track_active.load(std::sync::atomic::Ordering::Relaxed)
         {
-            self.build_dep(class, found.bottom, budget, track_active)?
+            self.build_dep(class, bottom, budget, track_active)?
         } else {
             None
         };
+        let subs_bytes = subs_len
+            .checked_mul(std::mem::size_of::<Ex>())
+            .ok_or(Halt::Memory(usize::MAX))?;
+        // Pre-admit `Found::subs` while `self` still holds its private state. Declare
+        // `subs_debit` BEFORE `found` so on any early return or unwind, `found.subs`
+        // drops its heap buffer before `subs_debit` retires its bytes.
+        let mut subs_debit: Option<super::MandatoryDebit<'r, 'b>> = None;
+        let mut found = Found {
+            bottom,
+            subs: Vec::new(),
+        };
+        if subs_bytes > 0 {
+            let subs_isize = isize::try_from(subs_bytes).map_err(|_| Halt::Memory(usize::MAX))?;
+            if let Some(budget) = subs_budget {
+                let prev = budget.post(subs_isize);
+                let guard = super::MandatoryDebit::new(budget, subs_isize);
+                if !budget.check_post(subs_isize, prev) {
+                    return Err(Halt::Stopped);
+                }
+                subs_debit = Some(guard);
+            } else {
+                let next_reported = self
+                    .debit
+                    .reported
+                    .get()
+                    .checked_add(subs_bytes)
+                    .filter(|&n| isize::try_from(n).is_ok())
+                    .ok_or(Halt::Memory(usize::MAX))?;
+                if !self
+                    .debit
+                    .reporter
+                    .tell_owned(subs_isize, || self.debit.reported.set(next_reported))
+                {
+                    return Err(Halt::Stopped);
+                }
+            }
+            if found.subs.try_reserve_exact(subs_len).is_err() {
+                return Err(Halt::Memory(usize::MAX));
+            }
+            self.with(class, &mut |st, _| {
+                found.subs.extend(st.subs.iter().copied());
+            });
+        }
+        #[cfg(test)]
+        let ready_reported = self
+            .debit
+            .reported
+            .get()
+            .saturating_add(subs_debit.as_ref().map_or(0, |d| d.bytes.max(0) as usize));
         #[cfg(test)]
         if let Some(rules) = &self.ix.top_chain {
-            rules.world_ready(class, self.debit.reported.get());
+            rules.world_ready(class, ready_reported);
         }
         #[cfg(test)]
         if let Reporter::NamedDomain(budget) = self.debit.reporter {
             super::world_retirement_mixed_tests::world_ready(
                 budget,
                 class,
-                self.debit.reported.get(),
+                ready_reported,
+                subs_debit.as_ref().map_or(0, |d| d.bytes),
             );
         }
         #[cfg(test)]
@@ -2638,8 +2706,15 @@ impl<'a> World<'a> {
             let state = self.slots[&class].st.as_ref().expect("resident COW slot");
             witness.ready(class, state, &found, self.debit.reported.get());
         }
-        // the world's copies go when it does
-        Ok((found, dep))
+        // the world's copies go when it does; `FoundRow` retains `subs_debit` until
+        // transferred to `FoundWorldChunk` or dropped
+        Ok((
+            FoundRow {
+                found,
+                debit: subs_debit,
+            },
+            dep,
+        ))
     }
 
     fn build_dep<'r, 'b>(
@@ -2649,6 +2724,8 @@ impl<'a> World<'a> {
         budget: &'r super::WorldBudget<'b>,
         track_active: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<FoundDep<'r, 'b>>, Halt> {
+        #[cfg(test)]
+        super::el_test_hooks::enter_scan(super::el_test_hooks::ScanKind::WorldBuildDep);
         let mut since_poll = 0usize;
         let mut poll_step = |work: usize| -> Result<(), Halt> {
             since_poll = since_poll.saturating_add(work);

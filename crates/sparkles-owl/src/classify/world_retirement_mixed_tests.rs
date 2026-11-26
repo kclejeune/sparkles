@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::thread::{self, ThreadId};
 
-const PREFIX_ROWS: usize = 2;
+const PREFIX_ROWS: usize = 4;
 const LIMIT: usize = 1 << 30;
 const FIRST_STOP: usize = LIMIT + 17;
 const B_LOCAL: index::Halt = index::Halt::Memory(usize::MAX - 11);
@@ -65,10 +65,10 @@ struct Trace {
     prefix: Vec<(Ex, isize)>,
     b_parked: bool,
     b_local: Option<Marks>,
-    a_private: Option<(Ex, isize, Marks)>,
-    a_retired: Option<Marks>,
+    a_private: Option<(Ex, isize, isize, Marks)>,
+    a_retired: Option<(Marks, isize)>,
     a_next_slot: Option<(Ex, isize, Marks)>,
-    armed_row: Option<(Ex, isize, Marks)>,
+    armed_row: Option<(Ex, isize, isize, Marks)>,
     posted: Option<Marks>,
     requests: Vec<(Arm, usize)>,
     collected: Option<(Option<index::Halt>, Marks)>,
@@ -165,7 +165,7 @@ pub(super) fn world_posted(budget: &WorldBudget<'_>, delta: isize, previous: isi
     ARM.set(Some(Arm::WorldCharge));
 }
 
-pub(super) fn world_ready(budget: &WorldBudget<'_>, class: Ex, reported: usize) {
+pub(super) fn world_ready(budget: &WorldBudget<'_>, class: Ex, reported: usize, subs_bytes: isize) {
     let Some(case) = worker_a() else { return };
     if case.scenario == Scenario::RefuseWorld {
         return;
@@ -178,14 +178,14 @@ pub(super) fn world_ready(budget: &WorldBudget<'_>, class: Ex, reported: usize) 
         marks.live,
         case.independent.load(Relaxed) + reported as isize
     );
-    trace.a_private = Some((class, reported as isize, marks));
+    trace.a_private = Some((class, reported as isize, subs_bytes, marks));
     case.changed.notify_all();
     case.wait(&mut trace, "B's post-chunk exit", |t| {
         t.exited[Lane::B as usize].is_some()
     });
 }
 
-// Called only for the row owner, after outstanding records the posted bytes.
+// Called only for the row owner, after `grow_guard` owns the posted resize bytes.
 pub(super) fn row_posted(
     budget: &WorldBudget<'_>,
     bytes: isize,
@@ -199,7 +199,7 @@ pub(super) fn row_posted(
     });
     let Some(case) = case else { return };
     let mut trace = case.trace.lock();
-    let Some((_, armed_bytes, before)) = trace.armed_row else {
+    let Some((_, armed_bytes, _, before)) = trace.armed_row else {
         return;
     };
     assert!(trace.posted.is_none());
@@ -403,11 +403,11 @@ impl Worker<'_, '_, '_> {
         Ok(())
     }
 
-    pub(super) fn after_world(&self, class: Ex) -> Result<(), index::Halt> {
+    pub(super) fn after_world(&self, class: Ex, subs_bytes: isize) -> Result<(), index::Halt> {
         if self.lane == Lane::A {
             let mut trace = self.case.trace.lock();
             assert_eq!(class, trace.classes[0]);
-            trace.a_retired = Some(self.case.marks(self.budget));
+            trace.a_retired = Some((self.case.marks(self.budget), subs_bytes));
             // A cannot finish its world in the refusal schedule. In the row
             // schedules, sample A's retirement and end before staging another row.
             return Err(A_LOCAL);
@@ -428,12 +428,10 @@ impl Worker<'_, '_, '_> {
             }
             let mut trace = case.trace.lock();
             let prefix = trace.prefix.iter().map(|&(_, bytes)| bytes).sum::<isize>();
-            let (_, private, _) = trace.a_private.unwrap();
-            assert_eq!(
-                before.live,
-                case.independent.load(Relaxed) + prefix + private
-            );
-            trace.armed_row = Some((class, bytes, before));
+            let (_, private, _, _) = trace.a_private.unwrap();
+            let row_subs = before.live - (case.independent.load(Relaxed) + prefix + private);
+            assert!(row_subs > 0, "armed row subs must be pre-admitted");
+            trace.armed_row = Some((class, bytes, row_subs, before));
         }
     }
 
@@ -501,7 +499,7 @@ fn exercise(scenario: Scenario) {
     assert_eq!(a.classes, trace.classes[..b.offset]);
     assert_eq!(b.classes, trace.classes[b.offset..]);
     assert_eq!(trace.prefix.len(), PREFIX_ROWS);
-    assert!(trace.prefix.iter().all(|&(_, bytes)| bytes >= 48));
+    assert!(trace.prefix.iter().all(|&(_, bytes)| bytes > 0));
     assert!(
         trace
             .prefix
@@ -510,6 +508,7 @@ fn exercise(scenario: Scenario) {
             .eq(b.classes[..PREFIX_ROWS].iter().copied())
     );
     let prefix = trace.prefix.iter().map(|&(_, bytes)| bytes).sum::<isize>();
+    assert!(prefix >= (PREFIX_ROWS * ROW_SLOT_BYTES) as isize);
     let independent = case.independent.load(Relaxed);
     let posted = trace.posted.unwrap();
     let a_exit = trace.exited[Lane::A as usize].unwrap();
@@ -554,21 +553,29 @@ fn exercise(scenario: Scenario) {
             eprintln!("retirement mixed refused-world delta={delta} prefix={prefix} used={used}");
         }
         Scenario::PanicAfterRowGrant | Scenario::StopBeforeRow => {
-            let (class, private, ready) = trace.a_private.unwrap();
-            let (row, bytes, before) = trace.armed_row.unwrap();
+            let (class, private, a_subs, ready) = trace.a_private.unwrap();
+            let (row, bytes, row_subs, before) = trace.armed_row.unwrap();
             assert_eq!((class, row), (a.classes[0], b.classes[PREFIX_ROWS]));
             assert_eq!(before.paid, trace.base + before.live as usize);
             assert_eq!(ready.halt, 0);
-            assert_eq!(posted.live - b_exit.live, prefix + bytes);
+            assert_eq!(posted.live - b_exit.live, prefix + row_subs + bytes);
             assert_eq!(b_exit.live, independent + private);
+            let (a_retired_marks, observed_a_subs) = trace.a_retired.unwrap();
+            assert_eq!(observed_a_subs, a_subs);
             assert_eq!(
-                trace.a_retired,
-                Some(Marks {
-                    live: independent,
+                a_retired_marks,
+                Marks {
+                    live: independent + a_subs,
                     ..b_exit
-                })
+                }
             );
-            assert_eq!(phase, trace.a_retired.unwrap());
+            assert_eq!(
+                phase,
+                Marks {
+                    live: independent,
+                    ..a_retired_marks
+                }
+            );
             if scenario == Scenario::PanicAfterRowGrant {
                 let used = before.paid + bytes as usize;
                 assert_eq!(trace.requests, [(Arm::RowCharge, bytes as usize)]);

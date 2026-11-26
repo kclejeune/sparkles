@@ -10348,9 +10348,11 @@ fn split_round5_retained_exclusions_reduce_taxonomy_headroom() {
     .unwrap();
     let cap = without_report + report_bytes.max(peak.get());
     let paid = std::cell::Cell::new(retained);
+    let tax_peak = std::cell::Cell::new(retained);
     let bounded = build(&Saturation::taxonomy_budget(
         retained,
         &paid,
+        &tax_peak,
         Some(cap),
         None,
     ));
