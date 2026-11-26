@@ -35,7 +35,7 @@
 //! relation. The operator then gives the rule back to the ordinary evaluator for the rest
 //! of the run, with one full evaluation, so the result stays the rules' fixpoint.
 
-use crate::budget::{Budget, BudgetFailure, Held, table_bytes};
+use crate::budget::{Budget, BudgetFailure, Held, table_bytes, table_capacity, table_grown};
 use crate::builtins::{BuiltinKind, same_value};
 use crate::engine::{Atom, CHead, CRule, Slot, incremental_blocker, reads_lists};
 use crate::facts::Memo;
@@ -1477,7 +1477,17 @@ impl Builder {
     }
 
     /// The compressed adjacency of the pairs, sorted and without duplicates.
-    fn finish(mut self, emit: Vec<bool>) -> Result<Local, BudgetFailure> {
+    fn finish(self, emit: Vec<bool>) -> Result<Local, BudgetFailure> {
+        let (local, _at, _at_held) = self.finish_with_map(emit)?;
+        Ok(local)
+    }
+
+    /// [`finish`](Self::finish), also returning the node-id map and its charge without
+    /// cloning.
+    fn finish_with_map(
+        mut self,
+        emit: Vec<bool>,
+    ) -> Result<(Local, FxHashMap<u64, u32>, Held), BudgetFailure> {
         self.charge()?;
         let n = self.ids.len();
         let mut pairs = std::mem::take(&mut self.pairs);
@@ -1495,21 +1505,25 @@ impl Builder {
         let adj: Vec<u32> = pairs.iter().map(|&(_, b)| b).collect();
         drop(pairs);
         let at = std::mem::take(&mut self.at);
-        drop(at);
+        let at_bytes = table_bytes(at.capacity(), size_of::<(u64, u32)>());
+        let local_bytes = self.ids.capacity() * size_of::<u64>()
+            + (off.capacity() + adj.capacity()) * size_of::<u32>()
+            + emit.capacity();
         let mut held = self.held;
-        held.try_set(
-            self.ids.capacity() * size_of::<u64>()
-                + (off.capacity() + adj.capacity()) * size_of::<u32>()
-                + emit.capacity(),
-        )?;
-        Ok(Local {
-            ids: self.ids,
-            off,
-            adj,
-            emit,
-            reversed: false,
-            _held: held,
-        })
+        held.try_set(local_bytes + at_bytes)?;
+        let at_held = held.split(at_bytes);
+        Ok((
+            Local {
+                ids: self.ids,
+                off,
+                adj,
+                emit,
+                reversed: false,
+                _held: held,
+            },
+            at,
+            at_held,
+        ))
     }
 }
 
@@ -2109,6 +2123,59 @@ fn guarded_symmetric(r: &CRule) -> Option<(u64, u64, bool)> {
     Some((gp, go, not_lit_y))
 }
 
+/// Maximum number of condensed SCCs for which [`BaseReach::Directed`] precomputes an
+/// O(1) SCC reachability bitset (`2048 * 32 * 8 = 512 KiB`).
+const MAX_BITSET_SCCS: usize = 2048;
+
+/// Maximum explicit-graph edges traversed by a single fallback DFS probe in
+/// [`BaseReach::Directed::proves`]. Exceeding this cap conservatively returns `false` so
+/// saturation re-closes the predicate in one O(|V| + |E|) SCC pass.
+const MAX_PROBE_STEPS: usize = 4096;
+
+/// Visit batch size for operator reachability probes and scans.
+const REACH_VISIT_BATCH: u64 = 1024;
+
+/// Reusable, budget-charged scratch workspace for directed explicit-edge reachability
+/// probes in [`BaseReach::proves`].
+pub(crate) struct ReachScratch {
+    seen: FxHashSet<u32>,
+    stack: Vec<u32>,
+    held: Held,
+}
+
+impl ReachScratch {
+    pub(crate) fn new(budget: &Arc<Budget>) -> ReachScratch {
+        ReachScratch {
+            seen: FxHashSet::default(),
+            stack: Vec::new(),
+            held: Held::new(budget),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.seen.clear();
+        self.stack.clear();
+    }
+
+    fn insert_seen(&mut self, v: u32) -> Result<bool, BudgetFailure> {
+        if self.seen.contains(&v) {
+            return Ok(false);
+        }
+        let (cap, len) = (self.seen.capacity(), self.seen.len());
+        let to = table_grown(cap, len, 1);
+        if to != cap {
+            self.held.try_grow(table_bytes(to, size_of::<u32>()))?;
+            self.seen.reserve(1);
+            self.held.shrink(table_bytes(cap, size_of::<u32>()));
+        }
+        Ok(self.seen.insert(v))
+    }
+
+    fn push_stack(&mut self, v: u32) -> Result<(), BudgetFailure> {
+        push_moved(&mut self.stack, v, &mut self.held)
+    }
+}
+
 /// Reachability over the confirmed explicit edges of one operator-governed predicate `q`
 /// during incremental deletion.
 enum BaseReach {
@@ -2118,41 +2185,47 @@ enum BaseReach {
         /// node id -> (component root, whether the component has >= 2 nodes or a self-loop)
         comp: FxHashMap<u64, (u32, bool)>,
         irreflexive: bool,
-        bytes: usize,
+        _held: Held,
     },
-    /// Directed strongly connected components + compressed adjacency over explicit edges.
+    /// Directed strongly connected components + compressed adjacency over explicit edges,
+    /// with an optional precomputed SCC reachability bitset for O(1) lookups.
     Directed {
         at: FxHashMap<u64, u32>,
         off: Vec<u32>,
         adj: Vec<u32>,
         comp: Vec<u32>,
         cyclic: Vec<bool>,
+        reach_bits: Option<(Vec<u64>, usize)>,
         irreflexive: bool,
-        bytes: usize,
+        _at_held: Held,
+        _graph_held: Held,
+        _extra_held: Held,
+        _bits_held: Option<Held>,
     },
 }
 
 impl BaseReach {
-    fn bytes(&self) -> usize {
-        match self {
-            BaseReach::Undirected { bytes, .. } | BaseReach::Directed { bytes, .. } => *bytes,
-        }
-    }
-
     /// Whether `[x, q, z]` follows from the confirmed explicit edges of `q` via the
-    /// closure operator.
-    fn proves(&self, x: u64, z: u64) -> bool {
+    /// closure operator. Counts DFS visits against `visit` and polls `cancel`.
+    fn proves(
+        &self,
+        x: u64,
+        z: u64,
+        scratch: &mut ReachScratch,
+        cancel: Option<&AtomicBool>,
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
         match self {
             BaseReach::Undirected {
                 comp, irreflexive, ..
             } => {
                 if *irreflexive && x == z {
-                    return false;
+                    return Ok(false);
                 }
                 let (Some(&(cx, cyc)), Some(&(cz, _))) = (comp.get(&x), comp.get(&z)) else {
-                    return false;
+                    return Ok(false);
                 };
-                cx == cz && (x != z || cyc)
+                Ok(cx == cz && (x != z || cyc))
             }
             BaseReach::Directed {
                 at,
@@ -2160,41 +2233,72 @@ impl BaseReach {
                 adj,
                 comp,
                 cyclic,
+                reach_bits,
                 irreflexive,
                 ..
             } => {
                 if *irreflexive && x == z {
-                    return false;
+                    return Ok(false);
                 }
                 let (Some(&ix), Some(&iz)) = (at.get(&x), at.get(&z)) else {
-                    return false;
+                    return Ok(false);
                 };
                 let (cx, cz) = (comp[ix as usize], comp[iz as usize]);
                 if cx == cz {
-                    return x != z || cyclic[cx as usize];
+                    return Ok(x != z || cyclic[cx as usize]);
                 }
                 // Tarjan numbers SCCs in reverse topological order: a lower SCC id cannot
                 // reach a higher SCC id.
                 if cx < cz {
-                    return false;
+                    return Ok(false);
                 }
-                // Bounded DFS over the explicit base graph of `q`, pruned by SCC order.
-                let mut seen: FxHashSet<u32> = FxHashSet::default();
-                let mut stack = vec![ix];
-                seen.insert(ix);
-                while let Some(u) = stack.pop() {
+                if let Some((bits, words)) = reach_bits {
+                    let hit = (bits[cx as usize * *words + (cz as usize / 64)]
+                        & (1u64 << (cz as usize % 64)))
+                        != 0;
+                    return Ok(hit);
+                }
+                // Bounded, charged, cancellable DFS over the explicit base graph of `q`,
+                // pruned by SCC order and short-circuiting on entering `cz`.
+                scratch.clear();
+                scratch.insert_seen(ix)?;
+                scratch.push_stack(ix)?;
+                let mut steps: usize = 0;
+                let mut pending: u64 = 0;
+                while let Some(u) = scratch.stack.pop() {
                     let lo = off[u as usize] as usize;
                     let hi = off[u as usize + 1] as usize;
                     for &v in &adj[lo..hi] {
-                        if v == iz {
-                            return true;
+                        steps += 1;
+                        pending += 1;
+                        let cv = comp[v as usize];
+                        if cv == cz {
+                            if pending > 0 {
+                                visit(pending)?;
+                            }
+                            return Ok(true);
                         }
-                        if comp[v as usize] >= cz && seen.insert(v) {
-                            stack.push(v);
+                        if pending >= REACH_VISIT_BATCH {
+                            visit(std::mem::take(&mut pending))?;
+                            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                                anyhow::bail!("reasoning cancelled");
+                            }
+                        }
+                        if steps >= MAX_PROBE_STEPS {
+                            if pending > 0 {
+                                visit(pending)?;
+                            }
+                            return Ok(false);
+                        }
+                        if cv > cz && scratch.insert_seen(v)? {
+                            scratch.push_stack(v)?;
                         }
                     }
                 }
-                false
+                if pending > 0 {
+                    visit(pending)?;
+                }
+                Ok(false)
             }
         }
     }
@@ -2205,18 +2309,25 @@ impl BaseReach {
         irreflexive: bool,
         budget: &Arc<Budget>,
         cancel: Option<&AtomicBool>,
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
     ) -> anyhow::Result<BaseReach> {
         let mut poll = Poll::new(cancel);
         let mut b = Builder::new(budget);
+        let mut loops_held = Held::new(budget);
         let mut self_loops: Vec<u32> = Vec::new();
+        let mut pending: u64 = 0;
         let mut add = |s: u64, o: u64| -> anyhow::Result<()> {
             let (a, _) = b.node(s)?;
             let (c, _) = b.node(o)?;
             if a == c {
-                self_loops.push(a);
+                push_moved(&mut self_loops, a, &mut loops_held)?;
             }
             b.room(0)?;
             b.pairs.push((a, c));
+            pending += 1;
+            if pending >= REACH_VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
+            }
             poll.tick(1)
         };
         if let Some(base) = g.base() {
@@ -2240,6 +2351,9 @@ impl BaseReach {
                     add(t[0], t[2])?;
                 }
             }
+        }
+        if pending > 0 {
+            visit(std::mem::take(&mut pending))?;
         }
         let n = b.ids.len();
         let _work = Held::try_new(budget, n * (2 * size_of::<u32>() + size_of::<bool>()))?;
@@ -2270,20 +2384,30 @@ impl BaseReach {
             let r = find(&mut parent, a);
             has_loop[r as usize] = true;
         }
+        drop(loops_held);
+        let mut comp_held = Held::try_new(
+            budget,
+            table_bytes(table_capacity(n), size_of::<(u64, (u32, bool))>()),
+        )?;
         let mut comp: FxHashMap<u64, (u32, bool)> =
             FxHashMap::with_capacity_and_hasher(n, Default::default());
         for (i, &id) in b.ids.iter().enumerate() {
             let r = find(&mut parent, i as u32);
             comp.insert(id, (r, sizes[r as usize] >= 2 || has_loop[r as usize]));
         }
-        let bytes = table_bytes(comp.capacity(), size_of::<(u64, (u32, bool))>());
+        comp_held.try_set(table_bytes(
+            comp.capacity(),
+            size_of::<(u64, (u32, bool))>(),
+        ))?;
+        visit(0)?;
         Ok(BaseReach::Undirected {
             comp,
             irreflexive,
-            bytes,
+            _held: comp_held,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_directed(
         q: u64,
         g: &Graph,
@@ -2292,13 +2416,19 @@ impl BaseReach {
         terms: &Terms,
         budget: &Arc<Budget>,
         cancel: Option<&AtomicBool>,
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
     ) -> anyhow::Result<BaseReach> {
         let mut poll = Poll::new(cancel);
         let mut b = Builder::new(budget);
+        let mut pending: u64 = 0;
         let mut add = |s: u64, o: u64| -> anyhow::Result<()> {
             b.edge(s, o)?;
             if add_non_literal_reverse && terms.kind(o) != Kind::Literal {
                 b.edge(o, s)?;
+            }
+            pending += 1;
+            if pending >= REACH_VISIT_BATCH {
+                visit(std::mem::take(&mut pending))?;
             }
             poll.tick(1)
         };
@@ -2324,33 +2454,107 @@ impl BaseReach {
                 }
             }
         }
-        let at = b.at.clone();
-        let local = b.finish(Vec::new())?;
+        if pending > 0 {
+            visit(std::mem::take(&mut pending))?;
+        }
+        let (local, at, at_held) = b.finish_with_map(Vec::new())?;
         let (comp, ncomp) = local.components(budget, &mut poll)?;
+        let mut extra_held = Held::try_new(budget, comp.capacity() * size_of::<u32>() + ncomp)?;
+        let sizes_held = Held::try_new(budget, ncomp * size_of::<u32>())?;
         let mut sizes = vec![0u32; ncomp];
         for &c in &comp {
             sizes[c as usize] += 1;
         }
         let mut cyclic: Vec<bool> = sizes.iter().map(|&sz| sz >= 2).collect();
+        drop(sizes);
+        drop(sizes_held);
         for u in 0..local.ids.len() as u32 {
             let cu = comp[u as usize] as usize;
             if !cyclic[cu] && local.out(u).binary_search(&u).is_ok() {
                 cyclic[cu] = true;
             }
         }
-        let bytes = table_bytes(at.capacity(), size_of::<(u64, u32)>())
-            + (local.off.capacity() + local.adj.capacity() + comp.capacity()) * size_of::<u32>()
-            + cyclic.capacity();
+        extra_held.try_set(comp.capacity() * size_of::<u32>() + cyclic.capacity())?;
+        visit(0)?;
+        // Precompute O(1) SCC reachability bitset for moderate DAGs when budget allows.
+        let mut reach_bits: Option<(Vec<u64>, usize)> = None;
+        let mut bits_held: Option<Held> = None;
+        if ncomp > 0 && ncomp <= MAX_BITSET_SCCS {
+            let words = ncomp.div_ceil(64);
+            let bits_bytes = ncomp.saturating_mul(words).saturating_mul(size_of::<u64>());
+            let n = local.ids.len();
+            let work_bytes = (ncomp + 1) * 2 * size_of::<u32>() + n * size_of::<u32>();
+            if let Ok(bh) = Held::try_new(budget, bits_bytes)
+                && let Ok(_wh) = Held::try_new(budget, work_bytes)
+            {
+                visit(0)?;
+                let mut moff = vec![0u32; ncomp + 1];
+                for &c in &comp {
+                    moff[c as usize + 1] += 1;
+                }
+                for i in 0..ncomp {
+                    moff[i + 1] += moff[i];
+                }
+                let mut members = vec![0u32; n];
+                let mut fill = moff.clone();
+                for (x, &c) in comp.iter().enumerate() {
+                    members[fill[c as usize] as usize] = x as u32;
+                    fill[c as usize] += 1;
+                }
+                drop(fill);
+                let mut bits = vec![0u64; ncomp * words];
+                let mut bit_visits: u64 = 0;
+                for c in 0..ncomp {
+                    bits[c * words + (c / 64)] |= 1u64 << (c % 64);
+                    let mine = &members[moff[c] as usize..moff[c + 1] as usize];
+                    for &u in mine {
+                        let out = local.out(u);
+                        poll.tick(out.len() + 1)?;
+                        for &v in out {
+                            let d = comp[v as usize] as usize;
+                            if d != c {
+                                let (lo_s, hi_s) = bits.split_at_mut(c * words);
+                                let src = &lo_s[d * words..(d + 1) * words];
+                                let dst = &mut hi_s[..words];
+                                for (a, &b) in dst.iter_mut().zip(src) {
+                                    *a |= b;
+                                }
+                                bit_visits += 1;
+                                if bit_visits >= REACH_VISIT_BATCH {
+                                    visit(std::mem::take(&mut bit_visits))?;
+                                }
+                            }
+                        }
+                    }
+                }
+                if bit_visits > 0 {
+                    visit(bit_visits)?;
+                }
+                reach_bits = Some((bits, words));
+                bits_held = Some(bh);
+            }
+        }
         Ok(BaseReach::Directed {
             at,
             off: local.off,
             adj: local.adj,
             comp,
             cyclic,
+            reach_bits,
             irreflexive,
-            bytes,
+            _at_held: at_held,
+            _graph_held: local._held,
+            _extra_held: extra_held,
+            _bits_held: bits_held,
         })
     }
+}
+
+/// Aggregate of all active closure operators currently governing a predicate `q`.
+#[derive(Clone, Copy)]
+struct Covering {
+    any_equiv: bool,
+    all_irreflexive: bool,
 }
 
 /// Operator-maintained transitive and equivalence relations during incremental deletion
@@ -2360,23 +2564,24 @@ pub(crate) struct DeletionOps {
     /// guarded symmetric rules `(gp, go, not_literal_y)` such as `prp-symp`
     guarded_sym: Vec<(u64, u64, bool)>,
     /// per predicate `q` materialized on demand: confirmed explicit-edge reachability
-    base_graphs: FxHashMap<u64, BaseReach>,
-    /// per guarded `(q, gp, go)`, cached provability of the guard
-    guard_ok: FxHashMap<(u64, u64, u64), bool>,
+    /// structures (empty if all covering operators have derived, non-explicit guards)
+    base_graphs: FxHashMap<u64, Vec<BaseReach>>,
+    /// guarded triples `(q, gp, go)` that were deleted in a dead-guard batch
+    dead_guards: FxHashSet<(u64, u64, u64)>,
     /// predicates whose live derived facts were scanned once for operator consequences
     scanned_all: FxHashSet<u64>,
     /// operator predicates that lost facts during deletion, so saturation resets their marks
     dirty: FxHashSet<u64>,
     /// dead edges seen per operator predicate so far
     dead_counts: FxHashMap<u64, usize>,
-    /// budget charge for `base_graphs` and bookkeeping
+    /// budget charge for bookkeeping tables
     held: Held,
 }
 
 impl DeletionOps {
-    /// Detect active closure operators for incremental deletion, disabling any
-    /// irreflexive operator whose predicate currently meets literal value ambiguity so
-    /// its rules stay with the join evaluator.
+    /// Detect active closure operators for incremental deletion, disabling any operator
+    /// whose predicate currently meets literal value ambiguity so its rules stay with the
+    /// join evaluator.
     pub(crate) fn detect(
         rules: &[CRule],
         g: &Graph,
@@ -2389,15 +2594,20 @@ impl DeletionOps {
         let guarded_sym: Vec<(u64, u64, bool)> =
             rules.iter().filter_map(guarded_symmetric).collect();
         for op in &mut closures.ops {
-            if !op.irreflexive {
-                continue;
-            }
-            let unsafe_lits = match op.over {
-                Over::Fixed(c) => match op.shape {
-                    Shape::Transitive => Self::pred_has_literal_subject(g, c, terms),
-                    Shape::Equivalence => Self::pred_has_ambiguous_literals(g, c, terms),
-                },
-                Over::Guarded(gp, go) => Self::guarded_has_literal_subject(g, gp, go, terms),
+            let unsafe_lits = match (op.over, op.shape) {
+                // Match `Local::equivalence`: check ambiguous literals unconditionally so
+                // a symmetric rule with `notEqual` paired with an unfiltered transitive
+                // rule is also covered.
+                (Over::Fixed(c), Shape::Equivalence) => {
+                    Self::pred_has_ambiguous_literals(g, c, terms)
+                }
+                (Over::Fixed(c), Shape::Transitive) if op.irreflexive => {
+                    Self::pred_has_literal_subject(g, c, terms)
+                }
+                (Over::Guarded(gp, go), Shape::Transitive) if op.irreflexive => {
+                    Self::guarded_has_literal_subject(g, gp, go, terms)
+                }
+                _ => false,
             };
             if unsafe_lits {
                 op.off = true;
@@ -2411,12 +2621,23 @@ impl DeletionOps {
             ops: closures.ops,
             guarded_sym,
             base_graphs: FxHashMap::default(),
-            guard_ok: FxHashMap::default(),
+            dead_guards: FxHashSet::default(),
             scanned_all: FxHashSet::default(),
             dirty: FxHashSet::default(),
             dead_counts: FxHashMap::default(),
             held: Held::new(budget),
         }))
+    }
+
+    fn charge_tables(&mut self) -> Result<(), BudgetFailure> {
+        let bytes = table_bytes(
+            self.base_graphs.capacity(),
+            size_of::<(u64, Vec<BaseReach>)>(),
+        ) + table_bytes(self.dead_guards.capacity(), size_of::<(u64, u64, u64)>())
+            + table_bytes(self.scanned_all.capacity(), size_of::<u64>())
+            + table_bytes(self.dirty.capacity(), size_of::<u64>())
+            + table_bytes(self.dead_counts.capacity(), size_of::<(u64, usize)>());
+        self.held.try_set(bytes)
     }
 
     fn pred_has_literal_subject(g: &Graph, q: u64, terms: &Terms) -> bool {
@@ -2523,35 +2744,42 @@ impl DeletionOps {
         g.position(t).is_some() || g.base().is_some_and(|b| b.contains(t).unwrap_or(false))
     }
 
-    /// Index of the active operator governing predicate `q` in `g`, if any.
-    fn op_for(&self, q: u64, g: &Graph) -> Option<usize> {
-        for (i, op) in self.ops.iter().enumerate() {
+    /// Aggregate of all active operators governing predicate `q` in `g`.
+    fn covering(&self, q: u64, g: &Graph) -> Option<Covering> {
+        let mut found = false;
+        let mut any_equiv = false;
+        let mut all_irreflexive = true;
+        for op in &self.ops {
             if op.off {
                 continue;
             }
-            match op.over {
-                Over::Fixed(c) if c == q => return Some(i),
+            let active = match op.over {
+                Over::Fixed(c) => c == q,
                 Over::Guarded(gp, go) => {
-                    if self.guard_ok.get(&(q, gp, go)) == Some(&false) {
-                        continue;
-                    }
-                    if Self::is_alive(g, &[q, gp, go]) {
-                        return Some(i);
-                    }
+                    !self.dead_guards.contains(&(q, gp, go)) && Self::is_alive(g, &[q, gp, go])
                 }
-                _ => {}
+            };
+            if active {
+                found = true;
+                any_equiv |= op.shape == Shape::Equivalence;
+                all_irreflexive &= op.irreflexive;
             }
         }
-        None
+        found.then_some(Covering {
+            any_equiv,
+            all_irreflexive,
+        })
     }
 
     /// Whether predicate `q` is governed by an active closure operator.
     pub(crate) fn is_governed(&self, q: u64, g: &Graph) -> bool {
-        self.op_for(q, g).is_some()
+        self.covering(q, g).is_some()
     }
 
-    /// Ensure the confirmed explicit-edge reachability graph for predicate `q` is built
-    /// (verifying its guard if guarded), returning whether `q` is actively governed.
+    /// Ensure the confirmed explicit-edge reachability structures for predicate `q` are
+    /// built over all active covering operators whose guard is explicit. Operators whose
+    /// guard is derived (non-explicit) stay governed for consequences and `dirty_preds`,
+    /// without fast-proving pairs via `base_graphs` or poisoning `Search::unprovable`.
     pub(crate) fn ensure_pred(
         &mut self,
         q: u64,
@@ -2559,72 +2787,149 @@ impl DeletionOps {
         terms: &Terms,
         budget: &Arc<Budget>,
         cancel: Option<&AtomicBool>,
-        prove_guard: &mut dyn FnMut(Triple) -> anyhow::Result<bool>,
-    ) -> anyhow::Result<bool> {
-        let Some(oi) = self.op_for(q, g) else {
-            return Ok(false);
-        };
-        let (over, shape, irreflexive) = {
-            let op = &self.ops[oi];
-            (op.over, op.shape, op.irreflexive)
-        };
-        if let Over::Guarded(gp, go) = over {
-            let ok = match self.guard_ok.get(&(q, gp, go)).copied() {
-                Some(v) => v,
-                None => {
-                    let v = if Self::is_explicit(g, &[q, gp, go]) {
-                        true
-                    } else {
-                        prove_guard([q, gp, go])?
-                    };
-                    self.guard_ok.insert((q, gp, go), v);
-                    v
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if self.base_graphs.contains_key(&q) {
+            return Ok(());
+        }
+        // Determine which explicit-guard reachability modes are needed across all active
+        // covering operators on `q`.
+        let mut undir_unfilt = false;
+        let mut undir_irref = false;
+        let mut dir_rev_unfilt = false;
+        let mut dir_rev_irref = false;
+        let mut dir_unfilt = false;
+        let mut dir_irref = false;
+        let mut checked_sym: Option<Option<bool>> = None;
+        for op in &self.ops {
+            if op.off {
+                continue;
+            }
+            let explicit_guard = match op.over {
+                Over::Fixed(c) => c == q,
+                Over::Guarded(gp, go) => {
+                    !self.dead_guards.contains(&(q, gp, go)) && Self::is_explicit(g, &[q, gp, go])
                 }
             };
-            if !ok {
-                return Ok(false);
+            if !explicit_guard {
+                continue;
             }
-        }
-        if self.base_graphs.contains_key(&q) {
-            return Ok(true);
-        }
-        let reach = match shape {
-            Shape::Equivalence => BaseReach::build_undirected(q, g, irreflexive, budget, cancel)?,
-            Shape::Transitive => {
-                // If `q` also has an explicit guarded symmetric declaration (`prp-symp`),
-                // include 1-hop symmetric reverses of explicit edges.
-                let sym = self
-                    .guarded_sym
-                    .iter()
-                    .find(|&&(sgp, sgo, _)| Self::is_explicit(g, &[q, sgp, sgo]))
-                    .copied();
-                match sym {
-                    Some((_, _, not_lit_y)) => {
-                        let has_lit_obj =
-                            not_lit_y && Self::pred_has_explicit_literal_obj(g, q, terms);
-                        if !has_lit_obj {
-                            BaseReach::build_undirected(q, g, irreflexive, budget, cancel)?
-                        } else {
-                            BaseReach::build_directed(
-                                q,
-                                g,
-                                irreflexive,
-                                true,
-                                terms,
-                                budget,
-                                cancel,
-                            )?
-                        }
+            match op.shape {
+                Shape::Equivalence => {
+                    if op.irreflexive {
+                        undir_irref = true;
+                    } else {
+                        undir_unfilt = true;
                     }
-                    None => {
-                        BaseReach::build_directed(q, g, irreflexive, false, terms, budget, cancel)?
+                }
+                Shape::Transitive => {
+                    // If `q` also has an explicit guarded symmetric declaration (`prp-symp`),
+                    // include 1-hop symmetric reverses of explicit edges.
+                    let sym_mode = *checked_sym.get_or_insert_with(|| {
+                        let mut any_explicit_sym = false;
+                        let mut any_unfiltered_sym = false;
+                        for &(sgp, sgo, not_lit_y) in &self.guarded_sym {
+                            if Self::is_explicit(g, &[q, sgp, sgo]) {
+                                any_explicit_sym = true;
+                                if !not_lit_y {
+                                    any_unfiltered_sym = true;
+                                }
+                            }
+                        }
+                        if !any_explicit_sym {
+                            None
+                        } else if any_unfiltered_sym
+                            || !Self::pred_has_explicit_literal_obj(g, q, terms)
+                        {
+                            Some(false) // full undirected
+                        } else {
+                            Some(true) // directed + non-literal reverse
+                        }
+                    });
+                    match sym_mode {
+                        Some(false) => {
+                            if op.irreflexive {
+                                undir_irref = true;
+                            } else {
+                                undir_unfilt = true;
+                            }
+                        }
+                        Some(true) => {
+                            if op.irreflexive {
+                                dir_rev_irref = true;
+                            } else {
+                                dir_rev_unfilt = true;
+                            }
+                        }
+                        None => {
+                            if op.irreflexive {
+                                dir_irref = true;
+                            } else {
+                                dir_unfilt = true;
+                            }
+                        }
                     }
                 }
             }
-        };
-        self.held.try_grow(reach.bytes())?;
-        self.base_graphs.insert(q, reach);
-        Ok(true)
+        }
+        // Prune strictly subsumed shapes so overlapping operators build the minimal set.
+        if undir_unfilt {
+            undir_irref = false;
+            dir_rev_unfilt = false;
+            dir_rev_irref = false;
+            dir_unfilt = false;
+            dir_irref = false;
+        }
+        if undir_irref {
+            dir_rev_irref = false;
+            dir_irref = false;
+        }
+        if dir_rev_unfilt {
+            dir_rev_irref = false;
+            dir_unfilt = false;
+            dir_irref = false;
+        }
+        if dir_rev_irref {
+            dir_irref = false;
+        }
+        if dir_unfilt {
+            dir_irref = false;
+        }
+
+        let mut reaches: Vec<BaseReach> = Vec::new();
+        if undir_unfilt {
+            reaches.push(BaseReach::build_undirected(
+                q, g, false, budget, cancel, visit,
+            )?);
+        }
+        if undir_irref {
+            reaches.push(BaseReach::build_undirected(
+                q, g, true, budget, cancel, visit,
+            )?);
+        }
+        if dir_rev_unfilt {
+            reaches.push(BaseReach::build_directed(
+                q, g, false, true, terms, budget, cancel, visit,
+            )?);
+        }
+        if dir_rev_irref {
+            reaches.push(BaseReach::build_directed(
+                q, g, true, true, terms, budget, cancel, visit,
+            )?);
+        }
+        if dir_unfilt {
+            reaches.push(BaseReach::build_directed(
+                q, g, false, false, terms, budget, cancel, visit,
+            )?);
+        }
+        if dir_irref {
+            reaches.push(BaseReach::build_directed(
+                q, g, true, false, terms, budget, cancel, visit,
+            )?);
+        }
+        self.base_graphs.insert(q, reaches);
+        self.charge_tables()?;
+        Ok(())
     }
 
     fn pred_has_explicit_literal_obj(g: &Graph, q: u64, terms: &Terms) -> bool {
@@ -2653,13 +2958,26 @@ impl DeletionOps {
     /// Read-only O(1)/bounded check whether `t` is proved by the confirmed explicit edges
     /// of its operator relation (`Sync` across parallel `prove_all` chunks).
     #[inline]
-    pub(crate) fn proved_by_base(&self, t: &Triple) -> bool {
-        self.base_graphs
-            .get(&t[1])
-            .is_some_and(|r| r.proves(t[0], t[2]))
+    pub(crate) fn proved_by_base(
+        &self,
+        t: &Triple,
+        scratch: &mut ReachScratch,
+        cancel: Option<&AtomicBool>,
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        let Some(reaches) = self.base_graphs.get(&t[1]) else {
+            return Ok(false);
+        };
+        for r in reaches {
+            if r.proves(t[0], t[2], scratch, cancel, visit)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Enumerate operator consequences of `dead` while `dead` rows are still live in `g`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn consequences(
         &mut self,
         dead: &[Triple],
@@ -2667,22 +2985,24 @@ impl DeletionOps {
         terms: &Terms,
         budget: &Arc<Budget>,
         cancel: Option<&AtomicBool>,
+        visit: &mut dyn FnMut(u64) -> anyhow::Result<()>,
         out: &mut dyn FnMut(Triple) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let mut poll = Poll::new(cancel);
+        let mut scratch = ReachScratch::new(budget);
+        let mut pending: u64 = 0;
         // 1. Dead guards invalidate the operator for those predicates: emit all live
         //    non-explicit derived facts of each such predicate.
+        let mut dead_guards_held = Held::new(budget);
         let mut dead_guards: Vec<u64> = Vec::new();
         for op in &self.ops {
             if let Over::Guarded(gp, go) = op.over {
                 for d in dead {
                     if d[1] == gp && d[2] == go {
                         let q = d[0];
-                        self.guard_ok.insert((q, gp, go), false);
-                        if let Some(old) = self.base_graphs.remove(&q) {
-                            self.held.shrink(old.bytes());
-                        }
-                        dead_guards.push(q);
+                        self.dead_guards.insert((q, gp, go));
+                        self.base_graphs.remove(&q);
+                        push_moved(&mut dead_guards, q, &mut dead_guards_held)?;
                     }
                 }
             }
@@ -2692,9 +3012,14 @@ impl DeletionOps {
         for q in dead_guards {
             self.dirty.insert(q);
             self.scanned_all.insert(q);
+            self.charge_tables()?;
             let c = g.cands(None, Some(q), None, g.offset(), g.len());
             for r in c.iter() {
                 poll.tick(1)?;
+                pending += 1;
+                if pending >= REACH_VISIT_BATCH {
+                    visit(std::mem::take(&mut pending))?;
+                }
                 if g.alive(r) && !g.flagged(r) {
                     let t = g.triple(r);
                     if t[1] == q {
@@ -2703,50 +3028,45 @@ impl DeletionOps {
                 }
             }
         }
-        // 2. Group dead edges by governed predicate `q`.
-        let mut by_pred: FxHashMap<u64, (usize, Vec<Triple>)> = FxHashMap::default();
+        drop(dead_guards_held);
+        // 2. Group dead edges by governed predicate `q`, charging before growth.
+        let mut by_pred_held = Held::new(budget);
+        let mut by_pred: FxHashMap<u64, (Covering, Vec<Triple>)> = FxHashMap::default();
         for &d in dead {
-            if let Some(oi) = self.op_for(d[1], g) {
-                by_pred
-                    .entry(d[1])
-                    .or_insert_with(|| (oi, Vec::new()))
-                    .1
-                    .push(d);
+            if let Some(cov) = self.covering(d[1], g) {
+                if !by_pred.contains_key(&d[1]) {
+                    reserve_one(&mut by_pred, &mut by_pred_held)?;
+                }
+                let entry = by_pred.entry(d[1]).or_insert_with(|| (cov, Vec::new()));
+                push_moved(&mut entry.1, d, &mut by_pred_held)?;
             }
         }
         // 3. Emit operator consequences for each affected predicate.
         let mut memo = Memo::default();
-        for (q, (oi, edges)) in by_pred {
+        for (q, (cov, edges)) in by_pred {
             self.dirty.insert(q);
             if self.scanned_all.contains(&q) {
                 continue;
             }
-            // Ensure `base_graphs[q]` exists when the guard holds so we skip surviving
-            // pairs immediately.
-            let guard_ok = match self.ops[oi].over {
-                Over::Fixed(_) => true,
-                Over::Guarded(gp, go) => self
-                    .guard_ok
-                    .get(&(q, gp, go))
-                    .copied()
-                    .unwrap_or_else(|| Self::is_explicit(g, &[q, gp, go])),
-            };
-            if guard_ok && !self.base_graphs.contains_key(&q) {
-                let mut always = |_: Triple| Ok(true);
-                let _ = self.ensure_pred(q, g, terms, budget, cancel, &mut always)?;
-            }
+            // Ensure `base_graphs[q]` exists for any explicit-guard operators so we skip
+            // surviving pairs immediately.
+            self.ensure_pred(q, g, terms, budget, cancel, visit)?;
             let total = self.dead_counts.entry(q).or_default();
             *total = total.saturating_add(edges.len());
-            let shape = self.ops[oi].shape;
-            let irreflexive = self.ops[oi].irreflexive;
-            if *total <= 32 && edges.len() <= 32 {
+            let total_dead = *total;
+            self.charge_tables()?;
+            if total_dead <= 32 && edges.len() <= 32 {
                 // Small deletion: 1-step operator consequences via the graph indexes.
                 let mut emit = |cand: Triple| -> anyhow::Result<()> {
-                    if irreflexive && cand[0] == cand[2] {
+                    pending += 1;
+                    if pending >= REACH_VISIT_BATCH {
+                        visit(std::mem::take(&mut pending))?;
+                    }
+                    if cov.all_irreflexive && cand[0] == cand[2] {
                         return Ok(());
                     }
                     if g.position(&cand).is_some_and(|r| !g.flagged(r))
-                        && !self.proved_by_base(&cand)
+                        && !self.proved_by_base(&cand, &mut scratch, cancel, visit)?
                     {
                         out(cand)?;
                     }
@@ -2754,7 +3074,7 @@ impl DeletionOps {
                 };
                 for d in &edges {
                     let (u, v) = (d[0], d[2]);
-                    if shape == Shape::Equivalence {
+                    if cov.any_equiv {
                         emit([v, q, u])?;
                     }
                     g.each_subject(&mut memo, q, u, g.len(), |x| {
@@ -2773,17 +3093,25 @@ impl DeletionOps {
                 // live non-explicit derived rows of `q`, skipping pairs proved by
                 // `base_graphs[q]`, so total work stays O(|E_derived(q)|).
                 self.scanned_all.insert(q);
+                self.charge_tables()?;
                 let c = g.cands(None, Some(q), None, g.offset(), g.len());
                 for r in c.iter() {
                     poll.tick(1)?;
+                    pending += 1;
+                    if pending >= REACH_VISIT_BATCH {
+                        visit(std::mem::take(&mut pending))?;
+                    }
                     if g.alive(r) && !g.flagged(r) {
                         let t = g.triple(r);
-                        if t[1] == q && !self.proved_by_base(&t) {
+                        if t[1] == q && !self.proved_by_base(&t, &mut scratch, cancel, visit)? {
                             out(t)?;
                         }
                     }
                 }
             }
+        }
+        if pending > 0 {
+            visit(pending)?;
         }
         if let Some(base) = g.base() {
             base.add_scans(memo.scans);

@@ -1577,3 +1577,519 @@ fn changed_lists_with_nonmonotonic_list_builtins_stay_incremental() {
         since = rep.receipt.unwrap().commit.seq;
     }
 }
+
+/// Derived `owl:TransitiveProperty` guards (through `owl:sameAs` + `eq-rep-s`, through a
+/// custom fixed transitive predicate `ex:r`, and through `rdfs:subClassOf` + `cax-sco`)
+/// must keep the predicate governed for retractions and saturation without poisoning
+/// `Search::unprovable`.
+#[test]
+fn derived_transitive_guard_retractions_and_shortcuts_match_full_runs() {
+    // 1. OWL 2 RL: `ex:p` derives `owl:TransitiveProperty` via `owl:sameAs` + `eq-rep-s`
+    {
+        let (_d, s) = persistent();
+        ttl(
+            &s,
+            "ex:p owl:sameAs ex:q .
+             ex:q a owl:TransitiveProperty .
+             ex:a ex:p ex:c .
+             ex:c ex:p ex:d .",
+        );
+        let p = Profile::OwlRl;
+        let cache = Cache::default();
+        let full = run_reporting(&s, &p, None, &cache);
+        check(&s, &p, &full, "sameAs derived guard initial");
+        // Delete chain edge `ex:a ex:p ex:c` -> `ex:a ex:p ex:d` must be retracted!
+        let before = inferred(&s);
+        change(&s, &[], &[t("ex:a", "ex:p", "ex:c")]);
+        let r1 = run_reporting(&s, &p, Some(full.receipt.unwrap().commit.seq), &cache);
+        assert_eq!(r1.method, Method::Incremental, "{:?}", r1.fallback);
+        check(&s, &p, &r1, "sameAs derived guard delete chain edge");
+        let after = inferred(&s);
+        assert!(
+            !after.contains(&t("ex:a", "ex:p", "ex:d").to_string()),
+            "stale transitive edge remained"
+        );
+        check_change(&s, &r1, &before, &after, "sameAs derived guard chain delta");
+
+        // Add shortcut + detour, then delete explicit shortcut `ex:a ex:p ex:c`:
+        // `ex:a ex:p ex:c` and `ex:a ex:p ex:d` must survive via `dirty_preds` saturation.
+        change(
+            &s,
+            &[
+                t("ex:a", "ex:p", "ex:b"),
+                t("ex:b", "ex:p", "ex:c"),
+                t("ex:a", "ex:p", "ex:c"),
+            ],
+            &[],
+        );
+        let r2 = run_reporting(&s, &p, Some(r1.receipt.unwrap().commit.seq), &cache);
+        assert_eq!(r2.method, Method::Incremental, "{:?}", r2.fallback);
+        check(&s, &p, &r2, "sameAs derived guard insert detour");
+        let before = inferred(&s);
+        change(&s, &[], &[t("ex:a", "ex:p", "ex:c")]);
+        let r3 = run_reporting(&s, &p, Some(r2.receipt.unwrap().commit.seq), &cache);
+        assert_eq!(r3.method, Method::Incremental, "{:?}", r3.fallback);
+        check(&s, &p, &r3, "sameAs derived guard delete shortcut");
+        let after = inferred(&s);
+        assert!(
+            after.contains(&t("ex:a", "ex:p", "ex:c").to_string()),
+            "shortcut lost"
+        );
+        assert!(
+            after.contains(&t("ex:a", "ex:p", "ex:d").to_string()),
+            "chained fact lost"
+        );
+        check_change(
+            &s,
+            &r3,
+            &before,
+            &after,
+            "sameAs derived guard shortcut delta",
+        );
+    }
+
+    // 2. Custom rule deriving `owl:TransitiveProperty` from a fixed transitive predicate `ex:r`
+    {
+        let rules = Profile::Rules(
+            "@prefix ex: <http://ex.org/>.
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>.
+             @prefix owl: <http://www.w3.org/2002/07/owl#>.
+             [r-tr: (?x ex:r ?y), (?y ex:r ?z) -> (?x ex:r ?z)]
+             [decl: (ex:u ex:r ex:w) -> (ex:q rdf:type owl:TransitiveProperty)]
+             [tr: (?p rdf:type owl:TransitiveProperty), (?x ?p ?y), (?y ?p ?z) -> (?x ?p ?z)]"
+                .into(),
+        );
+        let (_d, s) = persistent();
+        ttl(
+            &s,
+            "ex:u ex:r ex:v .
+             ex:v ex:r ex:w .
+             ex:a ex:q ex:b .
+             ex:b ex:q ex:c .",
+        );
+        let cache = Cache::default();
+        let full = run_reporting(&s, &rules, None, &cache);
+        check(&s, &rules, &full, "fixed-op derived guard initial");
+        let before = inferred(&s);
+        change(&s, &[], &[t("ex:a", "ex:q", "ex:b")]);
+        let r = run_reporting(&s, &rules, Some(full.receipt.unwrap().commit.seq), &cache);
+        assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
+        check(&s, &rules, &r, "fixed-op derived guard delete edge");
+        let after = inferred(&s);
+        assert!(
+            !after.contains(&t("ex:a", "ex:q", "ex:c").to_string()),
+            "stale transitive fact remained"
+        );
+        check_change(&s, &r, &before, &after, "fixed-op derived guard delta");
+    }
+
+    // 3. OWL 2 RL: `rdfs:subClassOf` + `cax-sco` deriving `owl:TransitiveProperty`
+    {
+        let (_d, s) = persistent();
+        ttl(
+            &s,
+            "ex:MyTrans rdfs:subClassOf owl:TransitiveProperty .
+             ex:p a ex:MyTrans .
+             ex:a ex:p ex:b .
+             ex:b ex:p ex:c .",
+        );
+        let p = Profile::OwlRl;
+        let cache = Cache::default();
+        let full = run_reporting(&s, &p, None, &cache);
+        check(&s, &p, &full, "subClassOf derived guard initial");
+        let before = inferred(&s);
+        change(&s, &[], &[t("ex:a", "ex:p", "ex:b")]);
+        let r1 = run_reporting(&s, &p, Some(full.receipt.unwrap().commit.seq), &cache);
+        assert_eq!(r1.method, Method::Incremental, "{:?}", r1.fallback);
+        check(&s, &p, &r1, "subClassOf derived guard delete edge");
+        check_change(
+            &s,
+            &r1,
+            &before,
+            &inferred(&s),
+            "subClassOf derived guard edge delta",
+        );
+        // Re-add edge and delete the subclass declaration
+        change(&s, &[t("ex:a", "ex:p", "ex:b")], &[]);
+        let r2 = run_reporting(&s, &p, Some(r1.receipt.unwrap().commit.seq), &cache);
+        let before = inferred(&s);
+        change(&s, &[], &[t("ex:p", "rdf:type", "ex:MyTrans")]);
+        let r3 = run_reporting(&s, &p, Some(r2.receipt.unwrap().commit.seq), &cache);
+        assert_eq!(r3.method, Method::Incremental, "{:?}", r3.fallback);
+        check(&s, &p, &r3, "subClassOf derived guard delete typing");
+        check_change(
+            &s,
+            &r3,
+            &before,
+            &inferred(&s),
+            "subClassOf derived guard typing delta",
+        );
+    }
+}
+
+/// Overlapping closure operators on the same predicate: an irreflexive transitive rule
+/// listed before an unfiltered transitive rule must still retract reflexive pairs produced
+/// by the unfiltered rule.
+#[test]
+fn overlapping_transitive_operators_retract_reflexive_pairs() {
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [tr-irref: (?x ex:q ?y), (?y ex:q ?z), notEqual(?x, ?z) -> (?x ex:q ?z)]
+         [tr-full: (?x ex:q ?y), (?y ex:q ?z) -> (?x ex:q ?z)]"
+            .into(),
+    );
+    let (_d, s) = persistent();
+    ttl(&s, "ex:a ex:q ex:b . ex:b ex:q ex:a .");
+    let cache = Cache::default();
+    let full = run_reporting(&s, &rules, None, &cache);
+    check(&s, &rules, &full, "overlapping ops initial");
+    let before = inferred(&s);
+    assert!(before.contains(&t("ex:a", "ex:q", "ex:a").to_string()));
+    assert!(before.contains(&t("ex:b", "ex:q", "ex:b").to_string()));
+    change(&s, &[], &[t("ex:a", "ex:q", "ex:b")]);
+    let r = run_reporting(&s, &rules, Some(full.receipt.unwrap().commit.seq), &cache);
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
+    check(&s, &rules, &r, "overlapping ops delete");
+    let after = inferred(&s);
+    assert!(!after.contains(&t("ex:a", "ex:q", "ex:a").to_string()));
+    assert!(!after.contains(&t("ex:b", "ex:q", "ex:b").to_string()));
+    check_change(&s, &r, &before, &after, "overlapping ops delta");
+}
+
+/// Multi-graph ordered RDF list edits: both removing an earlier graph's copy of a
+/// duplicated `rdf:first` (`base_moved`) and removing two competing objects from different
+/// graphs must agree with full runs for cached and dataset-backed closures.
+#[test]
+fn ordered_multi_graph_list_edits_match_full_runs() {
+    use sparkles_reasoner::{GraphRef, Inputs};
+    let g1 = format!("{EX}g1");
+    let g2 = format!("{EX}g2");
+    let g3 = format!("{EX}g3");
+    let inputs = Inputs {
+        data_graphs: vec![
+            GraphRef::Named(g1.clone()),
+            GraphRef::Named(g2.clone()),
+            GraphRef::Named(g3.clone()),
+        ],
+        ..Default::default()
+    };
+    let ropts = ReasonOptions {
+        inputs,
+        ..Default::default()
+    };
+    let extras = Extras::default();
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [m: (?c ex:items ?l), listMember(?l, ?x) -> (?c ex:has ?x)]"
+            .into(),
+    );
+    let q_in = |tr: &Triple, g: &str| {
+        Quad::new(
+            tr.subject.clone(),
+            tr.predicate.clone(),
+            tr.object.clone(),
+            GraphName::NamedNode(iri(g.to_string())),
+        )
+    };
+    let commit_quads = |s: &Store, add: &[Quad], del: &[Quad]| {
+        let mut txn = s.write();
+        let mut labels = Default::default();
+        for q in del {
+            let enc = txn.encode_quad(q, &mut labels).unwrap();
+            txn.delete(enc).unwrap();
+        }
+        for q in add {
+            let enc = txn.encode_quad(q, &mut labels).unwrap();
+            txn.insert(enc).unwrap();
+        }
+        txn.commit().unwrap();
+    };
+    let full_expected = |s: &Store| -> BTreeSet<String> {
+        let (ts, _) = infer(s.snapshot(), &rules, &ropts).unwrap();
+        ts.iter().map(|t| t.to_string()).collect()
+    };
+    let rdf_nil = format!("{RDF}nil");
+    let nil = rdf_nil.as_str();
+
+    for kept in [true, false] {
+        // Case 1: removing G1's copy of `(l rdf:first a)` while G3 also holds it (`base_moved`)
+        // changes the earliest object from `a` to `b` (in G2).
+        let (_d, s) = persistent();
+        let cache = Cache::default();
+        let cache_opt = kept.then_some(&cache);
+        commit_quads(
+            &s,
+            &[
+                q_in(&t("ex:l", "rdf:first", "ex:a"), &g1),
+                q_in(&t("ex:l", "rdf:first", "ex:b"), &g2),
+                q_in(&t("ex:l", "rdf:first", "ex:a"), &g3),
+                q_in(&t("ex:l", "rdf:rest", nil), &g3),
+                q_in(&t("ex:c", "ex:items", "ex:l"), &g3),
+            ],
+            &[],
+        );
+        let r0 = materialize_incremental(
+            &s,
+            &rules,
+            &extras,
+            Incremental {
+                since: None,
+                cache: cache_opt,
+            },
+            &ropts,
+        )
+        .unwrap();
+        assert_eq!(
+            inferred(&s),
+            full_expected(&s),
+            "case 1 initial (kept {kept})"
+        );
+        commit_quads(&s, &[], &[q_in(&t("ex:l", "rdf:first", "ex:a"), &g1)]);
+        let _r1 = materialize_incremental(
+            &s,
+            &rules,
+            &extras,
+            Incremental {
+                since: Some(r0.receipt.unwrap().commit.seq),
+                cache: cache_opt,
+            },
+            &ropts,
+        )
+        .unwrap();
+        assert_eq!(
+            inferred(&s),
+            full_expected(&s),
+            "case 1 base_moved list edit (kept {kept})"
+        );
+        assert!(inferred(&s).contains(&t("ex:c", "ex:has", "ex:b").to_string()));
+        assert!(!inferred(&s).contains(&t("ex:c", "ex:has", "ex:a").to_string()));
+
+        // Case 2: remove both competing `rdf:first` objects from G1 and G2 where G2's object
+        // has a lower term id than G1's object.
+        let (_d2, s2) = persistent();
+        let cache2 = Cache::default();
+        let cache2_opt = kept.then_some(&cache2);
+        // Intern `ex:a_low` first so its term ID is strictly lower than `ex:z_high`.
+        commit_quads(
+            &s2,
+            &[
+                q_in(&t("ex:l", "rdf:first", "ex:a_low"), &g2),
+                q_in(&t("ex:l", "rdf:first", "ex:z_high"), &g1),
+                q_in(&t("ex:l", "rdf:rest", nil), &g3),
+                q_in(&t("ex:c", "ex:items", "ex:l"), &g3),
+            ],
+            &[],
+        );
+        let r0 = materialize_incremental(
+            &s2,
+            &rules,
+            &extras,
+            Incremental {
+                since: None,
+                cache: cache2_opt,
+            },
+            &ropts,
+        )
+        .unwrap();
+        assert_eq!(
+            inferred(&s2),
+            full_expected(&s2),
+            "case 2 initial (kept {kept})"
+        );
+        commit_quads(
+            &s2,
+            &[],
+            &[
+                q_in(&t("ex:l", "rdf:first", "ex:z_high"), &g1),
+                q_in(&t("ex:l", "rdf:first", "ex:a_low"), &g2),
+            ],
+        );
+        let _r1 = materialize_incremental(
+            &s2,
+            &rules,
+            &extras,
+            Incremental {
+                since: Some(r0.receipt.unwrap().commit.seq),
+                cache: cache2_opt,
+            },
+            &ropts,
+        )
+        .unwrap();
+        assert_eq!(
+            inferred(&s2),
+            full_expected(&s2),
+            "case 2 competing multi-graph removal (kept {kept})"
+        );
+        assert!(inferred(&s2).is_empty());
+    }
+}
+
+/// Deleting ordinary instance `rdf:type` triples under `Profile::OwlRl` must respect
+/// constant object slots on `prp-symp`/`prp-fp`/`prp-ifp` in `estimate_deletion_visits`
+/// and remain incremental instead of triggering a false full-run fallback.
+#[test]
+fn owl_rl_instance_type_deletions_stay_incremental() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    // 10 predicates (~1,000 facts each -> avg_p ~ 1,000) plus 1,200 ordinary rdf:type rows.
+    for p_idx in 0..9 {
+        for i in 0..1_000 {
+            data += &format!("<{EX}s{i}> <{EX}p{p_idx}> <{EX}o{}> .\n", i % 50);
+        }
+    }
+    for i in 0..1_200 {
+        data += &format!("<{EX}ind{i}> <{RDF}type> <{EX}Student> .\n");
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let p = Profile::OwlRl;
+    let cache = Cache::default();
+    let full = run(&s, &p, None, Some(&cache));
+    let mut since = full.receipt.unwrap().commit.seq;
+
+    // Small deletion (50 rdf:type triples)
+    let small: Vec<Triple> = (0..50)
+        .map(|i| t(&format!("ex:ind{i}"), "rdf:type", "ex:Student"))
+        .collect();
+    change(&s, &[], &small);
+    let r1 = run(&s, &p, Some(since), Some(&cache));
+    assert_eq!(r1.method, Method::Incremental, "{:?}", r1.fallback);
+    check(&s, &p, &r1, "owl-rl small rdf:type deletion");
+    since = r1.receipt.unwrap().commit.seq;
+
+    // Larger deletion (600 rdf:type triples, > 5% of total facts)
+    let large: Vec<Triple> = (50..650)
+        .map(|i| t(&format!("ex:ind{i}"), "rdf:type", "ex:Student"))
+        .collect();
+    change(&s, &[], &large);
+    let r2 = run(&s, &p, Some(since), Some(&cache));
+    assert_eq!(r2.method, Method::Incremental, "{:?}", r2.fallback);
+    check(&s, &p, &r2, "owl-rl >5% rdf:type deletion");
+}
+
+/// `revive_overdeleted` path: a non-operator rule (`cls-svf1`) reads a surviving 2-hop
+/// mixed transitive fact (`ex:a ex:tr ex:c`, derived from `prp-spo1` + `prp-trp`, not
+/// explicit `ex:tr` edges alone) while an explicit copy of the head (`ex:a a ex:Reach`)
+/// is deleted.
+#[test]
+fn revive_overdeleted_surviving_mixed_transitive_support() {
+    let (_d, s) = persistent();
+    ttl(
+        &s,
+        "ex:sub rdfs:subPropertyOf ex:tr .
+         ex:tr a owl:TransitiveProperty .
+         ex:Reach owl:someValuesFrom ex:Target ; owl:onProperty ex:tr .
+         ex:c a ex:Target .
+         ex:a ex:sub ex:b .
+         ex:b ex:tr ex:c .
+         ex:a a ex:Reach .",
+    );
+    let p = Profile::OwlRl;
+    let cache = Cache::default();
+    let full = run_reporting(&s, &p, None, &cache);
+    check(&s, &p, &full, "revive_overdeleted initial");
+    let before = inferred(&s);
+    change(&s, &[], &[t("ex:a", "rdf:type", "ex:Reach")]);
+    let r = run_reporting(&s, &p, Some(full.receipt.unwrap().commit.seq), &cache);
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
+    check(&s, &p, &r, "revive_overdeleted delete explicit head");
+    let after = inferred(&s);
+    assert!(
+        after.contains(&t("ex:a", "rdf:type", "ex:Reach").to_string()),
+        "head supported by surviving mixed transitive fact must be revived"
+    );
+    check_change(&s, &r, &before, &after, "revive_overdeleted delta");
+}
+
+/// List replay (`eval_list_rules_new`) and revival (`revive_overdeleted`) enforce
+/// `max_inferred` across all derived facts admitted by the incremental pass.
+#[test]
+fn list_replay_and_revival_enforce_max_inferred() {
+    let rdf_nil = format!("{RDF}nil");
+    let nil = rdf_nil.as_str();
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [r1: (?c ex:items ?l), listMember(?l, ex:x) -> (?c ex:hit1 ex:ok)]
+         [r2: (?c ex:items ?l), listMember(?l, ex:x) -> (?c ex:hit2 ex:ok)]"
+            .into(),
+    );
+    let (_d, s) = persistent();
+    let cache = Cache::default();
+    change(
+        &s,
+        &[
+            t("ex:c0", "ex:items", "ex:l0"),
+            t("ex:l0", "rdf:first", "ex:y"),
+            t("ex:l0", "rdf:rest", nil),
+        ],
+        &[],
+    );
+    let r0 = run(&s, &rules, None, Some(&cache));
+    let since = r0.receipt.unwrap().commit.seq;
+    // Edit list so both rules derive 1 distinct triple each (2 total) while max_inferred = 1
+    change(
+        &s,
+        &[t("ex:l0", "rdf:first", "ex:x")],
+        &[t("ex:l0", "rdf:first", "ex:y")],
+    );
+    let opts = ReasonOptions {
+        max_inferred: 1,
+        ..ReasonOptions::default()
+    };
+    let err = materialize_incremental(
+        &s,
+        &rules,
+        &Extras::default(),
+        Incremental {
+            since: Some(since),
+            cache: Some(&cache),
+        },
+        &opts,
+    )
+    .expect_err("list replay producing 2 triples must fail when max_inferred = 1");
+    assert!(
+        err.to_string().contains("inferred") || err.to_string().contains("limit"),
+        "unexpected error: {err:#}"
+    );
+
+    // Revival path (`revive_overdeleted`) must also enforce `max_inferred`: `ex:a a ex:Reach`
+    // depends only on the surviving 2-hop mixed transitive edge `ex:a ex:tr ex:c`, so
+    // Phase 1 over-deletes it and `revive_overdeleted` attempts to revive it.
+    let (_d2, s2) = persistent();
+    let cache2 = Cache::default();
+    ttl(
+        &s2,
+        "ex:sub rdfs:subPropertyOf ex:tr .
+         ex:tr a owl:TransitiveProperty .
+         ex:Reach owl:someValuesFrom ex:Target ; owl:onProperty ex:tr .
+         ex:c a ex:Target .
+         ex:a ex:sub ex:b .
+         ex:b ex:tr ex:c .
+         ex:a a ex:Reach .",
+    );
+    let r_init = run(&s2, &Profile::OwlRl, None, Some(&cache2));
+    change(&s2, &[], &[t("ex:a", "rdf:type", "ex:Reach")]);
+    let zero_opts = ReasonOptions {
+        max_inferred: 0,
+        ..ReasonOptions::default()
+    };
+    let rev_err = materialize_incremental(
+        &s2,
+        &Profile::OwlRl,
+        &Extras::default(),
+        Incremental {
+            since: Some(r_init.receipt.unwrap().commit.seq),
+            cache: Some(&cache2),
+        },
+        &zero_opts,
+    )
+    .expect_err("revival producing a triple must fail when max_inferred = 0");
+    assert!(
+        rev_err.to_string().contains("inferred") || rev_err.to_string().contains("limit"),
+        "unexpected error: {rev_err:#}"
+    );
+}

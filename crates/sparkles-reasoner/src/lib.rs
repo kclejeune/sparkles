@@ -2007,12 +2007,14 @@ fn update_closure(
             Ok(())
         };
         let hook: Option<incremental::BeforeDelete<'_>> = if has { Some(&mut hook) } else { None };
-        let up = incremental::update_with(
+        let up = incremental::update_with_moved(
             &mut closure,
             &compiled,
             &limits,
             &ch.base_added,
             &ch.base_removed,
+            &ch.base_moved,
+            graphs.len() > 1,
             hook,
             rebuild,
         );

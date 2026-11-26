@@ -2534,28 +2534,6 @@ pub(crate) fn run(
     run_observed(g, rules, terms, limits, start, None)
 }
 
-/// [`run`] for incremental saturation when operator predicates in `dirty_preds` lost
-/// facts during deletion and must re-close from row 0.
-pub(crate) fn run_with_dirty(
-    g: &mut Graph,
-    rules: &[CRule],
-    terms: &Terms,
-    limits: &Limits,
-    start: Option<u32>,
-    dirty_preds: &[u64],
-) -> anyhow::Result<Outcome> {
-    run_from_with_dirty(
-        g,
-        rules,
-        terms,
-        limits,
-        start,
-        None,
-        Origin::default(),
-        dirty_preds,
-    )
-}
-
 /// Evaluate a program of the IR to its fixpoint (item 839's plan, §1.3 and §10.2). A
 /// program without an IR feature runs as Jena's rules do, in one stratum with Jena's
 /// `noValue`. One with relations and no negation runs its lowered rules in one stratum.
@@ -2671,7 +2649,7 @@ pub(crate) fn run_from(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_from_with_dirty(
+pub(crate) fn run_from_with_dirty(
     g: &mut Graph,
     rules: &[CRule],
     terms: &Terms,
