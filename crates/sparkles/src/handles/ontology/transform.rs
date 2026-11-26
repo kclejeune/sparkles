@@ -348,12 +348,12 @@ fn create_private_stage_dir(parent: &Path) -> std::io::Result<tempfile::TempDir>
 /// serialization and receive their preserved mode only after serialization and flush.
 fn create_staged_file(
     stage_dir: &Path,
-    preserve_existing: bool,
+    _preserve_existing: bool,
 ) -> std::io::Result<tempfile::NamedTempFile> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("out-").suffix(".tmp");
     #[cfg(unix)]
-    if !preserve_existing {
+    if !_preserve_existing {
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
