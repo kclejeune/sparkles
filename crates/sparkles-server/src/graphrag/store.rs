@@ -133,7 +133,9 @@ fn nn(iri: &str) -> NamedNode {
 
 /// A term from its canonical N-Triples form, when it is an IRI or a literal.
 pub fn parse_term(nt: &str) -> Option<Term> {
-    if let Some(iri) = nt.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+    if !nt.starts_with("<<(")
+        && let Some(iri) = nt.strip_prefix('<').and_then(|s| s.strip_suffix('>'))
+    {
         return NamedNode::new(iri).ok().map(Term::NamedNode);
     }
     // one allocation of the document's exact length, which the run's charges count on

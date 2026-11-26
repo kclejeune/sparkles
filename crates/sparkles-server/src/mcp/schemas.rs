@@ -728,23 +728,10 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "reviewedOnly": {"type":"boolean","default":false,"description":"Only reports a person marked reviewed"},
                 "limit": {"type":"integer","minimum":1,"maximum":100,"default":10},
                 "findings": {"type":"boolean","default":true,"description":"Include each report's findings and citations"},
+                "reviewPolicy": {"type":"string","minLength":1,"description":"A review policy of the dataset's evidence settings: select only reports read under that policy"},
+                "matchingPolicy": {"type":"string","minLength":1,"description":"A matching policy of the dataset's evidence settings: resolve entity identities referenced by the returned reports through its resolution map"},
                 "timeoutSeconds": to(cfg)}}),
-            Some(json!({"type":"object","required":["dataset","available","reports"],"properties":{
-                "dataset":{"type":"string"},"available":{"type":"boolean"},
-                "reason":{"enum":["off","unavailable","no-reports"]},"message":{"type":"string"},
-                "reportsGraph":{"type":"string"},"level":{"type":"integer"},
-                "levels":{"type":"array","items":{"type":"object","required":["level","reports"],"properties":{"level":{"type":"integer"},"reports":{"type":"integer"}}}},
-                "ranking":{"enum":["search","rating"]},"stale":{"type":"integer"},
-                "reports":{"type":"array","items":{"type":"object","required":["iri","community","level","title","summary","status","memberCount","findings"],"properties":{
-                    "iri":{"type":"string"},"community":{"type":"string"},"level":{"type":"integer"},
-                    "title":{"type":"string"},"summary":{"type":"string"},
-                    "status":{"enum":["unreviewed","reviewed","stale"]},"rating":{"type":["integer","null"]},
-                    "memberCount":{"type":"integer"},"score":{"type":"number"},
-                    "reviewPolicy":{"type":"object","required":["iri"],"description":"The review policy the report was read under, when it has one","properties":{
-                        "iri":{"type":"string"},"version":{"type":["integer","null"]},"configuration":{"type":["string","null"]}}},
-                    "findings":{"type":"array","items":{"type":"object","required":["iri","text","cites"],"properties":{
-                        "iri":{"type":"string"},"text":{"type":"string"},"cites":strings(),
-                        "claims":strings(),"decisions":strings()}}}}}}}})),
+            Some(community_reports_output()),
         ),
         read(
             "why_empty",
@@ -976,4 +963,106 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
     .filter(|t| !super::branches::WRITE_TOOLS.contains(&t.name) || cfg.allow_update)
     .map(super::branches::with_branch_argument)
     .collect()
+}
+
+fn community_reports_output() -> Value {
+    let identity = json!({
+        "type": "object",
+        "required": ["entity", "representative", "members", "membersComplete"],
+        "properties": {
+            "entity": { "type": "string" },
+            "representative": { "type": "string" },
+            "members": strings(),
+            "membersComplete": { "type": "boolean" },
+        },
+    });
+    let finding = json!({
+        "type": "object",
+        "required": ["iri", "text", "cites"],
+        "properties": {
+            "iri": { "type": "string" },
+            "text": { "type": "string" },
+            "cites": strings(),
+            "about": strings(),
+            "claims": strings(),
+            "decisions": strings(),
+        },
+    });
+    let report = json!({
+        "type": "object",
+        "required": ["iri", "community", "level", "title", "summary", "status", "memberCount", "findings"],
+        "properties": {
+            "iri": { "type": "string" },
+            "community": { "type": "string" },
+            "level": { "type": "integer" },
+            "title": { "type": "string" },
+            "summary": { "type": "string" },
+            "status": { "enum": ["unreviewed", "reviewed", "stale"] },
+            "rating": { "type": ["integer", "null"] },
+            "memberCount": { "type": "integer" },
+            "score": { "type": "number" },
+            "reviewPolicy": {
+                "type": "object",
+                "required": ["iri"],
+                "description": "The review policy the report was read under, when it has one",
+                "properties": {
+                    "iri": { "type": "string" },
+                    "version": { "type": ["integer", "null"] },
+                    "configuration": { "type": ["string", "null"] },
+                },
+            },
+            "identities": {
+                "type": "array",
+                "description": "With matchingPolicy, the mapped identities referenced by the report's findings",
+                "items": identity,
+            },
+            "findings": { "type": "array", "items": finding },
+        },
+    });
+    let resolution = json!({
+        "type": "object",
+        "required": ["policy", "version", "revision", "number", "entities"],
+        "description": "With matchingPolicy, the map revision read and the mapped identities referenced by the returned reports",
+        "properties": {
+            "policy": { "type": "string" },
+            "version": { "type": "integer" },
+            "revision": { "type": ["string", "null"] },
+            "number": { "type": "integer" },
+            "entities": { "type": "array", "items": identity },
+        },
+    });
+    json!({
+        "type": "object",
+        "required": ["dataset", "available", "reports"],
+        "properties": {
+            "dataset": { "type": "string" },
+            "available": { "type": "boolean" },
+            "reason": { "enum": ["off", "unavailable", "no-reports"] },
+            "message": { "type": "string" },
+            "reportsGraph": { "type": "string" },
+            "level": { "type": "integer" },
+            "levels": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["level", "reports"],
+                    "properties": { "level": { "type": "integer" }, "reports": { "type": "integer" } },
+                },
+            },
+            "ranking": { "enum": ["search", "rating"] },
+            "stale": { "type": "integer" },
+            "reviewPolicy": {
+                "type": "object",
+                "required": ["name", "iri", "version"],
+                "description": "With reviewPolicy, the requested review policy at the read view",
+                "properties": {
+                    "name": { "type": "string" },
+                    "iri": { "type": "string" },
+                    "version": { "type": "integer" },
+                },
+            },
+            "resolution": resolution,
+            "reports": { "type": "array", "items": report },
+        },
+    })
 }

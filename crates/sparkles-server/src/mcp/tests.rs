@@ -569,6 +569,8 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "reviewedOnly": {"type":"boolean","default":false,"description":"Only reports a person marked reviewed"},
                 "limit": {"type":"integer","minimum":1,"maximum":100,"default":10},
                 "findings": {"type":"boolean","default":true,"description":"Include each report's findings and citations"},
+                "reviewPolicy": {"type":"string","minLength":1,"description":"A review policy of the dataset's evidence settings: select only reports read under that policy"},
+                "matchingPolicy": {"type":"string","minLength":1,"description":"A matching policy of the dataset's evidence settings: resolve entity identities referenced by the returned reports through its resolution map"},
                 "timeoutSeconds": to}}),
         ),
         (

@@ -179,6 +179,96 @@ impl Reader {
         }
     }
 
+    /// Read usable report counts per level at this reader's state.
+    pub(crate) fn level_counts(
+        &self,
+        opts: &QueryOptions,
+        graph: &str,
+        filter: crate::graphrag::read::Filter<'_>,
+    ) -> Result<BTreeMap<u32, u64>, Error> {
+        match &self.source {
+            ReaderSource::Snapshot(snap) => {
+                crate::graphrag::read::level_counts(snap, opts, graph, filter)
+            }
+            ReaderSource::Evidence { view, ds } => crate::graphrag::read::level_counts_source(
+                &view.read_source(),
+                ds.dataset.store(),
+                opts,
+                graph,
+                filter,
+            ),
+        }
+    }
+
+    /// Read usable reports at `level` (or every level when `None`) at this reader's state.
+    pub(crate) fn reports_at(
+        &self,
+        opts: &QueryOptions,
+        graph: &str,
+        level: Option<u32>,
+        filter: crate::graphrag::read::Filter<'_>,
+        limit: usize,
+    ) -> Result<Vec<crate::graphrag::read::ReportRef>, Error> {
+        match &self.source {
+            ReaderSource::Snapshot(snap) => {
+                crate::graphrag::read::reports_at(snap, opts, graph, level, filter, limit)
+            }
+            ReaderSource::Evidence { view, ds } => crate::graphrag::read::reports_at_source(
+                &view.read_source(),
+                ds.dataset.store(),
+                opts,
+                graph,
+                level,
+                filter,
+                limit,
+            ),
+        }
+    }
+
+    /// Read usable reports among `reports` at this reader's state.
+    pub(crate) fn reports_named(
+        &self,
+        opts: &QueryOptions,
+        graph: &str,
+        reports: &[String],
+        filter: crate::graphrag::read::Filter<'_>,
+    ) -> Result<Vec<crate::graphrag::read::ReportRef>, Error> {
+        match &self.source {
+            ReaderSource::Snapshot(snap) => {
+                crate::graphrag::read::reports_named(snap, opts, graph, reports, filter)
+            }
+            ReaderSource::Evidence { view, ds } => crate::graphrag::read::reports_named_source(
+                &view.read_source(),
+                ds.dataset.store(),
+                opts,
+                graph,
+                reports,
+                filter,
+            ),
+        }
+    }
+
+    /// Fill in the findings of `reports` at this reader's state.
+    pub(crate) fn with_findings(
+        &self,
+        opts: &QueryOptions,
+        graph: &str,
+        reports: &mut [crate::graphrag::read::ReportRef],
+    ) -> Result<(), Error> {
+        match &self.source {
+            ReaderSource::Snapshot(snap) => {
+                crate::graphrag::read::with_findings(snap, opts, graph, reports)
+            }
+            ReaderSource::Evidence { view, ds } => crate::graphrag::read::with_findings_source(
+                &view.read_source(),
+                ds.dataset.store(),
+                opts,
+                graph,
+                reports,
+            ),
+        }
+    }
+
     /// Read community reports for `members` at this reader's state.
     pub(crate) fn reports_of_members(
         &self,
@@ -186,7 +276,7 @@ impl Reader {
         graph: &str,
         members: &[String],
         level: Option<u32>,
-        filter: crate::graphrag::read::Filter,
+        filter: crate::graphrag::read::Filter<'_>,
     ) -> Result<Vec<(String, crate::graphrag::read::ReportRef)>, Error> {
         match &self.source {
             ReaderSource::Snapshot(snap) => {

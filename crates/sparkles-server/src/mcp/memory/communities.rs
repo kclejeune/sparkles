@@ -9,7 +9,7 @@
 
 use super::Reader;
 use super::link::unavailable;
-use super::recall::rank_terms;
+use super::recall::{ResolutionDoc, ResolvedDoc, policy_error, rank_terms};
 use super::text::plain_query;
 use crate::graphrag::read::{self, Filter, ReportRef};
 use crate::mcp::Outcome;
@@ -18,10 +18,12 @@ use crate::mcp::tools::{Tools, bounded, parse};
 use oxrdf::NamedNode;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The most reports one call returns.
 pub(crate) const MAX_LIMIT: u64 = 100;
+/// The most distinct report entities one call resolves through a matching policy.
+const MAX_REPORT_ENTITIES: usize = 10_000;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -33,6 +35,10 @@ struct Args {
     reviewed_only: bool,
     limit: Option<u64>,
     findings: Option<bool>,
+    /// select only reports read under this review policy (C25, item 811)
+    review_policy: Option<String>,
+    /// resolve entity identities referenced by the reports under this matching policy (C25, item 811)
+    matching_policy: Option<String>,
     timeout_seconds: Option<f64>,
 }
 
@@ -50,8 +56,29 @@ pub(crate) enum Selection {
     },
 }
 
-/// The JSON form of a report.
-pub(crate) fn report_json(r: &ReportRef) -> Value {
+fn identity_json(entity: &str, d: &ResolvedDoc) -> Value {
+    json!({
+        "entity": entity,
+        "representative": d.representative.as_str(),
+        "members": d.members.iter().map(NamedNode::as_str).collect::<Vec<_>>(),
+        "membersComplete": d.complete,
+    })
+}
+
+fn resolution_json(doc: &ResolutionDoc, entities: &[Value]) -> Value {
+    json!({
+        "policy": doc.name,
+        "version": doc.version,
+        "revision": doc.revision.as_ref().map(NamedNode::as_str),
+        "number": doc.number,
+        "entities": entities,
+    })
+}
+
+/// The JSON form of a report. When `resolution` is `Some`, each finding includes its
+/// `about` entity IRIs and the report includes the mapped `identities` its findings
+/// reference.
+pub(crate) fn report_json(r: &ReportRef, resolution: Option<&ResolutionDoc>) -> Value {
     let mut v = json!({
         "iri": r.iri,
         "community": r.community,
@@ -73,6 +100,9 @@ pub(crate) fn report_json(r: &ReportRef) -> Value {
                 x["claims"] = json!(f.claims);
                 x["decisions"] = json!(f.decisions);
             }
+            if resolution.is_some() {
+                x["about"] = json!(f.about);
+            }
             x
         }).collect::<Vec<_>>(),
     });
@@ -85,6 +115,18 @@ pub(crate) fn report_json(r: &ReportRef) -> Value {
             "version": p.version,
             "configuration": p.configuration,
         });
+    }
+    if let Some(doc) = resolution {
+        let mut ids: BTreeMap<String, Value> = BTreeMap::new();
+        for f in &r.findings {
+            for n in read::finding_entity_iris(&f.about, &f.cites) {
+                if let Some(d) = doc.entities.get(n.as_str()).filter(|d| d.named) {
+                    ids.entry(n.as_str().to_string())
+                        .or_insert_with(|| identity_json(n.as_str(), d));
+                }
+            }
+        }
+        v["identities"] = Value::Array(ids.into_values().collect());
     }
     v
 }
@@ -108,9 +150,48 @@ impl Tools<'_> {
         let ds = self.dataset(a.dataset.as_deref())?;
         let ctx = self.ctx(&[], timeout.as_secs_f64());
         let deadline = self.call.arrived + timeout;
-        let r = self.reader(&ds, None, None, Some(false), deadline, &ctx)?;
+        let policies = a.review_policy.is_some() || a.matching_policy.is_some();
+        let view = if policies {
+            Some(self.evidence_view(&ds, None, None, deadline, &ctx)?)
+        } else {
+            None
+        };
+        let r = match &view {
+            Some(v) => self.reader_on_evidence(&ds, v.clone(), Some(false), deadline, &ctx)?,
+            None => self.reader(&ds, None, None, Some(false), deadline, &ctx)?,
+        };
+        let control = sparkles::task::Control {
+            deadline: Some(deadline),
+            ..sparkles::task::Control::with_cancel(self.call.cancel.clone())
+        };
+        let review_policy = match (&view, &a.review_policy) {
+            (Some(v), Some(name)) => Some(
+                sparkles::evidence::with_policy_claims(
+                    v,
+                    name,
+                    r.opts.graphs.clone(),
+                    &control,
+                    |pc| Ok(pc.policy()),
+                )
+                .map_err(|e| policy_error("reviewPolicy", e, &ctx))?,
+            ),
+            _ => None,
+        };
+        let mut resolution = match (&view, &a.matching_policy) {
+            (Some(v), Some(name)) => {
+                let version =
+                    sparkles::evidence::check_matching_policy(v, name, r.opts.graphs.as_ref())
+                        .map_err(|e| policy_error("matchingPolicy", e, &ctx))?;
+                let mut doc = ResolutionDoc::new(name, version);
+                doc.read(v, &[], &r, &control)
+                    .map_err(|e| policy_error("matchingPolicy", e, &ctx))?;
+                Some(doc)
+            }
+            _ => None,
+        };
         let filter = Filter {
             reviewed_only: a.reviewed_only,
+            review_policy_iri: review_policy.as_ref().map(|p| p.iri.as_str()),
         };
         let sel = self.select_reports(
             &ds,
@@ -120,9 +201,10 @@ impl Tools<'_> {
             filter,
             limit,
             a.findings.unwrap_or(true),
+            review_policy.as_ref().map(|p| p.name.as_str()),
             &ctx,
         )?;
-        let out = match sel {
+        let mut out = match sel {
             Selection::Unavailable(code, message) => json!({
                 "dataset": ds.name,
                 "available": false,
@@ -136,17 +218,65 @@ impl Tools<'_> {
                 levels,
                 ranking,
                 reports,
-            } => json!({
-                "dataset": ds.name,
-                "available": true,
-                "reportsGraph": graph,
-                "level": level,
-                "levels": levels.iter().map(|(l, n)| json!({ "level": l, "reports": n })).collect::<Vec<_>>(),
-                "ranking": ranking,
-                "stale": reports.iter().filter(|r| r.status == crate::graphrag::store::Status::Stale).count(),
-                "reports": reports.iter().map(report_json).collect::<Vec<_>>(),
-            }),
+            } => {
+                let mut resolved_entities: Vec<Value> = Vec::new();
+                if let (Some(v), Some(doc)) = (&view, resolution.as_mut()) {
+                    let mut seen: BTreeSet<String> = BTreeSet::new();
+                    let mut wanted: Vec<NamedNode> = Vec::new();
+                    for rep in &reports {
+                        for f in &rep.findings {
+                            for n in read::finding_entity_iris(&f.about, &f.cites) {
+                                if seen.insert(n.as_str().to_string()) {
+                                    if wanted.len() >= MAX_REPORT_ENTITIES {
+                                        return Err(ToolError::new(
+                                            "incomplete-evidence",
+                                            422,
+                                            format!(
+                                                "the selected reports reference more than {MAX_REPORT_ENTITIES} distinct entities to resolve"
+                                            ),
+                                        ));
+                                    }
+                                    wanted.push(n);
+                                }
+                            }
+                        }
+                    }
+                    doc.read(v, &wanted, &r, &control)
+                        .map_err(|e| policy_error("matchingPolicy", e, &ctx))?;
+                    for iri in &seen {
+                        if let Some(d) = doc.entities.get(iri.as_str()).filter(|d| d.named) {
+                            resolved_entities.push(identity_json(iri, d));
+                        }
+                    }
+                }
+                let mut j = json!({
+                    "dataset": ds.name,
+                    "available": true,
+                    "reportsGraph": graph,
+                    "level": level,
+                    "levels": levels.iter().map(|(l, n)| json!({ "level": l, "reports": n })).collect::<Vec<_>>(),
+                    "ranking": ranking,
+                    "stale": reports.iter().filter(|r| r.status == crate::graphrag::store::Status::Stale).count(),
+                    "reports": reports.iter().map(|rep| report_json(rep, resolution.as_ref())).collect::<Vec<_>>(),
+                });
+                if let Some(doc) = &resolution {
+                    j["resolution"] = resolution_json(doc, &resolved_entities);
+                }
+                j
+            }
         };
+        if let Some(p) = &review_policy {
+            out["reviewPolicy"] = json!({
+                "name": p.name,
+                "iri": p.iri.as_str(),
+                "version": p.version,
+            });
+        }
+        if out.get("resolution").is_none()
+            && let Some(doc) = &resolution
+        {
+            out["resolution"] = resolution_json(doc, &[]);
+        }
         Ok(Outcome::Structured(out))
     }
 
@@ -160,9 +290,10 @@ impl Tools<'_> {
         r: &Reader,
         query: Option<&str>,
         level: Option<u32>,
-        filter: Filter,
+        filter: Filter<'_>,
         limit: usize,
         findings: bool,
+        review_policy_name: Option<&str>,
         ctx: &ErrorContext,
     ) -> Result<Selection, ToolError> {
         let eng = |e| ctx.engine(e);
@@ -176,23 +307,26 @@ impl Tools<'_> {
         }
         let graph = settings.reports_graph;
         let opts = r.timed().map_err(eng)?;
-        if !read::readable(r.snap(), &opts, &graph) {
+        if !r.readable_graph(&opts, &graph).map_err(eng)? {
             return Ok(Selection::Unavailable(
                 "unavailable",
                 "the community reports are not available to you, because your access does not cover everything their build read".into(),
             ));
         }
-        let counts = read::level_counts(r.snap(), &opts, &graph, filter).map_err(eng)?;
+        let counts = r.level_counts(&opts, &graph, filter).map_err(eng)?;
         let Some(level) = level.or_else(|| read::choose_level(&counts, read::DEFAULT_MAX_REPORTS))
         else {
-            return Ok(Selection::Unavailable(
-                "no-reports",
-                if filter.reviewed_only {
-                    "no reviewed community report exists".into()
-                } else {
-                    "no community report exists".into()
-                },
-            ));
+            let msg = match (filter.reviewed_only, review_policy_name) {
+                (true, Some(p)) => {
+                    format!("no reviewed community report exists under reviewPolicy \"{p}\"")
+                }
+                (false, Some(p)) => {
+                    format!("no community report exists under reviewPolicy \"{p}\"")
+                }
+                (true, None) => "no reviewed community report exists".into(),
+                (false, None) => "no community report exists".into(),
+            };
+            return Ok(Selection::Unavailable("no-reports", msg));
         };
         let levels: Vec<(u32, u64)> = counts.iter().map(|(l, n)| (*l, *n)).collect();
         let mut ranking = "rating";
@@ -201,8 +335,9 @@ impl Tools<'_> {
             let hits = self.report_hits(ds, r, q, &graph).map_err(eng)?;
             if !hits.is_empty() {
                 let names: Vec<String> = hits.iter().map(|(r, _)| r.clone()).collect();
-                let found =
-                    read::reports_named(r.snap(), &opts, &graph, &names, filter).map_err(eng)?;
+                let found = r
+                    .reports_named(&opts, &graph, &names, filter)
+                    .map_err(eng)?;
                 let by: HashMap<&str, &ReportRef> =
                     found.iter().map(|x| (x.iri.as_str(), x)).collect();
                 for (iri, score) in &hits {
@@ -214,20 +349,22 @@ impl Tools<'_> {
                         reports.push(rep);
                     }
                 }
-                ranking = "search";
+                if !reports.is_empty() {
+                    ranking = "search";
+                }
             }
         }
         // reports the search did not find follow, best rated first
         if reports.len() < limit {
-            let rest = read::reports_at(
-                r.snap(),
-                &opts,
-                &graph,
-                Some(level),
-                filter,
-                read::DEFAULT_MAX_REPORTS.max(limit),
-            )
-            .map_err(eng)?;
+            let rest = r
+                .reports_at(
+                    &opts,
+                    &graph,
+                    Some(level),
+                    filter,
+                    read::DEFAULT_MAX_REPORTS.max(limit),
+                )
+                .map_err(eng)?;
             for rep in rest {
                 if reports.len() >= limit {
                     break;
@@ -239,7 +376,7 @@ impl Tools<'_> {
         }
         reports.truncate(limit);
         if findings {
-            read::with_findings(r.snap(), &opts, &graph, &mut reports).map_err(eng)?;
+            r.with_findings(&opts, &graph, &mut reports).map_err(eng)?;
         }
         Ok(Selection::Reports {
             graph,

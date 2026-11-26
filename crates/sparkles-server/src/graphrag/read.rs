@@ -25,6 +25,8 @@ pub struct FindingRef {
     pub iri: String,
     pub order: u64,
     pub text: String,
+    /// the entity IRIs the finding is about (`gr:about`)
+    pub about: Vec<String>,
     /// the cited facts as N-Triples triple terms, their reifiers and the cited child
     /// findings
     pub cites: Vec<String>,
@@ -61,12 +63,14 @@ pub struct ReportRef {
 
 /// Which reports a consumer uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Filter {
+pub struct Filter<'a> {
     /// only reports a person marked reviewed (`reviewedOnly`, A7)
     pub reviewed_only: bool,
+    /// only reports read under this review policy IRI (spec C25, item 811)
+    pub review_policy_iri: Option<&'a str>,
 }
 
-impl Filter {
+impl Filter<'_> {
     pub fn admits(&self, s: Status) -> bool {
         match s {
             Status::Reviewed => true,
@@ -83,6 +87,16 @@ impl Filter {
             .map(|s| format!("\"{}\"", s.as_str()))
             .collect();
         format!("VALUES ?status {{ {} }}", v.join(" "))
+    }
+
+    /// A required `gr:reviewPolicy` pattern on `?r` when filtering by policy IRI.
+    fn policy_clause(&self) -> Result<String, Error> {
+        let Some(p) = self.review_policy_iri else {
+            return Ok(String::new());
+        };
+        let node = oxrdf::NamedNode::new(p)
+            .map_err(|e| Error::Invalid(format!("reviewPolicy IRI: {e}")))?;
+        Ok(format!(" ; <{}> {node}", gr("reviewPolicy")))
     }
 }
 
@@ -111,14 +125,6 @@ fn rows_in(
     }
 }
 
-fn rows(
-    snap: &Arc<Snapshot>,
-    opts: &QueryOptions,
-    q: &str,
-) -> Result<sparql::output::OwnedRows, Error> {
-    rows_in(ReadInput::Snapshot(snap), opts, q)
-}
-
 fn lit(t: &Option<Term>) -> Option<String> {
     match t {
         Some(Term::Literal(l)) => Some(l.value().to_string()),
@@ -142,10 +148,31 @@ pub fn level_counts(
     snap: &Arc<Snapshot>,
     opts: &QueryOptions,
     graph: &str,
-    filter: Filter,
+    filter: Filter<'_>,
 ) -> Result<BTreeMap<u32, u64>, Error> {
+    level_counts_in(ReadInput::Snapshot(snap), opts, graph, filter)
+}
+
+/// [`level_counts`] evaluated over a [`BoundReadSource`] without extracting a raw snapshot.
+pub fn level_counts_source(
+    source: &BoundReadSource,
+    store: &Store,
+    opts: &QueryOptions,
+    graph: &str,
+    filter: Filter<'_>,
+) -> Result<BTreeMap<u32, u64>, Error> {
+    level_counts_in(ReadInput::Source(source, store), opts, graph, filter)
+}
+
+fn level_counts_in(
+    input: ReadInput<'_>,
+    opts: &QueryOptions,
+    graph: &str,
+    filter: Filter<'_>,
+) -> Result<BTreeMap<u32, u64>, Error> {
+    let policy_clause = filter.policy_clause()?;
     let q = format!(
-        "SELECT ?l (COUNT(?r) AS ?n) WHERE {{ {values} GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{report}> ?r . ?r <{status}> ?status }} }} GROUP BY ?l",
+        "SELECT ?l (COUNT(?r) AS ?n) WHERE {{ {values} GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{report}> ?r . ?r <{status}> ?status{policy_clause} }} }} GROUP BY ?l",
         values = filter.values(),
         community = gr("Community"),
         level = gr("level"),
@@ -153,7 +180,7 @@ pub fn level_counts(
         status = gr("status"),
     );
     let mut out = BTreeMap::new();
-    for r in rows(snap, opts, &q)? {
+    for r in rows_in(input, opts, &q)? {
         let r = r.values();
         if let (Some(l), Some(n)) = (int(&r[0]), int(&r[1])) {
             out.insert(l as u32, n);
@@ -180,11 +207,32 @@ pub fn reports_at(
     opts: &QueryOptions,
     graph: &str,
     level: Option<u32>,
-    filter: Filter,
+    filter: Filter<'_>,
     limit: usize,
 ) -> Result<Vec<ReportRef>, Error> {
     let level_filter = level.map_or(String::new(), |l| format!("FILTER(?l = {l})"));
     reports_where(snap, opts, graph, &level_filter, filter, limit)
+}
+
+/// [`reports_at`] evaluated over a [`BoundReadSource`] without extracting a raw snapshot.
+pub fn reports_at_source(
+    source: &BoundReadSource,
+    store: &Store,
+    opts: &QueryOptions,
+    graph: &str,
+    level: Option<u32>,
+    filter: Filter<'_>,
+    limit: usize,
+) -> Result<Vec<ReportRef>, Error> {
+    let level_filter = level.map_or(String::new(), |l| format!("FILTER(?l = {l})"));
+    reports_where_in(
+        ReadInput::Source(source, store),
+        opts,
+        graph,
+        &level_filter,
+        filter,
+        limit,
+    )
 }
 
 /// The usable reports among `reports`.
@@ -193,9 +241,27 @@ pub fn reports_named(
     opts: &QueryOptions,
     graph: &str,
     reports: &[String],
-    filter: Filter,
+    filter: Filter<'_>,
 ) -> Result<Vec<ReportRef>, Error> {
     reports_named_in(ReadInput::Snapshot(snap), opts, graph, reports, filter)
+}
+
+/// [`reports_named`] evaluated over a [`BoundReadSource`] without extracting a raw snapshot.
+pub fn reports_named_source(
+    source: &BoundReadSource,
+    store: &Store,
+    opts: &QueryOptions,
+    graph: &str,
+    reports: &[String],
+    filter: Filter<'_>,
+) -> Result<Vec<ReportRef>, Error> {
+    reports_named_in(
+        ReadInput::Source(source, store),
+        opts,
+        graph,
+        reports,
+        filter,
+    )
 }
 
 fn reports_named_in(
@@ -203,7 +269,7 @@ fn reports_named_in(
     opts: &QueryOptions,
     graph: &str,
     reports: &[String],
-    filter: Filter,
+    filter: Filter<'_>,
 ) -> Result<Vec<ReportRef>, Error> {
     let names: Vec<String> = reports
         .iter()
@@ -222,7 +288,7 @@ fn reports_where(
     opts: &QueryOptions,
     graph: &str,
     extra: &str,
-    filter: Filter,
+    filter: Filter<'_>,
     limit: usize,
 ) -> Result<Vec<ReportRef>, Error> {
     reports_where_in(ReadInput::Snapshot(snap), opts, graph, extra, filter, limit)
@@ -233,11 +299,12 @@ fn reports_where_in(
     opts: &QueryOptions,
     graph: &str,
     extra: &str,
-    filter: Filter,
+    filter: Filter<'_>,
     limit: usize,
 ) -> Result<Vec<ReportRef>, Error> {
+    let policy_clause = filter.policy_clause()?;
     let q = format!(
-        "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n ?policy ?version ?configuration WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{report}> ?r ; <{count}> ?n . ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary . OPTIONAL {{ ?r <{rating}> ?rating }} OPTIONAL {{ ?r <{policy}> ?policy OPTIONAL {{ ?r <{version}> ?version }} OPTIONAL {{ ?r <{configuration}> ?configuration }} }} }} }} ORDER BY DESC(?rating) ?r LIMIT {limit}",
+        "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n ?policy ?version ?configuration WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{report}> ?r ; <{count}> ?n . ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary{policy_clause} . OPTIONAL {{ ?r <{rating}> ?rating }} OPTIONAL {{ ?r <{policy}> ?policy OPTIONAL {{ ?r <{version}> ?version }} OPTIONAL {{ ?r <{configuration}> ?configuration }} }} }} }} ORDER BY DESC(?rating) ?r LIMIT {limit}",
         values = filter.values(),
         community = gr("Community"),
         level = gr("level"),
@@ -283,6 +350,26 @@ pub fn with_findings(
     graph: &str,
     reports: &mut [ReportRef],
 ) -> Result<(), Error> {
+    with_findings_in(ReadInput::Snapshot(snap), opts, graph, reports)
+}
+
+/// [`with_findings`] evaluated over a [`BoundReadSource`] without extracting a raw snapshot.
+pub fn with_findings_source(
+    source: &BoundReadSource,
+    store: &Store,
+    opts: &QueryOptions,
+    graph: &str,
+    reports: &mut [ReportRef],
+) -> Result<(), Error> {
+    with_findings_in(ReadInput::Source(source, store), opts, graph, reports)
+}
+
+fn with_findings_in(
+    input: ReadInput<'_>,
+    opts: &QueryOptions,
+    graph: &str,
+    reports: &mut [ReportRef],
+) -> Result<(), Error> {
     if reports.is_empty() {
         return Ok(());
     }
@@ -292,17 +379,18 @@ pub fn with_findings(
         .map(|n| n.to_string())
         .collect();
     let q = format!(
-        "SELECT ?r ?f ?o ?text ?p ?cite WHERE {{ VALUES ?r {{ {} }} GRAPH <{graph}> {{ ?r <{finding}> ?f . ?f <{order}> ?o ; <{text}> ?text . OPTIONAL {{ ?f ?p ?cite FILTER(?p IN (<{cites}>, <{claim}>, <{decision}>)) }} }} }} ORDER BY ?r ?o",
+        "SELECT ?r ?f ?o ?text ?p ?cite WHERE {{ VALUES ?r {{ {} }} GRAPH <{graph}> {{ ?r <{finding}> ?f . ?f <{order}> ?o ; <{text}> ?text . OPTIONAL {{ ?f ?p ?cite FILTER(?p IN (<{about}>, <{cites}>, <{claim}>, <{decision}>)) }} }} }} ORDER BY ?r ?o",
         names.join(" "),
         finding = gr("finding"),
         order = gr("order"),
         text = gr("text"),
+        about = gr("about"),
         cites = gr("cites"),
         claim = gr("citesClaim"),
         decision = gr("citesDecision"),
     );
     let mut by: HashMap<String, Vec<FindingRef>> = HashMap::new();
-    for row in rows(snap, opts, &q)? {
+    for row in rows_in(input, opts, &q)? {
         let row = row.values();
         let (Some(r), Some(f), Some(text)) = (iri(&row[0]), iri(&row[1]), lit(&row[3])) else {
             continue;
@@ -315,6 +403,7 @@ pub fn with_findings(
                     iri: f,
                     order: int(&row[2]).unwrap_or(0),
                     text,
+                    about: Vec::new(),
                     cites: Vec::new(),
                     claims: Vec::new(),
                     decisions: Vec::new(),
@@ -325,6 +414,11 @@ pub fn with_findings(
         let x = &mut list[at];
         let p = iri(&row[4]);
         match (p.as_deref(), &row[5]) {
+            (Some(p), Some(Term::NamedNode(n))) if p == gr("about") => {
+                if !x.about.iter().any(|a| a == n.as_str()) {
+                    x.about.push(n.as_str().to_string());
+                }
+            }
             (Some(p), Some(Term::NamedNode(n))) if p == gr("citesClaim") => {
                 if !x.claims.iter().any(|c| c == n.as_str()) {
                     x.claims.push(n.as_str().to_string());
@@ -363,7 +457,7 @@ pub fn reports_of_members(
     graph: &str,
     members: &[String],
     level: Option<u32>,
-    filter: Filter,
+    filter: Filter<'_>,
 ) -> Result<Vec<(String, ReportRef)>, Error> {
     reports_of_members_in(
         ReadInput::Snapshot(snap),
@@ -383,7 +477,7 @@ pub fn reports_of_members_source(
     graph: &str,
     members: &[String],
     level: Option<u32>,
-    filter: Filter,
+    filter: Filter<'_>,
 ) -> Result<Vec<(String, ReportRef)>, Error> {
     reports_of_members_in(
         ReadInput::Source(source, store),
@@ -401,7 +495,7 @@ fn reports_of_members_in(
     graph: &str,
     members: &[String],
     level: Option<u32>,
-    filter: Filter,
+    filter: Filter<'_>,
 ) -> Result<Vec<(String, ReportRef)>, Error> {
     let names: Vec<String> = members
         .iter()
@@ -456,6 +550,34 @@ pub fn report_of_finding(f: &str) -> Option<&str> {
     n.parse::<u64>().ok().map(|_| r)
 }
 
+/// The distinct entity IRIs referenced by a finding's `gr:about` list and any
+/// N-Triples triple terms in its `gr:cites` list, in deterministic order.
+pub fn finding_entity_iris(about: &[String], cites: &[String]) -> Vec<oxrdf::NamedNode> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let mut push = |n: oxrdf::NamedNode| {
+        if seen.insert(n.as_str().to_string()) {
+            out.push(n);
+        }
+    };
+    for iri in about {
+        if let Ok(n) = oxrdf::NamedNode::new(iri.as_str()) {
+            push(n);
+        }
+    }
+    for cite in cites {
+        if let Some(Term::Triple(t)) = store::parse_term(cite) {
+            if let oxrdf::NamedOrBlankNode::NamedNode(s) = t.subject {
+                push(s);
+            }
+            if let Term::NamedNode(o) = t.object {
+                push(o);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +604,7 @@ mod tests {
     fn reviewed_only_keeps_reviewed_reports() {
         let f = Filter {
             reviewed_only: true,
+            review_policy_iri: None,
         };
         assert!(f.admits(Status::Reviewed));
         assert!(!f.admits(Status::Unreviewed));
@@ -490,5 +613,26 @@ mod tests {
         assert!(all.admits(Status::Stale));
         assert!(!all.admits(Status::Rejected));
         assert!(!all.admits(Status::Failed));
+    }
+
+    #[test]
+    fn policy_clause_validates_and_formats_iri() {
+        let none = Filter::default();
+        assert_eq!(none.policy_clause().unwrap(), "");
+        let ok = Filter {
+            reviewed_only: false,
+            review_policy_iri: Some("urn:x-sparkles:evidence:policy:main"),
+        };
+        let clause = ok.policy_clause().unwrap();
+        assert!(clause.contains(&gr("reviewPolicy")), "{clause}");
+        assert!(
+            clause.contains("<urn:x-sparkles:evidence:policy:main>"),
+            "{clause}"
+        );
+        let bad = Filter {
+            reviewed_only: false,
+            review_policy_iri: Some("not a valid iri"),
+        };
+        assert!(bad.policy_clause().is_err());
     }
 }

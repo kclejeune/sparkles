@@ -2225,7 +2225,7 @@ const VIEW_BYTES: u64 = 64 << 20;
 impl Tools<'_> {
     /// The evidence view a call that names a policy reads, selected from its own
     /// selector: Head, `atCommit` or `at`, including a named snapshot.
-    fn evidence_view(
+    pub(super) fn evidence_view(
         &self,
         ds: &std::sync::Arc<crate::state::Dataset>,
         at_commit: Option<u64>,
@@ -2280,7 +2280,7 @@ impl Tools<'_> {
 
 /// A refusal of a policy argument: a policy the caller cannot use is a bad argument
 /// that names the argument and not the policy's graphs. Other errors keep their codes.
-fn policy_error(argument: &str, e: Error, ctx: &ErrorContext) -> ToolError {
+pub(super) fn policy_error(argument: &str, e: Error, ctx: &ErrorContext) -> ToolError {
     match e {
         Error::Invalid(m) => ToolError::bad_argument(match m.strip_prefix("policy: ") {
             Some(rest) => format!("{argument}: {rest}"),
@@ -2458,27 +2458,27 @@ impl ClaimsDoc {
 }
 
 /// One entity of the resolution map.
-struct ResolvedDoc {
-    representative: NamedNode,
-    members: Vec<NamedNode>,
-    complete: bool,
+pub(super) struct ResolvedDoc {
+    pub(super) representative: NamedNode,
+    pub(super) members: Vec<NamedNode>,
+    pub(super) complete: bool,
     /// whether the map names the entity, rather than resolving it to itself
-    named: bool,
+    pub(super) named: bool,
 }
 
 /// The resolution map of a call that names a matching policy.
-struct ResolutionDoc {
-    name: String,
-    version: u32,
-    revision: Option<NamedNode>,
-    number: u64,
-    entities: HashMap<String, ResolvedDoc>,
+pub(super) struct ResolutionDoc {
+    pub(super) name: String,
+    pub(super) version: u32,
+    pub(super) revision: Option<NamedNode>,
+    pub(super) number: u64,
+    pub(super) entities: HashMap<String, ResolvedDoc>,
     /// whether the map's header has been read
     read: bool,
 }
 
 impl ResolutionDoc {
-    fn new(name: &str, version: u32) -> Self {
+    pub(super) fn new(name: &str, version: u32) -> Self {
         ResolutionDoc {
             name: name.to_string(),
             version,
@@ -2490,7 +2490,7 @@ impl ResolutionDoc {
     }
 
     /// Resolve the entities of `named` not resolved yet, at `view`.
-    fn read(
+    pub(super) fn read(
         &mut self,
         view: &sparkles::store::BoundEvidenceView,
         named: &[NamedNode],
