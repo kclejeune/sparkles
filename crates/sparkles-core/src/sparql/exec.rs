@@ -7563,6 +7563,14 @@ pub(super) fn offer_rows<P>(
         }
         _ => Vec::new(),
     };
+    let secondary_iris = match sources.as_slice() {
+        [_, HeapKey::Var(Some(col))] => {
+            let vocab = &ctx.snap.generation.vocab;
+            Some((*col, vocab.first_iri()..vocab.len()))
+        }
+        _ => None,
+    };
+    let key_slots = keys.len() as u64 * std::mem::size_of::<SortKey>() as u64;
     for i in 0..t.len() {
         if i.is_multiple_of(4096) {
             ctx.check()?;
@@ -7598,13 +7606,43 @@ pub(super) fn offer_rows<P>(
                 first
             }
         };
-        let row_decode = ctx.charge(0)?;
+        if keys.len() == 1 {
+            // The heap can admit a single key from the stack before allocating
+            // its vector, without a separate scratch reservation for the slot.
+            let row = [first];
+            let payload = rows.keep(i, &row)?;
+            if let Some(out) = heap.offer(Vec::from(row), payload) {
+                rows.release(out)?;
+            }
+            ranked += 1;
+            continue;
+        }
+        // Compact-vocabulary IRIs are in SPARQL lexical order, as in the indexed
+        // top-k scan. Screen ties on their IDs before reconstructing front-coded
+        // keys. Mixed vocabularies compare decoded values through the ordinary heap.
+        let base_iri = secondary_iris.as_ref().and_then(|(col, range)| {
+            let id = col[i];
+            (id.tag() == crate::id::Tag::Vocab && range.contains(&id.payload()))
+                .then(|| id.payload())
+        });
+        if let Some(id) = base_iri
+            && heap.rejects_base_iri_tie(&first, id)
+        {
+            ctx.check()?;
+            heap.skip();
+            continue;
+        }
+        let row_decode = ctx.charge(key_slots)?;
         let mut row = Vec::with_capacity(keys.len());
         row.push(first);
         for (k, source) in sources.iter().enumerate().skip(1) {
             let sk = match source {
                 HeapKey::Var(Some(col)) => {
-                    SortKey::new(ctx.value_checked_into(col[i], &row_decode)?)
+                    let key = SortKey::new(ctx.value_checked_into(col[i], &row_decode)?);
+                    match base_iri {
+                        Some(id) => key.with_base_iri(id),
+                        None => key,
+                    }
                 }
                 _ => {
                     let sk = key_of(i, k)?;
@@ -7627,6 +7665,69 @@ pub(super) fn offer_rows<P>(
     }
     ctx.check()?;
     Ok(ranked)
+}
+
+#[cfg(test)]
+#[test]
+fn topk_screens_tied_base_iris_across_batches() {
+    use crate::sparql::opt_tests::{load, update};
+    use oxrdf::{NamedNode, Term};
+
+    let store = crate::store::Store::in_memory(Default::default());
+    load(
+        &store,
+        "<http://ex.org/a> <http://ex.org/age> 18 .\n\
+         <http://ex.org/a/> <http://ex.org/age> 18 .\n\
+         <http://ex.org/é> <http://ex.org/age> 18 .",
+        crate::io::RdfFormat::Turtle,
+    );
+    store.compact().unwrap();
+    update(&store, "INSERT DATA { ex:A ex:age 18 . ex:日本 ex:age 18 }");
+    let ctx = Ctx::new(store.snapshot());
+    let p = ctx.var("p");
+    let lookup = |suffix: &str| {
+        ctx.snap
+            .lookup_term(&Term::NamedNode(NamedNode::new_unchecked(format!(
+                "http://ex.org/{suffix}"
+            ))))
+            .unwrap()
+    };
+    let [a, slash, accented, upper, japanese] = ["a", "a/", "é", "A", "日本"].map(lookup);
+    assert_eq!(a.tag(), crate::id::Tag::Vocab);
+    assert_eq!(upper.tag(), crate::id::Tag::Delta);
+
+    for (asc, best, worse, delta) in [(true, a, accented, upper), (false, accented, a, japanese)] {
+        let keys = [
+            (Expr::Const(Id::from_i64(32).unwrap()), false),
+            (Expr::Var(p), asc),
+        ];
+        let mut rows = EagerHeapRows::new(&ctx).unwrap();
+        let mut heap = TopK::new(1, vec![false, asc]);
+        let mut report = ExprReport::default();
+        let mut batch = Table::new(vec![p]);
+        for id in [best, slash, worse, best] {
+            batch.push_row(&[id]);
+        }
+        assert_eq!(
+            offer_rows(&ctx, &mut heap, &batch, &keys, &mut report, &mut rows).unwrap(),
+            1
+        );
+
+        let mut next = Table::new(vec![p]);
+        // The first row is screened using a base IRI retained from the prior batch.
+        // The delta IRI enters via checked decode, and the last row is compared to
+        // it using lexical order even though its base ID is eligible for screening.
+        for id in [worse, delta, best] {
+            next.push_row(&[id]);
+        }
+        assert_eq!(
+            offer_rows(&ctx, &mut heap, &next, &keys, &mut report, &mut rows).unwrap(),
+            2
+        );
+        let winner = heap.into_sorted().pop().unwrap();
+        assert_eq!(winner.payload, 1);
+        assert_eq!(winner.seq, 5);
+    }
 }
 
 /// Candidates for `ORDER BY k1 k2 … LIMIT k`: a row whose first key is worse than the
