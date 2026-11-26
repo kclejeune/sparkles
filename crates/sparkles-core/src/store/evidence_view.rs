@@ -150,6 +150,20 @@ impl BoundEvidenceView {
         crate::access::triples::controlled::prepare_evidence(self.clone(), policy, preparation)
     }
 
+    /// Like [`Self::prepare_view`], but prepares a read-only view without binding
+    /// `policy.write` guards or invoking write guard providers.
+    pub fn prepare_read_only_view(
+        &self,
+        policy: Arc<crate::access::GraphAccess>,
+        preparation: &Preparation,
+    ) -> Result<crate::access::PreparedView> {
+        crate::access::triples::controlled::prepare_evidence_read_only(
+            self.clone(),
+            policy,
+            preparation,
+        )
+    }
+
     /// Exact original owner bytes. These describe history and grant no access.
     pub fn owner_settings(&self, owner: OwnerKind) -> Option<&[u8]> {
         self.inner

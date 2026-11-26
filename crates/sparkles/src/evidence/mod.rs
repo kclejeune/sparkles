@@ -104,7 +104,8 @@ pub use review::claims::{
     with_policy_claims,
 };
 pub use review::dependents::{
-    self, Dependence, Dependent, Dependents, MAX_CHANGED, dependents as find_dependents,
+    self, Dependence, Dependent, Dependents, MAX_CHANGED, ReportDependent,
+    dependents as find_dependents, dependents_at as find_dependents_at,
 };
 pub use review::identity::{
     self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, ResolvedEntity,

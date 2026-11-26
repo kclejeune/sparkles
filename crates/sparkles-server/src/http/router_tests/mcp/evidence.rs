@@ -278,6 +278,7 @@ async fn identity_proposals_reviews_reversals_and_dependents() {
     let dependents = success(&s, "find_evidence_dependents", dep_request.clone()).await;
     let found = dependents["dependents"].as_array().unwrap();
     assert_eq!(found.len(), 2);
+    assert_eq!(dependents["reports"], json!([]));
     assert!(
         found
             .iter()

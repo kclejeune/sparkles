@@ -2301,9 +2301,11 @@ guard of C22 §6, so the lists reach only readers for whom the reports graph is 
 A global answer still refuses `reviewPolicy`, because recall's argument names the policy
 whose claims an answer reads, not the policy its reports were built under. Roadmap item
 811 lets a global answer name a policy and use only reports read under it, and adds
-identity resolution through a matching policy to reports. Roadmap item 810 adds a search
-for the reports whose activity used a changed record, as `claims/dependents` does for
-assessments, for F22's maintained analyses.
+identity resolution through a matching policy to reports. `POST /{ds}/claims/dependents`,
+`find_evidence_dependents`, `sparkles::evidence::find_dependents` and
+`sparkles::evidence::find_dependents_at` also search guarded reports graphs through the
+C22 §6 disclosure guard for the reports whose activity used a changed record, as recorded
+below under [Delivered scope](#delivered-scope).
 
 #### Acceptance
 
@@ -2413,6 +2415,30 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+Roadmap item 810 extends `sparkles::evidence::find_dependents`,
+`POST /{ds}/claims/dependents` and the MCP tool `find_evidence_dependents` to search
+guarded reports graphs under `urn:x-sparkles:graphrag:` (excluding the disclosure
+footprints graph) for community reports whose generating activity recorded `prov:used`
+for a changed record, and adds `sparkles::evidence::find_dependents_at` for historical
+`BoundEvidenceView` reads. Each caller's `GraphAccess` has its undecided C22 §6 guards
+and triple protections bound against the exact snapshot being read under the shared
+preparation budget. An unproven or unreadable reports graph is skipped without counting
+against the 10,000-record bound, so restricted callers cannot infer hidden reports from
+counts or `incomplete-evidence` refusals, and a report or activity any of whose triples
+the caller's view masks is neither reported nor followed. Person-edited reports linked by
+`gr:editOf` carry no activity of their own and inherit the edited report's inputs at the
+same depth, while build replacements linked only by `prov:wasRevisionOf` are not
+followed. With `transitive: true`, dependent reports enter the search queue so higher-level
+reports whose activity used a dependent child report appear at `depth + 1`. Responses keep
+the existing `dependents` assessment array unchanged and add a sibling `reports` array of
+`{report, community, graph, on, dependence, depth}` entries sorted by depth and IRI. Unit
+tests in `crates/sparkles/tests/evidence_dependents.rs` and router tests in
+`crates/sparkles-server/src/http/router_tests/auth/graphrag_evidence.rs` cover direct and
+transitive claim, decision and source-revision lookups, `gr:editOf` chains, excluded
+unrelated and unguarded reports, C22 §6 footprint coverage, missing report graph grants,
+mismatched `?user` protection bindings, footprint removal, triple masks, branches,
+historical views, and the 10,000-record bound.
 
 ### Holds for stored facts of other datasets
 

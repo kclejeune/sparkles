@@ -51,8 +51,8 @@ use super::{
     Settings, Sha256Digest, SourceContent,
     model::{BoundaryInput, ValidityInput},
 };
-use crate::access::{Preparation, Reservation};
-use crate::id::Id;
+use crate::access::{Preparation, PreparationBuffer as Buffer, Reservation};
+use crate::id::{Id, Tag};
 use crate::index::Perm;
 use crate::store::Snapshot;
 use crate::task::Control;
@@ -61,6 +61,7 @@ use base64::Engine as _;
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 const EV: &str = "urn:x-sparkles:evidence:";
@@ -1228,6 +1229,14 @@ pub enum ExistingRecord {
     Many,
 }
 
+/// Retained scan results paired with the preparation reservation that pays for them.
+/// `items` is declared before `_held`, so its storage drops before its credit releases.
+pub struct AdmittedScan<T> {
+    pub items: Vec<T>,
+    pub more: bool,
+    _held: Reservation,
+}
+
 /// Lookups in one unmasked snapshot under one preparation. The writer reads its head
 /// with them, which no caller policy limits: what they find decides only whether the
 /// operation repeats or conflicts with records of the caller's own identities.
@@ -1296,6 +1305,11 @@ impl<'a> Reads<'a> {
         view: &'a crate::store::BoundEvidenceView,
     ) -> Self {
         Self::new(preparation, view.snapshot())
+    }
+
+    /// Resolve an IRI to its snapshot identifier under this reader's cached budget.
+    pub fn iri_id(&mut self, iri: &str) -> Result<Option<Id>> {
+        self.id(iri)
     }
 
     fn id(&mut self, iri: &str) -> Result<Option<Id>> {
@@ -1370,8 +1384,66 @@ impl<'a> Reads<'a> {
         Ok((out, more))
     }
 
+    fn is_iri_id(&self, id: Id) -> Result<bool> {
+        match id.tag() {
+            Tag::Vocab => Ok(id.payload() < self.snap.generation.vocab.len()
+                && self.snap.generation.vocab.is_iri(id.payload())),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with_prepared(self.preparation, |vocab| {
+                    Ok(id.payload() < self.snap.dvocab_len
+                        && vocab
+                            .get(id.payload())
+                            .is_some_and(|key| key.starts_with(b"<")))
+                }),
+            _ => Ok(false),
+        }
+    }
+
+    fn hides_subject_id_in_graph(&self, s: Id, g: Id) -> Result<bool> {
+        self.preparation.check()?;
+        let Some(mask) = self.snap.mask.as_deref() else {
+            return Ok(false);
+        };
+        if mask.hidden.is_empty() {
+            return Ok(false);
+        }
+        let start = mask.hidden.partition_point(|k| k[0] < s.0);
+        for (index, k) in mask.hidden[start..].iter().enumerate() {
+            if index.is_multiple_of(1024) {
+                self.preparation.check()?;
+            }
+            if k[0] != s.0 {
+                break;
+            }
+            if k[3] == g.0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether this snapshot's triple mask hides at least one quad with subject `s` in
+    /// graph `g`. Always `false` for an unmasked snapshot.
+    pub fn hides_subject_in_graph(&mut self, s: &str, g: &str) -> Result<bool> {
+        self.preparation.check()?;
+        let Some(mask) = self.snap.mask.as_deref() else {
+            return Ok(false);
+        };
+        if mask.hidden.is_empty() {
+            return Ok(false);
+        }
+        let (Some(s), Some(g)) = (self.id(s)?, self.id(g)?) else {
+            return Ok(false);
+        };
+        self.hides_subject_id_in_graph(s, g)
+    }
+
     /// The IRI subjects of `?s p o` in `g`, at most `limit` of them, and whether more
-    /// exist. `o` is a ground term.
+    /// exist. Non-IRI subjects are skipped without counting toward `limit`. `o` is a
+    /// ground term.
     pub fn subjects_up_to(
         &mut self,
         p: &str,
@@ -1379,40 +1451,337 @@ impl<'a> Reads<'a> {
         g: &str,
         limit: usize,
     ) -> Result<(Vec<NamedNode>, bool)> {
+        let scan = self.visible_subjects_up_to(p, o, g, limit, false)?;
+        Ok((scan.items, scan.more))
+    }
+
+    /// The IRI subjects of `?s p o` in `g`, at most `limit` of them, and whether more
+    /// exist, retaining the preparation reservation that pays for the returned vector
+    /// and its IRI strings. Non-IRI subjects and (when `skip_masked` is set) subjects
+    /// with any triple hidden in `g` by this snapshot's mask are skipped without
+    /// counting toward `limit`. `o` is a ground term.
+    pub fn visible_subjects_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        g: &str,
+        limit: usize,
+        skip_masked: bool,
+    ) -> Result<AdmittedScan<NamedNode>> {
         let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
-            return Ok((Vec::new(), false));
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
         };
         let o = match o {
             Term::NamedNode(n) => self.id(n.as_str())?,
             t => self.preparation.lookup_term(self.snap, t)?,
         };
         let Some(o) = o else {
-            return Ok((Vec::new(), false));
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
         };
-        let mut ids = Vec::new();
+        let mut ids: Buffer<Id> = Buffer::new(self.preparation)?;
         let mut more = false;
         self.preparation
             .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
                 if q[3] != g {
                     return Ok(true);
                 }
+                if !self.is_iri_id(q[0])? {
+                    return Ok(true);
+                }
+                if skip_masked && self.hides_subject_id_in_graph(q[0], g)? {
+                    return Ok(true);
+                }
                 if ids.len() == limit {
                     more = true;
                     return Ok(false);
                 }
-                ids.push(q[0]);
+                ids.push(q[0])?;
                 Ok(true)
             })?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(Term::NamedNode(n)) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
+        let mut out_held = self
+            .preparation
+            .reserve((ids.len() as u64).saturating_mul(std::mem::size_of::<NamedNode>() as u64))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(ids.len())
+            .map_err(|_| self.preparation.exhausted())?;
+        for &id in &*ids {
+            if let Some(n) = self.preparation.with_iri(self.snap, id, |iri| match iri {
+                Some(iri) => {
+                    let owned = self.preparation.copy_string(iri, &mut out_held)?;
+                    Ok(Some(NamedNode::new_unchecked(owned)))
+                }
+                None => Ok(None),
+            })? {
                 out.push(n);
             }
         }
-        Ok((out, more))
+        drop(ids);
+        Ok(AdmittedScan {
+            items: out,
+            more,
+            _held: out_held,
+        })
+    }
+
+    /// The `(subject, graph)` IRI pairs of `?s p o` in named graphs accepted by
+    /// `keep_graph`, at most `limit` of them, and whether more exist. Quads in
+    /// rejected graphs, non-IRI subjects, and (when `skip_masked` is set) subjects
+    /// with any triple hidden in that graph by this snapshot's mask are skipped
+    /// without counting toward `limit`. `o` is a ground term. Returned pairs share
+    /// graph IRI allocations and stay charged to the preparation through the returned
+    /// [`AdmittedScan`].
+    pub fn subjects_in_graphs_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        limit: usize,
+        skip_masked: bool,
+        keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        self.scan_subjects_in_graphs(p, o, None, limit, skip_masked, None, keep_graph)
+    }
+
+    /// Like [`Self::subjects_in_graphs_up_to`], but when `admitted` is `Some(map)`,
+    /// restricts candidate graphs to IDs present in `map` before touching the
+    /// vocabulary or decoding any graph IRI.
+    pub fn subjects_in_admitted_graphs_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        limit: usize,
+        skip_masked: bool,
+        admitted: Option<&BTreeMap<Id, Arc<NamedNode>>>,
+        keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        self.scan_subjects_in_graphs(p, o, None, limit, skip_masked, admitted, keep_graph)
+    }
+
+    /// Like [`Self::subjects_in_admitted_graphs_up_to`], additionally requiring that
+    /// the object `o` itself carries `o rdf_type object_class` in the candidate graph
+    /// (and, when `skip_masked` is set, has no triple hidden in that graph) before
+    /// counting the edge toward `limit`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subjects_for_typed_object_in_graphs_up_to(
+        &mut self,
+        p: &str,
+        o: &Term,
+        rdf_type: &str,
+        object_class: &str,
+        limit: usize,
+        skip_masked: bool,
+        admitted: Option<&BTreeMap<Id, Arc<NamedNode>>>,
+        keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        self.scan_subjects_in_graphs(
+            p,
+            o,
+            Some((rdf_type, object_class)),
+            limit,
+            skip_masked,
+            admitted,
+            keep_graph,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_subjects_in_graphs(
+        &mut self,
+        p: &str,
+        o: &Term,
+        object_type: Option<(&str, &str)>,
+        limit: usize,
+        skip_masked: bool,
+        admitted: Option<&BTreeMap<Id, Arc<NamedNode>>>,
+        mut keep_graph: impl FnMut(&str) -> bool,
+    ) -> Result<AdmittedScan<(NamedNode, Arc<NamedNode>)>> {
+        if admitted.is_some_and(BTreeMap::is_empty) {
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
+        }
+        let Some(p) = self.id(p)? else {
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
+        };
+        let o = match o {
+            Term::NamedNode(n) => self.id(n.as_str())?,
+            t => self.preparation.lookup_term(self.snap, t)?,
+        };
+        let Some(o) = o else {
+            return Ok(AdmittedScan {
+                items: Vec::new(),
+                more: false,
+                _held: self.preparation.reserve(0)?,
+            });
+        };
+        let object_type_ids = match object_type {
+            Some((rdf_type, class)) => {
+                let (Some(tp), Some(cls)) = (self.id(rdf_type)?, self.id(class)?) else {
+                    return Ok(AdmittedScan {
+                        items: Vec::new(),
+                        more: false,
+                        _held: self.preparation.reserve(0)?,
+                    });
+                };
+                Some((tp, cls))
+            }
+            None => None,
+        };
+        const SKIP_SLOTS: usize = 256;
+        let mut skipped = [None::<Id>; SKIP_SLOTS];
+        let mut out_held = self.preparation.reserve(0)?;
+        let mut scan_held = self.preparation.reserve(0)?;
+        let mut accepted: BTreeMap<Id, Arc<NamedNode>> = BTreeMap::new();
+        let mut accepted_started = false;
+        let mut pairs: Buffer<(Id, Id)> = Buffer::new(self.preparation)?;
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Pos, &[p.0, o.0], |q| {
+                let g = q[3];
+                if g == Id::DEFAULT_GRAPH {
+                    return Ok(true);
+                }
+                let slot = (g.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize % SKIP_SLOTS;
+                if skipped[slot] == Some(g) {
+                    return Ok(true);
+                }
+                if let Some(map) = admitted
+                    && !map.contains_key(&g)
+                {
+                    skipped[slot] = Some(g);
+                    return Ok(true);
+                }
+                if !self.is_iri_id(q[0])? {
+                    return Ok(true);
+                }
+                if skip_masked && self.hides_subject_id_in_graph(q[0], g)? {
+                    return Ok(true);
+                }
+                if let std::collections::btree_map::Entry::Vacant(e) = accepted.entry(g) {
+                    if let Some((tp, cls)) = object_type_ids
+                        && ((skip_masked && self.hides_subject_id_in_graph(o, g)?)
+                            || !self.preparation.contains(self.snap, &[o, tp, cls, g])?)
+                    {
+                        skipped[slot] = Some(g);
+                        return Ok(true);
+                    }
+                    let node = if let Some(map) = admitted {
+                        let candidate = map.get(&g).expect("checked admitted graph id");
+                        if keep_graph(candidate.as_str()) {
+                            Some(Arc::clone(candidate))
+                        } else {
+                            None
+                        }
+                    } else {
+                        self.preparation.with_iri(self.snap, g, |iri| match iri {
+                            Some(iri) if keep_graph(iri) => {
+                                let owned = self.preparation.copy_string(iri, &mut out_held)?;
+                                out_held.grow_by(32)?;
+                                Ok(Some(Arc::new(NamedNode::new_unchecked(owned))))
+                            }
+                            _ => Ok(None),
+                        })?
+                    };
+                    let Some(node) = node else {
+                        skipped[slot] = Some(g);
+                        return Ok(true);
+                    };
+                    let start = if accepted_started { 0 } else { CACHE_START };
+                    scan_held.grow_by(start + CACHE_ENTRY)?;
+                    accepted_started = true;
+                    e.insert(node);
+                }
+                if pairs.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                pairs.push((q[0], g))?;
+                Ok(true)
+            })?;
+        let vec_bytes = (pairs.len() as u64)
+            .saturating_mul(std::mem::size_of::<(NamedNode, Arc<NamedNode>)>() as u64);
+        out_held.grow_by(vec_bytes)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(pairs.len())
+            .map_err(|_| self.preparation.exhausted())?;
+        for &(s_id, g_id) in &*pairs {
+            if let Some(s) = self
+                .preparation
+                .with_iri(self.snap, s_id, |iri| match iri {
+                    Some(iri) => {
+                        let owned = self.preparation.copy_string(iri, &mut out_held)?;
+                        Ok(Some(NamedNode::new_unchecked(owned)))
+                    }
+                    None => Ok(None),
+                })?
+            {
+                let g = Arc::clone(
+                    accepted
+                        .get(&g_id)
+                        .expect("accepted graph id retained for scan"),
+                );
+                out.push((s, g));
+            }
+        }
+        drop(pairs);
+        drop(accepted);
+        drop(scan_held);
+        Ok(AdmittedScan {
+            items: out,
+            more,
+            _held: out_held,
+        })
+    }
+
+    /// The single IRI object of `s p ?o` in `g`, `None` when it has none, several, or
+    /// a non-IRI object. Reserves the IRI string bytes in `held` before copying it.
+    pub fn single_iri_admitted(
+        &mut self,
+        s: &str,
+        p: &str,
+        g: &str,
+        held: &mut Reservation,
+    ) -> Result<Option<NamedNode>> {
+        let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
+            return Ok(None);
+        };
+        let mut first: Option<Id> = None;
+        let mut many = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                if first.is_some() {
+                    many = true;
+                    return Ok(false);
+                }
+                first = Some(q[2]);
+                Ok(true)
+            })?;
+        if many {
+            return Ok(None);
+        }
+        let Some(id) = first else {
+            return Ok(None);
+        };
+        self.preparation.with_iri(self.snap, id, |iri| match iri {
+            Some(iri) => {
+                let owned = self.preparation.copy_string(iri, held)?;
+                Ok(Some(NamedNode::new_unchecked(owned)))
+            }
+            None => Ok(None),
+        })
     }
 
     /// The number of triples whose subject is `s` in `g`, counting at most `limit`.
@@ -1454,7 +1823,7 @@ impl<'a> Reads<'a> {
         let Some(o) = o else {
             return Ok(false);
         };
-        self.snap.contains(&[s, p, o, g])
+        self.preparation.contains(self.snap, &[s, p, o, g])
     }
 
     /// Whether `s` is a typed operation's authenticated record in `g`: its single
@@ -1512,7 +1881,7 @@ impl<'a> Reads<'a> {
         ) else {
             return Ok(false);
         };
-        self.snap.contains(&[s, p, o, g])
+        self.preparation.contains(self.snap, &[s, p, o, g])
     }
 
     /// The single protection nonce that `s` carries in `g`.

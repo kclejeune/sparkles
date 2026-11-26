@@ -1005,6 +1005,34 @@ impl Preparation {
         Ok(false)
     }
 
+    pub(crate) fn allows_named_graph_iri(&self, graphs: &Graphs, iri: &str) -> Result<bool> {
+        self.check()?;
+        let Graphs::Only(rule) = graphs else {
+            return Ok(true);
+        };
+        if iri == crate::sparql::ctx::DEFAULT_GRAPH_IRI {
+            Ok(rule.default_graph)
+        } else if iri == crate::sparql::ctx::UNION_GRAPH_IRI {
+            Ok(false)
+        } else {
+            self.named_rule(rule, iri)
+        }
+    }
+
+    pub(crate) fn covers_named_graph_iri(
+        &self,
+        protection: &Protection,
+        iri: &str,
+    ) -> Result<bool> {
+        match &protection.graphs {
+            Some(graphs) => self.allows_named_graph_iri(graphs, iri),
+            None => {
+                self.check()?;
+                Ok(true)
+            }
+        }
+    }
+
     pub(crate) fn covers_graph(
         &self,
         protection: &Protection,
@@ -1062,6 +1090,12 @@ impl Preparation {
         snap.scan_prepared(perm, prefix, self, each)
     }
 
+    /// Check whether `quad` is present in `snap` under this preparation's controls
+    /// and memory budget.
+    pub fn contains(&self, snap: &Snapshot, quad: &[Id; 4]) -> Result<bool> {
+        snap.contains_prepared(quad, self)
+    }
+
     /// Resolve an IRI with controlled reconstruction and delta-vocabulary waiting.
     pub fn lookup_iri(&self, snap: &Snapshot, iri: &str) -> Result<Option<Id>> {
         self.check()?;
@@ -1094,12 +1128,11 @@ impl Preparation {
     }
 
     fn lookup_vocab_key(&self, snap: &Snapshot, key: &[u8]) -> Result<Option<Id>> {
-        let mut workspace = self.reserve(0)?;
-        if let Ok(id) = snap.generation.vocab.find_with_controlled(
-            key,
-            |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
-            |phase| self.checkpoint(phase),
-        )? {
+        if let Ok(id) = snap
+            .generation
+            .vocab
+            .find_exact_controlled(key, |phase| self.checkpoint(phase))?
+        {
             self.check()?;
             return Ok(Some(Id::vocab(id)));
         }
@@ -1189,6 +1222,86 @@ impl Preparation {
                 }
                 Ok(vocab.get(id.payload()).map(&mut call))
             })?,
+            _ => None,
+        };
+        let result = match result {
+            Some(result) => result?,
+            None => (each.take().expect("not called"))(None)?,
+        };
+        self.check()?;
+        Ok(result)
+    }
+
+    /// The IRI text of a stored named node, borrowed for `each` without full term
+    /// decoding. Only the key's own bytes and the reconstruction workspace are
+    /// charged, so a long rejected IRI does not pay the general term-decoder
+    /// multiplier. `None` for any non-IRI term. Vocabulary locks are released
+    /// before the callback.
+    pub fn with_iri<R>(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        each: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        self.check()?;
+        let mut each = Some(each);
+        let mut call = |key: &[u8]| -> Result<R> {
+            let each = each.take().expect("called once");
+            let Some(text) = key.strip_prefix(b"<") else {
+                return each(None);
+            };
+            let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+            each(std::str::from_utf8(text).ok())
+        };
+        let mut workspace = self.reserve(0)?;
+        let result = match id.tag() {
+            Tag::Vocab => {
+                if id.payload() >= snap.generation.vocab.len()
+                    || !snap.generation.vocab.is_iri(id.payload())
+                {
+                    None
+                } else {
+                    snap.generation.vocab.get_with_controlled(
+                        id.payload(),
+                        |bytes| {
+                            workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256))
+                        },
+                        |phase| self.checkpoint(phase),
+                        &mut call,
+                    )?
+                }
+            }
+            Tag::Delta => {
+                // Copy the delta IRI into a budgeted temporary buffer so the delta
+                // vocabulary read lock is released before invoking `each`.
+                let copied: Option<(String, Reservation)> =
+                    snap.generation.dvocab.with_prepared(self, |vocab| {
+                        if id.payload() >= snap.dvocab_len {
+                            return Ok(None);
+                        }
+                        let Some(key) = vocab.get(id.payload()) else {
+                            return Ok(None);
+                        };
+                        let Some(text) = key.strip_prefix(b"<") else {
+                            return Ok(None);
+                        };
+                        let Ok(text) = std::str::from_utf8(text) else {
+                            return Ok(None);
+                        };
+                        let mut held = self.reserve(0)?;
+                        let owned = self.copy_string(text, &mut held)?;
+                        Ok(Some((owned, held)))
+                    })?;
+                let out = (each.take().expect("called once"))(
+                    copied.as_ref().map(|(text, _)| text.as_str()),
+                )?;
+                if let Some((owned, held)) = copied {
+                    drop(owned);
+                    drop(held);
+                }
+                self.check()?;
+                return Ok(out);
+            }
             _ => None,
         };
         let result = match result {
@@ -2183,6 +2296,21 @@ impl PreparedView {
     /// Whether the graph named by `iri` is readable under this prepared policy.
     pub fn allows_read_iri(&self, iri: &str) -> bool {
         self.inner.access.read.allows_iri(iri)
+    }
+
+    /// Whether the guarded named graph `iri` is readable under this prepared policy:
+    /// either reads are unrestricted, or `iri` is allowed by the read rule and exempted
+    /// by a snapshot-bound guard whose pattern matches `iri`.
+    pub fn allows_guarded_read_iri(&self, iri: &str) -> bool {
+        self.inner.access.allows_guarded_read_iri(iri)
+    }
+
+    /// See [`GraphAccess::visit_guarded_read_iris`].
+    pub fn visit_guarded_read_iris<E>(
+        &self,
+        visit: impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        self.inner.access.visit_guarded_read_iris(visit)
     }
 
     /// Whether the graph named by `term` (the default graph when `None`) is writable.

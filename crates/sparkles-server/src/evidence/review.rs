@@ -483,10 +483,12 @@ struct DependentsRequest {
 
 /// `POST /{ds}/claims/dependents`: the authenticated assessments in the proposal graphs
 /// the caller can read whose `ev:target` or `prov:used` names one of the changed record
-/// identities, and with `transitive` the assessments that depend on those. `200` with
-/// the commit read and each dependent's assessment, graph, the record it depends on, how
-/// and at what depth. `400` for a malformed request, `422 incomplete-evidence` beyond the
-/// bound. Needs `read` through the query endpoint and counts as a query.
+/// identities, and the community reports in guarded reports graphs proven for the caller
+/// (C22 §6) whose generating activity recorded `prov:used` for one of them (including
+/// person-edited reports via `gr:editOf`), and with `transitive` the assessments and
+/// reports that depend on those. `200` with the commit read, each dependent assessment
+/// and each dependent report. `400` for a malformed request, `422 incomplete-evidence`
+/// beyond the bound. Needs `read` through the query endpoint and counts as a query.
 pub(super) async fn dependents(
     State(st): St,
     Path(name): Path<String>,
@@ -554,6 +556,14 @@ pub(super) fn dependents_now(
             "on": d.on.as_str(),
             "dependence": d.dependence.name(),
             "depth": d.depth,
+        })).collect::<Vec<_>>(),
+        "reports": found.reports.iter().map(|rep| json!({
+            "report": rep.report.as_str(),
+            "community": rep.community.as_ref().map(|c| c.as_str()),
+            "graph": rep.graph.as_str(),
+            "on": rep.on.as_str(),
+            "dependence": rep.dependence.name(),
+            "depth": rep.depth,
         })).collect::<Vec<_>>(),
     }))
 }
