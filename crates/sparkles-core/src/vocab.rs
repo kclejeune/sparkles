@@ -19,6 +19,7 @@ pub use delta::parse_delta;
 pub use delta::{DeltaVocab, VocabMark};
 pub(crate) use sync::{LazySync, PendingSync};
 
+use crate::budgeted::{BudgetControl, Control, Unlimited};
 use crate::disk::WritebackFile;
 use crate::error::Result;
 use crate::ioacct::{self, IoFile, Phase};
@@ -35,7 +36,7 @@ pub const FC_BLOCK: usize = 16;
 /// The room past a key that a checked decode reserves for an FSST suffix.
 const FSST_ROOM: usize = 64;
 
-/// Every key of a front-coded block, as a mask of [`Vocab::decode_block`].
+/// Every key of a front-coded block, as a mask of [`Vocab::decode_block_with`].
 const ALL_KEYS: u32 = (1 << FC_BLOCK) - 1;
 
 /// How many bytes of key `i` of a front-coded block a decode of the keys in `wanted`
@@ -170,60 +171,55 @@ impl Sparse {
     /// Read `vocab.idx` for a vocabulary of `blocks` front-coded blocks and `data_len`
     /// data bytes. Index format 5 requires the file, so a missing one, or one that does
     /// not describe this vocabulary, is [`crate::Error::Corrupt`].
-    fn read(path: &Path, blocks: usize, data_len: u64) -> crate::error::Result<Sparse> {
-        let buf = std::fs::read(path).map_err(|e| missing_index(path, &e))?;
-        Self::decode(&buf, blocks, data_len).ok_or_else(|| mismatched_index(path))
-    }
-
-    fn read_controlled(
+    fn read_with<C: BudgetControl>(
         path: &Path,
         blocks: usize,
         data_len: u64,
-        budget: &mut crate::store::cold::ColdBudget<'_>,
-    ) -> crate::error::Result<Option<crate::store::cold::Loaded<Sparse>>> {
-        let start = budget.used();
-        let bytes = match budget.read_file(path) {
+        control: &mut C,
+    ) -> crate::error::Result<crate::store::cold::Loaded<Sparse>> {
+        let start = control.used();
+        let bytes = match control.read_file(path) {
             Ok(bytes) => bytes,
             Err(crate::Error::Io(error)) => {
-                budget.release(budget.used() - start);
+                control.release(control.used() - start);
                 return Err(missing_index(path, &error));
             }
             Err(error) => return Err(error),
         };
-        let parsed = match Self::decode_inner(&bytes, blocks, data_len, Some(budget)) {
+        let parsed = match Self::decode_with(&bytes, blocks, data_len, control) {
             Ok(parsed) => parsed,
             Err(error) => {
-                budget.drop_vec(bytes);
-                budget.release(budget.used() - start);
+                control.drop_vec(bytes);
+                control.release(control.used() - start);
                 return Err(error);
             }
         };
-        budget.drop_vec(bytes);
+        control.drop_vec(bytes);
         match parsed {
-            Some(value) => Ok(Some(crate::store::cold::Loaded {
+            Some(value) => Ok(crate::store::cold::Loaded {
                 value,
-                charge: budget.used() - start,
-            })),
+                charge: control.used() - start,
+            }),
             None => {
                 // The index that does not describe this vocabulary and all of its
                 // partial storage dropped before the refusal.
-                budget.release(budget.used() - start);
+                control.release(control.used() - start);
                 Err(mismatched_index(path))
             }
         }
     }
 
     fn decode(buf: &[u8], blocks: usize, data_len: u64) -> Option<Sparse> {
-        Self::decode_inner(buf, blocks, data_len, None)
+        Self::decode_with(buf, blocks, data_len, &mut Unlimited)
             .ok()
             .flatten()
     }
 
-    fn decode_inner(
+    fn decode_with<C: BudgetControl>(
         buf: &[u8],
         blocks: usize,
         data_len: u64,
-        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+        control: &mut C,
     ) -> crate::error::Result<Option<Sparse>> {
         let mut failure = None;
         macro_rules! admit {
@@ -247,21 +243,11 @@ impl Sparse {
             if n != blocks.div_ceil(IDX_BLOCKS) {
                 return None;
             }
-            let (starts, offsets, hinted, warm_keys) = if let Some(budget) = budget.as_deref_mut() {
-                let (mut starts, mut offsets) = (Vec::new(), Vec::new());
-                admit!(budget.reserve(&mut starts, n));
-                admit!(budget.reserve(&mut offsets, n));
-                let hinted = admit!(budget.filled(n.div_ceil(64)));
-                let warm_keys = admit!(budget.filled(WARM_KEY_SLOTS));
-                (starts, offsets, hinted, warm_keys)
-            } else {
-                (
-                    Vec::with_capacity(n),
-                    Vec::with_capacity(n),
-                    (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
-                    (0..WARM_KEY_SLOTS).map(|_| AtomicU64::new(0)).collect(),
-                )
-            };
+            let (mut starts, mut offsets) = (Vec::new(), Vec::new());
+            admit!(control.reserve(&mut starts, n));
+            admit!(control.reserve(&mut offsets, n));
+            let hinted = admit!(control.filled(n.div_ceil(64)));
+            let warm_keys = admit!(control.filled(WARM_KEY_SLOTS));
             let mut s = Sparse {
                 keys: Vec::new(),
                 starts,
@@ -271,9 +257,7 @@ impl Sparse {
             };
             let mut pos = 24;
             for _ in 0..n {
-                if let Some(budget) = budget.as_deref_mut() {
-                    admit!(budget.check());
-                }
+                admit!(control.check(0));
                 let off = u64_at(pos)?;
                 let len = u32_at(pos + 8)? as usize;
                 let key = buf.get(pos + 12..pos + 12 + len)?;
@@ -282,24 +266,22 @@ impl Sparse {
                 }
                 let unordered = if s.starts.is_empty() {
                     false
-                } else if let Some(budget) = budget.as_deref_mut() {
-                    admit!(cold::compare_controlled(s.key(s.len() - 1), key, budget))
-                        != std::cmp::Ordering::Less
                 } else {
-                    s.key(s.len() - 1) >= key
+                    admit!(cold::compare_with(s.key(s.len() - 1), key, control))
+                        != std::cmp::Ordering::Less
                 };
                 if unordered {
                     return None;
                 }
                 s.starts.push(u32::try_from(s.keys.len()).ok()?);
-                if let Some(budget) = budget.as_deref_mut() {
+                if C::ACCOUNTS {
                     let need = s.keys.len().checked_add(key.len())?;
-                    admit!(budget.reserve(&mut s.keys, need));
+                    admit!(control.reserve(&mut s.keys, need));
                     for (index, chunk) in key.chunks(64 << 10).enumerate() {
-                        admit!(budget.key_step("sparse copy", index * (64 << 10)));
+                        admit!(control.key_step("sparse copy", index * (64 << 10)));
                         s.keys.extend_from_slice(chunk);
                     }
-                    admit!(budget.key_step("sparse copy", key.len()));
+                    admit!(control.key_step("sparse copy", key.len()));
                 } else {
                     s.keys.extend_from_slice(key);
                 }
@@ -410,6 +392,245 @@ impl Ahead {
             self.until = to;
         }
     }
+}
+
+/// Compile-time policy governing scratch admission, exact growth, and cooperative
+/// checkpoint polling for front-coded block decoding and binary search.
+///
+/// Under [`Unlimited`], `CHECKED` and `POLLS` are both false so every check, admission,
+/// and error path compiles away.
+trait BlockScratch<E> {
+    const CHECKED: bool;
+    const POLLS: bool;
+    const EXACT_GROW: bool;
+    const ROOM: bool;
+    const SCRATCH_FLOOR: bool;
+    const ADMIT_PREFETCH: bool;
+    #[cfg(any(test, feature = "failpoints"))]
+    const PROJECTION_TAG: Option<&'static str>;
+
+    fn checkpoint(&mut self, _phase: &'static str) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn admit_growth(&mut self, _old_cap: usize, _new_cap: usize) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn settled(&mut self, _new_cap: usize) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn invalid_err(&self, _msg: &'static str) -> E {
+        unreachable!("unchecked vocabulary scratch cannot fail")
+    }
+    fn alloc_err(&self, _err: std::collections::TryReserveError) -> E {
+        self.invalid_err("vocabulary allocation failed")
+    }
+}
+
+impl BlockScratch<std::convert::Infallible> for Unlimited {
+    const CHECKED: bool = false;
+    const POLLS: bool = false;
+    const EXACT_GROW: bool = false;
+    const ROOM: bool = false;
+    const SCRATCH_FLOOR: bool = false;
+    const ADMIT_PREFETCH: bool = false;
+    #[cfg(any(test, feature = "failpoints"))]
+    const PROJECTION_TAG: Option<&'static str> = None;
+}
+
+/// Checked scratch reservation with `scratch_capacity()` floor and optional `FSST_ROOM`
+/// fast-path headroom (for cursor/projection lookups and sorted scans).
+struct CheckedScratch<R, const ROOM: bool> {
+    reserve: R,
+}
+
+impl<R, E, const ROOM: bool> BlockScratch<E> for CheckedScratch<R, ROOM>
+where
+    R: FnMut(usize) -> std::result::Result<(), E>,
+{
+    const CHECKED: bool = true;
+    const POLLS: bool = false;
+    const EXACT_GROW: bool = false;
+    const ROOM: bool = ROOM;
+    const SCRATCH_FLOOR: bool = true;
+    const ADMIT_PREFETCH: bool = false;
+    #[cfg(any(test, feature = "failpoints"))]
+    const PROJECTION_TAG: Option<&'static str> = Some("checked-vocab-scratch-allocated");
+
+    #[inline(always)]
+    fn admit_growth(&mut self, _old_cap: usize, new_cap: usize) -> std::result::Result<(), E> {
+        (self.reserve)(new_cap)
+    }
+}
+
+/// Checked scratch reservation for `get_sorted_owned_with_ahead` that also admits
+/// prefetch block-index scratch through the same callback.
+struct OwnedCheckedScratch<R> {
+    reserve: R,
+}
+
+impl<R> BlockScratch<crate::error::Error> for OwnedCheckedScratch<R>
+where
+    R: FnMut(usize) -> crate::error::Result<()>,
+{
+    const CHECKED: bool = true;
+    const POLLS: bool = false;
+    const EXACT_GROW: bool = false;
+    const ROOM: bool = false;
+    const SCRATCH_FLOOR: bool = true;
+    const ADMIT_PREFETCH: bool = true;
+    #[cfg(any(test, feature = "failpoints"))]
+    const PROJECTION_TAG: Option<&'static str> = Some("checked-vocab-scratch-allocated");
+
+    #[inline(always)]
+    fn admit_growth(&mut self, _old_cap: usize, new_cap: usize) -> crate::error::Result<()> {
+        (self.reserve)(new_cap)
+    }
+
+    fn invalid_err(&self, msg: &'static str) -> crate::error::Error {
+        crate::error::Error::invalid(msg)
+    }
+}
+
+/// Exact scratch admission using `try_reserve_exact` without `scratch_capacity()` floor
+/// (for call-owned projection scratch in `get_with_fallible` and `find_with_checked`).
+struct ExactScratch<R> {
+    reserve: R,
+}
+
+impl<R> BlockScratch<crate::error::Error> for ExactScratch<R>
+where
+    R: FnMut(usize) -> crate::error::Result<()>,
+{
+    const CHECKED: bool = true;
+    const POLLS: bool = false;
+    const EXACT_GROW: bool = true;
+    const ROOM: bool = false;
+    const SCRATCH_FLOOR: bool = false;
+    const ADMIT_PREFETCH: bool = false;
+    #[cfg(any(test, feature = "failpoints"))]
+    const PROJECTION_TAG: Option<&'static str> = Some("vocab-scratch-allocated");
+
+    #[inline(always)]
+    fn admit_growth(&mut self, _old_cap: usize, new_cap: usize) -> crate::error::Result<()> {
+        (self.reserve)(new_cap)
+    }
+
+    fn invalid_err(&self, msg: &'static str) -> crate::error::Error {
+        crate::error::Error::invalid(msg)
+    }
+
+    fn alloc_err(&self, err: std::collections::TryReserveError) -> crate::error::Error {
+        crate::error::Error::invalid(format!("vocabulary allocation failed: {err}"))
+    }
+}
+
+/// Fully controlled scratch accounting for coexisting old/new buffers, settled capacity,
+/// and cooperative checkpoints during measurement, decoding, and byte comparison.
+struct ControlledScratch<G, T, K> {
+    grow: G,
+    settled: T,
+    checkpoint: K,
+}
+
+impl<G, T, K, E> BlockScratch<E> for ControlledScratch<G, T, K>
+where
+    E: From<crate::error::Error>,
+    G: FnMut(usize, usize) -> std::result::Result<(), E>,
+    T: FnMut(usize) -> std::result::Result<(), E>,
+    K: FnMut(&'static str) -> std::result::Result<(), E>,
+{
+    const CHECKED: bool = true;
+    const POLLS: bool = true;
+    const EXACT_GROW: bool = true;
+    const ROOM: bool = false;
+    const SCRATCH_FLOOR: bool = false;
+    const ADMIT_PREFETCH: bool = false;
+    #[cfg(any(test, feature = "failpoints"))]
+    const PROJECTION_TAG: Option<&'static str> = None;
+
+    #[inline(always)]
+    fn checkpoint(&mut self, phase: &'static str) -> std::result::Result<(), E> {
+        (self.checkpoint)(phase)
+    }
+
+    #[inline(always)]
+    fn admit_growth(&mut self, old_cap: usize, new_cap: usize) -> std::result::Result<(), E> {
+        (self.grow)(old_cap, new_cap)
+    }
+
+    #[inline(always)]
+    fn settled(&mut self, new_cap: usize) -> std::result::Result<(), E> {
+        (self.settled)(new_cap)
+    }
+
+    fn invalid_err(&self, msg: &'static str) -> E {
+        crate::error::Error::invalid(msg).into()
+    }
+}
+
+/// Compile-time policy for admitting hint scratch vectors before read-ahead prefetching.
+trait HintAdmit {
+    type Error;
+    const CHECKED: bool;
+    fn admit(&mut self, _bytes: usize) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+    fn invalid_err(&self, msg: &'static str) -> Self::Error;
+}
+
+impl HintAdmit for Unlimited {
+    type Error = crate::error::Error;
+    const CHECKED: bool = false;
+
+    fn invalid_err(&self, msg: &'static str) -> crate::error::Error {
+        crate::error::Error::invalid(msg)
+    }
+}
+
+struct CheckedHint<F>(F);
+
+impl<F: FnMut(usize) -> crate::error::Result<()>> HintAdmit for CheckedHint<F> {
+    type Error = crate::error::Error;
+    const CHECKED: bool = true;
+
+    #[inline(always)]
+    fn admit(&mut self, bytes: usize) -> crate::error::Result<()> {
+        (self.0)(bytes)
+    }
+
+    fn invalid_err(&self, msg: &'static str) -> crate::error::Error {
+        crate::error::Error::invalid(msg)
+    }
+}
+
+struct ScratchHint<'a, S, E>(&'a mut S, std::marker::PhantomData<fn() -> E>);
+
+impl<S: BlockScratch<E>, E> HintAdmit for ScratchHint<'_, S, E> {
+    type Error = E;
+    const CHECKED: bool = true;
+
+    #[inline(always)]
+    fn admit(&mut self, bytes: usize) -> std::result::Result<(), E> {
+        self.0.admit_growth(0, bytes)
+    }
+
+    fn invalid_err(&self, msg: &'static str) -> E {
+        self.0.invalid_err(msg)
+    }
+}
+
+/// Compare two byte slices under `S`. Under non-polling controls, compiles directly to
+/// `left.cmp(right)`; under polling controls, compares in 1024-byte chunks with checkpoints.
+#[inline(always)]
+fn compare_bytes_with<S: BlockScratch<E>, E>(
+    left: &[u8],
+    right: &[u8],
+    scratch: &mut S,
+) -> std::result::Result<std::cmp::Ordering, E> {
+    if !S::POLLS {
+        return Ok(left.cmp(right));
+    }
+    compare_prepared_bytes(left, right, &mut |phase| scratch.checkpoint(phase))
 }
 
 /// Sorted, front-coded, memory-mapped vocabulary.
@@ -524,11 +745,40 @@ impl Vocab {
     /// Open the vocabulary in `dir`, whose suffixes are FSST-coded when `fsst` (and then
     /// `vocab.fsst` must be there).
     pub fn open_codec(dir: &Path, fsst: bool) -> Result<Vocab> {
+        Ok(Self::open_with(dir, fsst, &mut Unlimited)?.value)
+    }
+
+    pub(crate) fn open_with<C: BudgetControl>(
+        dir: &Path,
+        fsst: bool,
+        control: &mut C,
+    ) -> crate::error::Result<crate::store::cold::Loaded<Vocab>> {
+        use crate::error::Error;
+        control.check(0)?;
+        let start = control.used();
         let tables = if fsst {
-            Some(Box::new(fsst::Tables::read(dir)?))
+            if C::ACCOUNTS {
+                let path = dir.join(fsst::FILE);
+                let version = fsst::file_version(&path)?;
+                control.check(0)?;
+                crate::formats::VOCAB_FSST.check(fsst::FILE, version, None)?;
+                // Two tables have at most 255 nine-byte symbols in the current codec.
+                if std::fs::metadata(&path)?.len() > 32 + 2 * (1 + 255 * 9) {
+                    return Err(Error::Corrupt("vocab.fsst: trailing bytes".into()));
+                }
+                let bytes = control.read_file(&path)?;
+                control.charge(std::mem::size_of::<fsst::Tables>() as u64 + 64 + 4096)?;
+                let tables = fsst::Tables::decode(&bytes)?;
+                control.release(4096);
+                control.drop_vec(bytes);
+                Some(Box::new(tables))
+            } else {
+                Some(Box::new(fsst::Tables::read(dir)?))
+            }
         } else {
             None
         };
+        control.check(0)?;
         // A lookup reads a few hundred bytes of the data, so the data is read a page at
         // a time (see `crate::index::io_hints`). With the sparse index, a lookup reads
         // one range of the offsets, which are mapped for random access too. Without it, a
@@ -536,123 +786,72 @@ impl Vocab {
         // data and read in windows.
         let data = Bytes::open(&dir.join("vocab.dat"), true)?;
         let off_path = dir.join("vocab.off");
-        let blocks = (std::fs::metadata(&off_path)?.len() as usize / 8).saturating_sub(1);
-        let sparse = if crate::index::sparse_vocab() {
-            Some(Sparse::read(
-                &dir.join("vocab.idx"),
-                blocks,
-                data.as_slice().len() as u64,
-            )?)
-        } else {
-            require_index_file(dir)?;
-            None
-        };
-        let offsets = Bytes::open(&off_path, sparse.is_some())?;
-        let off = offsets.as_slice();
-        let len = if off.len() >= 8 {
-            u64::from_le_bytes(off[off.len() - 8..].try_into().unwrap())
-        } else {
-            0
-        };
-        let mut v = Vocab {
-            data,
-            offsets,
-            len,
-            first_iri: 0,
-            first_triple: 0,
-            sparse,
-            prefetched: (0..blocks.div_ceil(64))
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-            num: None,
-            fsst: tables,
-        };
-        // a cheap test that the index belongs to these files: its first and last data
-        // offsets (`sparkles check` compares every entry)
-        if let Some(s) = &v.sparse
-            && let Some(last) = s.len().checked_sub(1)
-            && (s.offsets[0] != v.block_offset(0) as u64
-                || s.offsets[last] != v.block_offset(last * IDX_BLOCKS) as u64)
-        {
-            return Err(mismatched_index(&dir.join("vocab.idx")));
-        }
-        v.first_iri = match v.find(b"<") {
-            Ok(i) | Err(i) => i,
-        };
-        v.first_triple = match v.find(b"(") {
-            Ok(i) | Err(i) => i,
-        };
-        v.num = numeric::NumColumn::open(dir, v.len, v.first_triple);
-        Ok(v)
-    }
-
-    pub(crate) fn open_controlled(
-        dir: &Path,
-        fsst: bool,
-        budget: &mut crate::store::cold::ColdBudget<'_>,
-    ) -> crate::error::Result<crate::store::cold::Loaded<Vocab>> {
-        use crate::error::Error;
-        budget.check()?;
-        let start = budget.used();
-        let tables = if fsst {
-            let path = dir.join(fsst::FILE);
-            let version = fsst::file_version(&path)?;
-            budget.check()?;
-            crate::formats::VOCAB_FSST.check(fsst::FILE, version, None)?;
-            // Two tables have at most 255 nine-byte symbols in the current codec.
-            if std::fs::metadata(&path)?.len() > 32 + 2 * (1 + 255 * 9) {
-                return Err(Error::Corrupt("vocab.fsst: trailing bytes".into()));
+        let (offsets, blocks, len, sparse) = if C::ACCOUNTS {
+            let offsets = Bytes::open(&off_path, true)?;
+            let off = offsets.as_slice();
+            if !off.len().is_multiple_of(8) {
+                return Err(Error::Corrupt("vocabulary offset length".into()));
             }
-            let bytes = budget.read_file(&path)?;
-            budget.charge(std::mem::size_of::<fsst::Tables>() as u64 + 64 + 4096)?;
-            let tables = fsst::Tables::decode(&bytes)?;
-            budget.release(4096);
-            budget.drop_vec(bytes);
-            Some(Box::new(tables))
-        } else {
-            None
-        };
-        budget.check()?;
-        let data = Bytes::open(&dir.join("vocab.dat"), true)?;
-        let offsets = Bytes::open(&dir.join("vocab.off"), true)?;
-        let off = offsets.as_slice();
-        if !off.len().is_multiple_of(8) {
-            return Err(Error::Corrupt("vocabulary offset length".into()));
-        }
-        let blocks = (off.len() / 8).saturating_sub(1);
-        let len = if off.len() >= 8 {
-            u64::from_le_bytes(off[off.len() - 8..].try_into().unwrap())
-        } else {
-            0
-        };
-        if usize::try_from(len).ok().map(|n| n.div_ceil(FC_BLOCK)) != Some(blocks) {
-            return Err(Error::Corrupt(
-                "vocabulary offsets disagree with its term count".into(),
-            ));
-        }
-        let sparse = if crate::index::sparse_vocab() {
-            let before = budget.used();
-            match Sparse::read_controlled(
-                &dir.join("vocab.idx"),
-                blocks,
-                data.as_slice().len() as u64,
-                budget,
-            ) {
-                Ok(loaded) => loaded.map(|loaded| loaded.value),
-                Err(crate::Error::BudgetExceeded(_)) => {
-                    // The index is required on disk but not in memory: a budgeted
-                    // reader that cannot hold it looks terms up through the offsets,
-                    // which remains exact. Its failed decoder owns no surviving storage.
-                    budget.release(budget.used() - before);
-                    None
+            let blocks = (off.len() / 8).saturating_sub(1);
+            let len = if off.len() >= 8 {
+                u64::from_le_bytes(off[off.len() - 8..].try_into().unwrap())
+            } else {
+                0
+            };
+            if usize::try_from(len).ok().map(|n| n.div_ceil(FC_BLOCK)) != Some(blocks) {
+                return Err(Error::Corrupt(
+                    "vocabulary offsets disagree with its term count".into(),
+                ));
+            }
+            let sparse = if crate::index::sparse_vocab() {
+                let before = control.used();
+                match Sparse::read_with(
+                    &dir.join("vocab.idx"),
+                    blocks,
+                    data.as_slice().len() as u64,
+                    control,
+                ) {
+                    Ok(loaded) => Some(loaded.value),
+                    Err(crate::Error::BudgetExceeded(_)) => {
+                        // The index is required on disk but not in memory: a budgeted
+                        // reader that cannot hold it looks terms up through the offsets,
+                        // which remains exact. Its failed decoder owns no surviving storage.
+                        control.release(control.used() - before);
+                        None
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
-            }
+            } else {
+                require_index_file(dir)?;
+                None
+            };
+            (offsets, blocks, len, sparse)
         } else {
-            require_index_file(dir)?;
-            None
+            let blocks = (std::fs::metadata(&off_path)?.len() as usize / 8).saturating_sub(1);
+            let sparse = if crate::index::sparse_vocab() {
+                Some(
+                    Sparse::read_with(
+                        &dir.join("vocab.idx"),
+                        blocks,
+                        data.as_slice().len() as u64,
+                        control,
+                    )?
+                    .value,
+                )
+            } else {
+                require_index_file(dir)?;
+                None
+            };
+            let offsets = Bytes::open(&off_path, sparse.is_some())?;
+            let off = offsets.as_slice();
+            let len = if off.len() >= 8 {
+                u64::from_le_bytes(off[off.len() - 8..].try_into().unwrap())
+            } else {
+                0
+            };
+            (offsets, blocks, len, sparse)
         };
-        let prefetched = budget.filled(blocks.div_ceil(64))?;
+        let prefetched = control.filled(blocks.div_ceil(64))?;
         let mut vocab = Vocab {
             data,
             offsets,
@@ -664,41 +863,63 @@ impl Vocab {
             num: None,
             fsst: tables,
         };
+        // a cheap test that the index belongs to these files: its first and last data
+        // offsets (`sparkles check` compares every entry)
         if let Some(sparse) = &vocab.sparse
             && let Some(last) = sparse.len().checked_sub(1)
             && (sparse.offsets[0] != vocab.block_offset(0) as u64
                 || sparse.offsets[last] != vocab.block_offset(last * IDX_BLOCKS) as u64)
         {
-            // The index and its owned storage drop with the refused vocabulary.
-            let sparse = vocab.sparse.take().unwrap();
-            let bytes = sparse.keys.capacity() as u64
-                + sparse.starts.capacity() as u64 * 4
-                + sparse.offsets.capacity() as u64 * 8
-                + (sparse.hinted.len() + sparse.warm_keys.len()) as u64 * 8;
-            drop(sparse);
-            budget.release(bytes);
+            if C::ACCOUNTS {
+                // The index and its owned storage drop with the refused vocabulary.
+                let sparse = vocab.sparse.take().unwrap();
+                let bytes = sparse.keys.capacity() as u64
+                    + sparse.starts.capacity() as u64 * 4
+                    + sparse.offsets.capacity() as u64 * 8
+                    + (sparse.hinted.len() + sparse.warm_keys.len()) as u64 * 8;
+                drop(sparse);
+                control.release(bytes);
+            }
             return Err(mismatched_index(&dir.join("vocab.idx")));
         }
-        // Type boundaries need one byte, not a reconstructed giant literal.
-        vocab.first_iri = vocab.boundary_controlled(b'<', budget)?;
-        vocab.first_triple = vocab.boundary_controlled(b'(', budget)?;
-        let before = budget.used();
-        vocab.num = match numeric::NumColumn::open_controlled(dir, len, vocab.first_triple, budget)
-        {
-            Ok(loaded) => loaded.map(|loaded| loaded.value),
-            Err(crate::Error::BudgetExceeded(_)) => {
-                // Numeric values can be decoded from keys when this optional
-                // column cannot fit. Do not invoke the old uncontrolled opener.
-                budget.release(budget.used() - before);
-                None
-            }
-            Err(error) => return Err(error),
-        };
-        budget.check()?;
+        if C::ACCOUNTS {
+            // Type boundaries need one byte, not a reconstructed giant literal.
+            vocab.first_iri = vocab.boundary_with(b'<', control)?;
+            vocab.first_triple = vocab.boundary_with(b'(', control)?;
+            let before = control.used();
+            vocab.num = match numeric::NumColumn::open_with(dir, len, vocab.first_triple, control) {
+                Ok(loaded) => loaded.map(|loaded| loaded.value),
+                Err(crate::Error::BudgetExceeded(_)) => {
+                    // Numeric values can be decoded from keys when this optional
+                    // column cannot fit. Do not invoke the old uncontrolled opener.
+                    control.release(control.used() - before);
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+        } else {
+            vocab.first_iri = match vocab.find(b"<") {
+                Ok(i) | Err(i) => i,
+            };
+            vocab.first_triple = match vocab.find(b"(") {
+                Ok(i) | Err(i) => i,
+            };
+            vocab.num = numeric::NumColumn::open(dir, vocab.len, vocab.first_triple);
+        }
+        control.check(0)?;
         Ok(crate::store::cold::Loaded {
             value: vocab,
-            charge: budget.used() - start,
+            charge: control.used() - start,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_controlled(
+        dir: &Path,
+        fsst: bool,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> crate::error::Result<crate::store::cold::Loaded<Vocab>> {
+        Self::open_with(dir, fsst, budget)
     }
 
     fn entry_controlled(&self, position: &mut usize, first: bool) -> crate::error::Result<Entry> {
@@ -727,14 +948,10 @@ impl Vocab {
         })
     }
 
-    fn boundary_controlled(
-        &self,
-        threshold: u8,
-        budget: &crate::store::cold::ColdBudget<'_>,
-    ) -> crate::error::Result<u64> {
+    fn boundary_with<C: Control>(&self, threshold: u8, control: &C) -> crate::error::Result<u64> {
         let count = self.num_blocks();
         let first_byte = |block: usize| -> crate::error::Result<Option<u8>> {
-            budget.check()?;
+            control.check(0)?;
             let mut position = usize::try_from(u64::from_le_bytes(
                 self.offsets.as_slice()[block * 8..block * 8 + 8]
                     .try_into()
@@ -756,7 +973,7 @@ impl Vocab {
             }
         }
         if lo == 0 {
-            budget.check()?;
+            control.check(0)?;
             return Ok(0);
         }
         let block = lo - 1;
@@ -768,14 +985,14 @@ impl Vocab {
         .map_err(|_| crate::Error::Corrupt("vocabulary offset overflows".into()))?;
         let mut previous = None;
         for index in 0..FC_BLOCK.min(self.len as usize - block * FC_BLOCK) {
-            budget.check()?;
+            control.check(0)?;
             let entry = self.entry_controlled(&mut position, index == 0)?;
             if entry.shared == 0 || previous.is_none() {
                 let suffix = &self.data.as_slice()[entry.start..entry.start + entry.len];
                 previous = match &self.fsst {
                     Some(tables) if entry.coded => tables
                         .table((block * FC_BLOCK + index) as u64)
-                        .first_byte_checked(suffix, || budget.check())?,
+                        .first_byte_with(suffix, control)?,
                     _ => suffix.first().copied(),
                 };
             }
@@ -783,7 +1000,7 @@ impl Vocab {
                 return Ok((block * FC_BLOCK + index) as u64);
             }
         }
-        budget.check()?;
+        control.check(0)?;
         Ok(((block + 1) * FC_BLOCK).min(self.len as usize) as u64)
     }
 
@@ -860,11 +1077,6 @@ impl Vocab {
         u64::from_le_bytes(o[b * 8..b * 8 + 8].try_into().unwrap()) as usize
     }
 
-    /// First key of block `b` (stored uncompressed).
-    fn block_first(&self, b: usize) -> &[u8] {
-        self.block_first_at::<true>(b)
-    }
-
     #[inline(always)]
     fn block_first_at<const P: bool>(&self, b: usize) -> &[u8] {
         if P {
@@ -924,47 +1136,51 @@ impl Vocab {
     }
 
     /// Decode a whole block, invoking `f(index_in_block, key)`; stops when `f` returns false.
-    fn scan_block(&self, b: usize, f: impl FnMut(usize, &[u8]) -> bool) {
+    fn scan_block(&self, b: usize, mut f: impl FnMut(usize, &[u8]) -> bool) {
         let mut key = Vec::with_capacity(self.scratch_capacity());
-        if ioacct::profiling() {
-            self.decode_block::<true>(b, ALL_KEYS, &mut key, f)
+        let mut cb = |i, _, k: &mut Vec<u8>, _: &mut Unlimited| Ok(f(i, k));
+        let _ = if ioacct::profiling() {
+            self.decode_block_dispatch::<true, _, _>(b, ALL_KEYS, &mut key, &mut Unlimited, &mut cb)
         } else {
-            self.decode_block::<false>(b, ALL_KEYS, &mut key, f)
-        }
+            self.decode_block_dispatch::<false, _, _>(
+                b,
+                ALL_KEYS,
+                &mut key,
+                &mut Unlimited,
+                &mut cb,
+            )
+        };
     }
 
-    /// Decode the keys of block `b` whose bits are set in `wanted` (bit `i` for the
-    /// block's `i`-th key), calling `f(i, key)` for each in order until it returns false.
-    /// `key` is the scratch buffer, cleared first. Of the other keys, only the bytes that
-    /// a wanted key takes from them are decoded (see [`lookahead`]). Under a profile
-    /// (`P`) the block is counted and its pages recorded.
     #[inline(always)]
-    fn decode_block<const P: bool>(
+    fn decode_block_dispatch<const P: bool, S: BlockScratch<E>, E>(
         &self,
         b: usize,
         wanted: u32,
         key: &mut Vec<u8>,
-        mut f: impl FnMut(usize, &[u8]) -> bool,
-    ) {
-        let f = |i, _, key: &[u8]| f(i, key);
+        scratch: &mut S,
+        each: &mut impl FnMut(usize, usize, &mut Vec<u8>, &mut S) -> std::result::Result<bool, E>,
+    ) -> std::result::Result<usize, E> {
         if self.fsst.is_some() {
-            self.decode_block_as::<P, true>(b, wanted, key, f)
+            self.decode_block_with::<P, true, S, E>(b, wanted, key, scratch, each)
         } else {
-            self.decode_block_as::<P, false>(b, wanted, key, f)
+            self.decode_block_with::<P, false, S, E>(b, wanted, key, scratch, each)
         }
     }
 
-    /// [`Vocab::decode_block`] for an FSST-coded vocabulary when `F` and a front-coded
-    /// one otherwise. Each hot loop is compiled once per codec, so the front-coded loops
-    /// carry no test for FSST codes.
+    /// Unified front-coded block decoder for both plain (`F = false`) and FSST (`F = true`)
+    /// vocabularies, generic over [`BlockScratch`]. Under [`Unlimited`], all admission and
+    /// checkpoint branches compile away and the dense fast path is preserved unchanged.
+    /// Returns the last decoded entry's shared-prefix length within the block.
     #[inline(always)]
-    fn decode_block_as<const P: bool, const F: bool>(
+    fn decode_block_with<const P: bool, const F: bool, S: BlockScratch<E>, E>(
         &self,
         b: usize,
         wanted: u32,
         key: &mut Vec<u8>,
-        mut f: impl FnMut(usize, usize, &[u8]) -> bool,
-    ) {
+        scratch: &mut S,
+        each: &mut impl FnMut(usize, usize, &mut Vec<u8>, &mut S) -> std::result::Result<bool, E>,
+    ) -> std::result::Result<usize, E> {
         key.clear();
         let data = self.data.as_slice();
         let mut pos = self.block_offset_at::<P>(b);
@@ -976,33 +1192,236 @@ impl Vocab {
         }
         let wanted = wanted & ((1u32 << n) - 1);
         if wanted == 0 {
-            return;
+            return Ok(0);
         }
         let last = 31 - wanted.leading_zeros() as usize;
-        if wanted == (2u32 << last) - 1 {
+        if !S::CHECKED && wanted == (2u32 << last) - 1 {
             // every key up to the last is wanted, so each is decoded whole
+            let mut last_shared = 0;
             for i in 0..=last {
                 let e = self.entry::<F>(data, &mut pos, i == 0);
+                last_shared = e.shared;
                 key.truncate(e.shared);
                 self.push_suffix::<F>(data, e, (start + i) as u64, usize::MAX, key, false);
-                if wanted >> i & 1 == 1 && !f(i, e.shared, key) {
-                    return;
+                if wanted >> i & 1 == 1 && !each(i, e.shared, key, scratch)? {
+                    return Ok(last_shared);
                 }
             }
-            return;
+            return Ok(last_shared);
         }
-        let mut cur = self.entry::<F>(data, &mut pos, true);
-        for i in 0..=last {
-            let next = (i < last).then(|| self.entry::<F>(data, &mut pos, false));
-            let need = lookahead(wanted, i, next);
-            self.step::<F>(data, cur, (start + i) as u64, need, key, false);
-            if wanted >> i & 1 == 1 && !f(i, cur.shared, key) {
-                return;
+        // Under checked non-polling decoders, capacity changes only through our own
+        // reservations below, so cache it in a register across entries.
+        let mut cap = key.capacity();
+        let mut e = self.entry::<F>(data, &mut pos, true);
+        if !S::CHECKED {
+            for i in 0..=last {
+                let next = (i < last).then(|| self.entry::<F>(data, &mut pos, false));
+                let need = lookahead(wanted, i, next);
+                self.step::<F>(data, e, (start + i) as u64, need, key, false);
+                if wanted >> i & 1 == 1 && !each(i, e.shared, key, scratch)? {
+                    return Ok(e.shared);
+                }
+                if let Some(n) = next {
+                    e = n;
+                }
             }
-            if let Some(e) = next {
-                cur = e;
+            return Ok(e.shared);
+        }
+        if !F && !S::POLLS && !S::EXACT_GROW {
+            // Checked plain-suffix fast path: keep the tight register-friendly loop.
+            for at in 0..=last {
+                let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
+                let nd = lookahead(wanted, at, next);
+                if nd <= e.shared {
+                    key.truncate(nd);
+                } else {
+                    key.truncate(e.shared);
+                    let add = e.len.min(nd - e.shared);
+                    let total = key.len() + add;
+                    if total > cap {
+                        let total = total.max(self.scratch_capacity());
+                        scratch.admit_growth(cap, total)?;
+                        key.reserve_exact(total - key.len());
+                        cap = key.capacity();
+                        #[cfg(any(test, feature = "failpoints"))]
+                        if let Some(tag) = S::PROJECTION_TAG {
+                            crate::algo::observe_projection(
+                                crate::algo::ProjectionEvent::Materialized(tag, cap),
+                            );
+                        }
+                    }
+                    key.extend_from_slice(&data[e.start..e.start + add]);
+                }
+                if wanted >> at & 1 == 1 && !each(at, e.shared, key, scratch)? {
+                    return Ok(e.shared);
+                }
+                if let Some(n) = next {
+                    e = n;
+                }
+            }
+            return Ok(e.shared);
+        }
+        for at in 0..=last {
+            if S::POLLS {
+                scratch.checkpoint("reconstructing vocabulary entry")?;
+            }
+            let id = (start + at) as u64;
+            let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
+            let nd = lookahead(wanted, at, next);
+            if S::POLLS {
+                key.truncate(e.shared.min(nd));
+            }
+            if nd > e.shared {
+                let prefix = key.len().min(e.shared);
+                let suffix = &data[e.start..e.start + e.len];
+                let coded_table = if F && e.coded {
+                    self.fsst.as_ref().map(|t| t.table(id))
+                } else {
+                    None
+                };
+                let add = if nd == usize::MAX {
+                    if let Some(table) = coded_table {
+                        if S::POLLS {
+                            struct PrefixMeasure<'a, S> {
+                                scratch: &'a mut S,
+                                prefix: usize,
+                                cur_cap: usize,
+                            }
+                            impl<S: BlockScratch<E>, E> fsst::SuffixMeasure<E> for PrefixMeasure<'_, S> {
+                                fn admit(&mut self, length: usize) -> std::result::Result<(), E> {
+                                    let new = self.prefix.checked_add(length).ok_or_else(|| {
+                                        self.scratch.invalid_err("vocabulary scratch overflows")
+                                    })?;
+                                    if new > self.cur_cap {
+                                        self.scratch.admit_growth(self.cur_cap, new)?;
+                                    }
+                                    Ok(())
+                                }
+                                fn checkpoint(
+                                    &mut self,
+                                    phase: &'static str,
+                                ) -> std::result::Result<(), E> {
+                                    self.scratch.checkpoint(phase)
+                                }
+                                fn overflow(&self) -> E {
+                                    self.scratch.invalid_err("vocabulary suffix overflows")
+                                }
+                            }
+                            let mut measure = PrefixMeasure {
+                                scratch,
+                                prefix,
+                                cur_cap: key.capacity(),
+                            };
+                            table.measure_with::<true, _, E>(suffix, &mut measure)?
+                        } else {
+                            table.decoded_len(suffix)
+                        }
+                    } else {
+                        e.len
+                    }
+                } else {
+                    (nd - e.shared).min(e.most())
+                };
+                let total = if S::EXACT_GROW {
+                    prefix
+                        .checked_add(add)
+                        .ok_or_else(|| scratch.invalid_err("vocabulary scratch overflows"))?
+                } else {
+                    prefix.saturating_add(add)
+                };
+                if S::EXACT_GROW {
+                    if total > cap {
+                        scratch.admit_growth(cap, total)?;
+                        key.try_reserve_exact(total - key.len())
+                            .map_err(|err| scratch.alloc_err(err))?;
+                        cap = key.capacity();
+                        if cap != total {
+                            return Err(
+                                scratch.invalid_err("unsupported vocabulary scratch capacity")
+                            );
+                        }
+                        if S::POLLS {
+                            scratch.settled(cap)?;
+                        }
+                        #[cfg(any(test, feature = "failpoints"))]
+                        if let Some(tag) = S::PROJECTION_TAG {
+                            crate::algo::observe_projection(
+                                crate::algo::ProjectionEvent::Materialized(tag, cap),
+                            );
+                        }
+                    }
+                } else {
+                    let fast_room = F && e.coded && e.len <= 8;
+                    let room = if S::ROOM && fast_room { FSST_ROOM } else { 0 };
+                    if total.saturating_add(room) > cap {
+                        // An FSST suffix of at most eight codes decodes fastest with room for
+                        // eight symbols (`fsst::Table::decode_at`). That headroom is optional:
+                        // if admitting it is refused, fall back to the required capacity (or
+                        // keep the already-admitted buffer when `total <= cap`) so checked
+                        // lookups never fail over optional headroom.
+                        let min_cap = if S::SCRATCH_FLOOR {
+                            total.max(self.scratch_capacity())
+                        } else {
+                            total
+                        };
+                        let target = if fast_room {
+                            let preferred = if S::SCRATCH_FLOOR {
+                                total.saturating_add(FSST_ROOM).max(self.scratch_capacity())
+                            } else {
+                                total.saturating_add(FSST_ROOM)
+                            };
+                            if scratch.admit_growth(cap, preferred).is_ok() {
+                                Some(preferred)
+                            } else if total > cap {
+                                scratch.admit_growth(cap, min_cap)?;
+                                Some(min_cap)
+                            } else {
+                                None
+                            }
+                        } else {
+                            scratch.admit_growth(cap, min_cap)?;
+                            Some(min_cap)
+                        };
+                        if let Some(target) = target {
+                            key.reserve_exact(target - key.len());
+                            cap = key.capacity();
+                            #[cfg(any(test, feature = "failpoints"))]
+                            if let Some(tag) = S::PROJECTION_TAG {
+                                crate::algo::observe_projection(
+                                    crate::algo::ProjectionEvent::Materialized(tag, cap),
+                                );
+                            }
+                        }
+                    }
+                }
+                if S::POLLS {
+                    if let Some(table) = coded_table {
+                        table.decode_controlled(suffix, add, key, &mut |phase| {
+                            scratch.checkpoint(phase)
+                        })?;
+                    } else {
+                        for chunk in suffix[..suffix.len().min(add)].chunks(1024) {
+                            key.extend_from_slice(chunk);
+                            scratch.checkpoint("copying vocabulary suffix")?;
+                        }
+                    }
+                } else {
+                    self.step::<F>(data, e, id, nd, key, true);
+                }
+            } else if !S::POLLS {
+                key.truncate(nd);
+            }
+            if wanted >> at & 1 == 1 && !each(at, e.shared, key, scratch)? {
+                break;
+            }
+            if let Some(n) = next {
+                e = n;
             }
         }
+        if S::POLLS {
+            scratch.checkpoint("completed vocabulary reconstruction")?;
+        }
+        Ok(e.shared)
     }
 
     /// The entry at `pos` (advanced past it), the first of its block when `first`.
@@ -1023,15 +1442,6 @@ impl Vocab {
             start,
             len,
             coded,
-        }
-    }
-
-    /// The length of the suffix `e` (of key `id`) stands for.
-    #[inline(always)]
-    fn suffix_len(&self, data: &[u8], e: Entry, id: u64) -> usize {
-        match &self.fsst {
-            Some(t) if e.coded => t.table(id).decoded_len(&data[e.start..e.start + e.len]),
-            _ => e.len,
         }
     }
 
@@ -1137,15 +1547,17 @@ impl Vocab {
             buf.clear();
             buf.reserve(cap);
         }
-        let read = |_, shared, key: &[u8]| {
+        let mut read = |_, shared, key: &mut Vec<u8>, _: &mut Unlimited| {
             out = Some(f((want != 0).then_some(shared), key));
-            false
+            Ok(false)
         };
-        if self.fsst.is_some() {
-            self.decode_block_as::<P, true>(b, 1 << want, &mut buf, read);
-        } else {
-            self.decode_block_as::<P, false>(b, 1 << want, &mut buf, read);
-        }
+        let _ = self.decode_block_dispatch::<P, _, _>(
+            b,
+            1 << want,
+            &mut buf,
+            &mut Unlimited,
+            &mut read,
+        );
         *key = buf;
         out
     }
@@ -1219,37 +1631,14 @@ impl Vocab {
             ));
         }
         let mut buf = std::mem::take(key);
-        let mut ignore = |_, _: &[u8]| Ok(());
+        let mut scratch = CheckedScratch::<_, ROOM> { reserve };
+        let mut ignore = |_, _, _: &mut Vec<u8>, _: &mut CheckedScratch<_, ROOM>| Ok(true);
         let mask = 1 << want;
         let res = if ioacct::profiling() {
             let _t = ioacct::timer(Phase::VocabRead);
-            if self.fsst.is_some() {
-                self.checked_block::<true, true, ROOM, E>(
-                    b,
-                    mask,
-                    &mut buf,
-                    &mut reserve,
-                    &mut ignore,
-                )
-            } else {
-                self.checked_block::<true, false, ROOM, E>(
-                    b,
-                    mask,
-                    &mut buf,
-                    &mut reserve,
-                    &mut ignore,
-                )
-            }
-        } else if self.fsst.is_some() {
-            self.checked_block::<false, true, ROOM, E>(b, mask, &mut buf, &mut reserve, &mut ignore)
+            self.decode_block_dispatch::<true, _, E>(b, mask, &mut buf, &mut scratch, &mut ignore)
         } else {
-            self.checked_block::<false, false, ROOM, E>(
-                b,
-                mask,
-                &mut buf,
-                &mut reserve,
-                &mut ignore,
-            )
+            self.decode_block_dispatch::<false, _, E>(b, mask, &mut buf, &mut scratch, &mut ignore)
         };
         *key = buf;
         let shared = res?;
@@ -1270,42 +1659,8 @@ impl Vocab {
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        self.get_sorted_checked_in::<false, E>(ids, &mut Vec::new(), reserve, f)
-    }
-
-    /// With `ROOM`, a coded step of at most eight codes prefers [`FSST_ROOM`] admitted
-    /// bytes of room past the key for FSST's branchless loop, falling back to the
-    /// required capacity when extra room is refused. A reused buffer keeps that room, and
-    /// a fresh buffer per call would reallocate for it.
-    fn get_sorted_checked_in<const ROOM: bool, E>(
-        &self,
-        ids: &[u64],
-        key: &mut Vec<u8>,
-        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
-        f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
-    ) -> std::result::Result<(), E> {
-        // One key needs no read-ahead or prefetch of its block.
-        let ahead = if ids.len() == 1 {
-            Ahead::default()
-        } else {
-            self.ahead_for(ids)
-        };
-        if ahead.end == 0 && ids.len() > 1 {
-            // scattered ids: ask for their blocks at once, so that a cold vocabulary
-            // reads them in parallel instead of faulting on one after another
-            self.prefetch_sorted(ids);
-        }
-        // Rebuild in a local buffer, which the decode loops can keep in registers, and
-        // return it, with its capacity, to the caller on every path.
-        let mut buf = std::mem::take(key);
-        let done = if ioacct::profiling() {
-            let _t = ioacct::timer(Phase::VocabRead);
-            self.get_sorted_checked_dispatch::<true, ROOM, E>(ids, &mut buf, reserve, f, ahead)
-        } else {
-            self.get_sorted_checked_dispatch::<false, ROOM, E>(ids, &mut buf, reserve, f, ahead)
-        };
-        *key = buf;
-        done
+        let mut scratch = CheckedScratch::<_, false> { reserve };
+        self.get_sorted_with(ids, &mut Vec::new(), &mut scratch, f, true)
     }
 
     /// The bulk output owner admits hint metadata and reconstruction independently
@@ -1313,60 +1668,85 @@ impl Vocab {
     pub(crate) fn get_sorted_owned_with_ahead(
         &self,
         ids: &[u64],
-        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        reserve: impl FnMut(usize) -> crate::error::Result<()>,
         f: impl FnMut(u64, &[u8]) -> crate::error::Result<()>,
         read_ahead: bool,
     ) -> crate::error::Result<()> {
-        let ahead = if read_ahead {
+        let mut scratch = OwnedCheckedScratch { reserve };
+        self.get_sorted_with(ids, &mut Vec::new(), &mut scratch, f, read_ahead)
+    }
+
+    /// Unified sorted multi-key decoder, generic over [`BlockScratch`]. Under [`Unlimited`],
+    /// admission and error propagation compile away.
+    #[inline]
+    fn get_sorted_with<S: BlockScratch<E>, E>(
+        &self,
+        ids: &[u64],
+        key: &mut Vec<u8>,
+        scratch: &mut S,
+        f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+        read_ahead: bool,
+    ) -> std::result::Result<(), E> {
+        // One key needs no read-ahead or prefetch of its block.
+        let ahead = if read_ahead && ids.len() > 1 {
             self.ahead_for(ids)
         } else {
             Ahead::default()
         };
         if read_ahead && ahead.end == 0 && ids.len() > 1 {
-            self.prefetch_sorted_checked(ids, &mut reserve)?;
+            // scattered ids: ask for their blocks at once, so that a cold vocabulary
+            // reads them in parallel instead of faulting on one after another
+            if S::ADMIT_PREFETCH {
+                self.prefetch_sorted_with(
+                    ids,
+                    &mut ScratchHint(scratch, std::marker::PhantomData),
+                )?;
+            } else {
+                self.prefetch_sorted(ids);
+            }
         }
-        if ioacct::profiling() {
+        // Rebuild in a local buffer, which the decode loops can keep in registers, and
+        // return it, with its capacity, to the caller on every path.
+        let mut buf = std::mem::take(key);
+        if !S::CHECKED
+            && buf.capacity() < self.scratch_capacity()
+            && ids.first().is_some_and(|&id| id < self.len)
+        {
+            buf.clear();
+            buf.reserve(self.scratch_capacity());
+        }
+        let done = if ioacct::profiling() {
             let _t = ioacct::timer(Phase::VocabRead);
-            self.get_sorted_checked_dispatch::<true, false, _>(
-                ids,
-                &mut Vec::new(),
-                reserve,
-                f,
-                ahead,
-            )
+            self.get_sorted_dispatch::<true, S, E>(ids, &mut buf, scratch, f, ahead)
         } else {
-            self.get_sorted_checked_dispatch::<false, false, _>(
-                ids,
-                &mut Vec::new(),
-                reserve,
-                f,
-                ahead,
-            )
-        }
+            self.get_sorted_dispatch::<false, S, E>(ids, &mut buf, scratch, f, ahead)
+        };
+        *key = buf;
+        done
     }
 
     #[inline]
-    fn get_sorted_checked_dispatch<const P: bool, const ROOM: bool, E>(
+    fn get_sorted_dispatch<const P: bool, S: BlockScratch<E>, E>(
         &self,
         ids: &[u64],
         key: &mut Vec<u8>,
-        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        scratch: &mut S,
         f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
         ahead: Ahead,
     ) -> std::result::Result<(), E> {
         if self.fsst.is_some() {
-            self.get_sorted_checked_as::<P, true, ROOM, E>(ids, key, reserve, f, ahead)
+            self.get_sorted_as::<P, true, S, E>(ids, key, scratch, f, ahead)
         } else {
-            self.get_sorted_checked_as::<P, false, ROOM, E>(ids, key, reserve, f, ahead)
+            self.get_sorted_as::<P, false, S, E>(ids, key, scratch, f, ahead)
         }
     }
 
     #[inline(always)]
-    fn get_sorted_checked_as<const P: bool, const F: bool, const ROOM: bool, E>(
+    fn get_sorted_as<const P: bool, const F: bool, S: BlockScratch<E>, E>(
         &self,
         ids: &[u64],
         key: &mut Vec<u8>,
-        mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        scratch: &mut S,
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
         mut ahead: Ahead,
     ) -> std::result::Result<(), E> {
@@ -1376,7 +1756,11 @@ impl Vocab {
             if *id < self.len {
                 let b = *id as usize / FC_BLOCK;
                 let mask = 1u32 << (*id as usize % FC_BLOCK);
-                self.checked_block::<P, F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
+                let mut emit = |at, _, k: &mut Vec<u8>, _: &mut S| {
+                    f((b * FC_BLOCK + at) as u64, k)?;
+                    Ok(true)
+                };
+                self.decode_block_with::<P, F, S, E>(b, mask, key, scratch, &mut emit)?;
             }
             return Ok(());
         }
@@ -1393,130 +1777,14 @@ impl Vocab {
                 mask |= 1 << (x as usize % FC_BLOCK);
             }
             mask &= (1u32 << n) - 1;
-            self.checked_block::<P, F, ROOM, E>(b, mask, key, &mut reserve, &mut f)?;
+            let mut emit = |at, _, k: &mut Vec<u8>, _: &mut S| {
+                f((b * FC_BLOCK + at) as u64, k)?;
+                Ok(true)
+            };
+            self.decode_block_with::<P, F, S, E>(b, mask, key, scratch, &mut emit)?;
             i = j;
         }
         Ok(())
-    }
-
-    /// The checked reconstruction of the keys of block `b` whose bits are set in the
-    /// nonempty `mask`, which holds only keys of the block. Returns the last key's
-    /// common prefix length with its predecessor within the block.
-    #[inline(always)]
-    fn checked_block<const P: bool, const F: bool, const ROOM: bool, E>(
-        &self,
-        b: usize,
-        mask: u32,
-        key: &mut Vec<u8>,
-        reserve: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        f: &mut impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
-    ) -> std::result::Result<usize, E> {
-        let data = self.data.as_slice();
-        let last = 31 - mask.leading_zeros() as usize;
-        let mut pos = self.block_offset_at::<P>(b);
-        if P {
-            ioacct::vocab_blocks_scanned(1);
-            self.touch_block(b);
-        }
-        key.clear();
-        // The steps below grow the buffer only through the reservations here, so its
-        // capacity is read once, rather than through `key` at every step.
-        let mut cap = key.capacity();
-        let mut e = self.entry::<F>(data, &mut pos, true);
-        if !F {
-            // plain suffixes: the same lookahead with a copy in place of a decode
-            for at in 0..=last {
-                let id = (b * FC_BLOCK + at) as u64;
-                let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
-                let nd = lookahead(mask, at, next);
-                if nd <= e.shared {
-                    key.truncate(nd);
-                } else {
-                    key.truncate(e.shared);
-                    let add = e.len.min(nd - e.shared);
-                    let total = key.len() + add;
-                    if total > cap {
-                        let total = total.max(self.scratch_capacity());
-                        reserve(total)?;
-                        key.reserve_exact(total - key.len());
-                        cap = key.capacity();
-                        #[cfg(any(test, feature = "failpoints"))]
-                        crate::algo::observe_projection(
-                            crate::algo::ProjectionEvent::Materialized(
-                                "checked-vocab-scratch-allocated",
-                                key.capacity(),
-                            ),
-                        );
-                    }
-                    key.extend_from_slice(&data[e.start..e.start + add]);
-                }
-                if mask >> at & 1 == 1 {
-                    f(id, key)?;
-                }
-                if let Some(n) = next {
-                    e = n;
-                }
-            }
-            return Ok(e.shared);
-        }
-        for at in 0..=last {
-            let id = (b * FC_BLOCK + at) as u64;
-            let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
-            let nd = lookahead(mask, at, next);
-            if nd > e.shared {
-                // the whole key, or the bytes of it that later keys take
-                let add = if nd == usize::MAX {
-                    self.suffix_len(data, e, id)
-                } else {
-                    (nd - e.shared).min(e.most())
-                };
-                let total = key.len().min(e.shared).saturating_add(add);
-                let fast_room = e.coded && e.len <= 8;
-                let room = if ROOM && fast_room { FSST_ROOM } else { 0 };
-                if total.saturating_add(room) > cap {
-                    // An FSST suffix of at most eight codes decodes fastest with room for
-                    // eight symbols (`fsst::Table::decode_at`). That headroom is optional:
-                    // if admitting it is refused, fall back to the required capacity (or
-                    // keep the already-admitted buffer when `total <= cap`) so checked
-                    // lookups never fail over optional headroom.
-                    let min_cap = total.max(self.scratch_capacity());
-                    let target = if fast_room {
-                        let preferred =
-                            total.saturating_add(FSST_ROOM).max(self.scratch_capacity());
-                        if reserve(preferred).is_ok() {
-                            Some(preferred)
-                        } else if total > cap {
-                            reserve(min_cap)?;
-                            Some(min_cap)
-                        } else {
-                            None
-                        }
-                    } else {
-                        reserve(min_cap)?;
-                        Some(min_cap)
-                    };
-                    if let Some(target) = target {
-                        key.reserve_exact(target - key.len());
-                        cap = key.capacity();
-                        #[cfg(any(test, feature = "failpoints"))]
-                        crate::algo::observe_projection(
-                            crate::algo::ProjectionEvent::Materialized(
-                                "checked-vocab-scratch-allocated",
-                                key.capacity(),
-                            ),
-                        );
-                    }
-                }
-            }
-            self.step::<F>(data, e, id, nd, key, true);
-            if mask >> at & 1 == 1 {
-                f(id, key)?;
-            }
-            if let Some(n) = next {
-                e = n;
-            }
-        }
-        Ok(e.shared)
     }
 
     /// Decode one key after `reserve` admits reconstruction capacity, including
@@ -1529,10 +1797,17 @@ impl Vocab {
         mut f: impl FnMut(&[u8]) -> T,
     ) -> std::result::Result<Option<T>, E> {
         let mut out = None;
-        self.get_sorted_checked(&[id], reserve, |_, key| {
-            out = Some(f(key));
-            Ok(())
-        })?;
+        let mut scratch = CheckedScratch::<_, false> { reserve };
+        self.get_sorted_with(
+            &[id],
+            &mut Vec::new(),
+            &mut scratch,
+            |_, key| {
+                out = Some(f(key));
+                Ok(())
+            },
+            true,
+        )?;
         Ok(out)
     }
 
@@ -1547,10 +1822,17 @@ impl Vocab {
         mut f: impl FnMut(&[u8]) -> T,
     ) -> std::result::Result<Option<T>, E> {
         let mut out = None;
-        self.get_sorted_checked_in::<true, E>(&[id], key, reserve, |_, key| {
-            out = Some(f(key));
-            Ok(())
-        })?;
+        let mut scratch = CheckedScratch::<_, true> { reserve };
+        self.get_sorted_with(
+            &[id],
+            key,
+            &mut scratch,
+            |_, key| {
+                out = Some(f(key));
+                Ok(())
+            },
+            true,
+        )?;
         Ok(out)
     }
 
@@ -1559,26 +1841,16 @@ impl Vocab {
         &self,
         id: u64,
         mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
-        mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
+        checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
         mut f: impl FnMut(&[u8]) -> T,
     ) -> crate::error::Result<Option<T>> {
-        checkpoint("starting vocabulary reconstruction")?;
-        if id >= self.len {
-            return Ok(None);
-        }
-        let b = id as usize / FC_BLOCK;
-        let mut result = None;
-        self.scan_block_controlled(
-            b,
-            1 << (id as usize % FC_BLOCK),
-            &mut reserve,
-            &mut checkpoint,
-            |_, key| {
-                result = Some(f(key));
-                Ok(false)
-            },
-        )?;
-        Ok(result)
+        self.get_with_controlled_capacity_checked(
+            id,
+            |_, new| reserve(new),
+            |_| Ok(()),
+            checkpoint,
+            |key| Ok(f(key)),
+        )
     }
 
     /// Read a key while its owner accounts for old and new scratch during growth,
@@ -1586,22 +1858,28 @@ impl Vocab {
     pub fn get_with_controlled_capacity<T, E: From<crate::error::Error>>(
         &self,
         id: u64,
-        mut grow: impl FnMut(usize, usize) -> Result<(), E>,
-        mut settled: impl FnMut(usize) -> Result<(), E>,
+        grow: impl FnMut(usize, usize) -> Result<(), E>,
+        settled: impl FnMut(usize) -> Result<(), E>,
         mut read: impl FnMut(&[u8]) -> Result<T, E>,
     ) -> Result<Option<T>, E> {
         if id >= self.len {
             return Ok(None);
         }
         let mut result = None;
-        self.scan_block_capacity_controlled(
+        let mut scratch = ControlledScratch {
+            grow,
+            settled,
+            checkpoint: |_| Ok(()),
+        };
+        let mut key = Vec::new();
+        let _timer = ioacct::timer(Phase::VocabRead);
+        self.decode_block_dispatch::<true, _, E>(
             id as usize / FC_BLOCK,
             1 << (id as usize % FC_BLOCK),
-            &mut grow,
-            &mut settled,
-            &mut |_| Ok(()),
-            |_, key| {
-                result = Some(read(key)?);
+            &mut key,
+            &mut scratch,
+            &mut |_, _, k, _| {
+                result = Some(read(k)?);
                 Ok(false)
             },
         )?;
@@ -1614,8 +1892,8 @@ impl Vocab {
     pub fn get_with_controlled_capacity_checked<T, E: From<crate::error::Error>>(
         &self,
         id: u64,
-        mut grow: impl FnMut(usize, usize) -> Result<(), E>,
-        mut settled: impl FnMut(usize) -> Result<(), E>,
+        grow: impl FnMut(usize, usize) -> Result<(), E>,
+        settled: impl FnMut(usize) -> Result<(), E>,
         mut checkpoint: impl FnMut(&'static str) -> Result<(), E>,
         mut read: impl FnMut(&[u8]) -> Result<T, E>,
     ) -> Result<Option<T>, E> {
@@ -1624,14 +1902,20 @@ impl Vocab {
             return Ok(None);
         }
         let mut result = None;
-        self.scan_block_capacity_controlled(
+        let mut scratch = ControlledScratch {
+            grow,
+            settled,
+            checkpoint,
+        };
+        let mut key = Vec::new();
+        let _timer = ioacct::timer(Phase::VocabRead);
+        self.decode_block_dispatch::<true, _, E>(
             id as usize / FC_BLOCK,
             1 << (id as usize % FC_BLOCK),
-            &mut grow,
-            &mut settled,
-            &mut checkpoint,
-            |_, key| {
-                result = Some(read(key)?);
+            &mut key,
+            &mut scratch,
+            &mut |_, _, k, _| {
+                result = Some(read(k)?);
                 Ok(false)
             },
         )?;
@@ -1644,8 +1928,8 @@ impl Vocab {
     pub(crate) fn get_owned_with_controlled<T>(
         &self,
         id: u64,
-        mut grow: impl FnMut(usize, usize) -> crate::error::Result<()>,
-        mut settled: impl FnMut(usize) -> crate::error::Result<()>,
+        grow: impl FnMut(usize, usize) -> crate::error::Result<()>,
+        settled: impl FnMut(usize) -> crate::error::Result<()>,
         mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
         f: impl FnOnce(Vec<u8>) -> crate::error::Result<T>,
     ) -> crate::error::Result<Option<T>> {
@@ -1655,138 +1939,26 @@ impl Vocab {
         }
         let mut f = Some(f);
         let mut result = None;
-        self.scan_block_capacity_controlled(
+        let mut scratch = ControlledScratch {
+            grow,
+            settled,
+            checkpoint,
+        };
+        let mut key = Vec::new();
+        let _timer = ioacct::timer(Phase::VocabRead);
+        self.decode_block_dispatch::<true, _, crate::error::Error>(
             id as usize / FC_BLOCK,
             1 << (id as usize % FC_BLOCK),
-            &mut grow,
-            &mut settled,
-            &mut checkpoint,
-            |_, key| {
+            &mut key,
+            &mut scratch,
+            &mut |_, _, k, _| {
                 result = Some(f.take().expect("one selected vocabulary key")(
-                    std::mem::take(key),
+                    std::mem::take(k),
                 )?);
                 Ok(false)
             },
         )?;
         Ok(result)
-    }
-
-    fn scan_block_controlled(
-        &self,
-        b: usize,
-        wanted: u32,
-        reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
-        checkpoint: &mut impl FnMut(&'static str) -> crate::error::Result<()>,
-        mut each: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
-    ) -> crate::error::Result<()> {
-        self.scan_block_capacity_controlled(
-            b,
-            wanted,
-            &mut |_, new| reserve(new),
-            &mut |_| Ok(()),
-            checkpoint,
-            |at, key| each(at, key),
-        )
-    }
-
-    fn scan_block_capacity_controlled<E: From<crate::error::Error>>(
-        &self,
-        b: usize,
-        wanted: u32,
-        grow: &mut impl FnMut(usize, usize) -> Result<(), E>,
-        settled: &mut impl FnMut(usize) -> Result<(), E>,
-        checkpoint: &mut impl FnMut(&'static str) -> Result<(), E>,
-        mut each: impl FnMut(usize, &mut Vec<u8>) -> Result<bool, E>,
-    ) -> Result<(), E> {
-        let _timer = ioacct::timer(Phase::VocabRead);
-        let data = self.data.as_slice();
-        let mut position = self.block_offset(b);
-        let count = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
-        let wanted = wanted & ((1u32 << count) - 1);
-        if wanted == 0 {
-            return Ok(());
-        }
-        let last = 31 - wanted.leading_zeros() as usize;
-        let mut key = Vec::new();
-        let read_entry = |position: &mut usize, first| {
-            if self.fsst.is_some() {
-                self.entry::<true>(data, position, first)
-            } else {
-                self.entry::<false>(data, position, first)
-            }
-        };
-        let mut entry = read_entry(&mut position, true);
-        ioacct::vocab_blocks_scanned(1);
-        self.touch_block(b);
-        for at in 0..=last {
-            checkpoint("reconstructing vocabulary entry")?;
-            let id = (b * FC_BLOCK + at) as u64;
-            let next = (at < last).then(|| read_entry(&mut position, false));
-            let need = lookahead(wanted, at, next);
-            key.truncate(entry.shared.min(need));
-            if need > entry.shared {
-                let prefix = key.len();
-                let coded = entry.coded.then(|| {
-                    self.fsst
-                        .as_ref()
-                        .expect("coded vocabulary metadata")
-                        .table(id)
-                });
-                let suffix = &data[entry.start..entry.start + entry.len];
-                let add = if need == usize::MAX {
-                    if let Some(table) = coded {
-                        table.measure_controlled(
-                            suffix,
-                            |length| {
-                                let new = prefix.checked_add(length).ok_or_else(|| {
-                                    crate::error::Error::invalid("vocabulary scratch overflows")
-                                })?;
-                                if new > key.capacity() {
-                                    grow(key.capacity(), new)?;
-                                }
-                                Ok(())
-                            },
-                            checkpoint,
-                        )?
-                    } else {
-                        entry.len
-                    }
-                } else {
-                    (need - entry.shared).min(entry.most())
-                };
-                let total = prefix
-                    .checked_add(add)
-                    .ok_or_else(|| crate::error::Error::invalid("vocabulary scratch overflows"))?;
-                if total > key.capacity() {
-                    grow(key.capacity(), total)?;
-                    key.try_reserve_exact(total - key.len()).map_err(|_| {
-                        crate::error::Error::invalid("vocabulary allocation failed")
-                    })?;
-                    if key.capacity() != total {
-                        return Err(crate::error::Error::invalid(
-                            "unsupported vocabulary scratch capacity",
-                        )
-                        .into());
-                    }
-                    settled(key.capacity())?;
-                }
-                if let Some(table) = coded {
-                    table.decode_controlled(suffix, add, &mut key, checkpoint)?;
-                } else {
-                    for chunk in suffix[..suffix.len().min(add)].chunks(1024) {
-                        key.extend_from_slice(chunk);
-                        checkpoint("copying vocabulary suffix")?;
-                    }
-                }
-            }
-            if wanted >> at & 1 == 1 && !each(at, &mut key)? {
-                break;
-            }
-            if let Some(next) = next {
-                entry = next;
-            }
-        }
-        checkpoint("completed vocabulary reconstruction")
     }
 
     pub(crate) fn find_with_controlled(
@@ -1810,53 +1982,17 @@ impl Vocab {
     pub(crate) fn find_with_controlled_capacity<E: From<crate::error::Error>>(
         &self,
         key: &[u8],
-        mut grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
-        mut settled: impl FnMut(usize) -> std::result::Result<(), E>,
-        mut checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
+        grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
+        settled: impl FnMut(usize) -> std::result::Result<(), E>,
+        checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
     ) -> std::result::Result<std::result::Result<u64, u64>, E> {
-        let (mut lo, mut hi) = (0usize, self.num_blocks());
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if compare_prepared_bytes(self.block_first(mid), key, &mut checkpoint)?.is_le() {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo == 0 {
-            checkpoint("completed vocabulary search")?;
-            return Ok(Err(0));
-        }
-        let b = lo - 1;
-        let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
-        // The scanner owns the mutable checkpoint; comparisons borrow the same
-        // callback through a RefCell only for the duration of each nonnested call.
-        let check = std::cell::RefCell::new(&mut checkpoint);
-        self.scan_block_capacity_controlled(
-            b,
-            ALL_KEYS,
-            &mut grow,
-            &mut settled,
-            &mut |phase| check.borrow_mut()(phase),
-            |at, actual| {
-                Ok(
-                    match compare_prepared_bytes(actual, key, &mut |phase| {
-                        check.borrow_mut()(phase)
-                    })? {
-                        std::cmp::Ordering::Less => true,
-                        std::cmp::Ordering::Equal => {
-                            result = Ok((b * FC_BLOCK + at) as u64);
-                            false
-                        }
-                        std::cmp::Ordering::Greater => {
-                            result = Err((b * FC_BLOCK + at) as u64);
-                            false
-                        }
-                    },
-                )
-            },
-        )?;
-        Ok(result)
+        let mut scratch = ControlledScratch {
+            grow,
+            settled,
+            checkpoint,
+        };
+        let _timer = ioacct::timer(Phase::VocabRead);
+        self.find_with::<true, _, E>(key, &mut scratch)
     }
 
     /// A serializer that already prefetched these blocks does not need dense hints
@@ -1868,42 +2004,16 @@ impl Vocab {
         mut f: impl FnMut(u64, &[u8]),
         read_ahead: bool,
     ) {
-        let _t = ioacct::timer(Phase::VocabRead);
-        let mut ahead = if read_ahead {
-            self.ahead_for(ids)
-        } else {
-            Ahead::default()
-        };
-        if read_ahead && ahead.end == 0 && ids.len() > 1 {
-            // scattered ids, as in `get_sorted_checked`
-            self.prefetch_sorted(ids);
-        }
-        // Empty and entirely out-of-range passes need no reconstruction storage.
-        let mut key = if ids.first().is_some_and(|&id| id < self.len) {
-            Vec::with_capacity(self.scratch_capacity())
-        } else {
-            Vec::new()
-        };
-        let mut i = 0;
-        while i < ids.len() {
-            let id = ids[i];
-            if id >= self.len {
-                break;
-            }
-            let b = (id as usize) / FC_BLOCK;
-            ahead.at(self, b);
-            let end = ((b + 1) * FC_BLOCK) as u64;
-            let j = i + ids[i..].partition_point(|&x| x < end);
-            let mut mask = 0u32;
-            for &x in &ids[i..j] {
-                mask |= 1 << (x as usize % FC_BLOCK);
-            }
-            self.decode_block::<true>(b, mask, &mut key, |at, k| {
-                f((b * FC_BLOCK + at) as u64, k);
-                true
-            });
-            i = j;
-        }
+        let _ = self.get_sorted_with(
+            ids,
+            &mut Vec::new(),
+            &mut Unlimited,
+            |id, k| {
+                f(id, k);
+                Ok(())
+            },
+            read_ahead,
+        );
     }
 
     /// Decode every key of block `b` into the reusable buffer `key`.
@@ -1912,9 +2022,10 @@ impl Vocab {
         &self,
         b: usize,
         key: &mut Vec<u8>,
-        f: impl FnMut(usize, &[u8]) -> bool,
+        mut f: impl FnMut(usize, &[u8]) -> bool,
     ) {
-        self.decode_block::<true>(b, ALL_KEYS, key, f)
+        let mut cb = |i, _, k: &mut Vec<u8>, _: &mut Unlimited| Ok(f(i, k));
+        let _ = self.decode_block_dispatch::<true, _, _>(b, ALL_KEYS, key, &mut Unlimited, &mut cb);
     }
 
     /// Ask the kernel to read ahead, asynchronously, the pages of the front-coded blocks
@@ -1923,48 +2034,52 @@ impl Vocab {
     /// ids then finds its pages read by many requests at once, instead of one page fault
     /// at a time. Nearby pages are asked for in one range.
     pub fn prefetch_sorted(&self, ids: &[u64]) {
-        if !crate::index::io_hints()
-            || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
-        {
-            return;
-        }
-        let blocks = ids
-            .iter()
-            .take_while(|&&id| id < self.len)
-            .map(|&id| id as usize / FC_BLOCK)
-            .collect();
-        self.prefetch_blocks(blocks);
+        let _ = self.prefetch_sorted_with(ids, &mut Unlimited);
     }
 
     pub(crate) fn prefetch_sorted_checked(
         &self,
         ids: &[u64],
-        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        reserve: impl FnMut(usize) -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
+        self.prefetch_sorted_with(ids, &mut CheckedHint(reserve))
+    }
+
+    fn prefetch_sorted_with<A: HintAdmit>(
+        &self,
+        ids: &[u64],
+        admit: &mut A,
+    ) -> std::result::Result<(), A::Error> {
         if !crate::index::io_hints()
             || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
         {
             return Ok(());
         }
-        let count = ids.iter().take_while(|&&id| id < self.len).count();
-        let bytes = count
-            .checked_mul(std::mem::size_of::<usize>())
-            .ok_or_else(|| crate::error::Error::invalid("vocabulary hint size overflow"))?;
-        reserve(bytes)?;
-        let mut blocks = Vec::new();
-        blocks
-            .try_reserve_exact(count)
-            .map_err(|_| crate::error::Error::invalid("vocabulary hint allocation failed"))?;
-        if blocks.capacity() != count {
-            return Err(crate::error::Error::invalid(
-                "vocabulary hint capacity exceeds admission",
-            ));
-        }
-        blocks.extend(
+        let blocks = if A::CHECKED {
+            let count = ids.iter().take_while(|&&id| id < self.len).count();
+            let bytes = count
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or_else(|| admit.invalid_err("vocabulary hint size overflow"))?;
+            admit.admit(bytes)?;
+            let mut blocks = Vec::new();
+            blocks
+                .try_reserve_exact(count)
+                .map_err(|_| admit.invalid_err("vocabulary hint allocation failed"))?;
+            if blocks.capacity() != count {
+                return Err(admit.invalid_err("vocabulary hint capacity exceeds admission"));
+            }
+            blocks.extend(
+                ids.iter()
+                    .take_while(|&&id| id < self.len)
+                    .map(|&id| id as usize / FC_BLOCK),
+            );
+            blocks
+        } else {
             ids.iter()
                 .take_while(|&&id| id < self.len)
-                .map(|&id| id as usize / FC_BLOCK),
-        );
+                .map(|&id| id as usize / FC_BLOCK)
+                .collect()
+        };
         self.prefetch_blocks(blocks);
         Ok(())
     }
@@ -2082,10 +2197,7 @@ impl Vocab {
     /// column's pages (see [`numeric::NumColumn::advise_ids`]). It reads no value, so a
     /// warm call costs the block lookups alone.
     pub fn prefetch_value_pages(&self, ids: &[u64]) {
-        self.prefetch_sorted(ids);
-        if let Some(num) = &self.num {
-            num.advise_ids(ids);
-        }
+        let _ = self.prefetch_value_pages_with(ids, &mut Unlimited);
     }
 
     /// Whether [`Vocab::prefetch_value_pages_checked`] has any memory-mapped vocabulary
@@ -2130,7 +2242,15 @@ impl Vocab {
         ids: &[u64],
         reserve: impl FnMut(usize) -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
-        self.prefetch_sorted_checked(ids, reserve)?;
+        self.prefetch_value_pages_with(ids, &mut CheckedHint(reserve))
+    }
+
+    fn prefetch_value_pages_with<A: HintAdmit<Error = crate::error::Error>>(
+        &self,
+        ids: &[u64],
+        admit: &mut A,
+    ) -> crate::error::Result<()> {
+        self.prefetch_sorted_with(ids, admit)?;
         if let Some(num) = &self.num {
             num.advise_ids(ids);
         }
@@ -2142,31 +2262,7 @@ impl Vocab {
     /// `find` does. Warm requests then avoid sorting their cells or repeating hints.
     #[cfg(test)]
     pub(crate) fn prefetch_terms(&self, ids: impl Iterator<Item = u64>) {
-        if !crate::index::io_hints()
-            || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
-        {
-            return;
-        }
-        let Some(s) = &self.sparse else {
-            let mut ids: Vec<u64> = ids.collect();
-            ids.sort_unstable();
-            ids.dedup();
-            self.prefetch_sorted(&ids);
-            return;
-        };
-        let mut groups = Vec::new();
-        let mut last = usize::MAX;
-        for id in ids.filter(|&id| id < self.len) {
-            let g = id as usize / (FC_BLOCK * IDX_BLOCKS);
-            // Row-ordered columns often stay in one group for hundreds of cells.
-            // Even a warm bitmap load need not be repeated for adjacent cells.
-            if g != last && s.first_hint(g) {
-                groups.push(g);
-            }
-            last = g;
-        }
-        groups.sort_unstable();
-        self.prefetch_groups(&groups);
+        let _ = self.prefetch_terms_with(ids, 0, &mut Unlimited);
     }
 
     /// An immutable result supplies a checked maximum count. Every actual vector
@@ -2175,58 +2271,84 @@ impl Vocab {
         &self,
         ids: impl Iterator<Item = u64>,
         count: usize,
-        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        reserve: impl FnMut(usize) -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        self.prefetch_terms_with(ids, count, &mut CheckedHint(reserve))
+    }
+
+    fn prefetch_terms_with<A: HintAdmit<Error = crate::error::Error>>(
+        &self,
+        ids: impl Iterator<Item = u64>,
+        count: usize,
+        admit: &mut A,
     ) -> crate::error::Result<()> {
         if !crate::index::io_hints()
             || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
         {
             return Ok(());
         }
-        let bytes = count
-            .checked_mul(std::mem::size_of::<u64>())
-            .ok_or_else(|| crate::error::Error::invalid("vocabulary hint size overflow"))?;
-        reserve(bytes)?;
-        if self.sparse.is_none() {
-            let mut all = Vec::new();
-            all.try_reserve_exact(count)
+        let bytes = if A::CHECKED {
+            let bytes = count
+                .checked_mul(std::mem::size_of::<u64>())
+                .ok_or_else(|| crate::error::Error::invalid("vocabulary hint size overflow"))?;
+            admit.admit(bytes)?;
+            bytes
+        } else {
+            0
+        };
+        let Some(sparse) = &self.sparse else {
+            let mut all = if A::CHECKED {
+                let mut all = Vec::new();
+                all.try_reserve_exact(count).map_err(|_| {
+                    crate::error::Error::invalid("vocabulary hint allocation failed")
+                })?;
+                if all.capacity() != count {
+                    return Err(crate::error::Error::invalid(
+                        "vocabulary hint capacity exceeds admission",
+                    ));
+                }
+                for id in ids {
+                    if all.len() == count {
+                        return Err(crate::error::Error::invalid(
+                            "vocabulary hint count exceeds admission",
+                        ));
+                    }
+                    all.push(id);
+                }
+                all
+            } else {
+                ids.collect()
+            };
+            all.sort_unstable();
+            all.dedup();
+            return if A::CHECKED {
+                self.prefetch_sorted_checked(&all, |need| {
+                    admit.admit(bytes.checked_add(need).ok_or_else(|| {
+                        crate::error::Error::invalid("vocabulary hint overlap overflow")
+                    })?)
+                })
+            } else {
+                self.prefetch_sorted(&all);
+                Ok(())
+            };
+        };
+        let mut groups = Vec::new();
+        if A::CHECKED {
+            groups
+                .try_reserve_exact(count)
                 .map_err(|_| crate::error::Error::invalid("vocabulary hint allocation failed"))?;
-            if all.capacity() != count {
+            if groups.capacity() != count {
                 return Err(crate::error::Error::invalid(
                     "vocabulary hint capacity exceeds admission",
                 ));
             }
-            for id in ids {
-                if all.len() == count {
-                    return Err(crate::error::Error::invalid(
-                        "vocabulary hint count exceeds admission",
-                    ));
-                }
-                all.push(id);
-            }
-            all.sort_unstable();
-            all.dedup();
-            return self.prefetch_sorted_checked(&all, |need| {
-                reserve(bytes.checked_add(need).ok_or_else(|| {
-                    crate::error::Error::invalid("vocabulary hint overlap overflow")
-                })?)
-            });
-        }
-        let sparse = self.sparse.as_ref().expect("checked sparse vocabulary");
-        let mut groups = Vec::new();
-        groups
-            .try_reserve_exact(count)
-            .map_err(|_| crate::error::Error::invalid("vocabulary hint allocation failed"))?;
-        if groups.capacity() != count {
-            return Err(crate::error::Error::invalid(
-                "vocabulary hint capacity exceeds admission",
-            ));
         }
         let mut last = usize::MAX;
         for id in ids.filter(|&id| id < self.len) {
             let g = id as usize / (FC_BLOCK * IDX_BLOCKS);
             if g != last {
                 // No unadmitted push can follow a global hint-state mutation.
-                if groups.len() == count {
+                if A::CHECKED && groups.len() == count {
                     return Err(crate::error::Error::invalid(
                         "vocabulary hint count exceeds admission",
                     ));
@@ -2294,26 +2416,41 @@ impl Vocab {
         if ioacct::profiling() {
             ioacct::vocab_find();
             let _t = ioacct::timer(Phase::VocabFind);
-            self.find_at::<true>(key)
+            self.find_with::<true, _, _>(key, &mut Unlimited)
+                .unwrap_or_else(|e| match e {})
         } else {
-            self.find_at::<false>(key)
+            self.find_with::<false, _, _>(key, &mut Unlimited)
+                .unwrap_or_else(|e| match e {})
         }
     }
 
+    /// Unified binary search over front-coded blocks, generic over [`BlockScratch`].
+    /// Under [`Unlimited`], narrows with the sparse index and uses the zero-rebuild
+    /// LCP in-block scan; under checked or polling controls, admits reconstruction
+    /// scratch and compares cooperatively.
     #[inline(always)]
-    fn find_at<const P: bool>(&self, key: &[u8]) -> std::result::Result<u64, u64> {
+    fn find_with<const P: bool, S: BlockScratch<E>, E>(
+        &self,
+        key: &[u8],
+        scratch: &mut S,
+    ) -> std::result::Result<std::result::Result<u64, u64>, E> {
         let nb = self.num_blocks();
         if nb == 0 {
-            return Err(0);
+            if S::POLLS {
+                scratch.checkpoint("completed vocabulary search")?;
+            }
+            return Ok(Err(0));
         }
         // last block whose first key <= key
         let (mut lo, mut hi) = (0usize, nb);
-        if let Some(s) = &self.sparse {
+        if !S::POLLS
+            && let Some(s) = &self.sparse
+        {
             // the group of blocks that holds the key, from memory; then only its offsets
             // and data are read, each asked for in one request
             let g = partition_point_by(s.len(), |g| s.key(g) <= key);
             if g == 0 {
-                return Err(0);
+                return Ok(Err(0));
             }
             let g = g - 1;
             lo = g * IDX_BLOCKS;
@@ -2334,20 +2471,48 @@ impl Vocab {
         }
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.block_first_at::<P>(mid) <= key {
+            if compare_bytes_with::<S, E>(self.block_first_at::<P>(mid), key, scratch)?.is_le() {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
         if lo == 0 {
-            return Err(0);
+            if S::POLLS {
+                scratch.checkpoint("completed vocabulary search")?;
+            }
+            return Ok(Err(0));
         }
-        if self.fsst.is_some() {
-            self.find_in_block::<P, true>(lo - 1, key)
-        } else {
-            self.find_in_block::<P, false>(lo - 1, key)
+        let b = lo - 1;
+        if !S::CHECKED {
+            return Ok(if self.fsst.is_some() {
+                self.find_in_block::<P, true>(b, key)
+            } else {
+                self.find_in_block::<P, false>(b, key)
+            });
         }
+        let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
+        let mut buf = Vec::new();
+        self.decode_block_dispatch::<P, S, E>(
+            b,
+            ALL_KEYS,
+            &mut buf,
+            scratch,
+            &mut |at, _, actual, scratch| {
+                Ok(match compare_bytes_with::<S, E>(actual, key, scratch)? {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => {
+                        result = Ok((b * FC_BLOCK + at) as u64);
+                        false
+                    }
+                    std::cmp::Ordering::Greater => {
+                        result = Err((b * FC_BLOCK + at) as u64);
+                        false
+                    }
+                })
+            },
+        )?;
+        Ok(result)
     }
 
     /// Find `probe` in block `b`, whose first key is not above it: `Ok(id)` when it is
@@ -2418,87 +2583,10 @@ impl Vocab {
         Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64)
     }
 
-    /// Fallible checked reconstruction for call-owned projection scratch. Public
-    /// dictionary readers retain their existing allocation and access paths.
-    fn scan_block_checked(
-        &self,
-        b: usize,
-        wanted: u32,
-        reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
-        f: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
-    ) -> crate::error::Result<()> {
-        if self.fsst.is_some() {
-            self.scan_block_checked_as::<true>(b, wanted, reserve, f)
-        } else {
-            self.scan_block_checked_as::<false>(b, wanted, reserve, f)
-        }
-    }
-
-    /// [`Vocab::scan_block_checked`] for an FSST-coded vocabulary when `F`.
-    #[inline(always)]
-    fn scan_block_checked_as<const F: bool>(
-        &self,
-        b: usize,
-        wanted: u32,
-        reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
-        mut f: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
-    ) -> crate::error::Result<()> {
-        let data = self.data.as_slice();
-        let mut pos = self.block_offset(b);
-        let n = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
-        let wanted = wanted & ((1u32 << n) - 1);
-        if wanted == 0 {
-            return Ok(());
-        }
-        let last = 31 - wanted.leading_zeros() as usize;
-        let mut key = Vec::new();
-        let mut e = self.entry::<F>(data, &mut pos, true);
-        for i in 0..=last {
-            let id = (b * FC_BLOCK + i) as u64;
-            let next = (i < last).then(|| self.entry::<F>(data, &mut pos, false));
-            let nd = lookahead(wanted, i, next);
-            if nd > e.shared {
-                let add = if nd == usize::MAX {
-                    self.suffix_len(data, e, id)
-                } else {
-                    (nd - e.shared).min(e.most())
-                };
-                let total =
-                    key.len().min(e.shared).checked_add(add).ok_or_else(|| {
-                        crate::error::Error::invalid("vocabulary scratch overflows")
-                    })?;
-                if total > key.capacity() {
-                    reserve(total)?;
-                    key.try_reserve_exact(total - key.len()).map_err(|e| {
-                        crate::error::Error::invalid(format!("vocabulary allocation failed: {e}"))
-                    })?;
-                    if key.capacity() != total {
-                        return Err(crate::error::Error::invalid(
-                            "unsupported vocabulary scratch capacity",
-                        ));
-                    }
-                    #[cfg(any(test, feature = "failpoints"))]
-                    crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
-                        "vocab-scratch-allocated",
-                        key.capacity(),
-                    ));
-                }
-            }
-            self.step::<F>(data, e, id, nd, &mut key, true);
-            if wanted >> i & 1 == 1 && !f(i, &key)? {
-                break;
-            }
-            if let Some(n) = next {
-                e = n;
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn get_with_fallible<T>(
         &self,
         id: u64,
-        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        reserve: impl FnMut(usize) -> crate::error::Result<()>,
         mut f: impl FnMut(&[u8]) -> T,
     ) -> crate::error::Result<Option<T>> {
         if id >= self.len {
@@ -2507,75 +2595,28 @@ impl Vocab {
         let b = id as usize / FC_BLOCK;
         self.ahead_for(&[id]).at(self, b);
         let mut result = None;
-        self.scan_block_checked(b, 1 << (id as usize % FC_BLOCK), &mut reserve, |_, key| {
-            result = Some(f(key));
-            Ok(false)
-        })?;
+        let mut scratch = ExactScratch { reserve };
+        let mut key = Vec::new();
+        self.decode_block_dispatch::<false, _, crate::error::Error>(
+            b,
+            1 << (id as usize % FC_BLOCK),
+            &mut key,
+            &mut scratch,
+            &mut |_, _, k, _| {
+                result = Some(f(k));
+                Ok(false)
+            },
+        )?;
         Ok(result)
     }
 
     pub(crate) fn find_with_checked(
         &self,
         key: &[u8],
-        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        reserve: impl FnMut(usize) -> crate::error::Result<()>,
     ) -> crate::error::Result<std::result::Result<u64, u64>> {
-        let nb = self.num_blocks();
-        if nb == 0 {
-            return Ok(Err(0));
-        }
-        // last block whose first key <= key
-        let (mut lo, mut hi) = (0usize, nb);
-        if let Some(s) = &self.sparse {
-            // the group of blocks that holds the key, from memory; then only its offsets
-            // and data are read, each asked for in one request
-            let g = partition_point_by(s.len(), |g| s.key(g) <= key);
-            if g == 0 {
-                return Ok(Err(0));
-            }
-            let g = g - 1;
-            lo = g * IDX_BLOCKS;
-            hi = ((g + 1) * IDX_BLOCKS).min(nb);
-            if crate::index::io_hints() && s.first_hint(g) {
-                if let Bytes::Map(m) = &self.offsets {
-                    crate::index::will_need(IoFile::VocabOff, m, lo * 8, (hi - lo) * 8);
-                }
-                let end = s
-                    .offsets
-                    .get(g + 1)
-                    .map_or(self.data.as_slice().len(), |&o| o as usize);
-                self.data
-                    .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
-            }
-            // block `lo` starts with the group's key, which is not above `key`
-            lo += 1;
-        }
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if self.block_first(mid) <= key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo == 0 {
-            return Ok(Err(0));
-        }
-        let b = lo - 1;
-        let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
-        self.scan_block_checked(b, ALL_KEYS, &mut reserve, |i, k| {
-            Ok(match k.cmp(key) {
-                std::cmp::Ordering::Less => true,
-                std::cmp::Ordering::Equal => {
-                    result = Ok((b * FC_BLOCK + i) as u64);
-                    false
-                }
-                std::cmp::Ordering::Greater => {
-                    result = Err((b * FC_BLOCK + i) as u64);
-                    false
-                }
-            })
-        })?;
-        Ok(result)
+        let mut scratch = ExactScratch { reserve };
+        self.find_with::<false, _, crate::error::Error>(key, &mut scratch)
     }
 
     /// Id range `[lo, hi)` of keys with the given byte prefix.
@@ -3298,15 +3339,26 @@ impl AppendVocab {
         self.map.entry(k).or_insert(i);
     }
 
-    /// Insert into a freshly admitted cold dictionary. Positional layers keep
-    /// duplicate entries, while ordinary dictionaries reuse the first key.
-    pub(crate) fn push_controlled(
+    /// Insert into a dictionary under `control`. Under [`Unlimited`], inserts into the
+    /// ordinary map directly; under an accounting carrier, constructs a freshly admitted
+    /// cold dictionary. Positional layers keep duplicate entries, while ordinary
+    /// dictionaries reuse the first key.
+    pub(crate) fn push_with<C: BudgetControl>(
         &mut self,
         key: &[u8],
         positional: bool,
-        budget: &mut crate::store::cold::ColdBudget<'_>,
+        control: &mut C,
     ) -> Result<(u64, bool)> {
-        budget.check()?;
+        if !C::ACCOUNTS {
+            return if positional {
+                let id = self.keys.len() as u64;
+                self.push_dup(key);
+                Ok((id, true))
+            } else {
+                Ok(self.insert(key))
+            };
+        }
+        control.check(0)?;
         if self.cold.is_none() {
             if !self.keys.is_empty()
                 || !self.map.is_empty()
@@ -3323,7 +3375,7 @@ impl AppendVocab {
             .cold
             .as_ref()
             .unwrap()
-            .find_controlled(&self.keys, key, budget)?;
+            .find_with(&self.keys, key, control)?;
         if !positional && let Some(id) = existing {
             return Ok((id, false));
         }
@@ -3331,24 +3383,31 @@ impl AppendVocab {
             .keys
             .len()
             .checked_add(1)
-            .ok_or_else(|| budget.exhausted())?;
-        budget.reserve(&mut self.keys, need)?;
+            .ok_or_else(|| control.exhausted())?;
+        control.reserve(&mut self.keys, need)?;
         let bytes = (key.len() as u64)
             .checked_add(64)
-            .ok_or_else(|| budget.exhausted())?;
-        budget.charge(bytes)?;
-        let owned = cold::copy_controlled(key, budget)?;
+            .ok_or_else(|| control.exhausted())?;
+        control.charge(bytes)?;
+        let owned = cold::copy_with(key, control)?;
         let id = self.keys.len() as u64;
         if existing.is_none() {
-            self.cold
-                .as_mut()
-                .unwrap()
-                .insert_controlled(hash, id, budget)?;
+            self.cold.as_mut().unwrap().insert_with(hash, id, control)?;
         }
         self.key_bytes += owned.len();
         self.keys.push(owned);
-        budget.check()?;
+        control.check(0)?;
         Ok((id, true))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_controlled(
+        &mut self,
+        key: &[u8],
+        positional: bool,
+        budget: &mut crate::store::cold::ColdBudget<'_>,
+    ) -> Result<(u64, bool)> {
+        self.push_with(key, positional, budget)
     }
 
     pub(crate) fn cold_bytes(&self) -> u64 {
@@ -3640,7 +3699,7 @@ mod tests {
         // Binary-search probes read a block's first key, but do not traverse a
         // decoder. They still observe its offset and data pages before reading.
         let profile = ioacct::Profile::start();
-        assert_eq!(vocab.block_first(1), keys[FC_BLOCK]);
+        assert_eq!(vocab.block_first_at::<true>(1), keys[FC_BLOCK]);
         assert_vocab_profile(&profile.report(), 0);
         drop(profile);
         let profile = ioacct::Profile::start();
@@ -3910,14 +3969,26 @@ mod tests {
                     let mut got = None;
                     let b = id as usize / FC_BLOCK;
                     let wanted = 1 << (id as usize % FC_BLOCK);
-                    let f = |_, k: &[u8]| {
+                    let mut f = |_, _: usize, k: &mut Vec<u8>, _: &mut Unlimited| {
                         got = Some(k.to_vec());
-                        false
+                        Ok::<bool, std::convert::Infallible>(false)
                     };
                     if profile {
-                        v.decode_block::<true>(b, wanted, &mut key, f);
+                        let _ = v.decode_block_dispatch::<true, _, _>(
+                            b,
+                            wanted,
+                            &mut key,
+                            &mut Unlimited,
+                            &mut f,
+                        );
                     } else {
-                        v.decode_block::<false>(b, wanted, &mut key, f);
+                        let _ = v.decode_block_dispatch::<false, _, _>(
+                            b,
+                            wanted,
+                            &mut key,
+                            &mut Unlimited,
+                            &mut f,
+                        );
                     }
                     assert_eq!(got, want, "fsst {fsst}: unchecked {id}");
                     assert!(
@@ -4351,9 +4422,11 @@ mod tests {
                         }
                     };
                     if room {
-                        v.get_sorted_checked_in::<true, _>(&[id], key, reserve, f)
+                        let mut scratch = CheckedScratch::<_, true> { reserve };
+                        v.get_sorted_with(&[id], key, &mut scratch, f, true)
                     } else {
-                        v.get_sorted_checked_in::<false, _>(&[id], key, reserve, f)
+                        let mut scratch = CheckedScratch::<_, false> { reserve };
+                        v.get_sorted_with(&[id], key, &mut scratch, f, true)
                     }
                 };
                 // A buffer with room for every key needs no reservation, so a failing
@@ -4416,19 +4489,15 @@ mod tests {
                         // A refused growth leaves the buffer as it was, so the
                         // reservation comes before the allocation.
                         let refused = if room {
-                            v.get_sorted_checked_in::<true, _>(
-                                &[id],
-                                &mut key,
-                                |_| Err(()),
-                                |_, _| Ok(()),
-                            )
+                            let mut scratch = CheckedScratch::<_, true> {
+                                reserve: |_| Err(()),
+                            };
+                            v.get_sorted_with(&[id], &mut key, &mut scratch, |_, _| Ok(()), true)
                         } else {
-                            v.get_sorted_checked_in::<false, _>(
-                                &[id],
-                                &mut key,
-                                |_| Err(()),
-                                |_, _| Ok(()),
-                            )
+                            let mut scratch = CheckedScratch::<_, false> {
+                                reserve: |_| Err(()),
+                            };
+                            v.get_sorted_with(&[id], &mut key, &mut scratch, |_, _| Ok(()), true)
                         };
                         assert_eq!(key.capacity(), held, "growth before admission at {id}");
                         let mut reserved = false;
@@ -4448,9 +4517,11 @@ mod tests {
                             Ok(())
                         };
                         if room {
-                            v.get_sorted_checked_in::<true, _>(&[id], &mut key, reserve, f)
+                            let mut scratch = CheckedScratch::<_, true> { reserve };
+                            v.get_sorted_with(&[id], &mut key, &mut scratch, f, true)
                         } else {
-                            v.get_sorted_checked_in::<false, _>(&[id], &mut key, reserve, f)
+                            let mut scratch = CheckedScratch::<_, false> { reserve };
+                            v.get_sorted_with(&[id], &mut key, &mut scratch, f, true)
                         }
                         .unwrap();
                         assert_eq!(got.as_ref(), Some(&keys[id as usize]));
@@ -4566,7 +4637,7 @@ mod tests {
             })
             .unwrap();
             budget.observe_keys(&observer);
-            let result = Sparse::decode_inner(&wire, IDX_BLOCKS + 1, 16, Some(&mut budget));
+            let result = Sparse::decode_with(&wire, IDX_BLOCKS + 1, 16, &mut budget);
             assert!(matches!(result, Err(Error::Cancelled)), "stage={stage}");
             assert!(
                 reached.get(),
@@ -5905,5 +5976,145 @@ mod tests {
         let mut all = Vec::new();
         v.for_each(|_, k| all.push(k.to_vec()));
         assert_eq!(all, keys);
+    }
+
+    #[test]
+    fn control_trait_vocab_open_and_scanners_parity_and_limits() {
+        use crate::{
+            Error,
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let keys = mixed_keys(400);
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+
+            let plain = Vocab::open_with(dir.path(), fsst, &mut Unlimited).unwrap();
+            assert_eq!(plain.charge, 0);
+            let options = HistoryOptions::default();
+            let mut budget = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(16 << 20),
+                held: 0,
+            })
+            .unwrap();
+            let controlled = Vocab::open_with(dir.path(), fsst, &mut budget).unwrap();
+            assert_eq!(plain.value.len(), controlled.value.len());
+            assert_eq!(plain.value.first_iri(), controlled.value.first_iri());
+            assert_eq!(plain.value.first_triple(), controlled.value.first_triple());
+            assert!(controlled.charge > 0);
+            drop(controlled.value);
+            budget.release(controlled.charge);
+            assert_eq!(budget.used(), 0);
+
+            // Uncapped ReadLimit still honours cancellation and deadline on open_with.
+            let cancel = Arc::new(AtomicBool::new(false));
+            let cancelled_opts = HistoryOptions {
+                cancel: Some(cancel.clone()),
+                deadline: None,
+            };
+            let mut uncapped_cancel = ColdBudget::new(ReadLimit {
+                options: &cancelled_opts,
+                memory: None,
+                held: 0,
+            })
+            .unwrap();
+            cancel.store(true, AtomicOrdering::Relaxed);
+            assert!(matches!(
+                Vocab::open_with(dir.path(), fsst, &mut uncapped_cancel),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(uncapped_cancel.used(), 0);
+
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let expired_opts = HistoryOptions {
+                cancel: None,
+                deadline: Some(deadline),
+            };
+            let mut uncapped_timeout = ColdBudget::new(ReadLimit {
+                options: &expired_opts,
+                memory: None,
+                held: 0,
+            })
+            .unwrap();
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(matches!(
+                Vocab::open_with(dir.path(), fsst, &mut uncapped_timeout),
+                Err(Error::Timeout)
+            ));
+            assert_eq!(uncapped_timeout.used(), 0);
+
+            // Tight budget refuses open_with cleanly.
+            let mut tiny = ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(1),
+                held: 0,
+            })
+            .unwrap();
+            assert!(matches!(
+                Vocab::open_with(dir.path(), fsst, &mut tiny),
+                Err(Error::BudgetExceeded(_))
+            ));
+
+            // Parity across Unlimited, CheckedScratch, ExactScratch, and ControlledScratch.
+            let v = &plain.value;
+            let sample_ids: Vec<u64> = (0..keys.len() as u64).step_by(7).collect();
+            let mut unlimited_out = Vec::new();
+            v.get_sorted(&sample_ids, |id, k| unlimited_out.push((id, k.to_vec())));
+            let mut checked_out = Vec::new();
+            v.get_sorted_checked(
+                &sample_ids,
+                |_| Ok::<_, Error>(()),
+                |id, k| {
+                    checked_out.push((id, k.to_vec()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let mut owned_out = Vec::new();
+            v.get_sorted_owned_with_ahead(
+                &sample_ids,
+                |_| Ok(()),
+                |id, k| {
+                    owned_out.push((id, k.to_vec()));
+                    Ok(())
+                },
+                true,
+            )
+            .unwrap();
+            assert_eq!(checked_out, unlimited_out);
+            assert_eq!(owned_out, unlimited_out);
+
+            // Tight budget refuses get_sorted_checked and find_with_checked cleanly.
+            assert!(matches!(
+                v.get_sorted_checked(&sample_ids, |_| Err(Error::Cancelled), |_, _| Ok(())),
+                Err(Error::Cancelled)
+            ));
+            assert!(matches!(
+                v.find_with_checked(&keys[17], |_| Err(Error::Timeout)),
+                Err(Error::Timeout)
+            ));
+            assert!(matches!(
+                v.find_with_controlled(&keys[17], |_| Ok(()), |_| Err(Error::Cancelled)),
+                Err(Error::Cancelled)
+            ));
+            for &id in &sample_ids {
+                let k = &keys[id as usize];
+                assert_eq!(v.find(k), Ok(id));
+                assert_eq!(v.find_with_checked(k, |_| Ok(())).unwrap(), Ok(id));
+                assert_eq!(
+                    v.find_with_controlled(k, |_| Ok(()), |_| Ok(())).unwrap(),
+                    Ok(id)
+                );
+                let fallible = v.get_with_fallible(id, |_| Ok(()), |b| b.to_vec()).unwrap();
+                assert_eq!(fallible.as_deref(), Some(k.as_slice()));
+            }
+        }
     }
 }

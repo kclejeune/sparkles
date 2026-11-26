@@ -104,7 +104,7 @@ pub(super) fn reconcile_tail(
     let start = budget.used();
     let result = (|| {
         let vocab = crate::store::cold::head_vocabulary_controlled(&current.dir, root, budget)?;
-        let terms = vocab.value.len_limited(&budget.owned_limit()?)?;
+        let terms = vocab.value.len_with(&*budget)?;
         let mut previous_time = current.base.timestamp_ms;
         prove_file_with(
             root,

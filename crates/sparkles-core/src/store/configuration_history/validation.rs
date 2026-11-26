@@ -332,7 +332,7 @@ fn inspect_generation(
         };
         inspection_point("bound");
         let vocabulary = cold::head_vocabulary_controlled(directory, root, budget)?;
-        let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+        let terms = vocabulary.value.len_with(&*budget)?;
         inspection_point("vocabulary");
         let annotations = match branch {
             None => cold::Loaded {

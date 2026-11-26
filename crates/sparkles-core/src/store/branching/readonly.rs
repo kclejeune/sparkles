@@ -307,7 +307,7 @@ pub(in crate::store) fn authenticate_retained_generation(
         })?,
         &mut budget,
     )?;
-    let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+    let terms = vocabulary.value.len_with(&budget)?;
     let root = store.root.as_deref().expect("checked persistent root");
     // This variant uses the actual resident family capture, including main.
     let annotations = crate::annotations::seqs_controlled(root, store.dataset_id, &mut budget)?;
@@ -372,7 +372,7 @@ fn head_controlled(
     let start = budget.used();
     let result = (|| {
         let vocab = crate::store::cold::head_vocabulary_controlled(&current.dir, root, budget)?;
-        let terms = vocab.value.len_limited(&budget.owned_limit()?)?;
+        let terms = vocab.value.len_with(&*budget)?;
         let proof = prove_file(root, id, current, u64::MAX, terms, budget)?;
         Ok(proof.head.seq)
     })();
@@ -666,7 +666,7 @@ impl Store {
             }
             let vocabulary =
                 cold::head_vocabulary_controlled(&selected.value.dir, &root, &mut budget)?;
-            let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+            let terms = vocabulary.value.len_with(&budget)?;
             let mut digest = None;
             let proof = prove_file_with(
                 &root,
@@ -735,7 +735,7 @@ impl Store {
             )?,
         };
         let generation = Arc::new(loaded.value);
-        let terms = generation.dvocab.len_limited(&budget.owned_limit()?)?;
+        let terms = generation.dvocab.len_with(&budget)?;
         let mut previous = wal::WalPoint {
             seq: selected.value.base.seq,
             offset: 0,
@@ -801,7 +801,7 @@ impl Store {
             .max(history_limited::SHARED_SNAPSHOT_BYTES);
         budget.charge(delta_bytes)?;
         budget.check()?;
-        let settings = ChangeLog::settings_controlled(&root, &mut budget)?;
+        let settings = changelog::read_settings_with(&root, &mut budget)?;
         let log = ChangeLog::capture_read_only(
             &root,
             id,
@@ -884,7 +884,7 @@ fn generation_end(
     let start = budget.used();
     let result = (|| {
         let vocab = cold::head_vocabulary_controlled(&generation.dir, root, budget)?;
-        let terms = vocab.value.len_limited(&budget.owned_limit()?)?;
+        let terms = vocab.value.len_with(&*budget)?;
         let proof = prove_file(root, id, generation, u64::MAX, terms, budget)?;
         budget.check()?;
         Ok(proof.head.seq)

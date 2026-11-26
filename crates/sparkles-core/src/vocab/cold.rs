@@ -1,5 +1,8 @@
 //! Cooperative payload operations for freshly constructed cold dictionaries.
-use crate::{error::Result, store::cold::ColdBudget};
+use crate::{
+    budgeted::{BudgetControl, Unlimited},
+    error::Result,
+};
 use std::{collections::BTreeMap, hash::Hasher, sync::Arc};
 
 const CHUNK: usize = 64 << 10;
@@ -15,72 +18,77 @@ pub(super) struct Index {
     bytes: u64,
 }
 
-fn hash_checked(key: &[u8], mut check: impl FnMut(usize) -> Result<()>) -> Result<u64> {
+fn hash_with<C: BudgetControl>(key: &[u8], control: &C) -> Result<u64> {
     let mut hash = rustc_hash::FxHasher::default();
     for (index, chunk) in key.chunks(CHUNK).enumerate() {
-        check(index * CHUNK)?;
+        control.key_step("hash", index * CHUNK)?;
         hash.write(chunk);
     }
-    check(key.len())?;
+    control.key_step("hash", key.len())?;
     Ok(hash.finish())
 }
 
 pub(super) fn fingerprint(key: &[u8]) -> u64 {
-    hash_checked(key, |_| Ok(())).expect("the unchecked fingerprint cannot fail")
+    hash_with(key, &Unlimited).expect("the unchecked fingerprint cannot fail")
 }
 
-pub(super) fn compare_controlled(
+pub(super) fn compare_with<C: BudgetControl>(
     left: &[u8],
     right: &[u8],
-    budget: &ColdBudget<'_>,
+    control: &C,
 ) -> Result<std::cmp::Ordering> {
+    if !C::CHECKS {
+        return Ok(left.cmp(right));
+    }
     let common = left.len().min(right.len());
     for (index, (a, b)) in left[..common]
         .chunks(CHUNK)
         .zip(right[..common].chunks(CHUNK))
         .enumerate()
     {
-        budget.key_step("sparse compare", index * CHUNK)?;
+        control.key_step("sparse compare", index * CHUNK)?;
         let order = a.cmp(b);
         if order != std::cmp::Ordering::Equal {
-            budget.check()?;
+            control.check(0)?;
             return Ok(order);
         }
     }
-    budget.key_step("sparse compare", common)?;
+    control.key_step("sparse compare", common)?;
     Ok(left.len().cmp(&right.len()))
 }
 
-fn equal_checked(
-    left: &[u8],
-    right: &[u8],
-    mut check: impl FnMut(usize) -> Result<()>,
-) -> Result<bool> {
-    check(0)?;
+fn equal_with<C: BudgetControl>(left: &[u8], right: &[u8], control: &C) -> Result<bool> {
+    if !C::CHECKS {
+        return Ok(left == right);
+    }
+    control.key_step("compare", 0)?;
     if left.len() != right.len() {
         return Ok(false);
     }
     for (index, (a, b)) in left.chunks(CHUNK).zip(right.chunks(CHUNK)).enumerate() {
-        check(index * CHUNK)?;
+        control.key_step("compare", index * CHUNK)?;
         if a != b {
             return Ok(false);
         }
     }
-    check(left.len())?;
+    control.key_step("compare", left.len())?;
     Ok(true)
 }
 
-pub(super) fn copy_controlled(key: &[u8], budget: &ColdBudget<'_>) -> Result<Arc<[u8]>> {
-    budget.key_step("copy", 0)?;
+pub(super) fn copy_with<C: BudgetControl>(key: &[u8], control: &C) -> Result<Arc<[u8]>> {
+    if !C::CHECKS {
+        return Ok(Arc::from(key));
+    }
+    control.key_step("copy", 0)?;
     let mut owned = Arc::<[u8]>::new_uninit_slice(key.len());
     let output = Arc::get_mut(&mut owned).expect("a new uninitialized Arc is uniquely owned");
     for (index, (target, source)) in output.chunks_mut(CHUNK).zip(key.chunks(CHUNK)).enumerate() {
-        budget.key_step("copy", index * CHUNK)?;
+        control.key_step("copy", index * CHUNK)?;
         for (target, byte) in target.iter_mut().zip(source) {
             target.write(*byte);
         }
     }
-    budget.key_step("copy", key.len())?;
+    control.key_step("copy", key.len())?;
     // SAFETY: the Arc stayed uniquely owned, every byte of its exact-length slice
     // was initialized by the safe chunk loop, and no reference to uninitialized
     // contents escaped. Any earlier error drops Arc<[MaybeUninit<u8>]> directly.
@@ -104,52 +112,63 @@ impl Index {
             .find(|&id| keys[id as usize].as_ref() == key)
     }
 
-    pub(super) fn find_controlled(
+    pub(super) fn find_with<C: BudgetControl>(
         &self,
         keys: &[Arc<[u8]>],
         key: &[u8],
-        budget: &ColdBudget<'_>,
+        control: &C,
     ) -> Result<(u64, Option<u64>)> {
-        let hash = hash_checked(key, |at| budget.key_step("hash", at))?;
+        let hash = hash_with(key, control)?;
         if let Some(bucket) = self.buckets.get(&hash) {
             for &id in bucket {
-                budget.check()?;
-                if equal_checked(&keys[id as usize], key, |at| budget.key_step("compare", at))? {
+                control.check(0)?;
+                if equal_with(&keys[id as usize], key, control)? {
                     return Ok((hash, Some(id)));
                 }
             }
         }
-        budget.check()?;
+        control.check(0)?;
         Ok((hash, None))
     }
 
-    pub(super) fn insert_controlled(
+    pub(super) fn insert_with<C: BudgetControl>(
         &mut self,
         hash: u64,
         id: u64,
-        budget: &mut ColdBudget<'_>,
+        control: &mut C,
     ) -> Result<()> {
-        budget.check()?;
+        if !C::ACCOUNTS {
+            let is_new = !self.buckets.contains_key(&hash);
+            let bucket = self.buckets.entry(hash).or_default();
+            let before = bucket.capacity();
+            bucket.push(id);
+            self.bytes = self
+                .bytes
+                .saturating_add((bucket.capacity() - before) as u64 * 8)
+                .saturating_add(if is_new { NODE_BYTES } else { 0 });
+            return Ok(());
+        }
+        control.check(0)?;
         if let Some(bucket) = self.buckets.get_mut(&hash) {
             let before = bucket.capacity();
             let need = bucket.len() + 1;
-            budget.reserve(bucket, need)?;
+            control.reserve(bucket, need)?;
             self.bytes = self
                 .bytes
                 .saturating_add((bucket.capacity() - before) as u64 * 8);
             bucket.push(id);
         } else {
             let mut bucket = Vec::new();
-            budget.reserve(&mut bucket, 1)?;
+            control.reserve(&mut bucket, 1)?;
             bucket.push(id);
             let levels = (self.buckets.len() as u64).saturating_add(1).ilog2() as u64 + 2;
             let workspace = levels.saturating_mul(NODE_BYTES);
-            budget.charge(NODE_BYTES.saturating_add(workspace))?;
+            control.charge(NODE_BYTES.saturating_add(workspace))?;
             // Only fixed-width fingerprints and IDs participate in the balanced
             // insertion. No payload hashing or copying can occur inside it.
             self.buckets.insert(hash, bucket);
             self.bytes = self.bytes.saturating_add(NODE_BYTES + 8);
-            budget.release(workspace);
+            control.release(workspace);
         }
         // The owner appends its preadmitted key immediately, then checks control.
         // Do not fail here with an index ID whose key has not been appended yet.
@@ -157,14 +176,8 @@ impl Index {
     }
 
     pub(super) fn insert(&mut self, hash: u64, id: u64) {
-        let is_new = !self.buckets.contains_key(&hash);
-        let bucket = self.buckets.entry(hash).or_default();
-        let before = bucket.capacity();
-        bucket.push(id);
-        self.bytes = self
-            .bytes
-            .saturating_add((bucket.capacity() - before) as u64 * 8)
-            .saturating_add(if is_new { NODE_BYTES } else { 0 });
+        self.insert_with(hash, id, &mut Unlimited)
+            .expect("unlimited cold index insert cannot fail");
     }
 
     pub(super) fn truncate(&mut self, end: u64) {
@@ -192,6 +205,7 @@ mod tests {
     use crate::{
         Error,
         history::{HistoryOptions, ReadLimit},
+        store::cold::ColdBudget,
         vocab::AppendVocab,
     };
     use std::{
@@ -320,7 +334,7 @@ mod tests {
             .cold
             .as_mut()
             .unwrap()
-            .insert_controlled(hash, 0, &mut budget)
+            .insert_with(hash, 0, &mut budget)
             .unwrap();
         assert_eq!(
             vocab.push_controlled(&second, false, &mut budget).unwrap(),

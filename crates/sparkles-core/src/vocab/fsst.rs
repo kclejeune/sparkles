@@ -68,16 +68,39 @@ impl std::fmt::Debug for Table {
     }
 }
 
+/// Cooperative admission and checkpoint hooks for [`Table::measure_with`].
+pub(super) trait SuffixMeasure<E> {
+    fn admit(&mut self, length: usize) -> Result<(), E>;
+    fn checkpoint(&mut self, phase: &'static str) -> Result<(), E>;
+    fn overflow(&self) -> E;
+}
+
+struct UncheckedMeasure;
+
+impl SuffixMeasure<std::convert::Infallible> for UncheckedMeasure {
+    #[inline(always)]
+    fn admit(&mut self, _length: usize) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+    #[inline(always)]
+    fn checkpoint(&mut self, _phase: &'static str) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+    fn overflow(&self) -> std::convert::Infallible {
+        unreachable!("unchecked measure cannot overflow")
+    }
+}
+
 impl Table {
-    pub(crate) fn first_byte_checked(
+    pub(crate) fn first_byte_with<C: crate::budgeted::Control>(
         &self,
         codes: &[u8],
-        check: impl Fn() -> Result<()>,
+        control: &C,
     ) -> Result<Option<u8>> {
         let mut index = 0usize;
         while index < codes.len() {
-            if index.is_multiple_of(64 << 10) {
-                check()?;
+            if C::CHECKS && index.is_multiple_of(64 << 10) {
+                control.check(0)?;
             }
             let code = codes[index];
             if code == ESCAPE {
@@ -88,7 +111,7 @@ impl Table {
             }
             index += 1;
         }
-        check()?;
+        control.check(0)?;
         Ok(None)
     }
 
@@ -325,29 +348,36 @@ impl Table {
     }
 
     /// The number of bytes that `codes` decode to.
+    #[inline]
     pub fn decoded_len(&self, codes: &[u8]) -> usize {
-        let mut n = 0;
-        let mut i = 0;
-        while i < codes.len() {
-            let c = codes[i];
-            if c == ESCAPE {
-                n += usize::from(i + 1 < codes.len());
-                i += 2;
-            } else {
-                n += self.lens[c as usize] as usize;
-                i += 1;
-            }
-        }
-        n
+        self.measure_with::<false, _, _>(codes, &mut UncheckedMeasure)
+            .unwrap_or_else(|e| match e {})
     }
 
-    /// Controlled opt-in decoder. Old decoder paths retain their optimized loops.
-    pub(super) fn measure_controlled<E: From<Error>>(
+    /// Measure the decoded length of `codes`. With `POLLS = false`, compiles to the
+    /// unchecked loop; with `POLLS = true`, admits length incrementally and polls
+    /// checkpoints every 1024 code bytes.
+    #[inline(always)]
+    pub(super) fn measure_with<const POLLS: bool, M: SuffixMeasure<E>, E>(
         &self,
         codes: &[u8],
-        mut admit: impl FnMut(usize) -> Result<(), E>,
-        checkpoint: &mut impl FnMut(&'static str) -> Result<(), E>,
+        measure: &mut M,
     ) -> Result<usize, E> {
+        if !POLLS {
+            let mut n = 0usize;
+            let mut i = 0usize;
+            while i < codes.len() {
+                let c = codes[i];
+                if c == ESCAPE {
+                    n += usize::from(i + 1 < codes.len());
+                    i += 2;
+                } else {
+                    n += self.lens[c as usize] as usize;
+                    i += 1;
+                }
+            }
+            return Ok(n);
+        }
         let (mut at, mut length, mut since_check) = (0usize, 0usize, 0usize);
         while at < codes.len() {
             let code = codes[at];
@@ -358,18 +388,18 @@ impl Table {
             };
             length = length
                 .checked_add(bytes)
-                .ok_or_else(|| Error::invalid("vocabulary suffix overflows"))?;
+                .ok_or_else(|| measure.overflow())?;
             at += consumed;
             since_check += consumed;
             if since_check >= 1024 {
                 // Admit incrementally, so a low cap refuses before a full long scan.
-                admit(length)?;
-                checkpoint("measuring vocabulary suffix")?;
+                measure.admit(length)?;
+                measure.checkpoint("measuring vocabulary suffix")?;
                 since_check = 0;
             }
         }
-        admit(length)?;
-        checkpoint("finishing vocabulary measurement")?;
+        measure.admit(length)?;
+        measure.checkpoint("finishing vocabulary measurement")?;
         Ok(length)
     }
 

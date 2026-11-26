@@ -457,7 +457,7 @@ impl super::Generation {
                 + self.dir.as_ref().map_or(0, |p| p.as_os_str().len()) as u64,
         )?;
         budget.charge(self.vocab.resident_bytes() + 64)?;
-        budget.charge(self.dvocab.resident_bytes_limited(&read_limit)?)?;
+        budget.charge(self.dvocab.resident_bytes_with(&budget)?)?;
         budget.charge(
             self.perms.capacity() as u64 * std::mem::size_of::<crate::index::PermIndex>() as u64,
         )?;
@@ -601,12 +601,18 @@ impl super::Generation {
             }
             stats.value
         };
-        let vocab = control.open_vocab(dir, meta.has_feature(builder::FEATURE_FSST_VOCAB))?;
+        let vocab = crate::vocab::Vocab::open_with(
+            dir,
+            meta.has_feature(builder::FEATURE_FSST_VOCAB),
+            control,
+        )?;
         control.charge(64)?;
         let vocab = Arc::new(vocab.value);
         let dvocab = match dvocab {
             Some(vocab) => vocab,
-            None => control.open_dvocab_ro(&dir.join("delta.vocab"))?,
+            None => {
+                crate::vocab::DeltaVocab::open_read_only_with(&dir.join("delta.vocab"), control)?
+            }
         };
         let mut perms = Vec::new();
         control.reserve(&mut perms, Perm::ALL.len())?;

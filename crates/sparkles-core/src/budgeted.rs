@@ -29,7 +29,8 @@ use crate::history::{HistoryOptions, ReadLimit};
 use crate::store::Delta;
 use crate::store::cold::{ColdBudget, Loaded};
 use serde::de::DeserializeOwned;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::Path;
 
 /// What a reader asks of the control that bounds it.
 pub(crate) trait Control {
@@ -93,8 +94,8 @@ pub(crate) trait Control {
         }
     }
 
-    /// The control as a [`ReadLimit`], for the remaining Stage 2 vocabulary readers that
-    /// are not generic yet. Stage 2 of item 830 removes it.
+    /// The control as a [`ReadLimit`], for carriers and helpers that need a `ReadLimit`
+    /// view (such as `ColdBudget` initialization, lock helpers, and cache retention).
     fn read_limit(&self) -> ReadLimit<'_>;
 
     /// The error of an allocation that the system refused although the cap admitted it.
@@ -138,14 +139,10 @@ pub(crate) trait BudgetControl: Control {
         label: impl std::fmt::Display,
     ) -> Result<T>;
     fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32]>;
-    fn open_vocab(&mut self, dir: &Path, fsst: bool) -> Result<Loaded<crate::vocab::Vocab>>;
-    fn open_dvocab_ro(&mut self, path: &Path) -> Result<Loaded<crate::vocab::DeltaVocab>>;
-    fn open_dvocab_layered(
-        &mut self,
-        prefix: &[(PathBuf, u64)],
-        path: &Path,
-        read_only: bool,
-    ) -> Result<Loaded<crate::vocab::DeltaVocab>>;
+    fn key_step(&self, stage: &str, at: usize) -> Result<()>;
+    fn read_from<R: Read>(&mut self, file: &mut R, length: u64) -> Result<Vec<u8>>;
+    fn read_mutable_prefix(&mut self, path: &Path) -> Result<Vec<u8>>;
+    fn crc32(&self, parts: &[&[u8]]) -> Result<u32>;
 }
 
 /// The control of a read that has none, for the bridge of [`Unlimited`].
@@ -286,32 +283,139 @@ impl BudgetControl for Unlimited {
     }
 
     #[inline(always)]
-    fn open_vocab(&mut self, dir: &Path, fsst: bool) -> Result<Loaded<crate::vocab::Vocab>> {
-        Ok(Loaded {
-            value: crate::vocab::Vocab::open_codec(dir, fsst)?,
-            charge: 0,
-        })
+    fn key_step(&self, _stage: &str, _at: usize) -> Result<()> {
+        Ok(())
     }
 
     #[inline(always)]
-    fn open_dvocab_ro(&mut self, path: &Path) -> Result<Loaded<crate::vocab::DeltaVocab>> {
-        Ok(Loaded {
-            value: crate::vocab::DeltaVocab::open_read_only(path)?,
-            charge: 0,
-        })
+    fn read_from<R: Read>(&mut self, file: &mut R, length: u64) -> Result<Vec<u8>> {
+        let len = usize::try_from(length).map_err(|_| self.exhausted())?;
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
     }
 
     #[inline(always)]
-    fn open_dvocab_layered(
-        &mut self,
-        prefix: &[(PathBuf, u64)],
-        path: &Path,
-        read_only: bool,
-    ) -> Result<Loaded<crate::vocab::DeltaVocab>> {
-        Ok(Loaded {
-            value: crate::vocab::DeltaVocab::open_layered(prefix, path, read_only)?,
-            charge: 0,
-        })
+    fn read_mutable_prefix(&mut self, path: &Path) -> Result<Vec<u8>> {
+        Ok(std::fs::read(path)?)
+    }
+
+    #[inline(always)]
+    fn crc32(&self, parts: &[&[u8]]) -> Result<u32> {
+        let mut crc = flate2::Crc::new();
+        for part in parts {
+            crc.update(part);
+        }
+        Ok(crc.sum())
+    }
+}
+
+/// Zero-cost adapter for a fallible `FnMut` check closure (`CHECKS = true, ACCOUNTS = false`),
+/// allowing `&mut dyn FnMut() -> Result<()>` callers to enter generic `Control` readers.
+pub(crate) struct FnMutControl<'a>(std::cell::RefCell<&'a mut (dyn FnMut() -> Result<()> + 'a)>);
+
+impl<'a> FnMutControl<'a> {
+    #[inline(always)]
+    pub(crate) fn new(check: &'a mut (dyn FnMut() -> Result<()> + 'a)) -> Self {
+        Self(std::cell::RefCell::new(check))
+    }
+}
+
+impl Control for FnMutControl<'_> {
+    const CHECKS: bool = true;
+    const ACCOUNTS: bool = false;
+
+    #[inline(always)]
+    fn check(&self, _bytes: u64) -> Result<()> {
+        (self.0.borrow_mut())()
+    }
+
+    #[inline(always)]
+    fn remaining(&self) -> u64 {
+        u64::MAX
+    }
+
+    #[inline]
+    fn lock<'m, T>(
+        &self,
+        mutex: &'m parking_lot::Mutex<T>,
+    ) -> Result<parking_lot::MutexGuard<'m, T>> {
+        loop {
+            self.check(0)?;
+            if let Some(guard) = mutex.try_lock_for(std::time::Duration::from_millis(10)) {
+                self.check(0)?;
+                return Ok(guard);
+            }
+        }
+    }
+
+    #[inline]
+    fn read_lock<'m, T>(
+        &self,
+        lock: &'m parking_lot::RwLock<T>,
+    ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        loop {
+            self.check(0)?;
+            if let Some(guard) = lock.try_read_for(std::time::Duration::from_millis(10)) {
+                self.check(0)?;
+                return Ok(guard);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn read_limit(&self) -> ReadLimit<'_> {
+        ReadLimit {
+            options: &NO_CONTROL,
+            memory: None,
+            held: 0,
+        }
+    }
+}
+
+impl Control for crate::task::Control {
+    const CHECKS: bool = true;
+    const ACCOUNTS: bool = false;
+
+    #[inline(always)]
+    fn check(&self, _bytes: u64) -> Result<()> {
+        crate::task::Control::check(self)
+    }
+
+    #[inline(always)]
+    fn remaining(&self) -> u64 {
+        u64::MAX
+    }
+
+    #[inline]
+    fn lock<'m, T>(
+        &self,
+        mutex: &'m parking_lot::Mutex<T>,
+    ) -> Result<parking_lot::MutexGuard<'m, T>> {
+        loop {
+            crate::task::Control::check(self)?;
+            if let Some(guard) = mutex.try_lock_for(std::time::Duration::from_millis(10)) {
+                crate::task::Control::check(self)?;
+                return Ok(guard);
+            }
+        }
+    }
+
+    #[inline]
+    fn read_lock<'m, T>(
+        &self,
+        lock: &'m parking_lot::RwLock<T>,
+    ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        crate::task::read_lock(lock, || crate::task::Control::check(self))
+    }
+
+    #[inline(always)]
+    fn read_limit(&self) -> ReadLimit<'_> {
+        ReadLimit {
+            options: &NO_CONTROL,
+            memory: None,
+            held: 0,
+        }
     }
 }
 
@@ -524,27 +628,23 @@ impl BudgetControl for ColdBudget<'_> {
     }
 
     #[inline]
-    fn open_vocab(&mut self, dir: &Path, fsst: bool) -> Result<Loaded<crate::vocab::Vocab>> {
-        crate::vocab::Vocab::open_controlled(dir, fsst, self)
+    fn key_step(&self, stage: &str, at: usize) -> Result<()> {
+        ColdBudget::key_step(self, stage, at)
     }
 
     #[inline]
-    fn open_dvocab_ro(&mut self, path: &Path) -> Result<Loaded<crate::vocab::DeltaVocab>> {
-        crate::vocab::DeltaVocab::open_read_only_controlled(path, self)
+    fn read_from<R: Read>(&mut self, file: &mut R, length: u64) -> Result<Vec<u8>> {
+        ColdBudget::read_from(self, file, length)
     }
 
     #[inline]
-    fn open_dvocab_layered(
-        &mut self,
-        prefix: &[(PathBuf, u64)],
-        path: &Path,
-        read_only: bool,
-    ) -> Result<Loaded<crate::vocab::DeltaVocab>> {
-        debug_assert!(
-            read_only,
-            "ColdBudget opens layered delta vocabularies read-only"
-        );
-        crate::vocab::DeltaVocab::open_layered_controlled(prefix, path, self)
+    fn read_mutable_prefix(&mut self, path: &Path) -> Result<Vec<u8>> {
+        ColdBudget::read_mutable_prefix(self, path)
+    }
+
+    #[inline]
+    fn crc32(&self, parts: &[&[u8]]) -> Result<u32> {
+        ColdBudget::crc32(self, parts)
     }
 }
 
@@ -860,23 +960,23 @@ impl<C: BudgetControl> BudgetControl for &mut C {
     }
 
     #[inline(always)]
-    fn open_vocab(&mut self, dir: &Path, fsst: bool) -> Result<Loaded<crate::vocab::Vocab>> {
-        (**self).open_vocab(dir, fsst)
+    fn key_step(&self, stage: &str, at: usize) -> Result<()> {
+        (**self).key_step(stage, at)
     }
 
     #[inline(always)]
-    fn open_dvocab_ro(&mut self, path: &Path) -> Result<Loaded<crate::vocab::DeltaVocab>> {
-        (**self).open_dvocab_ro(path)
+    fn read_from<R: Read>(&mut self, file: &mut R, length: u64) -> Result<Vec<u8>> {
+        (**self).read_from(file, length)
     }
 
     #[inline(always)]
-    fn open_dvocab_layered(
-        &mut self,
-        prefix: &[(PathBuf, u64)],
-        path: &Path,
-        read_only: bool,
-    ) -> Result<Loaded<crate::vocab::DeltaVocab>> {
-        (**self).open_dvocab_layered(prefix, path, read_only)
+    fn read_mutable_prefix(&mut self, path: &Path) -> Result<Vec<u8>> {
+        (**self).read_mutable_prefix(path)
+    }
+
+    #[inline(always)]
+    fn crc32(&self, parts: &[&[u8]]) -> Result<u32> {
+        (**self).crc32(parts)
     }
 }
 

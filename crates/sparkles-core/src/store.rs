@@ -3623,11 +3623,7 @@ impl Store {
         h.materializations += 1;
         h.materialize_nanos += t0.elapsed().as_nanos() as u64;
         let bytes = delta_bytes(&delta);
-        let dvocab_len = if C::ACCOUNTS {
-            generation.dvocab.len_limited(&limit.read_limit())?
-        } else {
-            generation.dvocab.len()
-        };
+        let dvocab_len = generation.dvocab.len_with(&limit)?;
         let mut snap = self
             .snapshot_of(generation, seq)
             .delta(delta)
