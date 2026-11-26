@@ -2100,6 +2100,13 @@ impl PreparedView {
         self.inner.access.read.allows_iri(iri)
     }
 
+    /// Whether the guarded named graph `iri` is readable under this prepared policy:
+    /// either reads are unrestricted, or `iri` is allowed by the read rule and exempted
+    /// by a snapshot-bound guard whose pattern matches `iri`.
+    pub fn allows_guarded_read_iri(&self, iri: &str) -> bool {
+        self.inner.access.allows_guarded_read_iri(iri)
+    }
+
     /// Whether the graph named by `term` (the default graph when `None`) is writable.
     pub fn writable(&self, term: Option<&oxrdf::Term>) -> bool {
         self.inner.access.writable(term)

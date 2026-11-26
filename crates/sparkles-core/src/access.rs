@@ -770,6 +770,28 @@ impl GraphAccess {
         self.write.allows_iri(iri) && self.read.allows_iri(iri)
     }
 
+    /// Whether the guarded named graph `iri` is readable: either reads see every graph
+    /// and triple ([`Self::reads_everything`]), or `self.read` allows `iri` and at least
+    /// one snapshot-bound [`GraphGuard`] whose pattern matches `iri` exempts it.
+    pub fn allows_guarded_read_iri(&self, iri: &str) -> bool {
+        if self.reads_everything() {
+            return true;
+        }
+        if iri == DEFAULT_GRAPH_IRI || iri == UNION_GRAPH_IRI {
+            return false;
+        }
+        let Graphs::Only(rule) = &self.read else {
+            return false;
+        };
+        rule.matches_iri(iri)
+            && rule.guards.iter().any(|g| {
+                g.bound_to.is_some()
+                    && g.decide.is_none()
+                    && glob(&g.pattern, iri)
+                    && g.exempt.binary_search_by(|x| x.as_str().cmp(iri)).is_ok()
+            })
+    }
+
     /// A stable key of the read rule (for caches).
     pub fn read_key(&self) -> String {
         format!("{:?}", self.read)

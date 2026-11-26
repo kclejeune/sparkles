@@ -290,9 +290,7 @@ impl State<'_> {
         let Some(seen) = self.seen.as_mut() else {
             return Ok(false);
         };
-        const LIMIT: usize = 1 << 20;
-        let all = self.reads.subject_triples(s.as_str(), g.as_str(), LIMIT)?;
-        Ok(seen.subject_triples(s.as_str(), g.as_str(), LIMIT)? != all)
+        seen.hides_subject_in_graph(s.as_str(), g.as_str())
     }
 
     fn iri(&mut self, s: &NamedNode, p: &str, g: &G) -> Result<Option<NamedNode>> {

@@ -385,3 +385,148 @@ fn single_identities_charge_their_first_allocations() {
     drop(held);
     assert!(preparation.reserve(LIMIT - 2048).is_ok());
 }
+
+/// Non-IRI subjects (blank nodes) do not consume the IRI-pair or IRI-subject limit
+/// (including at `limit = 0`), partially masked subjects are skipped before counting,
+/// `hides_subject_in_graph` checks the mask directly without count-cap saturation, and
+/// `AdmittedScan` retains its preparation credit until dropped.
+#[test]
+fn admitted_scans_skip_non_iri_and_masked_subjects_and_retain_credit() {
+    use crate::access::{GraphAccess, GraphRule, Graphs, triples};
+    use crate::store::{Store, StoreOptions};
+    use std::sync::Arc;
+
+    let s = Store::in_memory(StoreOptions::default());
+    let g1 = "urn:x-sparkles:graphrag:reports";
+    let g2 = "urn:x-sparkles:graphrag:other";
+    let mut trig = format!("GRAPH <{g1}> {{\n");
+    for i in 0..5 {
+        trig.push_str(&format!("  _:b{i} <urn:p> <urn:target> .\n"));
+    }
+    trig.push_str("  <urn:s:visible> <urn:p> <urn:target> .\n");
+    trig.push_str("  <urn:s:masked> <urn:p> <urn:target> ; <urn:secret> \"hidden\" .\n");
+    for i in 0..20 {
+        trig.push_str(&format!("  <urn:s:masked> <urn:extra> \"v{i}\" .\n"));
+        trig.push_str(&format!("  <urn:s:visible> <urn:extra> \"v{i}\" .\n"));
+    }
+    trig.push_str("}\n");
+    trig.push_str(&format!(
+        "GRAPH <{g2}> {{ <urn:s:visible> <urn:secret> \"other-graph\" . }}\n"
+    ));
+    crate::sparql::update::update(
+        &s,
+        &format!("INSERT DATA {{ {trig} }}"),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+
+    let snap = s.snapshot();
+    let target = Term::NamedNode(NamedNode::new_unchecked("urn:target"));
+
+    // 1. Blank nodes never set `more = true` at limit 0 or consume positive limits.
+    let s_only_bnode = Store::in_memory(StoreOptions::default());
+    crate::sparql::update::update(
+        &s_only_bnode,
+        &format!("INSERT DATA {{ GRAPH <{g1}> {{ _:b0 <urn:p> <urn:target> . }} }}"),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let bnode_snap = s_only_bnode.snapshot();
+    let prep = Preparation::new(crate::task::Control::none(), 1 << 20).unwrap();
+    let mut bnode_reads = Reads::new(&prep, &bnode_snap);
+    let zero_cross = bnode_reads
+        .subjects_in_graphs_up_to("urn:p", &target, 0, false, |_| true)
+        .unwrap();
+    assert!(zero_cross.items.is_empty());
+    assert!(!zero_cross.more);
+    let zero_single = bnode_reads
+        .visible_subjects_up_to("urn:p", &target, g1, 0, false)
+        .unwrap();
+    assert!(zero_single.items.is_empty());
+    assert!(!zero_single.more);
+
+    // Mix of blank nodes before named subjects finds the named subjects with limit = 2.
+    let mut reads = Reads::new(&prep, &snap);
+    let cross = reads
+        .subjects_in_graphs_up_to("urn:p", &target, 2, false, |g| g == g1)
+        .unwrap();
+    assert!(!cross.more);
+    assert_eq!(cross.items.len(), 2);
+
+    // 2. Direct mask lookup detects hidden quads even when capped counts saturate, and
+    //    is scoped to the requested graph.
+    let mask_access = GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::none(),
+        triples::TripleRules {
+            rules: vec![triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "hide-secret".into(),
+                    predicates: Some(vec!["urn:secret".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: Some(Graphs::Only(GraphRule::new([g1, g2], &[]))),
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: triples::Caller::default(),
+            limits: triples::Limits::default(),
+        },
+    );
+    let prepared = mask_access.masked_controlled(&snap, &prep).unwrap();
+    let mut seen = Reads::from_prepared(&prep, &prepared);
+    // A capped count of 10 saturates on both snapshots, missing the hidden quad.
+    assert_eq!(reads.subject_triples("urn:s:masked", g1, 10).unwrap(), 10);
+    assert_eq!(seen.subject_triples("urn:s:masked", g1, 10).unwrap(), 10);
+    // Direct mask inspection does not saturate and distinguishes graphs.
+    assert!(seen.hides_subject_in_graph("urn:s:masked", g1).unwrap());
+    assert!(!seen.hides_subject_in_graph("urn:s:visible", g1).unwrap());
+    assert!(seen.hides_subject_in_graph("urn:s:visible", g2).unwrap());
+
+    // 3. `skip_masked = true` excludes partially masked subjects before checking `limit`.
+    let only_visible = seen
+        .subjects_in_graphs_up_to("urn:p", &target, 1, true, |g| g == g1)
+        .unwrap();
+    assert!(!only_visible.more);
+    assert_eq!(only_visible.items.len(), 1);
+    assert_eq!(only_visible.items[0].0.as_str(), "urn:s:visible");
+    assert_eq!(only_visible.items[0].1.as_str(), g1);
+
+    let single_visible = seen
+        .visible_subjects_up_to("urn:p", &target, g1, 1, true)
+        .unwrap();
+    assert!(!single_visible.more);
+    assert_eq!(single_visible.items.len(), 1);
+    assert_eq!(single_visible.items[0].as_str(), "urn:s:visible");
+
+    // 4. `AdmittedScan` retains its preparation reservation until dropped, and a tight
+    //    allowance refuses before allocating oversized graph/subject IRIs.
+    let long_store = Store::in_memory(StoreOptions::default());
+    let long_graph = format!("urn:x-sparkles:graphrag:{}", "g".repeat(2048));
+    let long_subj = format!("urn:subj:{}", "s".repeat(2048));
+    crate::sparql::update::update(
+        &long_store,
+        &format!(
+            "INSERT DATA {{ GRAPH <{long_graph}> {{ <{long_subj}> <urn:p> <urn:target> . }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let long_snap = long_store.snapshot();
+    const LIMIT: u64 = 512 << 10;
+    let prep_keep = Preparation::new(crate::task::Control::none(), LIMIT).unwrap();
+    let mut long_reads = Reads::new(&prep_keep, &long_snap);
+    let scan = long_reads
+        .subjects_in_graphs_up_to("urn:p", &target, 10, false, |_| true)
+        .unwrap();
+    assert_eq!(scan.items.len(), 1);
+    // While `scan` is alive, its 4 KiB+ of retained IRIs stay charged on top of cache.
+    assert!(prep_keep.reserve(LIMIT - 4096).is_err());
+    drop(scan);
+    drop(long_reads);
+    assert!(prep_keep.reserve(LIMIT - 4096).is_ok());
+}

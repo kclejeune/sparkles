@@ -1144,3 +1144,873 @@ fn report_dependents_bound_counts_only_visible_candidates() {
         "{cancelled:?}"
     );
 }
+
+/// A restricted `GraphAccess` without a snapshot-bound disclosure guard never reads
+/// guarded reports graphs, even when it explicitly grants the reports graph or masks
+/// triples on `Graphs::All`. Applies to both head (`find_dependents`) and historical
+/// (`find_dependents_at`) calls.
+#[test]
+fn report_dependents_require_positive_guard_proof_for_restricted_policies() {
+    use sparkles::access::{Decider, triples};
+
+    let ds = Dataset::memory();
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    evidence::configure(&ds, &settings(), &Control::none()).unwrap();
+    let c = claim(&ds, "advisory");
+    let r = "urn:report:guarded";
+    add_report(&ds, REPORTS, r, Some("urn:comm:1"), &[c.0.as_str()]);
+    let seq = ds.store().head_commit().seq;
+    let view = ds
+        .store()
+        .evidence_view(&sparkles::history::At::Commit(seq), &prep)
+        .unwrap();
+
+    // 1. Bare restricted graph grant explicitly naming REPORTS, with no guard.
+    let bare_grant = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new([REPORTS], &[])),
+        Graphs::none(),
+    ));
+    // 2. Triple-masked Graphs::All with no guard (restricted because it hides triples).
+    let masked_without_guard = Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::none(),
+        triples::TripleRules {
+            rules: vec![triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "hide-other".into(),
+                    predicates: Some(vec!["urn:unrelated:pred".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: triples::Caller::default(),
+            limits: triples::Limits::default(),
+        },
+    ));
+    // 3. Statically constructed unbound guard (not bound to a snapshot).
+    let unbound_static = Arc::new(GraphAccess::graphs(
+        Graphs::All.guarded("urn:x-sparkles:graphrag:*", &[REPORTS.into()]),
+        Graphs::none(),
+    ));
+    for policy in [bare_grant, masked_without_guard, unbound_static] {
+        let head_res = evidence::find_dependents(
+            &ds,
+            &ds,
+            std::slice::from_ref(&c.0),
+            true,
+            Some(policy.clone()),
+            &Control::none(),
+        )
+        .unwrap();
+        assert!(head_res.reports.is_empty(), "{head_res:?}");
+
+        let hist_res = evidence::find_dependents_at(
+            &view,
+            std::slice::from_ref(&c.0),
+            true,
+            Some(policy),
+            &Control::none(),
+        )
+        .unwrap();
+        assert!(hist_res.reports.is_empty(), "{hist_res:?}");
+    }
+
+    // Positive controls: undecided guard bound during the call, and pre-bound policy
+    // matching the exact snapshot.
+    let proven_undecided = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new([REPORTS], &[])).guarded_by(
+            "urn:x-sparkles:graphrag:*",
+            Decider(Arc::new(FixedGuard(vec![REPORTS.into()]))),
+        ),
+        Graphs::none(),
+    ));
+    let proven_prebound = proven_undecided.bound(&ds.store().snapshot());
+    for policy in [proven_undecided, proven_prebound] {
+        let head_res = evidence::find_dependents(
+            &ds,
+            &ds,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(policy.clone()),
+            &Control::none(),
+        )
+        .unwrap();
+        assert_eq!(head_res.reports.len(), 1);
+        assert_eq!(head_res.reports[0].report.as_str(), r);
+
+        let hist_res = evidence::find_dependents_at(
+            &view,
+            std::slice::from_ref(&c.0),
+            false,
+            Some(policy),
+            &Control::none(),
+        )
+        .unwrap();
+        assert_eq!(hist_res.reports.len(), 1);
+        assert_eq!(hist_res.reports[0].report.as_str(), r);
+    }
+}
+
+/// Both `find_dependents` and `find_dependents_at` refuse with `unsupported-profile`
+/// when the evidence profile is unconfigured or disabled at the read view.
+#[test]
+fn dependents_refuses_when_profile_is_disabled_or_unconfigured() {
+    let ds = Dataset::memory();
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    let dummy = iri("urn:claim:any");
+    add_report(&ds, REPORTS, "urn:report:early", None, &[dummy.as_str()]);
+    let pre_seq = ds.store().head_commit().seq;
+    let pre_view = ds
+        .store()
+        .evidence_view(&sparkles::history::At::Commit(pre_seq), &prep)
+        .unwrap();
+
+    // Historical view captured before evidence::configure must refuse.
+    let err = evidence::find_dependents_at(
+        &pre_view,
+        std::slice::from_ref(&dummy),
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "unsupported-profile", "{err:?}");
+
+    // A dataset configured with `enabled: false` must refuse both head and historical calls.
+    let disabled = Settings {
+        enabled: false,
+        ..Settings::default()
+    };
+    evidence::configure(&ds, &disabled, &Control::none()).unwrap();
+    let dis_seq = ds.store().head_commit().seq;
+    let dis_view = ds
+        .store()
+        .evidence_view(&sparkles::history::At::Commit(dis_seq), &prep)
+        .unwrap();
+
+    let head_err = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&dummy),
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert_eq!(head_err.code(), "unsupported-profile", "{head_err:?}");
+
+    let hist_err = evidence::find_dependents_at(
+        &dis_view,
+        std::slice::from_ref(&dummy),
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert_eq!(hist_err.code(), "unsupported-profile", "{hist_err:?}");
+}
+
+/// Partially masked activities, reports and edits are excluded before charging
+/// `MAX_EVIDENCE`, so >10,000 partially masked records do not trigger
+/// `incomplete-evidence` and produce the exact same result as a dataset without them.
+#[test]
+fn partially_masked_records_do_not_trigger_candidate_bound() {
+    use sparkles::access::{Decider, triples};
+
+    let hide_secret = || {
+        Arc::new(GraphAccess::with_triples(
+            Graphs::All.guarded_by(
+                "urn:x-sparkles:graphrag:*",
+                Decider(Arc::new(FixedGuard(vec![REPORTS.into()]))),
+            ),
+            Graphs::none(),
+            triples::TripleRules {
+                rules: vec![triples::Rule {
+                    protection: Arc::new(triples::Protection {
+                        name: "hide-secret".into(),
+                        predicates: Some(vec!["urn:secret:tag".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: Some(Graphs::Only(GraphRule::new([REPORTS], &[]))),
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: triples::Caller::default(),
+                limits: triples::Limits::default(),
+            },
+        ))
+    };
+
+    // Baseline dataset with only the one visible report (and one visible edit).
+    let baseline = configured();
+    let c_base = claim(&baseline, "advisory");
+    let vis_rep = "urn:report:visible";
+    let vis_edit = "urn:report:visible-edit";
+    add_report(
+        &baseline,
+        REPORTS,
+        vis_rep,
+        Some("urn:comm:v"),
+        &[c_base.0.as_str()],
+    );
+    add_report_edit(&baseline, REPORTS, vis_edit, vis_rep, "urn:comm:v");
+    let expected = evidence::find_dependents(
+        &baseline,
+        &baseline,
+        std::slice::from_ref(&c_base.0),
+        true,
+        Some(hide_secret()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(expected.reports.len(), 2);
+
+    let shape = |reps: &[evidence::ReportDependent], expected_on: &NamedNode| {
+        reps.iter()
+            .map(|r| {
+                assert_eq!(&r.on, expected_on);
+                (
+                    r.report.clone(),
+                    r.community.clone(),
+                    r.graph.clone(),
+                    r.dependence,
+                    r.depth,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected_shape = shape(&expected.reports, &c_base.0);
+
+    // 1. 10,001 partially masked reports pointing to the visible activity.
+    let ds_reps = configured();
+    let c = claim(&ds_reps, "advisory");
+    add_report(
+        &ds_reps,
+        REPORTS,
+        vis_rep,
+        Some("urn:comm:v"),
+        &[c.0.as_str()],
+    );
+    add_report_edit(&ds_reps, REPORTS, vis_edit, vis_rep, "urn:comm:v");
+    let mut trig = format!("GRAPH <{REPORTS}> {{\n");
+    for i in 0..10_001 {
+        trig.push_str(&format!(
+            "<urn:rep:masked:{i}> <{RDF_TYPE}> <{GR}Report> ; \
+             <{PROV_WAS_GENERATED_BY}> <{vis_rep}#activity> ; \
+             <urn:secret:tag> \"x\" .\n"
+        ));
+    }
+    trig.push_str("}\n");
+    ds_reps
+        .update(&format!("INSERT DATA {{ {trig} }}"))
+        .unwrap();
+    let got_reps = evidence::find_dependents(
+        &ds_reps,
+        &ds_reps,
+        std::slice::from_ref(&c.0),
+        true,
+        Some(hide_secret()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(shape(&got_reps.reports, &c.0), expected_shape);
+
+    // 2. 10,001 partially masked activities using the claim.
+    let ds_acts = configured();
+    let c2 = claim(&ds_acts, "advisory");
+    add_report(
+        &ds_acts,
+        REPORTS,
+        vis_rep,
+        Some("urn:comm:v"),
+        &[c2.0.as_str()],
+    );
+    add_report_edit(&ds_acts, REPORTS, vis_edit, vis_rep, "urn:comm:v");
+    let mut trig = format!("GRAPH <{REPORTS}> {{\n");
+    for i in 0..10_001 {
+        trig.push_str(&format!(
+            "<urn:act:masked:{i}> <{RDF_TYPE}> <{PROV_ACTIVITY}> ; \
+             <{PROV_USED}> <{}> ; <urn:secret:tag> \"x\" .\n",
+            c2.0.as_str()
+        ));
+    }
+    trig.push_str("}\n");
+    ds_acts
+        .update(&format!("INSERT DATA {{ {trig} }}"))
+        .unwrap();
+    let got_acts = evidence::find_dependents(
+        &ds_acts,
+        &ds_acts,
+        std::slice::from_ref(&c2.0),
+        true,
+        Some(hide_secret()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(shape(&got_acts.reports, &c2.0), expected_shape);
+
+    // 3. 10,001 partially masked edits of the visible report.
+    let ds_edits = configured();
+    let c3 = claim(&ds_edits, "advisory");
+    add_report(
+        &ds_edits,
+        REPORTS,
+        vis_rep,
+        Some("urn:comm:v"),
+        &[c3.0.as_str()],
+    );
+    add_report_edit(&ds_edits, REPORTS, vis_edit, vis_rep, "urn:comm:v");
+    let mut trig = format!("GRAPH <{REPORTS}> {{\n");
+    for i in 0..10_001 {
+        trig.push_str(&format!(
+            "<urn:edit:masked:{i}> <{RDF_TYPE}> <{GR}Report> ; \
+             <{GR}editOf> <{vis_rep}> ; <urn:secret:tag> \"x\" .\n"
+        ));
+    }
+    trig.push_str("}\n");
+    ds_edits
+        .update(&format!("INSERT DATA {{ {trig} }}"))
+        .unwrap();
+    let got_edits = evidence::find_dependents(
+        &ds_edits,
+        &ds_edits,
+        std::slice::from_ref(&c3.0),
+        true,
+        Some(hide_secret()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(shape(&got_edits.reports, &c3.0), expected_shape);
+}
+
+/// Masking a triple on `<report#activity>` omits the report and prevents transitive
+/// traversal to parents even when the report itself has no hidden triples.
+#[test]
+fn report_dependents_omit_report_when_activity_is_masked() {
+    use sparkles::access::{Decider, triples};
+
+    let ds = configured();
+    let c = claim(&ds, "advisory");
+    let leaf = "urn:report:leaf";
+    let parent = "urn:report:parent";
+    add_report(&ds, REPORTS, leaf, Some("urn:comm:1"), &[c.0.as_str()]);
+    add_report(&ds, REPORTS, parent, Some("urn:comm:0"), &[leaf]);
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{REPORTS}> {{ <{leaf}#activity> <urn:sparkles:model> \"secret-model\" . }} }}"
+    ))
+    .unwrap();
+
+    let mask_activity = Arc::new(GraphAccess::with_triples(
+        Graphs::All.guarded_by(
+            "urn:x-sparkles:graphrag:*",
+            Decider(Arc::new(FixedGuard(vec![REPORTS.into()]))),
+        ),
+        Graphs::none(),
+        triples::TripleRules {
+            rules: vec![triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "hide-model".into(),
+                    predicates: Some(vec!["urn:sparkles:model".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: Some(Graphs::Only(GraphRule::new([REPORTS], &[]))),
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: triples::Caller::default(),
+            limits: triples::Limits::default(),
+        },
+    ));
+    let hidden = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&c.0),
+        true,
+        Some(mask_activity),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(hidden.reports.is_empty(), "{hidden:?}");
+
+    // Control without mask sees both leaf and parent.
+    let visible = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&c.0),
+        true,
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(visible.reports.len(), 2);
+}
+
+/// Direct lookup by an edited report IRI requires the predecessor to be a visible,
+/// unmasked `gr:Report` in that proven graph. Missing or masked predecessors yield
+/// nothing, while a visible predecessor yields its edit chain and transitive parents.
+#[test]
+fn direct_edit_lookup_requires_visible_unmasked_predecessor() {
+    use sparkles::access::{Decider, triples};
+
+    let ds = configured();
+    let missing = iri("urn:report:missing");
+    let masked_base = iri("urn:report:masked-base");
+    let visible_base = iri("urn:report:visible-base");
+    let edit_missing = "urn:report:edit-missing";
+    let edit_masked = "urn:report:edit-masked";
+    let parent_masked = "urn:report:parent-of-masked-edit";
+    let edit_vis_1 = "urn:report:edit-vis-1";
+    let edit_vis_2 = "urn:report:edit-vis-2";
+    let parent_vis = "urn:report:parent-vis";
+
+    add_report_edit(&ds, REPORTS, edit_missing, missing.as_str(), "urn:comm:m");
+    add_report(
+        &ds,
+        REPORTS,
+        masked_base.as_str(),
+        Some("urn:comm:mb"),
+        &["urn:claim:x"],
+    );
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{REPORTS}> {{ <{}> <urn:secret:tag> \"x\" . }} }}",
+        masked_base.as_str()
+    ))
+    .unwrap();
+    add_report_edit(
+        &ds,
+        REPORTS,
+        edit_masked,
+        masked_base.as_str(),
+        "urn:comm:mb",
+    );
+    add_report(
+        &ds,
+        REPORTS,
+        parent_masked,
+        Some("urn:comm:pm"),
+        &[edit_masked],
+    );
+
+    add_report(
+        &ds,
+        REPORTS,
+        visible_base.as_str(),
+        Some("urn:comm:vb"),
+        &["urn:claim:y"],
+    );
+    add_report_edit(
+        &ds,
+        REPORTS,
+        edit_vis_1,
+        visible_base.as_str(),
+        "urn:comm:vb",
+    );
+    add_report_edit(&ds, REPORTS, edit_vis_2, edit_vis_1, "urn:comm:vb");
+    add_report(&ds, REPORTS, parent_vis, Some("urn:comm:pv"), &[edit_vis_2]);
+
+    // 1. Missing predecessor returns no reports.
+    let res_missing = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&missing),
+        true,
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(res_missing.reports.is_empty(), "{res_missing:?}");
+
+    // 2. Masked predecessor hides its visible edit and transitive parent.
+    let mask_access = Arc::new(GraphAccess::with_triples(
+        Graphs::All.guarded_by(
+            "urn:x-sparkles:graphrag:*",
+            Decider(Arc::new(FixedGuard(vec![REPORTS.into()]))),
+        ),
+        Graphs::none(),
+        triples::TripleRules {
+            rules: vec![triples::Rule {
+                protection: Arc::new(triples::Protection {
+                    name: "hide-secret".into(),
+                    predicates: Some(vec!["urn:secret:tag".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: Some(Graphs::Only(GraphRule::new([REPORTS], &[]))),
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: triples::Caller::default(),
+            limits: triples::Limits::default(),
+        },
+    ));
+    let res_masked = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&masked_base),
+        true,
+        Some(mask_access.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(res_masked.reports.is_empty(), "{res_masked:?}");
+
+    // 3. Visible unmasked predecessor returns its edit chain (depth 0) and parent (depth 1).
+    let res_vis = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&visible_base),
+        true,
+        Some(mask_access),
+        &Control::none(),
+    )
+    .unwrap();
+    let got: Vec<(&str, &str, u32)> = res_vis
+        .reports
+        .iter()
+        .map(|r| (r.report.as_str(), r.on.as_str(), r.depth))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (edit_vis_1, visible_base.as_str(), 0),
+            (edit_vis_2, visible_base.as_str(), 0),
+            (parent_vis, edit_vis_2, 1),
+        ]
+    );
+}
+
+/// Duplicate IRIs in `changed`, transitive `gr:editOf` chains near `MAX_EVIDENCE`,
+/// blank-node subjects, and cyclic `gr:editOf` / `prov:used` graphs all avoid
+/// double-counting and terminate cleanly.
+#[test]
+fn repeated_inputs_transitive_edits_blank_nodes_and_cycles_behave_cleanly() {
+    // 1. Repeated `changed` IRIs do not double-count near MAX_EVIDENCE, and blank-node
+    //    subjects do not consume the candidate budget.
+    let ds = configured();
+    let c = claim(&ds, "advisory");
+    let mut trig = format!("GRAPH <{REPORTS}> {{\n");
+    trig.push_str(&format!(
+        "<urn:act:0> <{RDF_TYPE}> <{PROV_ACTIVITY}> ; <{PROV_USED}> <{}> .\n",
+        c.0.as_str()
+    ));
+    for i in 0..5_500 {
+        trig.push_str(&format!(
+            "<urn:rep:{i}> <{RDF_TYPE}> <{GR}Report> ; <{PROV_WAS_GENERATED_BY}> <urn:act:0> .\n"
+        ));
+    }
+    for i in 0..500 {
+        trig.push_str(&format!(
+            "_:bact{i} <{PROV_USED}> <{}> .\n_:brep{i} <{PROV_WAS_GENERATED_BY}> <urn:act:0> .\n",
+            c.0.as_str()
+        ));
+    }
+    trig.push_str("}\n");
+    ds.update(&format!("INSERT DATA {{ {trig} }}")).unwrap();
+    let once = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&c.0),
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let repeated = evidence::find_dependents(
+        &ds,
+        &ds,
+        &[c.0.clone(), c.0.clone(), c.0.clone()],
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(once.reports.len(), 5_500);
+    assert_eq!(repeated.reports, once.reports);
+
+    // 2. Transitive `gr:editOf` edges are not double-scanned/double-counted.
+    //    1 activity + 1 base report + 6,000 edits = 6,002 <= 10,000 (double-counting
+    //    would hit 12,002 and falsely refuse with `incomplete-evidence`).
+    let ds_edits = configured();
+    let c2 = claim(&ds_edits, "advisory");
+    add_report(&ds_edits, REPORTS, "urn:rep:base", None, &[c2.0.as_str()]);
+    let mut trig = format!("GRAPH <{REPORTS}> {{\n");
+    for i in 0..6_000 {
+        trig.push_str(&format!(
+            "<urn:edit:{i}> <{RDF_TYPE}> <{GR}Report> ; <{GR}editOf> <urn:rep:base> .\n"
+        ));
+    }
+    trig.push_str("}\n");
+    ds_edits
+        .update(&format!("INSERT DATA {{ {trig} }}"))
+        .unwrap();
+    let trans_edits = evidence::find_dependents(
+        &ds_edits,
+        &ds_edits,
+        std::slice::from_ref(&c2.0),
+        true,
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(trans_edits.reports.len(), 6_001);
+
+    // 3. Cyclic `gr:editOf` (2-cycle + self-loop) and cyclic `prov:used` terminate cleanly.
+    let ds_cyc = configured();
+    let c3 = claim(&ds_cyc, "advisory");
+    add_report(&ds_cyc, REPORTS, "urn:cyc:r1", None, &[c3.0.as_str()]);
+    add_report_edit(&ds_cyc, REPORTS, "urn:cyc:r2", "urn:cyc:r1", "urn:comm:c");
+    add_report_edit(&ds_cyc, REPORTS, "urn:cyc:r1", "urn:cyc:r2", "urn:comm:c");
+    add_report_edit(&ds_cyc, REPORTS, "urn:cyc:r1", "urn:cyc:r1", "urn:comm:c");
+    add_report(
+        &ds_cyc,
+        REPORTS,
+        "urn:cyc:p1",
+        None,
+        &["urn:cyc:r2", "urn:cyc:p2"],
+    );
+    add_report(&ds_cyc, REPORTS, "urn:cyc:p2", None, &["urn:cyc:p1"]);
+    let cyc = evidence::find_dependents(
+        &ds_cyc,
+        &ds_cyc,
+        std::slice::from_ref(&c3.0),
+        true,
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let got: Vec<(&str, u32)> = cyc
+        .reports
+        .iter()
+        .map(|r| (r.report.as_str(), r.depth))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("urn:cyc:r1", 0),
+            ("urn:cyc:r2", 0),
+            ("urn:cyc:p1", 1),
+            ("urn:cyc:p2", 2),
+        ]
+    );
+}
+
+/// A long stored input IRI repeated across reports is charged against the preparation
+/// allowance before cloning `on` into retained results.
+#[test]
+fn long_input_iri_repeated_across_reports_hits_memory_budget() {
+    let ds = configured();
+    let long_input = NamedNode::new(format!("urn:input:{}", "x".repeat(64 * 1024))).unwrap();
+    let mut trig = format!("GRAPH <{REPORTS}> {{\n");
+    trig.push_str(&format!(
+        "<urn:act:0> <{RDF_TYPE}> <{PROV_ACTIVITY}> ; <{PROV_USED}> <{}> .\n",
+        long_input.as_str()
+    ));
+    for i in 0..300 {
+        trig.push_str(&format!(
+            "<urn:rep:{i}> <{RDF_TYPE}> <{GR}Report> ; <{PROV_WAS_GENERATED_BY}> <urn:act:0> .\n"
+        ));
+    }
+    trig.push_str("}\n");
+    ds.update(&format!("INSERT DATA {{ {trig} }}")).unwrap();
+
+    // 300 copies of a 64 KiB `on` IRI exceed the 16 MiB preparation budget despite
+    // staying well below the 10,000-candidate limit.
+    let err = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&long_input),
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, sparkles::Error::BudgetExceeded(_)), "{err:?}");
+}
+
+/// An undecided legacy write guard on `access.write` does not force view preparation or
+/// fail read-only `find_dependents`.
+#[test]
+fn undecided_write_guard_does_not_block_read_only_dependents() {
+    use sparkles::access::{Decider, GuardDecision};
+
+    struct LegacyWriteGuard;
+    impl GuardDecision for LegacyWriteGuard {
+        fn exempt(&self, _snap: &Arc<sparkles::store::Snapshot>) -> Vec<String> {
+            Vec::new()
+        }
+        // Uses default `exempt_controlled`, which returns `Error::Unsupported`.
+    }
+
+    let ds = configured();
+    let c = claim(&ds, "advisory");
+    add_report(&ds, REPORTS, "urn:report:ok", None, &[c.0.as_str()]);
+    let write_guarded = Arc::new(GraphAccess::graphs(
+        Graphs::All,
+        Graphs::All.guarded_by("urn:g:*", Decider(Arc::new(LegacyWriteGuard))),
+    ));
+    let res = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(write_guarded),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(res.reports.len(), 1);
+    assert_eq!(res.reports[0].report.as_str(), "urn:report:ok");
+}
+
+/// Historical `find_dependents_at` binds undecided guards and triple protections against
+/// the exact historical snapshot rather than head.
+#[test]
+fn historical_dependents_bind_guard_and_mask_to_selected_snapshot() {
+    use sparkles::access::{Decider, GuardDecision, triples};
+
+    struct CommitAwareGuard {
+        allow_commit: u64,
+    }
+    impl GuardDecision for CommitAwareGuard {
+        fn exempt(&self, snap: &Arc<sparkles::store::Snapshot>) -> Vec<String> {
+            if snap.commit == self.allow_commit {
+                vec![REPORTS.into()]
+            } else {
+                Vec::new()
+            }
+        }
+        fn exempt_controlled(
+            &self,
+            snap: &sparkles::access::GuardSnapshot<'_>,
+            preparation: &sparkles::access::Preparation,
+        ) -> sparkles::Result<sparkles::access::Exemptions> {
+            let mut out = sparkles::access::Exemptions::new(preparation)?;
+            if snap.commit() == self.allow_commit {
+                out.push(REPORTS)?;
+            }
+            Ok(out)
+        }
+    }
+
+    let ds = Dataset::memory();
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    evidence::configure(&ds, &settings(), &Control::none()).unwrap();
+    let c = claim(&ds, "advisory");
+    let r = "urn:report:hist";
+    add_report(&ds, REPORTS, r, Some("urn:comm:1"), &[c.0.as_str()]);
+    let at_v1 = ds.store().head_commit().seq;
+    let view_v1 = ds
+        .store()
+        .evidence_view(&sparkles::history::At::Commit(at_v1), &prep)
+        .unwrap();
+
+    // After v1, add a triple on `r` that a triple protection masks.
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{REPORTS}> {{ <{r}> <urn:secret:tag> \"added-later\" . }} }}"
+    ))
+    .unwrap();
+    let at_head = ds.store().head_commit().seq;
+    assert_ne!(at_v1, at_head);
+
+    let mask_later = |allow_commit: u64| {
+        Arc::new(GraphAccess::with_triples(
+            Graphs::All.guarded_by(
+                "urn:x-sparkles:graphrag:*",
+                Decider(Arc::new(CommitAwareGuard { allow_commit })),
+            ),
+            Graphs::none(),
+            triples::TripleRules {
+                rules: vec![triples::Rule {
+                    protection: Arc::new(triples::Protection {
+                        name: "hide-secret".into(),
+                        predicates: Some(vec!["urn:secret:tag".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: Some(Graphs::Only(GraphRule::new([REPORTS], &[]))),
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: triples::Caller::default(),
+                limits: triples::Limits::default(),
+            },
+        ))
+    };
+
+    // Guard proves at v1 (and secret tag does not exist yet at v1): historical read sees `r`,
+    // while head read sees nothing (guard denies at head AND secret tag masks `r` at head).
+    let policy_v1 = mask_later(at_v1);
+    let hist = evidence::find_dependents_at(
+        &view_v1,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(policy_v1.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(hist.reports.len(), 1);
+    assert_eq!(hist.reports[0].report.as_str(), r);
+
+    let head = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(policy_v1),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(head.reports.is_empty());
+
+    // Guard proves only at head: historical read sees nothing, and head still hides `r`
+    // because the triple mask hides `urn:secret:tag` at head.
+    let policy_head = mask_later(at_head);
+    let hist_denied = evidence::find_dependents_at(
+        &view_v1,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(policy_head.clone()),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(hist_denied.reports.is_empty());
+
+    let head_masked = evidence::find_dependents(
+        &ds,
+        &ds,
+        std::slice::from_ref(&c.0),
+        false,
+        Some(policy_head),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(head_masked.reports.is_empty());
+}
