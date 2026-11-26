@@ -686,7 +686,15 @@ fn classify_el_and_horn_partial_under_deadline() {
             let t = format!("{}", ms as f64 / 1000.0);
             let o = sparkles(dir, &[&args[..], &["--partial", "--timeout", &t]].concat());
             let Ok(j) = serde_json::from_slice::<serde_json::Value>(&o.stdout) else {
-                assert_eq!(o.status.code(), Some(1), "{tier}: {}", err(&o));
+                let stderr = err(&o);
+                let stdout = out(&o);
+                let lower = stderr.to_ascii_lowercase();
+                assert!(
+                    o.status.code() == Some(1)
+                        && (lower.contains("timed out") || lower.contains("deadline")),
+                    "{tier}: unexpected non-JSON result at {ms}ms (status={:?}, stdout={stdout:?}, stderr={stderr:?})",
+                    o.status.code(),
+                );
                 trace.push((ms, Probe::TimedOut));
                 return Probe::TimedOut;
             };
@@ -712,16 +720,14 @@ fn classify_el_and_horn_partial_under_deadline() {
         };
 
         let mut saw_partial = false;
-        let mut lo_timeout: Option<u64> = None;
         let mut hi_complete: Option<u64> = None;
 
-        // Seed probes directly inside the measured saturation window.
+        // Seed probes directly inside the measured saturation window. A deadline that
+        // expires during post-saturation taxonomy also returns `Probe::TimedOut`, so
+        // timeouts never prune smaller deadlines; only `Probe::Complete` is an upper bound.
         for frac in [0.25, 0.50, 0.12, 0.70, 0.06] {
             let ms = (index_ms + sat_ms * frac).round().max(1.0) as u64;
-            if trace.iter().any(|&(tried, _)| tried == ms)
-                || hi_complete.is_some_and(|h| ms >= h)
-                || lo_timeout.is_some_and(|l| ms <= l)
-            {
+            if trace.iter().any(|&(tried, _)| tried == ms) || hi_complete.is_some_and(|h| ms >= h) {
                 continue;
             }
             match probe(ms, &mut trace) {
@@ -732,19 +738,21 @@ fn classify_el_and_horn_partial_under_deadline() {
                 Probe::Complete => {
                     hi_complete = Some(hi_complete.map_or(ms, |h| h.min(ms)));
                 }
-                Probe::TimedOut => {
-                    if hi_complete.is_none_or(|h| ms < h) {
-                        lo_timeout = Some(lo_timeout.map_or(ms, |l| l.max(ms)));
-                    }
-                }
+                Probe::TimedOut => {}
             }
         }
 
-        // Adaptive bracket + binary search fallback if machine speed shifted sharply.
+        // Adaptive fallback if machine speed shifted sharply relative to calibration.
+        // First bracket an upper bound if every seed timed out.
         if !saw_partial && hi_complete.is_none() {
-            let mut ms = lo_timeout.unwrap_or(2).max(2);
+            let mut ms = trace
+                .iter()
+                .map(|&(tried, _)| tried)
+                .max()
+                .unwrap_or(2)
+                .max(2);
             while ms < limit {
-                ms = (ms * 3 / 2).max(ms + 1).min(limit);
+                ms = ms.saturating_add((ms / 2).max(1)).min(limit);
                 match probe(ms, &mut trace) {
                     Probe::Partial => {
                         saw_partial = true;
@@ -754,49 +762,80 @@ fn classify_el_and_horn_partial_under_deadline() {
                         hi_complete = Some(ms);
                         break;
                     }
-                    Probe::TimedOut => {
-                        lo_timeout = Some(ms);
-                    }
+                    Probe::TimedOut => {}
                 }
             }
         }
-        if !saw_partial && lo_timeout.is_none() {
-            let mut ms = hi_complete.unwrap_or(2);
+        // Sweep downward by halving from the tightest complete bound without stopping on
+        // timeouts, so a post-saturation taxonomy timeout cannot trap the search above the
+        // saturation window.
+        if !saw_partial {
+            let mut ms = hi_complete.unwrap_or(limit);
             while ms > 1 {
                 ms /= 2;
+                if trace.iter().any(|&(tried, _)| tried == ms) {
+                    continue;
+                }
                 match probe(ms, &mut trace) {
                     Probe::Partial => {
                         saw_partial = true;
                         break;
                     }
                     Probe::Complete => {
-                        hi_complete = Some(ms);
+                        hi_complete = Some(hi_complete.map_or(ms, |h| h.min(ms)));
                     }
-                    Probe::TimedOut => {
-                        lo_timeout = Some(ms);
-                        break;
-                    }
+                    Probe::TimedOut => {}
                 }
             }
         }
+        // Probe across the full `(0, hi)` range in dyadic order so gaps below a taxonomy
+        // timeout are revisited, then refine near `hi` and retry against transient jitter.
         if !saw_partial {
-            let mut lo = lo_timeout.unwrap_or(0);
             let mut hi = hi_complete.unwrap_or(limit);
-            while hi > lo + 1 {
-                let mid = (lo + hi) / 2;
-                match probe(mid, &mut trace) {
-                    Probe::Partial => {
-                        saw_partial = true;
-                        break;
+            let span = hi;
+            let mut denom = 2u64;
+            'sweep: while denom <= 32 && denom < span.saturating_mul(2) {
+                let mut num = 1u64;
+                while num < denom {
+                    let ms = ((span as u128 * num as u128) / denom as u128) as u64;
+                    num += 2;
+                    if ms == 0 || ms >= hi || trace.iter().any(|&(tried, _)| tried == ms) {
+                        continue;
                     }
-                    Probe::Complete => hi = mid,
-                    Probe::TimedOut => lo = mid,
+                    match probe(ms, &mut trace) {
+                        Probe::Partial => {
+                            saw_partial = true;
+                            break 'sweep;
+                        }
+                        Probe::Complete => hi = hi.min(ms),
+                        Probe::TimedOut => {}
+                    }
+                }
+                denom *= 2;
+            }
+            if !saw_partial {
+                let mut lo = trace
+                    .iter()
+                    .filter(|&&(tried, outcome)| outcome == Probe::TimedOut && tried < hi)
+                    .map(|&(tried, _)| tried)
+                    .max()
+                    .unwrap_or(0);
+                while hi > lo + 1 {
+                    let mid = lo + (hi - lo) / 2;
+                    match probe(mid, &mut trace) {
+                        Probe::Partial => {
+                            saw_partial = true;
+                            break;
+                        }
+                        Probe::Complete => hi = mid,
+                        Probe::TimedOut => lo = mid,
+                    }
                 }
             }
             if !saw_partial {
                 for retry in [
                     hi.saturating_sub(1).max(1),
-                    hi,
+                    hi.max(1),
                     (index_ms + sat_ms * 0.35).round().max(1.0) as u64,
                 ] {
                     if probe(retry, &mut trace) == Probe::Partial {
