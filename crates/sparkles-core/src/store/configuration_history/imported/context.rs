@@ -190,26 +190,25 @@ impl Retained {
 
     /// Prove a retained older main generation (`gen_name != self.generation_name`)
     /// through `seq` and its required complete imported intervals using the already
-    /// authenticated `self.sources`, then resolve the WAL commit's binding.
+    /// authenticated `self.sources`, then resolve the WAL commit's binding strictly
+    /// from the authoritative proof's observation for `seq`.
     /// Caller holds history exclusion so `gen_dir` stays alive during proof.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::store) fn resolve_retained_wal_binding(
         &self,
         family: &crate::store::family::Family,
         gen_dir: &Path,
         gen_name: &str,
         actual: &crate::commit::RetainedGenerationCommit,
-        start_offset: u64,
-        end_offset: u64,
         seq: u64,
-        digest: Option<Sha256Digest>,
         preparation: &Preparation,
-    ) -> Result<Option<ConfigurationBinding>> {
+    ) -> Result<ConfigurationBinding> {
         preparation.check()?;
         family.verify_origin_lock(&self.root, &self.lock)?;
         family.check_origin_selection(opening_origin_selection(&self.root, preparation)?)?;
         if !self.has_ranges_for(gen_name) {
-            return Ok(None);
+            return Err(managed_history::unavailable(
+                "retained generation has no declared imported ranges",
+            ));
         }
         let local = Location {
             branch: None,
@@ -292,19 +291,20 @@ impl Retained {
             ));
         }
         // Scope proof to `seq` and every imported interval that starts at or before `seq`.
-        let mut needed = Vec::new();
+        ranges.retain(|range| range.span.first_seq <= seq);
+        let mut needed = ranges;
         let mut spans = Vec::new();
-        for range in ranges {
-            if range.span.first_seq <= seq {
-                spans.push(physical::Span {
-                    start: range.span.start,
-                    end: range.span.end,
-                    sha256: range.span.sha256,
-                    first_seq: range.span.first_seq,
-                    last_seq: range.span.last_seq,
-                });
-                needed.push(range);
-            }
+        spans
+            .try_reserve_exact(needed.len())
+            .map_err(|_| preparation.exhausted())?;
+        for range in &needed {
+            spans.push(physical::Span {
+                start: range.span.start,
+                end: range.span.end,
+                sha256: range.span.sha256,
+                first_seq: range.span.first_seq,
+                last_seq: range.span.last_seq,
+            });
         }
         let proof_target = spans.last().map_or(seq, |s| seq.max(s.last_seq));
         let state = family.managed.load_full();
@@ -346,6 +346,7 @@ impl Retained {
         let file = std::fs::File::open(&wal_path)?;
         let extent = file.metadata()?.len();
         let mut config_error = None;
+        let mut selected_obs = None;
         let _ = physical::prove_prefix_through(
             file,
             &spans,
@@ -356,7 +357,7 @@ impl Retained {
             annotations.value.as_deref(),
             &wal_path,
             &mut budget,
-            &mut |observation| {
+            &mut |observation, _| {
                 if config_error.is_none() {
                     let matched = needed.iter_mut().find(|r| {
                         (r.span.start <= observation.start_offset
@@ -381,6 +382,14 @@ impl Retained {
                     };
                     if let Err(error) = result {
                         config_error = Some(error);
+                    } else if observation.point.seq == seq {
+                        if selected_obs.is_some() {
+                            config_error = Some(managed_history::unavailable(
+                                "retained WAL proof observed duplicate selected commit",
+                            ));
+                        } else {
+                            selected_obs = Some(observation);
+                        }
                     }
                 }
                 Ok(())
@@ -389,21 +398,48 @@ impl Retained {
         if let Some(error) = config_error {
             return Err(error);
         }
+        let selected = selected_obs.ok_or_else(|| {
+            managed_history::unavailable("retained WAL proof has no selected binding")
+        })?;
         drop(annotations);
         drop(vocabulary);
         let _ = budget;
         drop(_loan);
         family.verify_origin_lock(&self.root, &self.lock)?;
         family.check_origin_selection(opening_origin_selection(&self.root, preparation)?)?;
-        resolve_binding_in_ranges(
+        if let Some(imported) = resolve_binding_in_ranges(
             &self.sources,
             &needed,
-            start_offset,
-            end_offset,
-            seq,
-            digest,
+            selected.start_offset,
+            selected.point.offset,
+            selected.point.seq,
+            selected.configuration,
             preparation,
-        )
+        )? {
+            return Ok(imported);
+        }
+        match selected.configuration {
+            Some(generation) => {
+                let installed = match state.as_deref() {
+                    Some(crate::managed::ManagedState::Installed(installed)) => Some(installed),
+                    Some(crate::managed::ManagedState::Unavailable { reason, .. }) => {
+                        return Err(managed_history::unavailable(reason.clone()));
+                    }
+                    None => None,
+                };
+                let history = installed
+                    .and_then(|i| i.configuration_history.as_ref())
+                    .ok_or_else(|| {
+                        managed_history::unavailable("WAL binding has no published lineage")
+                    })?;
+                Ok(managed_history::binding(ConfigurationIdentity {
+                    dataset_id: actual.dataset_id,
+                    lineage_id: history.lineage_id,
+                    generation,
+                }))
+            }
+            None => Ok(ConfigurationBinding::LegacyUnbound),
+        }
     }
 
     /// Authenticate an `ImportedUnbound` identity against this opening's retained
@@ -810,7 +846,7 @@ impl Pending {
             from.annotated.map(|_| membership.as_slice()),
             from.path,
             &mut budget,
-            &mut |observation| {
+            &mut |observation, _| {
                 if publication_error.is_none() {
                     publication_error = self.observation(observation, preparation).err();
                 }

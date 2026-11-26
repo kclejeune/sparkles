@@ -419,7 +419,6 @@ fn inspect_generation(
         {
             let file = reader.into_inner();
             budget.release(reader_charge);
-            let temporary = metadata_preparation(budget)?;
             closure.prove_wal(
                 family_root,
                 directory,
@@ -433,7 +432,6 @@ fn inspect_generation(
                 &path,
                 native,
                 budget,
-                &temporary,
             )?;
             return Ok(());
         }

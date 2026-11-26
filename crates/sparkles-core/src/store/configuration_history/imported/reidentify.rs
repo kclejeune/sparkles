@@ -32,6 +32,26 @@ pub(super) struct DiskNode {
     pub(super) directory: documents::Opened,
 }
 
+#[cfg(test)]
+pub(in crate::store) type ProveWalStageHook = Option<Box<dyn FnMut(&str, u64)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only stage observer for `DiskClosure::prove_wal` that reports
+    /// `(stage, budget.used())` at admission boundaries.
+    pub(in crate::store) static PROVE_WAL_STAGE_HOOK: std::cell::RefCell<ProveWalStageHook> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn prove_wal_stage_hook(_stage: &str, _used: u64) {
+    #[cfg(test)]
+    PROVE_WAL_STAGE_HOOK.with(|hook| {
+        if let Some(cb) = hook.borrow_mut().as_mut() {
+            cb(_stage, _used);
+        }
+    });
+}
+
 impl DiskClosure {
     /// Load and authenticate `evidence-history/origin.json` and every declared
     /// imported source under `evidence-history/imports/`. Returns `Ok(None)` if
@@ -491,157 +511,226 @@ impl DiskClosure {
         wal_path: &Path,
         native: &mut primary::Header,
         budget: &mut ColdBudget<'_>,
-        preparation: &Preparation,
     ) -> Result<()> {
-        let local = Location {
-            branch: None,
-            generation: gen_name.to_owned(),
-        };
-        struct DiskRange {
-            span: physical::Span,
-            source: usize,
-            header: primary::Header,
-        }
-        let mut ranges: Vec<DiskRange> = Vec::new();
-        let actual_commit_loaded = crate::commit::read_gen_commit_controlled(gen_dir, budget)?
-            .ok_or_else(|| managed_history::unavailable("copied generation commit is missing"))?;
-        let actual_commit = actual_commit_loaded.value;
-        budget.release(actual_commit_loaded.charge);
-        let actual_meta = read_meta_controlled(&gen_dir.join("meta.json"), preparation)?;
-        for assignment in &self.origin.value.ranges {
-            preparation.check()?;
-            if assignment.local != local {
-                continue;
-            }
-            let index = self.source_index(assignment.source)?;
-            let node = &self.nodes[index];
-            let interval = node
-                .descriptor
-                .value
-                .intervals
-                .get(assignment.interval as usize)
-                .ok_or_else(|| {
-                    managed_history::unavailable("imported range has no declared source interval")
-                })?;
-            let (orig_commit, orig_meta) =
-                read_disk_original_base(node, &interval.root, &interval.generation, preparation)?;
-            let retagged = match orig_commit.configuration {
-                ConfigurationBinding::Known { configuration } => {
-                    ConfigurationBinding::ImportedUnbound {
-                        source: configuration,
-                    }
-                }
-                other => other,
+        let start = budget.used();
+        let result = (|| -> Result<()> {
+            prove_wal_stage_hook("entered", budget.used());
+            let local = Location {
+                branch: None,
+                generation: gen_name.to_owned(),
             };
-            if orig_meta != actual_meta
-                || orig_commit.commit != actual_commit.commit
-                || orig_commit.origin != actual_commit.origin
-                || (actual_commit.configuration != orig_commit.configuration
-                    && actual_commit.configuration != retagged)
+            struct DiskRange {
+                span: physical::Span,
+                source: usize,
+                header: primary::Header,
+            }
+            let actual_commit_loaded = crate::commit::read_gen_commit_controlled(gen_dir, budget)?
+                .ok_or_else(|| {
+                    managed_history::unavailable("copied generation commit is missing")
+                })?;
+            let actual_commit = actual_commit_loaded.value;
+            budget.release(actual_commit_loaded.charge);
+
+            let count = self
+                .origin
+                .value
+                .ranges
+                .iter()
+                .filter(|r| r.local == local)
+                .count();
+            let range_storage = (count as u64)
+                .checked_mul(
+                    (std::mem::size_of::<DiskRange>() + std::mem::size_of::<physical::Span>())
+                        as u64,
+                )
+                .and_then(|n| n.checked_add(1024))
+                .ok_or_else(|| budget.exhausted())?;
+            budget.charge(range_storage)?;
+            let mut ranges: Vec<DiskRange> = Vec::new();
+            ranges
+                .try_reserve_exact(count)
+                .map_err(|_| budget.exhausted())?;
+
+            // Setup reads use a temporary Preparation bounded by `budget.available()`
+            // while `budget` is not mutated, then drop it before physical proof starts.
             {
+                let setup_prep = budget
+                    .owned_limit()?
+                    .options
+                    .temporary(budget.available())?;
+                let actual_meta = read_meta_controlled(&gen_dir.join("meta.json"), &setup_prep)?;
+                for assignment in &self.origin.value.ranges {
+                    setup_prep.check()?;
+                    if assignment.local != local {
+                        continue;
+                    }
+                    let index = self.source_index(assignment.source)?;
+                    let node = &self.nodes[index];
+                    let interval = node
+                        .descriptor
+                        .value
+                        .intervals
+                        .get(assignment.interval as usize)
+                        .ok_or_else(|| {
+                            managed_history::unavailable(
+                                "imported range has no declared source interval",
+                            )
+                        })?;
+                    let (orig_commit, orig_meta) = read_disk_original_base(
+                        node,
+                        &interval.root,
+                        &interval.generation,
+                        &setup_prep,
+                    )?;
+                    let retagged = match orig_commit.configuration {
+                        ConfigurationBinding::Known { configuration } => {
+                            ConfigurationBinding::ImportedUnbound {
+                                source: configuration,
+                            }
+                        }
+                        other => other,
+                    };
+                    if orig_meta != actual_meta
+                        || orig_commit.commit != actual_commit.commit
+                        || orig_commit.origin != actual_commit.origin
+                        || (actual_commit.configuration != orig_commit.configuration
+                            && actual_commit.configuration != retagged)
+                    {
+                        return Err(managed_history::unavailable(
+                            "imported WAL range base differs from copied generation",
+                        ));
+                    }
+                    let header = documents::source_header(
+                        &node.directory,
+                        &node.descriptor.value,
+                        &interval.root,
+                        &setup_prep,
+                    )?;
+                    ranges.push(DiskRange {
+                        span: physical::Span {
+                            start: interval.start,
+                            end: interval.end,
+                            sha256: interval.sha256,
+                            first_seq: interval.first_seq,
+                            last_seq: interval.last_seq,
+                        },
+                        source: index,
+                        header,
+                    });
+                }
+            }
+            ranges.sort_unstable_by_key(|r| r.span.start);
+            if ranges.windows(2).any(|p| p[0].span.end > p[1].span.start) {
                 return Err(managed_history::unavailable(
-                    "imported WAL range base differs from copied generation",
+                    "ambiguous imported physical intervals",
                 ));
             }
-            let header = documents::source_header(
-                &node.directory,
-                &node.descriptor.value,
-                &interval.root,
-                preparation,
-            )?;
-            ranges.push(DiskRange {
-                span: physical::Span {
-                    start: interval.start,
-                    end: interval.end,
-                    sha256: interval.sha256,
-                    first_seq: interval.first_seq,
-                    last_seq: interval.last_seq,
-                },
-                source: index,
-                header,
-            });
-        }
-        ranges.sort_unstable_by_key(|r| r.span.start);
-        if ranges.windows(2).any(|p| p[0].span.end > p[1].span.start) {
-            return Err(managed_history::unavailable(
-                "ambiguous imported physical intervals",
-            ));
-        }
-        if through < u64::MAX {
-            ranges.retain(|r| r.span.first_seq <= through);
-        }
-        let spans: Vec<physical::Span> = ranges
-            .iter()
-            .map(|r| physical::Span {
-                start: r.span.start,
-                end: r.span.end,
-                sha256: r.span.sha256,
-                first_seq: r.span.first_seq,
-                last_seq: r.span.last_seq,
-            })
-            .collect();
-        let mut config_error = None;
-        let mut visit = |observation: wal::probe::WalCommitObservation| {
-            if config_error.is_none() {
-                let matched = ranges.iter_mut().find(|r| {
-                    (r.span.start <= observation.start_offset
-                        || (r.span.start == 0 && observation.start_offset == WAL_REC as u64))
-                        && observation.point.offset <= r.span.end
+            if through < u64::MAX {
+                ranges.retain(|r| r.span.first_seq <= through);
+            }
+            let mut spans: Vec<physical::Span> = Vec::new();
+            spans
+                .try_reserve_exact(ranges.len())
+                .map_err(|_| budget.exhausted())?;
+            for r in &ranges {
+                spans.push(physical::Span {
+                    start: r.span.start,
+                    end: r.span.end,
+                    sha256: r.span.sha256,
+                    first_seq: r.span.first_seq,
+                    last_seq: r.span.last_seq,
                 });
-                let result = if let Some(range) = matched {
-                    let node = &self.nodes[range.source];
-                    range
-                        .header
-                        .observation_using(preparation, observation, &mut |identity| {
-                            documents::source_publication(
-                                &node.directory,
-                                &node.descriptor.value,
-                                identity,
-                                preparation,
-                            )
-                            .map(|_| ())
-                        })
-                } else {
-                    native.observation(family_root, preparation, observation)
-                };
-                if let Err(error) = result {
-                    config_error = Some(error);
+            }
+            prove_wal_stage_hook("before_physical", budget.used());
+            let mut config_error = None;
+            let mut visit = |observation: wal::probe::WalCommitObservation,
+                             proof_budget: &ColdBudget<'_>| {
+                prove_wal_stage_hook("callback", proof_budget.used());
+                if config_error.is_none() {
+                    let matched = ranges.iter_mut().find(|r| {
+                        (r.span.start <= observation.start_offset
+                            || (r.span.start == 0 && observation.start_offset == WAL_REC as u64))
+                            && observation.point.offset <= r.span.end
+                    });
+                    let result = if let Some(range) = matched {
+                        let node = &self.nodes[range.source];
+                        let callback_prep = proof_budget
+                            .owned_limit()?
+                            .options
+                            .temporary(proof_budget.available())?;
+                        range.header.observation_using(
+                            &callback_prep,
+                            observation,
+                            &mut |identity| {
+                                documents::source_publication(
+                                    &node.directory,
+                                    &node.descriptor.value,
+                                    identity,
+                                    &callback_prep,
+                                )
+                                .map(|_| ())
+                            },
+                        )
+                    } else {
+                        match native.cached_observation(observation) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => {
+                                let callback_prep = proof_budget
+                                    .owned_limit()?
+                                    .options
+                                    .temporary(proof_budget.available())?;
+                                native.observation(family_root, &callback_prep, observation)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    };
+                    if let Err(error) = result {
+                        if matches!(
+                            error,
+                            Error::BudgetExceeded(_) | Error::Cancelled | Error::Timeout
+                        ) {
+                            return Err(error);
+                        }
+                        config_error = Some(error);
+                    }
                 }
+                Ok(())
+            };
+            if through == u64::MAX {
+                let _ = physical::prove_prefix(
+                    input,
+                    &spans,
+                    extent,
+                    base,
+                    u64::MAX,
+                    terms,
+                    annotated,
+                    wal_path,
+                    budget,
+                    &mut visit,
+                )?;
+            } else {
+                let proof_target = spans.last().map_or(through, |s| through.max(s.last_seq));
+                let _ = physical::prove_prefix_through(
+                    input,
+                    &spans,
+                    extent,
+                    base,
+                    proof_target,
+                    terms,
+                    annotated,
+                    wal_path,
+                    budget,
+                    &mut visit,
+                )?;
+            }
+            if let Some(error) = config_error {
+                return Err(error);
             }
             Ok(())
-        };
-        if through == u64::MAX {
-            let _ = physical::prove_prefix(
-                input,
-                &spans,
-                extent,
-                base,
-                u64::MAX,
-                terms,
-                annotated,
-                wal_path,
-                budget,
-                &mut visit,
-            )?;
-        } else {
-            let proof_target = spans.last().map_or(through, |s| through.max(s.last_seq));
-            let _ = physical::prove_prefix_through(
-                input,
-                &spans,
-                extent,
-                base,
-                proof_target,
-                terms,
-                annotated,
-                wal_path,
-                budget,
-                &mut visit,
-            )?;
-        }
-        if let Some(error) = config_error {
-            return Err(error);
-        }
-        Ok(())
+        })();
+        budget.release(budget.used() - start);
+        result
     }
 }
 
@@ -824,11 +913,35 @@ pub(in crate::store) fn verify_imported_identity_for_family(
     closure.verify_identity(identity, preparation)
 }
 
+fn closure_import_file_count(closure: &DiskClosure) -> Option<usize> {
+    let mut total = 1usize; // evidence-history/origin.json
+    for node in &closure.nodes {
+        total = total
+            .checked_add(1)?
+            .checked_add(node.descriptor.value.files.len())?;
+    }
+    Some(total)
+}
+
+fn check_manifest_file_budget(
+    existing_files: usize,
+    additional_files: Option<usize>,
+) -> Result<()> {
+    let total = additional_files.and_then(|n| existing_files.checked_add(n));
+    if total.is_none_or(|t| t >= managed_history::capture::MAX_FILES) {
+        return Err(managed_history::unavailable(
+            "configuration closure exceeds backup manifest limits",
+        ));
+    }
+    Ok(())
+}
+
 /// Capture `evidence-history/origin.json` and every declared file under
 /// `evidence-history/imports/` as anchored-FD-pinned, hash-verified `CapturedFile`s
 /// for backup creation, without reopening verified paths outside the anchored dirs.
 pub(in crate::store) fn capture_import_files(
     root: &Path,
+    existing_files: usize,
     preparation: &Preparation,
     control: &WriteOptions,
 ) -> Result<Vec<CapturedFile>> {
@@ -836,6 +949,7 @@ pub(in crate::store) fn capture_import_files(
     let Some(closure) = DiskClosure::load(root, preparation)? else {
         return Ok(Vec::new());
     };
+    check_manifest_file_budget(existing_files, closure_import_file_count(&closure))?;
     let mut out = Vec::new();
     let origin_file = closure
         .history_dir
@@ -847,18 +961,26 @@ pub(in crate::store) fn capture_import_files(
         len: origin_file.metadata()?.len(),
         src: FileSource::File(origin_file),
     });
-    pin_closure_import_members(&closure, &mut out, preparation, control)?;
+    pin_closure_import_members(&closure, existing_files, &mut out, preparation, control)?;
     Ok(out)
 }
 
 fn pin_closure_import_members(
     closure: &DiskClosure,
+    existing_files: usize,
     out: &mut Vec<CapturedFile>,
     preparation: &Preparation,
     control: &WriteOptions,
 ) -> Result<()> {
     for node in &closure.nodes {
         control.check()?;
+        if existing_files.saturating_add(out.len()).saturating_add(1)
+            >= managed_history::capture::MAX_FILES
+        {
+            return Err(managed_history::unavailable(
+                "configuration closure exceeds backup manifest limits",
+            ));
+        }
         let hex = node.digest.to_string();
         let hex = hex.strip_prefix("sha256:").expect("canonical digest");
         let desc_rel = format!("evidence-history/imports/{hex}/origin.json");
@@ -875,6 +997,13 @@ fn pin_closure_import_members(
         let source_dir = node.directory.child("source", true, preparation)?;
         for (member_path, pin) in &node.descriptor.value.files {
             control.check()?;
+            if existing_files.saturating_add(out.len()).saturating_add(1)
+                >= managed_history::capture::MAX_FILES
+            {
+                return Err(managed_history::unavailable(
+                    "configuration closure exceeds backup manifest limits",
+                ));
+            }
             let rel = format!("evidence-history/imports/{hex}/source/{member_path}");
             let file = source_dir
                 .relative(member_path, false, preparation)?
@@ -898,6 +1027,7 @@ pub(in crate::store) fn capture_materialized_imported_origin(
     family_root: &Path,
     family: &crate::store::family::Family,
     staging_dir: &Path,
+    existing_files: usize,
     preparation: &Preparation,
     control: &WriteOptions,
 ) -> Result<Vec<CapturedFile>> {
@@ -905,6 +1035,7 @@ pub(in crate::store) fn capture_materialized_imported_origin(
     let Some(closure) = DiskClosure::load_for_family(family_root, family, preparation)? else {
         return Ok(Vec::new());
     };
+    check_manifest_file_budget(existing_files, closure_import_file_count(&closure))?;
     let reconciled =
         Origin {
             format: 2,
@@ -934,7 +1065,7 @@ pub(in crate::store) fn capture_materialized_imported_origin(
         len: origin_file.metadata()?.len(),
         src: FileSource::File(origin_file),
     });
-    pin_closure_import_members(&closure, &mut out, preparation, control)?;
+    pin_closure_import_members(&closure, existing_files, &mut out, preparation, control)?;
     Ok(out)
 }
 
@@ -948,11 +1079,21 @@ pub(in crate::store) fn write_memory_clone_origin(
     genesis: ConfigurationIdentity,
     coverage_digest: Sha256Digest,
     memory_origin: &managed_history::MemoryOrigin,
+    existing_files: usize,
     preparation: &Preparation,
     control: &WriteOptions,
 ) -> Result<Vec<CapturedFile>> {
     control.check()?;
     preparation.check()?;
+    let planned_files = (|| -> Option<usize> {
+        // origin.json + immediate source descriptor + immediate source files + prior imports
+        let mut total = 2usize.checked_add(memory_origin.source_files.len())?;
+        for (_, files) in &memory_origin.prior_imports {
+            total = total.checked_add(files.len())?;
+        }
+        Some(total)
+    })();
+    check_manifest_file_budget(existing_files, planned_files)?;
     let mut all_sources: BTreeSet<[u8; 32]> = BTreeSet::new();
     let mut staged_paths: Vec<(String, Sha256Digest)> = Vec::new();
     for (prior_digest, files) in &memory_origin.prior_imports {
@@ -1219,6 +1360,16 @@ pub(in crate::store) struct BranchProvenanceCapture {
     pub(in crate::store) source_current: Option<managed_history::Bytes>,
 }
 
+/// Anchored generation commit bytes and WAL extent captured once by direct
+/// branch backup so the emitted retagged commit and the provenance source
+/// member always come from the same read.
+pub(in crate::store) struct DirectBranchWalInput<'a> {
+    pub(in crate::store) gen_dir: &'a Path,
+    pub(in crate::store) base_seq: u64,
+    pub(in crate::store) wal_extent: u64,
+    pub(in crate::store) commit_bytes: managed_history::Bytes,
+}
+
 /// Build standalone destination provenance for a public backup of a branch of an
 /// activated family (materialized or direct unlinked). Establishes a fresh
 /// destination lineage for `branch_id` with `first_bound_own = head_seq + 1` and
@@ -1236,7 +1387,7 @@ pub(in crate::store) fn build_branch_standalone_provenance(
     dest_generation: &str,
     installed: &Installed,
     captured: &BranchProvenanceCapture,
-    wal_interval_inputs: Option<(&Path, u64, u64)>,
+    mut wal_interval_inputs: Option<DirectBranchWalInput<'_>>,
     preparation: &Preparation,
     control: &WriteOptions,
 ) -> Result<Vec<CapturedFile>> {
@@ -1253,6 +1404,12 @@ pub(in crate::store) fn build_branch_standalone_provenance(
             "direct branch backup source and destination generations differ",
         ));
     }
+    if wal_interval_inputs.is_some() && (family_root.is_none() || branch_root.is_none()) {
+        return Err(managed_history::unavailable(
+            "direct branch backup WAL input requires persistent family and branch roots",
+        ));
+    }
+    let mut wal_interval_meta: Option<(&Path, u64, u64)> = None;
     let mut source_files: BTreeMap<String, managed_history::Bytes> = BTreeMap::new();
     let mut push_src = |rel: String, bytes: managed_history::Bytes| -> Result<()> {
         if source_files.len() >= MAX_MEMBERS {
@@ -1278,8 +1435,8 @@ pub(in crate::store) fn build_branch_standalone_provenance(
     }
     let (prior_imports, prior_direct) = if let Some(froot) = family_root {
         // Use the branch dataset.json and CURRENT captured under the writer lock
-        // when persistent, and (if direct unlinked) read the leased generation's
-        // immutable commit.json and meta.json via anchored FD.
+        // when persistent, and (if direct unlinked) reuse the single anchored
+        // commit.json bytes alongside the leased generation's immutable meta.json.
         if let Some(broot) = branch_root {
             let ds_bytes = match &captured.source_dataset {
                 Some(bytes) => managed_history::Bytes::copy_from_slice(&bytes.value, preparation)?,
@@ -1301,19 +1458,20 @@ pub(in crate::store) fn build_branch_standalone_provenance(
             }
             push_src("dataset.json".into(), ds_bytes)?;
             push_src("CURRENT".into(), cur_bytes)?;
-            if wal_interval_inputs.is_some() {
+            if let Some(wal_input) = wal_interval_inputs.take() {
                 let bdir = documents::Opened::root(broot, preparation)?;
                 let gdir = bdir.child(source_generation, true, preparation)?;
                 push_src(
                     format!("{source_generation}/commit.json"),
-                    gdir.child("commit.json", false, preparation)?
-                        .bytes(None, preparation)?,
+                    wal_input.commit_bytes,
                 )?;
                 push_src(
                     format!("{source_generation}/meta.json"),
                     gdir.child("meta.json", false, preparation)?
                         .bytes(None, preparation)?,
                 )?;
+                wal_interval_meta =
+                    Some((wal_input.gen_dir, wal_input.base_seq, wal_input.wal_extent));
             }
         } else {
             let ds = managed_history::Bytes::from_serialized(2048, preparation, || {
@@ -1480,7 +1638,7 @@ pub(in crate::store) fn build_branch_standalone_provenance(
     // Optional WAL interval when capturing an unlinked branch directly.
     let mut intervals = Vec::new();
     let mut bases = Vec::new();
-    if let (Some(broot), Some((gdir, base_seq, wal_extent))) = (branch_root, wal_interval_inputs)
+    if let (Some(broot), Some((gdir, base_seq, wal_extent))) = (branch_root, wal_interval_meta)
         && wal_extent > WAL_REC as u64
         && let Some(interval) = compute_wal_suffix_interval_bounded(
             broot,
@@ -1617,7 +1775,7 @@ pub(in crate::store) fn build_branch_standalone_provenance(
         branch: None,
         generation: dest_generation.to_owned(),
     };
-    if wal_interval_inputs.is_some() {
+    if wal_interval_meta.is_some() {
         bases.push(BaseImport {
             local: local.clone(),
             source: src_digest,

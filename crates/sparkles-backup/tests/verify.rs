@@ -1684,14 +1684,13 @@ async fn restore_refuses_format_1_origin_under_v2_manifest_feature() {
     .await
     .unwrap();
 
-    let fmt1_origin = serde_json::to_vec(&serde_json::json!({
-        "format": 1,
-        "datasetId": src_id,
-        "sources": [format!("sha256:{import_hex}")],
-        "bases": [],
-        "ranges": []
-    }))
-    .unwrap();
+    // Encode in the exact canonical Origin struct field order (`format`, `datasetId`,
+    // `sources`, `bases`, `ranges`) so canonical decoding accepts the format 1 JSON
+    // and only the format 2 manifest-feature gate refuses it.
+    let fmt1_origin = format!(
+        r#"{{"format":1,"datasetId":"{src_id}","sources":["sha256:{import_hex}"],"bases":[],"ranges":[]}}"#
+    )
+    .into_bytes();
     let origin_blob = sparkles_backup::blob::encode(&fmt1_origin, false);
     mem.put(
         &sparkles_backup::layout::blob_key(&origin_blob.id),
@@ -1752,6 +1751,11 @@ async fn restore_refuses_format_1_origin_under_v2_manifest_feature() {
         )
         .await
         .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("format 2 origin closure"),
+        "expected format 2 origin closure gate refusal, got: {msg}"
+    );
     assert!(
         !dst_dir.exists(),
         "failed restore must not publish target directory (err: {err})"

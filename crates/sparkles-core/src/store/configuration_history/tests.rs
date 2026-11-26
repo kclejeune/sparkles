@@ -1359,28 +1359,102 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
         .unwrap();
         update(&dst, "own-1");
         update(&dst, "own-2");
+        update(&dst, "own-3");
         dst.compact().unwrap();
     }
     let dst = Store::open(&dst_root, retain_opts).unwrap();
+    let own_1_seq = imported_seq + 1;
+    let own_2_seq = imported_seq + 2;
     let own_last_seq = dst.head_commit().seq;
-    assert!(own_last_seq > imported_seq + 1);
+    assert!(own_last_seq > own_2_seq);
 
-    // 1. Measure retained DiskClosure charge alone, then verify that a ReadLimit
-    //    slightly larger than DiskClosure (enough for closure alone, not enough for
-    //    closure + vocabulary/annotations/WAL proof buffers simultaneously) returns
-    //    Error::BudgetExceeded instead of reusing the allowance.
-    let probe_prep = Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
-    let closure = DiskClosure::load_for_family(&dst_root, &dst.family, &probe_prep)
-        .unwrap()
-        .expect("imported destination has closure");
-    let closure_live_bytes = probe_prep.used();
-    drop(closure);
-    let tight_limit_bytes = closure_live_bytes + 4096;
+    // 1. Verify disjoint live memory accounting in `DiskClosure::prove_wal`:
+    //    first observe `entered`, `before_physical`, and `callback` charges on a full
+    //    budget, then find the exact minimum passing limit and verify that just below
+    //    it admission succeeds all the way into `"callback"` (after closure loading,
+    //    base check, vocabulary, annotations, range storage, and physical proof buffer
+    //    reservation) before refusing the combined live allocations with BudgetExceeded.
     let opts = HistoryOptions::default();
     let entry = {
         let hist = dst.history.as_ref().unwrap().lock();
         hist.gens.get(&1).expect("gen-0001 retained").clone()
     };
+    let full_limit = ReadLimit {
+        options: &opts,
+        memory: Some(64 << 20),
+        held: 0,
+    };
+    let observed_stages = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<(String, u64)>::new()));
+    let stages_clone = observed_stages.clone();
+    PROVE_WAL_STAGE_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |stage, used| {
+            stages_clone.lock().push((stage.to_owned(), used));
+        }));
+    });
+    super::branching::readonly::authenticate_retained_generation(
+        &dst,
+        &entry,
+        &full_limit,
+        imported_seq,
+    )
+    .unwrap();
+    PROVE_WAL_STAGE_HOOK.with(|hook| hook.borrow_mut().take());
+    let stages = observed_stages.lock().clone();
+    let entered_used = stages
+        .iter()
+        .find(|(s, _)| s == "entered")
+        .expect("entered stage")
+        .1;
+    let before_physical_used = stages
+        .iter()
+        .find(|(s, _)| s == "before_physical")
+        .expect("before_physical stage")
+        .1;
+    let callback_used = stages
+        .iter()
+        .find(|(s, _)| s == "callback")
+        .expect("callback stage")
+        .1;
+    assert!(
+        before_physical_used > entered_used,
+        "prove_wal must charge range/span storage ({before_physical_used} > {entered_used})"
+    );
+    assert!(
+        callback_used > before_physical_used,
+        "physical proof buffer/state must be charged during callback ({callback_used} > {before_physical_used})"
+    );
+
+    let mut lo = 1u64;
+    let mut hi = 4u64 << 20;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let limit = ReadLimit {
+            options: &opts,
+            memory: Some(mid),
+            held: 0,
+        };
+        if super::branching::readonly::authenticate_retained_generation(
+            &dst,
+            &entry,
+            &limit,
+            imported_seq,
+        )
+        .is_ok()
+        {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let min_pass = lo;
+    let tight_limit_bytes = min_pass.saturating_sub(1);
+    let tight_stages = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<(String, u64)>::new()));
+    let tight_stages_clone = tight_stages.clone();
+    PROVE_WAL_STAGE_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |stage, used| {
+            tight_stages_clone.lock().push((stage.to_owned(), used));
+        }));
+    });
     let tight_limit = ReadLimit {
         options: &opts,
         memory: Some(tight_limit_bytes),
@@ -1393,36 +1467,48 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
         imported_seq,
     )
     .unwrap_err();
+    PROVE_WAL_STAGE_HOOK.with(|hook| hook.borrow_mut().take());
+    let seen = tight_stages.lock().clone();
+    assert!(
+        seen.iter().any(|(s, _)| s == "callback"),
+        "tight budget ({tight_limit_bytes}) must pass closure/setup/physical buffer and reach proof callback before failing; stages={seen:?}, err={err:?}"
+    );
     assert!(
         matches!(err, Error::BudgetExceeded(_)),
-        "expected BudgetExceeded when closure + decoder exceed aggregate limit ({tight_limit_bytes}), got {err:?}"
+        "expected BudgetExceeded at proof callback under tight limit ({tight_limit_bytes}), got {err:?}"
     );
 
-    // Full budget authenticates cleanly through imported_seq.
-    let full_limit = ReadLimit {
-        options: &opts,
-        memory: Some(64 << 20),
-        held: 0,
-    };
-    super::branching::readonly::authenticate_retained_generation(
-        &dst,
-        &entry,
-        &full_limit,
-        imported_seq,
-    )
-    .unwrap();
-
-    // 2. Scoped WAL proof: corrupt the final native commit in retained gen-0001/wal.log
-    //    (strictly past the imported interval `<= imported_seq`). Reading `imported_seq`
-    //    must still succeed while reading `own_last_seq` in gen-0001 must fail.
+    // 2. Scoped WAL proof: corrupt `own-1` (strictly between `imported_seq` and
+    //    `own-2`, both owned by retained `gen-0001`) while leaving `own-2` intact so
+    //    `durable_after` proves `own-1` durable. Reading `imported_seq` must still
+    //    succeed while proving through `own_2_seq` or `u64::MAX` (and cold-reading
+    //    `own_2_seq` from retained `gen-0001`) must fail with `Error::Corrupt`.
     let wal_path = entry.dir.join("wal.log");
+    let own_1_end = {
+        let mut cursor = wal::WalCursor::open(
+            &wal_path,
+            wal::WalPoint {
+                seq: entry.base.seq,
+                offset: 0,
+            },
+        )
+        .unwrap();
+        let mut end = None;
+        while let Some((seq, _)) = cursor.next().unwrap() {
+            if seq == own_1_seq {
+                end = Some(cursor.position().offset);
+                break;
+            }
+        }
+        end.expect("own-1 must be present in retained gen-0001 wal.log")
+    };
     let mut wal_bytes = std::fs::read(&wal_path).unwrap();
-    let len = wal_bytes.len();
-    assert!(len >= super::WAL_REC * 2);
-    // Flip a byte in the final WAL_COMMIT record (native suffix past imported_seq).
-    wal_bytes[len - 1] ^= 0xFF;
-    // Also flip the previous record so durable_after sees corruption if scanned through end.
-    wal_bytes[len - super::WAL_REC - 1] ^= 0xFF;
+    assert!(
+        (own_1_end as usize) < wal_bytes.len(),
+        "own-2 must follow own-1 as a later durability witness"
+    );
+    // Flip a byte inside `own-1`'s WAL_COMMIT record while leaving `own-2` intact.
+    wal_bytes[own_1_end as usize - 1] ^= 0xFF;
     std::fs::write(&wal_path, &wal_bytes).unwrap();
     super::branching::readonly::authenticate_retained_generation(
         &dst,
@@ -1431,17 +1517,32 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
         imported_seq,
     )
     .expect("scoped prove_wal through imported_seq must not depend on unrelated native suffix");
+    let full_err = super::branching::readonly::authenticate_retained_generation(
+        &dst,
+        &entry,
+        &full_limit,
+        u64::MAX,
+    )
+    .unwrap_err();
     assert!(
-        super::branching::readonly::authenticate_retained_generation(
-            &dst,
-            &entry,
-            &full_limit,
-            u64::MAX,
-        )
-        .is_err()
-            || dst
-                .snapshot_at(&crate::history::At::Commit(imported_seq), &opts)
-                .is_ok()
+        matches!(full_err, Error::Corrupt(_)),
+        "unscoped proof must fail with Error::Corrupt on durable damaged own-1, got {full_err:?}"
+    );
+    let own_2_err = super::branching::readonly::authenticate_retained_generation(
+        &dst,
+        &entry,
+        &full_limit,
+        own_2_seq,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(own_2_err, Error::Corrupt(_)),
+        "proof through own-2 must fail with Error::Corrupt on durable damaged own-1, got {own_2_err:?}"
+    );
+    assert!(
+        dst.snapshot_at(&crate::history::At::Commit(own_2_seq), &opts)
+            .is_err(),
+        "cold RDF read of own_2_seq in retained gen-0001 must fail when durable own-1 is corrupted"
     );
     let (snap, _) = dst
         .snapshot_at(&crate::history::At::Commit(imported_seq), &opts)
@@ -1544,17 +1645,18 @@ fn reidentify_streams_multi_chunk_under_tight_budget_and_cancels_in_flight() {
     assert_eq!(reopened.dataset_id(), new_id);
     assert_eq!(crate::annotations::read(&stream_dir).unwrap().len(), 180);
 
-    // 2. In-flight cancellation triggered after the first 64 KiB WAL hashing chunk.
+    // 2. In-flight cancellation triggered after the first 64 KiB WAL hashing chunk
+    //    must abort before reading chunk 1 (exactly one chunk observed).
     let cancel_dir = dir.path().join("cancel-inflight");
     cap.write_to(&cancel_dir).unwrap();
     let ctl = crate::task::Control::none();
     let cancel_handle = ctl.cancel.clone();
-    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let fired_clone = fired.clone();
+    let chunks_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let chunks_seen_clone = chunks_seen.clone();
     WAL_HASH_CHUNK_HOOK.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move |chunk_index| {
+            chunks_seen_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if chunk_index == 0 {
-                fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 cancel_handle.cancel();
             }
         }));
@@ -1569,9 +1671,10 @@ fn reidentify_streams_multi_chunk_under_tight_budget_and_cancels_in_flight() {
         &ctl,
     );
     WAL_HASH_CHUNK_HOOK.with(|hook| hook.borrow_mut().take());
-    assert!(
-        fired.load(std::sync::atomic::Ordering::SeqCst),
-        "WAL hashing chunk hook must have fired in flight"
+    assert_eq!(
+        chunks_seen.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "WAL hashing must stop immediately after chunk 0 cancellation rather than hashing remaining chunks"
     );
     assert!(
         matches!(res, Err(Error::Cancelled)),
@@ -1625,4 +1728,296 @@ fn direct_branch_backup_capture_survives_concurrent_compaction() {
         .expect("captured branch backup after concurrent compaction must pass imported validation");
     let opened = Store::open(&staged, StoreOptions::default()).unwrap();
     assert_eq!(opened.snapshot().len(), branch.snapshot().len());
+}
+
+#[test]
+fn retained_binding_uses_authoritative_proof_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    update(&src, "imp-1");
+    let imported_seq = src.head_commit().seq;
+    let src_id = src.dataset_id();
+    let cap = src.backup_capture("b-ret-obs").unwrap();
+    drop(src);
+
+    let dst_root = dir.path().join("dst");
+    cap.write_to(&dst_root).unwrap();
+    let new_id = uuid::Uuid::new_v4();
+    reidentify_activated_dir(
+        &dst_root,
+        new_id,
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: imported_seq,
+        },
+        &crate::task::Control::none(),
+    )
+    .unwrap();
+
+    let retain_opts = StoreOptions {
+        history_max_generations: 4,
+        ..StoreOptions::default()
+    };
+    let own_1_seq = {
+        let dst = Store::open(&dst_root, retain_opts.clone()).unwrap();
+        dst.set_retention(crate::history::Retention {
+            keep_commits: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+        // Write a final annotated native commit in gen-0001 so WAL_FLAG_ANNOTATED is set.
+        let mut w = dst.write_with(
+            crate::commit::CommitKind::Update,
+            crate::guard::WriteOptions {
+                message: Some(std::sync::Arc::from("annotated-native-tail")),
+                ..Default::default()
+            },
+        );
+        let s = w
+            .intern(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new("urn:own-ann").unwrap(),
+            ))
+            .unwrap();
+        let p = w
+            .intern(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new("urn:p").unwrap(),
+            ))
+            .unwrap();
+        let o = w
+            .intern(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                "v",
+            )))
+            .unwrap();
+        w.insert([s, p, o, crate::id::Id::DEFAULT_GRAPH]).unwrap();
+        let info = w.commit().unwrap();
+        // Commit one more update before compacting so `gen-0002` starts after `own-1`
+        // and retained `gen-0001` owns `own-1`.
+        update(&dst, "own-after-ann");
+        dst.compact().unwrap();
+        info.commit.seq
+    };
+
+    let dst = Store::open(&dst_root, retain_opts).unwrap();
+    let prep = preparation();
+    // Both the imported commit and the valid annotated native suffix commit in retained
+    // gen-0001 resolve cleanly through the authoritative WAL proof.
+    let imp_binding = dst.configuration_binding_at(imported_seq, &prep).unwrap();
+    assert!(matches!(
+        imp_binding,
+        ConfigurationBinding::ImportedUnbound { .. }
+    ));
+    let native_binding = dst.configuration_binding_at(own_1_seq, &prep).unwrap();
+    assert!(matches!(native_binding, ConfigurationBinding::Known { .. }));
+
+    // Truncate retained `gen-0001/wal.log` right after `own-1` (so `own-1` is the tail
+    // commit with no later durability witness) and remove `own-1`'s annotation from
+    // `annotations.bin` (leaving only the 32-byte header). `WalCursor` still observes
+    // `own-1`, whereas the authoritative WAL proof treats an annotated tail without its
+    // annotation as incomplete and omits it.
+    let gen1_wal = dst_root.join("gen-0001").join("wal.log");
+    let own_1_end = {
+        let mut cursor =
+            wal::WalCursor::open(&gen1_wal, wal::WalPoint { seq: 0, offset: 0 }).unwrap();
+        let mut end = None;
+        while let Some((seq, _)) = cursor.next().unwrap() {
+            if seq == own_1_seq {
+                end = Some(cursor.position().offset);
+                break;
+            }
+        }
+        end.expect("own-1 must be present in gen-0001/wal.log")
+    };
+    let wal_bytes = std::fs::read(&gen1_wal).unwrap();
+    std::fs::write(&gen1_wal, &wal_bytes[..own_1_end as usize]).unwrap();
+
+    let ann_path = dst_root.join(crate::annotations::FILE);
+    let ann_bytes = std::fs::read(&ann_path).unwrap();
+    assert!(ann_bytes.len() > 32);
+    // Keep only the 32-byte annotations header so `seqs_controlled` returns an empty set.
+    std::fs::write(&ann_path, &ann_bytes[..32]).unwrap();
+
+    assert!(
+        dst.configuration_binding_at(own_1_seq, &prep).is_err(),
+        "retained WAL binding must refuse a commit omitted by the authoritative proof"
+    );
+    assert!(
+        matches!(
+            dst.configuration_binding_at(imported_seq, &prep).unwrap(),
+            ConfigurationBinding::ImportedUnbound { .. }
+        ),
+        "earlier imported commit must still resolve via the authoritative proof"
+    );
+}
+
+#[test]
+fn direct_branch_backup_uses_single_anchored_commit_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    update(&src, "seed");
+    src.create_branch("single-read-br", &Default::default())
+        .unwrap();
+    let branch = src.branch("single-read-br").unwrap();
+    update(&branch, "br-1");
+    // Compact once to unlink the branch so `backup_capture` takes the direct capture path.
+    branch.compact().unwrap();
+    update(&branch, "br-2");
+
+    let br_root = branch.root.clone().expect("persistent branch root");
+    let gen_name = std::fs::read_to_string(br_root.join("CURRENT"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let commit_path = br_root.join(&gen_name).join("commit.json");
+    let orig_commit_bytes = std::fs::read(&commit_path).unwrap();
+
+    // Immediately after the single anchored read of `commit.json`, overwrite it on disk
+    // with garbage; a second open inside `build_branch_standalone_provenance` would fail
+    // or emit mismatched source provenance.
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fired_clone = fired.clone();
+    let commit_path_clone = commit_path.clone();
+    branch.set_failpoint(
+        "backup-capture-branch-commit-read",
+        Some(std::sync::Arc::new(move |_| {
+            fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::fs::write(&commit_path_clone, b"{\"mutated\":true}\n").unwrap();
+        })),
+    );
+    let cap = branch.backup_capture("b-single-read").unwrap();
+    branch.set_failpoint("backup-capture-branch-commit-read", None);
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "single-read failpoint must have fired"
+    );
+
+    let staged = dir.path().join("staged");
+    cap.write_to(&staged).unwrap();
+    validate_copy_imported(&staged, &preparation())
+        .expect("direct branch backup must authenticate cleanly from single commit.json read");
+
+    // Verify the source descriptor embedded the exact original commit.json bytes.
+    let imports_dir = staged.join("evidence-history").join("imports");
+    let mut found_source_commit = None;
+    for entry in std::fs::read_dir(&imports_dir).unwrap() {
+        let candidate = entry
+            .unwrap()
+            .path()
+            .join("source")
+            .join(&gen_name)
+            .join("commit.json");
+        if candidate.exists() {
+            found_source_commit = Some(std::fs::read(&candidate).unwrap());
+        }
+    }
+    assert_eq!(
+        found_source_commit.as_deref(),
+        Some(orig_commit_bytes.as_slice()),
+        "staged source commit.json must match the single anchored read, not the later mutated file"
+    );
+}
+
+#[test]
+fn materialized_import_capture_checks_max_files_before_pinning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    update(&src, "seed");
+    let src_id = src.dataset_id();
+    let src_seq = src.head_commit().seq;
+    let cap = src.backup_capture("b-max-files").unwrap();
+
+    // 1. Imported persistent destination: `capture_materialized_imported_origin` and
+    //    `capture_import_files` must refuse BEFORE staging or pinning handles when
+    //    `existing_files + imported_count >= MAX_FILES`.
+    let dst_root = dir.path().join("dst");
+    cap.write_to(&dst_root).unwrap();
+    reidentify_activated_dir(
+        &dst_root,
+        uuid::Uuid::new_v4(),
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: src_seq,
+        },
+        &crate::task::Control::none(),
+    )
+    .unwrap();
+    let dst = Store::open(&dst_root, StoreOptions::default()).unwrap();
+    let prep = preparation();
+    let wopts = crate::guard::WriteOptions::default();
+    let existing = super::managed_history::capture::MAX_FILES - 2;
+
+    let staging_disk = dir.path().join("staging-disk");
+    std::fs::create_dir_all(&staging_disk).unwrap();
+    let err = capture_materialized_imported_origin(
+        &dst_root,
+        &dst.family,
+        &staging_disk,
+        existing,
+        &prep,
+        &wopts,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("backup manifest limits"),
+        "expected manifest limit refusal, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&staging_disk).unwrap().count(),
+        0,
+        "capture_materialized_imported_origin must not stage or open files once limit is exceeded"
+    );
+
+    let err_direct = capture_import_files(&dst_root, existing, &prep, &wopts).unwrap_err();
+    assert!(
+        err_direct.to_string().contains("backup manifest limits"),
+        "expected manifest limit refusal from capture_import_files, got {err_direct:?}"
+    );
+
+    // 2. In-memory clone: `write_memory_clone_origin` must refuse BEFORE staging or
+    //    pinning handles when `existing_files + planned_files >= MAX_FILES`.
+    let (mem_clone, _) = src
+        .clone_to_memory(&CloneOptions::default(), StoreOptions::default())
+        .unwrap();
+    let state = mem_clone.managed_state_shared().unwrap();
+    let crate::managed::ManagedState::Installed(installed) = state.as_ref() else {
+        panic!("expected installed managed state on memory clone");
+    };
+    let history = installed.configuration_history.as_ref().unwrap();
+    let memory = installed.history_memory.as_ref().unwrap();
+    let mem_origin = memory.origin.as_ref().unwrap();
+    let genesis = ConfigurationIdentity {
+        dataset_id: mem_clone.owner_dataset_id(),
+        lineage_id: history.lineage_id,
+        generation: memory.coverage.value.activation_generation,
+    };
+    let staging_mem = dir.path().join("staging-mem");
+    std::fs::create_dir_all(&staging_mem).unwrap();
+    let err_mem = write_memory_clone_origin(
+        &staging_mem,
+        mem_clone.dataset_id(),
+        genesis,
+        history.coverage,
+        mem_origin,
+        existing,
+        &prep,
+        &wopts,
+    )
+    .unwrap_err();
+    assert!(
+        err_mem.to_string().contains("backup manifest limits"),
+        "expected manifest limit refusal from write_memory_clone_origin, got {err_mem:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&staging_mem).unwrap().count(),
+        0,
+        "write_memory_clone_origin must not stage or open files once limit is exceeded"
+    );
 }

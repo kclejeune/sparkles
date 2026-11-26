@@ -1212,6 +1212,17 @@ pub(crate) fn reidentified_generation_bytes(
     new: uuid::Uuid,
     preparation: &crate::access::Preparation,
 ) -> Result<crate::store::managed_history::Bytes> {
+    Ok(reidentified_generation_bytes_with_base(bytes, old, new, preparation)?.1)
+}
+
+/// Like [`reidentified_generation_bytes`], additionally returning the parsed
+/// base commit sequence from the same single controlled parse.
+pub(crate) fn reidentified_generation_bytes_with_base(
+    bytes: &[u8],
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+    preparation: &crate::access::Preparation,
+) -> Result<(u64, crate::store::managed_history::Bytes)> {
     use crate::store::{cold::ColdBudget, managed_history};
     preparation.check()?;
     if old.is_nil() || new.is_nil() {
@@ -1249,6 +1260,7 @@ pub(crate) fn reidentified_generation_bytes(
             "original generation belongs to another physical source".into(),
         ));
     }
+    let base_seq = file.commit.seq;
     if let Some(binding) = &mut file.configuration_binding {
         let publisher = binding
             .configuration()
@@ -1263,7 +1275,10 @@ pub(crate) fn reidentified_generation_bytes(
     file.dataset_id = new;
     held.release_to(budget.used());
     preparation.check()?;
-    managed_history::encode_pretty(&file, preparation)
+    Ok((
+        base_seq,
+        managed_history::encode_pretty(&file, preparation)?,
+    ))
 }
 
 /// Rewrite only an already validated captured catalog header. The producer

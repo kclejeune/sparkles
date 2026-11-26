@@ -349,10 +349,6 @@ pub(in crate::store) fn authenticate_retained_generation(
         if closure.has_ranges(&entry.name) {
             let file = reader.into_inner();
             budget.release(reader_charge);
-            let temporary = budget
-                .owned_limit()?
-                .options
-                .temporary(budget.available())?;
             let result = closure.prove_wal(
                 &family_root,
                 &entry.dir,
@@ -366,9 +362,7 @@ pub(in crate::store) fn authenticate_retained_generation(
                 &path,
                 &mut native,
                 &mut budget,
-                &temporary,
             );
-            drop(temporary);
             drop(closure);
             budget.release(closure_bytes);
             result?;

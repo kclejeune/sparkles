@@ -218,8 +218,12 @@ fn files_with_imports(
         });
     }
     if include_imports {
-        let imported_files =
-            crate::store::configuration_history::capture_import_files(root, &preparation, control)?;
+        let imported_files = crate::store::configuration_history::capture_import_files(
+            root,
+            files.len(),
+            &preparation,
+            control,
+        )?;
         if files.len().saturating_add(imported_files.len()) >= MAX_FILES {
             return Err(unavailable(
                 "configuration closure exceeds backup manifest limits",

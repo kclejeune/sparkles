@@ -1740,6 +1740,7 @@ impl Store {
                             &root,
                             &self.family,
                             dir,
+                            files.len(),
                             &adm_prep,
                             &control,
                         )?;
@@ -1788,6 +1789,7 @@ impl Store {
                             genesis,
                             history.coverage,
                             mem_origin,
+                            files.len(),
                             &adm_prep,
                             &control,
                         )?;
@@ -2260,31 +2262,14 @@ impl Store {
                     .ok_or_else(|| {
                         Error::Corrupt("captured branch generation commit is missing".into())
                     })?;
-                    let physical_base = {
-                        let allowance = adm_prep.room();
-                        let _loan = adm_prep.reserve(allowance)?;
-                        let options = crate::history::HistoryOptions {
-                            cancel: Some(adm_prep.control().cancel.flag()),
-                            deadline: adm_prep.control().deadline,
-                        };
-                        let mut budget = super::cold::ColdBudget::new(crate::history::ReadLimit {
-                            options: &options,
-                            memory: Some(allowance),
-                            held: 0,
-                        })?;
-                        crate::commit::decode_gen_commit_bytes_controlled(
-                            &gdir.join("commit.json"),
+                    self.failpoint("backup-capture-branch-commit-read");
+                    let (base_seq, retagged) =
+                        crate::commit::reidentified_generation_bytes_with_base(
                             &orig_commit_bytes.value,
-                            &mut budget,
-                        )?
-                        .value
-                    };
-                    let retagged = crate::commit::reidentified_generation_bytes(
-                        &orig_commit_bytes.value,
-                        self.dataset_id,
-                        self.dataset_id,
-                        &adm_prep,
-                    )?;
+                            self.dataset_id,
+                            self.dataset_id,
+                            &adm_prep,
+                        )?;
                     let staging = tempfile::Builder::new()
                         .prefix("sparkles-branch-bak-")
                         .tempdir()?;
@@ -2299,7 +2284,12 @@ impl Store {
                         &generation,
                         installed,
                         captured_branch,
-                        Some((&gdir, physical_base.commit.seq, wal_len)),
+                        Some(super::configuration_history::DirectBranchWalInput {
+                            gen_dir: &gdir,
+                            base_seq,
+                            wal_extent: wal_len,
+                            commit_bytes: orig_commit_bytes,
+                        }),
                         &adm_prep,
                         control,
                     );
