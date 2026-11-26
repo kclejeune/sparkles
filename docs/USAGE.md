@@ -759,20 +759,20 @@ sparkles infer   --loc db --profile rdfs --max-inferred 200000000   # allow 200 
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
 sparkles infer   --loc db --ontology-graph http://ex.org/onto --imports fetch   # input graphs and owl:imports
 sparkles ontology summary --loc db             # OWL 2 header, axiom and entity counts, unmapped triples
-sparkles ontology axioms  --loc db --type SubClassOf --about http://ex.org/Person   # functional-style syntax (--format json)
+sparkles ontology axioms  --loc db --type SubClassOf --about http://ex.org/Person   # functional-style syntax (--format json|owx|omn|obo|obographs)
 sparkles ontology check   --loc db --profile el,rl   # OWL 2 profile checks (exit 1 when outside one)
 sparkles ontology check   onto.ttl --profile all     # check a file without a database
 sparkles ontology edit    --loc db --add new.json --remove old.json   # JSON axioms, in one commit
 sparkles ontology classify --loc db --format text   # OWL 2 EL taxonomy (exit 1 when unsatisfiable)
-sparkles ontology classify go.ofn > go-taxonomy.ofn  # classify a file without a database
+sparkles ontology classify go.ofn > go-taxonomy.ofn  # classify a file without a database (--format ofn|owx|omn|obo|obographs)
 sparkles ontology classify go.ofn --el-only --format text   # OWL 2 EL rules alone: ELK's taxonomy
 sparkles ontology classify --loc db --target http://ex.org/taxonomy   # write the taxonomy to a graph
 sparkles ontology classify dl.ofn --timeout 10 --partial --format json   # what 10 s proved (exit 2 when partial)
-sparkles ontology reason --input go.owl --output go-reasoned.ofn   # robot reason: the ontology with its inferred axioms
-sparkles ontology reason --input go.owl --reasoner ELK --output go-elk.ofn   # OWL 2 EL rules alone: ROBOT's output with ELK
-sparkles ontology reduce --input x.owl --output y.ofn   # robot reduce: without the entailed subclass axioms
-sparkles ontology relax  --input x.owl --output y.owl   # robot relax: subclass axioms from equivalences
-sparkles ontology reason --input x.owl relax reduce --output y.owl   # a chain in one process, as ROBOT runs it
+sparkles ontology reason --input go.owl --output go-reasoned.ofn   # robot reason: writes .ofn, .owx, .omn, .obo, .json, .owl, .ttl or .nt (optional .gz)
+sparkles ontology reason --input go.owl --reasoner ELK --output go-elk.obo   # OWL 2 EL rules alone, writing OBO 1.4
+sparkles ontology reduce --input x.owl --output y.json   # robot reduce: without the entailed subclass axioms, writing OBO Graphs JSON
+sparkles ontology relax  --input x.owl --output y.owx    # robot relax: subclass axioms from equivalences, writing OWL/XML
+sparkles ontology reason --input x.owl relax reduce --output y.omn   # a chain in one process, writing Manchester OWL syntax
 sparkles ontology materialize --input go.owl --term BFO:0000050 --output y.ofn   # robot materialize: direct part-of superclasses
 sparkles ontology materialize --input x.owl --term-file terms.txt reduce --output y.ofn   # properties from a file, then reduce
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,

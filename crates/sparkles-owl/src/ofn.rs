@@ -123,18 +123,21 @@ impl Renderer {
     pub fn new<P: Into<String>, N: Into<String>>(
         prefixes: impl IntoIterator<Item = (P, N)>,
     ) -> Renderer {
-        let mut v: Vec<(String, String)> = prefixes
-            .into_iter()
-            .map(|(p, n)| (p.into(), n.into()))
-            .collect();
-        for (p, n) in STANDARD_PREFIXES {
-            if !v.iter().any(|(q, _)| q == p) {
-                v.push((p.to_string(), n.to_string()));
+        let mut by_name: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (p, n) in prefixes {
+            let p = p.into();
+            let n = n.into();
+            if !n.is_empty() && (p.is_empty() || crate::write_common::is_pn_prefix(&p)) {
+                by_name.insert(p, n);
             }
         }
-        v.retain(|(p, n)| {
-            !n.is_empty() && p.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c))
-        });
+        for (p, n) in STANDARD_PREFIXES {
+            by_name
+                .entry(p.to_string())
+                .or_insert_with(|| n.to_string());
+        }
+        let mut v: Vec<(String, String)> = by_name.into_iter().collect();
         v.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
         Renderer { prefixes: v }
     }
@@ -1025,37 +1028,40 @@ impl Renderer {
     }
 }
 
-/// Whether `s` can follow a prefix in a prefixed name: a simplified PN_LOCAL that
-/// accepts letters, digits, `_` and `-`, and `.` inside.
+/// Whether `s` can follow a prefix in a prefixed name: a simplified `PN_LOCAL`
+/// matching W3C `PN_CHARS_U | [0-9]` followed by `PN_CHARS | '.'` not ending in `.`.
 fn is_local_name(s: &str) -> bool {
-    !s.is_empty()
-        && !s.ends_with('.')
-        && !s.starts_with(['-', '.'])
-        && s.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c))
+    crate::write_common::is_pn_local(s)
 }
 
 fn is_local_name_polled<E>(s: &str, w: &mut impl PolledWrite<E>) -> Result<bool, E> {
-    if s.is_empty() || s.ends_with('.') || s.starts_with(['-', '.']) {
+    let mut cs = s.chars();
+    let Some(first) = cs.next() else {
+        return Ok(false);
+    };
+    if !(crate::write_common::is_pn_chars_u(first) || first.is_ascii_digit()) {
         return Ok(false);
     }
-    let mut batch = 0usize;
-    for c in s.chars() {
+    let mut last = first;
+    let mut batch = 1usize;
+    for c in cs {
         batch += 1;
         if batch == POLL_CHUNK_BYTES {
             w.tick(batch)?;
             batch = 0;
         }
-        if !(c.is_alphanumeric() || "_-.".contains(c)) {
+        if !(crate::write_common::is_pn_chars(c) || c == '.') {
             if batch > 0 {
                 w.tick(batch)?;
             }
             return Ok(false);
         }
+        last = c;
     }
     if batch > 0 {
         w.tick(batch)?;
     }
-    Ok(true)
+    Ok(last != '.')
 }
 
 /// An ontology document in functional-style syntax: the prefix declarations, the

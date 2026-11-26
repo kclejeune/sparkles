@@ -5513,8 +5513,9 @@ ROBOT's error messages and its exit status 1 are kept. The transformations live 
 the classification passed in as a function, so they use the classifier without changing
 it. `sparkles::handles::ontology::transform::WorkingOntology` reads a file through
 `OntologyFile` or a database with `--loc`, runs the classifier with the caller's
-threads, deadline and budgets, and writes functional-style syntax, RDF/XML, Turtle and
-N-Triples, gzipped when the name ends in `.gz`.
+threads, deadline and budgets, and writes functional-style syntax, OWL/XML, Manchester
+OWL syntax, OBO 1.4, OBO Graphs JSON, RDF/XML, Turtle and N-Triples, gzipped when the
+name ends in `.gz`.
 
 **What each command does.** `reason` validates as ROBOT's `ReasonerHelper.validate` does.
 An inconsistent ontology, an unsatisfiable class or an unsatisfiable object property
@@ -5604,8 +5605,44 @@ and 30.63 s, and the chain took 3.87 s and 10.27 s. The run record of the
 [ROBOT comparison](../../benchmarks/el-classification/RESULTS.md#robot) keeps the
 comparison and the timings.
 
-**Limits.** The commands read no dataset on a server (item 685), write no OWL/XML,
-Manchester, OBO or OBO Graphs JSON (item 686), and refuse
+**Output formats.** `sparkles_owl::owx`, `sparkles_owl::manchester`, `sparkles_owl::obo`
+and `sparkles_owl::obographs` write OWL/XML (`.owx`), Manchester OWL syntax (`.omn`),
+OBO 1.4 (`.obo`) and OBO Graphs JSON (`.json`) documents with proper escaping, W3C
+`PN_PREFIX` prefix validation and bounded nesting (item 686). OBO 1.4 and OBO Graphs JSON
+sort axioms canonically for order-independent output, while OWL/XML streams in input order
+and Manchester groups axioms into sorted entity frames while preserving input order within
+frame sections and miscellaneous frames (repeatable for a given input order). OWL/XML
+covers all 37 OWL 2 axiom kinds losslessly, encodes non-`NCName` blank-node labels
+injectively and duplicates single-operand equivalences to satisfy XSD `minOccurs="2"`. The
+Manchester writer retains standard `rdf`, `rdfs`, `xsd` and `owl` prefix bindings, emits
+W3C-standard `HasKey:`, parenthesized nested complements aligned with the parser's depth
+budget, standard quoted and typed boolean literals, and `BLANK_NODE_LABEL`-validated
+anonymous individuals, synthesizes `DataProperty:`/`Datatype:` and colliding entity frames
+for referenced undeclared entities, and refuses or reports ambiguous punned object/data
+property constructs. OBO 1.4 follows OBO 1.4 URL-as-ID (`http://` and `https://`) and
+`idspace` rules, enforces unique stanza IDs across `[Term]`, `[Typedef]` and `[Instance]`
+and single-cardinality stanza tags including `[Typedef]` `domain:` and `range:` (routing
+eligible extra or boundary-whitespace annotations to `property_value:` and skipping extra
+`instance_of:`, `domain:`, `range:` or unrepresentable values), emits `is_asymmetric: true`
+and `subsetdef:`/`synonymtypedef:` headers, preserves reserved header metadata without
+conflation, and skips or refuses `DataProperty` declarations, `DataPropertyAssertion`
+axioms and non-string qualifiers. OBO Graphs JSON emits and reads `propertyType`
+(`OBJECT`, `DATA`, `ANNOTATION`), rejects cross-axiom and same-axiom entity-kind punning
+collisions, restricts generic `basicPropertyValues` to plain `xsd:string` values, and
+reserves `owl:imports` in graph header `basicPropertyValues` for imports. The Manchester,
+OBO 1.4 and OBO Graphs JSON writers accept `WriteOptions` so callers can either refuse the
+first unrepresentable axiom or header annotation in strict mode or skip it and receive a
+bounded `WriteReport` capping each sample list (`skipped` and `skipped_header`) at
+`MAX_REPORTED_SKIPPED` entries. File outputs stage beside the resolved destination
+(following symlinks, preserving existing file permissions and applying standard umask mode
+to new files) and replace it atomically only after serialization and gzip completion
+succeed. `sparkles ontology reason`, `reduce`, `relax`, `materialize` and chains select
+these writers from the output file extension, including `.gz` variants, and log a concise
+warning to stderr whenever a lossy format skips axioms or header annotations. `sparkles
+ontology axioms` and `sparkles ontology classify` also accept `--format owx`, `omn`, `obo`
+and `obographs`.
+
+**Limits.** The commands read no dataset on a server (item 685) and refuse
 `--prevent-invalid-references true` (item 687). `reason --reasoner emr` asserts
 named superclasses only, as ELK does, not the class expressions that ROBOT's expression
 materializing reasoner adds, which item 691 follows.

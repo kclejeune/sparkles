@@ -1560,3 +1560,524 @@ Ontology(<http://ex.org/horn>
         "{cj}"
     );
 }
+
+const WRITER_ONTO: &str = r#"Prefix(:=<http://ex.org/>)
+Prefix(obo:=<http://purl.obolibrary.org/obo/>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(<http://purl.obolibrary.org/obo/demo.owl>
+Declaration(Class(obo:GO_0000001))
+Declaration(Class(obo:GO_0000002))
+Declaration(Class(obo:GO_0000003))
+Declaration(Class(obo:GO_0000004))
+Declaration(ObjectProperty(obo:BFO_0000050))
+AnnotationAssertion(rdfs:label obo:GO_0000001 "cerebellar neuron")
+AnnotationAssertion(rdfs:label obo:GO_0000002 "hindbrain neuron")
+AnnotationAssertion(rdfs:label obo:GO_0000003 "neuron")
+AnnotationAssertion(rdfs:label obo:GO_0000004 "cerebellum")
+EquivalentClasses(obo:GO_0000001 ObjectIntersectionOf(obo:GO_0000003 ObjectSomeValuesFrom(obo:BFO_0000050 obo:GO_0000004)))
+SubClassOf(obo:GO_0000004 obo:GO_0000002)
+SubClassOf(obo:GO_0000001 obo:GO_0000003)
+TransitiveObjectProperty(obo:BFO_0000050)
+)
+"#;
+
+fn parse_and_assert_writer_onto_stdout(label: &str, fmt: &str, body: &str) {
+    let doc =
+        match fmt {
+            "owx" => sparkles::owl::owx::parse(body)
+                .unwrap_or_else(|e| panic!("{label} owx: {e}\n{body}")),
+            "omn" => sparkles::owl::manchester::parse_document(body)
+                .unwrap_or_else(|e| panic!("{label} omn: {e}\n{body}")),
+            "obo" => sparkles::owl::obo::parse(body)
+                .unwrap_or_else(|e| panic!("{label} obo: {e}\n{body}")),
+            "obographs" => sparkles::owl::obographs::parse(body)
+                .unwrap_or_else(|e| panic!("{label} obographs: {e}\n{body}")),
+            _ => unreachable!(),
+        };
+    let go1 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000001");
+    let go2 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000002");
+    let go3 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000003");
+    let go4 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000004");
+    let expected_sub_1_3 = sparkles::owl::AxiomKind::SubClassOf(go1.into(), go3.into());
+    let expected_sub_4_2 = sparkles::owl::AxiomKind::SubClassOf(go4.into(), go2.into());
+    assert!(
+        doc.axioms.iter().any(|a| a.kind == expected_sub_1_3),
+        "{label} {fmt} missing expected SubClassOf(GO_0000001, GO_0000003):\n{body}"
+    );
+    assert!(
+        doc.axioms.iter().any(|a| a.kind == expected_sub_4_2),
+        "{label} {fmt} missing expected SubClassOf(GO_0000004, GO_0000002):\n{body}"
+    );
+}
+
+#[test]
+fn ontology_writers_owx_omn_obo_and_obographs_cli() {
+    use sparkles::owl::{
+        Annotation, AnnotationProperty, AnnotationValue, Axiom, Class, ClassExpression, Literal,
+        ObjectProperty,
+    };
+    use std::collections::BTreeSet;
+    use std::io::Read as _;
+
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("demo.ofn"), WRITER_ONTO).unwrap();
+
+    // Write all four new formats (plus .gz) in a single reason/relax/reduce chain
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "--input",
+            "demo.ofn",
+            "-a",
+            "true",
+            "-o",
+            "reasoned.ofn",
+            "-o",
+            "reasoned.owx",
+            "-o",
+            "reasoned.omn",
+            "-o",
+            "reasoned.obo",
+            "-o",
+            "reasoned.json",
+            "-o",
+            "reasoned.owx.gz",
+            "-o",
+            "reasoned.obo.gz",
+            "-o",
+            "reasoned.json.gz",
+            "relax",
+            "-o",
+            "relaxed.owx",
+            "reduce",
+            "-o",
+            "reduced.omn",
+            "-o",
+            "reduced.obo",
+            "-o",
+            "reduced.json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+
+    // Reference axioms from .ofn
+    let ofn_doc =
+        sparkles::owl::ofn_read::parse(&std::fs::read_to_string(dir.join("reasoned.ofn")).unwrap())
+            .unwrap();
+    let ofn_set: BTreeSet<Axiom> = ofn_doc.axioms.into_iter().collect();
+
+    // OWL/XML round-trips identically to .ofn
+    let owx_text = std::fs::read_to_string(dir.join("reasoned.owx")).unwrap();
+    let owx_doc = sparkles::owl::owx::parse(&owx_text).unwrap();
+    assert_eq!(owx_doc.header, ofn_doc.header);
+    assert_eq!(owx_doc.axioms.into_iter().collect::<BTreeSet<_>>(), ofn_set);
+
+    // Gzipped OWL/XML matches plain OWL/XML byte-for-byte
+    let mut gz_buf = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(dir.join("reasoned.owx.gz")).unwrap())
+        .read_to_string(&mut gz_buf)
+        .unwrap();
+    assert_eq!(gz_buf, owx_text);
+
+    // Manchester round-trips identically to .ofn
+    let omn_text = std::fs::read_to_string(dir.join("reasoned.omn")).unwrap();
+    let omn_doc = sparkles::owl::manchester::parse_document(&omn_text).unwrap();
+    assert_eq!(omn_doc.header, ofn_doc.header);
+    assert_eq!(omn_doc.axioms.into_iter().collect::<BTreeSet<_>>(), ofn_set);
+
+    // OBO 1.4 contains OBO PURL IDs, trailing is_inferred qualifier, and parses back with expected axioms
+    let obo_text = std::fs::read_to_string(dir.join("reasoned.obo")).unwrap();
+    assert!(obo_text.contains("format-version: 1.4\n"), "{obo_text}");
+    assert!(obo_text.contains("id: GO:0000001\n"), "{obo_text}");
+    assert!(obo_text.contains("id: BFO:0000050\n"), "{obo_text}");
+    assert!(
+        obo_text.contains("is_a: GO:0000003 {is_inferred=\"true\"}\n"),
+        "{obo_text}"
+    );
+    let obo_doc = sparkles::owl::obo::parse(&obo_text).unwrap();
+    let go1 = Class::new("http://purl.obolibrary.org/obo/GO_0000001");
+    let go3 = Class::new("http://purl.obolibrary.org/obo/GO_0000003");
+    let go4 = Class::new("http://purl.obolibrary.org/obo/GO_0000004");
+    let bfo50 = ObjectProperty::new("http://purl.obolibrary.org/obo/BFO_0000050");
+    let inferred_sub = Axiom::sub_class_of(go1.clone(), go3.clone()).annotated(Annotation::new(
+        AnnotationProperty::new(sparkles::owl::obo::OIO_IS_INFERRED),
+        AnnotationValue::Literal(Literal::simple("true")),
+    ));
+    assert!(obo_doc.axioms.contains(&inferred_sub));
+
+    // Gzipped OBO matches plain OBO
+    let mut obo_gz = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(dir.join("reasoned.obo.gz")).unwrap())
+        .read_to_string(&mut obo_gz)
+        .unwrap();
+    assert_eq!(obo_gz, obo_text);
+
+    // OBO Graphs JSON is valid JSON, reports skipped TransitiveObjectProperty warning, and
+    // preserves classes, edges and logical definitions
+    assert!(
+        err(&o).contains("reasoned.json") && err(&o).contains("omitted"),
+        "lossy OBO Graphs JSON write must warn on stderr: {}",
+        err(&o)
+    );
+    let json_text = std::fs::read_to_string(dir.join("reasoned.json")).unwrap();
+    let json_doc = sparkles::owl::obographs::parse(&json_text).unwrap();
+    assert!(json_doc.axioms.contains(&inferred_sub));
+    let mut json_gz = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(dir.join("reasoned.json.gz")).unwrap())
+        .read_to_string(&mut json_gz)
+        .unwrap();
+    assert_eq!(json_gz, json_text);
+
+    // Relax output in .owx and reduce output in .obo/.json carry the relaxed existential
+    let relaxed_owx =
+        sparkles::owl::owx::parse(&std::fs::read_to_string(dir.join("relaxed.owx")).unwrap())
+            .unwrap();
+    let ex_ax = Axiom::sub_class_of(
+        go1.clone(),
+        ClassExpression::some(bfo50.clone(), go4.clone()),
+    );
+    assert!(relaxed_owx.axioms.contains(&ex_ax));
+    let reduced_obo =
+        sparkles::owl::obo::parse(&std::fs::read_to_string(dir.join("reduced.obo")).unwrap())
+            .unwrap();
+    assert!(reduced_obo.axioms.contains(&ex_ax));
+    let reduced_json = sparkles::owl::obographs::parse(
+        &std::fs::read_to_string(dir.join("reduced.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(reduced_json.axioms.contains(&ex_ax));
+
+    // Materialize also writes all four formats
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "materialize",
+            "-i",
+            "demo.ofn",
+            "--term",
+            "BFO:0000050",
+            "-o",
+            "mat.owx",
+            "-o",
+            "mat.omn",
+            "-o",
+            "mat.obo",
+            "-o",
+            "mat.json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    for f in ["mat.owx", "mat.omn", "mat.obo", "mat.json"] {
+        assert!(dir.join(f).exists(), "{f}");
+    }
+    let mat_owx =
+        sparkles::owl::owx::parse(&std::fs::read_to_string(dir.join("mat.owx")).unwrap()).unwrap();
+    assert!(mat_owx.axioms.contains(&ex_ax));
+
+    // Explicit --format flags on `classify` and `axioms`
+    for fmt in ["owx", "omn", "obo", "obographs"] {
+        let o = sparkles(dir, &["ontology", "classify", "demo.ofn", "--format", fmt]);
+        assert_eq!(o.status.code(), Some(0), "{fmt}: {}", err(&o));
+        let body = out(&o);
+        parse_and_assert_writer_onto_stdout("local classify", fmt, &body);
+        // --partial refuses every document syntax format
+        let p = sparkles(
+            dir,
+            &[
+                "ontology",
+                "classify",
+                "demo.ofn",
+                "--partial",
+                "--format",
+                fmt,
+            ],
+        );
+        assert_ne!(p.status.code(), Some(0), "{fmt}");
+        assert!(err(&p).contains("partial"), "{fmt}: {}", err(&p));
+    }
+
+    // Load into a local database and test `sparkles ontology axioms --format owx|omn|obo|obographs`
+    let o = sparkles(dir, &["load", "--loc", "db", "demo.ofn"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    for fmt in ["owx", "omn", "obo", "obographs"] {
+        let o = sparkles(dir, &["ontology", "axioms", "--loc", "db", "--format", fmt]);
+        assert_eq!(o.status.code(), Some(0), "{fmt}: {}", err(&o));
+        let body = out(&o);
+        parse_and_assert_writer_onto_stdout("local axioms", fmt, &body);
+    }
+}
+
+#[test]
+fn ontology_writers_atomic_error_omn_gz_chained_classify_and_header_loss_cli() {
+    use std::io::Read as _;
+
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("demo.ofn"), WRITER_ONTO).unwrap();
+
+    // 1. .omn.gz matches plain .omn byte-for-byte
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "-i",
+            "demo.ofn",
+            "-o",
+            "out.omn",
+            "-o",
+            "out.omn.gz",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let plain_omn = std::fs::read_to_string(dir.join("out.omn")).unwrap();
+    let mut gz_omn = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(dir.join("out.omn.gz")).unwrap())
+        .read_to_string(&mut gz_omn)
+        .unwrap();
+    assert_eq!(gz_omn, plain_omn);
+
+    // 2. Chained `reason ... classify --format owx|omn|obo|obographs`
+    for fmt in ["owx", "omn", "obo", "obographs"] {
+        let o = sparkles(
+            dir,
+            &[
+                "ontology", "reason", "-i", "demo.ofn", "classify", "--format", fmt,
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{fmt}: {}", err(&o));
+        let body = out(&o);
+        parse_and_assert_writer_onto_stdout("chained classify", fmt, &body);
+    }
+
+    // 3. Chained `classify --format bogus` fails fast before writing `-o`
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "-i",
+            "demo.ofn",
+            "classify",
+            "--format",
+            "bogus",
+            "-o",
+            "should_not_exist.owx",
+        ],
+    );
+    assert_ne!(o.status.code(), Some(0));
+    assert!(
+        !dir.join("should_not_exist.owx").exists(),
+        "invalid --format must fail before writing -o"
+    );
+
+    // 4. Atomic write: writer error (XML 1.0 illegal NUL in literal) must not truncate pre-existing file
+    let bad_ofn = "Prefix(:=<http://ex.org/>)\nPrefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)\nOntology(<http://ex.org/bad>\nDeclaration(Class(:A))\nAnnotationAssertion(rdfs:label :A \"bad\0nul\")\n)\n";
+    std::fs::write(dir.join("bad.ofn"), bad_ofn).unwrap();
+    let existing = dir.join("existing.owx");
+    std::fs::write(&existing, "SENTINEL_KEEP_ME").unwrap();
+    let o = sparkles(
+        dir,
+        &["ontology", "relax", "-i", "bad.ofn", "-o", "existing.owx"],
+    );
+    assert_ne!(o.status.code(), Some(0), "NUL in OWL/XML must fail");
+    let owx_err = err(&o);
+    assert!(
+        owx_err.contains("OWL/XML") && owx_err.contains("U+0000"),
+        "expected OWL/XML U+0000 serialization diagnostic, got: {owx_err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&existing).unwrap(),
+        "SENTINEL_KEEP_ME",
+        "writer error must not truncate or corrupt existing destination file"
+    );
+    let leftover_stage_dirs: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".sparkles-owl-stage-")
+        })
+        .collect();
+    assert!(
+        leftover_stage_dirs.is_empty(),
+        "serialization error must not leave staging dirs behind: {leftover_stage_dirs:?}"
+    );
+
+    // 4b. Atomic success preserves permissions on existing regular file and updates symlink target
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let shared = dir.join("shared.owx");
+        std::fs::write(&shared, "OLD").unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let target = dir.join("target.owx");
+        std::fs::write(&target, "STALE").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.join("link.owx");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let o = sparkles(
+            dir,
+            &[
+                "ontology",
+                "relax",
+                "-i",
+                "demo.ofn",
+                "-o",
+                "shared.owx",
+                "-o",
+                "link.owx",
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(sparkles::owl::owx::parse(&std::fs::read_to_string(&target).unwrap()).is_ok());
+    }
+
+    // 5. Header-only loss logs stderr warning on lossy format
+    let hdr_loss_ofn = "Prefix(:=<http://ex.org/>)\nPrefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)\nOntology(<http://ex.org/hdr>\nAnnotation(rdfs:label \"bonjour\"@fr)\nDeclaration(Class(:A))\n)\n";
+    std::fs::write(dir.join("hdr_loss.ofn"), hdr_loss_ofn).unwrap();
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "relax",
+            "-i",
+            "hdr_loss.ofn",
+            "-o",
+            "hdr_loss.json",
+            "-o",
+            "hdr_loss.obo",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let stderr = err(&o);
+    assert!(
+        stderr.contains("hdr_loss.json") && stderr.contains("header annotations"),
+        "expected header-loss warning for .json: {stderr}"
+    );
+    assert!(
+        stderr.contains("hdr_loss.obo") && stderr.contains("header annotations"),
+        "expected header-loss warning for .obo: {stderr}"
+    );
+}
+
+#[test]
+fn ontology_writers_remote_server_stdout_formats() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("demo.ofn"), WRITER_ONTO).unwrap();
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut server = Kill(
+        Command::new(BIN)
+            .current_dir(dir)
+            .args([
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--data",
+                "data",
+            ])
+            .env_remove("SPARKLES_AUTH_CONFIG")
+            .env_remove("SPARKLES_BACKUP_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let start = Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(server.0.try_wait().unwrap().is_none(), "server exited");
+        assert!(start.elapsed() < Duration::from_secs(30), "server timeout");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let url = format!("http://127.0.0.1:{port}");
+    // Wait until /$/ping responds 200
+    loop {
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            use std::io::{Read as _, Write as _};
+            let _ = stream
+                .write_all(b"GET /$/ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let mut resp = String::new();
+            let _ = stream.read_to_string(&mut resp);
+            if resp.starts_with("HTTP/1.1 200") {
+                break;
+            }
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "server not ready"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let o = sparkles(dir, &["dataset", "create", "onto", "--server", &url]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &["ontology", "relax", "-i", "demo.ofn", "-o", "demo.ttl"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &["load", "--server", &url, "--dataset", "onto", "demo.ttl"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+
+    for cmd in ["axioms", "classify"] {
+        for fmt in ["owx", "omn", "obo", "obographs"] {
+            let o = sparkles(
+                dir,
+                &[
+                    "ontology",
+                    cmd,
+                    "--server",
+                    &url,
+                    "--dataset",
+                    "onto",
+                    "--format",
+                    fmt,
+                ],
+            );
+            assert_eq!(o.status.code(), Some(0), "{cmd} {fmt}: {}", err(&o));
+            let body = out(&o);
+            parse_and_assert_writer_onto_stdout(&format!("remote {cmd}"), fmt, &body);
+        }
+    }
+}

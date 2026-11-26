@@ -12,6 +12,9 @@ type K = EntityKind;
 
 /// How deeply expressions may nest, as the RDF reader allows.
 const MAX_DEPTH: usize = crate::read::MAX_NESTING;
+/// Syntax-level cap on nested grouping parentheses so pathological `((...))` inputs are
+/// bounded without penalizing semantic depth for parenthesized complements or sub-expressions.
+const MAX_SYNTAX_DEPTH: usize = MAX_DEPTH * 2;
 
 /// The words that are part of the grammar of class expressions and data ranges.
 pub const KEYWORDS: [&str; 14] = [
@@ -70,6 +73,7 @@ pub struct Parser<'v> {
     len: usize,
     v: &'v Vocabulary,
     depth: usize,
+    paren_depth: usize,
     budget: Option<ByteBudget>,
     max_error_bytes: Option<usize>,
 }
@@ -77,16 +81,21 @@ pub struct Parser<'v> {
 impl<'v> Parser<'v> {
     pub fn new(text: &str, v: &'v Vocabulary) -> Result<Parser<'v>, Error> {
         let toks = lex::tokens(text)?;
-        Ok(Parser {
+        Ok(Self::from_tokens(toks, text.len(), v))
+    }
+
+    pub(super) fn from_tokens(toks: Vec<(Tok, Span)>, len: usize, v: &'v Vocabulary) -> Parser<'v> {
+        Parser {
             end: toks.len(),
             toks,
             pos: 0,
-            len: text.len(),
+            len,
             v,
             depth: 0,
+            paren_depth: 0,
             budget: None,
             max_error_bytes: None,
-        })
+        }
     }
 
     pub fn with_budget(mut self, max_bytes: usize) -> Self {
@@ -301,6 +310,17 @@ impl<'v> Parser<'v> {
         Ok(())
     }
 
+    fn nest_paren(&mut self) -> Result<(), Error> {
+        self.paren_depth += 1;
+        if self.paren_depth > MAX_SYNTAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_SYNTAX_DEPTH} parentheses deep"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether token `k` is a name that is not a keyword.
     fn is_name(&self, k: usize) -> bool {
         match self.tok(k) {
@@ -462,21 +482,21 @@ impl<'v> Parser<'v> {
         }
     }
 
-    fn class(&mut self) -> Result<Class, Error> {
+    pub(super) fn class(&mut self) -> Result<Class, Error> {
         match self.entity(&[K::Class], "a class")? {
             (Entity::Class(c), _) => Ok(c),
             _ => unreachable!("asked for a class"),
         }
     }
 
-    fn datatype(&mut self) -> Result<Datatype, Error> {
+    pub(super) fn datatype(&mut self) -> Result<Datatype, Error> {
         match self.entity(&[K::Datatype], "a datatype")? {
             (Entity::Datatype(d), _) => Ok(d),
             _ => unreachable!("asked for a datatype"),
         }
     }
 
-    fn object_property(&mut self) -> Result<ObjectProperty, Error> {
+    pub(super) fn object_property(&mut self) -> Result<ObjectProperty, Error> {
         match self.entity(&[K::ObjectProperty], "an object property")? {
             (Entity::ObjectProperty(p), _) => Ok(p),
             _ => unreachable!("asked for an object property"),
@@ -484,7 +504,7 @@ impl<'v> Parser<'v> {
     }
 
     /// An object property expression: a property, `inverse p` or `inverse (p)`.
-    fn ope(&mut self) -> Result<Ope, Error> {
+    pub(super) fn ope(&mut self) -> Result<Ope, Error> {
         if self.eat_word("inverse") {
             let paren = self.peek() == Some(&Tok::LParen);
             if paren {
@@ -553,45 +573,82 @@ impl<'v> Parser<'v> {
 
     /// `conjunction or conjunction …`
     pub fn description(&mut self) -> Result<Ce, Error> {
-        self.nest()?;
-        let first = self.conjunction()?;
-        let mut all = vec![first];
-        while self.eat_word("or") {
-            all.push(self.conjunction()?);
+        self.description_depth().map(|(ce, _)| ce)
+    }
+
+    fn description_depth(&mut self) -> Result<(Ce, usize), Error> {
+        let (first, first_h) = self.conjunction_depth()?;
+        if !self.eat_word("or") {
+            return Ok((first, first_h));
         }
-        self.depth -= 1;
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), Ce::ObjectUnionOf)
-        })
+        // Do not charge `self.depth` provisionally for booleans: recursion back into
+        // nested booleans is already bounded early by `nest_paren` (`MAX_SYNTAX_DEPTH`)
+        // and non-collapsing primaries (`nest` at `MAX_DEPTH`), while the exact semantic
+        // limit is enforced below after deduplication so `E or E` at height `MAX_DEPTH`
+        // still collapses cleanly.
+        let mut all = vec![first];
+        let mut max_h = first_h;
+        loop {
+            let (next, h) = self.conjunction_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !self.eat_word("or") {
+                break;
+            }
+        }
+        let set: BTreeSet<Ce> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let ce = collapse(set, Ce::ObjectUnionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
+        if self.depth + h > MAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok((ce, h))
     }
 
     /// `primary and primary …`, with `that` read as `and`.
-    fn conjunction(&mut self) -> Result<Ce, Error> {
-        let first = self.primary()?;
-        let mut all = vec![first];
-        while self.eat_word("and") || self.eat_word("that") {
-            all.push(self.primary()?);
+    fn conjunction_depth(&mut self) -> Result<(Ce, usize), Error> {
+        let (first, first_h) = self.primary_depth()?;
+        if !(self.eat_word("and") || self.eat_word("that")) {
+            return Ok((first, first_h));
         }
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), Ce::ObjectIntersectionOf)
-        })
+        let mut all = vec![first];
+        let mut max_h = first_h;
+        loop {
+            let (next, h) = self.primary_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !(self.eat_word("and") || self.eat_word("that")) {
+                break;
+            }
+        }
+        let set: BTreeSet<Ce> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let ce = collapse(set, Ce::ObjectIntersectionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
+        if self.depth + h > MAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok((ce, h))
     }
 
-    /// Whether a restriction starts at the next token: a property, then a restriction
+    /// Whether a restriction starts at token `pos`: a property, then a restriction
     /// keyword.
-    fn restriction_ahead(&self) -> bool {
-        let k = if self.is_word(self.pos, "inverse") {
-            if self.tok(self.pos + 1) == Some(&Tok::LParen) {
-                self.pos + 4
+    fn restriction_ahead_at(&self, pos: usize) -> bool {
+        let k = if self.is_word(pos, "inverse") {
+            if self.tok(pos + 1) == Some(&Tok::LParen) {
+                pos + 4
             } else {
-                self.pos + 2
+                pos + 2
             }
-        } else if self.is_name(self.pos) {
-            self.pos + 1
+        } else if self.is_name(pos) {
+            pos + 1
         } else {
             return false;
         };
@@ -600,37 +657,51 @@ impl<'v> Parser<'v> {
             .is_some_and(|w| RESTRICTIONS.contains(&w))
     }
 
-    fn primary(&mut self) -> Result<Ce, Error> {
+    /// Whether a restriction starts at the next token: a property, then a restriction
+    /// keyword.
+    fn restriction_ahead(&self) -> bool {
+        self.restriction_ahead_at(self.pos)
+    }
+
+    fn primary_depth(&mut self) -> Result<(Ce, usize), Error> {
+        if self.peek() == Some(&Tok::LParen) {
+            self.nest_paren()?;
+            self.bump();
+            let res = self.description_depth().and_then(|d| {
+                self.expect(Tok::RParen, "')' to close the parenthesis")?;
+                Ok(d)
+            });
+            self.paren_depth -= 1;
+            return res;
+        }
         self.nest()?;
-        let out = if self.eat_word("not") {
-            Ce::ObjectComplementOf(Box::new(self.primary()?))
-        } else if self.peek() == Some(&Tok::LParen) {
-            self.bump();
-            let d = self.description()?;
-            self.expect(Tok::RParen, "')' to close the parenthesis")?;
-            d
-        } else if self.peek() == Some(&Tok::LBrace) {
-            self.bump();
-            let mut is = BTreeSet::new();
-            loop {
-                is.insert(self.individual()?);
-                if self.peek() == Some(&Tok::Comma) {
-                    self.bump();
-                    continue;
+        let res = (|| {
+            if self.eat_word("not") {
+                let (inner, h) = self.primary_depth()?;
+                Ok((Ce::ObjectComplementOf(Box::new(inner)), h + 1))
+            } else if self.peek() == Some(&Tok::LBrace) {
+                self.bump();
+                let mut is = BTreeSet::new();
+                loop {
+                    is.insert(self.individual()?);
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                        continue;
+                    }
+                    self.expect(Tok::RBrace, "',' or '}'")?;
+                    break;
                 }
-                self.expect(Tok::RBrace, "',' or '}'")?;
-                break;
+                Ok((Ce::ObjectOneOf(is), 1))
+            } else if self.restriction_ahead() {
+                self.restriction_depth()
+            } else if self.is_name(self.pos) {
+                Ok((Ce::Class(self.class()?), 1))
+            } else {
+                Err(self.expected("a class, a restriction, 'not', '(' or '{'"))
             }
-            Ce::ObjectOneOf(is)
-        } else if self.restriction_ahead() {
-            self.restriction()?
-        } else if self.is_name(self.pos) {
-            Ce::Class(self.class()?)
-        } else {
-            return Err(self.expected("a class, a restriction, 'not', '(' or '{'"));
-        };
+        })();
         self.depth -= 1;
-        Ok(out)
+        res
     }
 
     /// Whether a data range rather than a class expression starts at token `k`.
@@ -643,6 +714,9 @@ impl<'v> Parser<'v> {
                 Some(Tok::LParen) => k += 1,
                 _ => break,
             }
+        }
+        if self.restriction_ahead_at(k) {
+            return false;
         }
         match self.tok(k) {
             Some(Tok::Str { .. } | Tok::Number(_)) => true,
@@ -675,7 +749,7 @@ impl<'v> Parser<'v> {
         }
     }
 
-    fn restriction(&mut self) -> Result<Ce, Error> {
+    fn restriction_depth(&mut self) -> Result<(Ce, usize), Error> {
         let p = self.prop()?;
         let (Tok::Name(Name::Word(kw)), kw_span) = self.bump().expect("a restriction keyword")
         else {
@@ -703,9 +777,15 @@ impl<'v> Parser<'v> {
         if data_filler {
             let d = p.data.clone().expect("a data property");
             return Ok(match kw.as_str() {
-                "some" => Ce::DataSomeValuesFrom(vec![d], self.data_primary()?),
-                "only" => Ce::DataAllValuesFrom(vec![d], self.data_primary()?),
-                "value" => Ce::DataHasValue(d, self.literal()?),
+                "some" => {
+                    let (r, rh) = self.data_primary_depth()?;
+                    (Ce::DataSomeValuesFrom(vec![d], r), rh + 1)
+                }
+                "only" => {
+                    let (r, rh) = self.data_primary_depth()?;
+                    (Ce::DataAllValuesFrom(vec![d], r), rh + 1)
+                }
+                "value" => (Ce::DataHasValue(d, self.literal()?), 1),
                 "Self" => {
                     return Err(Error {
                         kind: ErrorKind::Kind,
@@ -717,37 +797,47 @@ impl<'v> Parser<'v> {
                 }
                 _ => {
                     let n = self.cardinality()?;
-                    let f = if self.filler_ahead(self.pos) {
-                        Some(self.data_primary()?)
+                    let (f, h) = if self.filler_ahead(self.pos) {
+                        let (r, rh) = self.data_primary_depth()?;
+                        (Some(r), rh + 1)
                     } else {
-                        None
+                        (None, 1)
                     };
-                    match kw.as_str() {
+                    let ce = match kw.as_str() {
                         "min" => Ce::DataMinCardinality(n, d, f),
                         "max" => Ce::DataMaxCardinality(n, d, f),
                         _ => Ce::DataExactCardinality(n, d, f),
-                    }
+                    };
+                    (ce, h)
                 }
             });
         }
         let o = need_object(&p)?;
         Ok(match kw.as_str() {
-            "some" => Ce::ObjectSomeValuesFrom(o, Box::new(self.primary()?)),
-            "only" => Ce::ObjectAllValuesFrom(o, Box::new(self.primary()?)),
-            "value" => Ce::ObjectHasValue(o, self.individual()?),
-            "Self" => Ce::ObjectHasSelf(o),
+            "some" => {
+                let (f, fh) = self.primary_depth()?;
+                (Ce::ObjectSomeValuesFrom(o, Box::new(f)), fh + 1)
+            }
+            "only" => {
+                let (f, fh) = self.primary_depth()?;
+                (Ce::ObjectAllValuesFrom(o, Box::new(f)), fh + 1)
+            }
+            "value" => (Ce::ObjectHasValue(o, self.individual()?), 1),
+            "Self" => (Ce::ObjectHasSelf(o), 1),
             _ => {
                 let n = self.cardinality()?;
-                let f = if self.filler_ahead(self.pos) {
-                    Some(Box::new(self.primary()?))
+                let (f, h) = if self.filler_ahead(self.pos) {
+                    let (ce, fh) = self.primary_depth()?;
+                    (Some(Box::new(ce)), fh + 1)
                 } else {
-                    None
+                    (None, 1)
                 };
-                match kw.as_str() {
+                let ce = match kw.as_str() {
                     "min" => Ce::ObjectMinCardinality(n, o, f),
                     "max" => Ce::ObjectMaxCardinality(n, o, f),
                     _ => Ce::ObjectExactCardinality(n, o, f),
-                }
+                };
+                (ce, h)
             }
         })
     }
@@ -769,76 +859,118 @@ impl<'v> Parser<'v> {
 
     /// `dataConjunction or dataConjunction …`
     pub fn data_range(&mut self) -> Result<DataRange, Error> {
-        self.nest()?;
-        let mut all = vec![self.data_conjunction()?];
-        while self.eat_word("or") {
-            all.push(self.data_conjunction()?);
-        }
-        self.depth -= 1;
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), DataRange::UnionOf)
-        })
+        self.data_range_depth().map(|(dr, _)| dr)
     }
 
-    fn data_conjunction(&mut self) -> Result<DataRange, Error> {
-        let mut all = vec![self.data_primary()?];
-        while self.eat_word("and") {
-            all.push(self.data_primary()?);
+    fn data_range_depth(&mut self) -> Result<(DataRange, usize), Error> {
+        let (first, first_h) = self.data_conjunction_depth()?;
+        if !self.eat_word("or") {
+            return Ok((first, first_h));
         }
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), DataRange::IntersectionOf)
-        })
-    }
-
-    fn data_primary(&mut self) -> Result<DataRange, Error> {
-        self.nest()?;
-        let out = if self.eat_word("not") {
-            DataRange::ComplementOf(Box::new(self.data_primary()?))
-        } else if self.peek() == Some(&Tok::LParen) {
-            self.bump();
-            let r = self.data_range()?;
-            self.expect(Tok::RParen, "')' to close the parenthesis")?;
-            r
-        } else if self.peek() == Some(&Tok::LBrace) {
-            self.bump();
-            let mut ls = BTreeSet::new();
-            loop {
-                ls.insert(self.literal()?);
-                if self.peek() == Some(&Tok::Comma) {
-                    self.bump();
-                    continue;
-                }
-                self.expect(Tok::RBrace, "',' or '}'")?;
+        let mut all = vec![first];
+        let mut max_h = first_h;
+        loop {
+            let (next, h) = self.data_conjunction_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !self.eat_word("or") {
                 break;
             }
-            DataRange::OneOf(ls)
-        } else if self.is_name(self.pos) {
-            let d = self.datatype()?;
-            if self.peek() == Some(&Tok::LBracket) {
+        }
+        let set: BTreeSet<DataRange> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let dr = collapse(set, DataRange::UnionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
+        if self.depth + h > MAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok((dr, h))
+    }
+
+    fn data_conjunction_depth(&mut self) -> Result<(DataRange, usize), Error> {
+        let (first, first_h) = self.data_primary_depth()?;
+        if !self.eat_word("and") {
+            return Ok((first, first_h));
+        }
+        let mut all = vec![first];
+        let mut max_h = first_h;
+        loop {
+            let (next, h) = self.data_primary_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !self.eat_word("and") {
+                break;
+            }
+        }
+        let set: BTreeSet<DataRange> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let dr = collapse(set, DataRange::IntersectionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
+        if self.depth + h > MAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok((dr, h))
+    }
+
+    fn data_primary_depth(&mut self) -> Result<(DataRange, usize), Error> {
+        if self.peek() == Some(&Tok::LParen) {
+            self.nest_paren()?;
+            self.bump();
+            let res = self.data_range_depth().and_then(|r| {
+                self.expect(Tok::RParen, "')' to close the parenthesis")?;
+                Ok(r)
+            });
+            self.paren_depth -= 1;
+            return res;
+        }
+        self.nest()?;
+        let res = (|| {
+            if self.eat_word("not") {
+                let (inner, h) = self.data_primary_depth()?;
+                Ok((DataRange::ComplementOf(Box::new(inner)), h + 1))
+            } else if self.peek() == Some(&Tok::LBrace) {
                 self.bump();
-                let mut fs = BTreeSet::new();
+                let mut ls = BTreeSet::new();
                 loop {
-                    fs.insert(self.facet()?);
+                    ls.insert(self.literal()?);
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                         continue;
                     }
-                    self.expect(Tok::RBracket, "',' or ']'")?;
+                    self.expect(Tok::RBrace, "',' or '}'")?;
                     break;
                 }
-                DataRange::DatatypeRestriction(d, fs)
+                Ok((DataRange::OneOf(ls), 1))
+            } else if self.is_name(self.pos) {
+                let d = self.datatype()?;
+                if self.peek() == Some(&Tok::LBracket) {
+                    self.bump();
+                    let mut fs = BTreeSet::new();
+                    loop {
+                        fs.insert(self.facet()?);
+                        if self.peek() == Some(&Tok::Comma) {
+                            self.bump();
+                            continue;
+                        }
+                        self.expect(Tok::RBracket, "',' or ']'")?;
+                        break;
+                    }
+                    Ok((DataRange::DatatypeRestriction(d, fs), 1))
+                } else {
+                    Ok((DataRange::Datatype(d), 1))
+                }
             } else {
-                DataRange::Datatype(d)
+                Err(self.expected("a datatype, 'not', '(' or '{'"))
             }
-        } else {
-            return Err(self.expected("a datatype, 'not', '(' or '{'"));
-        };
+        })();
         self.depth -= 1;
-        Ok(out)
+        res
     }
 
     fn facet(&mut self) -> Result<FacetRestriction, Error> {
@@ -1169,14 +1301,14 @@ impl<'v> Parser<'v> {
         Left::of(es[0].clone())
     }
 
-    fn data_property(&mut self) -> Result<DataProperty, Error> {
+    pub(super) fn data_property(&mut self) -> Result<DataProperty, Error> {
         match self.entity(&[K::DataProperty], "a data property")? {
             (Entity::DataProperty(p), _) => Ok(p),
             _ => unreachable!("asked for a data property"),
         }
     }
 
-    fn annotation_property(&mut self) -> Result<AnnotationProperty, Error> {
+    pub(super) fn annotation_property(&mut self) -> Result<AnnotationProperty, Error> {
         match self.entity(&[K::AnnotationProperty], "an annotation property")? {
             (Entity::AnnotationProperty(p), _) => Ok(p),
             _ => unreachable!("asked for an annotation property"),

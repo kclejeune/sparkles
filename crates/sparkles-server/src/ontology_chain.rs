@@ -34,7 +34,8 @@ pub struct Io {
     #[arg(long, conflicts_with = "input")]
     pub loc: Option<PathBuf>,
     /// Write the ontology to this file after the command, in the syntax its extension
-    /// names: .ofn, .owl (RDF/XML), .ttl or .nt, each optionally .gz (repeatable)
+    /// names: .ofn, .owl (RDF/XML), .ttl, .nt, .owx (OWL/XML), .omn (Manchester),
+    /// .obo (OBO 1.4) or .json (OBO Graphs JSON), each optionally .gz (repeatable)
     #[arg(short = 'o', long)]
     pub output: Vec<PathBuf>,
     #[command(flatten)]
@@ -201,7 +202,7 @@ pub struct ClassifyStep {
     /// Refuse when the classifier would leave an axiom out, as `classify --strict`
     #[arg(long)]
     pub strict: bool,
-    /// ofn (the taxonomy as a functional-style document), json or text
+    /// ofn, owx, omn, obo, obographs, json or text
     #[arg(long, default_value = "ofn")]
     pub format: String,
     #[command(flatten)]
@@ -290,8 +291,7 @@ pub fn resume(
     let w = WorkingOntology::read(file, &read.request()?, threads, &q)
         .with_context(|| format!("cannot read {}", file.display()))?;
     for o in &output {
-        w.write(o)
-            .with_context(|| format!("cannot write {}", o.display()))?;
+        write_working(&w, o)?;
     }
     follow(Some(w), rest, &opts)
 }
@@ -322,6 +322,21 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
     let io = step.io().clone();
     for o in &io.output {
         OutputFormat::of(o)?;
+    }
+    match &step {
+        Step::Classify(a)
+            if !["ofn", "owx", "omn", "obo", "obographs", "json", "text"]
+                .contains(&a.format.as_str()) =>
+        {
+            bail!(
+                "unknown --format {}: ofn, owx, omn, obo, obographs, json or text",
+                a.format
+            );
+        }
+        Step::Check(a) if !["json", "text"].contains(&a.format.as_str()) => {
+            bail!("unknown --format {}: json or text", a.format);
+        }
+        _ => {}
     }
     let q = QueryOptions::default();
     let mut w = match state.take() {
@@ -402,9 +417,9 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 ..c.clone()
             };
             let file = w.to_file()?;
-            let (j, doc) = classify_body_of_file(&file, &c, &io.read, about, &q)?;
+            let (j, doc) = classify_body_of_file(&file, &c, &io.read, about, &a.format, &q)?;
             for o in &io.output {
-                w.write(o)?;
+                write_working(&w, o)?;
             }
             ok = finish_classify(&j, &doc, &a.format, a.allow_unsatisfiable)?;
             *state = Some(w);
@@ -432,7 +447,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 check.assertions,
             );
             for o in &io.output {
-                w.write(o)?;
+                write_working(&w, o)?;
             }
             ok = finish_check(&j, &a.format)?;
             *state = Some(w);
@@ -440,11 +455,61 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
         }
     }
     for o in &io.output {
-        w.write(o)
-            .with_context(|| format!("cannot write {}", o.display()))?;
+        write_working(&w, o)?;
     }
     *state = Some(w);
     Ok(ok)
+}
+
+fn write_working(w: &WorkingOntology, path: &Path) -> Result<()> {
+    let report = w
+        .write_reported(path)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    log_write_report(path, &w.renderer(), &report);
+    Ok(())
+}
+
+fn log_write_report(
+    path: &Path,
+    renderer: &sparkles::owl::ofn::Renderer,
+    report: &sparkles::owl::WriteReport,
+) {
+    if report.skipped_count > 0 {
+        eprintln!(
+            "WARN {}: {} axioms could not be represented in the target syntax and were omitted",
+            path.display(),
+            report.skipped_count
+        );
+        for s in report.skipped.iter().take(UNMAPPED_LOGGED) {
+            eprintln!(
+                "WARN   omitted ({}): {}",
+                s.reason,
+                renderer.axiom(&s.axiom)
+            );
+        }
+        if report.skipped_count > UNMAPPED_LOGGED {
+            eprintln!(
+                "WARN   and {} more",
+                report.skipped_count - UNMAPPED_LOGGED.min(report.skipped.len())
+            );
+        }
+    }
+    if report.skipped_header_count > 0 {
+        eprintln!(
+            "WARN {}: {} header annotations could not be represented in the target syntax and were omitted",
+            path.display(),
+            report.skipped_header_count
+        );
+        for reason in report.skipped_header.iter().take(UNMAPPED_LOGGED) {
+            eprintln!("WARN   omitted header: {reason}");
+        }
+        if report.skipped_header_count > UNMAPPED_LOGGED {
+            eprintln!(
+                "WARN   and {} more header annotations",
+                report.skipped_header_count - UNMAPPED_LOGGED.min(report.skipped_header.len())
+            );
+        }
+    }
 }
 
 fn read_input(io: &Io, opts: &StoreOptions, q: &QueryOptions) -> Result<WorkingOntology> {
@@ -637,7 +702,7 @@ fn failed(e: TransformError, dump: Option<&Path>, w: &WorkingOntology) -> anyhow
         let written = OutputFormat::of(path)
             .map_err(anyhow::Error::from)
             .and_then(|(f, gz)| {
-                sparkles::handles::ontology::transform::write_axioms(
+                let rep = sparkles::handles::ontology::transform::write_axioms_reported(
                     path,
                     f,
                     gz,
@@ -645,7 +710,9 @@ fn failed(e: TransformError, dump: Option<&Path>, w: &WorkingOntology) -> anyhow
                     &Default::default(),
                     m.iter(),
                 )
-                .map_err(anyhow::Error::from)
+                .map_err(anyhow::Error::from)?;
+                log_write_report(path, &w.renderer(), &rep);
+                Ok(())
             });
         if let Err(x) = written {
             eprintln!(
