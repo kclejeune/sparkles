@@ -1176,3 +1176,250 @@ async fn stored_answers_need_the_askers_view() {
         );
     }
 }
+
+/// The internal F13 refresh accumulator respects the GraphRAG principal's graph grants
+/// and predicate protections, stays hidden from `/$/views`, and falls back cleanly when
+/// the principal's view has data-dependent protections.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_respects_principal_visibility_and_protections() {
+    use crate::graphrag::build::{self, Mode, Run};
+    use crate::graphrag::refresh::{Watch, tick_once};
+    use crate::graphrag::settings::GraphragSettings;
+    use crate::models::mock;
+
+    // 1. Graph grants + state-independent predicate protection (`own` without pattern).
+    let s = build(Fixture {
+        extra: users(r#""urn:g:a", "urn:x-sparkles:graphrag:reports""#, false),
+        ..Default::default()
+    });
+    let ds = s.state.attach("rag", DbType::Persistent, None).unwrap();
+    let mock = mock::MockModel::start(|r, _| {
+        (200, mock::openai(&crate::graphrag::build::tests::answer(r)))
+    });
+    let pair = serde_json::json!({ "provider": "p", "model": "m" });
+    s.state
+        .models
+        .store(Some(Arc::new(crate::graphrag::build::tests::models_for(
+            &mock.url(),
+            &pair,
+        ))));
+    // Load a small cluster into urn:g:a (visible to tua) and extra data into urn:g:b (hidden).
+    let mut cluster = String::from("<urn:g:a> {\n");
+    for i in 0..4 {
+        cluster.push_str(&format!(
+            "<http://ex/a{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"a{i}\" .\n"
+        ));
+        for j in (i + 1)..4 {
+            cluster.push_str(&format!(
+                "<http://ex/a{i}> <http://ex/knows> <http://ex/a{j}> .\n"
+            ));
+        }
+    }
+    cluster.push_str("}\n");
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            cluster.clone().into_bytes(),
+            sparkles::io::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+
+    let mut assistant: crate::assistant::AssistantSettings =
+        crate::settings::effective(&s.state, &ds, &crate::settings::ASSISTANT);
+    assistant.send = crate::assistant::Send::Rows;
+    crate::settings::store_runtime(
+        &s.state,
+        &ds,
+        &crate::settings::ASSISTANT,
+        &serde_json::to_value(assistant).unwrap(),
+    )
+    .unwrap();
+
+    let gr_settings: GraphragSettings = serde_json::from_value(serde_json::json!({
+        "enabled": true,
+        "principal": "tua",
+        "projection": { "graphs": ["urn:g:*"] },
+        "minCommunitySize": 3,
+        "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.25 }
+    }))
+    .unwrap();
+    crate::settings::store_runtime(
+        &s.state,
+        &ds,
+        &crate::settings::GRAPHRAG,
+        &serde_json::to_value(&gr_settings).unwrap(),
+    )
+    .unwrap();
+
+    let st = s.state.clone();
+    let ds2 = ds.clone();
+    let gr2 = gr_settings.clone();
+    tokio::task::spawn_blocking(move || {
+        build::run(&Run {
+            st: &st,
+            ds: ds2.clone(),
+            settings: gr2,
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: String::new(),
+            cancel: Default::default(),
+            limits: Default::default(),
+        })
+        .unwrap();
+        assert_eq!(ds2.dataset.inner_state().views.internal_count(), 1);
+    })
+    .await
+    .unwrap();
+
+    // The internal circuit must never appear in `/$/views/rag`.
+    let views_resp = get(&s.app, "tadmin", "/$/views/rag", "application/json").await;
+    assert_eq!(views_resp.status, StatusCode::OK);
+    let views_json: serde_json::Value = serde_json::from_slice(&views_resp.body).unwrap();
+    assert_eq!(views_json["views"], serde_json::json!([]));
+
+    let st = s.state.clone();
+    let ds2 = ds.clone();
+    tokio::task::spawn_blocking(move || {
+        let tasks = || -> Vec<crate::state::Task> {
+            st.tasks
+                .lock()
+                .iter()
+                .filter(|t| t.kind == build::TASK_KIND)
+                .cloned()
+                .collect()
+        };
+        let sec = std::time::Duration::from_secs(1);
+        let mut w: std::collections::HashMap<String, Watch> = std::collections::HashMap::new();
+        let mut now = std::time::Instant::now();
+        tick_once(&st, &mut w, now);
+        now += sec;
+        tick_once(&st, &mut w, now);
+        assert!(tasks().is_empty());
+
+        // Writes to hidden graph `urn:g:b` and hidden predicate `ex:secret` in `urn:g:a`
+        // must be invisible to `tua`'s refresh circuit and start no refresh.
+        let mut hidden = String::from("INSERT DATA { ");
+        for i in 0..20 {
+            hidden.push_str(&format!(
+                "GRAPH <urn:g:b> {{ <http://ex/a0> <http://ex/note> \"h{i}\" }} \
+                 GRAPH <urn:g:a> {{ <http://ex/a0> <http://ex/secret> \"s{i}\" }} "
+            ));
+        }
+        hidden.push('}');
+        sparkles::sparql::update::update(&ds2.store, &hidden, &Default::default()).unwrap();
+        for _ in 0..3 {
+            now += sec;
+            tick_once(&st, &mut w, now);
+        }
+        assert!(
+            tasks().is_empty(),
+            "hidden graph and protected predicate must not trigger refresh: {:?}",
+            tasks()
+        );
+
+        // Visible writes to `urn:g:a` with an allowed predicate DO trigger refresh.
+        let mut visible = String::from("INSERT DATA { GRAPH <urn:g:a> { ");
+        for i in 0..10 {
+            visible.push_str(&format!("<http://ex/a0> <http://ex/note> \"v{i}\" . "));
+        }
+        visible.push_str("} }");
+        sparkles::sparql::update::update(&ds2.store, &visible, &Default::default()).unwrap();
+        now += sec;
+        tick_once(&st, &mut w, now);
+        now += sec;
+        tick_once(&st, &mut w, now);
+        assert_eq!(tasks().len(), 1, "visible changes trigger refresh");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while st.active_task(build::TASK_KIND, "rag").is_some() {
+            assert!(std::time::Instant::now() < end);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(tasks()[0].state, "done", "{:?}", tasks()[0]);
+    })
+    .await
+    .unwrap();
+
+    // 2. Data-dependent protection (`own` with caller-bound pattern): detaches the
+    // circuit and falls back cleanly without failing.
+    let s2 = build(Fixture {
+        extra: users(r#""urn:g:a", "urn:x-sparkles:graphrag:reports""#, true),
+        ..Default::default()
+    });
+    let ds_pat = s2.state.attach("rag", DbType::Persistent, None).unwrap();
+    let mock2 = mock::MockModel::start(|r, _| {
+        (200, mock::openai(&crate::graphrag::build::tests::answer(r)))
+    });
+    s2.state
+        .models
+        .store(Some(Arc::new(crate::graphrag::build::tests::models_for(
+            &mock2.url(),
+            &pair,
+        ))));
+    ds_pat
+        .store
+        .load(&[sparkles::io::Source::from_bytes(
+            cluster.into_bytes(),
+            sparkles::io::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let mut assistant2: crate::assistant::AssistantSettings =
+        crate::settings::effective(&s2.state, &ds_pat, &crate::settings::ASSISTANT);
+    assistant2.send = crate::assistant::Send::Rows;
+    crate::settings::store_runtime(
+        &s2.state,
+        &ds_pat,
+        &crate::settings::ASSISTANT,
+        &serde_json::to_value(assistant2).unwrap(),
+    )
+    .unwrap();
+    crate::settings::store_runtime(
+        &s2.state,
+        &ds_pat,
+        &crate::settings::GRAPHRAG,
+        &serde_json::to_value(&gr_settings).unwrap(),
+    )
+    .unwrap();
+    let st2 = s2.state.clone();
+    tokio::task::spawn_blocking(move || {
+        build::run(&Run {
+            st: &st2,
+            ds: ds_pat.clone(),
+            settings: gr_settings.clone(),
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: String::new(),
+            cancel: Default::default(),
+            limits: Default::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            ds_pat.dataset.inner_state().views.internal_count(),
+            0,
+            "data-dependent protection does not attach a full-scan circuit"
+        );
+        sparkles::sparql::update::update(
+            &ds_pat.store,
+            "INSERT DATA { GRAPH <urn:g:a> { <http://ex/a0> <http://ex/note> \"p\" } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let reason = crate::graphrag::refresh::due_reason(
+            &st2,
+            &ds_pat,
+            &gr_settings,
+            &mut Watch::default(),
+        )
+        .unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("depend on the data")),
+            "{reason:?}"
+        );
+    })
+    .await
+    .unwrap();
+}

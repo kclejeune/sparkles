@@ -1402,3 +1402,435 @@ fn report_charges_bound_what_the_report_builds() {
         );
     }
 }
+
+/// End-to-end automatic refresh on the internal F13 accumulator circuit:
+/// - attaches after build and detaches when switched to manual or disabled,
+/// - counts insertions, deletions and updates independently across two communities,
+/// - rewrites only the community whose count crosses `minChangedFraction`,
+/// - triggers refresh when an entity joins a community (in either direction),
+/// - replaces the circuit cleanly when projection settings change.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_handles_insertions_deletions_updates_and_joining_across_communities() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    let f = fixture(5);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.15 }
+        }));
+        f.run(s, Mode::Build).unwrap();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        assert_eq!(
+            ds.dataset.inner_state().views.internal_count(),
+            1,
+            "build in auto mode attaches the internal refresh circuit"
+        );
+        let tasks = |st: &AppState| -> Vec<crate::state::Task> {
+            st.tasks
+                .lock()
+                .iter()
+                .filter(|t| t.kind == TASK_KIND)
+                .cloned()
+                .collect()
+        };
+        let wait = |st: &AppState| {
+            let end = Instant::now() + Duration::from_secs(60);
+            while st.active_task(TASK_KIND, "org").is_some() {
+                assert!(Instant::now() < end, "the refresh did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let upd = |u: &str| {
+            sparkles::sparql::update::update(&ds.store, u, &Default::default()).unwrap();
+        };
+        let sec = Duration::from_secs(1);
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let mut now = Instant::now();
+
+        // First sight waits one debounce and starts nothing.
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert!(tasks(&f.st).is_empty());
+
+        // Insertions + deletions + replacements in community x only; community y gets 1
+        // small change below threshold.
+        let before = f.reports();
+        upd(&format!(
+            "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/n> \"1\", \"2\", \"3\", \"4\" . \
+             <http://ex/y0> <http://ex/n> \"small\" }} }}"
+        ));
+        upd(&format!(
+            "DELETE DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/n> \"1\" }} }}"
+        ));
+        upd(&format!(
+            "DELETE {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/n> \"2\" }} }} \
+             INSERT {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/n> \"2b\" }} }} WHERE {{}}"
+        ));
+        // 4 inserts + 1 delete + 2 (replace) = 7 gross changes (3 net facts out of 16 >= 15%)
+        // on community x; community y has only 1 change (< 15%).
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert_eq!(tasks(&f.st).len(), 1);
+        wait(&f.st);
+        assert_eq!(tasks(&f.st)[0].state, "done", "{:?}", tasks(&f.st)[0]);
+        let after = f.reports();
+        assert_eq!(
+            after.iter().filter(|r| !before.contains(r)).count(),
+            1,
+            "only the changed community's report is rewritten"
+        );
+
+        // Next ticks see no further refresh because `after_build` discarded prior counts.
+        for _ in 0..3 {
+            now += sec;
+            tick_once(&f.st, &mut w, now);
+        }
+        assert_eq!(tasks(&f.st).len(), 1);
+
+        // An entity joining a community (`new -> member`) triggers refresh even on 1 edge.
+        upd(&format!(
+            "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/newcomer> <http://ex/knows> <http://ex/y1> }} }}"
+        ));
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert_eq!(tasks(&f.st).len(), 2, "{:?}", tasks(&f.st));
+        wait(&f.st);
+        assert_eq!(tasks(&f.st)[1].state, "done", "{:?}", tasks(&f.st)[1]);
+        assert!(
+            tasks(&f.st)[1]
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("newcomer") && m.contains("joined")),
+            "{:?}",
+            tasks(&f.st)[1].message
+        );
+
+        // Changing projection settings replaces the circuit cleanly without conflict.
+        let wider = settings(json!({
+            "projection": { "graphs": [ORG, "urn:g:extra"] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.15 }
+        }));
+        store_settings(&f.st, &ds, &wider);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert_eq!(ds.dataset.inner_state().views.internal_count(), 1);
+
+        // Switching to manual detaches and collects the internal circuit.
+        let manual = settings(json!({ "refresh": { "mode": "manual" } }));
+        store_settings(&f.st, &ds, &manual);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        ds.dataset
+            .inner_state()
+            .views
+            .settle(Duration::from_secs(10));
+        assert_eq!(
+            ds.dataset.inner_state().views.internal_count(),
+            0,
+            "manual mode detaches the internal circuit"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// Persistent restart recovery: accumulator counts checkpointed on clean close are
+/// reloaded on reopen, offline commits are replayed from the change log, and an
+/// unbridgeable gap without a change log falls back to a refresh cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_recovers_checkpoint_across_restart_and_handles_gap() {
+    use crate::graphrag::refresh::{CIRCUIT_ID, Watch, tick_once};
+    for change_log in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("org");
+        let mock = MockModel::start(|r, _| (200, mock::openai(&answer(r))));
+        let pair = json!({ "provider": "p", "model": "m" });
+        let opts = sparkles::store::StoreOptions {
+            change_log,
+            history_max_generations: if change_log { 8 } else { 1 },
+            ..Default::default()
+        };
+        let s = settings(json!({
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.15 }
+        }));
+        let mock_url = mock.url();
+        let db_clone = db.clone();
+        let s_clone = s.clone();
+        tokio::task::spawn_blocking(move || {
+            let open_state = |mock_url: &str| {
+                let mut st = AppState::standalone(opts.clone(), Duration::from_secs(30));
+                st.models = arc_swap::ArcSwapOption::from_pointee(models_for(mock_url, &pair));
+                let st = Arc::new(st);
+                let ds = st.attach("org", DbType::Persistent, Some(&db_clone)).unwrap();
+                (st, ds)
+            };
+            // Phase 1: initial build + 2 facts (below threshold), then clean close.
+            {
+                let (st, ds) = open_state(&mock_url);
+                ds.store
+                    .load(&[Source::from_bytes(
+                        data(5).into_bytes(),
+                        RdfFormat::TriG,
+                        None,
+                    )])
+                    .unwrap();
+                let mut assistant: crate::assistant::AssistantSettings =
+                    crate::settings::effective(&st, &ds, &crate::settings::ASSISTANT);
+                assistant.send = crate::assistant::Send::Rows;
+                crate::settings::store_runtime(
+                    &st,
+                    &ds,
+                    &crate::settings::ASSISTANT,
+                    &serde_json::to_value(assistant).unwrap(),
+                )
+                .unwrap();
+                store_settings(&st, &ds, &s_clone);
+                run(&Run {
+                    st: &st,
+                    ds: ds.clone(),
+                    settings: s_clone.clone(),
+                    mode: Mode::Build,
+                    confirmed: true,
+                    task: None,
+                    task_id: String::new(),
+                    cancel: Default::default(),
+                    limits: Default::default(),
+                })
+                .unwrap();
+                // Add 2 facts (below 15% threshold of ~20 facts) and wait for circuit.
+                sparkles::sparql::update::update(
+                    &ds.store,
+                    &format!(
+                        "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/n> \"pre1\", \"pre2\" }} }}"
+                    ),
+                    &Default::default(),
+                )
+                .unwrap();
+                let mut w = HashMap::new();
+                let now = Instant::now();
+                tick_once(&st, &mut w, now);
+                tick_once(&st, &mut w, now + Duration::from_secs(2));
+                assert!(
+                    st.tasks
+                        .lock()
+                        .iter()
+                        .all(|t| t.kind != TASK_KIND),
+                    "2 facts stay below threshold before restart"
+                );
+                // Clean close writes the internal circuit checkpoint.
+                st.graphrag.detach_circuit("org");
+                ds.dataset.inner_state().views.close(&ds.store);
+            }
+            let ckpt_dir = db_clone.join("circuits").join(CIRCUIT_ID).join("main");
+            assert!(
+                ckpt_dir.exists()
+                    && std::fs::read_dir(&ckpt_dir)
+                        .unwrap()
+                        .next()
+                        .is_some(),
+                "clean close wrote internal circuit checkpoint at {}",
+                ckpt_dir.display()
+            );
+
+            // Phase 2: offline commit adds 4 more facts while server is stopped
+            // (2 pre-restart + 4 offline = 6 >= 15% threshold). Without change_log,
+            // compacting discards the old generation so the gap cannot be bridged.
+            {
+                let store = sparkles::store::Store::open(&db_clone, opts.clone()).unwrap();
+                sparkles::sparql::update::update(
+                    &store,
+                    &format!(
+                        "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/n> \"off1\", \"off2\", \"off3\", \"off4\" }} }}"
+                    ),
+                    &Default::default(),
+                )
+                .unwrap();
+                if !change_log {
+                    store.compact().unwrap();
+                }
+            }
+
+            // Phase 3: reopen server and tick: loads checkpoint, replays or falls back,
+            // and triggers the refresh cleanly.
+            let (st, ds) = open_state(&mock_url);
+            let mut w: HashMap<String, Watch> = HashMap::new();
+            let now = Instant::now();
+            tick_once(&st, &mut w, now);
+            assert_eq!(
+                ds.dataset.inner_state().views.stats(&ds.store).loaded,
+                1,
+                "change_log={change_log}: checkpoint must be loaded on reopen"
+            );
+            tick_once(&st, &mut w, now + Duration::from_secs(2));
+            let started: Vec<_> = st
+                .tasks
+                .lock()
+                .iter()
+                .filter(|t| t.kind == TASK_KIND)
+                .cloned()
+                .collect();
+            assert_eq!(
+                started.len(),
+                1,
+                "change_log={change_log}: expected refresh after restart: {started:?}"
+            );
+            let end = Instant::now() + Duration::from_secs(60);
+            while st.active_task(TASK_KIND, "org").is_some() {
+                assert!(Instant::now() < end, "refresh did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let done = st
+                .tasks
+                .lock()
+                .iter()
+                .find(|t| t.kind == TASK_KIND)
+                .cloned()
+                .unwrap();
+            assert_eq!(done.state, "done", "change_log={change_log}: {done:?}");
+            let msg = done.message.unwrap_or_default();
+            if change_log {
+                assert!(
+                    msg.contains("facts of <"),
+                    "with change_log, exact count triggers refresh: {msg}"
+                );
+            } else {
+                assert!(
+                    msg.contains("cannot count every commit"),
+                    "without change_log, unbridgeable gap triggers fallback refresh: {msg}"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// Tight memory budget on the refresh accumulator keeps memory bounded, triggers a clean
+/// fallback refresh on eviction, and resumes exact counting after refresh discards counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_enforces_memory_bounds_and_recovers_after_eviction() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    let mock = MockModel::start(|r, _| (200, mock::openai(&answer(r))));
+    let pair = json!({ "provider": "p", "model": "m" });
+    let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
+    st.models = arc_swap::ArcSwapOption::from_pointee(models_for(&mock.url(), &pair));
+    st.views_options.views_memory = Some(16 << 10);
+    let st = Arc::new(st);
+    let ds = st.attach("org", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            data(5).into_bytes(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let app = crate::http::router(st.clone());
+    let f = Fixture { st, app, mock };
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.5 }
+        }));
+        f.run(s, Mode::Build).unwrap();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        // Push many distinct large subjects (unrelated to stored communities) in separate
+        // commits so the 16 KiB tally cap evicts earlier commits and records `unknown`.
+        for i in 0..80 {
+            let big = "k".repeat(300);
+            sparkles::sparql::update::update(
+                &ds.store,
+                &format!(
+                    "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/big/{big}/{i}> <http://ex/n> \"v\" }} }}"
+                ),
+                &Default::default(),
+            )
+            .unwrap();
+        }
+        let sec = Duration::from_secs(1);
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let mut now = Instant::now();
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        let started: Vec<_> = f
+            .st
+            .tasks
+            .lock()
+            .iter()
+            .filter(|t| t.kind == TASK_KIND)
+            .cloned()
+            .collect();
+        assert_eq!(started.len(), 1, "eviction triggers fallback refresh: {started:?}");
+        let end = Instant::now() + Duration::from_secs(60);
+        while f.st.active_task(TASK_KIND, "org").is_some() {
+            assert!(Instant::now() < end, "refresh did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let done = f
+            .st
+            .tasks
+            .lock()
+            .iter()
+            .find(|t| t.kind == TASK_KIND)
+            .cloned()
+            .unwrap();
+        assert_eq!(done.state, "done", "{done:?}");
+        assert!(
+            done.message
+                .as_deref()
+                .is_some_and(|m| m.contains("cannot count every commit")),
+            "{:?}",
+            done.message
+        );
+        // After refresh discards counts, a small change is counted cleanly and stays below 50%.
+        sparkles::sparql::update::update(
+            &ds.store,
+            &format!("INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/n> \"tiny\" }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            now += sec;
+            tick_once(&f.st, &mut w, now);
+        }
+        let all: Vec<_> = f
+            .st
+            .tasks
+            .lock()
+            .iter()
+            .filter(|t| t.kind == TASK_KIND)
+            .cloned()
+            .collect();
+        assert_eq!(
+            all.len(),
+            1,
+            "exact counting resumes after refresh discards evicted range: {all:?}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// Deleting a dataset detaches its internal refresh circuit cleanly without pinning it.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_detaches_on_dataset_delete() {
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "refresh": { "mode": "auto", "debounceSeconds": 1 }
+        }));
+        f.run(s, Mode::Build).unwrap();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        assert!(f.st.graphrag.has_refresh_circuit("org", &ds));
+        drop(ds);
+        assert!(f.st.delete("org").unwrap());
+    })
+    .await
+    .unwrap();
+}

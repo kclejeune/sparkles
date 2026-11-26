@@ -1359,6 +1359,7 @@ impl AppState {
                 if deleted {
                     self.metrics.forget(name);
                     self.volatile.forget(name);
+                    self.graphrag.detach_circuit(name);
                 }
                 Ok((deleted, deleted.then_some(identity).flatten()))
             }

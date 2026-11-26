@@ -1498,3 +1498,96 @@ async fn declared_drift_refuses_policy_build_and_refresh_before_model_calls() {
     .unwrap();
     assert!(e.mock.requests().is_empty());
 }
+
+/// With `reviewPolicy` and `refresh.mode: "auto"`, the internal F13 circuit excludes
+/// non-output evidence graphs even when a projection wildcard matches them, so a claim
+/// written to `CLAIMS` neither joins a community nor triggers an uncounted fallback.
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_circuit_counts_only_policy_readable_graphs_without_uncounted_fallback() {
+    use crate::graphrag::refresh::Watch;
+    let e = Arc::new(env(true));
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        let e = e2;
+        let ds = e.dataset();
+        let a = propose(&ds, "advisory", leads());
+        decide(&ds, &a, Disposition::Accepted, 1);
+        let s = settings(serde_json::json!({
+            "projection": { "graphs": [ORG, "urn:ev:*"] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+        }));
+        e.run(s.clone(), Mode::Build).unwrap();
+        let srv_ds = e.ds();
+        assert_eq!(
+            srv_ds.dataset.inner_state().views.internal_count(),
+            1,
+            "auto mode under reviewPolicy attaches the internal circuit"
+        );
+        let mut w = Watch::default();
+        // Prime `note_private` baseline so `due` starts false after first sight.
+        assert_eq!(
+            crate::graphrag::refresh::due_reason(&e.s.state, &srv_ds, &s, &mut w).unwrap(),
+            None
+        );
+        // Clear initial first-sight private flag via `tick_once` pattern: we only check
+        // whether `propose_by` in excluded CLAIMS triggers `due_reason` or `uncounted`.
+        let mut w2 = Watch::default();
+        // Run once to initialize private watch at current head.
+        let _ = crate::graphrag::refresh::due_reason(&e.s.state, &srv_ds, &s, &mut w2).unwrap();
+        // Simulate private check already cleared for the initial build.
+        let mut watches = std::collections::HashMap::from([("ev".to_string(), w2)]);
+        let now = std::time::Instant::now();
+        crate::graphrag::refresh::tick_once(&e.s.state, &mut watches, now);
+        crate::graphrag::refresh::tick_once(
+            &e.s.state,
+            &mut watches,
+            now + std::time::Duration::from_secs(2),
+        );
+        assert!(!watches["ev"].private().due);
+        // Writing to excluded CLAIMS (which matches `urn:ev:*` wildcard!) must be ignored
+        // by the accumulator without triggering `uncounted` or joining a community.
+        propose_by(
+            &ds,
+            CLAIMS,
+            "memo",
+            Triple::new(ex("z0"), ex("knows"), ex("z1")),
+            ex("x0"),
+        );
+        let reason = crate::graphrag::refresh::due_reason(
+            &e.s.state,
+            &srv_ds,
+            &s,
+            watches.get_mut("ev").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reason, None);
+        assert!(
+            !watches["ev"].private().due,
+            "excluded CLAIMS write must be counted as 0 by the circuit, not fall back to uncounted"
+        );
+        // Writing an entity-joining edge into ORG IS counted by the circuit.
+        sparkles::sparql::update::update(
+            &srv_ds.store,
+            &format!(
+                "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/knows> <http://ex/fresh> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let reason = crate::graphrag::refresh::due_reason(
+            &e.s.state,
+            &srv_ds,
+            &s,
+            watches.get_mut("ev").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("http://ex/fresh") && r.contains("joined")),
+            "{reason:?}"
+        );
+    })
+    .await
+    .unwrap();
+}

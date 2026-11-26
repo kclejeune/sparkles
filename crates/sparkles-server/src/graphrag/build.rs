@@ -2342,6 +2342,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         }),
         ..BuildState::default()
     })?;
+    super::refresh::after_build(r.st, &r.ds, &r.settings, prep.source_commit, ev.as_ref());
     let phase = r.mode.as_str();
     let tokens = outcome.tokens;
     let stale = pending.len() as u64;

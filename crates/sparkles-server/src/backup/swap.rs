@@ -44,6 +44,7 @@ pub fn replace_in_place(
         std::thread::sleep(Duration::from_millis(5));
     }
     st.forget_routing(name);
+    st.graphrag.detach_circuit(name);
     // the catalog lists the dataset again only once the swap or its rollback is done
     let swapping = st.swapping();
     let result = st
