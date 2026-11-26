@@ -765,6 +765,7 @@ fn members(op: &str) -> &'static [&'static str] {
         ],
         "classify" => &[
             "assertions",
+            "elOnly",
             "target",
             "message",
             "about",
@@ -794,12 +795,15 @@ fn members(op: &str) -> &'static [&'static str] {
         "individuals" => &[
             "type", "untyped", "iri", "after", "limit", "lang", "sourceId",
         ],
-        "keptClassification" => &["part", "about", "offset", "limit", "resultId", "lang"],
+        "keptClassification" => &[
+            "part", "about", "offset", "limit", "resultId", "lang", "elOnly",
+        ],
         "term" => &["iri", "mentions", "incoming", "lang", "sourceId"],
         "dlQuery" => &[
             "expression",
             "syntax",
             "reasoning",
+            "elOnly",
             "answers",
             "limit",
             "threads",
@@ -1166,7 +1170,7 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 target: string(a, "target")?.map(graph_ref).transpose()?,
                 message: string(a, "message")?.map(str::to_string),
                 about: about.clone(),
-                el_only: false,
+                el_only: boolean(a, "elOnly")?.unwrap_or(false),
                 partial: boolean(a, "partial")?.unwrap_or(false),
                 strict: boolean(a, "strict")?.unwrap_or(false),
                 skip_coverage: false,
@@ -1849,6 +1853,7 @@ pub fn dl_query_of(a: &Map<String, J>) -> Result<(DlQueryRequest, usize)> {
     }
     q.threads = number(a, "threads", 0, 1024)?.unwrap_or(0);
     q.max_derived = number(a, "maxDerived", 1, usize::MAX)?;
+    q.el_only = boolean(a, "elOnly")?.unwrap_or(false);
     let limit = number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DL_QUERY_LIMIT);
     Ok((q, limit))
 }
@@ -1925,6 +1930,7 @@ pub fn dl_query_body(
         "engine": u.engine.as_str(),
         "title": u.engine.title(),
         "why": u.why,
+        "elOnly": u.el_only,
         "complete": u.complete,
         "instancesComplete": u.instances_complete,
         "gapCount": u.gaps.len(),
@@ -2087,6 +2093,7 @@ pub fn kept_query_of(a: &Map<String, J>) -> Result<super::kept::KeptQuery> {
         limit: number(a, "limit", 1, 1000)?.unwrap_or(100),
         result_id,
         languages: languages_of(a)?,
+        el_only: boolean(a, "elOnly")?.unwrap_or(false),
     })
 }
 pub fn kept_body(name: &str, answer: &super::kept::KeptRead) -> Result<J> {

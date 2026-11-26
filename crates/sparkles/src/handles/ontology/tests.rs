@@ -1835,9 +1835,11 @@ mod classification {
         let elk = h.classify(&req, &el_only, &opts()).unwrap();
         dl663_partial_chain(&elk);
         assert!(!dl663_has_domain(&elk));
-        assert!(!elk.reused && !elk.retained);
+        assert!(!elk.reused && elk.retained);
         let again = h.classify(&req, &el_only, &opts()).unwrap();
-        assert!(!again.reused && !again.retained);
+        assert!(again.reused && again.retained);
+        assert!(Arc::ptr_eq(&elk.classification, &again.classification));
+        assert_eq!(again.publication.id, elk.publication.id);
         assert_eq!(again.classification.taxonomy, elk.classification.taxonomy);
         let cached = h.classify(&req, &default, &opts()).unwrap();
         assert!(cached.reused && cached.retained);
