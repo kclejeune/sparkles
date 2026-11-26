@@ -39,7 +39,7 @@ use uuid::Uuid;
 pub const MAPPING_FORMAT_VERSION: u32 = 1;
 /// Supported format version of crash-recoverable pending publication journals
 /// (versioned independently of [`MAPPING_FORMAT_VERSION`]).
-const PENDING_PUBLICATION_FORMAT_VERSION: u32 = 4;
+const PENDING_PUBLICATION_FORMAT_VERSION: u32 = 5;
 /// Prefix written inside `.git/index.lock` to prove Sparkles ownership during crash recovery.
 const INDEX_LOCK_PREFIX: &str = "sparkles-git-index-lock-v1:";
 /// Stable profile identifier recorded in the mapping file.
@@ -286,6 +286,9 @@ struct PendingPublication {
     /// while refusing active or foreign locks.
     index_lock_token: String,
     mapping_path: PathBuf,
+    /// Deepest existing mapping directory before this publication created any parents.
+    #[serde(default)] // Version 4 did not record the mapping ancestry.
+    mapping_sync_base: PathBuf,
     ref_name: String,
     old_ref_sha: Option<String>,
     /// Commit that was checked out in HEAD / `.git/index` / worktree before this sync
@@ -301,6 +304,32 @@ struct PendingPublication {
     /// ref and mapping did not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mapping: Option<CommitMapping>,
+}
+
+impl PendingPublication {
+    // The atomic mapping write flushes its immediate parent. Each new directory also
+    // needs its name flushed in its own parent, up to the base recorded before mkdir.
+    fn sync_mapping_ancestors(&self, abandoning: bool) -> GitResult<()> {
+        for dir in self
+            .mapping_path
+            .ancestors()
+            .skip(2)
+            .take_while(|dir| dir.starts_with(&self.mapping_sync_base))
+        {
+            match checkout_sync_dir(dir) {
+                Ok(()) => {}
+                // A pre-ref interruption can leave only a prefix of the intended directories.
+                Err(e) if abandoning && e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(GitError::io(dir, e)),
+            }
+        }
+        Ok(())
+    }
+
+    fn abandon(&self, pending_path: &Path) -> GitResult<()> {
+        self.sync_mapping_ancestors(true)?;
+        remove_pending_file(pending_path)
+    }
 }
 
 fn max_pending_journal_bytes(max_mapping_bytes: u64) -> u64 {
@@ -547,16 +576,14 @@ pub fn export_branch_to_git(
     let pending_path = pending_publication_path(&git_dir, &git_branch)?;
 
     let custom_mapping = options.mapping_path.is_some();
-    let mapping_path = match &options.mapping_path {
-        Some(p) => resolve_mapping_path_readonly(p)?,
-        None => {
-            let sparkles_dir = ensure_child_dir_no_symlink(&git_dir, DEFAULT_SPARKLES_GIT_SUBDIR)?;
-            let mappings_dir = ensure_child_dir_no_symlink(&sparkles_dir, DEFAULT_MAPPINGS_SUBDIR)?;
-            let slug = sanitize_slug(&git_branch);
-            let hash = sha256_hex(git_branch.as_bytes());
-            mappings_dir.join(format!("{slug}-{}.json", &hash[..16]))
-        }
-    };
+    let slug = sanitize_slug(&git_branch);
+    let hash = sha256_hex(git_branch.as_bytes());
+    let default_mapping = git_dir
+        .join(DEFAULT_SPARKLES_GIT_SUBDIR)
+        .join(DEFAULT_MAPPINGS_SUBDIR)
+        .join(format!("{slug}-{}.json", &hash[..16]));
+    let (mapping_path, mapping_sync_base) =
+        resolve_mapping_path_readonly(options.mapping_path.as_deref().unwrap_or(&default_mapping))?;
     validate_mapping_destination_no_overlap(
         &mapping_path,
         &canon_repo,
@@ -711,6 +738,7 @@ pub fn export_branch_to_git(
                     options.syntax,
                     options.max_mapping_bytes,
                     &mapping_path,
+                    &mapping_sync_base,
                     &pending_path,
                 )?;
                 entries.push(entry);
@@ -771,6 +799,7 @@ pub fn export_branch_to_git(
                     options.syntax,
                     options.max_mapping_bytes,
                     &mapping_path,
+                    &mapping_sync_base,
                     &pending_path,
                 )?;
                 entries.push(entry);
@@ -808,6 +837,7 @@ pub fn export_branch_to_git(
                 format_version: PENDING_PUBLICATION_FORMAT_VERSION,
                 index_lock_token: lock_token.clone(),
                 mapping_path: mapping_path.clone(),
+                mapping_sync_base: mapping_sync_base.clone(),
                 ref_name: ref_name.clone(),
                 old_ref_sha: Some(head_git_sha.clone()),
                 prev_checkout_sha: prev_head.clone(),
@@ -816,7 +846,7 @@ pub fn export_branch_to_git(
                 mapping: None,
             };
             let pending_bytes = serialize_pending_bounded(&pending, options.max_mapping_bytes)?;
-            write_publication_file(&pending_path, &pending_bytes)?;
+            write_pending_publication(&pending_path, &pending_bytes, &canon_repo)?;
             #[cfg(test)]
             test_hooks::during_worktree_sync(&clean_repo)?;
             sync_worktree_to_commit_no_filters(
@@ -889,6 +919,7 @@ fn build_and_publish_commit(
     syntax: CanonicalSyntax,
     max_mapping_bytes: u64,
     mapping_path: &Path,
+    mapping_sync_base: &Path,
     pending_path: &Path,
 ) -> GitResult<(String, CommitMappingEntry)> {
     // 1. Write the canonical profile tree inside an isolated temporary staging directory
@@ -1009,16 +1040,14 @@ fn build_and_publish_commit(
     ensure_clean_git_state(clean_repo, git_dir)?;
     let next_mapping_bytes = next_mapping.serialize_bounded(max_mapping_bytes)?;
 
-    // 6. Ensure the validated mapping parent directory exists (now that all overlap,
-    //    tracked-path, and clean checks have succeeded) and persist the crash-recoverable
-    //    pending publication record BEFORE moving the ref.
-    let mapping_parent = effective_parent(mapping_path)?;
-    ensure_dir_no_symlink(&mapping_parent)?;
+    // 6. Persist the ancestry needed for recovery before creating any mapping
+    //    directories. Directory creation errors still precede the ref update.
     let lock_token = Uuid::new_v4().to_string();
     let pending = PendingPublication {
         format_version: PENDING_PUBLICATION_FORMAT_VERSION,
         index_lock_token: lock_token.clone(),
         mapping_path: mapping_path.to_path_buf(),
+        mapping_sync_base: mapping_sync_base.to_path_buf(),
         ref_name: ref_name.to_string(),
         old_ref_sha: old_ref_sha.map(str::to_string),
         prev_checkout_sha: prev_head_sha.clone(),
@@ -1027,7 +1056,12 @@ fn build_and_publish_commit(
         mapping: Some(next_mapping),
     };
     let pending_bytes = serialize_pending_bounded(&pending, max_mapping_bytes)?;
-    write_publication_file(pending_path, &pending_bytes)?;
+    let mapping_parent = effective_parent(mapping_path)?;
+    write_pending_publication(pending_path, &pending_bytes, canon_repo)?;
+    if let Err(err) = ensure_dir_no_symlink(&mapping_parent) {
+        pending.abandon(pending_path)?;
+        return Err(err);
+    }
 
     #[cfg(test)]
     test_hooks::before_update_ref()?;
@@ -1041,7 +1075,7 @@ fn build_and_publish_commit(
     ) {
         // Ref did not advance; clean up pending journal if still unchanged.
         if git_rev_parse_opt(clean_repo, ref_name)?.as_deref() == old_ref_sha {
-            let _ = remove_pending_file(pending_path);
+            let _ = pending.abandon(pending_path);
         }
         return Err(err);
     }
@@ -1051,6 +1085,7 @@ fn build_and_publish_commit(
     #[cfg(test)]
     test_hooks::during_mapping_write()?;
     write_publication_file(mapping_path, &next_mapping_bytes)?;
+    pending.sync_mapping_ancestors(false)?;
 
     // 9. Sync `HEAD`, `.git/index`, and the working tree byte-exact without `.gitattributes`
     //    filters under `.git/index.lock`, then remove the pending journal.
@@ -1119,14 +1154,14 @@ fn reconcile_pending_publication(
             GitError::InvalidMapping("pending publication record missing format_version".into())
         })?;
     let found = u32::try_from(found_u64).unwrap_or(u32::MAX);
-    if found != PENDING_PUBLICATION_FORMAT_VERSION {
+    if found != 4 && found != PENDING_PUBLICATION_FORMAT_VERSION {
         return Err(GitError::UnsupportedFormatVersion {
             file: label,
             found,
             supported: PENDING_PUBLICATION_FORMAT_VERSION,
         });
     }
-    let pending: PendingPublication = serde_json::from_value(raw_val).map_err(|e| {
+    let mut pending: PendingPublication = serde_json::from_value(raw_val).map_err(|e| {
         GitError::InvalidMapping(format!("invalid pending publication record: {e}"))
     })?;
     if pending.index_lock_token.is_empty()
@@ -1145,6 +1180,30 @@ fn reconcile_pending_publication(
             "unreconciled pending publication at {} does not match current export target",
             pending_path.display()
         )));
+    }
+    if found == 4 {
+        // A legacy record does not identify the oldest new mapping directory.
+        // The managed layout is rooted in .git. For a custom path only the
+        // filesystem root is known to predate directory creation.
+        pending.mapping_sync_base = if mapping_path.starts_with(git_dir) {
+            git_dir.to_path_buf()
+        } else {
+            mapping_path
+                .ancestors()
+                .last()
+                .expect("absolute mapping path")
+                .to_path_buf()
+        };
+    }
+    if !pending.mapping_sync_base.is_absolute()
+        || !mapping_path
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir == pending.mapping_sync_base)
+    {
+        return Err(GitError::InvalidMapping(
+            "invalid mapping directory boundary in pending record".into(),
+        ));
     }
     if let Some(ref pending_mapping) = pending.mapping
         && (pending_mapping.dataset_id != dataset_id
@@ -1167,8 +1226,7 @@ fn reconcile_pending_publication(
     if pending.mapping.is_some() && matches_old {
         // Previous commit publication failed before advancing `ref_name`; clear the stale
         // pending file.
-        remove_pending_file(pending_path)?;
-        return Ok(());
+        return pending.abandon(pending_path);
     }
 
     let matches_new = branch_head
@@ -1235,6 +1293,10 @@ fn reconcile_pending_publication(
         need_mapping_write = !already_persisted;
     }
 
+    // A branch-switch journal can be visible even when its publication flush failed.
+    sync_pending_dirs(&effective_parent(pending_path)?, canon_repo)
+        .map_err(|e| GitError::io(pending_path, e))?;
+
     // Replay or finish the checkout under `.git/index.lock` using the recorded prior
     // checkout identity and lock ownership token, accepting files matching either the prior
     // or target blob while refusing any local edits, unmanaged collisions, or foreign locks.
@@ -1257,6 +1319,7 @@ fn reconcile_pending_publication(
             let parent = effective_parent(mapping_path)?;
             checkout_sync_dir(&parent).map_err(|e| GitError::io(&parent, e))?;
         }
+        pending.sync_mapping_ancestors(false)?;
     }
 
     remove_pending_file(pending_path)?;
@@ -1296,6 +1359,22 @@ fn pending_publication_path(git_dir: &Path, git_branch: &str) -> GitResult<PathB
     let slug = sanitize_slug(git_branch);
     let hash = sha256_hex(git_branch.as_bytes());
     Ok(pending_dir.join(format!("{slug}-{}.json", &hash[..16])))
+}
+
+fn sync_pending_dirs(pending_dir: &Path, canon_repo: &Path) -> io::Result<()> {
+    for dir in pending_dir
+        .ancestors()
+        .take_while(|dir| dir.starts_with(canon_repo))
+    {
+        checkout_sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+fn write_pending_publication(path: &Path, bytes: &[u8], canon_repo: &Path) -> GitResult<()> {
+    super::profile::write_atomic_with_dir_sync(path, bytes, |dir| {
+        sync_pending_dirs(dir, canon_repo)
+    })
 }
 
 fn write_publication_file(path: &Path, bytes: &[u8]) -> GitResult<()> {
@@ -2034,11 +2113,11 @@ fn validate_git_branch_name(name: &str) -> GitResult<()> {
     Ok(())
 }
 
-/// Resolve a custom mapping path read-only (WITHOUT creating any missing parent
+/// Resolve a mapping path read-only (WITHOUT creating any missing parent
 /// directories), rejecting symlinks on existing ancestors or the destination file, and
 /// returning one canonical absolute destination path for overlap checks, journals, and
-/// persistence.
-fn resolve_mapping_path_readonly(path: &Path) -> GitResult<PathBuf> {
+/// persistence, together with its deepest existing parent directory.
+fn resolve_mapping_path_readonly(path: &Path) -> GitResult<(PathBuf, PathBuf)> {
     let parent = effective_parent(path)?;
     let label = path.display().to_string();
     verify_no_symlink_components(&parent, &label)?;
@@ -2087,8 +2166,9 @@ fn resolve_mapping_path_readonly(path: &Path) -> GitResult<PathBuf> {
         }
     };
 
-    let mut canon_parent =
+    let sync_base =
         fs::canonicalize(&existing_base).map_err(|e| GitError::io(&existing_base, e))?;
+    let mut canon_parent = sync_base.clone();
     let parent_existed = missing.is_empty();
     for seg in missing.into_iter().rev() {
         canon_parent.push(seg);
@@ -2097,7 +2177,7 @@ fn resolve_mapping_path_readonly(path: &Path) -> GitResult<PathBuf> {
     if parent_existed {
         check_dest_file_not_symlink(&resolved)?;
     }
-    Ok(resolved)
+    Ok((resolved, sync_base))
 }
 
 /// Refuse any mapping destination that aliases internal Git/pending metadata or published
@@ -3920,6 +4000,10 @@ mod dirfd_ops {
             if test_hooks::disable_moveout_rename() {
                 return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
             }
+            #[cfg(all(test, target_os = "linux"))]
+            if test_hooks::crosses_simulated_mount(&self.display_path, &new_dir.display_path) {
+                return Err(io::Error::from_raw_os_error(libc::EXDEV));
+            }
             #[cfg(target_os = "linux")]
             {
                 // SAFETY: Both directory fds are valid and both names are NUL-terminated.
@@ -4356,7 +4440,17 @@ mod dirfd_ops {
         #[cfg(test)]
         test_hooks::after_move_out_before_install(&parent.display_path, leaf);
 
-        let collided = match staged.dir.rename_noreplace_at(&staged.name, parent, leaf) {
+        let install = |s: &StagedAtFile| s.dir.rename_noreplace_at(&s.name, parent, leaf);
+        let mut result = install(&staged);
+        if let Err(e) = &result
+            && e.kind() == io::ErrorKind::CrossesDevices
+        {
+            // Bind mounts can share st_dev. The old file remains in its receipted
+            // slot if restaging fails, so recovery can restore it without clobbering.
+            staged = restage_staged_into_dir(staged, parent, target_mode, rel)?;
+            result = install(&staged);
+        }
+        let collided = match result {
             Ok(()) => {
                 staged.disarm();
                 false
@@ -5668,7 +5762,7 @@ fn sync_worktree_to_commit_no_filters(
 
     // Once the checkout has been verified, make every target name and its ancestors
     // durable. An earlier attempt may have installed a name and failed its directory sync.
-    let sync_recovered_target_dirs = || -> GitResult<()> {
+    let sync_target_dirs = || -> GitResult<()> {
         let mut synced = HashSet::new();
         for target in target_tree.keys() {
             let mut child = target.as_str();
@@ -5739,7 +5833,7 @@ fn sync_worktree_to_commit_no_filters(
             #[cfg(unix)]
             &root_dir,
         )?;
-        sync_recovered_target_dirs()?;
+        sync_target_dirs()?;
         #[cfg(unix)]
         {
             git_dir_handle.sync()?;
@@ -6311,8 +6405,10 @@ fn sync_worktree_to_commit_no_filters(
         #[cfg(unix)]
         &root_dir,
     )?;
-    if mode == SyncMode::Recovery {
-        sync_recovered_target_dirs()?;
+    // Unix syncs the containing directory at mkdir. Windows also needs this
+    // walk on the first checkout to persist new directories in the worktree root.
+    if cfg!(windows) || mode == SyncMode::Recovery {
+        sync_target_dirs()?;
     }
     #[cfg(unix)]
     {
@@ -6508,7 +6604,7 @@ mod test_hooks {
         pub fail_before_update_ref: bool,
         pub fail_mapping_write: bool,
         pub fail_worktree_sync: bool,
-        pub fail_parent_sync_for_visible_file: Option<PathBuf>,
+        pub fail_dir_sync_when_visible: Option<(PathBuf, PathBuf)>,
         pub fail_after_first_blob_write: bool,
         pub exit_after_first_blob_write: Option<i32>,
         pub fail_after_first_removal: bool,
@@ -6526,6 +6622,8 @@ mod test_hooks {
         pub fail_moveout_sync: bool,
         #[cfg(unix)]
         pub disable_moveout_rename: bool,
+        #[cfg(target_os = "linux")]
+        pub simulated_mount: Option<PathBuf>,
         #[cfg(unix)]
         pub fail_install_parent_sync: bool,
         #[cfg(unix)]
@@ -6590,11 +6688,11 @@ mod test_hooks {
         FAULTS.with(|f| {
             let mut state = f.borrow_mut();
             if state
-                .fail_parent_sync_for_visible_file
+                .fail_dir_sync_when_visible
                 .as_ref()
-                .is_some_and(|file| file.parent() == Some(parent) && file.exists())
+                .is_some_and(|(dir, entry)| dir == parent && entry.exists())
             {
-                state.fail_parent_sync_for_visible_file = None;
+                state.fail_dir_sync_when_visible = None;
                 return Err(io::Error::other("injected directory sync failure"));
             }
             Ok(())
@@ -6680,6 +6778,16 @@ mod test_hooks {
             f(lock_path).map_err(|e| GitError::io(lock_path, e))?;
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn crosses_simulated_mount(src: &Path, dest: &Path) -> bool {
+        FAULTS.with(|f| {
+            f.borrow()
+                .simulated_mount
+                .as_ref()
+                .is_some_and(|mount| src.starts_with(mount) != dest.starts_with(mount))
+        })
     }
 
     #[cfg(unix)]
@@ -7175,7 +7283,7 @@ mod tests {
         let graph = repo.path().join("graphs/default.ttl");
         let fail_graph_sync = || {
             let _fault = test_hooks::install(test_hooks::FaultState {
-                fail_parent_sync_for_visible_file: Some(graph.clone()),
+                fail_dir_sync_when_visible: Some((graph.parent().unwrap().into(), graph.clone())),
                 ..Default::default()
             });
             let err = export().unwrap_err();
@@ -7218,6 +7326,296 @@ mod tests {
     }
 
     #[test]
+    fn publication_syncs_new_pending_ancestors_before_moving_ref() {
+        let db = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db.path().join("db")).unwrap();
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+            .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let options = GitExportOptions {
+            mode: GitExportMode::Squash,
+            ..Default::default()
+        };
+        let export = || export_branch_to_git(&ds, repo.path(), &options);
+        let git_dir = fs::canonicalize(repo.path()).unwrap().join(".git");
+        let pending_dir = git_dir.join("sparkles/pending");
+        // A fresh attempt and a retry with those directories already visible both
+        // need a durable journal before crossing the ref boundary.
+        for _ in 0..2 {
+            let _fault = test_hooks::install(test_hooks::FaultState {
+                fail_dir_sync_when_visible: Some((git_dir.clone(), pending_dir.clone())),
+                ..Default::default()
+            });
+            let err = export().unwrap_err();
+            assert!(
+                err.to_string().contains("injected directory sync failure"),
+                "{err}"
+            );
+            assert!(pending_dir.is_dir());
+            assert!(
+                git_rev_parse_opt(repo.path(), "refs/heads/main")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!repo.path().join("graphs").exists());
+        }
+        assert_eq!(export().unwrap().mapping.entries.len(), 1);
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[test]
+    fn publication_syncs_new_custom_mapping_ancestors_on_install_and_recovery() {
+        let db = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db.path().join("db")).unwrap();
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+            .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(base.path()).unwrap();
+        let mapping = base.join("new/nested/custom.json");
+        let options = GitExportOptions {
+            mode: GitExportMode::Squash,
+            mapping_path: Some(mapping.clone()),
+            ..Default::default()
+        };
+        let export = || export_branch_to_git(&ds, repo.path(), &options);
+        let fail = |parent: &Path| {
+            let _fault = test_hooks::install(test_hooks::FaultState {
+                fail_dir_sync_when_visible: Some((parent.into(), mapping.clone())),
+                ..Default::default()
+            });
+            let err = export().unwrap_err();
+            assert!(
+                err.to_string().contains("injected directory sync failure"),
+                "{err}"
+            );
+        };
+        {
+            let _fault = test_hooks::install(test_hooks::FaultState {
+                fail_before_update_ref: true,
+                ..Default::default()
+            });
+            assert!(
+                export()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("before git update-ref")
+            );
+        }
+        let journal = pending_publication_path(&repo.path().join(".git"), "main").unwrap();
+        let unpublished = fs::read(&journal).unwrap();
+        {
+            let _fault = test_hooks::install(test_hooks::FaultState {
+                fail_dir_sync_when_visible: Some((base.clone(), base.join("new"))),
+                ..Default::default()
+            });
+            let err = export().unwrap_err();
+            assert!(
+                err.to_string().contains("injected directory sync failure"),
+                "{err}"
+            );
+            assert_eq!(fs::read(&journal).unwrap(), unpublished);
+            assert!(
+                git_rev_parse_opt(repo.path(), "refs/heads/main")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // Recreate the power-loss state in which both unsynced directories disappear.
+        fs::remove_dir(base.join("new/nested")).unwrap();
+        fs::remove_dir(base.join("new")).unwrap();
+        fail(&base.join("new"));
+        let intent = fs::read(&journal).unwrap();
+        let bytes = fs::read(&mapping).unwrap();
+        fail(&base);
+        assert_eq!(fs::read(&journal).unwrap(), intent);
+        assert_eq!(fs::read(&mapping).unwrap(), bytes);
+        assert_eq!(export().unwrap().commits_exported, 0);
+        assert!(!journal.exists());
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[test]
+    fn recovery_retries_mapping_ancestors_in_a_v4_journal() {
+        let db = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db.path().join("db")).unwrap();
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+            .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let maps = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(maps.path()).unwrap();
+        let mapping = base.join("new/custom.json");
+        let options = GitExportOptions {
+            mode: GitExportMode::Squash,
+            mapping_path: Some(mapping.clone()),
+            ..Default::default()
+        };
+        let export = || export_branch_to_git(&ds, repo.path(), &options);
+        {
+            let _fault = test_hooks::install(test_hooks::FaultState {
+                fail_before_remove_pending: true,
+                ..Default::default()
+            });
+            assert!(
+                export()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("removing pending journal")
+            );
+        }
+        let journal = pending_publication_path(&repo.path().join(".git"), "main").unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        record["format_version"] = 4.into();
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("mapping_sync_base")
+            .unwrap();
+        let v4 = serde_json::to_vec(&record).unwrap();
+        fs::write(&journal, &v4).unwrap();
+        {
+            let _fault = test_hooks::install(test_hooks::FaultState {
+                fail_dir_sync_when_visible: Some((base, mapping)),
+                ..Default::default()
+            });
+            let err = export().unwrap_err();
+            assert!(
+                err.to_string().contains("injected directory sync failure"),
+                "{err}"
+            );
+            assert_eq!(fs::read(&journal).unwrap(), v4);
+        }
+        // A legacy custom path requires permission to flush the whole ancestor chain.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(export().unwrap().commits_exported, 0);
+            assert!(!journal.exists());
+        }
+    }
+
+    #[test]
+    fn publication_syncs_new_graph_directory_before_index_install() {
+        let db = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db.path().join("db")).unwrap();
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+            .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(repo.path()).unwrap();
+        let export = || {
+            export_branch_to_git(
+                &ds,
+                &root,
+                &GitExportOptions {
+                    mode: GitExportMode::Squash,
+                    ..Default::default()
+                },
+            )
+        };
+        let graphs = root.join("graphs");
+        {
+            let _fault = test_hooks::install(test_hooks::FaultState {
+                fail_dir_sync_when_visible: Some((root.clone(), graphs.clone())),
+                ..Default::default()
+            });
+            let err = export().unwrap_err();
+            assert!(
+                err.to_string().contains("injected directory sync failure"),
+                "{err}"
+            );
+        }
+        let journal = pending_publication_path(&root.join(".git"), "main").unwrap();
+        assert!(journal.is_file());
+        assert!(graphs.is_dir());
+        assert!(read_index_entries(&root).unwrap().is_empty());
+        assert_eq!(export().unwrap().commits_exported, 0);
+        assert!(!journal.exists());
+        verify_git_tree(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_restages_graph_replacement_on_same_device_exdev() {
+        use std::os::unix::fs::MetadataExt;
+
+        let db = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(db.path().join("db")).unwrap();
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+            .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let export = || export_branch_to_git(&ds, repo.path(), &GitExportOptions::default());
+        export().unwrap();
+        let graphs = repo.path().join("graphs");
+        let staged = repo.path().join(".git/sparkles/staging");
+        assert_eq!(
+            fs::metadata(&graphs).unwrap().dev(),
+            fs::metadata(&staged).unwrap().dev()
+        );
+        ds.update("INSERT DATA { <urn:replacement> <urn:p> <urn:o> }")
+            .unwrap();
+        let fault = test_hooks::install(test_hooks::FaultState {
+            simulated_mount: Some(graphs.clone()),
+            ..Default::default()
+        });
+        let report = export().unwrap();
+        assert_eq!(report.commits_exported, 1);
+        let graph = fs::read_to_string(graphs.join("default.ttl")).unwrap();
+        assert!(graph.contains("urn:replacement"));
+        assert_eq!(fs::read_dir(&graphs).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&staged).unwrap().count(), 0);
+        assert_eq!(
+            read_index_entries(repo.path()).unwrap(),
+            read_commit_tree_entries(repo.path(), Some("HEAD")).unwrap()
+        );
+        drop(fault);
+
+        ds.update("INSERT DATA { <urn:retry> <urn:p> <urn:o> }")
+            .unwrap();
+        {
+            let staging = staged.clone();
+            let _fault = test_hooks::install(test_hooks::FaultState {
+                simulated_mount: Some(graphs.clone()),
+                after_move_out_action: Some((
+                    "default.ttl".into(),
+                    Box::new(move |_, _| {
+                        let temp = fs::read_dir(staging)
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .find(|e| e.file_name().to_string_lossy().starts_with("worktree-"))
+                            .unwrap();
+                        fs::remove_file(temp.path()).unwrap();
+                    }),
+                )),
+                ..Default::default()
+            });
+            assert!(
+                matches!(export(), Err(GitError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound)
+            );
+        }
+        let journal = pending_publication_path(&repo.path().join(".git"), "main").unwrap();
+        let pending: PendingPublication =
+            serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        let receipt = graphs.join(replacement_moveout_name(
+            &pending.index_lock_token,
+            "graphs/default.ttl",
+        ));
+        assert!(receipt.is_file());
+        assert!(!graphs.join("default.ttl").exists());
+        let _fault = test_hooks::install(test_hooks::FaultState {
+            simulated_mount: Some(graphs.clone()),
+            ..Default::default()
+        });
+        assert_eq!(export().unwrap().commits_exported, 0);
+        assert!(!receipt.exists());
+        assert!(
+            fs::read_to_string(graphs.join("default.ttl"))
+                .unwrap()
+                .contains("urn:retry")
+        );
+        verify_git_tree(repo.path()).unwrap();
+    }
+
+    #[test]
     fn recovery_retries_custom_mapping_directory_sync_before_retiring_journal() {
         let db = tempfile::tempdir().unwrap();
         let ds = Dataset::open(db.path().join("db")).unwrap();
@@ -7234,7 +7632,10 @@ mod tests {
         let export = || export_branch_to_git(&ds, repo.path(), &options);
         let fail_mapping_sync = || {
             let _fault = test_hooks::install(test_hooks::FaultState {
-                fail_parent_sync_for_visible_file: Some(mapping.clone()),
+                fail_dir_sync_when_visible: Some((
+                    mapping.parent().unwrap().into(),
+                    mapping.clone(),
+                )),
                 ..Default::default()
             });
             let err = export().unwrap_err();
@@ -7555,6 +7956,7 @@ mod tests {
             format_version: PENDING_PUBLICATION_FORMAT_VERSION,
             index_lock_token: Uuid::new_v4().to_string(),
             mapping_path: PathBuf::from("/tmp/mapping.json"),
+            mapping_sync_base: PathBuf::from("/tmp"),
             ref_name: "refs/heads/main".to_string(),
             old_ref_sha: Some(format!("{:040x}", 4499u64)),
             prev_checkout_sha: Some(format!("{:040x}", 4499u64)),
