@@ -1498,26 +1498,67 @@ fn path_search_r1_parity_cancellation_and_release() {
     drop(c);
     assert_eq!(meter.live_bytes(), 0);
 
-    // 5b. Mid-pull cancellation after first batch releases all bounded-search memory.
-    let b_cancel = Arc::new(AtomicBool::new(false));
-    let b_cancel_opts = QueryOptions {
-        no_cache: true,
-        cancel: Some(b_cancel.clone()),
-        ..Default::default()
-    };
-    let mut c = select_cursor(
-        star_snap.clone(),
-        &q_bounded_unbound,
-        &b_cancel_opts,
-        &strict,
-    )
-    .unwrap();
-    let meter = c.memory_meter();
-    assert!(c.next_batch().unwrap().is_some());
-    b_cancel.store(true, Ordering::Relaxed);
-    assert!(matches!(c.next_batch(), Err(Error::Cancelled)));
-    drop(c);
-    assert_eq!(meter.live_bytes(), 0);
+    // 5b. True within-pull cancellation during bounded cursor relaxation (both one-ended
+    //     unbound-target and bidirectional pair searches): cancellation stays false until
+    //     traversal poll #2 inside the first `next_batch()` pull, proving bounded cursor
+    //     relaxation observes cancellation mid-pull and releases every charged byte.
+    let big_star = Store::in_memory(StoreOptions::default());
+    let mut big_star_data = String::from("<urn:z> <urn:p> <urn:t> .\n");
+    for i in 0..10_000 {
+        big_star_data.push_str(&format!("<urn:s> <urn:p> <urn:l:{i}> .\n"));
+    }
+    load(&big_star, &big_star_data, RdfFormat::Turtle);
+    let big_star_snap = big_star.snapshot();
+    let q_bounded_cancel_unbound = format!(
+        "{P}SELECT ?t ?c ?l {{ SERVICE path:search {{ [] path:source <urn:s> ; path:target ?t ; path:predicate <urn:p> ; path:weight <urn:w> ; path:maxLength 2 ; path:maxVisited 20000 ; path:cost ?c ; path:length ?l }} }}"
+    );
+    let q_bounded_cancel_pair = format!(
+        "{P}SELECT ?c ?l {{ SERVICE path:search {{ [] path:source <urn:s> ; path:target <urn:t> ; path:predicate <urn:p> ; path:weight <urn:w> ; path:maxLength 2 ; path:maxVisited 2 ; path:cost ?c ; path:length ?l }} }}"
+    );
+    for (label, q) in [
+        ("bounded unbound mid-pull cancel", &q_bounded_cancel_unbound),
+        ("bounded pair mid-pull cancel", &q_bounded_cancel_pair),
+    ] {
+        let b_cancel = Arc::new(AtomicBool::new(false));
+        let b_cancel_opts = QueryOptions {
+            no_cache: true,
+            cancel: Some(b_cancel.clone()),
+            ..Default::default()
+        };
+        let mut c = select_cursor(big_star_snap.clone(), q, &b_cancel_opts, &strict).unwrap();
+        let meter = c.memory_meter();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_hook = polls.clone();
+        let cancel_hook = b_cancel.clone();
+        let _hook = sparkles_core::sparql::pathsearch::test_hooks::on_traversal_poll(move || {
+            let count = polls_hook.fetch_add(1, Ordering::Relaxed) + 1;
+            if count == 2 {
+                cancel_hook.store(true, Ordering::Release);
+            }
+        });
+        let res = c.next_batch().map(|b| b.is_some());
+        drop(_hook);
+        assert!(
+            matches!(res, Err(Error::Cancelled)),
+            "{label}: expected mid-pull cancellation inside first next_batch(), got {res:?}"
+        );
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            2,
+            "{label}: expected immediate abort on traversal poll #2"
+        );
+        let ps_node = find_ps_node(c.plan()).expect("PathSearch node in cursor plan");
+        assert!(
+            !ps_node.complete,
+            "{label}: cancelled PathSearch must remain incomplete in cursor plan"
+        );
+        drop(c);
+        assert_eq!(
+            meter.live_bytes(),
+            0,
+            "{label}: live bytes not released after mid-pull cancellation"
+        );
+    }
 
     // 5c. Admission failure while bounded Pareto frontier state is live (both pair and
     //     one-ended searches) returns Memory BudgetExceeded and releases every charged byte.

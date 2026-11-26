@@ -274,10 +274,13 @@ run a Pareto-pruned search over `(node, length)` pairs that bounds each search b
 `path:maxLength` instead of enumerating longer paths. Single-pair searches and Yen's spurs
 split the edge budget into `ceil(L / 2)` forward and `floor(L / 2)` backward halves and
 fall back to a source-order bounded search when wide weights or overflow could affect
-ranking. Unbound ends in weighted `path:shortest` with `path:maxLength` run a one-ended
-Pareto-pruned search, while weighted `path:allShortest` with `path:maxLength` requires both
-ends bound because it enumerates tied short paths through Yen's algorithm. Lengths still
-count edges.
+ranking, with Yen's spurs carrying their accumulated prefix cost and weight range into that
+check and fallback. Unbound ends in weighted `path:shortest` with `path:maxLength` run a
+one-ended Pareto-pruned search, and an unbound-source search falls back to source-order
+bounded forward searches pruned by backward BFS distances when wide weights or overflow
+could make reverse sums disagree with source-order costs. Weighted `path:allShortest` with
+`path:maxLength` requires both ends bound because it enumerates tied short paths through
+Yen's algorithm. Lengths still count edges.
 
 The cost of a path is the sum of its weights, added in double-double arithmetic, and
 `path:cost` is that sum rounded to the nearest double. Two paths tie in the shortest modes
@@ -936,18 +939,23 @@ both the eager engine and the streaming cursor reader.
   both cheaper-or-equal and shorter-or-equal. Labels at a side's half-length boundary
   record their least cost in `bounds[side]` without entering that side's heap, and the
   search stops once `min(top[0] + min(top[1], bound[1]), top[1] + min(top[0], bound[0]))`
-  reaches the cheapest valid meeting or becomes empty. When `L > 1` and edge weights span
-  more than 2²⁸, exceed the exact double-double span for `L`, or overflow to infinity, both
-  engines release their bidirectional state and fall back to a source-order one-ended
-  bounded Pareto search so candidate ranking agrees with Yen's source-order `exact_cost`.
+  reaches the cheapest valid meeting or becomes empty. When `L > 1` and edge weights
+  across the prefix and spur span more than 2²⁸, exceed the exact double-double span for
+  `L`, or overflow to infinity, both engines release their bidirectional state and fall
+  back to a source-order one-ended bounded Pareto search seeded with the prefix's
+  accumulated cost so candidate ranking agrees with Yen's source-order `exact_cost`.
   `path:shortest` with bound ends runs this search directly, and Yen's algorithm passes the
-  remaining length `maxLength - i` into this search for every weighted spur in both
-  `path:kShortest` and length-bounded `path:allShortest`.
+  remaining length `maxLength - i` and the prefix cost and weight range into this search
+  for every weighted spur in both `path:kShortest` and length-bounded `path:allShortest`.
 * **Unbound ends in `path:shortest`.** `Engine::dijkstra_bounded` and
   `SearchContext::run_dijkstra_bounded` (streamed by `BoundedShortestJob`) run a
   one-ended Pareto-pruned search over `(node, length)` up to `maxLength`, so weighted
   `path:shortest` with `path:maxLength` now answers unbound targets and unbound sources as
-  well as bound pairs. Weighted `path:allShortest` with `path:maxLength` continues to run
+  well as bound pairs. When a reverse search for an unbound source encounters wide weights
+  or overflow with `maxLength > 1`, both engines drop the reverse frontier, collect
+  reachable sources and minimum edge distances by backward BFS, and run source-order
+  bounded forward searches per source so reported costs match bound-pair and forward
+  searches. Weighted `path:allShortest` with `path:maxLength` continues to run
   Yen's algorithm with length-bounded spurs and therefore still requires both ends bound.
 * **Tests.** `pathsearch.rs` adds unit tests for Pareto frontier pruning and lower-bound
   arithmetic. In `crates/sparkles-core/tests/path_search.rs`,
@@ -956,16 +964,20 @@ both the eager engine and the streaming cursor reader.
   `weighted_bounded_edge_cases` covers `maxLength` 0 and 1, equal costs at different
   lengths, zero-weight edges and cycles, `minLength > 1` in `kShortest`, unbound target
   and reverse Pareto unbound-source queries, `minLength 0` with `path:limit 1` and
-  `path:maxVisited 1`, negative weight refusal, and `path:maxVisited` enforcement.
+  `path:maxVisited 1` across `shortest` and `kShortest`, negative weight refusal, and
+  `path:maxVisited` enforcement.
   `random_weighted_bounded_against_brute_force` compares 45 random graphs across all
   directions, excluded predicates, hubs, zero and decimal weights, and lengths 1 to 5
   against brute-force enumeration for bound pairs, unbound targets, unbound sources,
   `path:allShortest`, and `path:kShortest`. Additional regressions verify wide-weight
-  four-edge cycle ranking, eager frontier memory pre-admission and release across repeated
-  pairs, single-visit `VIRT` pruning, and eager mid-relaxation cancellation.
+  four-edge cycle ranking, shared-prefix Yen spur ranking, variable-source wide-weight
+  cross-form ranking, streaming eager weight lookups on a 5,000-reifier edge, eager
+  frontier memory pre-admission and release across repeated pairs, single-visit `VIRT`
+  pruning, and eager mid-relaxation cancellation.
   `crates/sparkles-core/tests/cursor_pathsearch.rs` verifies eager and streaming parity,
   counter equality across `maxLength` 0 and 1, cycles, unbound ends, `VALUES`, `kShortest`,
   and `allShortest`, and memory release after bounded weighted admission failure, early
-  close, and cancellation. `crates/sparkles-core/tests/cursor_memory_audit.rs` audits
-  bounded weighted `shortest` on bound and unbound ends and `kShortest` at
-  `Allowance::EXACT`.
+  close, and within-pull relaxation cancellation.
+  `crates/sparkles-core/tests/cursor_memory_audit.rs` audits bounded weighted `shortest` on
+  bound, unbound, and reverse wide-weight fallback forms and `kShortest` at
+  `Allowance::EXACT`, plus bounded scratch heap for eager high-reifier weight lookup.

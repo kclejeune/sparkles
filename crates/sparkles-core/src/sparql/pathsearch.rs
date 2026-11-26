@@ -1319,6 +1319,40 @@ fn opt_cost_add(a: Option<Cost>, b: Option<Cost>) -> Option<Cost> {
     }
 }
 
+/// Accumulated prefix cost and positive weight bounds carried into a length-bounded
+/// pair or Yen spur search so wide-weight detection and source-order fallback match the
+/// full path from the original source.
+#[derive(Clone, Copy)]
+struct PrefixCost {
+    cost: Cost,
+    wmin: f64,
+    wmax: f64,
+    total_max_len: u32,
+}
+
+impl PrefixCost {
+    const fn zero(total_max_len: u32) -> Self {
+        Self {
+            cost: Cost::ZERO,
+            wmin: f64::INFINITY,
+            wmax: 0.0,
+            total_max_len,
+        }
+    }
+}
+
+/// Outcome of a one-ended length-bounded weighted search: either a Pareto-pruned parent
+/// tree or, for a reverse search whose wide weights or overflow could make target-to-source
+/// sums disagree with source-order sums, backward BFS distances and reachable sources for
+/// per-source forward evaluation.
+enum BoundedTreeOutcome {
+    Tree(ChargedBoundedTree),
+    ReverseWide {
+        bwd_dist: HbMap<u64, u32>,
+        sources: Vec<u64>,
+    },
+}
+
 /// Whether the ratio of positive edge weights or the budget `max_len` can make
 /// double-double `Cost::add` round differently across bidirectional split points.
 #[inline]
@@ -2208,35 +2242,97 @@ impl<'a> Engine<'a> {
             tt
         };
         let graph = &self.spec.graph;
-        let mut reifiers = Vec::new();
-        for k in ctx.snap.scan_keys(Perm::Pos, &[reifies, tt.0])? {
-            if graph.accepts(k[3]) {
-                reifiers.push(k[2]);
-            }
-        }
         let mut best: Option<f64> = None;
-        for r in reifiers {
-            for k in ctx.snap.scan_keys(Perm::Pso, &[w, r])? {
-                if !graph.accepts(k[3]) {
-                    continue;
+        let mut last_reifier: Option<u64> = None;
+        let mut scanned = 0usize;
+        let scan_weights = |reifier: u64, best: &mut Option<f64>| -> Result<()> {
+            let mut inner_scanned = 0usize;
+            let mut handle_weight = |val_id: u64, g: u64| -> Result<()> {
+                if !graph.accepts(g) {
+                    return Ok(());
                 }
                 let v = ctx
-                    .value_checked(Id(k[2]))?
+                    .value_checked(Id(val_id))?
                     .as_ref()
                     .and_then(super::value::approx_f64);
                 match v {
                     Some(v) if v >= 0.0 && v.is_finite() => {
-                        best = Some(best.map_or(v, |b: f64| b.min(v)));
+                        *best = Some(best.map_or(v, |b: f64| b.min(v)));
+                        Ok(())
                     }
                     _ => {
                         let t = ctx
-                            .plan_term(Id(k[2]))
+                            .plan_term(Id(val_id))
                             .map_or_else(|| "?".to_string(), |t| t.to_string());
-                        return Err(bad(format!("the weight {t} is not a non-negative number")));
+                        Err(bad(format!("the weight {t} is not a non-negative number")))
                     }
                 }
-            }
-        }
+            };
+            ctx.snap.scan_checked(
+                Perm::Pso,
+                &[w, reifier],
+                || ctx.check(),
+                |c| {
+                    match c {
+                        Chunk::Block(b, s_idx, e_idx) => {
+                            for i in s_idx..e_idx {
+                                inner_scanned += 1;
+                                if inner_scanned.is_multiple_of(4096) {
+                                    ctx.check()?;
+                                }
+                                handle_weight(b.cols[2][i], b.cols[3][i])?;
+                            }
+                        }
+                        Chunk::Row(k) => {
+                            inner_scanned += 1;
+                            if inner_scanned.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            handle_weight(k[2], k[3])?;
+                        }
+                    }
+                    Ok(true)
+                },
+            )
+        };
+        ctx.snap.scan_checked(
+            Perm::Pos,
+            &[reifies, tt.0],
+            || ctx.check(),
+            |c| {
+                match c {
+                    Chunk::Block(b, s_idx, e_idx) => {
+                        for i in s_idx..e_idx {
+                            scanned += 1;
+                            if scanned.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            if graph.accepts(b.cols[3][i]) {
+                                let r = b.cols[2][i];
+                                if last_reifier != Some(r) {
+                                    last_reifier = Some(r);
+                                    scan_weights(r, &mut best)?;
+                                }
+                            }
+                        }
+                    }
+                    Chunk::Row(k) => {
+                        scanned += 1;
+                        if scanned.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        if graph.accepts(k[3]) {
+                            let r = k[2];
+                            if last_reifier != Some(r) {
+                                last_reifier = Some(r);
+                                scan_weights(r, &mut best)?;
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            },
+        )?;
         Ok(best.unwrap_or(default))
     }
 
@@ -3033,11 +3129,14 @@ impl<'a> Engine<'a> {
         root: u64,
         forward: bool,
         max_len: u32,
-    ) -> Result<(ChargedBoundedTree, Charge<'a>)> {
+    ) -> Result<(BoundedTreeOutcome, Charge<'a>)> {
         self.set_roots(&[root]);
         let mut work = self.ctx.charge(0)?;
         if max_len == 0 {
-            return Ok(((Vec::new(), HbMap::default()), work));
+            return Ok((
+                BoundedTreeOutcome::Tree((Vec::new(), HbMap::default())),
+                work,
+            ));
         }
         let real = |x: u64| if x == VIRT { root } else { x };
         let mut best_len: HbMap<u64, u32> = HbMap::default();
@@ -3047,6 +3146,8 @@ impl<'a> Engine<'a> {
         let mut order: Vec<(u64, u32)> = Vec::new();
         let mut heap: BoundedHeap = BinaryHeap::new();
         let mut best_virt: Option<(Cost, u32)> = None;
+        let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
+        let mut wide = false;
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
@@ -3072,7 +3173,7 @@ impl<'a> Engine<'a> {
         )?;
         let _ = push_heap(&mut heap, Reverse((Cost::ZERO, 0, root)), &mut work, base)?;
         let mut n = 0u64;
-        while let Some(Reverse((d, l, u))) = heap.pop() {
+        'search: while let Some(Reverse((d, l, u))) = heap.pop() {
             n += 1;
             if n.is_multiple_of(4096) {
                 self.ctx.check()?;
@@ -3119,7 +3220,20 @@ impl<'a> Engine<'a> {
                         rev: st.rev,
                     }
                 };
-                let nd = d.add(Cost::of(self.weight(&e.map(real))?));
+                let wv = self.weight(&e.map(real))?;
+                if !forward && wv > 0.0 {
+                    wmin = wmin.min(wv);
+                    wmax = wmax.max(wv);
+                    if bounded_weights_too_wide(max_len, wmin, wmax) {
+                        wide = true;
+                        break 'search;
+                    }
+                }
+                let nd = d.add(Cost::of(wv));
+                if !forward && max_len > 1 && nd.hi.is_infinite() {
+                    wide = true;
+                    break 'search;
+                }
                 let mut cur_base =
                     local_bytes(&best_len, &dist, dist_vec_bytes, &parent, &order, &heap)
                         .saturating_add(out_bytes);
@@ -3169,8 +3283,90 @@ impl<'a> Engine<'a> {
         drop(best_len);
         drop(dist);
         drop(heap);
+        if wide {
+            drop(parent);
+            drop(order);
+            work.resize(0)?;
+            let (bwd_dist, sources) = self.reverse_bounded_bfs(root, max_len, &mut work)?;
+            return Ok((BoundedTreeOutcome::ReverseWide { bwd_dist, sources }, work));
+        }
         work.resize(map_bytes(&parent).saturating_add(vec_bytes::<(u64, u32)>(order.capacity())))?;
-        Ok(((order, parent), work))
+        Ok((BoundedTreeOutcome::Tree((order, parent)), work))
+    }
+
+    /// Backward unweighted BFS from `root` up to `max_len` edges, returning each
+    /// reachable node's minimum edge distance to `root` and the ordered list of reachable
+    /// sources (including `VIRT` when a cycle of length `<= max_len` closes at `root`).
+    fn reverse_bounded_bfs(
+        &self,
+        root: u64,
+        max_len: u32,
+        work: &mut Charge<'a>,
+    ) -> Result<(HbMap<u64, u32>, Vec<u64>)> {
+        self.set_roots(&[root]);
+        let mut bwd_dist: HbMap<u64, u32> = HbMap::default();
+        let mut sources: Vec<u64> = Vec::new();
+        let mut frontier: Vec<u64> = Vec::new();
+        let mut seen_virt = false;
+        let bfs_bytes = |bwd_dist: &HbMap<u64, u32>,
+                         sources: &Vec<u64>,
+                         frontier: &Vec<u64>,
+                         next: &Vec<u64>| {
+            map_bytes(bwd_dist)
+                .saturating_add(vec_bytes::<u64>(sources.capacity()))
+                .saturating_add(vec_bytes::<u64>(frontier.capacity()))
+                .saturating_add(vec_bytes::<u64>(next.capacity()))
+        };
+        let empty_next: Vec<u64> = Vec::new();
+        let mut base = 0u64;
+        (_, base) = insert_hb_map(&mut bwd_dist, root, 0, work, base)?;
+        let _ = push_vec(&mut frontier, root, work, base)?;
+        for depth in 1..=max_len {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next: Vec<u64> = Vec::new();
+            for &u in &frontier {
+                self.ctx.check()?;
+                self.visit_count(1)?;
+                let loc = bfs_bytes(&bwd_dist, &sources, &frontier, &next);
+                let mut out_steps = Vec::new();
+                self.expand_one_charged(u, false, &mut out_steps, work, loc)?;
+                let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+                for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        #[cfg(any(test, feature = "failpoints"))]
+                        test_hooks::fire_traversal_poll();
+                        self.ctx.check()?;
+                    }
+                    let y = if st.node == root { VIRT } else { st.node };
+                    let cur_base =
+                        bfs_bytes(&bwd_dist, &sources, &frontier, &next).saturating_add(out_bytes);
+                    if y == VIRT {
+                        if !seen_virt {
+                            seen_virt = true;
+                            let _ = push_vec(&mut sources, VIRT, work, cur_base)?;
+                        }
+                        continue;
+                    }
+                    if bwd_dist.contains_key(&y) {
+                        continue;
+                    }
+                    let (_, next_base) = insert_hb_map(&mut bwd_dist, y, depth, work, cur_base)?;
+                    let next_base = push_vec(&mut sources, y, work, next_base)?;
+                    if depth < max_len {
+                        let _ = push_vec(&mut next, y, work, next_base)?;
+                    }
+                }
+                drop(out_steps);
+                work.resize(bfs_bytes(&bwd_dist, &sources, &frontier, &next))?;
+            }
+            frontier = next;
+            work.resize(bfs_bytes(&bwd_dist, &sources, &frontier, &empty_next))?;
+        }
+        drop(frontier);
+        work.resize(map_bytes(&bwd_dist).saturating_add(vec_bytes::<u64>(sources.capacity())))?;
+        Ok((bwd_dist, sources))
     }
 
     /// One cheapest simple path from `from` to `to` of at most `max_len` edges by
@@ -3193,6 +3389,7 @@ impl<'a> Engine<'a> {
         banned_nodes: Option<&FxHashSet<u64>>,
         banned_edges: Option<&FxHashSet<Edge>>,
         max_len: u32,
+        prefix: PrefixCost,
     ) -> Result<Option<(Vec<Edge>, Charge<'a>)>> {
         debug_assert!(from != to);
         let cycle = to == VIRT;
@@ -3200,6 +3397,21 @@ impl<'a> Engine<'a> {
         self.set_roots(&[from, real(to)]);
         if max_len == 0 {
             return Ok(None);
+        }
+        if prefix.total_max_len > 1
+            && (prefix.cost.hi.is_infinite()
+                || bounded_weights_too_wide(prefix.total_max_len, prefix.wmin, prefix.wmax))
+        {
+            return self.dijkstra_pair_bounded_forward(
+                from,
+                to,
+                virt,
+                banned_nodes,
+                banned_edges,
+                max_len,
+                prefix.cost,
+                None,
+            );
         }
         let max_side = [max_len.div_ceil(2), max_len / 2];
         let mut work = self.ctx.charge(0)?;
@@ -3245,7 +3457,7 @@ impl<'a> Engine<'a> {
         }
         let mut best: Option<(Cost, u64, (u32, u32))> = None;
         let mut n = 0u64;
-        let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
+        let (mut wmin, mut wmax) = (prefix.wmin, prefix.wmax);
         let mut wide = false;
         'search: loop {
             let mut tops: [Option<Cost>; 2] = [None, None];
@@ -3269,7 +3481,9 @@ impl<'a> Engine<'a> {
             let Some(lb) = lb else {
                 break;
             };
-            if max_len > 1 && lb.hi.is_infinite() {
+            if prefix.total_max_len > 1
+                && (lb.hi.is_infinite() || prefix.cost.add(lb).hi.is_infinite())
+            {
                 wide = true;
                 break;
             }
@@ -3355,13 +3569,15 @@ impl<'a> Engine<'a> {
                 if wv > 0.0 {
                     wmin = wmin.min(wv);
                     wmax = wmax.max(wv);
-                    if bounded_weights_too_wide(max_len, wmin, wmax) {
+                    if bounded_weights_too_wide(prefix.total_max_len, wmin, wmax) {
                         wide = true;
                         break 'search;
                     }
                 }
                 let nd = d.add(Cost::of(wv));
-                if max_len > 1 && nd.hi.is_infinite() {
+                if prefix.total_max_len > 1
+                    && (nd.hi.is_infinite() || prefix.cost.add(nd).hi.is_infinite())
+                {
                     wide = true;
                     break 'search;
                 }
@@ -3406,7 +3622,9 @@ impl<'a> Engine<'a> {
                     } else {
                         c_other.add(nd)
                     };
-                    if max_len > 1 && total.hi.is_infinite() {
+                    if prefix.total_max_len > 1
+                        && (total.hi.is_infinite() || prefix.cost.add(total).hi.is_infinite())
+                    {
                         wide = true;
                         break 'search;
                     }
@@ -3445,6 +3663,8 @@ impl<'a> Engine<'a> {
                 banned_nodes,
                 banned_edges,
                 max_len,
+                prefix.cost,
+                None,
             );
         }
         let Some((_, m, (lf, lb))) = best else {
@@ -3498,8 +3718,11 @@ impl<'a> Engine<'a> {
     }
 
     /// Source-order one-ended bounded Pareto search used as a fallback from
-    /// [`dijkstra_pair_bounded`] when wide weights or overflow could make bidirectional
-    /// split sums disagree with source-order accumulation.
+    /// [`dijkstra_pair_bounded`] and reverse [`dijkstra_bounded`] when wide weights or
+    /// overflow could make split or reverse sums disagree with source-order accumulation.
+    /// `init_cost` seeds `from` with an already-accumulated Yen prefix cost, and
+    /// `bwd_dist`, when provided, prunes interior nodes that cannot reach `to` within the
+    /// remaining edge budget.
     #[allow(clippy::too_many_arguments)]
     fn dijkstra_pair_bounded_forward(
         &self,
@@ -3509,10 +3732,16 @@ impl<'a> Engine<'a> {
         banned_nodes: Option<&FxHashSet<u64>>,
         banned_edges: Option<&FxHashSet<Edge>>,
         max_len: u32,
+        init_cost: Cost,
+        bwd_dist: Option<&HbMap<u64, u32>>,
     ) -> Result<Option<(Vec<Edge>, Charge<'a>)>> {
         debug_assert!(from != to);
         let cycle = to == VIRT;
         let real = |x: u64| if x == VIRT { virt } else { x };
+        self.set_roots(&[from, real(to)]);
+        if max_len == 0 {
+            return Ok(None);
+        }
         let mut work = self.ctx.charge(0)?;
         let mut dist: HbMap<u64, Vec<(u32, Cost)>> = HbMap::default();
         let mut dist_vec_bytes = 0u64;
@@ -3537,11 +3766,11 @@ impl<'a> Engine<'a> {
             &mut dist_vec_bytes,
             from,
             0,
-            Cost::ZERO,
+            init_cost,
             &mut work,
             base,
         )?;
-        let _ = push_heap(&mut heap, Reverse((Cost::ZERO, 0, from)), &mut work, base)?;
+        let _ = push_heap(&mut heap, Reverse((init_cost, 0, from)), &mut work, base)?;
         let mut n = 0u64;
         let mut found_len: Option<u32> = None;
         while let Some(Reverse((d, l, u))) = heap.pop() {
@@ -3593,6 +3822,14 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 if nl == max_len && y != to {
+                    continue;
+                }
+                if y != to
+                    && let Some(bd) = bwd_dist
+                    && bd
+                        .get(&y)
+                        .is_none_or(|&rem| nl.saturating_add(rem) > max_len)
+                {
                     continue;
                 }
                 if best_len.get(&y).is_some_and(|&bl| y == to || nl >= bl) {
@@ -3689,6 +3926,7 @@ impl<'a> Engine<'a> {
 
     /// The shortest path from `from` to `to` (forward) that avoids the banned nodes and
     /// edges, of at most `budget` edges: Yen's spur search.
+    #[allow(clippy::too_many_arguments)]
     fn spur(
         &self,
         from: u64,
@@ -3697,6 +3935,7 @@ impl<'a> Engine<'a> {
         banned_nodes: &FxHashSet<u64>,
         banned_edges: &FxHashSet<Edge>,
         budget: Option<u32>,
+        prefix: PrefixCost,
     ) -> Result<Option<SpurPath<'a>>> {
         if self.spec.weighted() {
             if let Some(max) = budget {
@@ -3708,6 +3947,7 @@ impl<'a> Engine<'a> {
                         Some(banned_nodes),
                         Some(banned_edges),
                         max,
+                        prefix,
                     )?
                     .map(|(p, work)| (p, 0.0, Some(work))));
             }
@@ -3779,7 +4019,10 @@ impl<'a> Engine<'a> {
         let none_n = FxHashSet::default();
         let none_e = FxHashSet::default();
         let budget = max;
-        let Some((first, _, first_charge)) = self.spur(s, tt, s, &none_n, &none_e, budget)? else {
+        let init_prefix = PrefixCost::zero(budget.unwrap_or(0));
+        let Some((first, _, first_charge)) =
+            self.spur(s, tt, s, &none_n, &none_e, budget, init_prefix)?
+        else {
             return Ok(());
         };
         let _first_charge = first_charge;
@@ -3801,7 +4044,17 @@ impl<'a> Engine<'a> {
                 return Ok(());
             }
             let nodes: Vec<u64> = std::iter::once(s).chain(cur.iter().map(|e| e.to)).collect();
+            let mut prefix_cost = Cost::ZERO;
+            let (mut prefix_wmin, mut prefix_wmax) = (f64::INFINITY, 0.0f64);
             for i in 0..cur.len() {
+                if i > 0 && self.spec.weighted() {
+                    let w = self.weight(&cur[i - 1].map(real))?;
+                    if w > 0.0 {
+                        prefix_wmin = prefix_wmin.min(w);
+                        prefix_wmax = prefix_wmax.max(w);
+                    }
+                    prefix_cost = prefix_cost.add(Cost::of(w));
+                }
                 let root = &cur[..i];
                 let mut banned_edges = FxHashSet::default();
                 for (p, _) in &a {
@@ -3810,14 +4063,26 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let banned_nodes: FxHashSet<u64> = nodes[..i].iter().copied().collect();
-                let budget = match budget {
+                let step_budget = match budget {
                     Some(m) if m <= i as u32 => continue,
                     Some(m) => Some(m - i as u32),
                     None => None,
                 };
-                if let Some((sp, _, sp_charge)) =
-                    self.spur(nodes[i], tt, s, &banned_nodes, &banned_edges, budget)?
-                {
+                let prefix = PrefixCost {
+                    cost: prefix_cost,
+                    wmin: prefix_wmin,
+                    wmax: prefix_wmax,
+                    total_max_len: budget.unwrap_or(0),
+                };
+                if let Some((sp, _, sp_charge)) = self.spur(
+                    nodes[i],
+                    tt,
+                    s,
+                    &banned_nodes,
+                    &banned_edges,
+                    step_budget,
+                    prefix,
+                )? {
                     let mut path = root.to_vec();
                     path.extend(sp);
                     if seen.insert(path.clone()) {
@@ -4102,9 +4367,11 @@ pub fn run(
                     if eng.full() {
                         break 'sources;
                     }
-                    let ((order, parent), tree_charge) = eng.dijkstra_bounded(s, true, max)?;
+                    let (outcome, tree_charge) = eng.dijkstra_bounded(s, true, max)?;
+                    let BoundedTreeOutcome::Tree((order, parent)) = outcome else {
+                        unreachable!("forward bounded Dijkstra never takes reverse wide fallback");
+                    };
                     let _tree_charge = tree_charge;
-                    let (order, parent) = (order, parent);
                     let tree_bytes = map_bytes(&parent)
                         .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()));
                     for (m, l) in order {
@@ -4138,9 +4405,15 @@ pub fn run(
                         }
                         let tt = if s == t { VIRT } else { t };
                         let real = |x: u64| if x == VIRT { s } else { x };
-                        if let Some((mut p, path_charge)) =
-                            eng.dijkstra_pair_bounded(s, tt, s, None, None, max)?
-                        {
+                        if let Some((mut p, path_charge)) = eng.dijkstra_pair_bounded(
+                            s,
+                            tt,
+                            s,
+                            None,
+                            None,
+                            max,
+                            PrefixCost::zero(max),
+                        )? {
                             for e in &mut p {
                                 *e = e.map(real);
                             }
@@ -4317,6 +4590,9 @@ pub fn run(
                     return Err(bad("path:kShortest needs a bound target"));
                 }
                 for &t in &targets.set {
+                    if eng.full() {
+                        break 'sources;
+                    }
                     eng.begin();
                     let mut n = 0usize;
                     if spec.min_len == 0 && s == t {
@@ -4324,6 +4600,9 @@ pub fn run(
                             break 'sources;
                         }
                         n += 1;
+                    }
+                    if eng.full() {
+                        break 'sources;
                     }
                     if n >= spec.k {
                         continue;
@@ -4381,27 +4660,65 @@ pub fn run(
                     if eng.full() {
                         break 'targets;
                     }
-                    let ((order, parent), tree_charge) =
-                        eng.dijkstra_bounded(t, false, spec.max_len.unwrap())?;
-                    let _tree_charge = tree_charge;
-                    let (order, parent) = (order, parent);
-                    let tree_bytes = map_bytes(&parent)
-                        .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()));
-                    for (m, l) in order {
-                        if eng.full() {
-                            break 'targets;
+                    let max = spec.max_len.unwrap();
+                    match eng.dijkstra_bounded(t, false, max)? {
+                        (BoundedTreeOutcome::Tree((order, parent)), tree_charge) => {
+                            let _tree_charge = tree_charge;
+                            let tree_bytes =
+                                map_bytes(&parent)
+                                    .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()));
+                            for (m, l) in order {
+                                if eng.full() {
+                                    break 'targets;
+                                }
+                                if spec.min_len == 0 && m == VIRT {
+                                    continue;
+                                }
+                                let start = if m == VIRT { t } else { m };
+                                _tree_charge.resize(
+                                    tree_bytes.saturating_add(vec_bytes::<Edge>(l as usize)),
+                                )?;
+                                let p = reconstruct_bounded(eng.ctx, t, false, &parent, m, l)?;
+                                let added = add(&mut found, start, t, p, None, false)?;
+                                _tree_charge.resize(tree_bytes)?;
+                                if !added {
+                                    break 'targets;
+                                }
+                            }
                         }
-                        if spec.min_len == 0 && m == VIRT {
-                            continue;
-                        }
-                        let start = if m == VIRT { t } else { m };
-                        _tree_charge
-                            .resize(tree_bytes.saturating_add(vec_bytes::<Edge>(l as usize)))?;
-                        let p = reconstruct_bounded(eng.ctx, t, false, &parent, m, l)?;
-                        let added = add(&mut found, start, t, p, None, false)?;
-                        _tree_charge.resize(tree_bytes)?;
-                        if !added {
-                            break 'targets;
+                        (BoundedTreeOutcome::ReverseWide { bwd_dist, sources }, _bfs_charge) => {
+                            for m in sources {
+                                if eng.full() {
+                                    break 'targets;
+                                }
+                                if spec.min_len == 0 && m == VIRT {
+                                    continue;
+                                }
+                                let start = if m == VIRT { t } else { m };
+                                let to = if m == VIRT { VIRT } else { t };
+                                let real = |x: u64| if x == VIRT { start } else { x };
+                                if let Some((mut p, path_charge)) = eng
+                                    .dijkstra_pair_bounded_forward(
+                                        start,
+                                        to,
+                                        start,
+                                        None,
+                                        None,
+                                        max,
+                                        Cost::ZERO,
+                                        Some(&bwd_dist),
+                                    )?
+                                {
+                                    for e in &mut p {
+                                        *e = e.map(real);
+                                    }
+                                    let added = add(&mut found, start, t, p, None, false)?;
+                                    drop(path_charge);
+                                    if !added {
+                                        break 'targets;
+                                    }
+                                }
+                            }
                         }
                     }
                     continue;
@@ -7588,10 +7905,10 @@ impl SearchContext {
         max_len: u32,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
-    ) -> Result<ChargedBoundedTree> {
+    ) -> Result<BoundedTreeOutcome> {
         self.set_roots(spec, &[root], charge, outer_bytes)?;
         if max_len == 0 {
-            return Ok((Vec::new(), HbMap::default()));
+            return Ok(BoundedTreeOutcome::Tree((Vec::new(), HbMap::default())));
         }
         let real = |x: u64| if x == VIRT { root } else { x };
         let mut best_len: HbMap<u64, u32> = HbMap::default();
@@ -7601,6 +7918,8 @@ impl SearchContext {
         let mut order: Vec<(u64, u32)> = Vec::new();
         let mut heap: BoundedHeap = BinaryHeap::new();
         let mut best_virt: Option<(Cost, u32)> = None;
+        let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
+        let mut wide = false;
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
@@ -7626,7 +7945,7 @@ impl SearchContext {
         )?;
         let _ = push_heap(&mut heap, Reverse((Cost::ZERO, 0, root)), charge, base)?;
         let mut n = 0u64;
-        while let Some(Reverse((d, l, u))) = heap.pop() {
+        'search: while let Some(Reverse((d, l, u))) = heap.pop() {
             n += 1;
             if n.is_multiple_of(4096) {
                 ctx.check()?;
@@ -7667,6 +7986,8 @@ impl SearchContext {
             let nl = l + 1;
             for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
                 if idx.is_multiple_of(4096) {
+                    #[cfg(any(test, feature = "failpoints"))]
+                    test_hooks::fire_traversal_poll();
                     ctx.check()?;
                 }
                 let y = if st.node == root { VIRT } else { st.node };
@@ -7699,7 +8020,19 @@ impl SearchContext {
                     ))
                     .saturating_add(out_bytes);
                 let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
+                if !forward && w > 0.0 {
+                    wmin = wmin.min(w);
+                    wmax = wmax.max(w);
+                    if bounded_weights_too_wide(max_len, wmin, wmax) {
+                        wide = true;
+                        break 'search;
+                    }
+                }
                 let nd = d.add(Cost::of(w));
+                if !forward && max_len > 1 && nd.hi.is_infinite() {
+                    wide = true;
+                    break 'search;
+                }
                 let mut cur_base = self.retained_bytes().saturating_add(step_outer);
                 if y == VIRT {
                     if best_virt.is_some_and(|(bc, bl)| (nd, nl) >= (bc, bl)) {
@@ -7751,13 +8084,114 @@ impl SearchContext {
         drop(best_len);
         drop(dist);
         drop(heap);
+        if wide {
+            drop(parent);
+            drop(order);
+            charge.resize(self.retained_bytes().saturating_add(outer_bytes))?;
+            let (bwd_dist, sources) =
+                self.run_reverse_bounded_bfs(ctx, spec, root, max_len, charge, outer_bytes)?;
+            return Ok(BoundedTreeOutcome::ReverseWide { bwd_dist, sources });
+        }
         charge.resize(
             self.retained_bytes()
                 .saturating_add(outer_bytes)
                 .saturating_add(map_bytes(&parent))
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity())),
         )?;
-        Ok((order, parent))
+        Ok(BoundedTreeOutcome::Tree((order, parent)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_reverse_bounded_bfs(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        root: u64,
+        max_len: u32,
+        charge: &mut super::ctx::OwnedCharge,
+        outer_bytes: u64,
+    ) -> Result<(HbMap<u64, u32>, Vec<u64>)> {
+        self.set_roots(spec, &[root], charge, outer_bytes)?;
+        let mut bwd_dist: HbMap<u64, u32> = HbMap::default();
+        let mut sources: Vec<u64> = Vec::new();
+        let mut frontier: Vec<u64> = Vec::new();
+        let mut seen_virt = false;
+        let bfs_bytes = |bwd_dist: &HbMap<u64, u32>,
+                         sources: &Vec<u64>,
+                         frontier: &Vec<u64>,
+                         next: &Vec<u64>| {
+            map_bytes(bwd_dist)
+                .saturating_add(vec_bytes::<u64>(sources.capacity()))
+                .saturating_add(vec_bytes::<u64>(frontier.capacity()))
+                .saturating_add(vec_bytes::<u64>(next.capacity()))
+        };
+        let empty_next: Vec<u64> = Vec::new();
+        let mut base = self.retained_bytes().saturating_add(outer_bytes);
+        (_, base) = insert_hb_map(&mut bwd_dist, root, 0, charge, base)?;
+        let _ = push_vec(&mut frontier, root, charge, base)?;
+        for depth in 1..=max_len {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next: Vec<u64> = Vec::new();
+            for &u in &frontier {
+                ctx.check()?;
+                self.visit(spec, 1)?;
+                let loc =
+                    outer_bytes.saturating_add(bfs_bytes(&bwd_dist, &sources, &frontier, &next));
+                let mut out_steps: Vec<(u64, Step)> = Vec::new();
+                self.expand(ctx, spec, &[u], false, &mut out_steps, charge, loc)?;
+                let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+                for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        #[cfg(any(test, feature = "failpoints"))]
+                        test_hooks::fire_traversal_poll();
+                        ctx.check()?;
+                    }
+                    let y = if st.node == root { VIRT } else { st.node };
+                    let cur_base = self
+                        .retained_bytes()
+                        .saturating_add(outer_bytes)
+                        .saturating_add(bfs_bytes(&bwd_dist, &sources, &frontier, &next))
+                        .saturating_add(out_bytes);
+                    if y == VIRT {
+                        if !seen_virt {
+                            seen_virt = true;
+                            let _ = push_vec(&mut sources, VIRT, charge, cur_base)?;
+                        }
+                        continue;
+                    }
+                    if bwd_dist.contains_key(&y) {
+                        continue;
+                    }
+                    let (_, next_base) = insert_hb_map(&mut bwd_dist, y, depth, charge, cur_base)?;
+                    let next_base = push_vec(&mut sources, y, charge, next_base)?;
+                    if depth < max_len {
+                        let _ = push_vec(&mut next, y, charge, next_base)?;
+                    }
+                }
+                drop(out_steps);
+                charge.resize(
+                    self.retained_bytes()
+                        .saturating_add(outer_bytes)
+                        .saturating_add(bfs_bytes(&bwd_dist, &sources, &frontier, &next)),
+                )?;
+            }
+            frontier = next;
+            charge.resize(
+                self.retained_bytes()
+                    .saturating_add(outer_bytes)
+                    .saturating_add(bfs_bytes(&bwd_dist, &sources, &frontier, &empty_next)),
+            )?;
+        }
+        drop(frontier);
+        charge.resize(
+            self.retained_bytes()
+                .saturating_add(outer_bytes)
+                .saturating_add(map_bytes(&bwd_dist))
+                .saturating_add(vec_bytes::<u64>(sources.capacity())),
+        )?;
+        Ok((bwd_dist, sources))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7771,6 +8205,7 @@ impl SearchContext {
         banned_nodes: Option<&HbSet<u64>>,
         banned_edges: Option<&HbSet<Edge>>,
         max_len: u32,
+        prefix: PrefixCost,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
     ) -> Result<Option<Vec<Edge>>> {
@@ -7780,6 +8215,25 @@ impl SearchContext {
         self.set_roots(spec, &[from, real(to)], charge, outer_bytes)?;
         if max_len == 0 {
             return Ok(None);
+        }
+        if prefix.total_max_len > 1
+            && (prefix.cost.hi.is_infinite()
+                || bounded_weights_too_wide(prefix.total_max_len, prefix.wmin, prefix.wmax))
+        {
+            return self.run_dijkstra_pair_bounded_forward(
+                ctx,
+                spec,
+                from,
+                to,
+                virt,
+                banned_nodes,
+                banned_edges,
+                max_len,
+                prefix.cost,
+                None,
+                charge,
+                outer_bytes,
+            );
         }
         let max_side = [max_len.div_ceil(2), max_len / 2];
         let mut dist: [HbMap<u64, Vec<(u32, Cost)>>; 2] = Default::default();
@@ -7824,7 +8278,7 @@ impl SearchContext {
         }
         let mut best: Option<(Cost, u64, (u32, u32))> = None;
         let mut n = 0u64;
-        let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
+        let (mut wmin, mut wmax) = (prefix.wmin, prefix.wmax);
         let mut wide = false;
         'search: loop {
             let mut tops: [Option<Cost>; 2] = [None, None];
@@ -7848,7 +8302,9 @@ impl SearchContext {
             let Some(lb) = lb else {
                 break;
             };
-            if max_len > 1 && lb.hi.is_infinite() {
+            if prefix.total_max_len > 1
+                && (lb.hi.is_infinite() || prefix.cost.add(lb).hi.is_infinite())
+            {
                 wide = true;
                 break;
             }
@@ -7905,6 +8361,8 @@ impl SearchContext {
             let at_boundary = nl == max_side[side];
             for idx in 0..step_count {
                 if idx.is_multiple_of(4096) {
+                    #[cfg(any(test, feature = "failpoints"))]
+                    test_hooks::fire_traversal_poll();
                     ctx.check()?;
                 }
                 let st = match &cached_steps {
@@ -7956,13 +8414,15 @@ impl SearchContext {
                 if w > 0.0 {
                     wmin = wmin.min(w);
                     wmax = wmax.max(w);
-                    if bounded_weights_too_wide(max_len, wmin, wmax) {
+                    if bounded_weights_too_wide(prefix.total_max_len, wmin, wmax) {
                         wide = true;
                         break 'search;
                     }
                 }
                 let nd = d.add(Cost::of(w));
-                if max_len > 1 && nd.hi.is_infinite() {
+                if prefix.total_max_len > 1
+                    && (nd.hi.is_infinite() || prefix.cost.add(nd).hi.is_infinite())
+                {
                     wide = true;
                     break 'search;
                 }
@@ -8007,7 +8467,9 @@ impl SearchContext {
                     } else {
                         c_other.add(nd)
                     };
-                    if max_len > 1 && total.hi.is_infinite() {
+                    if prefix.total_max_len > 1
+                        && (total.hi.is_infinite() || prefix.cost.add(total).hi.is_infinite())
+                    {
                         wide = true;
                         break 'search;
                     }
@@ -8065,6 +8527,8 @@ impl SearchContext {
                 banned_nodes,
                 banned_edges,
                 max_len,
+                prefix.cost,
+                None,
                 charge,
                 outer_bytes,
             );
@@ -8126,8 +8590,8 @@ impl SearchContext {
     }
 
     /// Source-order one-ended bounded Pareto search used as a fallback from
-    /// [`run_dijkstra_pair_bounded`] when wide weights or overflow could make bidirectional
-    /// split sums disagree with source-order accumulation.
+    /// [`run_dijkstra_pair_bounded`] and reverse [`run_dijkstra_bounded`] when wide weights
+    /// or overflow could make split or reverse sums disagree with source-order accumulation.
     #[allow(clippy::too_many_arguments)]
     fn run_dijkstra_pair_bounded_forward(
         &mut self,
@@ -8139,12 +8603,18 @@ impl SearchContext {
         banned_nodes: Option<&HbSet<u64>>,
         banned_edges: Option<&HbSet<Edge>>,
         max_len: u32,
+        init_cost: Cost,
+        bwd_dist: Option<&HbMap<u64, u32>>,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
     ) -> Result<Option<Vec<Edge>>> {
         debug_assert!(from != to);
         let cycle = to == VIRT;
         let real = |x: u64| if x == VIRT { virt } else { x };
+        self.set_roots(spec, &[from, real(to)], charge, outer_bytes)?;
+        if max_len == 0 {
+            return Ok(None);
+        }
         let mut dist: HbMap<u64, Vec<(u32, Cost)>> = HbMap::default();
         let mut dist_vec_bytes = 0u64;
         let mut best_len: HbMap<u64, u32> = HbMap::default();
@@ -8168,11 +8638,11 @@ impl SearchContext {
             &mut dist_vec_bytes,
             from,
             0,
-            Cost::ZERO,
+            init_cost,
             charge,
             base,
         )?;
-        let _ = push_heap(&mut heap, Reverse((Cost::ZERO, 0, from)), charge, base)?;
+        let _ = push_heap(&mut heap, Reverse((init_cost, 0, from)), charge, base)?;
         let mut n = 0u64;
         let mut found_len: Option<u32> = None;
         while let Some(Reverse((d, l, u))) = heap.pop() {
@@ -8222,6 +8692,8 @@ impl SearchContext {
             let nl = l + 1;
             for idx in 0..step_count {
                 if idx.is_multiple_of(4096) {
+                    #[cfg(any(test, feature = "failpoints"))]
+                    test_hooks::fire_traversal_poll();
                     ctx.check()?;
                 }
                 let st = match &cached_steps {
@@ -8237,6 +8709,14 @@ impl SearchContext {
                     continue;
                 }
                 if nl == max_len && y != to {
+                    continue;
+                }
+                if y != to
+                    && let Some(bd) = bwd_dist
+                    && bd
+                        .get(&y)
+                        .is_none_or(|&rem| nl.saturating_add(rem) > max_len)
+                {
                     continue;
                 }
                 if best_len.get(&y).is_some_and(|&bl| y == to || nl >= bl) {
@@ -8361,6 +8841,7 @@ impl SearchContext {
         banned_nodes: &HbSet<u64>,
         banned_edges: &HbSet<Edge>,
         budget: Option<u32>,
+        prefix: PrefixCost,
         charge: &mut super::ctx::OwnedCharge,
         outer_bytes: u64,
     ) -> Result<Option<(Vec<Edge>, f64)>> {
@@ -8376,6 +8857,7 @@ impl SearchContext {
                         Some(banned_nodes),
                         Some(banned_edges),
                         max,
+                        prefix,
                         charge,
                         outer_bytes,
                     )?
@@ -9475,7 +9957,17 @@ impl YenJob {
             let none_e = HbSet::default();
             let spur_outer = outer_bytes.saturating_add(self.retained_bytes());
             let Some((first, _)) = search.run_spur(
-                ctx, spec, s, tt, s, &none_n, &none_e, budget, charge, spur_outer,
+                ctx,
+                spec,
+                s,
+                tt,
+                s,
+                &none_n,
+                &none_e,
+                budget,
+                PrefixCost::zero(budget.unwrap_or(0)),
+                charge,
+                spur_outer,
             )?
             else {
                 self.done = true;
@@ -9528,8 +10020,27 @@ impl YenJob {
                     nodes.push(e.to);
                 }
                 let nodes_cap_bytes = vec_bytes::<u64>(nodes.capacity());
+                let mut prefix_cost = Cost::ZERO;
+                let (mut prefix_wmin, mut prefix_wmax) = (f64::INFINITY, 0.0f64);
                 for i in 0..cur_len {
                     ctx.check()?;
+                    if i > 0 && spec.weighted() {
+                        let edge = self.a.last().unwrap().0[i - 1].map(real);
+                        let w = search.weight(
+                            ctx,
+                            spec,
+                            &edge,
+                            charge,
+                            outer_bytes
+                                .saturating_add(self.retained_bytes())
+                                .saturating_add(nodes_cap_bytes),
+                        )?;
+                        if w > 0.0 {
+                            prefix_wmin = prefix_wmin.min(w);
+                            prefix_wmax = prefix_wmax.max(w);
+                        }
+                        prefix_cost = prefix_cost.add(Cost::of(w));
+                    }
                     let step_budget = match budget {
                         Some(m) if m <= i as u32 => continue,
                         Some(m) => Some(m - i as u32),
@@ -9561,6 +10072,12 @@ impl YenJob {
                         .saturating_add(nodes_cap_bytes)
                         .saturating_add(set_bytes(&banned_edges))
                         .saturating_add(set_bytes(&banned_nodes));
+                    let prefix = PrefixCost {
+                        cost: prefix_cost,
+                        wmin: prefix_wmin,
+                        wmax: prefix_wmax,
+                        total_max_len: budget.unwrap_or(0),
+                    };
                     let sp = search.run_spur(
                         ctx,
                         spec,
@@ -9570,6 +10087,7 @@ impl YenJob {
                         &banned_nodes,
                         &banned_edges,
                         step_budget,
+                        prefix,
                         charge,
                         spur_outer,
                     )?;
@@ -10131,15 +10649,28 @@ impl AllPathsJob {
 }
 
 /// Active resumable search stream for one scheduled job.
+enum BoundedShortestState {
+    Tree {
+        parent: HbMap<(u64, u32), Parent>,
+        order: Vec<(u64, u32)>,
+        idx: usize,
+    },
+    ReverseWide {
+        bwd_dist: HbMap<u64, u32>,
+        sources: Vec<u64>,
+        idx: usize,
+        max_len: u32,
+    },
+}
+
 /// Resumable job for length-bounded weighted `path:shortest` with an unbound end
-/// (ROADMAP item 275): runs one Pareto-pruned search and emits each reached node's
-/// optimal path within `max_len` on demand.
+/// (ROADMAP item 275): runs one Pareto-pruned search (or, for reverse wide weights,
+/// per-source forward searches pruned by backward BFS distances) and emits each reached
+/// node's optimal path within `max_len` on demand.
 struct BoundedShortestJob {
     root: u64,
     forward: bool,
-    parent: HbMap<(u64, u32), Parent>,
-    order: Vec<(u64, u32)>,
-    idx: usize,
+    state: BoundedShortestState,
     pending_zero: bool,
     skip_virt: bool,
     need_edges: bool,
@@ -10158,15 +10689,34 @@ impl BoundedShortestJob {
         outer_bytes: u64,
     ) -> Result<Self> {
         search.begin();
-        let (order, parent) =
-            search.run_dijkstra_bounded(ctx, spec, root, forward, max_len, charge, outer_bytes)?;
+        let state = match search.run_dijkstra_bounded(
+            ctx,
+            spec,
+            root,
+            forward,
+            max_len,
+            charge,
+            outer_bytes,
+        )? {
+            BoundedTreeOutcome::Tree((order, parent)) => BoundedShortestState::Tree {
+                parent,
+                order,
+                idx: 0,
+            },
+            BoundedTreeOutcome::ReverseWide { bwd_dist, sources } => {
+                BoundedShortestState::ReverseWide {
+                    bwd_dist,
+                    sources,
+                    idx: 0,
+                    max_len,
+                }
+            }
+        };
         let pending_zero = spec.min_len == 0;
         Ok(Self {
             root,
             forward,
-            parent,
-            order,
-            idx: 0,
+            state,
             pending_zero,
             skip_virt: pending_zero,
             need_edges: spec.per_edge() || spec.weighted(),
@@ -10174,7 +10724,14 @@ impl BoundedShortestJob {
     }
 
     fn retained_bytes(&self) -> u64 {
-        map_bytes(&self.parent).saturating_add(vec_bytes::<(u64, u32)>(self.order.capacity()))
+        match &self.state {
+            BoundedShortestState::Tree { parent, order, .. } => {
+                map_bytes(parent).saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+            }
+            BoundedShortestState::ReverseWide {
+                bwd_dist, sources, ..
+            } => map_bytes(bwd_dist).saturating_add(vec_bytes::<u64>(sources.capacity())),
+        }
     }
 
     fn next_path(
@@ -10196,78 +10753,146 @@ impl BoundedShortestJob {
                 cost: 0.0,
             }));
         }
-        while self.idx < self.order.len() {
-            let (m, len) = self.order[self.idx];
-            self.idx += 1;
-            if self.skip_virt && m == VIRT {
-                continue;
-            }
-            let real = |x: u64| if x == VIRT { self.root } else { x };
-            let job_outer = outer_bytes.saturating_add(self.retained_bytes());
-            let base = search.retained_bytes().saturating_add(job_outer);
-            charge.resize(base.saturating_add(vec_bytes::<Edge>(len as usize)))?;
-            let mut edges = Vec::with_capacity(len as usize);
-            let mut cur = m;
-            let mut l = len;
-            let mut steps = 0usize;
-            while l > 0 {
-                steps += 1;
-                if steps.is_multiple_of(4096) {
-                    ctx.check()?;
+        let job_outer = outer_bytes.saturating_add(self.retained_bytes());
+        match &mut self.state {
+            BoundedShortestState::Tree { parent, order, idx } => {
+                while *idx < order.len() {
+                    let (m, len) = order[*idx];
+                    *idx += 1;
+                    if self.skip_virt && m == VIRT {
+                        continue;
+                    }
+                    let real = |x: u64| if x == VIRT { self.root } else { x };
+                    let base = search.retained_bytes().saturating_add(job_outer);
+                    charge.resize(base.saturating_add(vec_bytes::<Edge>(len as usize)))?;
+                    let mut edges = Vec::with_capacity(len as usize);
+                    let mut cur = m;
+                    let mut l = len;
+                    let mut steps = 0usize;
+                    while l > 0 {
+                        steps += 1;
+                        if steps.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        let q = parent[&(cur, l)];
+                        let e = if self.forward {
+                            Edge {
+                                from: q.node,
+                                to: cur,
+                                p: q.p,
+                                rev: q.rev,
+                            }
+                        } else {
+                            Edge {
+                                from: cur,
+                                to: q.node,
+                                p: q.p,
+                                rev: q.rev,
+                            }
+                        };
+                        edges.push(e.map(real));
+                        cur = q.node;
+                        l -= 1;
+                    }
+                    if self.forward {
+                        edges.reverse();
+                    }
+                    let cost = search.path_cost(
+                        ctx,
+                        spec,
+                        &edges,
+                        charge,
+                        job_outer.saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                    )?;
+                    let edges = if self.need_edges { edges } else { Vec::new() };
+                    charge.resize(
+                        search
+                            .retained_bytes()
+                            .saturating_add(job_outer)
+                            .saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                    )?;
+                    let other = real(m);
+                    let (start, end) = if self.forward {
+                        (self.root, other)
+                    } else {
+                        (other, self.root)
+                    };
+                    search.paths_found += 1;
+                    return Ok(Some(Found {
+                        start,
+                        end,
+                        edges,
+                        len: len as usize,
+                        cost,
+                    }));
                 }
-                let q = self.parent[&(cur, l)];
-                let e = if self.forward {
-                    Edge {
-                        from: q.node,
-                        to: cur,
-                        p: q.p,
-                        rev: q.rev,
-                    }
-                } else {
-                    Edge {
-                        from: cur,
-                        to: q.node,
-                        p: q.p,
-                        rev: q.rev,
-                    }
-                };
-                edges.push(e.map(real));
-                cur = q.node;
-                l -= 1;
+                Ok(None)
             }
-            if self.forward {
-                edges.reverse();
+            BoundedShortestState::ReverseWide {
+                bwd_dist,
+                sources,
+                idx,
+                max_len,
+            } => {
+                while *idx < sources.len() {
+                    let m = sources[*idx];
+                    *idx += 1;
+                    if self.skip_virt && m == VIRT {
+                        continue;
+                    }
+                    let start = if m == VIRT { self.root } else { m };
+                    let to = if m == VIRT { VIRT } else { self.root };
+                    let real = |x: u64| if x == VIRT { start } else { x };
+                    let Some(mut edges) = search.run_dijkstra_pair_bounded_forward(
+                        ctx,
+                        spec,
+                        start,
+                        to,
+                        start,
+                        None,
+                        None,
+                        *max_len,
+                        Cost::ZERO,
+                        Some(bwd_dist),
+                        charge,
+                        job_outer,
+                    )?
+                    else {
+                        continue;
+                    };
+                    for (i, edge) in edges.iter_mut().enumerate() {
+                        if i.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        *edge = edge.map(real);
+                    }
+                    let cost = search.path_cost(
+                        ctx,
+                        spec,
+                        &edges,
+                        charge,
+                        job_outer.saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                    )?;
+                    let len = edges.len();
+                    let edges = if self.need_edges { edges } else { Vec::new() };
+                    charge.resize(
+                        search
+                            .retained_bytes()
+                            .saturating_add(job_outer)
+                            .saturating_add(vec_bytes::<Edge>(edges.capacity())),
+                    )?;
+                    search.paths_found += 1;
+                    return Ok(Some(Found {
+                        start,
+                        end: self.root,
+                        edges,
+                        len,
+                        cost,
+                    }));
+                }
+                Ok(None)
             }
-            let cost = search.path_cost(
-                ctx,
-                spec,
-                &edges,
-                charge,
-                job_outer.saturating_add(vec_bytes::<Edge>(edges.capacity())),
-            )?;
-            let edges = if self.need_edges { edges } else { Vec::new() };
-            charge.resize(
-                search
-                    .retained_bytes()
-                    .saturating_add(job_outer)
-                    .saturating_add(vec_bytes::<Edge>(edges.capacity())),
-            )?;
-            let other = real(m);
-            let (start, end) = if self.forward {
-                (self.root, other)
-            } else {
-                (other, self.root)
-            };
-            search.paths_found += 1;
-            return Ok(Some(Found {
-                start,
-                end,
-                edges,
-                len: len as usize,
-                cost,
-            }));
         }
-        Ok(None)
     }
 }
 
@@ -10914,6 +11539,7 @@ impl Reader {
                                 None,
                                 None,
                                 max,
+                                PrefixCost::zero(max),
                                 &mut self.charge,
                                 outer,
                             )? {

@@ -1451,6 +1451,12 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
             ),
         ),
         (
+            "shortest variable source weighted maxLength wide-weight fallback",
+            format!(
+                "{P}SELECT ?s ?i ?c {{ SERVICE path:search {{ [] path:source ?s ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:weight <urn:w> ; path:maxLength 3 ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
             "shortest variable target",
             format!(
                 "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:n:0> ; path:target ?t ; path:predicate <urn:e> ; path:length ?l }} }}"
@@ -1537,6 +1543,24 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
         }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+
+    // Eager bounded high-reifier weight lookup (`path:limit`) reduces reifiers in place
+    // without allocating `Vec<Key>` or `Vec<u64>` proportional to the 2,000 reifiers.
+    let eager_reifier_q = format!(
+        "{P}SELECT ?c {{ SERVICE path:search {{ [] path:source <urn:mr:0> ; path:target <urn:mr:1> ; path:predicate <urn:mre> ; path:weight <urn:w> ; path:maxLength 2 ; path:limit 10 ; path:cost ?c }} }}"
+    );
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    let _ = sparkles_core::sparql::query(snap.clone(), &eager_reifier_q, &opts).unwrap();
+    let (_, eager_peak) =
+        heap::peak(|| sparkles_core::sparql::query(snap.clone(), &eager_reifier_q, &opts).unwrap());
+    assert!(
+        eager_peak < 64 * 1024,
+        "eager bounded high-reifier weight lookup allocated {eager_peak} bytes (expected O(1) scratch < 64 KiB)"
+    );
 }
 
 #[test]

@@ -1831,6 +1831,51 @@ fn weighted_bounded_edge_cases() {
         ("s", "0")
     );
 
+    // 4d. Bounded eager kShortest stops once path:limit is filled by an empty path or a
+    // prior target instead of opening Yen or advancing to the next target.
+    let kshort_cycle = store_of("ex:s ex:p ex:a . ex:a ex:p ex:s . ex:s ex:p ex:u .");
+    let kshort_empty_limit = rows(
+        &kshort_cycle,
+        "SELECT ?len WHERE { SERVICE path:search { [] path:source ex:s ; path:target ex:s ; \
+         path:predicate ex:p ; path:weight ex:w ; path:algorithm path:kShortest ; path:k 2 ; \
+         path:minLength 0 ; path:maxLength 2 ; path:limit 1 ; path:maxVisited 1 ; \
+         path:length ?len } }",
+    );
+    assert_eq!(kshort_empty_limit.len(), 1);
+    assert_eq!(kshort_empty_limit[0]["len"].as_str(), "0");
+
+    let kshort_multi_target_limit = rows(
+        &kshort_cycle,
+        "SELECT ?t ?len WHERE { VALUES ?t { ex:s ex:u } SERVICE path:search { \
+         [] path:source ex:s ; path:target ?t ; path:predicate ex:p ; path:weight ex:w ; \
+         path:algorithm path:kShortest ; path:k 2 ; path:minLength 0 ; path:maxLength 2 ; \
+         path:limit 1 ; path:maxVisited 1 ; path:length ?len } }",
+    );
+    assert_eq!(kshort_multi_target_limit.len(), 1);
+    assert_eq!(
+        (
+            kshort_multi_target_limit[0]["t"].as_str(),
+            kshort_multi_target_limit[0]["len"].as_str()
+        ),
+        ("s", "0")
+    );
+
+    let kshort_next_target_limit = rows(
+        &kshort_cycle,
+        "SELECT ?t ?len WHERE { VALUES ?t { ex:a ex:s } SERVICE path:search { \
+         [] path:source ex:s ; path:target ?t ; path:predicate ex:p ; path:weight ex:w ; \
+         path:algorithm path:kShortest ; path:k 1 ; path:minLength 1 ; path:maxLength 2 ; \
+         path:limit 1 ; path:maxVisited 1 ; path:length ?len } }",
+    );
+    assert_eq!(kshort_next_target_limit.len(), 1);
+    assert_eq!(
+        (
+            kshort_next_target_limit[0]["t"].as_str(),
+            kshort_next_target_limit[0]["len"].as_str()
+        ),
+        ("a", "1")
+    );
+
     // 5. allShortest with weight + maxLength still requires bound target / source.
     let e = error(
         &u,
@@ -2384,4 +2429,248 @@ fn weighted_bounded_virt_visited_once() {
             "cycle cost ({lim}): {got:?}"
         );
     }
+}
+
+/// Regression for Sol r2 P2 #1: Yen spurs with a shared prefix must include the prefix's
+/// accumulated cost and weight range in wide-weight detection and source-order fallback so
+/// rounded sums select the cheaper full path rather than a suffix that only looks cheaper
+/// from zero.
+#[test]
+fn weighted_bounded_yen_shared_prefix_wide_weight_ranking() {
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let ttl = format!(
+        "ex:s ex:p1 ex:p {{| ex:w {} |}} . ex:p ex:p1 ex:v {{| ex:w {} |}} . \
+         ex:v ex:p1 ex:t {{| ex:w {} |}} . ex:v ex:p2 ex:t {{| ex:w {} |}} . \
+         ex:v ex:p1 ex:x1 {{| ex:w {} |}} . ex:x1 ex:p1 ex:x2 {{| ex:w {} |}} . \
+         ex:x2 ex:p1 ex:t {{| ex:w {} |}} .",
+        dbl(1.0),
+        dbl(m),
+        dbl(0.0),
+        dbl(d),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    let s = store_of(&ttl);
+    let path_zero = vec!["s", "p", "v", "t"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let path_three = vec!["s", "p", "v", "x1", "x2", "t"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+
+    for lim in ["", " ; path:limit 10"] {
+        // allShortest must return both tied cost-1.0 routes (the 0-weight edge and the
+        // 3-edge e,e,e suffix) and omit the dearer d-weight direct edge.
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:t ; path:predicate ex:p1 , ex:p2 ; path:weight ex:w ; \
+                 path:algorithm path:allShortest ; path:minLength 1 ; path:maxLength 5{lim} ; \
+                 path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; \
+                 path:edgeObject ?o ; path:cost ?c }} }}"
+            ),
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 2, "allShortest ({lim}): {paths:?}");
+        let got_set: BTreeSet<Vec<String>> = paths.values().cloned().collect();
+        assert_eq!(
+            got_set,
+            BTreeSet::from([path_zero.clone(), path_three.clone()]),
+            "allShortest ({lim}) must keep both source-order ties"
+        );
+        for row in &r {
+            let cost: f64 = row["c"].parse().unwrap();
+            assert_eq!(cost, 1.0, "allShortest ({lim}) expected reported cost 1.0");
+        }
+
+        // kShortest k=2 must return the 0-edge route first and the tied 3-edge route second
+        // before the dearer direct d route.
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:t ; path:predicate ex:p1 , ex:p2 ; path:weight ex:w ; \
+                 path:algorithm path:kShortest ; path:k 2 ; path:minLength 1 ; \
+                 path:maxLength 5{lim} ; path:pathIndex ?path ; path:edgeIndex ?i ; \
+                 path:edgeSubject ?s ; path:edgeObject ?o ; path:cost ?c }} }}"
+            ),
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 2, "kShortest k=2 ({lim}): {paths:?}");
+        assert_eq!(paths["0"], path_zero, "kShortest k=2 ({lim}) path 0");
+        assert_eq!(paths["1"], path_three, "kShortest k=2 ({lim}) path 1");
+
+        // kShortest k=3 places the dearer direct d route third with cost 1 + 2^-52.
+        let r = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:t ; path:predicate ex:p1 , ex:p2 ; path:weight ex:w ; \
+                 path:algorithm path:kShortest ; path:k 3 ; path:minLength 1 ; \
+                 path:maxLength 5{lim} ; path:pathIndex ?path ; path:edgeIndex ?i ; \
+                 path:edgeSubject ?s ; path:edgeObject ?o ; path:cost ?c }} }}"
+            ),
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 3, "kShortest k=3 ({lim}): {paths:?}");
+        assert_eq!(paths["0"], path_zero, "kShortest k=3 ({lim}) path 0");
+        assert_eq!(paths["1"], path_three, "kShortest k=3 ({lim}) path 1");
+        assert_eq!(paths["2"], path_zero, "kShortest k=3 ({lim}) path 2 nodes");
+        let cost2: f64 = r.iter().find(|row| row["path"] == "2").unwrap()["c"]
+            .parse()
+            .unwrap();
+        assert_eq!(
+            cost2,
+            1.0 + 2f64.powi(-52),
+            "kShortest k=3 ({lim}) third path must report 1 + 2^-52"
+        );
+    }
+}
+
+/// Regression for Sol r2 P2 #2: bounded weighted `path:shortest` with a variable source must
+/// agree with bound-pair and forward unbound-target searches under wide weights, picking the
+/// path with the lower source-order cost rather than a path that only looks cheaper in
+/// target-to-source order.
+#[test]
+fn weighted_bounded_variable_source_wide_weight_ranking() {
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let ttl = format!(
+        "ex:s ex:p1 ex:p {{| ex:w {} |}} . ex:p ex:p1 ex:v {{| ex:w {} |}} . \
+         ex:v ex:p2 ex:t {{| ex:w {} |}} . \
+         ex:v ex:p1 ex:x1 {{| ex:w {} |}} . ex:x1 ex:p1 ex:x2 {{| ex:w {} |}} . \
+         ex:x2 ex:p1 ex:t {{| ex:w {} |}} .",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    let s = store_of(&ttl);
+    let expected_from_s: Vec<String> = ["s", "p", "v", "x1", "x2", "t"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let expected_from_v: Vec<String> = ["v", "t"].into_iter().map(String::from).collect();
+
+    for lim in ["", " ; path:limit 20"] {
+        // Bound pair (s, t) picks the 3-edge suffix with cost 1.0.
+        let r_pair = rows(
+            &s,
+            &format!(
+                "SELECT ?path ?i ?s ?o ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ex:t ; path:predicate ex:p1 , ex:p2 ; path:weight ex:w ; \
+                 path:minLength 1 ; path:maxLength 5{lim} ; path:pathIndex ?path ; \
+                 path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o ; path:cost ?c }} }}"
+            ),
+        );
+        let pair_paths = node_paths(&r_pair);
+        assert_eq!(pair_paths["0"], expected_from_s, "bound pair ({lim})");
+        assert_eq!(r_pair[0]["c"].parse::<f64>().unwrap(), 1.0);
+
+        // Variable target (s, ?t) picks the same 3-edge suffix for ?t = ex:t.
+        let r_fwd = rows(
+            &s,
+            &format!(
+                "SELECT ?t ?path ?i ?s ?o ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+                 path:target ?t ; path:predicate ex:p1 , ex:p2 ; path:weight ex:w ; \
+                 path:minLength 1 ; path:maxLength 5{lim} ; path:pathIndex ?path ; \
+                 path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o ; path:cost ?c }} }}"
+            ),
+        );
+        let fwd_for_t: Vec<_> = r_fwd.into_iter().filter(|r| r["t"] == "t").collect();
+        let fwd_paths = node_paths(&fwd_for_t);
+        assert_eq!(fwd_paths.len(), 1);
+        assert_eq!(
+            fwd_paths.values().next().unwrap(),
+            &expected_from_s,
+            "variable target ({lim})"
+        );
+        assert_eq!(fwd_for_t[0]["c"].parse::<f64>().unwrap(), 1.0);
+
+        // Variable source (?src, t) must also pick the 3-edge suffix for ?src = ex:s with
+        // cost 1.0, while still picking the direct d edge for ?src = ex:v (d < 3e).
+        let r_rev = rows(
+            &s,
+            &format!(
+                "SELECT ?src ?path ?i ?s ?o ?c WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
+                 path:target ex:t ; path:predicate ex:p1 , ex:p2 ; path:weight ex:w ; \
+                 path:minLength 1 ; path:maxLength 5{lim} ; path:pathIndex ?path ; \
+                 path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o ; path:cost ?c }} }}"
+            ),
+        );
+        let rev_for_s: Vec<_> = r_rev.iter().filter(|r| r["src"] == "s").cloned().collect();
+        let rev_s_paths = node_paths(&rev_for_s);
+        assert_eq!(rev_s_paths.len(), 1, "variable source s ({lim})");
+        assert_eq!(
+            rev_s_paths.values().next().unwrap(),
+            &expected_from_s,
+            "variable source ({lim}) must choose source-order 3-edge suffix for ex:s"
+        );
+        assert_eq!(
+            rev_for_s[0]["c"].parse::<f64>().unwrap(),
+            1.0,
+            "variable source ({lim}) reported cost for ex:s"
+        );
+
+        let rev_for_v: Vec<_> = r_rev.iter().filter(|r| r["src"] == "v").cloned().collect();
+        let rev_v_paths = node_paths(&rev_for_v);
+        assert_eq!(rev_v_paths.len(), 1, "variable source v ({lim})");
+        assert_eq!(
+            rev_v_paths.values().next().unwrap(),
+            &expected_from_v,
+            "variable source ({lim}) must choose direct edge for ex:v"
+        );
+        assert_eq!(
+            rev_for_v[0]["c"].parse::<f64>().unwrap(),
+            d,
+            "variable source ({lim}) reported cost for ex:v"
+        );
+    }
+}
+
+/// Regression for Sol r2 P2 #4: eager bounded weight lookup reduces reifier and weight rows
+/// in place through checked streaming scans rather than materializing `Vec<Key>` scratch,
+/// keeping memory flat and respecting cancellation and graph filtering.
+#[test]
+fn weighted_bounded_eager_high_reifier_weight_lookup_streams() {
+    let mut ttl = String::from("ex:s ex:p ex:t .\n");
+    for i in 0..5_000 {
+        let w = if i == 4_200 { "1.5" } else { "2.0" };
+        ttl += &format!("<< ex:s ex:p ex:t ~ ex:r{i} >> ex:w {w}e0 .\n");
+    }
+    let s = store_of(&ttl);
+    let q = format!(
+        "{PREFIXES}SELECT ?c WHERE {{ SERVICE path:search {{ [] path:source ex:s ; \
+         path:target ex:t ; path:predicate ex:p ; path:weight ex:w ; path:maxLength 2 ; \
+         path:limit 10 ; path:cost ?c }} }}"
+    );
+    let opts = QueryOptions {
+        max_memory_bytes: Some(64 * 1024),
+        no_cache: true,
+        ..Default::default()
+    };
+    let res = query(s.snapshot(), &q, &opts).expect("streaming lookup must fit in 64 KiB");
+    let got = rows(
+        &s,
+        "SELECT ?c WHERE { SERVICE path:search { [] path:source ex:s ; path:target ex:t ; \
+         path:predicate ex:p ; path:weight ex:w ; path:maxLength 2 ; path:limit 10 ; path:cost ?c } }",
+    );
+    assert_eq!(got.len(), 1);
+    assert!((got[0]["c"].parse::<f64>().unwrap() - 1.5).abs() < 1e-12);
+    assert!(
+        res.mem_peak_bytes < 64 * 1024,
+        "expected small bounded peak on 5,000-reifier edge, got {}",
+        res.mem_peak_bytes
+    );
 }
