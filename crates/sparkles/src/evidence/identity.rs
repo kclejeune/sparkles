@@ -792,9 +792,29 @@ pub(super) fn review(
         if let Some((commit, recorded_branch)) = replayed(found, &probe)? {
             let mut out = Vec::with_capacity(decisions.len());
             for d in decisions {
+                let iri = decided_iri(d)?;
+                match state.reads.record(&iri, &records)? {
+                    sparkles_core::evidence::write::ExistingRecord::Present {
+                        graph,
+                        authenticated: true,
+                        ..
+                    } if graph == m.decisions.0
+                        && state.typed(&iri, &m.decisions, RecordKind::ReviewDecision)? => {}
+                    _ => {
+                        return Err(managed(
+                            ManagedErrorKind::ImmutableRecordConflict,
+                            format!(
+                                "{}: decision <{}> from replayed operation <{}> is not authenticated",
+                                d.key,
+                                iri.as_str(),
+                                probe.operation_iri.as_str()
+                            ),
+                        ));
+                    }
+                }
                 out.push(Decided {
                     key: d.key.clone(),
-                    iri: decided_iri(d)?,
+                    iri,
                     target: d.target.clone(),
                     disposition: d.disposition,
                     supersedes: d.supersedes.clone(),
@@ -810,9 +830,30 @@ pub(super) fn review(
                 m.maps.0.as_str(),
                 MAX_DECISIONS + 2,
             )?;
+            let map_class = Term::NamedNode(NamedNode::new_unchecked(
+                sparkles_core::evidence::resolve::kind_iri(RecordKind::ResolutionMap),
+            ));
             let mut map_revision = None;
             for s in published {
-                if state.typed(&s, &m.maps, RecordKind::ResolutionMap)? {
+                if state.reads.contains(
+                    s.as_str(),
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    &map_class,
+                    m.maps.0.as_str(),
+                )? {
+                    if !state
+                        .reads
+                        .authenticated(s.as_str(), m.maps.0.as_str(), m.maps.1)?
+                    {
+                        return Err(managed(
+                            ManagedErrorKind::ImmutableRecordConflict,
+                            format!(
+                                "map revision <{}> from replayed operation <{}> is not authenticated",
+                                s.as_str(),
+                                probe.operation_iri.as_str()
+                            ),
+                        ));
+                    }
                     map_revision = Some(s);
                 }
             }

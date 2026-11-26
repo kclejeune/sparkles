@@ -1231,18 +1231,129 @@ pub fn review(
             let mut out = Vec::new();
             for d in decisions {
                 let iri = decided_iri(d)?;
+                // Read the authenticated decision's projectionNote (if any) and verify
+                // the stored decision digest and receipt match this exact operation.
+                let (note_objs, note_more) = state.reads.objects_up_to(
+                    iri.as_str(),
+                    &ev("projectionNote"),
+                    p.decisions.0.as_str(),
+                    2,
+                )?;
+                let not_projected = if note_more {
+                    return Err(managed(
+                        ManagedErrorKind::ImmutableRecordConflict,
+                        format!(
+                            "{}: decision <{}> from replayed operation <{}> has multiple projection notes",
+                            d.key,
+                            iri.as_str(),
+                            probe.operation_iri.as_str()
+                        ),
+                    ));
+                } else {
+                    match note_objs.as_slice() {
+                        [] => None,
+                        [Term::Literal(l)]
+                            if l.datatype().as_str()
+                                == "http://www.w3.org/2001/XMLSchema#string" =>
+                        {
+                            let Some(note) = NOTES.iter().copied().find(|k| *k == l.value()) else {
+                                return Err(managed(
+                                    ManagedErrorKind::ImmutableRecordConflict,
+                                    format!(
+                                        "{}: decision <{}> from replayed operation <{}> has an unknown projection note",
+                                        d.key,
+                                        iri.as_str(),
+                                        probe.operation_iri.as_str()
+                                    ),
+                                ));
+                            };
+                            Some(note)
+                        }
+                        _ => {
+                            return Err(managed(
+                                ManagedErrorKind::ImmutableRecordConflict,
+                                format!(
+                                    "{}: decision <{}> from replayed operation <{}> has an invalid projection note",
+                                    d.key,
+                                    iri.as_str(),
+                                    probe.operation_iri.as_str()
+                                ),
+                            ));
+                        }
+                    }
+                };
+                let expected_decision = rv::decision_record(
+                    main.dataset_id(),
+                    &options.principal,
+                    operation,
+                    policy_name,
+                    policy_version,
+                    d,
+                    not_projected,
+                    &p.decisions.0,
+                    control,
+                )?;
+                match state.reads.record(&iri, &records)? {
+                    sparkles_core::evidence::write::ExistingRecord::Present {
+                        graph,
+                        digest,
+                        authenticated: true,
+                    } if graph == p.decisions.0
+                        && digest == Some(expected_decision.digest)
+                        && state.typed(&iri, &p.decisions, RecordKind::ReviewDecision)?
+                        && state.reads.receipt_of(&iri, &p.decisions.0)?
+                            == Some(probe.operation_iri.clone()) => {}
+                    _ => {
+                        return Err(managed(
+                            ManagedErrorKind::ImmutableRecordConflict,
+                            format!(
+                                "{}: decision <{}> from replayed operation <{}> is not authenticated",
+                                d.key,
+                                iri.as_str(),
+                                probe.operation_iri.as_str()
+                            ),
+                        ));
+                    }
+                }
+                // Every accepted decision that did not produce a support (including
+                // accepted assessments) carries an authenticated `ev:projectionNote`.
+                // Therefore an accepted decision without a projection note MUST still
+                // have its authenticated acceptance support from this operation.
+                let expected_support =
+                    d.disposition == Disposition::Accepted && not_projected.is_none();
                 let support =
                     rv::support_iri(main.dataset_id(), &options.principal, &iri, control)?;
-                let present = matches!(
-                    state
-                        .reads
-                        .record(&support, std::slice::from_ref(&p.supports))?,
-                    sparkles_core::evidence::write::ExistingRecord::Present { .. }
-                );
-                // the first answer's metadata, from the records it wrote
-                let not_projected = state
-                    .text(&iri, &ev("projectionNote"), &p.decisions)?
-                    .and_then(|n| NOTES.iter().copied().find(|k| *k == n));
+                let present = match state
+                    .reads
+                    .record(&support, std::slice::from_ref(&p.supports))?
+                {
+                    sparkles_core::evidence::write::ExistingRecord::Present {
+                        graph,
+                        authenticated: true,
+                        ..
+                    } if expected_support
+                        && graph == p.supports.0
+                        && state.typed(&support, &p.supports, RecordKind::AcceptanceSupport)?
+                        && state.reads.receipt_of(&support, &p.supports.0)?
+                            == Some(probe.operation_iri.clone()) =>
+                    {
+                        true
+                    }
+                    sparkles_core::evidence::write::ExistingRecord::Absent if !expected_support => {
+                        false
+                    }
+                    _ => {
+                        return Err(managed(
+                            ManagedErrorKind::ImmutableRecordConflict,
+                            format!(
+                                "{}: support <{}> from replayed operation <{}> is missing or not authenticated",
+                                d.key,
+                                support.as_str(),
+                                probe.operation_iri.as_str()
+                            ),
+                        ));
+                    }
+                };
                 let conflicts = if present {
                     let (v, _) = state.reads.objects_up_to(
                         support.as_str(),
@@ -1896,12 +2007,39 @@ pub fn withdraw(
                     g,
                     control,
                 )?;
-                let ours = matches!(
-                    state
-                        .reads
-                        .record(&r.iri, &[(g.clone(), capability.protection(g.as_str()))])?,
-                    sparkles_core::evidence::write::ExistingRecord::Present { .. }
-                );
+                let protected: G = (g.clone(), capability.protection(g.as_str()));
+                let ours = match state.reads.record(&r.iri, &records)? {
+                    sparkles_core::evidence::write::ExistingRecord::Present {
+                        graph,
+                        digest,
+                        authenticated: true,
+                    } if graph == *g && digest == Some(r.digest) => true,
+                    sparkles_core::evidence::write::ExistingRecord::Absent => {
+                        if state.withdrawal(&w.target, &protected)?.is_none() {
+                            return Err(managed(
+                                ManagedErrorKind::ImmutableRecordConflict,
+                                format!(
+                                    "{}: withdrawal for <{}> from replayed operation <{}> is not authenticated",
+                                    w.key,
+                                    w.target.as_str(),
+                                    batch.operation_iri.as_str()
+                                ),
+                            ));
+                        }
+                        false
+                    }
+                    _ => {
+                        return Err(managed(
+                            ManagedErrorKind::ImmutableRecordConflict,
+                            format!(
+                                "{}: withdrawal <{}> from replayed operation <{}> is not authenticated",
+                                w.key,
+                                r.iri.as_str(),
+                                batch.operation_iri.as_str()
+                            ),
+                        ));
+                    }
+                };
                 out.push(WithdrawnClaim {
                     key: w.key.clone(),
                     iri: ours.then_some(r.iri),

@@ -1082,6 +1082,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/evidence/{ds}/reauthenticate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-authenticate evidence records under a graph's current protection
+         * @description Needs `admin` on the dataset and target branch, and requires activated configuration history (`409 configuration-history-inactive` otherwise). Verifies records written under an earlier protection nonce in a protected evidence record graph against their retained, configuration-bound publication views, recorded digests, retained content, passage spans and receipt lineage, and atomically marks the verified records and their receipt operations under the graph's current protection nonce together with an audit operation. Refuses tampered, unretained or mismatched records without writing (`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable`, `422 incomplete-evidence`). Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused key with another payload, `409 unsupported-profile` while the graph is detached or the profile is disabled, and `503 authority-changed` when authorization changes before publication.
+         */
+        post: operations["reauthenticateEvidence"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/evidence/{ds}/settings": {
         parameters: {
             query?: never;
@@ -8076,6 +8096,64 @@ export interface components {
                 recordDigest: string;
             }[];
             /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
+        };
+        /** @description Administered re-authentication request for records of an earlier protection. */
+        EvidenceReauthenticateRequest: {
+            /** @description The target branch name. `main` when absent. */
+            branch?: string;
+            /** @description Verify and preview the changes without committing. */
+            dryRun?: boolean;
+            /** @description The protected evidence record graph to reconcile. */
+            graph: string;
+            /** @description Replays the first reconciliation receipt when repeated with the same payload. */
+            idempotencyKey?: string;
+            /** @description Commit only while the target branch head equals this commit. */
+            ifHead?: number;
+            /** @description Optional commit message. */
+            message?: string;
+            /** @description Specific records to verify and re-authenticate. Omit to reconcile every profile record in `graph`. */
+            records?: {
+                /** @description The record IRI to verify and vouch for. */
+                iri: string;
+                /** @description Optional expected `ev:recordDigest` that the record must match. */
+                recordDigest?: string;
+            }[];
+        };
+        /** @description Result of an administered evidence re-authentication reconciliation. */
+        EvidenceReauthenticateResult: {
+            /**
+             * Format: uuid
+             * @description The reconciled branch's UUID.
+             */
+            branchId: string;
+            /** @description The publishing commit, the first commit on a replay, or the branch head on a dry run or no-op. */
+            commit: number;
+            /** @description Whether this call published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The reconciled evidence record graph. */
+            graph: string;
+            /** @description The audit `ev:Operation` IRI in the reconciled graph. */
+            operation: string;
+            /** @description Every verified record of the reconciliation. */
+            records: {
+                /** @description Whether the record already carried the graph's current protection nonce. */
+                alreadyAuthenticated: boolean;
+                iri: string;
+                /** @enum {string} */
+                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection" | "ResolutionMap";
+                /** @description The record's preserved `ev:availabilityReceipt` operation IRI. */
+                receipt: string;
+                /** @description The verified `ev:recordDigest`. */
+                recordDigest: string;
+            }[];
+            /** @description Whether an earlier idempotent operation's receipt was returned. */
             replayed: boolean;
         };
         /** @description Recorded evidence settings, protection state and drift status. */
@@ -17249,6 +17327,42 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reauthenticateEvidence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceReauthenticateRequest"];
+            };
+        };
+        responses: {
+            /** @description The reconciliation receipt and verified records. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceReauthenticateResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
             422: components["responses"]["Unprocessable"];
             503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];

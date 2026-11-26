@@ -232,6 +232,12 @@ impl SelectedPair {
     }
 }
 
+enum ConfigurationSource<'a> {
+    Borrowed(&'a Store),
+    Resident(Arc<Store>),
+    Cold(uuid::Uuid),
+}
+
 impl Store {
     /// Pin the exact pair selected by a Store-minted view. Unlike the legacy
     /// sequence-only API, an existing name at the same RDF commit conflicts when
@@ -297,6 +303,89 @@ impl Store {
     ) -> Result<BoundEvidenceView> {
         let selection = preparation.selection_scope();
         let pair = self.select_configuration_pair(store, at, &selection)?;
+        self.finish_evidence_view(pair, &selection, preparation)
+    }
+
+    /// Resolve the original publication view of `(receipt_branch, commit)` in `logical`'s
+    /// retained first-parent lineage up to `logical_head`.
+    ///
+    /// Unlike [`Self::evidence_view_with_branch`], when `logical` (or an intermediate
+    /// ancestor) was forked at `commit` after a configuration change, this walks retained
+    /// origin metadata to the branch that originally authored `commit`, verifies that
+    /// authoring branch equals `receipt_branch`, and binds `commit`'s original publication
+    /// configuration on that branch (supporting `main`, resident non-`main` branches, and
+    /// cold or retired persistent ancestor branches).
+    pub(crate) fn publication_evidence_view(
+        &self,
+        logical: &Store,
+        logical_head: u64,
+        receipt_branch: uuid::Uuid,
+        commit: u64,
+        preparation: &Preparation,
+    ) -> Result<BoundEvidenceView> {
+        let selection = preparation.selection_scope();
+        selection.check()?;
+        if self.is_branch() || !Arc::ptr_eq(&self.family, &logical.family) {
+            return Err(Error::invalid(
+                "evidence selection uses the actual owning main Store",
+            ));
+        }
+        if commit > logical_head {
+            return Err(managed_history::unavailable(
+                "publication commit is ahead of the pinned branch head",
+            ));
+        }
+        let owner = if logical.branch_id() == self.dataset_id {
+            crate::branch::CommitRef {
+                branch_id: self.dataset_id,
+                seq: commit,
+            }
+        } else {
+            let options = HistoryOptions {
+                cancel: Some(selection.control().cancel.flag()),
+                deadline: selection.control().deadline,
+            };
+            let limit = ReadLimit {
+                options: &options,
+                memory: Some(selection.available_bytes()),
+                held: 0,
+            };
+            self.owned_set()?.normalize_limited(
+                crate::branch::CommitRef {
+                    branch_id: logical.branch_id(),
+                    seq: commit,
+                },
+                &limit,
+            )?
+        };
+        if owner.branch_id != receipt_branch {
+            return Err(managed_history::unavailable(
+                "publication commit does not belong to the named branch in this branch's lineage",
+            ));
+        }
+        let at = At::Commit(commit);
+        if owner.branch_id == logical.branch_id() {
+            return self.evidence_view_with_branch(logical, &at, preparation);
+        }
+        if owner.branch_id == self.dataset_id {
+            return self.evidence_view_with_branch(self, &at, preparation);
+        }
+        let set = self.owned_set()?;
+        let resident = selection.lock(&set.stores)?.get(&owner.branch_id).cloned();
+        if let Some(ancestor) = resident {
+            return self.evidence_view_with_branch(&ancestor, &at, preparation);
+        }
+        let pair =
+            self.select_cold_commit_configuration_pair(owner.branch_id, commit, &selection)?;
+        self.finish_evidence_view(pair, &selection, preparation)
+    }
+
+    fn finish_evidence_view(
+        &self,
+        pair: SelectedPair,
+        selection: &Preparation,
+        preparation: &Preparation,
+    ) -> Result<BoundEvidenceView> {
         let configuration = pair.semantic.configuration().ok_or_else(|| {
             managed_history::unavailable("historical evidence configuration is explicitly unbound")
         })?;
@@ -314,7 +403,7 @@ impl Store {
                 self.owner_dataset_id(),
                 history,
                 configuration,
-                &selection,
+                selection,
             )?
         } else {
             let published = installed.history_memory.as_ref().ok_or_else(|| {
@@ -325,7 +414,7 @@ impl Store {
                     "configuration memory root differs",
                 ));
             }
-            managed_history::resolve_memory(published, configuration, &selection)?
+            managed_history::resolve_memory(published, configuration, selection)?
         };
         selection.check()?;
         Ok(BoundEvidenceView {
@@ -344,6 +433,76 @@ impl Store {
                 _held: pair.held,
                 preparation: preparation.without_selection_scope(),
             }),
+        })
+    }
+
+    fn select_cold_commit_configuration_pair(
+        &self,
+        branch_id: uuid::Uuid,
+        commit: u64,
+        preparation: &Preparation,
+    ) -> Result<SelectedPair> {
+        let preparation = &preparation.selection_scope();
+        preparation.check()?;
+        let at = At::Commit(commit);
+        let metadata = preparation.reserve(1024)?;
+        let before = self.managed_state_shared().ok_or_else(inactive)?;
+        let installed = match before.as_ref() {
+            ManagedState::Installed(installed) => installed,
+            ManagedState::Unavailable { reason, .. } => {
+                return Err(managed_history::unavailable(reason.clone()));
+            }
+        };
+        let _current = installed
+            .configuration_history
+            .as_ref()
+            .ok_or_else(inactive)?
+            .identity(self.owner_dataset_id());
+        let (allowance, mut held) = preparation.reserve_available()?;
+        let options = HistoryOptions {
+            cancel: Some(preparation.control().cancel.flag()),
+            deadline: preparation.control().deadline,
+        };
+        let (snapshot, resolved, serving_branch, charge) =
+            self.snapshot_of_origin_branch_limited_charged(branch_id, &at, &options, allowance)?;
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(allowance),
+            held: 0,
+        };
+        let retained = charge
+            .delta_bytes
+            .checked_add(snapshot.generation.retained_bytes_limited(&limit)?)
+            .and_then(|bytes| bytes.checked_add(1024))
+            .ok_or_else(|| preparation.exhausted())?;
+        if retained > allowance {
+            return Err(preparation.exhausted());
+        }
+        held.release_to(retained);
+        held.merge(metadata);
+        let data =
+            self.configuration_of_cold_branch(branch_id, resolved.commit.seq, preparation)?;
+        let after = self.managed_state_shared();
+        if !after
+            .as_ref()
+            .is_some_and(|after| Arc::ptr_eq(after, &before))
+        {
+            return Err(managed_history::unavailable(
+                "configuration changed during evidence selection",
+            ));
+        }
+        preparation.check()?;
+        Ok(SelectedPair {
+            snapshot,
+            commit: resolved.commit,
+            requested: at.clone(),
+            selected_by: at,
+            logical_branch: branch_id,
+            serving_branch,
+            semantic: data,
+            data,
+            state: before,
+            held,
         })
     }
 
@@ -476,13 +635,26 @@ impl Store {
         seq: u64,
         preparation: &Preparation,
     ) -> Result<ConfigurationBinding> {
-        enum Source<'a> {
-            Borrowed(&'a Store),
-            Resident(Arc<Store>),
-            Cold(uuid::Uuid),
-        }
+        self.configuration_of_source(ConfigurationSource::Borrowed(store), seq, preparation)
+    }
+
+    fn configuration_of_cold_branch(
+        &self,
+        branch_id: uuid::Uuid,
+        seq: u64,
+        preparation: &Preparation,
+    ) -> Result<ConfigurationBinding> {
+        self.configuration_of_source(ConfigurationSource::Cold(branch_id), seq, preparation)
+    }
+
+    fn configuration_of_source<'a>(
+        &'a self,
+        mut source: ConfigurationSource<'a>,
+        seq: u64,
+        preparation: &Preparation,
+    ) -> Result<ConfigurationBinding> {
+        use ConfigurationSource as Source;
         use branching::readonly::{OriginRead, Purpose};
-        let mut source = Source::Borrowed(store);
         for _ in 0..1024 {
             preparation.check()?;
             let resident = match &source {

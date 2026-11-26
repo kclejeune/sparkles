@@ -121,7 +121,7 @@ pub fn kind_iri(kind: RecordKind) -> &'static str {
     }
 }
 
-const KINDS: [RecordKind; 16] = [
+pub(super) const KINDS: [RecordKind; 16] = [
     RecordKind::SourceRevision,
     RecordKind::Rendition,
     RecordKind::Passage,
@@ -1048,7 +1048,7 @@ fn receipt(
 }
 
 /// A non-negative `xsd:integer` value, also from a stored inline literal.
-fn integer(l: &oxrdf::Literal) -> Option<u64> {
+pub(super) fn integer(l: &oxrdf::Literal) -> Option<u64> {
     let datatype = l.datatype().as_str();
     if datatype != XSD_INTEGER {
         return None;

@@ -466,6 +466,11 @@ python = "planned: identity resolution map rebuild in the bindings with the type
 jvm = "planned: identity resolution map rebuild in the bindings with the typed evidence operations"
 node = "planned: identity resolution map rebuild in the bindings with the typed evidence operations"
 
+["evidence.reauthenticate"]
+python = "planned: evidence re-authentication in the bindings with the typed evidence operations"
+jvm = "planned: evidence re-authentication in the bindings with the typed evidence operations"
+node = "planned: evidence re-authentication in the bindings with the typed evidence operations"
+
 ["evidence.release_hold"]
 python = "planned: evidence holds in the bindings with the typed evidence operations"
 jvm = "planned: evidence holds in the bindings with the typed evidence operations"

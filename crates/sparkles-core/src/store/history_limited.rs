@@ -346,6 +346,31 @@ impl Store {
         Ok(read)
     }
 
+    /// Read a commit from a cold or retired ancestor branch already proven to lie in the
+    /// caller's branch lineage.
+    pub(super) fn snapshot_of_origin_branch_limited_charged(
+        &self,
+        branch: uuid::Uuid,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
+        if self.is_branch() {
+            return Err(crate::branch::invalid_branch(
+                "a branch is resolved through the dataset's main store",
+            ));
+        }
+        if branch == self.dataset_id {
+            return self.snapshot_from_limited(
+                PinnedSource::Resident(branching::BranchStore::Main(self)),
+                at,
+                options,
+                max_memory_bytes,
+            );
+        }
+        self.snapshot_from_limited(PinnedSource::Cold(branch), at, options, max_memory_bytes)
+    }
+
     fn snapshot_pinned_limited(
         &self,
         store: &Store,

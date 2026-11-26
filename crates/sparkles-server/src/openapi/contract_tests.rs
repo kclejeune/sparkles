@@ -11,7 +11,7 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 /// Why `v` does not match `schema` (`$ref`s resolve in `doc`), if it does not.
-fn mismatch(doc: &J, schema: &J, v: &J, at: &str) -> Option<String> {
+pub(crate) fn mismatch(doc: &J, schema: &J, v: &J, at: &str) -> Option<String> {
     let fail = |m: String| Some(format!("{at}: {m}"));
     if let Some(r) = schema.get("$ref").and_then(J::as_str) {
         let name = r.trim_start_matches("#/components/schemas/");

@@ -1866,3 +1866,378 @@ async fn identity_map_rebuild_over_http_restores_reviews_reads_and_persists() {
     assert_eq!(s, StatusCode::OK, "{r}");
     assert_eq!(r["changed"]["map"]["number"], 5);
 }
+
+/// `POST /$/evidence/{ds}/reauthenticate` (spec C25, roadmap item 552): verifies records
+/// written under an earlier protection nonce after a detach + re-protect, refuses
+/// tampered records cleanly, restores resolution and proposals, and matches OpenAPI.
+#[tokio::test]
+async fn evidence_reauthenticate_http_route_and_openapi_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    // Initialize persistent dataset and activate configuration history before opening.
+    let ds_path = dir.path().join("databases").join("d");
+    {
+        let _ds = sparkles::Dataset::open(&ds_path).unwrap();
+        drop(_ds);
+        let prep =
+            sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+        sparkles::migrate::activate_configuration_history(&ds_path, false, &prep).unwrap();
+    }
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state
+        .attach("d", DbType::Persistent, Some(&ds_path))
+        .unwrap();
+    // Attach a second unactivated dataset to verify `409 configuration-history-inactive`.
+    state.attach("legacy", DbType::Memory, None).unwrap();
+    let app = router(state.clone());
+    let post = |uri: &'static str, body: J| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                uri,
+                Some("application/json"),
+                &body.to_string(),
+            )
+            .await
+        }
+    };
+    let settings = json!({
+        "format": 1,
+        "profile": 1,
+        "enabled": true,
+        "sourceRecords": ["urn:ev:sources"],
+        "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "advisories": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "requiredScope": [],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let batch = json!({
+        "revisions": [{
+            "key": "rev",
+            "source": "https://example.org/src",
+            "sourceKey": "src-1",
+            "content": { "text": "hello world" }
+        }],
+        "claims": [{
+            "key": "c1",
+            "occurrenceKey": "c1",
+            "revision": { "key": "rev" },
+            "proposition": "<https://example.org/a> <https://example.org/p> <https://example.org/b>",
+            "kind": "reported",
+            "polarity": "positive",
+            "author": "https://example.org/author"
+        }]
+    });
+    let (status, proposed) = post("/d/claims", batch.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{proposed}");
+    let rev_iri = proposed["records"][0]["iri"].as_str().unwrap().to_string();
+    let claim_iri = proposed["records"][1]["iri"].as_str().unwrap().to_string();
+    let claim_digest = proposed["records"][1]["recordDigest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Detach and re-protect `urn:ev:claims`.
+    let (status, _) = post("/$/evidence/d/detach", json!({ "graph": "urn:ev:claims" })).await;
+    assert_eq!(status, StatusCode::OK);
+    // Refuses while still detached.
+    let (status, j) = post(
+        "/$/evidence/d/reauthenticate",
+        json!({ "graph": "urn:ev:claims" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "unsupported-profile");
+
+    // Re-protect.
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Resolution fails with `origin-not-reproduced`, and re-proposal fails with
+    // `immutable-record-conflict`.
+    let (status, j) = post(
+        "/d/claims/resolve",
+        json!({ "references": [{ "key": "k", "record": { "iri": claim_iri } }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{j}");
+    assert_eq!(j["code"], "origin-not-reproduced");
+    let (status, j) = post("/d/claims", batch.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "immutable-record-conflict");
+
+    // Dry-run preview works without committing.
+    let (status, dry) = post(
+        "/$/evidence/d/reauthenticate",
+        json!({ "graph": "urn:ev:claims", "dryRun": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dry}");
+    assert_eq!(dry["committed"], false);
+    assert_eq!(dry["dryRun"]["wouldCommit"], true);
+
+    // Real reconciliation with idempotency key and pinned recordDigest succeeds.
+    let req_body = json!({
+        "graph": "urn:ev:claims",
+        "idempotencyKey": "http-reauth-1",
+        "records": [{ "iri": claim_iri, "recordDigest": claim_digest }],
+        "message": "re-authenticate claims after maintenance"
+    });
+    let (status, res) = post("/$/evidence/d/reauthenticate", req_body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{res}");
+    assert_eq!(res["committed"], true);
+    assert_eq!(res["replayed"], false);
+    assert_eq!(res["records"][0]["iri"], claim_iri);
+    assert_eq!(res["records"][0]["kind"], "Claim");
+    assert_eq!(res["records"][0]["alreadyAuthenticated"], false);
+
+    // Replay returns the original receipt cleanly.
+    let (status, replay) = post("/$/evidence/d/reauthenticate", req_body).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["committed"], false);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["operation"], res["operation"]);
+    assert_eq!(replay["commit"], res["commit"]);
+
+    // Same key with a different payload returns 409 idempotency-conflict.
+    let (status, conflict) = post(
+        "/$/evidence/d/reauthenticate",
+        json!({ "graph": "urn:ev:claims", "idempotencyKey": "http-reauth-1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["code"], "idempotency-conflict");
+
+    // Resolution and new proposals referencing the records now succeed.
+    let (status, resolved) = post(
+        "/d/claims/resolve",
+        json!({ "references": [{ "key": "k", "record": { "iri": claim_iri } }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resolved}");
+    assert_eq!(resolved["resolved"][0]["record"]["iri"], claim_iri);
+    let (status, followup) = post(
+        "/d/claims",
+        json!({
+            "claims": [{
+                "key": "c2",
+                "occurrenceKey": "c2",
+                "revision": { "iri": rev_iri },
+                "proposition": "<https://example.org/a> <https://example.org/p> <https://example.org/c>",
+                "kind": "observation",
+                "polarity": "positive",
+                "author": "https://example.org/author"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{followup}");
+
+    // Tampering while detached causes 409 immutable-record-conflict over HTTP.
+    let (status, _) = post("/$/evidence/d/detach", json!({ "graph": "urn:ev:claims" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/d/update",
+        Some(UPDATE),
+        &format!("INSERT DATA {{ GRAPH <urn:ev:claims> {{ <{claim_iri}> <https://example.org/bad> \"1\" }} }}"),
+    )
+    .await;
+    assert!(status.is_success());
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, tampered) = post(
+        "/$/evidence/d/reauthenticate",
+        json!({ "graph": "urn:ev:claims" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{tampered}");
+    assert_eq!(tampered["code"], "immutable-record-conflict");
+
+    // Unactivated dataset returns 409 configuration-history-inactive.
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/legacy/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, inactive) = post(
+        "/$/evidence/legacy/reauthenticate",
+        json!({ "graph": "urn:ev:claims" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{inactive}");
+    assert_eq!(inactive["code"], "configuration-history-inactive");
+
+    // Projection graphs and malformed requests are rejected with consistent plain 400
+    // errors (never mixing `invalid-reference` with plain 400).
+    for bad in [
+        json!({ "graph": "urn:ev:accepted" }),
+        json!({ "graph": "urn:ev:claims", "records": [] }),
+        json!({ "graph": "not an iri" }),
+        json!({ "graph": "urn:ev:claims", "idempotencyKey": "" }),
+        json!({ "graph": "urn:ev:claims", "extra": 1 }),
+    ] {
+        let (status, j) = post("/$/evidence/d/reauthenticate", bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+        assert!(j.get("code").is_none(), "unexpected error code on 400: {j}");
+    }
+
+    // Response matches the published OpenAPI schema.
+    let doc = crate::openapi::build("0.0.0");
+    let schema = doc["paths"]["/$/evidence/{ds}/reauthenticate"]["post"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]
+        .clone();
+    assert_eq!(
+        crate::openapi::contract_tests::mismatch(&doc, &schema, &res, "$"),
+        None
+    );
+
+    // Chunked streaming body above 4 MiB is rejected with 413 at extraction time even
+    // when the general admin ceiling is much larger (16 MiB default).
+    {
+        use axum::body::{Body, Bytes};
+        use axum::http::Request;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt as _;
+
+        let yielded = StdArc::new(AtomicUsize::new(0));
+        let yielded_stream = yielded.clone();
+        // 16 chunks x 512 KiB = 8 MiB total, streamed with no Content-Length.
+        let chunk = Bytes::from(vec![b' '; 512 * 1024]);
+        let stream = futures_util::stream::iter((0..16).map(move |_| {
+            yielded_stream.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(chunk.clone())
+        }));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/$/evidence/d/reauthenticate")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Stopped streaming right after crossing 4 MiB (<= 10 chunks, not all 16).
+        assert!(
+            yielded.load(Ordering::SeqCst) <= 10,
+            "stream was buffered past 4 MiB: yielded {} chunks",
+            yielded.load(Ordering::SeqCst)
+        );
+    }
+
+    // Read-only server rejects re-authentication with 403.
+    {
+        let ro_dir = tempfile::tempdir().unwrap();
+        let mut ro_state = AppState::new(
+            ro_dir.path(),
+            StoreOptions::default(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        ro_state.read_only = true;
+        let ro_state = Arc::new(ro_state);
+        ro_state.attach("d", DbType::Memory, None).unwrap();
+        let ro_app = router(ro_state);
+        let (status, j) = call(
+            &ro_app,
+            "POST",
+            "/$/evidence/d/reauthenticate",
+            Some("application/json"),
+            &json!({ "graph": "urn:ev:claims" }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{j}");
+    }
+
+    // Local preparation budget exhaustion during whole-graph discovery must return
+    // HTTP 422 `incomplete-evidence` (never HTTP 507 Insufficient Storage).
+    {
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/$/evidence/d/detach",
+            Some("application/json"),
+            &json!({ "graph": "urn:ev:claims" }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        {
+            let ds = state.datasets().remove("d").unwrap();
+            let mut t = ds.dataset.store().write();
+            let mut labels = std::collections::HashMap::new();
+            let gn = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked("urn:ev:claims"));
+            let rdf_type =
+                oxrdf::NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+            let claim_cls = oxrdf::NamedNode::new_unchecked("urn:x-sparkles:evidence:Claim");
+            // 520 subjects x ~132 KiB IRI ≈ 68 MiB > 64 MiB local preparation budget.
+            let pad = "a".repeat(132 * 1024);
+            for i in 0..520 {
+                let subj = oxrdf::NamedNode::new_unchecked(format!("urn:long:{i}:{pad}"));
+                let q = oxrdf::Quad::new(subj, rdf_type.clone(), claim_cls.clone(), gn.clone());
+                let ids = t.encode_quad(&q, &mut labels).unwrap();
+                t.insert(ids).unwrap();
+            }
+            t.commit().unwrap();
+        }
+        let (status, _) = call(
+            &app,
+            "PUT",
+            "/$/evidence/d/settings",
+            Some("application/json"),
+            &settings.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, budget_err) = post(
+            "/$/evidence/d/reauthenticate",
+            json!({ "graph": "urn:ev:claims" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{budget_err}");
+        assert_eq!(budget_err["code"], "incomplete-evidence");
+    }
+}

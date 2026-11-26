@@ -90,6 +90,7 @@ pub fn profile(version: u32) -> Option<&'static Profile> {
 }
 
 pub mod propose;
+pub mod reauth;
 pub mod resolve;
 pub mod review;
 
@@ -97,6 +98,10 @@ pub use propose::{
     AuthorityFence, Options as ProposeOptions, OrdinaryChanges, Proposed, ProposedRecord,
     operation_id, operation_iri, operation_recorded, propose, reconcile_operation_holds,
     reconcile_operation_holds_in,
+};
+pub use reauth::{
+    MAX_REAUTHENTICATE_RECORDS, MAX_RECORD_TRIPLES, ReauthenticateOptions, ReauthenticateRecord,
+    Reauthenticated, ReauthenticatedRecord, reauthenticate,
 };
 pub use review::claims::{
     self, ClaimOccurrence, ClaimOrigin, ClaimState, MAX_CLAIM_SCAN, MAX_CLAIMS, MEM_INSTRUCTIONS,

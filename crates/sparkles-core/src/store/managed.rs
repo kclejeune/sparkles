@@ -159,6 +159,13 @@ impl Store {
         }
     }
 
+    /// Whether `capability` still matches this dataset's currently installed managed-graph
+    /// registry (the same pointer identity checked by write admission at commit time).
+    pub fn managed_writer_current(&self, capability: &ManagedWrite) -> bool {
+        self.managed_state()
+            .is_some_and(|current| Arc::ptr_eq(&current, &capability.state))
+    }
+
     /// The managed graphs of this store's dataset, `None` when no owner manages any.
     /// Fails with `managed-unavailable` when the registry cannot be enforced.
     pub fn managed_graphs(&self) -> Result<Option<ManagedGraphs>> {
