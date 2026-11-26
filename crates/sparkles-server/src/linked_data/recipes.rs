@@ -151,13 +151,6 @@ pub fn escape_rewrite_subst(s: &str) -> String {
     out
 }
 
-fn relative_path(iri: &str) -> String {
-    match url::Url::parse(iri) {
-        Ok(u) => u.path().trim_start_matches('/').to_string(),
-        Err(_) => iri.trim_start_matches('/').to_string(),
-    }
-}
-
 /// Validate that a catalog namespace or version IRI can be represented by HTTP path-based
 /// Apache / PURL redirection recipes without losing IRI identity (must be `http://` or
 /// `https://` with a host, no query string, and no non-empty fragment).
@@ -199,9 +192,10 @@ fn derive_w3id_mount(namespaces: &[NamespaceRecipe], versions: &[VersionRecipe])
         .map(|n| n.iri.as_str())
         .chain(versions.iter().map(|v| v.version_iri.as_str()))
     {
-        let path = relative_path(iri);
+        let path = url::Url::parse(iri)
+            .ok()
+            .and_then(|u| u.path().strip_prefix('/').map(str::to_string))?;
         let first = path
-            .trim_end_matches('/')
             .split('/')
             .next()
             .filter(|s| !s.is_empty() && validate_mount(s).is_ok())?;
@@ -214,33 +208,22 @@ fn derive_w3id_mount(namespaces: &[NamespaceRecipe], versions: &[VersionRecipe])
     shared
 }
 
-/// Strip `mount` directory prefix from a URL's root-relative path so `.htaccess`
-/// rules target the directory mount consistently.
-fn strip_mount(path: &str, mount: Option<&str>) -> String {
-    let p = path.trim_start_matches('/');
-    let Some(m) = mount.filter(|s| !s.is_empty()) else {
-        return p.to_string();
+/// Exact wire-level request-target path for `iri` matched against Apache's
+/// `%{THE_REQUEST}`, preserving trailing and repeated slashes as well as percent-encoded
+/// octets and scoping under `mount` when `iri`'s path does not already start with it.
+fn wire_request_path(iri: &str, mount: Option<&str>) -> String {
+    let raw = match url::Url::parse(iri) {
+        Ok(u) => u.path().to_string(),
+        Err(_) => format!("/{}", iri.trim_start_matches('/')),
     };
-    if p == m {
-        String::new()
-    } else if let Some(rest) = p.strip_prefix(m).and_then(|r| r.strip_prefix('/')) {
-        rest.to_string()
+    let Some(m) = mount.filter(|s| !s.is_empty()) else {
+        return raw;
+    };
+    let prefix = format!("/{m}");
+    if raw == prefix || raw.starts_with(&format!("/{m}/")) {
+        raw
     } else {
-        p.to_string()
-    }
-}
-
-/// Raw request-target path prefix matched against Apache's `%{THE_REQUEST}` (preserving
-/// percent-encoded segments as transmitted on the wire).
-fn raw_request_path(iri: &str, mount: Option<&str>) -> String {
-    let raw = relative_path(iri);
-    let rel = strip_mount(&raw, mount);
-    let rel = rel.trim_matches('/');
-    match (mount.filter(|s| !s.is_empty()), rel.is_empty()) {
-        (Some(m), true) => format!("/{m}"),
-        (Some(m), false) => format!("/{m}/{rel}"),
-        (None, true) => String::new(),
-        (None, false) => format!("/{rel}"),
+        format!("/{m}{raw}")
     }
 }
 
@@ -327,45 +310,83 @@ pub fn generate(
     })
 }
 
-fn exact_request_pattern(raw_path: &str) -> String {
-    if raw_path.is_empty() {
-        r"^\S+\s+/(?:\?|\s|$)".to_string()
-    } else {
-        format!(r"^\S+\s+{}/?(?:\?|\s|$)", escape_regex(raw_path))
-    }
+fn exact_request_pattern(wire_path: &str) -> String {
+    format!(r"^\S+\s+{}(?:\s|$)", escape_regex(wire_path))
 }
 
-fn subterm_request_pattern(raw_path: &str) -> String {
-    if raw_path.is_empty() {
-        r"^\S+\s+/([^?\s]+)(?:\?|\s|$)".to_string()
-    } else {
-        format!(r"^\S+\s+{}/([^?\s]+)(?:\?|\s|$)", escape_regex(raw_path))
-    }
+fn subterm_request_pattern(wire_path: &str) -> String {
+    format!(r"^\S+\s+{}([^?\s]+)(?:\s|$)", escape_regex(wire_path))
+}
+
+fn subterm_query_request_pattern(wire_path: &str) -> String {
+    format!(
+        r"^\S+\s+{}([^?\s]*)\?([^?\s]*)(?:\s|$)",
+        escape_regex(wire_path)
+    )
+}
+
+fn subterm_multi_query_request_pattern(wire_path: &str) -> String {
+    format!(
+        r"^\S+\s+{}[^?\s]*\?\S*\?\S*(?:\s|$)",
+        escape_regex(wire_path)
+    )
 }
 
 fn write_dynamic_slash_rule(
     out: &mut String,
     tag: &str,
-    raw_path: &str,
+    wire_path: &str,
     subst_base: &str,
     subst_iri: &str,
 ) {
-    let sub_pat = subterm_request_pattern(raw_path);
-    // Capture the raw (un-decoded) request-target suffix from %{THE_REQUEST} into an
-    // internal marker path with [DPI] so Apache does not re-append PATH_INFO, then
-    // let [B] percent-encode the raw suffix for the `?iri=` query parameter (turning
-    // `%3B` into `%253B`, `&` into `%26`, `+` into `%2B`, etc.) while keeping the RDF
-    // IRI's exact identity intact.
+    let query_pat = subterm_query_request_pattern(wire_path);
+    let multi_q_pat = subterm_multi_query_request_pattern(wire_path);
+    let sub_pat = subterm_request_pattern(wire_path);
+
+    // 1. Dynamic slash IRIs carrying a query component (`.../Term?edition=1` or
+    //    `.../?edition=1`): encode the raw path suffix and raw query string in separate
+    //    `[B]` passes so Apache neither drops nor URL-decodes either part.
+    let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ^$");
+    let _ = writeln!(out, "RewriteCond %{{THE_REQUEST}} {query_pat}");
+    let _ = writeln!(
+        out,
+        "RewriteRule ^ __sparkles_ld_p__/%1 [DPI,QSD,E=SPARKLES_LD:{tag}q,E=SPARKLES_LD_Q:%2]"
+    );
+    let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ={tag}q");
+    let _ = writeln!(
+        out,
+        "RewriteRule ^__sparkles_ld_p__/(.*)$ __sparkles_ld_q__/$1 [B,DPI,QSD,E=SPARKLES_LD:{tag}q2]"
+    );
+    let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ={tag}q2");
+    let _ = writeln!(
+        out,
+        "RewriteRule ^__sparkles_ld_q__/(.*)$ __sparkles_ld_f__/%{{ENV:SPARKLES_LD_Q}} [DPI,QSD,E=SPARKLES_LD:{tag}q3,E=SPARKLES_LD_P:$1]"
+    );
+    let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ={tag}q3");
+    let _ = writeln!(
+        out,
+        "RewriteRule ^__sparkles_ld_f__/(.*)$ {subst_base}/$/ld/doc?iri={subst_iri}%{{ENV:SPARKLES_LD_P}}\\%3F$1 [B,QSD,R=303,L,NE]"
+    );
+
+    // 2. Explicitly reject requests whose query contains an additional literal `?`
+    //    rather than silently altering or dropping the query suffix.
+    let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ^$");
+    let _ = writeln!(out, "RewriteCond %{{THE_REQUEST}} {multi_q_pat}");
+    let _ = writeln!(out, "RewriteRule ^ - [R=400,L]");
+
+    // 3. Dynamic slash IRIs without a query string: capture the raw (un-decoded) suffix
+    //    from %{THE_REQUEST} into an internal marker path with [DPI], then let [B]
+    //    percent-encode it for the `?iri=` parameter while keeping RDF IRI identity exact.
     let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ^$");
     let _ = writeln!(out, "RewriteCond %{{THE_REQUEST}} {sub_pat}");
     let _ = writeln!(
         out,
-        "RewriteRule ^ __sparkles_ld__/%1 [DPI,E=SPARKLES_LD:{tag}]"
+        "RewriteRule ^ __sparkles_ld__/%1 [DPI,QSD,E=SPARKLES_LD:{tag}]"
     );
     let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ={tag}");
     let _ = writeln!(
         out,
-        "RewriteRule ^__sparkles_ld__/(.+)$ {subst_base}/$/ld/doc?iri={subst_iri}$1 [B,R=303,L,NE]"
+        "RewriteRule ^__sparkles_ld__/(.+)$ {subst_base}/$/ld/doc?iri={subst_iri}$1 [B,QSD,R=303,L,NE]"
     );
 }
 
@@ -417,17 +438,35 @@ fn render_htaccess(
         out,
         "# Content negotiation (Accept, q-values, Vary: Accept) is handled by Sparkles"
     );
+    let _ = writeln!(
+        out,
+        "# Note: terms with encoded path separators (%2F) require `AllowEncodedSlashes NoDecode`"
+    );
+    let _ = writeln!(
+        out,
+        "# in the enclosing Apache VirtualHost (Apache forbids it inside .htaccess)."
+    );
     let _ = writeln!(out, "Options +FollowSymLinks");
     let _ = writeln!(out, "RewriteEngine on");
     let _ = writeln!(out);
 
     let subst_base = escape_rewrite_subst(base);
 
-    // Version IRI rules come before general namespace rules so specific version IRIs match first.
+    // Version IRI rules come before general namespace rules, ordered longest-first so
+    // more specific prefixes (including repeated-slash prefixes) match before parents.
     if !versions.is_empty() {
         let _ = writeln!(out, "# Versioned IRI rules");
-        for (i, v) in versions.iter().enumerate() {
-            let raw_path = raw_request_path(&v.version_iri, mount);
+        let mut ver_order: Vec<usize> = (0..versions.len()).collect();
+        ver_order.sort_by(|&a, &b| {
+            versions[b]
+                .version_iri
+                .len()
+                .cmp(&versions[a].version_iri.len())
+                .then_with(|| a.cmp(&b))
+        });
+        for i in ver_order {
+            let v = &versions[i];
+            let wire_path = wire_request_path(&v.version_iri, mount);
             let subst_vi = escape_rewrite_subst(&percent_encode(&v.version_iri));
             let _ = writeln!(
                 out,
@@ -439,18 +478,18 @@ fn render_htaccess(
                     .map(|s| format!(" -> {s}"))
                     .unwrap_or_default()
             );
-            let exact_pat = exact_request_pattern(&raw_path);
+            let exact_pat = exact_request_pattern(&wire_path);
             let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ^$");
             let _ = writeln!(out, "RewriteCond %{{THE_REQUEST}} {exact_pat}");
             let _ = writeln!(
                 out,
-                "RewriteRule ^ {subst_base}/$/ld/doc?iri={subst_vi} [R=303,L,NE]"
+                "RewriteRule ^ {subst_base}/$/ld/doc?iri={subst_vi} [QSD,R=303,L,NE]"
             );
-            if v.version_iri.ends_with('/') {
+            if v.version_iri.ends_with('/') || v.version_iri.ends_with(':') {
                 write_dynamic_slash_rule(
                     &mut out,
                     &format!("v{i}"),
-                    &raw_path,
+                    &wire_path,
                     &subst_base,
                     &subst_vi,
                 );
@@ -459,8 +498,17 @@ fn render_htaccess(
         }
     }
 
-    for (i, ns) in namespaces.iter().enumerate() {
-        let raw_path = raw_request_path(&ns.iri, mount);
+    let mut ns_order: Vec<usize> = (0..namespaces.len()).collect();
+    ns_order.sort_by(|&a, &b| {
+        namespaces[b]
+            .iri
+            .len()
+            .cmp(&namespaces[a].iri.len())
+            .then_with(|| a.cmp(&b))
+    });
+    for i in ns_order {
+        let ns = &namespaces[i];
+        let wire_path = wire_request_path(&ns.iri, mount);
         let subst_prefix = escape_rewrite_subst(&percent_encode(&ns.prefix));
         let subst_ns = escape_rewrite_subst(&percent_encode(&ns.iri));
         let _ = writeln!(
@@ -468,27 +516,29 @@ fn render_htaccess(
             "# Namespace '{}' ({}, {} IRI)",
             ns.prefix, ns.iri, ns.style
         );
-        let root_pat = exact_request_pattern(&raw_path);
+        let root_pat = exact_request_pattern(&wire_path);
         if ns.style == "hash" {
             let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ^$");
             let _ = writeln!(out, "RewriteCond %{{THE_REQUEST}} {root_pat}");
             let _ = writeln!(
                 out,
-                "RewriteRule ^ {subst_base}/$/ld/ns/{subst_prefix} [R=303,L,NE]"
+                "RewriteRule ^ {subst_base}/$/ld/ns/{subst_prefix} [QSD,R=303,L,NE]"
             );
         } else {
-            write_dynamic_slash_rule(
-                &mut out,
-                &format!("n{i}"),
-                &raw_path,
-                &subst_base,
-                &subst_ns,
-            );
+            if ns.iri.ends_with('/') || ns.iri.ends_with(':') {
+                write_dynamic_slash_rule(
+                    &mut out,
+                    &format!("n{i}"),
+                    &wire_path,
+                    &subst_base,
+                    &subst_ns,
+                );
+            }
             let _ = writeln!(out, "RewriteCond %{{ENV:SPARKLES_LD}} ^$");
             let _ = writeln!(out, "RewriteCond %{{THE_REQUEST}} {root_pat}");
             let _ = writeln!(
                 out,
-                "RewriteRule ^ {subst_base}/$/ld/doc?iri={subst_ns} [R=303,L,NE]"
+                "RewriteRule ^ {subst_base}/$/ld/doc?iri={subst_ns} [QSD,R=303,L,NE]"
             );
         }
         let _ = writeln!(out);

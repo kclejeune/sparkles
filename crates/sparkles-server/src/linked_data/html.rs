@@ -81,43 +81,73 @@ fn compact_iri<'a>(
     best.map(|(p, ns)| (p, &iri[ns.len()..]))
 }
 
-/// Bounded HTML writer enforcing both `max_result_bytes` and the request's shared
-/// [`MemoryCharge`] (query memory budget and admitted pool grant) before every append.
-struct HtmlWriter<'a> {
+/// Bounded HTML writer enforcing both `max_result_bytes` (on logical payload length) and
+/// the request's shared [`MemoryCharge`] (on backing buffer capacity) before every growth.
+pub(crate) struct HtmlWriter<'a> {
     buf: String,
     limit: Option<u64>,
     charge: &'a mut MemoryCharge,
+    charged: u64,
 }
 
 impl<'a> HtmlWriter<'a> {
-    fn new(limit: Option<u64>, charge: &'a mut MemoryCharge) -> Self {
+    pub(crate) fn new(limit: Option<u64>, charge: &'a mut MemoryCharge) -> Self {
         Self {
             buf: String::new(),
             limit,
             charge,
+            charged: 0,
         }
     }
 
     #[inline]
     fn reserve(&mut self, add: usize) -> sparkles::Result<()> {
-        if let Some(limit) = self.limit {
-            let requested = (self.buf.len() as u64).saturating_add(add as u64);
-            if requested > limit {
-                return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
-                    kind: sparkles::BudgetKind::ResultBytes,
-                    limit,
-                    requested,
-                }));
+        let Some(want) = self.buf.len().checked_add(add) else {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::Memory,
+                limit: self.limit.unwrap_or(u64::MAX),
+                requested: u64::MAX,
+            }));
+        };
+        if let Some(limit) = self.limit
+            && want as u64 > limit
+        {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::ResultBytes,
+                limit,
+                requested: want as u64,
+            }));
+        }
+        if want > self.buf.capacity() {
+            let target = want.max(self.buf.capacity().saturating_mul(2)).max(256);
+            let delta = (target as u64).saturating_sub(self.charged);
+            self.charge.charge(delta)?;
+            self.buf.reserve_exact(target - self.buf.len());
+            let actual = self.buf.capacity() as u64;
+            let charged_now = self.charged.saturating_add(delta);
+            self.charged = charged_now;
+            if actual > charged_now {
+                self.charge.charge(actual - charged_now)?;
+                self.charged = actual;
             }
         }
-        self.charge.charge(add as u64)?;
         Ok(())
     }
 
-    fn push_str(&mut self, s: &str) -> sparkles::Result<()> {
+    pub(crate) fn push_str(&mut self, s: &str) -> sparkles::Result<()> {
         self.reserve(s.len())?;
         self.buf.push_str(s);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len()
     }
 
     fn push_u64(&mut self, n: u64) -> sparkles::Result<()> {

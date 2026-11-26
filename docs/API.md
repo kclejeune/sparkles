@@ -6078,7 +6078,9 @@ redirect.
 `kind=htaccess` or `kind=purl`, an optional `base=` public URL, an optional `mount=`
 directory path stripped from `.htaccess` patterns (defaulting to the shared first path
 segment for `w3id` and the site root for `htaccess`) and `format=text` or `format=json`.
-Generated Apache rules delegate `Accept` content negotiation to Sparkles.
+Generated Apache rules delegate `Accept` content negotiation to Sparkles. Terms whose path
+contains percent-encoded slashes (`%2F`) require `AllowEncodedSlashes NoDecode` in the
+enclosing Apache virtual host, because Apache does not permit that directive in `.htaccess`.
 
 ## Backup repositories
 

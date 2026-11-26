@@ -721,25 +721,26 @@ async fn purl_and_w3id_recipe_export_covers_namespaces_and_versions() {
     let text = w3id.text();
     assert!(text.contains("RewriteEngine on"), "{text}");
     assert!(text.contains("ids/myorg/.htaccess"), "{text}");
+    assert!(text.contains("AllowEncodedSlashes NoDecode"), "{text}");
     assert!(
-        text.contains(r"RewriteCond %{THE_REQUEST} ^\S+\s+/myorg/mv/1\.0/?(?:\?|\s|$)"),
+        text.contains(r"RewriteCond %{THE_REQUEST} ^\S+\s+/myorg/mv/1\.0(?:\s|$)"),
         "{text}"
     );
     assert!(!text.contains("RewriteCond %{HTTP_ACCEPT}"), "{text}");
     assert!(
         text.contains(
-            "RewriteRule ^ https://rdf.example.org/$/ld/doc?iri=https\\%3A\\%2F\\%2Fw3id.org\\%2Fmyorg\\%2Fmv\\%2F1.0 [R=303,L,NE]"
+            "RewriteRule ^ https://rdf.example.org/$/ld/doc?iri=https\\%3A\\%2F\\%2Fw3id.org\\%2Fmyorg\\%2Fmv\\%2F1.0 [QSD,R=303,L,NE]"
         ),
         "{text}"
     );
     assert!(
         text.contains(
-            "RewriteRule ^__sparkles_ld__/(.+)$ https://rdf.example.org/$/ld/doc?iri=https\\%3A\\%2F\\%2Fw3id.org\\%2Fmyorg\\%2Fmv\\%2F$1 [B,R=303,L,NE]"
+            "RewriteRule ^__sparkles_ld__/(.+)$ https://rdf.example.org/$/ld/doc?iri=https\\%3A\\%2F\\%2Fw3id.org\\%2Fmyorg\\%2Fmv\\%2F$1 [B,QSD,R=303,L,NE]"
         ),
         "{text}"
     );
     assert!(
-        text.contains("RewriteRule ^ https://rdf.example.org/$/ld/ns/mvh [R=303,L,NE]"),
+        text.contains("RewriteRule ^ https://rdf.example.org/$/ld/ns/mvh [QSD,R=303,L,NE]"),
         "{text}"
     );
 
@@ -1498,18 +1499,95 @@ graphs = ["http://example.org/cold/g"]
         assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
     }
 
-    // Reopen with a cold history cache and a 24 KiB per-query memory ceiling: live 1-triple
-    // probes succeed easily, whereas cold replay of commit 1 exceeds 24 KiB.
-    let mut st =
+    // Reopen with a cold history cache and test three tight memory ceilings:
+    //  1. 24 KiB: cold replay itself exceeds the cap inside `snapshot_for_limited`.
+    //  2. `retained`: replay + `settle_replay` succeed, then `charge.engine_budget()` fails.
+    //  3. `retained + 64`: replay + `engine_budget()` succeed, then `sparql::query()` fails.
+    let probe_st =
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
-    st.auth = auth;
-    st.limits.query_memory_bytes = Some(24 * 1024);
-    let st = Arc::new(st);
-    let app = crate::http::router(st.clone());
+    let probe_ds = crate::http::dataset(&probe_st, "cold_ds")
+        .ok()
+        .expect("cold_ds dataset");
+    let (_, _, retained) = probe_ds
+        .store
+        .snapshot_at_limited_bytes(
+            &sparkles::history::At::Snapshot("cold".to_string()),
+            &sparkles::history::HistoryOptions::default(),
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+    assert!(
+        retained > 24 * 1024,
+        "expected retained > 24 KiB, got {retained}"
+    );
+    drop(probe_ds);
+    drop(probe_st);
 
-    // pub_reader cannot read cold/v1 (hidden by triple protection): direct lookup,
-    // redirect probe and conflict probes must all return the generic 404 — identical to
-    // an absent IRI — and must NEVER return 507 or leak replay byte counts.
+    for (label, cap) in [
+        ("cold-replay-exceeds-cap", 24 * 1024),
+        ("post-replay-engine-budget-zero", retained),
+        ("post-replay-query-budget-exhausted", retained + 64),
+    ] {
+        let mut st =
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        st.auth = auth.clone();
+        st.limits.query_memory_bytes = Some(cap);
+        let st = Arc::new(st);
+        let app = crate::http::router(st.clone());
+
+        // pub_reader cannot read cold/v1 (hidden by triple protection): direct lookup,
+        // redirect probe and conflict probes must all return the generic 404 — identical to
+        // an absent IRI — and must NEVER return 507 or leak replay/engine byte counts.
+        for uri in [
+            format!("/$/ld?iri={}", enc("http://example.org/cold/v1")),
+            format!("/$/ld/doc?iri={}", enc("http://example.org/cold/v1")),
+            format!(
+                "/$/ld/doc?iri={}&version=2.0",
+                enc("http://example.org/cold/v1")
+            ),
+            format!(
+                "/$/ld/doc?iri={}&at=commit:999",
+                enc("http://example.org/cold/v1")
+            ),
+        ] {
+            let r = send(&app, get_req(&uri, Some("text/turtle"), Some(&pub_auth))).await;
+            assert_eq!(
+                r.status,
+                StatusCode::NOT_FOUND,
+                "{label} disclosed hidden catalog entry on {uri}: {}",
+                r.text()
+            );
+            assert_eq!(r.json()["code"], "linked-data-not-found");
+            assert!(!r.text().contains("requested"), "{label}: {}", r.text());
+        }
+
+        // Authorized caller on a live-readable target (pub_reader on PublicTerm?at=snapshot:cold)
+        // still receives 507 when replay or post-replay query execution exceeds the budget.
+        let auth_cold = send(
+            &app,
+            get_req(
+                &format!(
+                    "/$/ld/doc?iri={}&at=snapshot:cold",
+                    enc("http://example.org/cold/PublicTerm")
+                ),
+                Some("text/turtle"),
+                Some(&pub_auth),
+            ),
+        )
+        .await;
+        assert_eq!(
+            auth_cold.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{label}: {}",
+            auth_cold.text()
+        );
+    }
+
+    // Expired deadline on historical lookup must also stay 404 (never 408) for a hidden target.
+    let mut st_to =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_nanos(1)).unwrap();
+    st_to.auth = auth;
+    let app_to = crate::http::router(Arc::new(st_to));
     for uri in [
         format!("/$/ld?iri={}", enc("http://example.org/cold/v1")),
         format!("/$/ld/doc?iri={}", enc("http://example.org/cold/v1")),
@@ -1522,37 +1600,15 @@ graphs = ["http://example.org/cold/g"]
             enc("http://example.org/cold/v1")
         ),
     ] {
-        let r = send(&app, get_req(&uri, Some("text/turtle"), Some(&pub_auth))).await;
+        let r = send(&app_to, get_req(&uri, Some("text/turtle"), Some(&pub_auth))).await;
         assert_eq!(
             r.status,
             StatusCode::NOT_FOUND,
-            "cold replay failure disclosed hidden catalog entry on {uri}: {}",
+            "expired deadline disclosed hidden catalog entry on {uri}: {}",
             r.text()
         );
         assert_eq!(r.json()["code"], "linked-data-not-found");
-        assert!(!r.text().contains("requested"), "{}", r.text());
     }
-
-    // Authorized caller on a live-readable target (pub_reader on PublicTerm?at=snapshot:cold
-    // or admin on cold/v1) still receives 507 when replay exceeds the budget.
-    let auth_cold = send(
-        &app,
-        get_req(
-            &format!(
-                "/$/ld/doc?iri={}&at=snapshot:cold",
-                enc("http://example.org/cold/PublicTerm")
-            ),
-            Some("text/turtle"),
-            Some(&pub_auth),
-        ),
-    )
-    .await;
-    assert_eq!(
-        auth_cold.status,
-        StatusCode::INSUFFICIENT_STORAGE,
-        "{}",
-        auth_cold.text()
-    );
 }
 
 #[tokio::test]
@@ -1726,8 +1782,10 @@ async fn html_escaping_expansion_and_response_body_charge_shared_memory_account(
     .await;
     assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
 
-    // Turtle output (~120.5 KiB) fits inside 1.5 MiB and holds its pool grant until the
-    // HTTP response body is dropped.
+    // Turtle output (~120.5 KiB) fits inside 1.5 MiB and keeps its pool grant charged
+    // through `Bytes::from_owner` even after the HTTP Body is polled and dropped, until
+    // the yielded frame `Bytes` itself drops.
+    use http_body_util::BodyExt as _;
     let pool = st.catalog.pool().expect("pool configured");
     let raw_ttl = app
         .clone()
@@ -1752,14 +1810,24 @@ async fn html_escaping_expansion_and_response_body_charge_shared_memory_account(
         pool.granted() > 0,
         "response body must keep its pool grant charged until consumed/dropped"
     );
-    let ttl_bytes = axum::body::to_bytes(raw_ttl.into_body(), usize::MAX)
+    let mut ttl_body = raw_ttl.into_body();
+    let frame = ttl_body
+        .frame()
         .await
-        .unwrap();
+        .expect("expected data frame")
+        .expect("data frame error");
+    let ttl_bytes = frame.into_data().expect("expected data frame bytes");
+    drop(ttl_body);
     assert!(ttl_bytes.len() >= 120 * 1024);
+    assert!(
+        pool.granted() > 0,
+        "pool grant must remain charged after body drops while response Bytes frame is still live"
+    );
+    drop(ttl_bytes);
     assert_eq!(
         pool.granted(),
         0,
-        "pool grant must be released once response body drops"
+        "pool grant must be released once response Bytes frame drops"
     );
 
     // HTML output (~1.8 MiB escaped + live QueryResult > 1.5 MiB) exceeds the shared
@@ -1780,6 +1848,286 @@ async fn html_escaping_expansion_and_response_body_charge_shared_memory_account(
         html_r.text()
     );
     assert_eq!(pool.granted(), 0);
+}
+
+#[tokio::test]
+async fn historical_snapshot_charge_persists_through_rendering_and_writers_charge_capacity() {
+    use std::io::Write as _;
+
+    // 1. Capacity-before-growth accounting in both `HtmlWriter` and `ChargedLimitedWriter`:
+    //    an append that fits the logical remainder (`10 <= 400 - 256`) but crosses current
+    //    capacity (`256 -> 512 > 400`) must fail BEFORE reallocating.
+    {
+        let mut charge = super::MemoryCharge::new(None, Some(400));
+        let mut hw = super::html::HtmlWriter::new(Some(1024), &mut charge);
+        hw.push_str(&"a".repeat(256)).unwrap();
+        assert_eq!(hw.capacity(), 256);
+        assert_eq!(hw.len(), 256);
+        let err = hw.push_str("0123456789").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                sparkles::Error::BudgetExceeded(sparkles::Budget {
+                    kind: sparkles::BudgetKind::Memory,
+                    limit: 400,
+                    requested: 512,
+                })
+            ),
+            "unexpected HtmlWriter error: {err:?}"
+        );
+        assert_eq!(hw.capacity(), 256, "HtmlWriter reallocated past limit");
+        assert_eq!(hw.len(), 256);
+
+        // `max_result_bytes` still bounds logical payload length independently of capacity:
+        // growing 0 -> 256 -> 512 keeps logical length 300 <= 300 even though capacity is 512.
+        let mut big_charge = super::MemoryCharge::new(None, Some(1024));
+        let mut hw2 = super::html::HtmlWriter::new(Some(300), &mut big_charge);
+        hw2.push_str(&"b".repeat(256)).unwrap();
+        hw2.push_str(&"b".repeat(44)).unwrap();
+        assert_eq!(hw2.capacity(), 512);
+        let err2 = hw2.push_str("x").unwrap_err();
+        assert!(
+            matches!(
+                err2,
+                sparkles::Error::BudgetExceeded(sparkles::Budget {
+                    kind: sparkles::BudgetKind::ResultBytes,
+                    limit: 300,
+                    requested: 301,
+                })
+            ),
+            "unexpected HtmlWriter ResultBytes error: {err2:?}"
+        );
+    }
+    {
+        let mut charge = super::MemoryCharge::new(None, Some(400));
+        let mut rw = super::ChargedLimitedWriter::new(Some(1024), &mut charge);
+        rw.write_all(&[b'a'; 256]).unwrap();
+        assert_eq!(rw.capacity(), 256);
+        assert_eq!(rw.len(), 256);
+        assert!(rw.write_all(b"0123456789").is_err());
+        let err = rw.take_budget_err().expect("expected budget error");
+        assert!(
+            matches!(
+                err,
+                sparkles::Error::BudgetExceeded(sparkles::Budget {
+                    kind: sparkles::BudgetKind::Memory,
+                    limit: 400,
+                    requested: 512,
+                })
+            ),
+            "unexpected ChargedLimitedWriter error: {err:?}"
+        );
+        assert_eq!(
+            rw.capacity(),
+            256,
+            "ChargedLimitedWriter reallocated past limit"
+        );
+        assert_eq!(rw.len(), 256);
+
+        let mut big_charge = super::MemoryCharge::new(None, Some(1024));
+        let mut rw2 = super::ChargedLimitedWriter::new(Some(300), &mut big_charge);
+        rw2.write_all(&[b'b'; 256]).unwrap();
+        rw2.write_all(&[b'b'; 44]).unwrap();
+        assert_eq!(rw2.capacity(), 512);
+        assert!(rw2.write_all(b"x").is_err());
+        let err2 = rw2.take_budget_err().expect("expected ResultBytes error");
+        assert!(
+            matches!(
+                err2,
+                sparkles::Error::BudgetExceeded(sparkles::Budget {
+                    kind: sparkles::BudgetKind::ResultBytes,
+                    limit: 300,
+                    requested: 301,
+                })
+            ),
+            "unexpected ChargedLimitedWriter ResultBytes error: {err2:?}"
+        );
+    }
+
+    // 2. Historical snapshot charge remains held across `QueryResult` through rendering:
+    //    use an HTML-escapable `rdfs:label` of `&` characters so the rendered HTML buffer
+    //    capacity (~2 MiB) exceeds `query_peak`, letting us set a ceiling where `snapshot +
+    //    query` fits AND `result + rendered_buffer` alone would fit, while `snapshot +
+    //    query_result + rendered_buffer_capacity` together exceed the ceiling.
+    let dir = tempfile::tempdir().unwrap();
+    let payload = "&".repeat(120 * 1024);
+    let (retained, query_peak, res_bytes, html_cap) = {
+        let st = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        st.create("snapds", DbType::Persistent).unwrap();
+        let app = crate::http::router(st.clone());
+
+        let mut ttl = format!(
+            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+             @prefix sh: <http://example.org/sh/> .\n\
+             sh:Big rdfs:label \"{payload}\" .\n"
+        );
+        for i in 0..800 {
+            ttl.push_str(&format!(
+                "sh:Pad{i} rdfs:comment \"historical-delta-padding-entry-{i:04}-for-retained-snapshot\" .\n"
+            ));
+        }
+        let put1 = send(
+            &app,
+            Request::put("/snapds/data?graph=http%3A%2F%2Fexample.org%2Fsh%2Fg")
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from(ttl))
+                .unwrap(),
+        )
+        .await;
+        assert!(put1.status.is_success(), "{}", put1.text());
+
+        let snap = send(
+            &app,
+            post_json("/$/snapshots/snapds", json!({"name": "h1"}), None),
+        )
+        .await;
+        assert_eq!(snap.status, StatusCode::CREATED, "{}", snap.text());
+
+        // Advance head so snapshot:h1 is a historical state with a non-trivial delta charge.
+        let post2 = send(
+            &app,
+            Request::post("/snapds/data?graph=http%3A%2F%2Fexample.org%2Fsh%2Fg")
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from(
+                    "<http://example.org/sh/Other> <http://www.w3.org/2000/01/rdf-schema#label> \"head\" .",
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert!(post2.status.is_success(), "{}", post2.text());
+
+        let reg = send(
+            &app,
+            post_json(
+                "/$/resources",
+                json!({
+                    "id": "shv",
+                    "kind": "vocabulary",
+                    "title": "Snap Hist Vocab",
+                    "namespaces": [{"prefix": "sh", "iri": "http://example.org/sh/"}],
+                    "graphs": [{"dataset": "snapds", "graph": "http://example.org/sh/g"}]
+                }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
+
+        let ds = crate::http::dataset(&st, "snapds")
+            .ok()
+            .expect("snapds dataset");
+        let (snap_arc, _, retained) = ds
+            .store
+            .snapshot_at_limited_bytes(
+                &sparkles::history::At::Snapshot("h1".to_string()),
+                &sparkles::history::HistoryOptions::default(),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+        let opts = sparkles::sparql::QueryOptions {
+            default_graph_uris: vec!["http://example.org/sh/g".to_string()],
+            ..Default::default()
+        };
+        let qres = sparkles::sparql::query(snap_arc, "DESCRIBE <http://example.org/sh/Big>", &opts)
+            .unwrap();
+        let res_bytes: u64 = qres.triples().iter().map(super::triple_bytes).sum();
+        let query_peak = qres.mem_peak_bytes;
+
+        let ok_resp = send(
+            &app,
+            get_req(
+                &format!(
+                    "/$/ld/doc?iri={}&at=snapshot:h1",
+                    enc("http://example.org/sh/Big")
+                ),
+                Some("text/html"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(ok_resp.status, StatusCode::OK, "{}", ok_resp.text());
+        let html_len = ok_resp.body.len();
+        let mut cap = 256usize;
+        while cap < html_len {
+            cap *= 2;
+        }
+        (retained, query_peak, res_bytes, cap as u64)
+    };
+
+    // Choose a tight ceiling strictly above BOTH `retained + query_peak` (replay + DESCRIBE
+    // fit) AND `res_bytes + html_cap` (releasing `snap_charge` early would bypass the limit),
+    // and strictly below `retained + res_bytes + html_cap` (keeping `snap_charge` live across
+    // `QueryResult` during HTML rendering must fail with 507).
+    let lower = (retained + query_peak).max(res_bytes + html_cap);
+    let upper = retained + res_bytes + html_cap;
+    assert!(
+        lower < upper,
+        "fixture invariant violated: lower ({lower}) >= upper ({upper}) (retained={retained}, query_peak={query_peak}, res_bytes={res_bytes}, html_cap={html_cap})"
+    );
+    let tight_limit = lower + (upper - lower) / 2;
+
+    let mut st = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(16 * 1024 * 1024),
+    )
+    .unwrap();
+    st.limits.query_memory_bytes = Some(tight_limit);
+    st.set_phase(crate::obs::Phase::Ready);
+    let st = Arc::new(st);
+    let app = crate::http::router(st.clone());
+
+    let fail_r = send(
+        &app,
+        get_req(
+            &format!(
+                "/$/ld/doc?iri={}&at=snapshot:h1",
+                enc("http://example.org/sh/Big")
+            ),
+            Some("text/html"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        fail_r.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "historical snapshot + QueryResult + rendered buffer must exceed tight_limit={tight_limit}: {}",
+        fail_r.text()
+    );
+    assert_eq!(st.catalog.pool().unwrap().granted(), 0);
+    drop(app);
+    drop(st);
+
+    // Raising the ceiling to cover all three simultaneously succeeds cleanly.
+    let mut st_ok = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(16 * 1024 * 1024),
+    )
+    .unwrap();
+    st_ok.limits.query_memory_bytes = Some(upper + 64 * 1024);
+    st_ok.set_phase(crate::obs::Phase::Ready);
+    let st_ok = Arc::new(st_ok);
+    let app_ok = crate::http::router(st_ok.clone());
+    let ok_r = send(
+        &app_ok,
+        get_req(
+            &format!(
+                "/$/ld/doc?iri={}&at=snapshot:h1",
+                enc("http://example.org/sh/Big")
+            ),
+            Some("text/html"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(ok_r.status, StatusCode::OK, "{}", ok_r.text());
+    assert_eq!(st_ok.catalog.pool().unwrap().granted(), 0);
 }
 
 #[tokio::test]
@@ -2386,8 +2734,9 @@ async fn cross_vocabulary_html_links_do_not_propagate_version_param() {
 
 /// Evaluate generated Apache 2.4 `.htaccess` `RewriteCond %{THE_REQUEST}` / `RewriteRule`
 /// directives against a raw HTTP/1.1 request line (`GET <raw_target> HTTP/1.1`), including
-/// internal `[DPI,E=SPARKLES_LD:...]` handoff and `[B]` backreference escaping.
-fn eval_htaccess_request(htaccess: &str, raw_target: &str) -> Option<String> {
+/// internal `[DPI,QSD,E=...]` handoffs, `[B]` backreference escaping, and `[R=400,L]`
+/// rejections. Returns `(status_code, optional_location)`.
+fn eval_htaccess_request(htaccess: &str, raw_target: &str) -> Option<(u16, Option<String>)> {
     let the_request = format!("GET {raw_target} HTTP/1.1");
     let mut uri = raw_target
         .split('?')
@@ -2395,7 +2744,7 @@ fn eval_htaccess_request(htaccess: &str, raw_target: &str) -> Option<String> {
         .unwrap_or(raw_target)
         .trim_start_matches('/')
         .to_string();
-    let mut env_sparkles_ld = String::new();
+    let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut pending_conds: Vec<(String, String)> = Vec::new();
 
     for line in htaccess.lines().map(str::trim) {
@@ -2424,12 +2773,17 @@ fn eval_htaccess_request(htaccess: &str, raw_target: &str) -> Option<String> {
         };
 
         let mut cond_match = true;
-        let mut last_cond_cap1: Option<String> = None;
+        let mut last_cond_caps: Vec<Option<String>> = Vec::new();
         for (test, pat) in pending_conds.drain(..) {
-            let val = match test.as_str() {
-                "%{THE_REQUEST}" => the_request.as_str(),
-                "%{ENV:SPARKLES_LD}" => env_sparkles_ld.as_str(),
-                other => panic!("unexpected RewriteCond test string: {other}"),
+            let val = if test == "%{THE_REQUEST}" {
+                the_request.as_str()
+            } else if let Some(var) = test
+                .strip_prefix("%{ENV:")
+                .and_then(|s| s.strip_suffix('}'))
+            {
+                env.get(var).map(String::as_str).unwrap_or("")
+            } else {
+                panic!("unexpected RewriteCond test string: {test}");
             };
             if let Some(eq) = pat.strip_prefix('=') {
                 if val != eq {
@@ -2439,7 +2793,9 @@ fn eval_htaccess_request(htaccess: &str, raw_target: &str) -> Option<String> {
             } else {
                 let re = regex::Regex::new(&pat).unwrap();
                 if let Some(c) = re.captures(val) {
-                    last_cond_cap1 = c.get(1).map(|m| m.as_str().to_string());
+                    last_cond_caps = (0..c.len())
+                        .map(|i| c.get(i).map(|m| m.as_str().to_string()))
+                        .collect();
                 } else {
                     cond_match = false;
                     break;
@@ -2452,46 +2808,77 @@ fn eval_htaccess_request(htaccess: &str, raw_target: &str) -> Option<String> {
 
         let has_b = flags.split(',').any(|f| f == "B");
         let has_ne = flags.split(',').any(|f| f == "NE");
-        let is_redirect = flags.split(',').any(|f| f.starts_with("R="));
-        for f in flags.split(',') {
-            if let Some(ev) = f.strip_prefix("E=SPARKLES_LD:") {
-                env_sparkles_ld = ev.to_string();
-            }
-        }
+        let status_code = flags
+            .split(',')
+            .find_map(|f| f.strip_prefix("R=").and_then(|n| n.parse::<u16>().ok()));
 
-        let rule_cap1 = rule_caps.get(1).map(|m| m.as_str());
-        let mut out = String::new();
-        let mut chars = subst.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                if let Some(next) = chars.next() {
-                    out.push(next);
-                }
-            } else if c == '%' && chars.peek() == Some(&'1') {
-                let _ = chars.next();
-                if let Some(cap) = &last_cond_cap1 {
-                    out.push_str(cap);
-                }
-            } else if c == '$' && chars.peek() == Some(&'1') {
-                let _ = chars.next();
-                if let Some(cap) = rule_cap1 {
-                    if has_b {
-                        let escaped: String =
-                            url::form_urlencoded::byte_serialize(cap.as_bytes()).collect();
-                        out.push_str(&escaped);
-                    } else {
+        let expand = |template: &str, escape_rule_caps: bool| -> String {
+            let mut out = String::new();
+            let mut chars = template.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else if c == '%' && chars.peek() == Some(&'{') {
+                    let _ = chars.next();
+                    let mut expr = String::new();
+                    for ch in chars.by_ref() {
+                        if ch == '}' {
+                            break;
+                        }
+                        expr.push(ch);
+                    }
+                    if let Some(var) = expr.strip_prefix("ENV:")
+                        && let Some(v) = env.get(var)
+                    {
+                        out.push_str(v);
+                    }
+                } else if c == '%' && chars.peek().is_some_and(char::is_ascii_digit) {
+                    let idx = chars.next().unwrap().to_digit(10).unwrap() as usize;
+                    if let Some(Some(cap)) = last_cond_caps.get(idx) {
                         out.push_str(cap);
                     }
+                } else if c == '$' && chars.peek().is_some_and(char::is_ascii_digit) {
+                    let idx = chars.next().unwrap().to_digit(10).unwrap() as usize;
+                    if let Some(m) = rule_caps.get(idx) {
+                        let cap = m.as_str();
+                        if escape_rule_caps {
+                            let escaped: String =
+                                url::form_urlencoded::byte_serialize(cap.as_bytes()).collect();
+                            out.push_str(&escaped);
+                        } else {
+                            out.push_str(cap);
+                        }
+                    }
+                } else {
+                    out.push(c);
                 }
-            } else {
-                out.push(c);
+            }
+            out
+        };
+
+        let mut next_env_updates = Vec::new();
+        for f in flags.split(',') {
+            if let Some(rest) = f.strip_prefix("E=")
+                && let Some((k, v)) = rest.split_once(':')
+            {
+                next_env_updates.push((k.to_string(), expand(v, false)));
             }
         }
-        if is_redirect {
+        let mut out = expand(subst, has_b);
+        for (k, v) in next_env_updates {
+            env.insert(k, v);
+        }
+
+        if let Some(code) = status_code {
+            if subst == "-" {
+                return Some((code, None));
+            }
             if !has_ne {
                 out = out.replace('%', "%25");
             }
-            return Some(out);
+            return Some((code, Some(out)));
         }
         uri = out;
     }
@@ -2524,6 +2911,24 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
     rdfs:label "Ampersand Term" .
   <https://w3id.org/myorg/mv/a+b> a owl:Class ;
     rdfs:label "Plus Term" .
+  <https://w3id.org/myorg/mv/Term> a owl:Class ;
+    rdfs:label "Bare Term Without Query" .
+  <https://w3id.org/myorg/mv/Term?edition=1> a owl:Class ;
+    rdfs:label "Query Edition Term" .
+  <https://w3id.org/myorg/mv/a%3Bb?c=1&d=a+b> a owl:Class ;
+    rdfs:label "Encoded Path And Query Term" .
+  <https://w3id.org/myorg/mv/?edition=1> a owl:Class ;
+    rdfs:label "Slash Root With Query" .
+  <https://w3id.org/myorg/mv//Term> a owl:Class ;
+    rdfs:label "Repeated Slash Suffix Term" .
+  <https://w3id.org/myorg/mv/a//b> a owl:Class ;
+    rdfs:label "Internal Repeated Slash Term" .
+  <https://w3id.org/myorg/vocab//> a owl:Ontology ;
+    rdfs:label "Double Slash Namespace Root" .
+  <https://w3id.org/myorg/vocab//Term> a owl:Class ;
+    rdfs:label "Double Slash Namespace Term" .
+  <https://w3id.org/myorg/vocab//Term?edition=1> a owl:Class ;
+    rdfs:label "Double Slash Namespace Query Term" .
 }
 "#;
     let put = send(
@@ -2548,7 +2953,10 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
                 "id": "apvocab",
                 "kind": "vocabulary",
                 "title": "Apache Vocab",
-                "namespaces": [{"prefix": "mv", "iri": "https://w3id.org/myorg/mv/"}],
+                "namespaces": [
+                    {"prefix": "mv", "iri": "https://w3id.org/myorg/mv/"},
+                    {"prefix": "dbl", "iri": "https://w3id.org/myorg/vocab//"}
+                ],
                 "graphs": [{"dataset": "apds", "graph": "http://example.org/ap/g"}],
                 "versions": [{
                     "version": "1.0",
@@ -2584,11 +2992,30 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
         ("/myorg/mv/code;part", "Dynamic Unencoded code;part", None),
         ("/myorg/mv/a&b", "Ampersand Term", None),
         ("/myorg/mv/a+b", "Plus Term", None),
+        ("/myorg/mv/Term", "Bare Term Without Query", None),
+        ("/myorg/mv/Term?edition=1", "Query Edition Term", None),
+        (
+            "/myorg/mv/a%3Bb?c=1&d=a+b",
+            "Encoded Path And Query Term",
+            None,
+        ),
+        ("/myorg/mv/?edition=1", "Slash Root With Query", None),
+        ("/myorg/mv//Term", "Repeated Slash Suffix Term", None),
+        ("/myorg/mv/a//b", "Internal Repeated Slash Term", None),
+        ("/myorg/vocab//", "Double Slash Namespace Root", None),
+        ("/myorg/vocab//Term", "Double Slash Namespace Term", None),
+        (
+            "/myorg/vocab//Term?edition=1",
+            "Double Slash Namespace Query Term",
+            None,
+        ),
     ];
 
     for (raw_path, want_label, want_at) in cases {
-        let loc = eval_htaccess_request(&text, raw_path)
+        let (code, loc) = eval_htaccess_request(&text, raw_path)
             .unwrap_or_else(|| panic!("no rule matched {raw_path} in:\n{text}"));
+        assert_eq!(code, 303, "expected 303 for {raw_path}");
+        let loc = loc.unwrap_or_else(|| panic!("missing Location for {raw_path}"));
         let rel = loc
             .strip_prefix("https://rdf.example.org")
             .unwrap_or_else(|| panic!("bad redirect {loc}"));
@@ -2606,6 +3033,19 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
         );
         assert_eq!(resp.header("sparkles-at"), want_at, "{raw_path}");
     }
+
+    // Single-slash `/myorg/vocab/Term` must NOT redirect into `/myorg/vocab//Term`.
+    assert_eq!(
+        eval_htaccess_request(&text, "/myorg/vocab/Term"),
+        None,
+        "single-slash path must not match double-slash namespace"
+    );
+    // Multi-`?` query must be explicitly rejected (`400`) rather than altered or dropped.
+    assert_eq!(
+        eval_htaccess_request(&text, "/myorg/mv/Term?a=1?b=2"),
+        Some((400, None)),
+        "multi-? query must be rejected with 400"
+    );
 
     // If Apache 2.4 (`apache2` or `httpd`) is installed on this host, verify the exact
     // generated `.htaccess` against real HTTP/1.1 requests to Apache as well.
@@ -2685,7 +3125,7 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
         }
         assert!(ready, "apache2 did not start on port {port}");
 
-        for (raw_path, want_label, want_at) in cases {
+        let raw_http = |raw_path: &str| -> String {
             let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -2697,6 +3137,11 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
             .unwrap();
             let mut raw_resp = String::new();
             stream.read_to_string(&mut raw_resp).unwrap();
+            raw_resp
+        };
+
+        for (raw_path, want_label, want_at) in cases {
+            let raw_resp = raw_http(raw_path);
             assert!(
                 raw_resp.starts_with("HTTP/1.1 303"),
                 "apache2 {raw_path}: {raw_resp}"
@@ -2725,6 +3170,19 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
             );
             assert_eq!(resp.header("sparkles-at"), want_at, "apache2 {raw_path}");
         }
+
+        // Verify real Apache refuses single-slash `/myorg/vocab/Term` (404, no redirect)
+        // and explicitly rejects multi-`?` queries (400).
+        let miss = raw_http("/myorg/vocab/Term");
+        assert!(
+            miss.starts_with("HTTP/1.1 404"),
+            "apache2 /myorg/vocab/Term should be 404, got: {miss}"
+        );
+        let bad_q = raw_http("/myorg/mv/Term?a=1?b=2");
+        assert!(
+            bad_q.starts_with("HTTP/1.1 400"),
+            "apache2 /myorg/mv/Term?a=1?b=2 should be 400, got: {bad_q}"
+        );
 
         drop(_apache);
     }
@@ -2757,11 +3215,212 @@ async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms
     assert_eq!(root_rec.status, StatusCode::OK, "{}", root_rec.text());
     let root_text = root_rec.text();
     assert_eq!(
-        eval_htaccess_request(&root_text, "/").as_deref(),
-        Some("https://rdf.example.org/$/ld/doc?iri=https%3A%2F%2Fexample.org%2F")
+        eval_htaccess_request(&root_text, "/"),
+        Some((
+            303,
+            Some("https://rdf.example.org/$/ld/doc?iri=https%3A%2F%2Fexample.org%2F".to_string())
+        ))
     );
     assert_eq!(
-        eval_htaccess_request(&root_text, "/code%3Bpart").as_deref(),
-        Some("https://rdf.example.org/$/ld/doc?iri=https%3A%2F%2Fexample.org%2Fcode%253Bpart")
+        eval_htaccess_request(&root_text, "/code%3Bpart"),
+        Some((
+            303,
+            Some(
+                "https://rdf.example.org/$/ld/doc?iri=https%3A%2F%2Fexample.org%2Fcode%253Bpart"
+                    .to_string()
+            )
+        ))
     );
+    assert_eq!(
+        eval_htaccess_request(&root_text, "/Term?edition=1"),
+        Some((
+            303,
+            Some(
+                "https://rdf.example.org/$/ld/doc?iri=https%3A%2F%2Fexample.org%2FTerm%3Fedition%3D1"
+                    .to_string()
+            )
+        ))
+    );
+}
+
+#[cfg(feature = "auth")]
+#[tokio::test]
+async fn html_does_not_mark_dataset_version_with_unreadable_graphs_as_hosted() {
+    use base64::Engine as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h = |pw: &str| crate::auth::hash_password_with(pw, 8, 1, 1).unwrap();
+    let auth_toml = format!(
+        r#"
+version = 1
+
+[server]
+public_url = "http://localhost:3030"
+
+[anonymous]
+datasets = {{}}
+
+[[users]]
+name = "admin"
+password = "{admin}"
+server = ["server-admin"]
+
+[[users]]
+name = "pub_reader"
+password = "{pub_reader}"
+[[users.grants]]
+dataset = "ds_acl"
+level = "read"
+graphs = ["http://example.org/ds/public"]
+"#,
+        admin = h("admin-pw"),
+        pub_reader = h("pub-pw"),
+    );
+    let auth_path = dir.path().join("auth.toml");
+    std::fs::write(&auth_path, auth_toml).unwrap();
+    let auth = crate::auth::load(Some(&auth_path), dir.path(), "127.0.0.1", false).unwrap();
+
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.auth = auth;
+    let st = Arc::new(st);
+    let ds = st.attach("ds_acl", DbType::Mem, None).unwrap();
+    let trig = r#"
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+<http://example.org/ds/public> {
+  <http://example.org/pubv/Term>
+    rdfs:label "Public Term" ;
+    rdfs:seeAlso <http://example.org/ds/v1-pub>,
+                 <http://example.org/ds/v2-priv>,
+                 <http://example.org/ds/unregistered> .
+  <http://example.org/ds/v1-pub> rdfs:label "Readable Dataset Version" .
+}
+<http://example.org/ds/private> {
+  <http://example.org/ds/v2-priv> rdfs:label "Private Dataset Version" .
+}
+"#;
+    ds.store
+        .load(&[Source::from_bytes(
+            trig.as_bytes().to_vec(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+
+    let basic = |u: &str, pw: &str| {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{u}:{pw}"))
+        )
+    };
+    let admin_auth = basic("admin", "admin-pw");
+    let pub_auth = basic("pub_reader", "pub-pw");
+    let app = crate::http::router(st.clone());
+
+    let reg_v = send(
+        &app,
+        post_json(
+            "/$/resources",
+            json!({
+                "id": "pubv",
+                "kind": "vocabulary",
+                "title": "Public Vocab",
+                "namespaces": [{"prefix": "pubv", "iri": "http://example.org/pubv/"}],
+                "graphs": [{"dataset": "ds_acl", "graph": "http://example.org/ds/public"}]
+            }),
+            Some(&admin_auth),
+        ),
+    )
+    .await;
+    assert_eq!(reg_v.status, StatusCode::CREATED, "{}", reg_v.text());
+
+    let reg_d = send(
+        &app,
+        post_json(
+            "/$/resources",
+            json!({
+                "id": "my_ds_res",
+                "kind": "dataset",
+                "title": "Mixed Dataset",
+                "dataset": "ds_acl",
+                "versions": [
+                    {
+                        "version": "1.0",
+                        "versionIri": "http://example.org/ds/v1-pub",
+                        "graphs": [{"graph": "http://example.org/ds/public"}]
+                    },
+                    {
+                        "version": "2.0",
+                        "versionIri": "http://example.org/ds/v2-priv",
+                        "graphs": [{"graph": "http://example.org/ds/private"}]
+                    }
+                ]
+            }),
+            Some(&admin_auth),
+        ),
+    )
+    .await;
+    assert_eq!(reg_d.status, StatusCode::CREATED, "{}", reg_d.text());
+
+    // pub_reader has dataset-level read on `ds_acl` restricted to `public`:
+    // HTML must mark `v1-pub` as hosted (`/$/ld?iri=...`) and render `v2-priv` as an
+    // external link indistinguishable from `unregistered`.
+    let pub_html = send(
+        &app,
+        get_req(
+            &format!("/$/ld/doc?iri={}", enc("http://example.org/pubv/Term")),
+            Some("text/html"),
+            Some(&pub_auth),
+        ),
+    )
+    .await;
+    assert_eq!(pub_html.status, StatusCode::OK, "{}", pub_html.text());
+    let body = pub_html.text();
+    let local_pub = format!("href=\"/$/ld?iri={}\"", enc("http://example.org/ds/v1-pub"));
+    let local_priv = format!(
+        "href=\"/$/ld?iri={}\"",
+        enc("http://example.org/ds/v2-priv")
+    );
+    let ext_priv = "href=\"http://example.org/ds/v2-priv\" rel=\"noopener noreferrer\"";
+    let ext_unreg = "href=\"http://example.org/ds/unregistered\" rel=\"noopener noreferrer\"";
+    assert!(
+        body.contains(&local_pub),
+        "missing hosted v1-pub link:\n{body}"
+    );
+    assert!(
+        !body.contains(&local_priv),
+        "unreadable dataset version v2-priv leaked as hosted link:\n{body}"
+    );
+    assert!(
+        body.contains(ext_priv),
+        "unreadable dataset version v2-priv must render as plain external link:\n{body}"
+    );
+    assert!(body.contains(ext_unreg), "{body}");
+
+    // Direct lookup of v2-priv by pub_reader returns 404.
+    let priv_lookup = send(
+        &app,
+        get_req(
+            &format!("/$/ld/doc?iri={}", enc("http://example.org/ds/v2-priv")),
+            Some("text/turtle"),
+            Some(&pub_auth),
+        ),
+    )
+    .await;
+    assert_eq!(priv_lookup.status, StatusCode::NOT_FOUND);
+
+    // admin can read both graphs and sees both versions linked locally.
+    let adm_html = send(
+        &app,
+        get_req(
+            &format!("/$/ld/doc?iri={}", enc("http://example.org/pubv/Term")),
+            Some("text/html"),
+            Some(&admin_auth),
+        ),
+    )
+    .await;
+    assert_eq!(adm_html.status, StatusCode::OK, "{}", adm_html.text());
+    let adm_body = adm_html.text();
+    assert!(adm_body.contains(&local_pub), "{adm_body}");
+    assert!(adm_body.contains(&local_priv), "{adm_body}");
 }

@@ -24,9 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use sparkles::history::Resolved;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 type St = State<Arc<AppState>>;
 
@@ -153,35 +151,18 @@ fn live_original_uri(uri: &Uri, iri_pinned_version: bool) -> Option<String> {
     (original != current).then_some(original)
 }
 
-/// Response body that retains the [`MemoryCharge`] for its buffered bytes until the body
-/// itself is dropped after transmission or disconnect.
-struct ChargedBody {
-    data: Option<Bytes>,
+/// Response buffer owner attached to [`Bytes::from_owner`] so the rendered allocation's
+/// [`MemoryCharge`] (and [`PoolGrant`]) remains live until every `Bytes` frame or slice
+/// referencing the buffer is dropped, even after the HTTP body stream ends.
+struct ChargedBytes {
+    // Declared before `_charge` so the heap allocation frees before releasing the charge.
+    buf: Vec<u8>,
     _charge: MemoryCharge,
 }
 
-impl http_body::Body for ChargedBody {
-    type Data = Bytes;
-    type Error = std::convert::Infallible;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        match self.data.take() {
-            Some(bytes) if !bytes.is_empty() => {
-                Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
-            }
-            _ => Poll::Ready(None),
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.data.as_ref().is_none_or(Bytes::is_empty)
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        http_body::SizeHint::with_exact(self.data.as_ref().map_or(0, Bytes::len) as u64)
+impl AsRef<[u8]> for ChargedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
     }
 }
 
@@ -212,14 +193,15 @@ fn build_document_response(
     at_param: Option<&str>,
     extra: &[(String, String)],
 ) -> Response {
-    let (is_html, bytes) = match doc.body {
-        RenderedBody::Rdf(bytes) => (false, Bytes::from(bytes)),
-        RenderedBody::Html(html_body) => (true, Bytes::from(html_body.into_bytes())),
+    let (is_html, buf) = match doc.body {
+        RenderedBody::Rdf(bytes) => (false, bytes),
+        RenderedBody::Html(html_body) => (true, html_body.into_bytes()),
     };
-    let body = Body::new(ChargedBody {
-        data: Some(bytes),
+    let bytes = Bytes::from_owner(ChargedBytes {
+        buf,
         _charge: doc.memory_charge,
     });
+    let body = Body::from(bytes);
     let mut resp = (
         StatusCode::OK,
         [(header::CONTENT_TYPE, format.media_type())],
@@ -366,9 +348,9 @@ async fn handle_lookup(
                         .map_err(ApiError::from)?,
                     ),
                 };
-                // Drop the input triples/QueryResult and release their charge, keeping
-                // the rendered body bytes charged inside `memory_charge` until the HTTP
-                // response body itself is dropped.
+                // Drop the input triples/QueryResult (including any retained historical
+                // snapshot) and release their charges, keeping the rendered body buffer
+                // capacity charged inside `memory_charge` until the response `Bytes` drop.
                 let super::Description {
                     iri,
                     triples,
@@ -377,11 +359,13 @@ async fn handle_lookup(
                     iri_pinned_version,
                     mut memory_charge,
                     retained_triples_bytes,
+                    retained_snapshot_bytes,
                     ..
                 } = *desc;
                 drop(triples);
                 memory_charge.clear_external();
-                memory_charge.release(retained_triples_bytes);
+                memory_charge
+                    .release(retained_triples_bytes.saturating_add(retained_snapshot_bytes));
                 Ok(RenderedOutcome::Document(RenderedDocument {
                     iri,
                     body,
