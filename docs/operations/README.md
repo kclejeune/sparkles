@@ -40,8 +40,8 @@ Sparkles runs as a single binary packaged for NixOS, Home Manager, Docker, and K
 ### Observability
 
 * **Audit events.** Dataset creation, deletion, and cloning, plus branch creation and deletion, emit `INFO` events under `sparkles::audit` with actor and operation identities and bounded failure codes (never request payloads or credentials). Local CLI operations log as `local:<user>` to stderr, remote CLI commands rely on server events, and automatic scratch-branch expiry logs `system:scratch-expiry` with `reason=idle-expiry`. `RUST_LOG` controls filtering.
-* **Access logs and Prometheus metrics.** Every HTTP request receives an `X-Request-Id` and one structured text or JSON access-log line. `/$/metrics` exports Prometheus metrics including query rows, peak query memory, and index rebuild reasons/durations. `--metrics-fuseki-names` adds Fuseki request metric names, and `--metrics-addr` serves metrics on a dedicated listener.
-* **OpenTelemetry.** Compiled with the `otel` cargo feature and enabled at runtime via `--otel` or `OTEL_*` variables, OpenTelemetry exports OTLP traces (honoring and propagating W3C `traceparent` on `SERVICE` and `LOAD`, with spans for commits, background tasks, query phases, and operator trees), bridges Prometheus metrics, and optionally exports trace-correlated OTLP logs.
+* **Access logs and Prometheus metrics.** Every HTTP request receives an `X-Request-Id` and one structured text or JSON access-log line. `/$/metrics` exports Prometheus metrics and `/$/metrics?format=json` exposes the matching JSON snapshot, including produced query rows, peak query memory histograms, and index rebuild counts and duration histograms by reason. `--metrics-fuseki-names` adds Fuseki request metric names, and `--metrics-addr` serves metrics on a dedicated listener.
+* **OpenTelemetry.** Compiled with the `otel` cargo feature and enabled at runtime via `--otel` or `OTEL_*` variables, OpenTelemetry exports OTLP traces (honoring and propagating W3C `traceparent` on `SERVICE` and `LOAD`, with spans for commits, background tasks, query phases, and operator trees), bridges Prometheus metrics including produced rows, query memory peaks, and rebuild series, and optionally exports trace-correlated OTLP logs.
 
 ### Backups
 
@@ -125,7 +125,7 @@ The [API compatibility policy](../DEVELOPMENT.md#api-compatibility) covers HTTP 
 
 ## Known gaps
 
-Operational limits for single-node deployment, backup scope, encryption at rest, metrics export parity, and runtime key protection are listed under [Server, access control and operations](../server/README.md#server-access-control-and-operations). Release binary, container image, and package publication limits are listed under [Bindings and packaging](../integrations/README.md#bindings-and-packaging). Degraded derived-index and WAL-replay startup reporting is tracked in roadmap [item 402](../ROADMAP.md), and full API compatibility checks in roadmap [item 60](../ROADMAP.md).
+Operational limits for single-node deployment, backup scope, encryption at rest, and runtime key protection are listed under [Server, access control and operations](../server/README.md#server-access-control-and-operations). Release binary, container image, and package publication limits are listed under [Bindings and packaging](../integrations/README.md#bindings-and-packaging). Degraded derived-index and WAL-replay startup reporting is tracked in roadmap [item 402](../ROADMAP.md), and full API compatibility checks in roadmap [item 60](../ROADMAP.md).
 
 ## Roadmap
 

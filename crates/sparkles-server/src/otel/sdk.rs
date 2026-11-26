@@ -20,7 +20,7 @@ use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 use parking_lot::Mutex;
 use serde_json::Value as J;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -773,19 +773,20 @@ pub(super) fn update_done(span: &Span, t0: SystemTime, s: &sparkles::sparql::upd
 /// One registry snapshot per collection, shared by every observable instrument.
 struct Snapshot {
     st: Arc<AppState>,
-    last: Mutex<Option<(Instant, Arc<J>)>>,
+    last: Mutex<Option<Arc<J>>>,
 }
 
 impl Snapshot {
-    fn get(&self) -> Arc<J> {
+    /// Returns the snapshot for the current collection cycle. Callback index 0 refreshes
+    /// unconditionally so consecutive collections never observe stale state, while every
+    /// later callback in the same collection reads the same snapshot.
+    fn get(&self, refresh: bool) -> Arc<J> {
         let mut last = self.last.lock();
-        if let Some((t, v)) = &*last
-            && t.elapsed() < Duration::from_secs(1)
-        {
+        if !refresh && let Some(v) = &*last {
             return v.clone();
         }
         let v = Arc::new(crate::obs::metrics_json(&self.st));
-        *last = Some((Instant::now(), v.clone()));
+        *last = Some(v.clone());
         v
     }
 }
@@ -797,6 +798,10 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
     let Some(meter) = globals().and_then(|g| g.meter.clone()) else {
         return;
     };
+    register_metrics_on(&meter, st);
+}
+
+pub(super) fn register_metrics_on(meter: &Meter, st: Arc<AppState>) {
     let snap = Arc::new(Snapshot {
         st,
         last: Mutex::new(None),
@@ -865,6 +870,144 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
             "Result rows of queries (triples for CONSTRUCT and DESCRIBE).",
             Kind::Counter,
             |j, f| per_dataset(j, f, |d| d["resultRows"].as_f64()),
+        ),
+        (
+            "sparkles.rows.produced",
+            "{row}",
+            "Rows produced by all operators of queries and updates (the rows-produced work).",
+            Kind::Counter,
+            |j, f| per_dataset(j, f, |d| d["rowsProduced"].as_f64()),
+        ),
+        (
+            "sparkles.query.memory.peak.bucket",
+            "{query}",
+            "Cumulative query counts by estimated peak memory bucket in bytes.",
+            Kind::Counter,
+            |j, f| {
+                let bounds = j["queryMemoryPeakBucketBounds"].as_array();
+                for d in j["datasets"].as_array().into_iter().flatten() {
+                    let Some(buckets) = d["queryMemoryPeak"]["buckets"].as_array() else {
+                        continue;
+                    };
+                    let ds = str_of(&d["name"]);
+                    observe_histogram_buckets(bounds, buckets, |le, n| {
+                        f(
+                            n,
+                            vec![
+                                KeyValue::new("dataset", ds.clone()),
+                                KeyValue::new("le", le),
+                            ],
+                        );
+                    });
+                }
+            },
+        ),
+        (
+            "sparkles.query.memory.peak.sum",
+            "By",
+            "Sum of estimated peak memory of queries in bytes.",
+            Kind::Counter,
+            |j, f| per_dataset(j, f, |d| d["queryMemoryPeak"]["sumBytes"].as_f64()),
+        ),
+        (
+            "sparkles.query.memory.peak.count",
+            "{query}",
+            "Number of queries observed in the peak memory histogram.",
+            Kind::Counter,
+            |j, f| per_dataset(j, f, |d| d["queryMemoryPeak"]["count"].as_f64()),
+        ),
+        (
+            "sparkles.rebuilds",
+            "{rebuild}",
+            "New generations published since the dataset was opened, by reason: compact or bulk.",
+            Kind::Counter,
+            |j, f| {
+                for d in j["datasets"].as_array().into_iter().flatten() {
+                    let ds = str_of(&d["name"]);
+                    for (reason, entry) in d["rebuilds"].as_object().into_iter().flatten() {
+                        if let Some(n) = entry["count"].as_f64() {
+                            f(
+                                n,
+                                vec![
+                                    KeyValue::new("dataset", ds.clone()),
+                                    KeyValue::new("reason", reason.clone()),
+                                ],
+                            );
+                        }
+                    }
+                }
+            },
+        ),
+        (
+            "sparkles.rebuild.duration.bucket",
+            "{rebuild}",
+            "Cumulative rebuild counts by duration bucket in seconds.",
+            Kind::Counter,
+            |j, f| {
+                let bounds = j["rebuildDurationBucketBounds"].as_array();
+                for d in j["datasets"].as_array().into_iter().flatten() {
+                    let ds = str_of(&d["name"]);
+                    for (reason, entry) in d["rebuilds"].as_object().into_iter().flatten() {
+                        let Some(buckets) = entry["duration"]["buckets"].as_array() else {
+                            continue;
+                        };
+                        observe_histogram_buckets(bounds, buckets, |le, n| {
+                            f(
+                                n,
+                                vec![
+                                    KeyValue::new("dataset", ds.clone()),
+                                    KeyValue::new("reason", reason.clone()),
+                                    KeyValue::new("le", le),
+                                ],
+                            );
+                        });
+                    }
+                }
+            },
+        ),
+        (
+            "sparkles.rebuild.duration.sum",
+            "s",
+            "Sum of rebuild durations for published generations, in seconds.",
+            Kind::Counter,
+            |j, f| {
+                for d in j["datasets"].as_array().into_iter().flatten() {
+                    let ds = str_of(&d["name"]);
+                    for (reason, entry) in d["rebuilds"].as_object().into_iter().flatten() {
+                        if let Some(sum) = entry["duration"]["sumSeconds"].as_f64() {
+                            f(
+                                sum,
+                                vec![
+                                    KeyValue::new("dataset", ds.clone()),
+                                    KeyValue::new("reason", reason.clone()),
+                                ],
+                            );
+                        }
+                    }
+                }
+            },
+        ),
+        (
+            "sparkles.rebuild.duration.count",
+            "{rebuild}",
+            "Number of rebuilds observed in the duration histogram.",
+            Kind::Counter,
+            |j, f| {
+                for d in j["datasets"].as_array().into_iter().flatten() {
+                    let ds = str_of(&d["name"]);
+                    for (reason, entry) in d["rebuilds"].as_object().into_iter().flatten() {
+                        if let Some(count) = entry["duration"]["count"].as_f64() {
+                            f(
+                                count,
+                                vec![
+                                    KeyValue::new("dataset", ds.clone()),
+                                    KeyValue::new("reason", reason.clone()),
+                                ],
+                            );
+                        }
+                    }
+                }
+            },
         ),
         (
             "sparkles.budget.exceeded",
@@ -1081,8 +1224,9 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
             },
         ),
     ];
-    for (name, unit, desc, kind, observe) in series {
+    for (idx, (name, unit, desc, kind, observe)) in series.into_iter().enumerate() {
         let snap = snap.clone();
+        let refresh = idx == 0;
         // the instruments live as long as the meter provider
         match kind {
             Kind::Counter => {
@@ -1090,7 +1234,9 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
                     .f64_observable_counter(name)
                     .with_unit(unit)
                     .with_description(desc)
-                    .with_callback(move |o| observe(&snap.get(), &mut |v, a| o.observe(v, &a)))
+                    .with_callback(move |o| {
+                        observe(&snap.get(refresh), &mut |v, a| o.observe(v, &a));
+                    })
                     .build();
             }
             Kind::UpDown => {
@@ -1098,7 +1244,9 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
                     .f64_observable_up_down_counter(name)
                     .with_unit(unit)
                     .with_description(desc)
-                    .with_callback(move |o| observe(&snap.get(), &mut |v, a| o.observe(v, &a)))
+                    .with_callback(move |o| {
+                        observe(&snap.get(refresh), &mut |v, a| o.observe(v, &a));
+                    })
                     .build();
             }
             Kind::Gauge => {
@@ -1106,10 +1254,36 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
                     .f64_observable_gauge(name)
                     .with_unit(unit)
                     .with_description(desc)
-                    .with_callback(move |o| observe(&snap.get(), &mut |v, a| o.observe(v, &a)))
+                    .with_callback(move |o| {
+                        observe(&snap.get(refresh), &mut |v, a| o.observe(v, &a));
+                    })
                     .build();
             }
         }
+    }
+}
+
+fn bound_label(v: &J) -> String {
+    if let Some(n) = v.as_u64() {
+        n.to_string()
+    } else if let Some(n) = v.as_f64() {
+        n.to_string()
+    } else {
+        str_of(v)
+    }
+}
+
+fn observe_histogram_buckets(
+    bounds: Option<&Vec<J>>,
+    buckets: &[J],
+    mut emit: impl FnMut(String, f64),
+) {
+    let bounds = bounds.map(Vec::as_slice).unwrap_or(&[]);
+    for (i, n) in buckets.iter().enumerate() {
+        let le = bounds
+            .get(i)
+            .map_or_else(|| "+Inf".to_string(), bound_label);
+        emit(le, n.as_f64().unwrap_or(0.0));
     }
 }
 

@@ -672,7 +672,7 @@ pub struct DsMetrics {
 
 /// Upper bounds in bytes of the `sparkles_query_memory_peak_bytes` histogram, without
 /// `+Inf`: 1 MiB to 16 GiB in steps of ×4.
-const MEMORY_BUCKETS: [u64; 8] = [
+pub(crate) const MEMORY_BUCKETS: [u64; 8] = [
     1 << 20,
     1 << 22,
     1 << 24,
@@ -682,6 +682,38 @@ const MEMORY_BUCKETS: [u64; 8] = [
     1 << 32,
     1 << 34,
 ];
+
+impl DsMetrics {
+    /// Cumulative bucket counts (the last is `+Inf`, the total count) and byte sum of
+    /// `sparkles_query_memory_peak_bytes`, or `None` when no query has been observed.
+    fn mem_peak_snapshot(&self) -> Option<([u64; MEMORY_BUCKETS.len() + 1], u64)> {
+        let mut cum = [0u64; MEMORY_BUCKETS.len() + 1];
+        let mut acc = 0u64;
+        for (i, c) in self.mem_peak.iter().enumerate() {
+            acc += c.load(Ordering::Relaxed);
+            cum[i] = acc;
+        }
+        if acc == 0 {
+            return None;
+        }
+        Some((cum, self.mem_peak_sum.load(Ordering::Relaxed)))
+    }
+}
+
+/// Cumulative bucket counts (the last is `+Inf`, the total count) and second sum of a
+/// rebuild histogram, or `None` when no rebuild has been recorded.
+fn rebuild_cumulative(h: &RebuildHistogram) -> Option<([u64; REBUILD_BUCKETS.len() + 1], f64)> {
+    let mut cum = [0u64; REBUILD_BUCKETS.len() + 1];
+    let mut acc = 0u64;
+    for (i, &n) in h.buckets.iter().enumerate() {
+        acc += n;
+        cum[i] = acc;
+    }
+    if acc == 0 {
+        return None;
+    }
+    Some((cum, h.sum_seconds))
+}
 
 /// Upper bounds of the `sparkles_graphql_groups` histogram, without `+Inf`.
 const GROUP_BUCKETS: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
@@ -1641,14 +1673,11 @@ pub fn render_prometheus(st: &AppState) -> String {
         "Estimated peak memory of queries in bytes.",
     );
     for (ds, m) in &series {
-        let total: u64 = m.mem_peak.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        if total == 0 {
+        let Some((cum, sum)) = m.mem_peak_snapshot() else {
             continue;
-        }
+        };
         let ds = escape_label(ds);
-        let mut acc = 0;
-        for (i, c) in m.mem_peak.iter().enumerate() {
-            acc += c.load(Ordering::Relaxed);
+        for (i, acc) in cum.iter().enumerate() {
             let le = MEMORY_BUCKETS
                 .get(i)
                 .map_or("+Inf".to_string(), |b| b.to_string());
@@ -1659,12 +1688,12 @@ pub fn render_prometheus(st: &AppState) -> String {
         }
         let _ = writeln!(
             o,
-            "sparkles_query_memory_peak_bytes_sum{{dataset=\"{ds}\"}} {}",
-            m.mem_peak_sum.load(Ordering::Relaxed)
+            "sparkles_query_memory_peak_bytes_sum{{dataset=\"{ds}\"}} {sum}"
         );
         let _ = writeln!(
             o,
-            "sparkles_query_memory_peak_bytes_count{{dataset=\"{ds}\"}} {total}"
+            "sparkles_query_memory_peak_bytes_count{{dataset=\"{ds}\"}} {}",
+            cum[MEMORY_BUCKETS.len()]
         );
     }
     family(
@@ -1966,13 +1995,11 @@ pub fn render_prometheus(st: &AppState) -> String {
     for (ds, g) in &gauges {
         let ds = escape_label(ds);
         for (h, reason) in g.rebuilds.iter().zip(RebuildReason::ALL) {
-            if h.count() == 0 {
+            let Some((cum, sum)) = rebuild_cumulative(h) else {
                 continue;
-            }
+            };
             let labels = format!("dataset=\"{ds}\",reason=\"{}\"", reason.as_str());
-            let mut acc = 0;
-            for (i, n) in h.buckets.iter().enumerate() {
-                acc += n;
+            for (i, acc) in cum.iter().enumerate() {
                 let le = REBUILD_BUCKETS
                     .get(i)
                     .map_or("+Inf".to_string(), |b| b.to_string());
@@ -1981,14 +2008,11 @@ pub fn render_prometheus(st: &AppState) -> String {
                     "sparkles_rebuild_duration_seconds_bucket{{{labels},le=\"{le}\"}} {acc}"
                 );
             }
+            let _ = writeln!(o, "sparkles_rebuild_duration_seconds_sum{{{labels}}} {sum}");
             let _ = writeln!(
                 o,
-                "sparkles_rebuild_duration_seconds_sum{{{labels}}} {}",
-                h.sum_seconds
-            );
-            let _ = writeln!(
-                o,
-                "sparkles_rebuild_duration_seconds_count{{{labels}}} {acc}"
+                "sparkles_rebuild_duration_seconds_count{{{labels}}} {}",
+                cum[REBUILD_BUCKETS.len()]
             );
         }
     }
@@ -2129,10 +2153,19 @@ pub fn metrics_json(st: &AppState) -> J {
                 )
             })
             .collect();
+        let query_memory_peak = m.mem_peak_snapshot().map_or(J::Null, |(cum, sum)| {
+            json!({
+                "count": cum[MEMORY_BUCKETS.len()],
+                "sumBytes": sum,
+                "buckets": cum.to_vec(),
+            })
+        });
         counters.insert(
             ds,
             json!({
                 "resultRows": m.result_rows.load(Ordering::Relaxed),
+                "rowsProduced": m.rows_produced.load(Ordering::Relaxed),
+                "queryMemoryPeak": query_memory_peak,
                 "budgetExceeded": budget,
                 "rateLimited": crate::ratelimit::Class::ALL
                     .iter()
@@ -2148,6 +2181,26 @@ pub fn metrics_json(st: &AppState) -> J {
     let datasets: Vec<J> = gauges(st)
         .into_iter()
         .map(|(ds, g)| {
+            let rebuilds: serde_json::Map<String, J> = RebuildReason::ALL
+                .iter()
+                .zip(&g.rebuilds)
+                .map(|(reason, h)| {
+                    let duration = rebuild_cumulative(h).map_or(J::Null, |(cum, sum)| {
+                        json!({
+                            "count": cum[REBUILD_BUCKETS.len()],
+                            "sumSeconds": sum,
+                            "buckets": cum.to_vec(),
+                        })
+                    });
+                    (
+                        reason.as_str().to_string(),
+                        json!({
+                            "count": h.count(),
+                            "duration": duration,
+                        }),
+                    )
+                })
+                .collect();
             json!({
                 "geo": crate::geo::series_json(geo.get(&ds)),
                 "name": ds,
@@ -2169,6 +2222,9 @@ pub fn metrics_json(st: &AppState) -> J {
                 "diskBytes": g.disk_bytes,
                 "quotaBytes": g.quota_bytes,
                 "resultRows": counters.get(&ds).map_or(J::from(0), |c| c["resultRows"].clone()),
+                "rowsProduced": counters.get(&ds).map_or(J::from(0), |c| c["rowsProduced"].clone()),
+                "queryMemoryPeak": counters.get(&ds).map_or(J::Null, |c| c["queryMemoryPeak"].clone()),
+                "rebuilds": rebuilds,
                 "budgetExceeded": counters.get(&ds).map_or(J::Null, |c| c["budgetExceeded"].clone()),
                 "rateLimited": counters.get(&ds).map_or(J::Null, |c| c["rateLimited"].clone()),
                 "blockCache": {
@@ -2209,6 +2265,8 @@ pub fn metrics_json(st: &AppState) -> J {
         "io": sparkles::ioacct::IoSnapshot::now().report(),
         "limits": st.limits.json(st.default_timeout),
         "bucketBounds": BUCKETS.to_vec(),
+        "queryMemoryPeakBucketBounds": MEMORY_BUCKETS.to_vec(),
+        "rebuildDurationBucketBounds": REBUILD_BUCKETS.to_vec(),
         "active": active,
         "requests": requests,
         "datasets": datasets,

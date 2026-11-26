@@ -405,6 +405,8 @@ type MetricsSnapshot = {
   processResidentBytes: number | null;
   limits: Limits;
   bucketBounds: number[];                  // histogram upper bounds in seconds, without +Inf
+  queryMemoryPeakBucketBounds: number[];   // query memory peak upper bounds in bytes, without +Inf
+  rebuildDurationBucketBounds: number[];   // rebuild duration upper bounds in seconds, without +Inf
   active: Record<Operation, number>;       // requests in progress
   requests: {
     dataset: string; operation: Operation;
@@ -416,6 +418,18 @@ type MetricsSnapshot = {
   datasets: {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
     walBytes: number; diskBytes: number; quotaBytes: number /* 0: unlimited */; resultRows: number;
+    rowsProduced: number;                  // rows produced by all operators of queries and updates
+    queryMemoryPeak: null | {              // null before the first query on the dataset
+      count: number; sumBytes: number;
+      buckets: number[];                   // cumulative counts for queryMemoryPeakBucketBounds plus +Inf
+    };
+    rebuilds: Record<"compact" | "bulk", {
+      count: number;                       // resets to 0 when the dataset opens
+      duration: null | {                   // null while count is 0
+        count: number; sumSeconds: number;
+        buckets: number[];                 // cumulative counts for rebuildDurationBucketBounds plus +Inf
+      };
+    }>;
     groupCommit: boolean;                  // concurrent commits share one synchronization
     commits: { fences: number; failures: number; fallbacks: Record<string, number> }; // group commit counters, fences counts successful fences
     budgetExceeded: Record<BudgetKind, number> | null;
@@ -512,7 +526,10 @@ is exported as observable instruments read at collection time, so nothing is cou
 twice and `/$/metrics` does not change. These instruments are
 `sparkles.requests` (`dataset`, `operation`, `outcome`),
 `sparkles.response.size`, `sparkles.requests.active`, `sparkles.result.rows`,
-`sparkles.budget.exceeded`, `sparkles.rate_limited`, `sparkles.dataset.quads`,
+`sparkles.rows.produced`, `sparkles.query.memory.peak.{bucket,sum,count}` (`dataset`, with
+`le` on `.bucket`), `sparkles.rebuilds` (`dataset`, `reason`),
+`sparkles.rebuild.duration.{bucket,sum,count}` (`dataset`, `reason`, with `le` on
+`.bucket`), `sparkles.budget.exceeded`, `sparkles.rate_limited`, `sparkles.dataset.quads`,
 `sparkles.delta.quads`, `sparkles.wal.size`, `sparkles.disk.size`,
 `sparkles.block_cache.{size,capacity,hits,misses}`,
 `sparkles.result_cache.{size,capacity,entries,hits,misses}`, `sparkles.geo.rows`

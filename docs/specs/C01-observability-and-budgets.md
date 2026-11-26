@@ -1007,11 +1007,40 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
   shares the rebuild histogram with bulk commits.
 - `obs_tests::metrics_count_work_memory_peaks_and_rebuilds` and
   `compaction_tests::rebuilds_are_counted_by_reason` cover them, and the access log test
-  checks the new field. The JSON snapshot of `/$/metrics?format=json` does not have the
-  new series, and neither do the OTLP metrics, which are read from that snapshot.
+  checks the new field. Initially the JSON snapshot of `/$/metrics?format=json` and the
+  OTLP metrics read from it did not carry the new series; item 342 added both.
 
-**Not built.** The new Phase 2 metrics are not in the JSON snapshot or the OTLP
-metrics. Item 342 tracks them.
+**Metrics parity** (item 342). The Phase 2 produced-row, query-memory-peak and rebuild
+series now appear in `/$/metrics?format=json` and in OTLP metric export alongside
+Prometheus.
+- `MetricsSnapshot` keeps `"formatVersion": 1` because all added fields are purely additive
+  and every existing member keeps its name and type. Top-level fields
+  `queryMemoryPeakBucketBounds` and `rebuildDurationBucketBounds` expose the byte and
+  second bucket bounds without `+Inf`. Each dataset entry gains `rowsProduced`,
+  `queryMemoryPeak` (`null` until a query is observed, else `{count, sumBytes, buckets}`
+  with cumulative counts matching `MEMORY_BUCKETS` plus `+Inf`), and `rebuilds` keyed by
+  `compact` and `bulk` (`{count, duration}`, with `duration` `null` while `count` is zero
+  and `{count, sumSeconds, buckets}` matching `REBUILD_BUCKETS` plus `+Inf` otherwise).
+  `DsMetrics::mem_peak_snapshot` and `rebuild_cumulative` share the cumulative snapshot
+  computation between Prometheus and JSON so `+Inf` always equals `_count` under
+  concurrency.
+- The OTLP observer in `otel/sdk.rs` exports `sparkles.rows.produced` (`{row}`),
+  `sparkles.query.memory.peak.{bucket,sum,count}` (`{query}` and `By`, with `le` on
+  `.bucket`), `sparkles.rebuilds` (`{rebuild}`, labelled by `dataset` and `reason`), and
+  `sparkles.rebuild.duration.{bucket,sum,count}` (`{rebuild}` and `s`, labelled by
+  `dataset`, `reason`, and `le` on `.bucket`) as monotonic observable counters read from
+  `metrics_json`. OpenTelemetry has no asynchronous histogram instrument and cumulative
+  synchronous histograms in `opentelemetry_sdk` cannot reset or drop series when a dataset
+  is deleted, renamed, or reopened, so observable counters from `metrics_json` preserve
+  exact parity across dataset-label caps (`$other`), renames, deletes, and rebuild resets
+  on reopen. Callback index zero refreshes the snapshot at the start of each collection so
+  consecutive flushes never read stale cached snapshots.
+- `obs_tests::metrics_count_work_memory_peaks_and_rebuilds`,
+  `obs_tests::metrics_parity_dataset_cap_reset_reopen_and_auth`, and
+  `otel::tests::phase2_metrics_match_prometheus_json_and_otlp` verify cross-format parity
+  across unseen datasets, queries, updates, failed or abandoned builds, compactions, bulk
+  commits, `$other` aggregation, deletes, persistent reopens, and `metrics` access control,
+  and the `--no-default-features` build checks the exporter-disabled path.
 
 **Bind-before-open startup** (item 64). `serve` binds its listeners, then opens the
 registered datasets as §4.1 Phase 2 describes. The [startup section of
