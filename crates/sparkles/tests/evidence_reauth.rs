@@ -32,10 +32,27 @@ const CLAIMS: &str = "urn:ev:claims";
 const DECISIONS: &str = "urn:ev:decisions";
 const SUPPORTS: &str = "urn:ev:supports";
 const IDENTITY: &str = "urn:ev:identity";
+const MAPS: &str = "urn:ev:maps";
 const OUTPUT: &str = "urn:ev:accepted";
+const MAP_OUTPUT: &str = "urn:ev:identities-out";
 
 fn iri(s: &str) -> NamedNode {
     NamedNode::new(s).unwrap()
+}
+
+fn memory_ds() -> Dataset {
+    let ds = Dataset::memory();
+    let prep = sparkles_core::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    ds.store()
+        .set_retention(sparkles_core::history::Retention {
+            keep_commits: Some(256),
+            ..Default::default()
+        })
+        .unwrap();
+    ds
 }
 
 fn key(s: &str) -> RecordKey {
@@ -83,6 +100,23 @@ fn settings() -> Settings {
 
 fn configure(ds: &Dataset) {
     evidence::configure(ds, &settings(), &Control::none()).unwrap();
+}
+
+fn identity_settings() -> Settings {
+    let mut s = settings();
+    s.identity = vec![IDENTITY.into(), MAPS.into()];
+    s.projections = vec![OUTPUT.into(), MAP_OUTPUT.into()];
+    s.matching_policies.insert(
+        "people".into(),
+        sparkles::evidence::MatchingPolicy {
+            version: 1,
+            boundary: vec![IDENTITY.into()],
+            decisions: DECISIONS.into(),
+            maps: MAPS.into(),
+            output: MAP_OUTPUT.into(),
+        },
+    );
+    s
 }
 
 fn propose_options() -> ProposeOptions {
@@ -363,7 +397,7 @@ fn digest_of(p: &evidence::Proposed, k: &str) -> Sha256Digest {
 
 #[test]
 fn detach_and_reprotect_then_reauthenticate_restores_resolution_and_proposals() {
-    let ds = Dataset::memory();
+    let ds = memory_ds();
     configure(&ds);
 
     let batch = rich_batch("1");
@@ -547,7 +581,7 @@ fn detach_and_reprotect_then_reauthenticate_restores_resolution_and_proposals() 
 fn reauthenticate_rejects_tampered_records_atomically() {
     // 1. Tampered claim triple (extra triple added while detached)
     {
-        let ds = Dataset::memory();
+        let ds = memory_ds();
         configure(&ds);
         let p = propose(&ds, &rich_batch("t1"), &propose_options()).unwrap();
         let claim = iri_of(&p, "claim");
@@ -574,7 +608,7 @@ fn reauthenticate_rejects_tampered_records_atomically() {
 
     // 2. Tampered fragment sub-node (confidence value edited while detached)
     {
-        let ds = Dataset::memory();
+        let ds = memory_ds();
         configure(&ds);
         let p = propose(&ds, &rich_batch("t2"), &propose_options()).unwrap();
         let claim = iri_of(&p, "claim");
@@ -606,7 +640,7 @@ fn reauthenticate_rejects_tampered_records_atomically() {
 
     // 3. Tampered ev:retainedBytes (bytes changed without changing ev:contentDigest)
     {
-        let ds = Dataset::memory();
+        let ds = memory_ds();
         configure(&ds);
         let _p = propose(&ds, &rich_batch("t3"), &propose_options()).unwrap();
         evidence::detach(&ds, SOURCES).unwrap();
@@ -634,7 +668,7 @@ fn reauthenticate_rejects_tampered_records_atomically() {
 
     // 4. Tampered ev:normalizedText (text changed without changing ev:contentDigest)
     {
-        let ds = Dataset::memory();
+        let ds = memory_ds();
         configure(&ds);
         let _p = propose(&ds, &rich_batch("t4"), &propose_options()).unwrap();
         evidence::detach(&ds, SOURCES).unwrap();
@@ -662,7 +696,7 @@ fn reauthenticate_rejects_tampered_records_atomically() {
 
     // 5. Tampered ev:firstAvailableAt (backdated while detached)
     {
-        let ds = Dataset::memory();
+        let ds = memory_ds();
         configure(&ds);
         let _p = propose(&ds, &rich_batch("t5"), &propose_options()).unwrap();
         evidence::detach(&ds, SOURCES).unwrap();
@@ -690,7 +724,7 @@ fn reauthenticate_rejects_tampered_records_atomically() {
 
     // 6. Caller-supplied expected_digest mismatch -> target-changed
     {
-        let ds = Dataset::memory();
+        let ds = memory_ds();
         configure(&ds);
         let p = propose(&ds, &small_batch("c1", "r1"), &propose_options()).unwrap();
         let claim = iri_of(&p, "claim");
@@ -715,7 +749,7 @@ fn reauthenticate_rejects_tampered_records_atomically() {
 
     // 7. Planted record pointing to a future predictable operation cannot be vouched
     {
-        let ds = Dataset::memory();
+        let ds = memory_ds();
         configure(&ds);
         let mut future_opts = propose_options();
         future_opts.idempotency_key = Some("predictable-future".into());
@@ -777,7 +811,7 @@ fn reauthenticate_rejects_tampered_records_atomically() {
 
 #[test]
 fn selective_reauthentication_and_partial_operation_replay_safety() {
-    let ds = Dataset::memory();
+    let ds = memory_ds();
     configure(&ds);
 
     let batch = EvidenceInput {
@@ -914,7 +948,7 @@ fn selective_reauthentication_and_partial_operation_replay_safety() {
 
 #[test]
 fn reauthenticate_refuses_detached_projection_stale_head_and_supports_dry_run_and_branches() {
-    let ds = Dataset::memory();
+    let ds = memory_ds();
     configure(&ds);
     let p = propose(&ds, &small_batch("c1", "r1"), &propose_options()).unwrap();
     let claim = iri_of(&p, "claim");
@@ -938,6 +972,17 @@ fn reauthenticate_refuses_detached_projection_stale_head_and_supports_dry_run_an
         "unsupported-profile"
     );
     configure(&ds);
+
+    // Refuses when the caller's graph write grants exclude the target graph.
+    let mut restricted = reauth_options();
+    restricted.write = Some(Arc::new(GraphAccess::graphs(
+        sparkles::access::Graphs::All,
+        sparkles::access::Graphs::Only(sparkles::access::GraphRule::new([SOURCES], &[])),
+    )));
+    assert!(matches!(
+        evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &restricted, &Control::none()),
+        Err(Error::NotPermitted(_))
+    ));
 
     // Refuses stale if_head.
     let head = ds.store().head_commit().seq;
@@ -999,6 +1044,12 @@ fn reauthenticate_survives_persistent_reopen_and_respects_authority_fence() {
     }
 
     let dir = tempfile::tempdir().unwrap();
+    {
+        let init = Dataset::open(dir.path()).unwrap();
+        drop(init);
+        let prep = sparkles_core::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+        sparkles_core::migrate::activate_configuration_history(dir.path(), false, &prep).unwrap();
+    }
     let claim_iri;
     let rev_iri;
     {
@@ -1058,7 +1109,7 @@ fn reauthenticate_survives_persistent_reopen_and_respects_authority_fence() {
 
 #[test]
 fn reauthenticate_handles_withdrawals_and_preserves_projection_unavailable() {
-    let ds = Dataset::memory();
+    let ds = memory_ds();
     configure(&ds);
     let p = propose(
         &ds,
@@ -1166,5 +1217,1608 @@ fn reauthenticate_handles_withdrawals_and_preserves_projection_unavailable() {
             &Control::none(),
         )),
         "immutable-record-conflict"
+    );
+}
+
+#[test]
+fn reauthenticate_requires_configuration_history_and_refuses_detached_forgeries() {
+    // 1. Unactivated configuration history -> 409 configuration-history-inactive.
+    {
+        let ds = Dataset::memory();
+        configure(&ds);
+        let _p = propose(&ds, &small_batch("unact", "r-unact"), &propose_options()).unwrap();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "configuration-history-inactive"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+
+    // 2. Unretained/pruned publication commit -> 422 origin-not-reproduced (even with pinned digest).
+    {
+        let ds = Dataset::memory();
+        let prep = sparkles_core::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+        ds.store()
+            .activate_memory_configuration_history(&prep)
+            .unwrap();
+        // Keep 0 past commits so commit 1 is dropped once commit 2 happens.
+        configure(&ds);
+        let p = propose(&ds, &small_batch("pruned", "r-pruned"), &propose_options()).unwrap();
+        let claim = iri_of(&p, "claim");
+        let claim_digest = digest_of(&p, "claim");
+        // Advance head with an unrelated write so commit 1 is no longer retained.
+        ds.update("INSERT DATA { GRAPH <urn:other> { <urn:a> <urn:b> <urn:c> } }")
+            .unwrap();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        let mut opts = reauth_options();
+        opts.records = Some(vec![ReauthenticateRecord {
+            iri: claim.clone(),
+            expected_digest: Some(claim_digest),
+        }]);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &opts,
+                &Control::none(),
+            )),
+            "origin-not-reproduced"
+        );
+    }
+
+    // 3. Changed record content PLUS recomputed `ev:recordDigest` while detached -> refused!
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &small_batch("recomp", "r-recomp"), &propose_options()).unwrap();
+        let claim = iri_of(&p, "claim");
+        evidence::detach(&ds, CLAIMS).unwrap();
+        // Add an extra triple AND recompute and replace `ev:recordDigest` to match it.
+        let extra_pred = iri("https://example.org/tampered");
+        let extra_obj = Term::Literal(Literal::new_simple_literal("forged"));
+        ds.update(&format!(
+            "INSERT DATA {{ GRAPH <{CLAIMS}> {{ <{c}> <{p}> \"forged\" }} }}",
+            c = claim.as_str(),
+            p = extra_pred.as_str(),
+        ))
+        .unwrap();
+        // Read all current immutable triples of `claim` from `CLAIMS` and recompute digest.
+        let snap = ds.store().snapshot();
+        let prep = sparkles_core::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+        let mut triples = Vec::new();
+        let g_id = prep.lookup_iri(&snap, CLAIMS).unwrap().unwrap();
+        let s_id = prep.lookup_iri(&snap, claim.as_str()).unwrap().unwrap();
+        let excluded = [
+            format!("{EV}availabilityReceipt"),
+            "http://www.w3.org/ns/prov#wasGeneratedBy".to_string(),
+            format!("{EV}graphProtection"),
+            format!("{EV}recordDigest"),
+        ];
+        prep.scan(
+            &snap,
+            sparkles_core::index::Perm::Gspo,
+            &[g_id.0, s_id.0],
+            |q| {
+                let p_term = prep.with_term(&snap, q[1], |t| Ok(t.cloned()))?.unwrap();
+                let o_term = prep.with_term(&snap, q[2], |t| Ok(t.cloned()))?.unwrap();
+                if let Term::NamedNode(pn) = p_term
+                    && !excluded.iter().any(|e| e == pn.as_str())
+                {
+                    triples.push(Triple::new(claim.clone(), pn, o_term));
+                }
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(
+            triples
+                .iter()
+                .any(|t| t.predicate == extra_pred && t.object == extra_obj)
+        );
+        let forged_digest = sparkles_core::evidence::write::record_digest(
+            RecordKind::Claim,
+            &triples,
+            &Control::none(),
+        )
+        .unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             DELETE {{ GRAPH <{CLAIMS}> {{ <{c}> ev:recordDigest ?d }} }}
+             INSERT {{ GRAPH <{CLAIMS}> {{ <{c}> ev:recordDigest \"{fd}\" }} }}
+             WHERE {{ GRAPH <{CLAIMS}> {{ <{c}> ev:recordDigest ?d }} }}",
+            c = claim.as_str(),
+            fd = forged_digest,
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+        assert_eq!(
+            code(resolve_record(&ds, &ds, &claim, RecordKind::Claim)),
+            "origin-not-reproduced"
+        );
+    }
+
+    // 4. Planted record absent from publication commit claiming existing earlier receipt + matching nonce.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &small_batch("legit", "r-legit"), &propose_options()).unwrap();
+        let legit_op = p.operation.clone();
+        // Read the original protection nonce on `legit_op`.
+        let orig_nonce = {
+            let snap = ds.store().snapshot();
+            let prep = sparkles_core::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+            let mut reads = sparkles_core::evidence::write::Reads::new(&prep, &snap);
+            match reads
+                .single(legit_op.as_str(), &format!("{EV}graphProtection"), CLAIMS)
+                .unwrap()
+                .unwrap()
+            {
+                Term::Literal(l) => l.value().to_string(),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let planted = iri("urn:planted:absent-from-commit");
+        let planted_digest = sparkles_core::evidence::write::record_digest(
+            RecordKind::Claim,
+            &[Triple::new(
+                planted.clone(),
+                iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                iri(&format!("{EV}Claim")),
+            )],
+            &Control::none(),
+        )
+        .unwrap();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}> PREFIX prov: <http://www.w3.org/ns/prov#>
+             INSERT DATA {{ GRAPH <{CLAIMS}> {{
+                 <{c}> a ev:Claim ;
+                     ev:availabilityReceipt <{op}> ;
+                     prov:wasGeneratedBy <{op}> ;
+                     ev:graphProtection \"{n}\" ;
+                     ev:recordDigest \"{d}\" .
+             }} }}",
+            c = planted.as_str(),
+            op = legit_op.as_str(),
+            n = orig_nonce,
+            d = planted_digest,
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "origin-not-reproduced"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+
+    // 5. Matching edits to BOTH `ev:firstAvailableAt` AND receipt `prov:endedAtTime` -> refused!
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let _p = propose(&ds, &rich_batch("ts-both"), &propose_options()).unwrap();
+        evidence::detach(&ds, SOURCES).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}> PREFIX prov: <http://www.w3.org/ns/prov#>
+             DELETE {{ GRAPH <{SOURCES}> {{ ?r ev:firstAvailableAt ?t1 . ?op prov:endedAtTime ?t2 }} }}
+             INSERT {{ GRAPH <{SOURCES}> {{
+                 ?r ev:firstAvailableAt \"2020-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+                 ?op prov:endedAtTime \"2020-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+             }} }}
+             WHERE {{ GRAPH <{SOURCES}> {{ ?r ev:firstAvailableAt ?t1 ; ev:availabilityReceipt ?op . ?op prov:endedAtTime ?t2 }} }}"
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(SOURCES),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+
+    // 6. Detached write forging BOTH a new record AND a new receipt naming the detached commit itself -> refused!
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        evidence::detach(&ds, CLAIMS).unwrap();
+        let fake_op = iri("urn:uuid:11111111-2222-4333-8444-555555555555");
+        let fake_claim = iri("urn:forged:detached-commit-claim");
+        let fake_nonce = uuid::Uuid::new_v4();
+        let fake_digest = sparkles_core::evidence::write::record_digest(
+            RecordKind::Claim,
+            &[Triple::new(
+                fake_claim.clone(),
+                iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                iri(&format!("{EV}Claim")),
+            )],
+            &Control::none(),
+        )
+        .unwrap();
+        let next_commit = ds.store().head_commit().seq + 1;
+        ds.update(&format!(
+            "PREFIX ev: <{EV}> PREFIX prov: <http://www.w3.org/ns/prov#> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             INSERT DATA {{ GRAPH <{CLAIMS}> {{
+                 <{op}> a ev:Operation , prov:Activity ;
+                     ev:datasetId \"{ds_id}\" ;
+                     ev:branchId \"{ds_id}\" ;
+                     ev:commit {seq} ;
+                     prov:wasAssociatedWith <urn:x-sparkles:principal:attacker> ;
+                     prov:endedAtTime \"2026-01-01T00:00:00Z\"^^xsd:dateTime ;
+                     ev:payloadDigest \"{pd}\" ;
+                     ev:graphProtection \"{n}\" .
+                 <{c}> a ev:Claim ;
+                     ev:availabilityReceipt <{op}> ;
+                     prov:wasGeneratedBy <{op}> ;
+                     ev:graphProtection \"{n}\" ;
+                     ev:recordDigest \"{d}\" .
+             }} }}",
+            op = fake_op.as_str(),
+            ds_id = ds.dataset_id(),
+            seq = next_commit,
+            pd = sha256(b"fake"),
+            n = fake_nonce,
+            c = fake_claim.as_str(),
+            d = fake_digest,
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "origin-not-reproduced"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+}
+
+#[test]
+fn reauthenticate_refuses_preexisting_triples_on_audit_subject() {
+    let ds = memory_ds();
+    configure(&ds);
+    let p = propose(
+        &ds,
+        &small_batch("audit-pre", "r-audit-pre"),
+        &propose_options(),
+    )
+    .unwrap();
+    let claim = iri_of(&p, "claim");
+    let receipt = p.operation.clone();
+
+    // Precompute the predictable audit operation IRI for key "admin-key-1".
+    let admin_principal = reauth_options().principal;
+    let op_id = sparkles_core::evidence::write::operation_id(
+        ds.dataset_id(),
+        &admin_principal,
+        "admin-key-1",
+    );
+    let audit_iri = sparkles_core::evidence::write::operation_iri(op_id);
+
+    // Detach CLAIMS and plant an untyped `prov:wasInformedBy` triple on `audit_iri`.
+    evidence::detach(&ds, CLAIMS).unwrap();
+    ds.update(&format!(
+        "PREFIX prov: <http://www.w3.org/ns/prov#>
+         INSERT DATA {{ GRAPH <{CLAIMS}> {{ <{a}> prov:wasInformedBy <{r}> }} }}",
+        a = audit_iri.as_str(),
+        r = receipt.as_str(),
+    ))
+    .unwrap();
+    configure(&ds);
+
+    let mut opts = reauth_options();
+    opts.idempotency_key = Some("admin-key-1".into());
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::reauthenticate(
+            &ds,
+            &ds,
+            &iri(CLAIMS),
+            &opts,
+            &Control::none(),
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    // The untyped audit subject gained no `ev:Operation` type or protection marker, and
+    // `claim` remains unauthenticated.
+    assert_eq!(
+        code(resolve_record(&ds, &ds, &claim, RecordKind::Claim)),
+        "origin-not-reproduced"
+    );
+}
+
+#[test]
+fn multi_detach_partial_reconciliation_works_in_any_order_and_rejects_unrelated_nonce() {
+    // Helper that creates two claims under N1, detaches to N2, selectively reconciles c1
+    // (leaving c2 at N1 and receipt at N2), then detaches again to N3.
+    let setup_two_detaches = || {
+        let ds = memory_ds();
+        configure(&ds);
+        let batch = EvidenceInput {
+            revisions: vec![SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("rev"),
+                source: iri("https://example.org/bulletin"),
+                source_key: key("md-rev"),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly {
+                    digest: sha256(b"md-rev"),
+                },
+                metadata: SourceMetadata::default(),
+                times: SourceTimes::default(),
+                lineage: SourceLineage::default(),
+            }],
+            claims: vec![
+                ClaimInput {
+                    version: RecordVersion::V1,
+                    key: key("c1"),
+                    occurrence_key: key("c1"),
+                    revision: RecordRef::Local(key("rev")),
+                    proposition: proposition("md1"),
+                    kind: ClaimKind::Reported,
+                    polarity: Polarity::Positive,
+                    attributed_author: iri("https://example.org/pub"),
+                    scope: Scope::new(),
+                    confidence: ConfidenceFacets::default(),
+                    validity: None,
+                },
+                ClaimInput {
+                    version: RecordVersion::V1,
+                    key: key("c2"),
+                    occurrence_key: key("c2"),
+                    revision: RecordRef::Local(key("rev")),
+                    proposition: proposition("md2"),
+                    kind: ClaimKind::Reported,
+                    polarity: Polarity::Positive,
+                    attributed_author: iri("https://example.org/pub"),
+                    scope: Scope::new(),
+                    confidence: ConfidenceFacets::default(),
+                    validity: None,
+                },
+            ],
+            ..EvidenceInput::default()
+        };
+        let p = propose(&ds, &batch, &propose_options()).unwrap();
+        let c1 = iri_of(&p, "c1");
+        let c2 = iri_of(&p, "c2");
+        // Detach #1 -> N2, selectively reconcile ONLY c1.
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        let mut sel1 = reauth_options();
+        sel1.records = Some(vec![ReauthenticateRecord {
+            iri: c1.clone(),
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &sel1, &Control::none())
+                .unwrap()
+                .committed
+        );
+        // Detach #2 -> N3. Now c1 & OP carry N2, while c2 still carries N1.
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        (ds, c1, c2)
+    };
+
+    // (a) Whole-graph reconciliation under N3 succeeds for both c1 and c2.
+    {
+        let (ds, c1, c2) = setup_two_detaches();
+        let res =
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &reauth_options(), &Control::none())
+                .unwrap();
+        assert!(res.committed);
+        assert_eq!(res.records.len(), 2);
+        assert!(resolve_record(&ds, &ds, &c1, RecordKind::Claim).is_ok());
+        assert!(resolve_record(&ds, &ds, &c2, RecordKind::Claim).is_ok());
+    }
+
+    // (b) Selective c2 first, then c1 under N3.
+    {
+        let (ds, c1, c2) = setup_two_detaches();
+        let mut o2 = reauth_options();
+        o2.records = Some(vec![ReauthenticateRecord {
+            iri: c2.clone(),
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &o2, &Control::none())
+                .unwrap()
+                .committed
+        );
+        let mut o1 = reauth_options();
+        o1.records = Some(vec![ReauthenticateRecord {
+            iri: c1.clone(),
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &o1, &Control::none())
+                .unwrap()
+                .committed
+        );
+        assert!(resolve_record(&ds, &ds, &c1, RecordKind::Claim).is_ok());
+        assert!(resolve_record(&ds, &ds, &c2, RecordKind::Claim).is_ok());
+    }
+
+    // (c) Selective c1 first, then c2 under N3.
+    {
+        let (ds, c1, c2) = setup_two_detaches();
+        let mut o1 = reauth_options();
+        o1.records = Some(vec![ReauthenticateRecord {
+            iri: c1.clone(),
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &o1, &Control::none())
+                .unwrap()
+                .committed
+        );
+        let mut o2 = reauth_options();
+        o2.records = Some(vec![ReauthenticateRecord {
+            iri: c2.clone(),
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &o2, &Control::none())
+                .unwrap()
+                .committed
+        );
+        assert!(resolve_record(&ds, &ds, &c1, RecordKind::Claim).is_ok());
+        assert!(resolve_record(&ds, &ds, &c2, RecordKind::Claim).is_ok());
+    }
+
+    // (d) Overwriting c2's protection nonce with an unrelated random UUID during detach
+    //     is refused even after c1 is reconciled under N3.
+    {
+        let (ds, c1, c2) = setup_two_detaches();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        let random_nonce = uuid::Uuid::new_v4();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             DELETE {{ GRAPH <{CLAIMS}> {{ <{c2}> ev:graphProtection ?n }} }}
+             INSERT {{ GRAPH <{CLAIMS}> {{ <{c2}> ev:graphProtection \"{rn}\" }} }}
+             WHERE {{ GRAPH <{CLAIMS}> {{ <{c2}> ev:graphProtection ?n }} }}",
+            c2 = c2.as_str(),
+            rn = random_nonce,
+        ))
+        .unwrap();
+        configure(&ds);
+        let mut o1 = reauth_options();
+        o1.records = Some(vec![ReauthenticateRecord {
+            iri: c1.clone(),
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &o1, &Control::none())
+                .unwrap()
+                .committed
+        );
+        let mut o2 = reauth_options();
+        o2.records = Some(vec![ReauthenticateRecord {
+            iri: c2.clone(),
+            expected_digest: None,
+        }]);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &o2,
+                &Control::none(),
+            )),
+            "origin-not-reproduced"
+        );
+    }
+}
+
+#[test]
+fn reauthenticate_handles_reifier_anchored_blank_node_expected_triple() {
+    let ds = memory_ds();
+    configure(&ds);
+
+    // Assert a blank-node fact anchored by a stable RDF 1.2 reifier in a data graph.
+    let data_graph = iri("urn:data:facts");
+    let reifier = iri("urn:reifier:blank-fact-1");
+    ds.update(&format!(
+        "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+         INSERT DATA {{
+             GRAPH <{g}> {{
+                 _:stored_node <https://example.org/label> \"alpha\" .
+                 <{r}> rdf:reifies <<( _:stored_node <https://example.org/label> \"alpha\" )>> .
+             }}
+         }}",
+        g = data_graph.as_str(),
+        r = reifier.as_str(),
+    ))
+    .unwrap();
+    let fact_commit = ds.store().head_commit().seq;
+
+    // Propose a stored-fact `ev:EvidenceRef` whose input blank-node label differs from
+    // whatever internal blank-node ID the store allocates on `encode_quad`.
+    let caller_triple = Triple::new(
+        oxrdf::BlankNode::new("caller_distinct_label_xyz").unwrap(),
+        iri("https://example.org/label"),
+        Literal::new_simple_literal("alpha"),
+    );
+    let batch = EvidenceInput {
+        references: vec![EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: key("bref"),
+            occurrence_key: key("bref-1"),
+            target: EvidenceRefTarget::StoredFact(sparkles_core::evidence::StoredFactRef {
+                dataset: ds.dataset_id(),
+                branch: ds.dataset_id(),
+                commit: fact_commit,
+                graph: sparkles_core::evidence::GraphIdentity::Named(data_graph),
+                expected: caller_triple,
+                anchor: Some(sparkles_core::evidence::BlankAnchor::Reifier(reifier)),
+            }),
+        }],
+        ..EvidenceInput::default()
+    };
+    let p = propose(&ds, &batch, &propose_options()).unwrap();
+    let bref = iri_of(&p, "bref");
+
+    // Detach, re-protect, and re-authenticate CLAIMS -> must succeed cleanly!
+    evidence::detach(&ds, CLAIMS).unwrap();
+    configure(&ds);
+    let res = evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &reauth_options(), &Control::none())
+        .unwrap();
+    assert!(res.committed);
+    assert_eq!(res.records.len(), 1);
+    assert_eq!(res.records[0].iri, bref);
+    assert!(resolve_record(&ds, &ds, &bref, RecordKind::EvidenceRef).is_ok());
+
+    // Legacy pre-fix digest fallback: simulate a record published under the old scheme
+    // where `ev:recordDigest` hashed a caller blank-node label that differs from the
+    // canonical `b0` label (while `ev:expectedTriple` was stored with a store bnode ID).
+    {
+        let ds2 = memory_ds();
+        configure(&ds2);
+        let data_g = iri("urn:data:legacy");
+        let reif = iri("urn:reifier:legacy-1");
+        ds2.update(&format!(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             INSERT DATA {{ GRAPH <{g}> {{
+                 _:s <https://example.org/p> \"v\" .
+                 <{r}> rdf:reifies <<( _:s <https://example.org/p> \"v\" )>> .
+             }} }}",
+            g = data_g.as_str(),
+            r = reif.as_str(),
+        ))
+        .unwrap();
+        let fc = ds2.store().head_commit().seq;
+        // Propose under current canonical digest, then publish an identical protected
+        // record with a legacy raw-label digest (simulated as a pre-fix build commit).
+        let legacy_ref = iri("urn:uuid:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+        let legacy_op_id = uuid::Uuid::new_v4();
+        let legacy_op = sparkles_core::evidence::write::operation_iri(legacy_op_id);
+        let cap = ds2
+            .store()
+            .managed_writer(sparkles::managed::OwnerKind::Evidence, legacy_op_id)
+            .unwrap();
+        let nonce = cap.protection(CLAIMS).unwrap();
+        let mut t = ds2
+            .store()
+            .try_write_with(
+                sparkles_core::commit::CommitKind::Transaction,
+                Default::default(),
+            )
+            .unwrap();
+        t.set_managed(cap).unwrap();
+        let (seq, time_ms) = t.managed_stamp().unwrap();
+        let gn = oxrdf::GraphName::NamedNode(iri(CLAIMS));
+        let expected_triple = Triple::new(
+            oxrdf::BlankNode::new("legacy_caller_label_999").unwrap(),
+            iri("https://example.org/p"),
+            Literal::new_simple_literal("v"),
+        );
+        // Legacy digest differs from canonical digest because it hashed raw label.
+        let legacy_digest = sha256(b"legacy-raw-label-digest");
+        let ts = sparkles_core::evidence::write::date_time(time_ms);
+        let quads = vec![
+            oxrdf::Quad::new(
+                legacy_op.clone(),
+                iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                iri(&format!("{EV}Operation")),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_op.clone(),
+                iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                iri("http://www.w3.org/ns/prov#Activity"),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_op.clone(),
+                iri("http://www.w3.org/ns/prov#wasAssociatedWith"),
+                iri("urn:x-sparkles:principal:importer"),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_op.clone(),
+                iri("http://www.w3.org/ns/prov#endedAtTime"),
+                ts,
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_op.clone(),
+                iri(&format!("{EV}datasetId")),
+                Literal::new_simple_literal(ds2.dataset_id().to_string()),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_op.clone(),
+                iri(&format!("{EV}branchId")),
+                Literal::new_simple_literal(ds2.dataset_id().to_string()),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_op.clone(),
+                iri(&format!("{EV}commit")),
+                Literal::new_typed_literal(seq.to_string(), xsd::INTEGER),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_op.clone(),
+                iri(&format!("{EV}payloadDigest")),
+                Literal::new_simple_literal(sha256(b"legacy-payload").to_string()),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_op.clone(),
+                iri(&format!("{EV}graphProtection")),
+                Literal::new_simple_literal(nonce.to_string()),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                iri(&format!("{EV}EvidenceRef")),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}datasetId")),
+                Literal::new_simple_literal(ds2.dataset_id().to_string()),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}branchId")),
+                Literal::new_simple_literal(ds2.dataset_id().to_string()),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}commit")),
+                Literal::new_typed_literal(fc.to_string(), xsd::INTEGER),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}graphKind")),
+                iri(&format!("{EV}NamedGraph")),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}graph")),
+                data_g,
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}reifier")),
+                reif,
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}expectedTriple")),
+                Term::Triple(Box::new(expected_triple)),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}availabilityReceipt")),
+                legacy_op.clone(),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri("http://www.w3.org/ns/prov#wasGeneratedBy"),
+                legacy_op,
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}graphProtection")),
+                Literal::new_simple_literal(nonce.to_string()),
+                gn.clone(),
+            ),
+            oxrdf::Quad::new(
+                legacy_ref.clone(),
+                iri(&format!("{EV}recordDigest")),
+                Literal::new_simple_literal(legacy_digest.to_string()),
+                gn,
+            ),
+        ];
+        let mut labels = std::collections::HashMap::new();
+        for q in &quads {
+            let ids = t.encode_quad(q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        t.commit().unwrap();
+
+        // Untampered legacy record succeeds via its retained publication view.
+        evidence::detach(&ds2, CLAIMS).unwrap();
+        configure(&ds2);
+        let res2 = evidence::reauthenticate(
+            &ds2,
+            &ds2,
+            &iri(CLAIMS),
+            &reauth_options(),
+            &Control::none(),
+        )
+        .unwrap();
+        assert!(res2.committed);
+        assert!(resolve_record(&ds2, &ds2, &legacy_ref, RecordKind::EvidenceRef).is_ok());
+
+        // Tampering with the legacy record while detached still refuses!
+        evidence::detach(&ds2, CLAIMS).unwrap();
+        ds2.update(&format!(
+            "INSERT DATA {{ GRAPH <{CLAIMS}> {{ <{r}> <https://example.org/tampered> \"1\" }} }}",
+            r = legacy_ref.as_str(),
+        ))
+        .unwrap();
+        configure(&ds2);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds2,
+                &ds2,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+}
+
+#[test]
+fn reauthenticate_handles_multi_mib_retained_bytes_and_json_structured_reference() {
+    let ds = memory_ds();
+    configure(&ds);
+
+    // 2 MiB binary retained payload (~2.67 MiB base64 -> would exceed 64 MiB by >5x under
+    // the old `128x` decode charge!) plus a 1.2 MiB retained JSON revision with a
+    // structured `ev:EvidenceRef` pointing into it.
+    let bin_bytes: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+    let padding = "x".repeat(1200 * 1024);
+    let json_text = format!(r#"{{"target":"needle","pad":"{padding}"}}"#);
+    let val_digest =
+        sparkles_core::evidence::select_json_lexical_utf8(&json_text, "/target", &Control::none())
+            .unwrap()
+            .digest;
+
+    let batch = EvidenceInput {
+        revisions: vec![
+            SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("binrev"),
+                source: iri("https://example.org/bin"),
+                source_key: key("bin-2mib"),
+                upstream_version: None,
+                content: SourceContent::Retained {
+                    bytes: bin_bytes,
+                    expected_digest: None,
+                },
+                metadata: SourceMetadata::default(),
+                times: SourceTimes::default(),
+                lineage: SourceLineage::default(),
+            },
+            SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("jsonrev"),
+                source: iri("https://example.org/json"),
+                source_key: key("json-1mib"),
+                upstream_version: None,
+                content: SourceContent::Retained {
+                    bytes: json_text.into_bytes(),
+                    expected_digest: None,
+                },
+                metadata: SourceMetadata::default(),
+                times: SourceTimes::default(),
+                lineage: SourceLineage::default(),
+            },
+        ],
+        references: vec![EvidenceRefInput {
+            version: RecordVersion::V1,
+            key: key("sref"),
+            occurrence_key: key("sref-big"),
+            target: EvidenceRefTarget::Structured {
+                revision: RecordRef::Local(key("jsonrev")),
+                pointer: "/target".into(),
+                method: MethodRef {
+                    method: iri(JSON_LEXICAL_UTF8_V1),
+                    version: key(JSON_LEXICAL_UTF8_VERSION),
+                },
+                value_digest: val_digest,
+            },
+        }],
+        ..EvidenceInput::default()
+    };
+    let p = propose(&ds, &batch, &propose_options()).unwrap();
+    let binrev = iri_of(&p, "binrev");
+    let sref = iri_of(&p, "sref");
+
+    evidence::detach(&ds, SOURCES).unwrap();
+    evidence::detach(&ds, CLAIMS).unwrap();
+    configure(&ds);
+
+    let re_src =
+        evidence::reauthenticate(&ds, &ds, &iri(SOURCES), &reauth_options(), &Control::none())
+            .unwrap();
+    assert!(re_src.committed);
+    assert_eq!(re_src.records.len(), 2);
+    let re_claims =
+        evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &reauth_options(), &Control::none())
+            .unwrap();
+    assert!(re_claims.committed);
+    assert_eq!(re_claims.records.len(), 1);
+    assert!(resolve_record(&ds, &ds, &binrev, RecordKind::SourceRevision).is_ok());
+    assert!(resolve_record(&ds, &ds, &sref, RecordKind::EvidenceRef).is_ok());
+}
+
+#[test]
+fn reauthenticate_keyed_whole_graph_replay_and_cross_graph_idempotency() {
+    let ds = memory_ds();
+    configure(&ds);
+    let p1 = propose(&ds, &small_batch("m1", "rm1"), &propose_options()).unwrap();
+    let c1 = iri_of(&p1, "claim");
+
+    // Detach & re-protect CLAIMS, then propose a second claim `c2` under the NEW nonce
+    // so CLAIMS is mixed: `c1` stale, `c2` already authenticated.
+    evidence::detach(&ds, CLAIMS).unwrap();
+    configure(&ds);
+    let mut p2_opts = propose_options();
+    p2_opts.idempotency_key = Some("prop-key-shared".into());
+    let p2 = propose(&ds, &small_batch("m2", "rm2"), &p2_opts).unwrap();
+    let c2 = iri_of(&p2, "claim");
+
+    // Keyed whole-graph reconciliation on mixed graph returns both records with exact flags.
+    let head_before = ds.store().head_commit().seq;
+    let mut opts = reauth_options();
+    opts.idempotency_key = Some("whole-mixed-1".into());
+    opts.if_head = Some(head_before);
+    let first = evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &opts, &Control::none()).unwrap();
+    assert!(first.committed);
+    assert!(!first.replayed);
+    assert_eq!(first.records.len(), 2);
+    assert!(
+        first
+            .records
+            .iter()
+            .any(|r| r.iri == c1 && !r.already_authenticated)
+    );
+    assert!(
+        first
+            .records
+            .iter()
+            .any(|r| r.iri == c2 && r.already_authenticated)
+    );
+
+    // Replaying with the original (now stale!) `ifHead` must STILL replay identically
+    // (replay runs before `ifHead` AND preserves alreadyAuthenticated records).
+    let replayed =
+        evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &opts, &Control::none()).unwrap();
+    assert!(!replayed.committed);
+    assert!(replayed.replayed);
+    assert_eq!(replayed.operation, first.operation);
+    assert_eq!(replayed.commit, first.commit);
+    assert_eq!(replayed.records, first.records);
+
+    // Cross-graph key reuse: reusing "whole-mixed-1" on SOURCES must return
+    // `409 idempotency-conflict`, NOT publish a second operation under the same IRI.
+    let mut cross = reauth_options();
+    cross.idempotency_key = Some("whole-mixed-1".into());
+    assert_eq!(
+        code(evidence::reauthenticate(
+            &ds,
+            &ds,
+            &iri(SOURCES),
+            &cross,
+            &Control::none(),
+        )),
+        "idempotency-conflict"
+    );
+
+    // Cross-operation key reuse: reusing the `propose` key "prop-key-shared" for
+    // `reauthenticate` on SOURCES (same principal) must return `idempotency-conflict`
+    // and leave the original proposal replay intact.
+    let mut cross_op = ReauthenticateOptions::new(propose_options().principal);
+    cross_op.idempotency_key = Some("prop-key-shared".into());
+    assert_eq!(
+        code(evidence::reauthenticate(
+            &ds,
+            &ds,
+            &iri(SOURCES),
+            &cross_op,
+            &Control::none(),
+        )),
+        "idempotency-conflict"
+    );
+    let prop_replay = propose(&ds, &small_batch("m2", "rm2"), &p2_opts).unwrap();
+    assert!(prop_replay.replayed);
+    assert_eq!(prop_replay.operation, p2.operation);
+
+    // Keyed whole-graph reconciliation on an all-current graph returns all records on
+    // both initial call and replay.
+    let mut all_cur = reauth_options();
+    all_cur.idempotency_key = Some("whole-all-current".into());
+    let first_cur =
+        evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &all_cur, &Control::none()).unwrap();
+    assert!(first_cur.committed);
+    assert_eq!(first_cur.records.len(), 2);
+    assert!(first_cur.records.iter().all(|r| r.already_authenticated));
+    let replay_cur =
+        evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &all_cur, &Control::none()).unwrap();
+    assert!(replay_cur.replayed);
+    assert_eq!(replay_cur.records, first_cur.records);
+}
+
+#[test]
+fn reauthenticate_rejects_noncanonical_uuids_and_subnode_large_predicates() {
+    // 1. Uppercase UUID on record -> refuses without writing or leaving duplicate nonce.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &small_batch("uc-rec", "r-uc-rec"), &propose_options()).unwrap();
+        let claim = iri_of(&p, "claim");
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             DELETE {{ GRAPH <{CLAIMS}> {{ <{c}> ev:graphProtection ?n }} }}
+             INSERT {{ GRAPH <{CLAIMS}> {{ <{c}> ev:graphProtection ?u }} }}
+             WHERE {{ GRAPH <{CLAIMS}> {{ <{c}> ev:graphProtection ?n . BIND(UCASE(?n) AS ?u) }} }}",
+            c = claim.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "origin-not-reproduced"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+
+    // 2. Uppercase UUID on receipt -> refuses without writing.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &small_batch("uc-op", "r-uc-op"), &propose_options()).unwrap();
+        let op = p.operation.clone();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             DELETE {{ GRAPH <{CLAIMS}> {{ <{op}> ev:graphProtection ?n }} }}
+             INSERT {{ GRAPH <{CLAIMS}> {{ <{op}> ev:graphProtection ?u }} }}
+             WHERE {{ GRAPH <{CLAIMS}> {{ <{op}> ev:graphProtection ?n . BIND(UCASE(?n) AS ?u) }} }}",
+            op = op.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "origin-not-reproduced"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+
+    // 3. Adding `ev:retainedBytes` on a fragment sub-node of a revision -> refused!
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &rich_batch("sub-large"), &propose_options()).unwrap();
+        let rev = iri_of(&p, "rev");
+        evidence::detach(&ds, SOURCES).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             INSERT DATA {{ GRAPH <{SOURCES}> {{ <{r}#selector> ev:retainedBytes \"arbitrary\" }} }}",
+            r = rev.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let head = ds.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(SOURCES),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+        assert_eq!(ds.store().head_commit().seq, head);
+    }
+}
+
+#[test]
+fn reauthenticate_checks_passage_and_structured_dependencies_and_duplicates() {
+    // 1. Removed rendition -> reconciling passage refuses with `evidence-unavailable`.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &rich_batch("no-rend"), &propose_options()).unwrap();
+        let rend = iri_of(&p, "rend");
+        let pass = iri_of(&p, "pass");
+        evidence::detach(&ds, SOURCES).unwrap();
+        ds.update(&format!(
+            "DELETE WHERE {{ GRAPH <{SOURCES}> {{ <{r}> ?p ?o }} }}",
+            r = rend.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let mut opts = reauth_options();
+        opts.records = Some(vec![ReauthenticateRecord {
+            iri: pass,
+            expected_digest: None,
+        }]);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(SOURCES),
+                &opts,
+                &Control::none(),
+            )),
+            "evidence-unavailable"
+        );
+    }
+
+    // 2. Removed `ev:normalizedText` on rendition -> reconciling passage refuses `evidence-unavailable`.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &rich_batch("no-text"), &propose_options()).unwrap();
+        let rend = iri_of(&p, "rend");
+        let pass = iri_of(&p, "pass");
+        evidence::detach(&ds, SOURCES).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}> DELETE WHERE {{ GRAPH <{SOURCES}> {{ <{r}> ev:normalizedText ?t }} }}",
+            r = rend.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let mut opts = reauth_options();
+        opts.records = Some(vec![ReauthenticateRecord {
+            iri: pass,
+            expected_digest: None,
+        }]);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(SOURCES),
+                &opts,
+                &Control::none(),
+            )),
+            "evidence-unavailable"
+        );
+    }
+
+    // 3. Duplicate rendition in another record graph -> reconciling passage refuses `immutable-record-conflict`.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &rich_batch("dup-rend"), &propose_options()).unwrap();
+        let rend = iri_of(&p, "rend");
+        let pass = iri_of(&p, "pass");
+        evidence::detach(&ds, SOURCES).unwrap();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             INSERT DATA {{ GRAPH <{CLAIMS}> {{ <{r}> a ev:Rendition }} }}",
+            r = rend.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let mut opts = reauth_options();
+        opts.records = Some(vec![ReauthenticateRecord {
+            iri: pass,
+            expected_digest: None,
+        }]);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(SOURCES),
+                &opts,
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+
+    // 4. Multiple `ev:retainedBytes` on JSON revision -> reconciling structured ref refuses `immutable-record-conflict`.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &rich_batch("multi-bytes"), &propose_options()).unwrap();
+        let rev = iri_of(&p, "rev");
+        let sref = iri_of(&p, "sref");
+        evidence::detach(&ds, SOURCES).unwrap();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "PREFIX ev: <{EV}>
+             INSERT DATA {{ GRAPH <{SOURCES}> {{ <{r}> ev:retainedBytes \"e30=\"^^<http://www.w3.org/2001/XMLSchema#base64Binary> }} }}",
+            r = rev.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        let mut opts = reauth_options();
+        opts.records = Some(vec![ReauthenticateRecord {
+            iri: sref,
+            expected_digest: None,
+        }]);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &opts,
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+
+    // 5. Tampered passage quote (`oa:exact`) and selector (`oa:end`) -> refused.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(&ds, &rich_batch("bad-quote"), &propose_options()).unwrap();
+        let pass = iri_of(&p, "pass");
+        evidence::detach(&ds, SOURCES).unwrap();
+        ds.update(&format!(
+            "PREFIX oa: <http://www.w3.org/ns/oa#>
+             DELETE {{ GRAPH <{SOURCES}> {{ <{p}> oa:exact ?q }} }}
+             INSERT {{ GRAPH <{SOURCES}> {{ <{p}> oa:exact \"different quote\" }} }}
+             WHERE {{ GRAPH <{SOURCES}> {{ <{p}> oa:exact ?q }} }}",
+            p = pass.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(SOURCES),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+
+    // 6. Cross-graph duplicate candidate record -> refused.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p = propose(
+            &ds,
+            &small_batch("dup-cand", "r-dup-cand"),
+            &propose_options(),
+        )
+        .unwrap();
+        let claim = iri_of(&p, "claim");
+        evidence::detach(&ds, SOURCES).unwrap();
+        evidence::detach(&ds, CLAIMS).unwrap();
+        ds.update(&format!(
+            "INSERT DATA {{ GRAPH <{SOURCES}> {{ <{c}> <urn:extra> \"1\" }} }}",
+            c = claim.as_str(),
+        ))
+        .unwrap();
+        configure(&ds);
+        assert_eq!(
+            code(evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(CLAIMS),
+                &reauth_options(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+}
+
+#[test]
+fn partial_reauth_blocks_unauthenticated_replay_in_review_withdraw_and_identity_review() {
+    // 1. Multi-decision `review`: selectively re-authenticating only one decision (or one
+    //    support) must prevent replaying the review idempotency key.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p1 = propose(&ds, &small_batch("rv1", "rrv1"), &propose_options()).unwrap();
+        let p2 = propose(&ds, &small_batch("rv2", "rrv2"), &propose_options()).unwrap();
+        let c1 = iri_of(&p1, "claim");
+        let c2 = iri_of(&p2, "claim");
+        let d1_dig = digest_of(&p1, "claim");
+        let d2_dig = digest_of(&p2, "claim");
+
+        let decisions = vec![
+            DecisionInput {
+                key: "d1".into(),
+                target: c1,
+                target_digest: d1_dig,
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            },
+            DecisionInput {
+                key: "d2".into(),
+                target: c2,
+                target_digest: d2_dig,
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            },
+        ];
+        let mut ropts = ReviewOptions::new(iri("urn:x-sparkles:principal:reviewer"));
+        ropts.if_head = Some(ds.store().head_commit().seq);
+        ropts.idempotency_key = Some("review-multi-1".into());
+        let rev = evidence::review(
+            None,
+            &ds,
+            &ds,
+            "advisories",
+            1,
+            &decisions,
+            &ropts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let dec1 = rev.decisions[0].iri.clone();
+        let sup1 = rev.decisions[0].support.clone().unwrap();
+
+        // Detach DECISIONS, re-protect, selectively reconcile ONLY dec1 (leaving dec2 unvouched).
+        evidence::detach(&ds, DECISIONS).unwrap();
+        configure(&ds);
+        let mut sel = reauth_options();
+        sel.records = Some(vec![ReauthenticateRecord {
+            iri: dec1,
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(DECISIONS), &sel, &Control::none())
+                .unwrap()
+                .committed
+        );
+        // Replaying the review idempotency key MUST refuse with `immutable-record-conflict`!
+        assert_eq!(
+            code(evidence::review(
+                None,
+                &ds,
+                &ds,
+                "advisories",
+                1,
+                &decisions,
+                &ropts,
+                &mut |_, _| all(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+
+        // Now reconcile all of DECISIONS, then detach SUPPORTS and reconcile ONLY sup1.
+        assert!(
+            evidence::reauthenticate(
+                &ds,
+                &ds,
+                &iri(DECISIONS),
+                &reauth_options(),
+                &Control::none()
+            )
+            .unwrap()
+            .committed
+        );
+        evidence::detach(&ds, SUPPORTS).unwrap();
+        configure(&ds);
+        let mut sel_s = reauth_options();
+        sel_s.records = Some(vec![ReauthenticateRecord {
+            iri: sup1,
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(SUPPORTS), &sel_s, &Control::none())
+                .unwrap()
+                .committed
+        );
+        assert_eq!(
+            code(evidence::review(
+                None,
+                &ds,
+                &ds,
+                "advisories",
+                1,
+                &decisions,
+                &ropts,
+                &mut |_, _| all(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+
+    // 2. Multi-withdrawal `withdraw`: selectively re-authenticating only w1 must block
+    //    replaying the withdrawal idempotency key.
+    {
+        let ds = memory_ds();
+        configure(&ds);
+        let p1 = propose(&ds, &small_batch("wd1", "rwd1"), &propose_options()).unwrap();
+        let p2 = propose(&ds, &small_batch("wd2", "rwd2"), &propose_options()).unwrap();
+        let withdrawals = vec![
+            WithdrawalInput {
+                key: "w1".into(),
+                target: iri_of(&p1, "claim"),
+                target_digest: digest_of(&p1, "claim"),
+            },
+            WithdrawalInput {
+                key: "w2".into(),
+                target: iri_of(&p2, "claim"),
+                target_digest: digest_of(&p2, "claim"),
+            },
+        ];
+        let mut wopts = ReviewOptions::new(iri("urn:x-sparkles:principal:reviewer"));
+        wopts.idempotency_key = Some("withdraw-multi-1".into());
+        let w = evidence::withdraw(
+            &ds,
+            &ds,
+            &withdrawals,
+            &wopts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let w1_iri = w.withdrawals[0].iri.clone().unwrap();
+
+        evidence::detach(&ds, CLAIMS).unwrap();
+        configure(&ds);
+        // Re-authenticate both target claims AND w1 (leaving ONLY w2 unvouched) so
+        // `withdraw` passes target resolution, enters its replay path with an
+        // authenticated operation receipt, and must refuse because w2 is unvouched.
+        let mut sel = reauth_options();
+        sel.records = Some(vec![
+            ReauthenticateRecord {
+                iri: iri_of(&p1, "claim"),
+                expected_digest: None,
+            },
+            ReauthenticateRecord {
+                iri: iri_of(&p2, "claim"),
+                expected_digest: None,
+            },
+            ReauthenticateRecord {
+                iri: w1_iri,
+                expected_digest: None,
+            },
+        ]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(CLAIMS), &sel, &Control::none())
+                .unwrap()
+                .committed
+        );
+        assert_eq!(
+            code(evidence::withdraw(
+                &ds,
+                &ds,
+                &withdrawals,
+                &wopts,
+                &mut |_, _| all(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+
+    // 3. Multi-decision `identity::review`: selectively re-authenticating only d1 must
+    //    block replaying the identity review idempotency key.
+    {
+        let ds = memory_ds();
+        evidence::configure(&ds, &identity_settings(), &Control::none()).unwrap();
+        let batch = EvidenceInput {
+            identities: vec![
+                IdentityInput {
+                    version: RecordVersion::V1,
+                    key: key("id1"),
+                    occurrence_key: key("id1"),
+                    entities: vec![iri("https://example.org/p1"), iri("https://example.org/p2")],
+                    relation: IdentityRelation::PossibleMatch,
+                    preferred: Some(iri("https://example.org/p1")),
+                    attributed_author: iri("https://example.org/matcher"),
+                    method: None,
+                },
+                IdentityInput {
+                    version: RecordVersion::V1,
+                    key: key("id2"),
+                    occurrence_key: key("id2"),
+                    entities: vec![iri("https://example.org/p3"), iri("https://example.org/p4")],
+                    relation: IdentityRelation::PossibleMatch,
+                    preferred: Some(iri("https://example.org/p3")),
+                    attributed_author: iri("https://example.org/matcher"),
+                    method: None,
+                },
+            ],
+            ..EvidenceInput::default()
+        };
+        let mut popts = propose_options();
+        popts.identity_graph = Some(iri(IDENTITY));
+        let p = propose(&ds, &batch, &popts).unwrap();
+        let decisions = vec![
+            DecisionInput {
+                key: "d1".into(),
+                target: iri_of(&p, "id1"),
+                target_digest: digest_of(&p, "id1"),
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            },
+            DecisionInput {
+                key: "d2".into(),
+                target: iri_of(&p, "id2"),
+                target_digest: digest_of(&p, "id2"),
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            },
+        ];
+        let mut ropts = ReviewOptions::new(iri("urn:x-sparkles:principal:reviewer"));
+        ropts.if_head = Some(ds.store().head_commit().seq);
+        ropts.idempotency_key = Some("id-review-multi-1".into());
+        let rev = evidence::review(
+            None,
+            &ds,
+            &ds,
+            "people",
+            1,
+            &decisions,
+            &ropts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let dec1 = rev.decisions[0].iri.clone();
+
+        evidence::detach(&ds, DECISIONS).unwrap();
+        evidence::configure(&ds, &identity_settings(), &Control::none()).unwrap();
+        let mut sel = reauth_options();
+        sel.records = Some(vec![ReauthenticateRecord {
+            iri: dec1,
+            expected_digest: None,
+        }]);
+        assert!(
+            evidence::reauthenticate(&ds, &ds, &iri(DECISIONS), &sel, &Control::none())
+                .unwrap()
+                .committed
+        );
+        assert_eq!(
+            code(evidence::review(
+                None,
+                &ds,
+                &ds,
+                "people",
+                1,
+                &decisions,
+                &ropts,
+                &mut |_, _| all(),
+                &Control::none(),
+            )),
+            "immutable-record-conflict"
+        );
+    }
+}
+
+#[test]
+fn reauthenticate_counts_direct_and_fragment_triples_against_max_record_triples() {
+    let ds = memory_ds();
+    configure(&ds);
+    let p = propose(&ds, &small_batch("max-t", "r-max-t"), &propose_options()).unwrap();
+    let claim = iri_of(&p, "claim");
+
+    // Count existing direct triples on `claim` (including server-owned triples like
+    // `ev:availabilityReceipt`, `prov:wasGeneratedBy`, `ev:graphProtection`, `ev:recordDigest`).
+    let direct_count = {
+        let snap = ds.store().snapshot();
+        let prep = sparkles_core::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+        let mut reads = sparkles_core::evidence::write::Reads::new(&prep, &snap);
+        reads.subject_triples(claim.as_str(), CLAIMS, 1000).unwrap()
+    };
+    // Insert fragment triples so that `direct_count + fragment_count == MAX_RECORD_TRIPLES + 1`.
+    // Previously `MAX_RECORD_TRIPLES.saturating_sub(immutable_triples.len())` forgot the 4
+    // excluded server-owned direct triples and let this slip through.
+    let to_add = evidence::MAX_RECORD_TRIPLES - direct_count + 1;
+    evidence::detach(&ds, CLAIMS).unwrap();
+    {
+        let mut t = ds.store().write();
+        let mut labels = std::collections::HashMap::new();
+        let sub = iri(&format!("{}#sourceConfidence", claim.as_str()));
+        let pred = iri("https://example.org/pad");
+        let gn = oxrdf::GraphName::NamedNode(iri(CLAIMS));
+        for i in 0..to_add {
+            let q = oxrdf::Quad::new(
+                sub.clone(),
+                pred.clone(),
+                Literal::new_simple_literal(format!("v{i}")),
+                gn.clone(),
+            );
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        t.commit().unwrap();
+    }
+    configure(&ds);
+    assert_eq!(
+        code(evidence::reauthenticate(
+            &ds,
+            &ds,
+            &iri(CLAIMS),
+            &reauth_options(),
+            &Control::none(),
+        )),
+        "incomplete-evidence"
     );
 }

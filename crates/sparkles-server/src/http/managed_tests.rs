@@ -1231,10 +1231,23 @@ async fn identities_are_proposed_reviewed_and_resolved_over_http() {
 #[tokio::test]
 async fn evidence_reauthenticate_http_route_and_openapi_contract() {
     let dir = tempfile::tempdir().unwrap();
+    // Initialize persistent dataset and activate configuration history before opening.
+    let ds_path = dir.path().join("databases").join("d");
+    {
+        let _ds = sparkles::Dataset::open(&ds_path).unwrap();
+        drop(_ds);
+        let prep =
+            sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+        sparkles::migrate::activate_configuration_history(&ds_path, false, &prep).unwrap();
+    }
     let state = Arc::new(
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
     );
-    state.attach("d", DbType::Persistent, None).unwrap();
+    state
+        .attach("d", DbType::Persistent, Some(&ds_path))
+        .unwrap();
+    // Attach a second unactivated dataset to verify `409 configuration-history-inactive`.
+    state.attach("legacy", DbType::Memory, None).unwrap();
     let app = router(state.clone());
     let post = |uri: &'static str, body: J| {
         let app = app.clone();
@@ -1439,15 +1452,36 @@ async fn evidence_reauthenticate_http_route_and_openapi_contract() {
     assert_eq!(status, StatusCode::CONFLICT, "{tampered}");
     assert_eq!(tampered["code"], "immutable-record-conflict");
 
-    // Projection graphs and malformed requests are rejected with 400.
+    // Unactivated dataset returns 409 configuration-history-inactive.
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/legacy/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, inactive) = post(
+        "/$/evidence/legacy/reauthenticate",
+        json!({ "graph": "urn:ev:claims" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{inactive}");
+    assert_eq!(inactive["code"], "configuration-history-inactive");
+
+    // Projection graphs and malformed requests are rejected with consistent plain 400
+    // errors (never mixing `invalid-reference` with plain 400).
     for bad in [
         json!({ "graph": "urn:ev:accepted" }),
         json!({ "graph": "urn:ev:claims", "records": [] }),
         json!({ "graph": "not an iri" }),
+        json!({ "graph": "urn:ev:claims", "idempotencyKey": "" }),
         json!({ "graph": "urn:ev:claims", "extra": 1 }),
     ] {
         let (status, j) = post("/$/evidence/d/reauthenticate", bad).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+        assert!(j.get("code").is_none(), "unexpected error code on 400: {j}");
     }
 
     // Response matches the published OpenAPI schema.
@@ -1459,4 +1493,61 @@ async fn evidence_reauthenticate_http_route_and_openapi_contract() {
         crate::openapi::contract_tests::mismatch(&doc, &schema, &res, "$"),
         None
     );
+
+    // Chunked streaming body above 4 MiB is rejected with 413 at extraction time even
+    // when the general admin ceiling is much larger (16 MiB default).
+    {
+        use axum::body::{Body, Bytes};
+        use axum::http::Request;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt as _;
+
+        let yielded = StdArc::new(AtomicUsize::new(0));
+        let yielded_stream = yielded.clone();
+        // 16 chunks x 512 KiB = 8 MiB total, streamed with no Content-Length.
+        let chunk = Bytes::from(vec![b' '; 512 * 1024]);
+        let stream = futures_util::stream::iter((0..16).map(move |_| {
+            yielded_stream.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(chunk.clone())
+        }));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/$/evidence/d/reauthenticate")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Stopped streaming right after crossing 4 MiB (<= 10 chunks, not all 16).
+        assert!(
+            yielded.load(Ordering::SeqCst) <= 10,
+            "stream was buffered past 4 MiB: yielded {} chunks",
+            yielded.load(Ordering::SeqCst)
+        );
+    }
+
+    // Read-only server rejects re-authentication with 403.
+    {
+        let ro_dir = tempfile::tempdir().unwrap();
+        let mut ro_state = AppState::new(
+            ro_dir.path(),
+            StoreOptions::default(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        ro_state.read_only = true;
+        let ro_state = Arc::new(ro_state);
+        ro_state.attach("d", DbType::Memory, None).unwrap();
+        let ro_app = router(ro_state);
+        let (status, j) = call(
+            &ro_app,
+            "POST",
+            "/$/evidence/d/reauthenticate",
+            Some("application/json"),
+            &json!({ "graph": "urn:ev:claims" }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{j}");
+    }
 }

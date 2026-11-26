@@ -35,6 +35,23 @@ pub fn select_json_lexical_utf8<'a>(
     Ok(selected.swap_remove(0))
 }
 
+/// Like [`select_json_lexical_utf8`], charging all temporary and retained selection
+/// scratch directly to `preparation` instead of a separate 64 MiB counter. The caller
+/// is responsible for keeping `source` charged to `preparation`.
+pub(super) fn select_json_lexical_utf8_prepared<'a>(
+    source: &'a str,
+    pointer: &str,
+    preparation: &crate::access::Preparation,
+) -> Result<SelectedJsonValue<'a>> {
+    let mut selected = select_json_lexical_utf8_batch_with(
+        source,
+        &[pointer],
+        preparation.control(),
+        Some(preparation),
+    )?;
+    Ok(selected.swap_remove(0))
+}
+
 /// A revision is validated and traversed once for its entire set of mandatory
 /// pointers. Outputs retain their input positions, including duplicate pointers.
 pub(super) fn select_json_lexical_utf8_batch<'a>(
@@ -42,14 +59,31 @@ pub(super) fn select_json_lexical_utf8_batch<'a>(
     pointers: &[&str],
     control: &Control,
 ) -> Result<Vec<SelectedJsonValue<'a>>> {
+    select_json_lexical_utf8_batch_with(source, pointers, control, None)
+}
+
+fn select_json_lexical_utf8_batch_with<'a>(
+    source: &'a str,
+    pointers: &[&str],
+    control: &Control,
+    preparation: Option<&crate::access::Preparation>,
+) -> Result<Vec<SelectedJsonValue<'a>>> {
     control.check()?;
     if pointers.is_empty() {
         return Ok(Vec::new());
     }
     input_bound(source.len())?;
-    let mut memory = Memory::new(pointers.iter().fold(source.len(), |total, pointer| {
-        total.saturating_add(pointer.len())
-    }))?;
+    let mut memory = match preparation {
+        Some(prep) => {
+            let initial = pointers
+                .iter()
+                .fold(0usize, |total, pointer| total.saturating_add(pointer.len()));
+            Memory::prepared(prep, initial)?
+        }
+        None => Memory::new(pointers.iter().fold(source.len(), |total, pointer| {
+            total.saturating_add(pointer.len())
+        }))?,
+    };
     memory.add(
         pointers.len().saturating_mul(
             (std::mem::size_of::<SelectedJsonValue<'_>>()
@@ -404,27 +438,52 @@ fn decode_string(raw: &str, memory: &mut Memory, control: &Control) -> Result<St
     Ok(decoded)
 }
 
-struct Memory(usize);
+enum Memory {
+    Local(usize),
+    Prepared(crate::access::Reservation),
+}
 impl Memory {
     fn new(bytes: usize) -> Result<Self> {
-        let mut memory = Self(0);
+        let mut memory = Self::Local(0);
         memory.add(bytes)?;
         Ok(memory)
     }
+    fn prepared(preparation: &crate::access::Preparation, bytes: usize) -> Result<Self> {
+        let res = preparation.reserve(bytes as u64)?;
+        Ok(Self::Prepared(res))
+    }
     fn add(&mut self, bytes: usize) -> Result<()> {
-        let requested = self.0.saturating_add(bytes);
-        if requested > MEMORY_LIMIT {
-            return Err(Error::BudgetExceeded(Budget {
-                kind: BudgetKind::Memory,
-                limit: MEMORY_LIMIT as u64,
-                requested: requested as u64,
-            }));
+        match self {
+            Self::Local(used) => {
+                let requested = used.saturating_add(bytes);
+                if requested > MEMORY_LIMIT {
+                    return Err(Error::BudgetExceeded(Budget {
+                        kind: BudgetKind::Memory,
+                        limit: MEMORY_LIMIT as u64,
+                        requested: requested as u64,
+                    }));
+                }
+                *used = requested;
+                Ok(())
+            }
+            Self::Prepared(res) => res.grow_by(bytes as u64),
         }
-        self.0 = requested;
-        Ok(())
     }
     fn remove(&mut self, bytes: usize) {
-        self.0 = self.0.saturating_sub(bytes);
+        match self {
+            Self::Local(used) => *used = used.saturating_sub(bytes),
+            Self::Prepared(res) => {
+                let next = res.bytes().saturating_sub(bytes as u64);
+                res.release_to(next);
+            }
+        }
+    }
+    #[cfg(test)]
+    fn used(&self) -> usize {
+        match self {
+            Self::Local(used) => *used,
+            Self::Prepared(res) => res.bytes() as usize,
+        }
     }
 }
 
@@ -713,7 +772,7 @@ mod tests {
         let many = pointer_trie(&pointers, &mut repeated, &Control::none()).unwrap();
         assert_eq!(one.len(), 1025);
         assert_eq!(many.len(), one.len());
-        assert!(repeated.0 < once.0 + pointers.len() * 64);
+        assert!(repeated.used() < once.used() + pointers.len() * 64);
         let source = format!("{}0{}", "{\"é/x~\":".repeat(1024), "}".repeat(1024));
         let pointer = "/é~1x~0".repeat(1024);
         let values =

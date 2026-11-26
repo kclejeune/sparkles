@@ -840,15 +840,61 @@ async fn evidence_settings_reads_use_admin_middleware() {
 
 #[tokio::test]
 async fn evidence_reauthenticate_requires_admin_and_respects_drift() {
-    let s = proposal_server();
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[users]]
+name = "evw"
+password = "{evw}"
+datasets = {{ ev = "write" }}
+
+[[users]]
+name = "main_admin"
+password = "{ma}"
+[[users.grants]]
+dataset = "ev"
+branches = ["main"]
+level = "admin"
+"#,
+            evw = h("evw-pw"),
+            ma = h("ma-pw"),
+        ),
+        ..Default::default()
+    });
+    // Create persistent dataset `ev` and activate configuration history before attaching.
+    let ev_path = s.dir.path().join("databases").join("ev");
+    {
+        let _ds = sparkles::Dataset::open(&ev_path).unwrap();
+        drop(_ds);
+        let prep =
+            sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+        sparkles::migrate::activate_configuration_history(&ev_path, false, &prep).unwrap();
+    }
+    let ds = s
+        .state
+        .attach("ev", DbType::Persistent, Some(&ev_path))
+        .unwrap();
+    let settings = sparkles::evidence::Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        ..Default::default()
+    };
+    sparkles::evidence::configure(&ds.dataset, &settings, &sparkles::task::Control::none())
+        .unwrap();
     let alice = b("alice");
     let evw = basic("evw", "evw-pw");
+    let main_admin = basic("main_admin", "ma-pw");
     let bob = b("bob");
 
-    // Propose a claim as writer `evw`.
+    // Propose a claim as writer `evw`, then fork branch `dev`.
     let r = propose(&s, &evw, &revision_and_claim("reauth-auth")).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let claim_iri = r.json()["records"][1]["iri"].as_str().unwrap().to_string();
+    ds.dataset
+        .create_branch("dev", &Default::default())
+        .unwrap();
 
     // Admin detaches and re-protects `urn:ev:claims`.
     let r = call(
@@ -906,6 +952,20 @@ async fn evidence_reauthenticate_requires_admin_and_respects_drift() {
             ("content-type", "application/json"),
         ],
         &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+
+    // Branch-scoped admin (`main_admin` has admin on `main` only) -> 403 on `branch: "dev"`.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/reauthenticate",
+        &[
+            ("authorization", &main_admin),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({ "graph": "urn:ev:claims", "branch": "dev" }).to_string(),
     )
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());

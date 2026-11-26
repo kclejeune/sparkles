@@ -1209,14 +1209,48 @@ pub fn review(
             let mut out = Vec::new();
             for d in decisions {
                 let iri = decided_iri(d)?;
+                match state.reads.record(&iri, &records)? {
+                    sparkles_core::evidence::write::ExistingRecord::Present {
+                        graph,
+                        authenticated: true,
+                        ..
+                    } if graph == p.decisions.0
+                        && state.typed(&iri, &p.decisions, RecordKind::ReviewDecision)? => {}
+                    _ => {
+                        return Err(managed(
+                            ManagedErrorKind::ImmutableRecordConflict,
+                            format!(
+                                "{}: decision <{}> from replayed operation <{}> is not authenticated",
+                                d.key,
+                                iri.as_str(),
+                                probe.operation_iri.as_str()
+                            ),
+                        ));
+                    }
+                }
                 let support =
                     rv::support_iri(main.dataset_id(), &options.principal, &iri, control)?;
-                let present = matches!(
-                    state
-                        .reads
-                        .record(&support, std::slice::from_ref(&p.supports))?,
-                    sparkles_core::evidence::write::ExistingRecord::Present { .. }
-                );
+                let present = match state
+                    .reads
+                    .record(&support, std::slice::from_ref(&p.supports))?
+                {
+                    sparkles_core::evidence::write::ExistingRecord::Present {
+                        authenticated: true,
+                        ..
+                    } => true,
+                    sparkles_core::evidence::write::ExistingRecord::Absent => false,
+                    _ => {
+                        return Err(managed(
+                            ManagedErrorKind::ImmutableRecordConflict,
+                            format!(
+                                "{}: support <{}> from replayed operation <{}> is not authenticated",
+                                d.key,
+                                support.as_str(),
+                                probe.operation_iri.as_str()
+                            ),
+                        ));
+                    }
+                };
                 // the first answer's metadata, from the records it wrote
                 let not_projected = state
                     .text(&iri, &ev("projectionNote"), &p.decisions)?
@@ -1864,12 +1898,39 @@ pub fn withdraw(
                     g,
                     control,
                 )?;
-                let ours = matches!(
-                    state
-                        .reads
-                        .record(&r.iri, &[(g.clone(), capability.protection(g.as_str()))])?,
-                    sparkles_core::evidence::write::ExistingRecord::Present { .. }
-                );
+                let protected: G = (g.clone(), capability.protection(g.as_str()));
+                let ours = match state.reads.record(&r.iri, &records)? {
+                    sparkles_core::evidence::write::ExistingRecord::Present {
+                        graph,
+                        digest,
+                        authenticated: true,
+                    } if graph == *g && digest == Some(r.digest) => true,
+                    sparkles_core::evidence::write::ExistingRecord::Absent => {
+                        if state.withdrawal(&w.target, &protected)?.is_none() {
+                            return Err(managed(
+                                ManagedErrorKind::ImmutableRecordConflict,
+                                format!(
+                                    "{}: withdrawal for <{}> from replayed operation <{}> is not authenticated",
+                                    w.key,
+                                    w.target.as_str(),
+                                    batch.operation_iri.as_str()
+                                ),
+                            ));
+                        }
+                        false
+                    }
+                    _ => {
+                        return Err(managed(
+                            ManagedErrorKind::ImmutableRecordConflict,
+                            format!(
+                                "{}: withdrawal <{}> from replayed operation <{}> is not authenticated",
+                                w.key,
+                                r.iri.as_str(),
+                                batch.operation_iri.as_str()
+                            ),
+                        ));
+                    }
+                };
                 out.push(WithdrawnClaim {
                     key: w.key.clone(),
                     iri: ours.then_some(r.iri),

@@ -1114,6 +1114,66 @@ impl Preparation {
         Ok(result)
     }
 
+    /// The lexical form of a stored typed literal with exact datatype `datatype`,
+    /// borrowed for `each` without decoding it as a general [`Term`]. Avoids the
+    /// general term decoder's `128x` reserve so multi-MiB payloads (such as
+    /// `xsd:base64Binary` `ev:retainedBytes` up to C25's 16 MiB limit) fit within a
+    /// 64 MiB preparation allowance. `None` for any other term or datatype.
+    pub fn with_typed_literal<R>(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        datatype: &str,
+        each: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        fn parse_typed_key<'a>(key: &'a [u8], datatype: &str) -> Option<&'a str> {
+            if key.first() != Some(&b'"') {
+                return None;
+            }
+            let sep = key.iter().rposition(|&b| b == crate::id::KEY_SEP)?;
+            let suffix = key.get(sep + 1..)?;
+            match suffix.split_first() {
+                Some((&b'^', dt)) if dt == datatype.as_bytes() => {
+                    std::str::from_utf8(&key[1..sep]).ok()
+                }
+                _ => None,
+            }
+        }
+        self.check()?;
+        let mut each = Some(each);
+        let mut workspace = self.reserve(0)?;
+        let result = match id.tag() {
+            Tag::Vocab => snap.generation.vocab.get_with_controlled(
+                id.payload(),
+                |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
+                |phase| self.checkpoint(phase),
+                |key| {
+                    // `workspace` already holds at least `2 * bytes + 256` for the
+                    // reconstructed vocabulary block that `key` borrows from.
+                    let each = each.take().expect("called once");
+                    each(parse_typed_key(key, datatype))
+                },
+            )?,
+            Tag::Delta => snap.generation.dvocab.with_prepared(self, |vocab| {
+                if id.payload() >= snap.dvocab_len {
+                    return Ok(None);
+                }
+                Ok(vocab.get(id.payload()).map(|key| {
+                    let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+                    let each = each.take().expect("called once");
+                    each(parse_typed_key(key, datatype))
+                }))
+            })?,
+            _ => None,
+        };
+        let result = match result {
+            Some(result) => result?,
+            None => (each.take().expect("not called"))(None)?,
+        };
+        self.check()?;
+        Ok(result)
+    }
+
     fn decode_term(&self, key: &[u8]) -> Result<(Term, Reservation)> {
         // Includes decoded strings/boxes. Explicit frame/value buffers below carry
         // separate reservations and avoid a recursive native-stack decoder.

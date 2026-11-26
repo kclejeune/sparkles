@@ -155,44 +155,49 @@ struct ReauthenticateRecordJson {
 }
 
 /// `POST /$/evidence/{ds}/reauthenticate`: verify records written under an earlier
-/// protection nonce in a protected evidence record graph against their recorded digests
-/// and mark the vouched records under the graph's current protection nonce.
+/// protection nonce in a protected evidence record graph against their retained
+/// configuration-bound publication views and recorded digests, and mark the vouched
+/// records under the graph's current protection nonce.
 async fn reauthenticate(
     State(st): St,
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
-    AdminBody(bytes): AdminBody,
+    body: axum::body::Body,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
-    if bytes.len() > MAX_REAUTHENTICATE_BYTES {
-        return Err(err(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("a re-authentication request holds at most {MAX_REAUTHENTICATE_BYTES} bytes"),
-        ));
-    }
+    let bytes = crate::http::read_admin_body_capped(
+        body,
+        &st.limits,
+        MAX_REAUTHENTICATE_BYTES as u64,
+        "re-authentication body limit",
+    )
+    .await?;
     let request: ReauthenticateRequest = serde_json::from_slice(&bytes).map_err(|e| {
         err(
             StatusCode::BAD_REQUEST,
             format!("invalid re-authentication request: {e}"),
         )
     })?;
-    let graph = named("graph", &request.graph)?;
+    let bad_req = |field: &str, why: &dyn std::fmt::Display| {
+        err(StatusCode::BAD_REQUEST, format!("{field}: {why}"))
+    };
+    let graph = oxrdf::NamedNode::new(&request.graph).map_err(|e| bad_req("graph", &e))?;
     let records = match request.records {
         None => None,
         Some(list) => {
             if list.is_empty() {
-                return Err(bad(
-                    "records".into(),
-                    "records must not be empty when supplied; omit records to reconcile every record in the graph",
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "records: records must not be empty when supplied; omit records to reconcile every record in the graph",
                 ));
             }
             if list.len() > sparkles::evidence::MAX_REAUTHENTICATE_RECORDS {
-                return Err(bad(
-                    "records".into(),
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
                     format!(
-                        "at most {} records",
+                        "records: at most {} records",
                         sparkles::evidence::MAX_REAUTHENTICATE_RECORDS
                     ),
                 ));
@@ -200,11 +205,15 @@ async fn reauthenticate(
             let mut parsed = Vec::with_capacity(list.len());
             for (i, item) in list.into_iter().enumerate() {
                 let at = format!("records[{i}]");
-                let iri = named(&format!("{at}.iri"), &item.iri)?;
+                let iri = oxrdf::NamedNode::new(&item.iri)
+                    .map_err(|e| bad_req(&format!("{at}.iri"), &e))?;
                 let expected_digest = item
                     .record_digest
                     .as_deref()
-                    .map(|d| claims::digest(&format!("{at}.recordDigest"), d))
+                    .map(|d| {
+                        d.parse::<sparkles::evidence::Sha256Digest>()
+                            .map_err(|e| bad_req(&format!("{at}.recordDigest"), &e))
+                    })
                     .transpose()?;
                 parsed.push(sparkles::evidence::ReauthenticateRecord {
                     iri,
@@ -217,7 +226,10 @@ async fn reauthenticate(
     if let Some(k) = &request.idempotency_key
         && (k.is_empty() || k.len() > 256)
     {
-        return Err(bad("idempotencyKey".into(), "a key has 1 to 256 bytes"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "idempotencyKey: a key has 1 to 256 bytes",
+        ));
     }
     let branch = request
         .branch

@@ -13406,26 +13406,32 @@ profile does not protect is a `404`. A detach refuses with `503 managed-unavaila
 and changes nothing when this build cannot read the recorded settings. A registry that this build cannot enforce answers
 `503 managed-unavailable` on all three routes.
 
-`POST /$/evidence/{ds}/reauthenticate` needs `admin` on the dataset and target branch.
+`POST /$/evidence/{ds}/reauthenticate` needs `admin` on the dataset and target branch, and
+requires activated configuration history (`409 configuration-history-inactive` otherwise).
 After a graph is detached and protected again under a new nonce, records of the earlier
 protection answer `422 origin-not-reproduced` and their identities refuse new proposals.
 This route takes `{"graph": IRI}` with optional `branch` (`main` by default), `records`
 (an explicit list of `{"iri": IRI, "recordDigest"?: "sha256:…"}` entries, or omitted to
 reconcile up to 10,000 profile records in `graph`), `ifHead`, `idempotencyKey`,
-`dryRun` and `message`. Only protected record-role graphs (`sourceRecords`, `proposals`,
-`decisions`, `supports` and `identity`) are accepted, and projection graphs are refused
-with `400`. Every candidate is checked against its recorded `ev:recordDigest`, retained
-bytes or normalized text, passage span, structured selection and receipt lineage within
-the 64 MiB preparation limit. Any tampered or mismatched record refuses the whole
-operation without writing (`409 immutable-record-conflict`, `409 target-changed`,
-`422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable` or
-`422 incomplete-evidence`). When all candidates pass, one atomic commit updates
-`ev:graphProtection` on the verified records and their receipt operations to the graph's
-current nonce, preserves the original receipts and timestamps, and writes an audit
-`ev:Operation`. It returns `409 evidence-settings-drift` while declared and recorded
-settings differ, `409 unsupported-profile` while the graph is detached, `409 head-changed`
-for a stale `ifHead`, `409 idempotency-conflict` for a reused key with another payload,
-and `503 authority-changed` when authorization changes before publication.
+`dryRun` and `message`, capped at 4 MiB while streaming the request body. Only protected
+record-role graphs (`sourceRecords`, `proposals`, `decisions`, `supports` and `identity`)
+are accepted, and projection graphs are refused with `400`. Every stale candidate is
+verified against its retained, configuration-bound publication view (`BoundEvidenceView`)
+for original protection, receipt, digest and commit timestamp, as well as its recomputed
+`ev:recordDigest`, retained bytes or normalized text, passage span, structured selection
+and audit lineage within the 64 MiB preparation limit. Any tampered, unretained or
+mismatched record refuses the whole operation without writing
+(`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`,
+`422 span-mismatch`, `422 evidence-unavailable` or `422 incomplete-evidence`). When all
+candidates pass, one atomic commit updates `ev:graphProtection` on the verified records
+and their receipt operations to the graph's current nonce, preserves the original receipts
+and timestamps, and writes an audit `ev:Operation`. Idempotency keys are checked across
+all configured record graphs before `ifHead`, and keyed whole-graph replays reproduce both
+renewed and already-authenticated records. It returns `409 evidence-settings-drift` while
+declared and recorded settings differ, `409 unsupported-profile` while the graph is
+detached, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused
+key with another payload, and `503 authority-changed` when authorization changes before
+publication.
 
 With [`serve --settings`](#settings), put `evidence` under `defaults` or a named
 dataset. Lock the entire kind with `evidence`, a field such as `evidence.sourceRecords`,

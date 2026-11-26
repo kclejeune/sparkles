@@ -3215,6 +3215,21 @@ async fn read_body(body: axum::body::Body, limit: Option<u64>, flag: &str) -> Ap
     Ok(first.unwrap_or_else(|| buf.into()))
 }
 
+/// Read an admin request body capped at the smaller of the route's own `cap` and the
+/// server's `--max-admin-body-mb` limit, enforcing the ceiling on both declared lengths
+/// and streamed chunks before buffering past it.
+pub(crate) async fn read_admin_body_capped(
+    body: axum::body::Body,
+    limits: &crate::state::Limits,
+    cap: u64,
+    what: &str,
+) -> ApiResult<Bytes> {
+    match limits.max_admin_body_bytes {
+        Some(admin) if admin <= cap => read_body(body, Some(admin), "--max-admin-body-mb").await,
+        _ => read_body(body, Some(cap), what).await,
+    }
+}
+
 /// Body extractors with the ceiling of their request class. Only the Graph Store and
 /// upload endpoints stream bodies of any size.
 macro_rules! limited_body {

@@ -2361,39 +2361,58 @@ An administrator with `admin` on the dataset and target branch reconciles one pr
 record-role graph (`sourceRecords`, `proposals`, `decisions`, `supports` or `identity`)
 at a time, either every profile record in the graph up to 10,000 records or an explicit
 list of record IRIs with optional expected `ev:recordDigest` values. Projection graphs
-are refused because they hold projected assertions rather than profile records. The
-operation checks each candidate under the 64 MiB preparation allowance, verifying that
-the record is absent from all other record graphs, carries a single profile class,
-matches its recomputed canonical `ev:recordDigest` across its direct triples and
-fragment sub-nodes, matches any retained `ev:retainedBytes` or `ev:normalizedText`
-against its `ev:contentDigest`, matches its passage quote and retained rendition span
-when applicable, matches any retained JSON structured selection, and carries an
-`ev:Operation` receipt of this dataset and a known branch whose timestamp matches
-`ev:firstAvailableAt` or `prov:invalidatedAtTime` and whose earlier nonce matches the
-record or was already renewed by an authenticated reconciliation linked through
-`prov:wasInformedBy`.
+are refused because they hold projected assertions rather than profile records.
+Re-authentication requires activated configuration history (`409 configuration-history-inactive`
+otherwise) so every stale candidate is independently checked against its retained,
+configuration-bound publication view (`BoundEvidenceView`) proving that the record and its
+receipt existed together under an earlier protection nonce at that commit with matching
+`ev:recordDigest`, receipt metadata and commit timestamp. Candidates whose publication
+view is not retained or predates activation are refused with `422 origin-not-reproduced`.
+Under the shared 64 MiB preparation allowance, the operation also verifies that each
+record is absent from all other record graphs, carries a single profile class, matches its
+recomputed canonical `ev:recordDigest` across its direct triples and fragment sub-nodes
+(canonicalizing blank-node labels inside reifier-anchored `ev:expectedTriple` terms, with
+publication-view verification for previously published records under the earlier raw-label
+scheme), matches any retained `ev:retainedBytes` (via bounded typed-literal streaming
+base64 hashing) or `ev:normalizedText` against its `ev:contentDigest`, matches its passage
+quote and unique retained rendition span when applicable, matches any retained JSON
+structured selection under the shared preparation allowance, rejects noncanonical nonce
+spellings and forbidden sub-node predicates, and verifies multi-detach nonce lineage
+through the original protection and authenticated reconciliation audit operations.
 
-Any tampered, missing or mismatched candidate refuses the entire operation without
-writing, returning `409 immutable-record-conflict`, `409 target-changed`,
+Any tampered, missing, unretained or mismatched candidate refuses the entire operation
+without writing, returning `409 immutable-record-conflict`, `409 target-changed`,
 `422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable` or
-`422 incomplete-evidence`. When every candidate verifies, one atomic managed-write
-commit rewrites `ev:graphProtection` on each verified record and its receipt operation
-to the graph's current nonce while preserving `ev:availabilityReceipt`,
-`prov:wasGeneratedBy`, `ev:recordDigest` and availability timestamps, and records an
-audit `ev:Operation` linking vouched records via `prov:used` and renewed receipts via
-`prov:wasInformedBy`. The operation honors `ifHead`, `idempotencyKey`, `dryRun`,
-declared evidence-settings drift checks and the caller authority fence. Replaying an
-idempotent proposal checks that every record of the replayed payload remains
-authenticated, so a partial re-authentication never replays an unvouched record.
-Projection and resolution-map records keep their immutable nonce fields, so
-`projection-unavailable` remains enforced until the projection or map is reconciled.
+`422 incomplete-evidence`. When every candidate verifies and the audit subject carries no
+pre-existing triples in any record graph, one atomic managed-write commit rewrites
+`ev:graphProtection` on each verified record and its receipt operation to the graph's
+current nonce while preserving `ev:availabilityReceipt`, `prov:wasGeneratedBy`,
+`ev:recordDigest` and availability timestamps, and records an audit `ev:Operation` stamped
+with `ev:operationKind ev:Reauthentication` and `ev:reauthenticatedGraph`, linking renewed
+records via `prov:used`, already-authenticated records via `ev:alreadyAuthenticated`, and
+renewed receipts via `prov:wasInformedBy`. The operation checks idempotency keys across
+all configured record graphs before `ifHead`, honors `dryRun`, declared evidence-settings
+drift checks, the caller authority fence and streaming 4 MiB body limits, and reproduces
+both renewed and already-authenticated records on whole-graph replay. Replaying an
+idempotent proposal, review, withdrawal or identity review verifies that every record
+produced by the replayed operation remains authenticated, so a partial re-authentication
+never replays an unvouched record. Projection and resolution-map records keep their
+immutable nonce fields, so `projection-unavailable` remains enforced until the projection
+or map is reconciled.
 
 Unit, library, router and auth tests cover detach and re-protect cycles across all
-record kinds, retained bytes and normalized text tampering, sub-node and timestamp
-tampering, planted records targeting predictable future operations, selective
-re-authentication and partial-replay safety, dry runs, branch scoping, persistent
-reopen durability, non-admin and drift refusals, idempotency replays and conflicts,
-and OpenAPI schema conformance.
+record kinds, retained bytes (including multi-MiB payloads and JSON selections) and
+normalized text tampering, changed records with recomputed digests, records absent from
+their publication commit, matching timestamp edits, detached-commit forged receipts,
+unactivated configuration history and unretained commits, untyped pre-existing audit
+subjects, multi-detach partial reconciliation across epochs in every order, reifier-backed
+blank-node `ev:expectedTriple` round-trips and legacy digests, preparation-budget and
+triple-count boundaries, noncanonical UUID nonces, passage and structured dependency
+duplicates and missing content, fragment sub-node `LARGE` predicates, partial-replay
+safety across proposals, reviews, withdrawals and identity reviews, cross-graph
+idempotency conflicts, keyed whole-graph mixed and all-current replays, dry runs, branch
+scoping, persistent reopen durability, streaming 4 MiB body caps, read-only, non-admin,
+branch-admin, graph-grant and drift refusals, and OpenAPI schema conformance.
 
 ### Scope changes
 

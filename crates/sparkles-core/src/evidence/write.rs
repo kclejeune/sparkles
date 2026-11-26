@@ -407,13 +407,51 @@ impl Record {
     }
 }
 
+/// Deterministically relabel blank nodes inside a single triple (including nested
+/// triple terms) to `b0`, `b1`, … in `subject -> object` encounter order. Ground
+/// triples are returned unchanged. Two triples are isomorphic iff their canonicalized
+/// forms are equal, so `ev:expectedTriple` hashes identically before and after scoped
+/// blank-node allocation in the store.
+pub(super) fn canonicalize_triple_blanks(triple: &Triple) -> Triple {
+    fn relabel_blank(b: &oxrdf::BlankNode, map: &mut BTreeMap<String, String>) -> oxrdf::BlankNode {
+        let next = map.len();
+        let label = map
+            .entry(b.as_str().to_string())
+            .or_insert_with(|| format!("b{next}"));
+        oxrdf::BlankNode::new_unchecked(label.as_str())
+    }
+    fn relabel_term(term: &Term, map: &mut BTreeMap<String, String>) -> Term {
+        match term {
+            Term::BlankNode(b) => Term::BlankNode(relabel_blank(b, map)),
+            Term::Triple(t) => Term::Triple(Box::new(relabel_triple(t, map))),
+            other => other.clone(),
+        }
+    }
+    fn relabel_triple(t: &Triple, map: &mut BTreeMap<String, String>) -> Triple {
+        let subject = match &t.subject {
+            NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::BlankNode(relabel_blank(b, map)),
+            NamedOrBlankNode::NamedNode(n) => NamedOrBlankNode::NamedNode(n.clone()),
+        };
+        let object = relabel_term(&t.object, map);
+        Triple::new(subject, t.predicate.clone(), object)
+    }
+    if !super::prepare::has_blank(triple) {
+        return triple.clone();
+    }
+    let mut map = BTreeMap::new();
+    relabel_triple(triple, &mut map)
+}
+
 /// The digest of a record's immutable content: the sorted digests of its triples,
 /// framed under the record kind, without the large values listed in [`LARGE`].
+/// Blank nodes inside a stored fact's `ev:expectedTriple` are canonicalized in
+/// deterministic traversal order so the digest survives scoped storage allocation.
 pub fn record_digest(
     kind: RecordKind,
     triples: &[Triple],
     control: &Control,
 ) -> Result<Sha256Digest> {
+    const EXPECTED_TRIPLE: &str = "urn:x-sparkles:evidence:expectedTriple";
     let mut each = Vec::with_capacity(triples.len());
     for t in triples {
         if LARGE.contains(&t.predicate.as_str()) {
@@ -425,7 +463,19 @@ pub fn record_digest(
             continue;
         }
         let mut frame = FrameHash::new(b"sparkles-evidence-record-triple-v1", control)?;
-        frame.triple(t)?;
+        if t.predicate.as_str() == EXPECTED_TRIPLE
+            && let Term::Triple(inner) = &t.object
+            && super::prepare::has_blank(inner)
+        {
+            let canon = Triple::new(
+                t.subject.clone(),
+                t.predicate.clone(),
+                Term::Triple(Box::new(canonicalize_triple_blanks(inner))),
+            );
+            frame.triple(&canon)?;
+        } else {
+            frame.triple(t)?;
+        }
         each.push(frame.finish()?);
     }
     each.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -1289,9 +1339,24 @@ impl<'a> Reads<'a> {
         g: &str,
         limit: usize,
     ) -> Result<(Vec<Term>, bool)> {
+        let mut held = self.preparation.reserve(0)?;
+        self.objects_up_to_held(s, p, g, limit, &mut held)
+    }
+
+    /// Like [`Self::objects_up_to`], charging every returned term into `held` before
+    /// copying it so the caller keeps the copies charged for their full lifetime.
+    pub fn objects_up_to_held(
+        &mut self,
+        s: &str,
+        p: &str,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<Term>, bool)> {
         let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
             return Ok((Vec::new(), false));
         };
+        let mut ids_held = self.preparation.reserve(0)?;
         let mut ids = Vec::new();
         let mut more = false;
         self.preparation
@@ -1300,15 +1365,24 @@ impl<'a> Reads<'a> {
                     more = true;
                     return Ok(false);
                 }
+                if ids.len() == ids.capacity() {
+                    const CHUNK: usize = 256;
+                    ids_held.grow_by((CHUNK * std::mem::size_of::<Id>()) as u64)?;
+                    ids.reserve_exact(CHUNK);
+                }
                 ids.push(q[2]);
                 Ok(true)
             })?;
         let mut out = Vec::with_capacity(ids.len());
+        held.grow_by((ids.len() * std::mem::size_of::<Term>()) as u64)?;
         for id in ids {
-            if let Some(t) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
+            if let Some(t) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(t) => {
+                    held.grow_by(term_heap_bytes(t))?;
+                    Ok(Some(t.clone()))
+                }
+                None => Ok(None),
+            })? {
                 out.push(t);
             }
         }
@@ -1324,6 +1398,20 @@ impl<'a> Reads<'a> {
         g: &str,
         limit: usize,
     ) -> Result<(Vec<NamedNode>, bool)> {
+        let mut held = self.preparation.reserve(0)?;
+        self.subjects_up_to_held(p, o, g, limit, &mut held)
+    }
+
+    /// Like [`Self::subjects_up_to`], charging every returned IRI into `held` before
+    /// copying it so the caller keeps the copies charged for their full lifetime.
+    pub fn subjects_up_to_held(
+        &mut self,
+        p: &str,
+        o: &Term,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<NamedNode>, bool)> {
         let (Some(p), Some(g)) = (self.id(p)?, self.id(g)?) else {
             return Ok((Vec::new(), false));
         };
@@ -1334,6 +1422,7 @@ impl<'a> Reads<'a> {
         let Some(o) = o else {
             return Ok((Vec::new(), false));
         };
+        let mut ids_held = self.preparation.reserve(0)?;
         let mut ids = Vec::new();
         let mut more = false;
         self.preparation
@@ -1345,15 +1434,24 @@ impl<'a> Reads<'a> {
                     more = true;
                     return Ok(false);
                 }
+                if ids.len() == ids.capacity() {
+                    const CHUNK: usize = 256;
+                    ids_held.grow_by((CHUNK * std::mem::size_of::<Id>()) as u64)?;
+                    ids.reserve_exact(CHUNK);
+                }
                 ids.push(q[0]);
                 Ok(true)
             })?;
         let mut out = Vec::with_capacity(ids.len());
+        held.grow_by((ids.len() * std::mem::size_of::<NamedNode>()) as u64)?;
         for id in ids {
-            if let Some(Term::NamedNode(n)) = self
-                .preparation
-                .with_term(self.snap, id, |t| Ok(t.cloned()))?
-            {
+            if let Some(n) = self.preparation.with_term(self.snap, id, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by((n.as_str().len() as u64).saturating_add(48))?;
+                    Ok(Some(n.clone()))
+                }
+                _ => Ok(None),
+            })? {
                 out.push(n);
             }
         }
@@ -1436,7 +1534,15 @@ impl<'a> Reads<'a> {
     }
 
     pub(super) fn has_subject(&mut self, s: &str, g: &str) -> Result<bool> {
-        let (Some(s), Some(g)) = (self.id(s)?, self.id(g)?) else {
+        self.has_subject_in(s, g)
+    }
+
+    /// Whether `s` has any triple in `g`, without caching `s` in `self.ids`.
+    pub fn has_subject_in(&mut self, s: &str, g: &str) -> Result<bool> {
+        let Some(g) = self.id(g)? else {
+            return Ok(false);
+        };
+        let Some(s) = self.preparation.lookup_iri(self.snap, s)? else {
             return Ok(false);
         };
         let mut found = false;
@@ -1446,6 +1552,15 @@ impl<'a> Reads<'a> {
                 Ok(false)
             })?;
         Ok(found)
+    }
+
+    /// Up to two objects of `s p ?o` in `g`.
+    pub(super) fn pair_objects(&mut self, s: &str, p: &str, g: &str) -> Result<Vec<Term>> {
+        self.objects(s, p, g)
+    }
+
+    pub fn is_operation_in(&mut self, op: &str, g: &str) -> Result<bool> {
+        self.is_operation(op, g)
     }
 
     pub(super) fn is_operation(&mut self, op: &str, g: &str) -> Result<bool> {
@@ -1699,6 +1814,27 @@ impl<'a> Reads<'a> {
             };
         }
         Ok(found)
+    }
+}
+
+/// Estimate heap bytes owned by a cloned `Term` for preparation accounting.
+fn term_heap_bytes(t: &Term) -> u64 {
+    match t {
+        Term::NamedNode(n) => (n.as_str().len() as u64).saturating_add(48),
+        Term::BlankNode(b) => (b.as_str().len() as u64).saturating_add(48),
+        Term::Literal(l) => (l.value().len() as u64)
+            .saturating_add(l.datatype().as_str().len() as u64)
+            .saturating_add(l.language().map_or(0, str::len) as u64)
+            .saturating_add(96),
+        Term::Triple(tr) => {
+            let s = match &tr.subject {
+                NamedOrBlankNode::NamedNode(n) => n.as_str().len() as u64,
+                NamedOrBlankNode::BlankNode(b) => b.as_str().len() as u64,
+            };
+            s.saturating_add(tr.predicate.as_str().len() as u64)
+                .saturating_add(term_heap_bytes(&tr.object))
+                .saturating_add(96)
+        }
     }
 }
 
