@@ -926,11 +926,22 @@ impl WriteTxn<'_> {
         let staged = 0;
         // The commit record counts the commits before it that may not be durable yet
         // in one byte, which a full queue keeps far below its limit.
-        if grouped && (group.full(bytes + staged) || self.unfenced(store) >= MAX_UNFENCED) {
-            store.drain_group(&mut self.guard, Some(&self.opts))?;
+        if grouped {
+            let full = if self.idle_group {
+                bytes + staged > MAX_BYTES
+            } else {
+                group.full(bytes + staged) || self.unfenced(store) >= MAX_UNFENCED
+            };
+            if full {
+                self.drain_predecessors()?;
+            }
         }
         // Publication only lowers the count, so reading it early stays conservative.
-        let unfenced = u8::try_from(self.unfenced(store)).expect("drained above");
+        let unfenced = if self.idle_group {
+            0
+        } else {
+            u8::try_from(self.unfenced(store)).expect("drained above")
+        };
         let prealloc = self.wal_prealloc();
         let owned_wal = self
             .guard
@@ -2011,6 +2022,49 @@ mod tests {
     }
 
     #[test]
+    fn idle_writes_skip_draining_and_keep_prepublication_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), options()).unwrap();
+        assert_eq!(insert(&s, "seed").unwrap().commit.seq, 1);
+        let drains = Arc::new(AtomicUsize::new(0));
+        s.set_failpoint(
+            "group-draining",
+            Some(Arc::new({
+                let drains = drains.clone();
+                move |_| {
+                    drains.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+        );
+
+        let t = s.write();
+        assert!(t.idle_group && t.guard.staged.is_none());
+        assert_eq!(t.view().commit, 1);
+        assert!(!t.commit().unwrap().committed);
+
+        let mut t = s
+            .try_write_with(
+                CommitKind::Update,
+                crate::guard::WriteOptions {
+                    before_publish: Some(crate::guard::PublishHook::new(|| Err(Error::Cancelled))),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(t.idle_group);
+        let ids = t
+            .encode_quad(&quad("retry"), &mut Default::default())
+            .unwrap();
+        assert!(t.insert(ids).unwrap());
+        assert!(matches!(t.commit(), Err(Error::Cancelled)));
+        assert_eq!(s.snapshot().commit, 1);
+        assert_eq!(insert(&s, "retry").unwrap().commit.seq, 2);
+        assert_eq!(synced(&s, SyncPath::Group), 2);
+        assert_eq!(drains.load(Ordering::Relaxed), 0);
+        s.set_failpoint("group-draining", None);
+    }
+
+    #[test]
     fn the_only_writer_commits_as_a_group_of_one_and_a_contended_commit_groups() {
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(
@@ -2126,6 +2180,7 @@ mod tests {
         hit.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(s.snapshot().commit, 0, "synced but not yet published");
         let held = speculative(&s);
+        assert!(!held.idle_group, "a synchronized fence is still active");
         assert_eq!(held.view().len(), 1, "private writer sees its predecessor");
         go.send(()).unwrap();
         let receipt = received
@@ -2136,6 +2191,9 @@ mod tests {
         assert_eq!(s.snapshot().commit, 1);
         drop(held);
         first.join().unwrap();
+        let next = speculative(&s);
+        assert!(next.idle_group);
+        assert_eq!(next.view().commit, 1);
     }
 
     #[test]
@@ -2360,6 +2418,7 @@ mod tests {
             thread::spawn(move || insert(&s, "one"))
         };
         hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(no_wait_insert(&s, "busy"), Err(Error::WriterBusy)));
         let next = {
             let s = s.clone();
             thread::spawn(move || insert(&s, "two"))
@@ -2372,6 +2431,7 @@ mod tests {
         assert_eq!(s.snapshot().commit, 0);
         assert_eq!(s.head_commit().seq, 0);
         assert!(matches!(insert(&s, "three"), Err(Error::Poisoned)));
+        assert!(matches!(no_wait_insert(&s, "three"), Err(Error::Poisoned)));
         drop(s);
         // As with ordinary failed sync, complete but unacknowledged WAL records
         // may recover. Nothing that returned success can disappear. The failed fence
