@@ -2752,19 +2752,31 @@ mod tests {
         let pool = crate::sparql::pool::QueryPool::new(16 << 20);
         let grant = Arc::new(pool.empty_grant());
         let root_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut expired = Control::with_cancel(root_cancel.clone());
-        expired.deadline = Some(std::time::Instant::now() + Duration::from_millis(25));
-        let root = Preparation::with_grant(expired, 8192, grant.clone()).unwrap();
+        // Build and charge the root BEFORE expiring its deadline so a slow runner
+        // cannot hit `Error::Timeout` during setup.
+        let mut root = Preparation::with_grant(
+            Control::with_cancel(root_cancel.clone()),
+            8192,
+            grant.clone(),
+        )
+        .unwrap();
         // Simulate 5000 bytes retained on the root preparation.
-        let retained = root.reserve(5000).unwrap();
+        root.reserve_bytes(5000).unwrap();
+        let past_deadline = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        root.inner
+            .get_mut()
+            .expect("unique root before creating Reservation")
+            .control
+            .deadline = Some(past_deadline);
+        let retained = Reservation {
+            preparation: root.clone(),
+            bytes: 5000,
+        };
         let baseline_used = root.inner.used.load(Ordering::Relaxed);
         let baseline_grant = grant.used();
 
-        // Wait until the root deadline has genuinely expired before creating fresh children.
-        let wait_limit = std::time::Instant::now() + Duration::from_secs(2);
-        while root.check().is_ok() && std::time::Instant::now() < wait_limit {
-            std::thread::sleep(Duration::from_millis(5));
-        }
         assert!(
             matches!(root.check(), Err(Error::Timeout)),
             "root preparation deadline must be expired before child_with_control"

@@ -171,6 +171,26 @@ impl SharedSseQueue {
         ok
     }
 
+    /// Preload a priming or cached replay event into a freshly established queue without
+    /// enforcing the live-overflow bound, so live `try_push` can stay aligned with
+    /// `SessionConfig::channel_capacity` and the replay ring.
+    fn push_replay(&self, event: CreditedSseEvent) -> bool {
+        let waker = {
+            let mut q = self.inner.lock();
+            if q.closed {
+                drop(q);
+                drop(event);
+                return false;
+            }
+            q.items.push_back(event);
+            q.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+        true
+    }
+
     /// Signal clean EOF after any already-queued events are drained by the body.
     fn close_eof(&self) {
         let waker = {
@@ -497,7 +517,7 @@ impl CachedChannel {
             .iter()
             .any(|e| e.terminal && e.index <= last_index);
         for event in self.cache.iter().filter(|e| e.index > last_index) {
-            if !self.tx.try_push(event.clone()) {
+            if !self.tx.push_replay(event.clone()) {
                 return Err(CreditedSessionError::ChannelClosed(self.http_request_id));
             }
         }
@@ -510,7 +530,7 @@ impl CachedChannel {
     /// `GET /$/mcp` without `Last-Event-ID` replaces the dead initial primary).
     fn replay_all(&mut self) -> Result<(), CreditedSessionError> {
         for event in &self.cache {
-            if !self.tx.try_push(event.clone()) {
+            if !self.tx.push_replay(event.clone()) {
                 return Err(CreditedSessionError::ChannelClosed(self.http_request_id));
             }
         }
@@ -1037,11 +1057,10 @@ impl CreditedSessionWorker {
                     let is_completed = request_wise.completed_at.is_some();
                     // Validate cursor BEFORE closing or replacing the active live stream.
                     request_wise.channel.can_replay_after(index, is_completed)?;
-                    let cap = self
-                        .config
-                        .channel_capacity
-                        .max(request_wise.channel.cache.len() + 2);
-                    let queue = SharedSseQueue::new(cap);
+                    // Keep the live-overflow bound aligned with `channel_capacity` (and
+                    // the `C + 1` replay ring); `replay_after` preloads cached events via
+                    // `push_replay` without triggering live overflow.
+                    let queue = SharedSseQueue::new(self.config.channel_capacity);
                     let receiver = CreditedSseReceiver::new(queue.clone());
                     request_wise.channel.tx.close_and_discard();
                     request_wise.channel.tx = queue;
@@ -1080,9 +1099,7 @@ impl CreditedSessionWorker {
             self.common.can_replay_after(idx, false)?;
         }
         let cap = if replacing {
-            self.config
-                .channel_capacity
-                .max(self.common.cache.len() + 2)
+            self.config.channel_capacity
         } else {
             2
         };
@@ -1091,7 +1108,7 @@ impl CreditedSessionWorker {
         if last_event_index.is_none()
             && let Some(retry) = self.config.sse_retry
         {
-            let _ = queue.try_push(CreditedSseEvent::priming(0, "0", retry));
+            let _ = queue.push_replay(CreditedSseEvent::priming(0, "0", retry));
         }
         if replacing {
             self.common.tx = queue;
@@ -1857,5 +1874,127 @@ mod tests {
             orig_events.iter().any(|e| e.contains("\"id\":99")),
             "expected original response for id 99: {orig_events:?}"
         );
+    }
+
+    #[test]
+    fn replacement_sse_queues_stay_aligned_with_replay_ring_on_overflow() {
+        let mut cfg = SessionConfig::default();
+        cfg.channel_capacity = 2; // live queue capacity = 2, replay ring capacity = 3
+        cfg.sse_retry = Some(Duration::from_secs(3));
+        let (_handle, mut worker) =
+            create_credited_session("s5".into(), cfg, 30.0, CancellationToken::new());
+
+        // Case 1: Common stream replacement after a full ring [1, 2, 3].
+        let notif = || {
+            ServerJsonRpcMessage::notification(ServerNotification::ToolListChangedNotification(
+                Default::default(),
+            ))
+        };
+        for _ in 0..3 {
+            worker.handle_server_message(notif()).unwrap();
+        }
+        let primary = worker.establish_common_channel().unwrap();
+        let initial = drain_queue_strings(primary.queue.as_ref().unwrap());
+        assert_eq!(
+            initial.len(),
+            4,
+            "expected priming + backlog [1, 2, 3]: {initial:?}"
+        );
+        // Client read through index 3 and now stalls. Indices 4 & 5 fill the 2-slot live
+        // queue; index 6 overflows and closes it while ring retains [4, 5, 6].
+        worker.handle_server_message(notif()).unwrap();
+        assert!(!primary.queue.as_ref().unwrap().is_closed());
+        worker.handle_server_message(notif()).unwrap();
+        assert!(!primary.queue.as_ref().unwrap().is_closed());
+        worker.handle_server_message(notif()).unwrap();
+        assert!(
+            primary.queue.as_ref().unwrap().is_closed(),
+            "replacement common queue must overflow at channel_capacity + 1 unread events"
+        );
+        drop(primary);
+
+        let (_, resumed) = worker
+            .resume("3".parse().unwrap())
+            .expect("common overflow after replacement must stay replayable from index 3");
+        let replayed = drain_queue_strings(resumed.queue.as_ref().unwrap());
+        assert_eq!(replayed.len(), 3, "expected [4, 5, 6]: {replayed:?}");
+        assert!(replayed[0].contains("id: 4\n"), "{replayed:?}");
+        assert!(replayed[2].contains("id: 6\n"), "{replayed:?}");
+
+        // Second overflow after a `resume("3")` replacement must also remain gap-free.
+        worker.handle_server_message(notif()).unwrap();
+        worker.handle_server_message(notif()).unwrap();
+        assert!(!resumed.queue.as_ref().unwrap().is_closed());
+        worker.handle_server_message(notif()).unwrap();
+        assert!(resumed.queue.as_ref().unwrap().is_closed());
+        drop(resumed);
+
+        let (_, resumed2) = worker
+            .resume("6".parse().unwrap())
+            .expect("common overflow after resume must stay replayable from index 6");
+        let replayed2 = drain_queue_strings(resumed2.queue.as_ref().unwrap());
+        assert_eq!(replayed2.len(), 3, "expected [7, 8, 9]: {replayed2:?}");
+        assert!(replayed2[0].contains("id: 7\n"), "{replayed2:?}");
+        assert!(replayed2[2].contains("id: 9\n"), "{replayed2:?}");
+        drop(resumed2);
+
+        // Case 2: In-flight request stream overflow after a successful resume.
+        let (http_id, live_rx) = worker.alloc_request_wise_channel();
+        let req_id = RequestId::Number(17);
+        let req = JsonRpcRequest {
+            jsonrpc: Default::default(),
+            id: req_id.clone(),
+            request: ClientRequest::PingRequest(Default::default()),
+        };
+        worker.register_request(&req, Some(http_id));
+        let _ = drain_queue_strings(live_rx.queue.as_ref().unwrap()); // priming index 0
+        for step in 1..=3usize {
+            let ch = worker.tx_router.get_mut(&http_id).unwrap();
+            let (idx, eid) = ch.channel.alloc_index();
+            assert_eq!(idx, step);
+            let pushed = ch.channel.send_event(CreditedSseEvent {
+                index: idx,
+                bytes: Bytes::from(format!("data: {{\"step\":{step}}}\nid: {eid}\n\n")),
+                terminal: false,
+            });
+            assert_eq!(pushed, step < 3);
+        }
+        assert!(live_rx.queue.as_ref().unwrap().is_closed());
+        drop(live_rx);
+
+        let (_, req_resumed) = worker
+            .resume(format!("0/{http_id}").parse().unwrap())
+            .expect("in-flight request resume from 0 must succeed");
+        let got = drain_queue_strings(req_resumed.queue.as_ref().unwrap());
+        assert_eq!(got.len(), 3, "expected [1, 2, 3]: {got:?}");
+        assert!(got[2].contains(&format!("id: 3/{http_id}\n")), "{got:?}");
+
+        // Client stalls at index 3 while request stays in-flight; 4 & 5 queue, 6 overflows.
+        for step in 4..=6usize {
+            let ch = worker.tx_router.get_mut(&http_id).unwrap();
+            let (idx, eid) = ch.channel.alloc_index();
+            assert_eq!(idx, step);
+            let pushed = ch.channel.send_event(CreditedSseEvent {
+                index: idx,
+                bytes: Bytes::from(format!("data: {{\"step\":{step}}}\nid: {eid}\n\n")),
+                terminal: false,
+            });
+            assert_eq!(
+                pushed,
+                step < 6,
+                "resumed in-flight request queue must overflow on step 6"
+            );
+        }
+        assert!(req_resumed.queue.as_ref().unwrap().is_closed());
+        drop(req_resumed);
+
+        let (_, req_resumed2) = worker
+            .resume(format!("3/{http_id}").parse().unwrap())
+            .expect("in-flight request overflow after resume must stay replayable from index 3");
+        let got2 = drain_queue_strings(req_resumed2.queue.as_ref().unwrap());
+        assert_eq!(got2.len(), 3, "expected [4, 5, 6]: {got2:?}");
+        assert!(got2[0].contains(&format!("id: 4/{http_id}\n")), "{got2:?}");
+        assert!(got2[2].contains(&format!("id: 6/{http_id}\n")), "{got2:?}");
+        drop(req_resumed2);
     }
 }

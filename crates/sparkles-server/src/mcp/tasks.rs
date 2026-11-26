@@ -515,6 +515,11 @@ impl Tasks {
         drop(removed);
     }
 
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.inner.lock().tasks.len()
+    }
+
     /// Convenience wrapper for tests that spawn a plain `CallToolResult`.
     #[cfg(test)]
     pub fn start(

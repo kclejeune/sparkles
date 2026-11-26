@@ -968,21 +968,31 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
 
         // Send a duplicate request with id 101 WHILE original 101's response is already
         // queued/writing inside `StdioQueue` under open backpressure: must still be rejected
-        // with -32600 rather than admitted as a second concurrent request!
+        // with -32600 rather than admitted as a second concurrent request! Follow it with
+        // a distinct query (id 104) and wait for its credit to appear BEFORE reading stdout,
+        // deterministically proving `receive()` already rejected `dup_101` while `101` stayed
+        // blocked on the 4 KiB pipe.
         let dup_101 = json!({
             "jsonrpc": "2.0",
             "id": 101,
             "method": "tools/list",
             "params": { "_meta": modern_meta(false) }
         });
-        cw.write_all(format!("{}\n", serde_json::to_string(&dup_101).unwrap()).as_bytes())
-            .await
-            .unwrap();
+        let probe_batch = format!(
+            "{}\n{}",
+            serde_json::to_string(&dup_101).unwrap(),
+            make_call(104)
+        );
+        cw.write_all(probe_batch.as_bytes()).await.unwrap();
         cw.flush().await.unwrap();
+        assert!(
+            wait_for(Duration::from_secs(5), || pool.granted() > held_by_one).await,
+            "expected req 104 after dup_101 to queue behind backpressured req 101"
+        );
 
-        // Now drain req 1 (pipe still open) and verify the duplicate-ID -32600 rejection and
-        // a subsequent tools/list work cleanly with no stray response for cancelled req 2 and
-        // pool.granted() == 0!
+        // Now drain stdout (pipe still open) and verify req 101, the duplicate-ID -32600
+        // rejection, req 104, and a subsequent tools/list work cleanly with no stray response
+        // for cancelled req 2 and pool.granted() == 0!
         let mut lines = BufReader::new(cr).lines();
         let line1 = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
             .await
@@ -1004,6 +1014,15 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
             reply_dup["error"]["code"], -32600,
             "duplicate ID while response is in StdioQueue must return -32600: {reply_dup}"
         );
+
+        let line_104 = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reply_104: Value = serde_json::from_str(&line_104).unwrap();
+        assert_eq!(reply_104["id"], 104);
+        assert_eq!(reply_104["result"]["isError"], false);
 
         let list = json!({
             "jsonrpc": "2.0",
@@ -1173,12 +1192,13 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
         cw.write_all(batch.as_bytes()).await.unwrap();
         cw.flush().await.unwrap();
         // Half-close stdin immediately while keeping stdout (`cr`) open to read.
+        let eof_start = Instant::now();
         cw.shutdown().await.unwrap();
         drop(cw);
 
         let mut lines = BufReader::new(cr).lines();
         let mut err_count = 0usize;
-        while let Some(line) = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        while let Some(line) = tokio::time::timeout(Duration::from_secs(4), lines.next_line())
             .await
             .unwrap()
             .unwrap()
@@ -1193,7 +1213,150 @@ async fn stdio_cancel_under_open_backpressure_dup_id_and_short_write_framing() {
             "all accepted protocol errors must drain before EOF"
         );
         serve_handle.await.unwrap().unwrap();
+        assert!(
+            eof_start.elapsed() < Duration::from_secs(2),
+            "clean stdin EOF drain must exit promptly without hitting 5s timeout: {:?}",
+            eof_start.elapsed()
+        );
     }
+}
+
+/// R3-1: cancelling a task-creation request whose `CreateTaskResult` is already queued in
+/// `StdioQueue` behind a backpressured response must retire the detached task immediately
+/// instead of stranding its entry and retained credit until TTL.
+#[tokio::test(flavor = "multi_thread")]
+async fn stdio_cancelling_queued_task_creation_retires_detached_task() {
+    let ttl = big_turtle(180, 900);
+    let cfg = McpConfig {
+        max_bytes: 1 << 20,
+        task_after: Duration::ZERO,
+        ..Default::default()
+    };
+    let (_dir, state, pool) = pooled_state(64 << 20, &ttl, cfg.clone(), 0);
+    let server = McpServer::new_with_task_ttl(state, cfg, Duration::from_secs(60));
+
+    let (client, srv) = tokio::io::duplex(4096);
+    let (sr, sw) = tokio::io::split(srv);
+    let serve_handle = tokio::spawn(super::adapter::serve(Adapter::new(server.clone()), sr, sw));
+    let (cr, mut cw) = tokio::io::split(client);
+
+    // 1. Block the 4 KiB stdout pipe with a synchronous (~180 KiB) tool response.
+    let req_block = json!({
+        "jsonrpc": "2.0",
+        "id": 501,
+        "method": "tools/call",
+        "params": {
+            "_meta": modern_meta(false),
+            "name": "sparql_query",
+            "arguments": large_query_args(512 << 10)
+        }
+    });
+    cw.write_all(format!("{}\n", serde_json::to_string(&req_block).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    cw.flush().await.unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            let g = pool.granted();
+            g > 0 && g < (4 << 20)
+        })
+        .await,
+        "expected req 501 to trim and block inside StdioQueue: granted={}",
+        pool.granted()
+    );
+    let held_by_one = pool.granted();
+
+    // 2. Send a task-capable call (`task_after = 0`). It detaches into `server.shared.tasks`
+    //    and queues its `CreateTaskResult` reply behind blocked req 501 in `StdioQueue`.
+    let req_task = json!({
+        "jsonrpc": "2.0",
+        "id": 502,
+        "method": "tools/call",
+        "params": {
+            "_meta": modern_meta(true),
+            "name": "sparql_query",
+            "arguments": large_query_args(512 << 10)
+        }
+    });
+    cw.write_all(format!("{}\n", serde_json::to_string(&req_task).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    cw.flush().await.unwrap();
+    // Wait until the detached task is registered, finishes executing, and trims its
+    // retained result (< 4 MiB above `held_by_one`), ensuring `CreateTaskResult` has
+    // already been handed to `CreditedStdioTransport::send` and queued behind req 501.
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            let g = pool.granted();
+            server.shared.tasks.len() == 1 && g > held_by_one && g < held_by_one + (4 << 20)
+        })
+        .await,
+        "detached task did not complete behind blocked req 501: tasks={}, granted={}, held_by_one={held_by_one}",
+        server.shared.tasks.len(),
+        pool.granted()
+    );
+
+    // 3. Cancel req 502 while stdout remains blocked on req 501.
+    let cancel_502 = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": 502 }
+    });
+    cw.write_all(format!("{}\n", serde_json::to_string(&cancel_502).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    cw.flush().await.unwrap();
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            server.shared.tasks.len() == 0 && pool.granted() <= held_by_one
+        })
+        .await,
+        "cancelling queued task-creation response left detached task stranded: tasks={}, granted={}, held_by_one={held_by_one}",
+        server.shared.tasks.len(),
+        pool.granted()
+    );
+
+    // 4. Drain stdout: req 501 and a subsequent tools/list arrive with no CreateTaskResult
+    //    for cancelled req 502, and pool credit drops to 0.
+    let list = json!({
+        "jsonrpc": "2.0",
+        "id": 503,
+        "method": "tools/list",
+        "params": { "_meta": modern_meta(false) }
+    });
+    cw.write_all(format!("{}\n", serde_json::to_string(&list).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    cw.flush().await.unwrap();
+
+    let mut lines = BufReader::new(cr).lines();
+    let line1 = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let reply1: Value = serde_json::from_str(&line1).unwrap();
+    assert_eq!(reply1["id"], 501);
+    assert_eq!(reply1["result"]["isError"], false);
+
+    let line2 = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let reply2: Value = serde_json::from_str(&line2).unwrap();
+    assert_eq!(
+        reply2["id"], 503,
+        "cancelled queued CreateTaskResult 502 must not appear on stdout: {reply2}"
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || pool.granted() == 0).await,
+        "credit leaked after draining stdout: granted={}",
+        pool.granted()
+    );
+
+    drop((cw, lines));
+    serve_handle.await.unwrap().unwrap();
 }
 
 /// F2, F6, F7, F8, F16:
@@ -1394,20 +1557,20 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
     );
     drop(unread_resp);
 
-    // 2b. (F8 / R2-11) Duplicate in-flight RequestId on a legacy HTTP session returns
+    // 2b. (F8 / R2-11 / R3-6) Duplicate in-flight RequestId on a legacy HTTP session returns
     //     -32600 on the duplicate SSE stream without breaking the original request.
+    //     Use `prompts/get` (which bypasses `http.rs` pre-admission and acquires pool credit
+    //     inside `Adapter::get_prompt` -> `admit_call`) while holding the entire QueryPool
+    //     capacity so id 305 is deterministically registered in-flight and blocked until the
+    //     duplicate's `-32600` response has been observed.
     {
-        let slow_body = json!({
+        let gated_body = json!({
             "jsonrpc": "2.0",
             "id": 305,
-            "method": "tools/call",
+            "method": "prompts/get",
             "params": {
-                "name": "sparql_query",
-                "arguments": {
-                    "dataset": "t",
-                    "query": "PREFIX ex: <http://ex.org/> SELECT (COUNT(*) AS ?n) WHERE { ?a ex:v ?v1 . ?b ex:v ?v2 . FILTER(STRLEN(CONCAT(?v1, ?v2)) > 0) }",
-                    "format": "json"
-                }
+                "name": "explore_dataset",
+                "arguments": { "dataset": "t" }
             }
         });
         let dup_body = json!({
@@ -1422,10 +1585,14 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
             ("mcp-protocol-version", "2025-11-25"),
             ("mcp-session-id", sid.as_str()),
         ];
-        // First POST returns the SSE response as soon as the session worker registers id 305.
+        let gate_grant = pool
+            .try_grant(64 << 20)
+            .expect("pool idle before gated duplicate subcase");
+        // First POST returns the SSE response as soon as the session worker registers id 305,
+        // while `gate_grant` blocks `Adapter::get_prompt` inside `admit_call`.
         let orig_resp = app
             .clone()
-            .oneshot(http_req("POST", &headers, &slow_body.to_string()))
+            .oneshot(http_req("POST", &headers, &gated_body.to_string()))
             .await
             .unwrap();
         assert_eq!(orig_resp.status(), StatusCode::OK);
@@ -1452,6 +1619,8 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
             "expected -32600 duplicate ID rejection on legacy HTTP: {dup_v}"
         );
 
+        // Release the pool gate so original id 305 unblocks and emits its terminal response.
+        drop(gate_grant);
         let orig_bytes = axum::body::to_bytes(orig_resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -1463,7 +1632,12 @@ async fn http_legacy_sse_midwrite_replay_post_cache_cancel_dup_id_and_shutdown()
             .expect("original request must still emit its terminal response");
         let orig_v: Value = serde_json::from_str(orig_payload).unwrap();
         assert_eq!(orig_v["id"], 305);
-        assert_eq!(orig_v["result"]["isError"], false, "{orig_v}");
+        assert!(
+            orig_v["result"]["messages"]
+                .as_array()
+                .is_some_and(|m| !m.is_empty()),
+            "expected original prompts/get response for id 305: {orig_v}"
+        );
         // Evict 305's replay cache via cancellation so subcase 3 starts from 0 credit.
         let cancel_305 = json!({
             "jsonrpc": "2.0",

@@ -977,6 +977,26 @@ pub(super) struct ResponseSlot {
     inner: Arc<Mutex<SlotState>>,
 }
 
+/// Armed cancellation/retirement hook extracted from a [`ResponseSlot`] so an
+/// asynchronous transport writer can keep retirement armed until the response commits
+/// to the wire. Dropping while armed invokes the hook; call [`Self::take_disarmed`]
+/// once committed and drop the returned closure outside any mutex.
+pub(super) struct CancelHook(Option<Box<dyn FnOnce() + Send>>);
+
+impl CancelHook {
+    pub(super) fn take_disarmed(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.0.take()
+    }
+}
+
+impl Drop for CancelHook {
+    fn drop(&mut self) {
+        if let Some(hook) = self.0.take() {
+            hook();
+        }
+    }
+}
+
 impl ResponseSlot {
     pub(super) fn open() -> Self {
         Self {
@@ -1026,6 +1046,18 @@ impl ResponseSlot {
         match std::mem::replace(&mut *guard, SlotState::Closed) {
             SlotState::Open { staged, .. } => staged.map(|b| *b),
             SlotState::Closed => None,
+        }
+    }
+
+    /// Take any staged payload together with an armed [`CancelHook`] so a queued writer
+    /// keeps task retirement armed until the reply commits to the transport.
+    pub(super) fn take_with_cancel_hook(&self) -> (Option<StagedResponse>, Option<CancelHook>) {
+        let mut guard = self.inner.lock();
+        match std::mem::replace(&mut *guard, SlotState::Closed) {
+            SlotState::Open { staged, on_cancel } => {
+                (staged.map(|b| *b), on_cancel.map(|h| CancelHook(Some(h))))
+            }
+            SlotState::Closed => (None, None),
         }
     }
 

@@ -16,7 +16,7 @@ use super::context::{ContextError, PROMPTS, templates};
 use super::errors::{ERROR_META, ErrorContext, ToolError};
 use super::notify::{Change, Watch};
 use super::retained::{
-    Framing, ResponseSlot, RetainedCallResult, RetainedResourceResult, StagedResponse,
+    CancelHook, Framing, ResponseSlot, RetainedCallResult, RetainedResourceResult, StagedResponse,
     bounded_why_empty_summary, placeholder_task_result,
 };
 use super::tasks::{TaskOutcome, TaskSnapshot};
@@ -1043,6 +1043,7 @@ struct StdioWriteJob {
     is_raw_error: bool,
     raw_len: usize,
     payload: StdioWritePayload,
+    on_drop: Option<CancelHook>,
     cancel: CancellationToken,
     done: Option<oneshot::Sender<std::io::Result<()>>>,
 }
@@ -1051,6 +1052,7 @@ struct StdioActiveJob {
     session_id: u64,
     request_id: Option<RequestId>,
     staged: bool,
+    has_cancel_hook: bool,
     cancel: CancellationToken,
 }
 
@@ -1108,6 +1110,8 @@ impl StdioWriterHandle {
         };
         let task = tokio::spawn(async move {
             loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
                 let next_job = {
                     let mut q = queue.lock();
                     if q.closed {
@@ -1135,18 +1139,21 @@ impl StdioWriterHandle {
                                 let _ = done.send(Ok(()));
                             }
                             drop(job.payload);
+                            drop(job.on_drop);
                             continue;
                         }
                         q.active = Some(StdioActiveJob {
                             session_id: job.session_id,
                             request_id: job.request_id.clone(),
                             staged: matches!(job.payload, StdioWritePayload::Staged { .. }),
+                            has_cancel_hook: job.on_drop.is_some(),
                             cancel: job.cancel.clone(),
                         });
                         Some(job)
                     } else if q.draining {
                         return;
                     } else {
+                        notified.as_mut().enable();
                         None
                     }
                 };
@@ -1164,19 +1171,21 @@ impl StdioWriterHandle {
                             drop(dropped);
                             return;
                         }
-                        () = notify.notified() => continue,
+                        () = &mut notified => continue,
                     }
                 };
                 let StdioWriteJob {
                     is_raw_error,
                     raw_len,
                     payload,
+                    mut on_drop,
                     cancel,
                     done,
                     ..
                 } = job;
                 if cancel.is_cancelled() || shutdown.is_cancelled() {
                     drop(payload);
+                    drop(on_drop);
                     {
                         let mut q = queue.lock();
                         q.active = None;
@@ -1201,11 +1210,7 @@ impl StdioWriterHandle {
                     } => staged.into_frame_or_error(Framing::NdJson, max_timeout_secs),
                     StdioWritePayload::Raw(bytes) => bytes,
                 };
-                let body_len = if frame.last() == Some(&b'\n') {
-                    frame.len().saturating_sub(1)
-                } else {
-                    frame.len()
-                };
+                let body_len = frame.len().saturating_sub(1);
                 let mut written = 0usize;
                 let mut cancelled_before_wire = false;
                 let mut write_res: std::io::Result<()> = Ok(());
@@ -1273,34 +1278,72 @@ impl StdioWriterHandle {
                     }
                 }
                 if write_res.is_ok() && !cancelled_before_wire {
-                    // Release the request-ID reservation BEFORE writing the trailing `\n`
-                    // so a sequential client that immediately reuses the same ID upon
-                    // reading the complete line never races `q.active`.
-                    if let Some(active) = queue.lock().active.as_mut() {
-                        active.request_id = None;
-                    }
-                    while written < frame.len() {
-                        let step = tokio::select! {
-                            biased;
-                            () = shutdown.cancelled() => {
-                                write_res = Err(std::io::Error::new(
-                                    std::io::ErrorKind::NotConnected,
-                                    "Transport is closed",
-                                ));
-                                break;
+                    // Synchronize releasing `active.request_id` and disarming any task
+                    // retirement hook with the exact non-blocking `poll_write` that
+                    // accepts the terminating byte (`\n`): while `\n` is pending, the
+                    // incomplete line still blocks duplicate IDs and keeps retirement
+                    // armed; once `\n` is accepted, sequential reuse immediately sees
+                    // `active.request_id == None` under `queue.lock()`.
+                    if written >= frame.len() {
+                        let disarmed_hook = {
+                            let mut q = queue.lock();
+                            if let Some(active) = q.active.as_mut() {
+                                active.request_id = None;
                             }
-                            res = output.write(&frame[written..]) => res,
+                            on_drop.as_mut().and_then(CancelHook::take_disarmed)
                         };
-                        match step {
-                            Ok(0) => {
-                                write_res = Err(std::io::Error::new(
-                                    std::io::ErrorKind::WriteZero,
-                                    "failed to write stdio frame",
-                                ));
-                                break;
-                            }
-                            Ok(n) => written += n,
-                            Err(e) => {
+                        drop(disarmed_hook);
+                    } else {
+                        while written < frame.len() {
+                            let step = tokio::select! {
+                                biased;
+                                () = shutdown.cancelled() => {
+                                    write_res = Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Transport is closed",
+                                    ));
+                                    break;
+                                }
+                                () = cancel.cancelled(), if written == 0 => {
+                                    cancelled_before_wire = true;
+                                    break;
+                                }
+                                res = std::future::poll_fn(|cx| {
+                                    let mut disarmed_hook = None;
+                                    let poll = {
+                                        let mut q = queue.lock();
+                                        match std::pin::Pin::new(&mut output)
+                                            .poll_write(cx, &frame[written..])
+                                        {
+                                            std::task::Poll::Pending => std::task::Poll::Pending,
+                                            std::task::Poll::Ready(Ok(0)) => {
+                                                std::task::Poll::Ready(Err(std::io::Error::new(
+                                                    std::io::ErrorKind::WriteZero,
+                                                    "failed to write stdio frame",
+                                                )))
+                                            }
+                                            std::task::Poll::Ready(Ok(n)) => {
+                                                written += n;
+                                                if written >= frame.len() {
+                                                    if let Some(active) = q.active.as_mut() {
+                                                        active.request_id = None;
+                                                    }
+                                                    disarmed_hook = on_drop
+                                                        .as_mut()
+                                                        .and_then(CancelHook::take_disarmed);
+                                                }
+                                                std::task::Poll::Ready(Ok(()))
+                                            }
+                                            std::task::Poll::Ready(Err(e)) => {
+                                                std::task::Poll::Ready(Err(e))
+                                            }
+                                        }
+                                    };
+                                    drop(disarmed_hook);
+                                    poll
+                                }) => res,
+                            };
+                            if let Err(e) = step {
                                 write_res = Err(e);
                                 break;
                             }
@@ -1317,8 +1360,10 @@ impl StdioWriterHandle {
                         res = output.flush() => res,
                     };
                 }
-                // Release `Bytes` / `FrameOwner` credit before waking `send()`.
+                // Release `Bytes` / `FrameOwner` credit and fire any still-armed cancel
+                // hook outside `queue.lock()` before waking `send()`.
                 drop(frame);
+                drop(on_drop);
                 let failed = write_res.is_err();
                 let mut wake_raw = is_raw_error;
                 let mut dropped_on_fail = None;
@@ -1370,12 +1415,14 @@ impl StdioWriterHandle {
         session_id: u64,
         request_id: Option<RequestId>,
         payload: StdioWritePayload,
+        on_drop: Option<CancelHook>,
     ) -> oneshot::Receiver<std::io::Result<()>> {
         let (tx, rx) = oneshot::channel();
         let mut q = self.queue.lock();
         if q.closed || q.draining || self.shutdown.is_cancelled() {
             drop(q);
             drop(payload);
+            drop(on_drop);
             let _ = tx.send(Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "Transport is closed",
@@ -1388,6 +1435,7 @@ impl StdioWriterHandle {
             is_raw_error: false,
             raw_len: 0,
             payload,
+            on_drop,
             cancel: CancellationToken::new(),
             done: Some(tx),
         });
@@ -1420,6 +1468,7 @@ impl StdioWriterHandle {
             is_raw_error: true,
             raw_len,
             payload: StdioWritePayload::Raw(bytes),
+            on_drop: None,
             cancel: CancellationToken::new(),
             done: None,
         });
@@ -1455,7 +1504,7 @@ impl StdioWriterHandle {
             let mut q = self.queue.lock();
             q.draining = true;
         }
-        self.notify.notify_waiters();
+        self.notify.notify_one();
         self.raw_space_notify.notify_waiters();
     }
 
@@ -1487,6 +1536,7 @@ impl StdioWriterHandle {
                 let _ = done.send(Ok(()));
             }
             drop(job.payload);
+            drop(job.on_drop);
         }
     }
 
@@ -1497,7 +1547,8 @@ impl StdioWriterHandle {
             let mut i = 0;
             while i < q.jobs.len() {
                 if q.jobs[i].session_id == session_id
-                    && matches!(q.jobs[i].payload, StdioWritePayload::Staged { .. })
+                    && (matches!(q.jobs[i].payload, StdioWritePayload::Staged { .. })
+                        || q.jobs[i].on_drop.is_some())
                 {
                     if let Some(job) = q.jobs.remove(i) {
                         removed.push(job);
@@ -1508,7 +1559,7 @@ impl StdioWriterHandle {
             }
             if let Some(active) = &q.active
                 && active.session_id == session_id
-                && active.staged
+                && (active.staged || active.has_cancel_hook)
             {
                 active.cancel.cancel();
             }
@@ -1521,6 +1572,7 @@ impl StdioWriterHandle {
                 )));
             }
             drop(job.payload);
+            drop(job.on_drop);
         }
     }
 
@@ -1533,7 +1585,7 @@ impl StdioWriterHandle {
             q.pending_raw_error_bytes = 0;
             std::mem::take(&mut q.jobs)
         };
-        self.notify.notify_waiters();
+        self.notify.notify_one();
         self.raw_space_notify.notify_waiters();
         for job in dropped {
             if let Some(done) = job.done {
@@ -1543,6 +1595,7 @@ impl StdioWriterHandle {
                 )));
             }
             drop(job.payload);
+            drop(job.on_drop);
         }
     }
 }
@@ -1642,13 +1695,14 @@ where
             ServerJsonRpcMessage::Error(err) => err.id.clone(),
             _ => None,
         };
-        let staged = request_id
+        let (staged, cancel_hook) = request_id
             .as_ref()
             .and_then(|id| self.pending.remove(id))
-            .and_then(|slot| slot.take());
+            .map_or((None, None), |slot| slot.take_with_cancel_hook());
         let closed = self.closed.load(Ordering::Relaxed);
         if closed {
             drop(staged);
+            drop(cancel_hook);
             return futures_util::future::Either::Left(std::future::ready(Err(
                 std::io::Error::new(std::io::ErrorKind::NotConnected, "Transport is closed"),
             )));
@@ -1664,6 +1718,7 @@ where
                     StdioWritePayload::Raw(axum::body::Bytes::from(buf))
                 }
                 Err(e) => {
+                    drop(cancel_hook);
                     return futures_util::future::Either::Left(std::future::ready(Err(
                         std::io::Error::new(std::io::ErrorKind::InvalidData, e),
                     )));
@@ -1672,7 +1727,7 @@ where
         };
         let rx = self
             .writer
-            .enqueue_with_ack(self.session_id, request_id, payload);
+            .enqueue_with_ack(self.session_id, request_id, payload, cancel_hook);
         futures_util::future::Either::Right(async move {
             rx.await.unwrap_or_else(|_| {
                 Err(std::io::Error::new(
@@ -1874,8 +1929,12 @@ mod stdio_writer_tests {
         // Fill the duplex buffer with a blocking request response so raw errors queue up.
         let blocker_id = RequestId::Number(1);
         let blocker = axum::body::Bytes::from(vec![b'x'; 256]);
-        let _ack =
-            handle.enqueue_with_ack(1, Some(blocker_id.clone()), StdioWritePayload::Raw(blocker));
+        let _ack = handle.enqueue_with_ack(
+            1,
+            Some(blocker_id.clone()),
+            StdioWritePayload::Raw(blocker),
+            None,
+        );
         assert!(handle.has_in_flight_request(1, &blocker_id));
 
         let err_frame = axum::body::Bytes::from_static(
@@ -1909,5 +1968,341 @@ mod stdio_writer_tests {
         let output = drain_task.await.unwrap();
         let err_lines = String::from_utf8_lossy(&output).matches("-32600").count();
         assert_eq!(err_lines, MAX_PENDING_RAW_ERRORS + 1);
+    }
+
+    #[tokio::test]
+    async fn stdio_task_cancel_hook_retires_on_queued_cancel_or_reject_and_disarms_on_commit() {
+        let (mut out_reader, out_writer) = tokio::io::duplex(64);
+        let (handle, task) = StdioWriterHandle::spawn(out_writer);
+        let mut guard = StdioWriterGuard {
+            handle: handle.clone(),
+            task: Some(task),
+        };
+        let (_in_writer, in_reader) = tokio::io::duplex(64);
+        let mut transport = CreditedStdioTransport::new(
+            1,
+            Arc::new(tokio::sync::Mutex::new(BufReader::new(in_reader))),
+            handle.clone(),
+            30.0,
+        );
+
+        // Block stdout with a 256-byte frame so subsequent jobs queue in StdioQueue.
+        let _blocker_ack = handle.enqueue_with_ack(
+            1,
+            Some(RequestId::Number(1)),
+            StdioWritePayload::Raw(axum::body::Bytes::from(vec![b'x'; 256])),
+            None,
+        );
+
+        // 1. Cancelling a queued task-creation reply behind a blocked line retires the task.
+        let retired_queued = Arc::new(AtomicBool::new(false));
+        let slot2 = ResponseSlot::open();
+        let flag2 = retired_queued.clone();
+        assert!(slot2.arm_cancel_hook(move || flag2.store(true, Ordering::SeqCst)));
+        transport.pending.insert(RequestId::Number(2), slot2);
+        let send2 = transport.send(ServerJsonRpcMessage::response(
+            rmcp::model::ServerResult::empty(()),
+            RequestId::Number(2),
+        ));
+        assert!(
+            !retired_queued.load(Ordering::SeqCst),
+            "armed retirement hook must survive transport.send() while queued"
+        );
+        handle.cancel_request(1, &RequestId::Number(2));
+        assert!(
+            retired_queued.load(Ordering::SeqCst),
+            "cancelling queued task-creation response must fire retirement hook"
+        );
+        send2.await.unwrap();
+
+        // 2. Committing a task-creation reply to stdout disarms retirement.
+        let retired_committed = Arc::new(AtomicBool::new(false));
+        let slot3 = ResponseSlot::open();
+        let flag3 = retired_committed.clone();
+        assert!(slot3.arm_cancel_hook(move || flag3.store(true, Ordering::SeqCst)));
+        transport.pending.insert(RequestId::Number(3), slot3);
+        let send3 = transport.send(ServerJsonRpcMessage::response(
+            rmcp::model::ServerResult::empty(()),
+            RequestId::Number(3),
+        ));
+        let drain_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = out_reader.read_to_end(&mut buf).await;
+            buf
+        });
+        send3.await.unwrap();
+        assert!(
+            !retired_committed.load(Ordering::SeqCst),
+            "committed task-creation reply must disarm retirement hook"
+        );
+
+        // 3. Rejecting an enqueue once the writer is draining/closed retires the task.
+        guard.drain(STDIO_EOF_DRAIN_TIMEOUT).await;
+        drop(guard);
+        let output = drain_task.await.unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("\"id\":3"));
+        assert!(!retired_committed.load(Ordering::SeqCst));
+
+        let retired_rejected = Arc::new(AtomicBool::new(false));
+        let slot4 = ResponseSlot::open();
+        let flag4 = retired_rejected.clone();
+        assert!(slot4.arm_cancel_hook(move || flag4.store(true, Ordering::SeqCst)));
+        transport.pending.insert(RequestId::Number(4), slot4);
+        let send4 = transport.send(ServerJsonRpcMessage::response(
+            rmcp::model::ServerResult::empty(()),
+            RequestId::Number(4),
+        ));
+        assert!(
+            retired_rejected.load(Ordering::SeqCst),
+            "rejected enqueue on closed writer must fire retirement hook"
+        );
+        assert!(send4.await.is_err());
+    }
+
+    struct GatedNewlineState {
+        hold_newline: bool,
+        newline_blocked: bool,
+        newline_waker: Option<std::task::Waker>,
+        written: Vec<u8>,
+    }
+
+    struct GatedNewlineControl {
+        state: Arc<parking_lot::Mutex<GatedNewlineState>>,
+        blocked_notify: Arc<Notify>,
+        committed_notify: Arc<Notify>,
+    }
+
+    impl GatedNewlineControl {
+        async fn wait_newline_blocked(&self) {
+            loop {
+                let notified = self.blocked_notify.notified();
+                tokio::pin!(notified);
+                {
+                    let st = self.state.lock();
+                    if st.newline_blocked {
+                        return;
+                    }
+                    notified.as_mut().enable();
+                }
+                notified.await;
+            }
+        }
+
+        fn release_newline(&self) {
+            let waker = {
+                let mut st = self.state.lock();
+                st.hold_newline = false;
+                st.newline_blocked = false;
+                st.newline_waker.take()
+            };
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+
+        async fn wait_newline_committed(&self) {
+            loop {
+                let notified = self.committed_notify.notified();
+                tokio::pin!(notified);
+                {
+                    let st = self.state.lock();
+                    if st.written.ends_with(b"\n") {
+                        return;
+                    }
+                    notified.as_mut().enable();
+                }
+                notified.await;
+            }
+        }
+    }
+
+    struct GatedNewlineSink {
+        state: Arc<parking_lot::Mutex<GatedNewlineState>>,
+        blocked_notify: Arc<Notify>,
+        committed_notify: Arc<Notify>,
+    }
+
+    impl AsyncWrite for GatedNewlineSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                if pos > 0 {
+                    self.state.lock().written.extend_from_slice(&buf[..pos]);
+                    return std::task::Poll::Ready(Ok(pos));
+                }
+                let mut st = self.state.lock();
+                if st.hold_newline {
+                    st.newline_blocked = true;
+                    st.newline_waker = Some(cx.waker().clone());
+                    drop(st);
+                    self.blocked_notify.notify_waiters();
+                    return std::task::Poll::Pending;
+                }
+                st.written.push(b'\n');
+                drop(st);
+                self.committed_notify.notify_waiters();
+                return std::task::Poll::Ready(Ok(1));
+            }
+            self.state.lock().written.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_holds_request_id_while_newline_blocked_and_allows_sequential_reuse() {
+        let state = Arc::new(parking_lot::Mutex::new(GatedNewlineState {
+            hold_newline: true,
+            newline_blocked: false,
+            newline_waker: None,
+            written: Vec::new(),
+        }));
+        let blocked_notify = Arc::new(Notify::new());
+        let committed_notify = Arc::new(Notify::new());
+        let control = GatedNewlineControl {
+            state: state.clone(),
+            blocked_notify: blocked_notify.clone(),
+            committed_notify: committed_notify.clone(),
+        };
+        let sink = GatedNewlineSink {
+            state: state.clone(),
+            blocked_notify,
+            committed_notify,
+        };
+        let (handle, task) = StdioWriterHandle::spawn(sink);
+        let mut guard = StdioWriterGuard {
+            handle: handle.clone(),
+            task: Some(task),
+        };
+        let (mut in_writer, in_reader) = tokio::io::duplex(4096);
+        let mut transport = CreditedStdioTransport::new(
+            1,
+            Arc::new(tokio::sync::Mutex::new(BufReader::new(in_reader))),
+            handle.clone(),
+            30.0,
+        );
+
+        // Send response for id 1; the sink accepts the JSON body and holds `\n` pending.
+        let send1 = transport.send(ServerJsonRpcMessage::response(
+            rmcp::model::ServerResult::empty(()),
+            RequestId::Number(1),
+        ));
+        control.wait_newline_blocked().await;
+        assert!(
+            handle.has_in_flight_request(1, &RequestId::Number(1)),
+            "request ID must remain reserved while terminating newline is blocked"
+        );
+
+        // While `\n` is blocked, a duplicate id 1 must be rejected (-32600) so receive()
+        // skips it and returns the next distinct request (id 2).
+        in_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
+            )
+            .await
+            .unwrap();
+        in_writer.flush().await.unwrap();
+        let next_msg = tokio::time::timeout(std::time::Duration::from_secs(5), transport.receive())
+            .await
+            .unwrap()
+            .expect("expected id 2 after rejecting duplicate id 1");
+        match next_msg {
+            ClientJsonRpcMessage::Request(req) => assert_eq!(req.id, RequestId::Number(2)),
+            other => panic!("expected request id 2, got {other:?}"),
+        }
+
+        // Release `\n`: once the terminating byte is accepted, sequential reuse of id 1
+        // must immediately be admitted without racing `q.active`.
+        control.release_newline();
+        control.wait_newline_committed().await;
+        assert!(
+            !handle.has_in_flight_request(1, &RequestId::Number(1)),
+            "request ID must be released synchronously with terminating newline acceptance"
+        );
+        send1.await.unwrap();
+
+        in_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        in_writer.flush().await.unwrap();
+        let reused = tokio::time::timeout(std::time::Duration::from_secs(5), transport.receive())
+            .await
+            .unwrap()
+            .expect("sequential reuse of id 1 after complete line must be accepted");
+        match reused {
+            ClientJsonRpcMessage::Request(req) => assert_eq!(req.id, RequestId::Number(1)),
+            other => panic!("expected reused request id 1, got {other:?}"),
+        }
+
+        guard.drain(STDIO_EOF_DRAIN_TIMEOUT).await;
+        drop(guard);
+        let written = String::from_utf8(state.lock().written.clone()).unwrap();
+        let lines: Vec<Value> = written
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected response 1 + -32600 error: {lines:?}"
+        );
+        assert_eq!(lines[0]["id"], 1);
+        assert!(lines[0].get("result").is_some());
+        assert_eq!(lines[1]["id"], 1);
+        assert_eq!(lines[1]["error"]["code"], -32600);
+    }
+
+    #[tokio::test]
+    async fn stdio_idle_writer_drains_promptly_on_eof() {
+        let start = Instant::now();
+        for i in 0..50usize {
+            let (mut reader, writer_half) = tokio::io::duplex(256);
+            let (handle, task) = StdioWriterHandle::spawn(writer_half);
+            let mut guard = StdioWriterGuard {
+                handle: handle.clone(),
+                task: Some(task),
+            };
+            if i % 2 == 1 {
+                let ack = handle.enqueue_with_ack(
+                    1,
+                    None,
+                    StdioWritePayload::Raw(axum::body::Bytes::from_static(b"{}\n")),
+                    None,
+                );
+                ack.await.unwrap().unwrap();
+                let mut buf = [0u8; 3];
+                reader.read_exact(&mut buf).await.unwrap();
+            } else {
+                tokio::task::yield_now().await;
+            }
+            guard.drain(STDIO_EOF_DRAIN_TIMEOUT).await;
+            assert!(
+                guard.task.is_none(),
+                "idle writer must exit on begin_drain instead of hitting 5s timeout (iter {i})"
+            );
+            drop(guard);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "50 idle EOF drains took {:?} (expected << 5s timeout)",
+            start.elapsed()
+        );
     }
 }
