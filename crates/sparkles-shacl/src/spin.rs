@@ -3108,13 +3108,16 @@ mod tests {
             Literal::new_simple_literal(payload),
         ));
 
-        // Failing dual-form nested SubQuery (sp:Select with unsupported element after an inner
-        // sp:Select) that must cleanly roll back segments and fall back to sp:text exporting ?arg.
+        // Failing dual-form nested SubQuery (sp:Select whose WHERE succeeds and joins its
+        // segments, flushing the 600 KiB outer `out` buffer into `segments`, and then fails
+        // during solution-modifier emission with a non-limit error) so `rollback_output`
+        // exercises the segment-restoration arm and falls back to `sp:text` exporting `?arg`.
         let inner_sq = BlankNode::new_unchecked("innerSq");
         let inner_sel = BlankNode::new_unchecked("innerSel");
         let nested_sq = BlankNode::new_unchecked("nestedSq");
         let nested_sel = BlankNode::new_unchecked("nestedSel");
-        let bad_elem = BlankNode::new_unchecked("badElem");
+        let inner_anon_var = BlankNode::new_unchecked("innerAnonV");
+        let inner_tp = BlankNode::new_unchecked("innerTp");
         g.insert(&Triple::new(
             inner_sq.clone(),
             crate::vocab::rdf::TYPE,
@@ -3135,8 +3138,12 @@ mod tests {
             super::vocab::sp::TEXT,
             Literal::new_simple_literal("SELECT ?arg WHERE { ?s <http://example.org/q> ?arg }"),
         ));
-        // inner_sel's sp:where has [nested_sq, bad_elem] so nested_sel flushes segments first,
-        // then bad_elem fails and triggers segment rollback to sp:text.
+        // Non-limit modifier error after inner_sel joins its WHERE and flushes segments.
+        g.insert(&Triple::new(
+            inner_sel.clone(),
+            super::vocab::sp::LIMIT,
+            Literal::new_simple_literal("not-a-number"),
+        ));
         g.insert(&Triple::new(
             nested_sq.clone(),
             crate::vocab::rdf::TYPE,
@@ -3158,16 +3165,31 @@ mod tests {
             crate::vocab::rdf::NIL,
         ));
         g.insert(&Triple::new(
-            bad_elem.clone(),
+            inner_anon_var.clone(),
             crate::vocab::rdf::TYPE,
-            NamedNode::new_unchecked("http://spinrdf.org/sp#UnsupportedOp"),
+            super::vocab::sp::VARIABLE_CLS,
+        ));
+        g.insert(&Triple::new(
+            inner_tp.clone(),
+            super::vocab::sp::SUBJECT,
+            inner_anon_var,
+        ));
+        g.insert(&Triple::new(
+            inner_tp.clone(),
+            super::vocab::sp::PREDICATE,
+            NamedNode::new_unchecked("http://example.org/tmp"),
+        ));
+        g.insert(&Triple::new(
+            inner_tp.clone(),
+            super::vocab::sp::OBJECT,
+            Literal::new_simple_literal("discarded"),
         ));
         let ic2 = BlankNode::new_unchecked("ic2");
         let ic1 = BlankNode::new_unchecked("ic1");
         g.insert(&Triple::new(
             ic2.clone(),
             crate::vocab::rdf::FIRST,
-            bad_elem,
+            inner_tp,
         ));
         g.insert(&Triple::new(
             ic2.clone(),
@@ -3218,7 +3240,7 @@ mod tests {
         );
         assert!(
             peak_live < 700 * 1024,
-            "joining 600 KiB WHERE must not duplicate buffer bytes (peak={peak_live})"
+            "joining and finalizing 600 KiB WHERE must not duplicate buffer bytes (peak={peak_live})"
         );
         assert!(parse_query(&q, None, &[]).is_ok(), "invalid SPARQL output");
         assert!(q.contains("SELECT ?arg ?_spin_v1 WHERE {"), "{}", &q[..120]);
@@ -3227,9 +3249,268 @@ mod tests {
             "anon var collision must rewrite"
         );
         assert!(
+            q.contains("SELECT (<http://example.org/Val> AS ?arg) WHERE { ?s <http://example.org/q> <http://example.org/Val> }"),
+            "segment rollback must restore fallback text: {}",
+            &q[q.len().saturating_sub(240)..]
+        );
+        assert!(
+            !q.contains("http://example.org/tmp"),
+            "rolled-back segment output must not leak into final query"
+        );
+        assert!(
             q.ends_with("ORDER BY (<http://example.org/Val>) LIMIT 5"),
             "{}",
             &q[q.len() - 60..]
         );
+    }
+
+    #[test]
+    fn round5_base_iri_declaration_and_absolute_ref_bounds() {
+        let long_base = format!("https://example.org/{}/", "a".repeat(200_000));
+
+        // 1. Direct sp:text with 200 KiB BASE and 64 unused relative PREFIX declarations
+        //    would retain ~12.5 MiB in spargebra's prefix map; admission must refuse it
+        //    before parsing.
+        let mut decl_query = format!("BASE <{long_base}>\n");
+        for i in 0..64 {
+            decl_query.push_str(&format!("PREFIX p{i}: <ns/>\n"));
+        }
+        decl_query.push_str("CONSTRUCT { ?this <urn:ok> 1 } WHERE { ?this <urn:in> ?x }");
+        let mut g_decls = parse_ttl(r#"ex:Person spin:rule ex:r ."#);
+        g_decls.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/r"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(decl_query),
+        ));
+        let err = translate(&g_decls, &[]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum resolved IRI size"),
+            "{err:#}"
+        );
+
+        // 2. Direct sp:text with 200 KiB BASE and 64 ordinary absolute predicate IRIs
+        //    must succeed AND must not retain `base.len()` capacity per parsed NamedNode.
+        let mut abs_query =
+            format!("BASE <{long_base}>\nCONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{\n");
+        for i in 0..64 {
+            abs_query.push_str(&format!("  ?this <urn:p{i}> ?v{i} .\n"));
+        }
+        abs_query.push('}');
+        let mut g_abs = parse_ttl(r#"ex:Person spin:rule ex:r ."#);
+        g_abs.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/r"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(abs_query),
+        ));
+        let translated = translate(&g_abs, &[]).unwrap();
+        let construct_str = translated
+            .triples_for_predicate(crate::vocab::sh::CONSTRUCT)
+            .next()
+            .and_then(|t| match t.object {
+                oxrdf::TermRef::Literal(l) => Some(l.value().to_string()),
+                _ => None,
+            })
+            .expect("missing sh:construct");
+        let parsed = parse_query(&construct_str, None, &[]).unwrap();
+        let spargebra::Query::Construct { pattern, .. } = parsed else {
+            panic!("expected CONSTRUCT");
+        };
+        let bgp = match pattern {
+            spargebra::algebra::GraphPattern::Project { inner, .. } => *inner,
+            other => other,
+        };
+        let spargebra::algebra::GraphPattern::Bgp { patterns } = bgp else {
+            panic!("expected BGP");
+        };
+        assert_eq!(patterns.len(), 64);
+        let mut total_cap = 0usize;
+        for tp in patterns {
+            let spargebra::term::NamedNodePattern::NamedNode(pred) = tp.predicate else {
+                panic!("expected NamedNode predicate");
+            };
+            let cap = pred.into_string().capacity();
+            assert!(
+                cap < 64,
+                "absolute IRI under 200 KiB BASE retained oversized buffer capacity ({cap})"
+            );
+            total_cap += cap;
+        }
+        assert!(
+            total_cap < 4096,
+            "cumulative capacity across 64 absolute predicates must stay tiny ({total_cap})"
+        );
+
+        // 3. Root-relative IRI `</short>` under 200 KiB BASE also avoids retaining BASE capacity.
+        let root_rel_query = format!(
+            "BASE <{long_base}>\nCONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{ ?this </short> ?v }}"
+        );
+        let parsed_rel = parse_query(&root_rel_query, None, &[]).unwrap();
+        let spargebra::Query::Construct { pattern, .. } = parsed_rel else {
+            panic!("expected CONSTRUCT");
+        };
+        let bgp_rel = match pattern {
+            spargebra::algebra::GraphPattern::Project { inner, .. } => *inner,
+            other => other,
+        };
+        let spargebra::algebra::GraphPattern::Bgp { mut patterns } = bgp_rel else {
+            panic!("expected BGP");
+        };
+        let spargebra::term::NamedNodePattern::NamedNode(pred) = patterns.pop().unwrap().predicate
+        else {
+            panic!("expected NamedNode predicate");
+        };
+        assert_eq!(pred.as_str(), "https://example.org/short");
+        let rel_cap = pred.into_string().capacity();
+        assert!(
+            rel_cap < 128,
+            "root-relative IRI under 200 KiB BASE retained oversized buffer capacity ({rel_cap})"
+        );
+    }
+
+    #[test]
+    fn round5_preflight_placeholder_preserves_fragment_validity_for_fallback() {
+        for ns in [
+            "http://example.org/ns#".to_string(),
+            format!("http://example.org/{}#", "a".repeat(200_000)),
+        ] {
+            // Structural CONSTRUCT (no outer sp:text) embedding a dual-form sp:Select whose
+            // RDF child sp:SubQuery expands `ex:k\#part` into an invalid second `#`, while
+            // the enclosing dual-form sp:Select has a valid local `sp:text` fallback.
+            let mut g = parse_ttl(
+                r#"
+                ex:Person spin:rule [
+                  a sp:Construct ;
+                  sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object [ sp:varName "s" ] ] ) ;
+                  sp:where (
+                    [ a sp:SubQuery ;
+                      sp:query [
+                        a sp:Select ;
+                        sp:text "SELECT ?s WHERE { ?s ex:ok ?o }" ;
+                        sp:where (
+                          [ a sp:SubQuery ; sp:query ex:badChild ]
+                        )
+                      ] ]
+                  )
+                ] .
+                "#,
+            );
+            g.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/badChild"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(r"SELECT ?s WHERE { ?s ex:k\#part ?o }"),
+            ));
+            let prefixes = vec![("ex".to_string(), ns)];
+            let translated = translate(&g, &prefixes).unwrap();
+            let construct_str = translated
+                .triples_for_predicate(crate::vocab::sh::CONSTRUCT)
+                .next()
+                .and_then(|t| match t.object {
+                    oxrdf::TermRef::Literal(l) => Some(l.value().to_string()),
+                    _ => None,
+                })
+                .expect("missing sh:construct");
+            assert!(
+                construct_str.contains("ex:ok"),
+                "enclosing dual-form SELECT must fall back to its valid sp:text: {construct_str}"
+            );
+            assert!(
+                !construct_str.contains(r"ex:k\#part"),
+                "invalid child expansion must not survive preflight: {construct_str}"
+            );
+        }
+
+        // Port-terminated namespace must also reject non-digit local expansions during preflight
+        // so the enclosing dual-form SELECT can fall back.
+        let mut g_port = parse_ttl(
+            r#"
+            ex:Person spin:rule [
+              a sp:Construct ;
+              sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:out ; sp:object [ sp:varName "s" ] ] ) ;
+              sp:where (
+                [ a sp:SubQuery ;
+                  sp:query [
+                    a sp:Select ;
+                    sp:text "SELECT ?s WHERE { ?s <urn:ok> ?o }" ;
+                    sp:where (
+                      [ a sp:SubQuery ; sp:query ex:badPortChild ]
+                    )
+                  ] ]
+              )
+            ] .
+            "#,
+        );
+        g_port.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/badPortChild"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal("SELECT ?s WHERE { ?s ex:notaport ?o }"),
+        ));
+        let port_prefixes = vec![("ex".to_string(), "http://example.org:80".to_string())];
+        let tr_port = translate(&g_port, &port_prefixes).unwrap();
+        let q_port = tr_port
+            .triples_for_predicate(crate::vocab::sh::CONSTRUCT)
+            .next()
+            .and_then(|t| match t.object {
+                oxrdf::TermRef::Literal(l) => Some(l.value().to_string()),
+                _ => None,
+            })
+            .expect("missing sh:construct");
+        assert!(q_port.contains("<urn:ok>"), "{q_port}");
+    }
+
+    #[test]
+    fn round5_standalone_explicit_placeholder_iri_rejected() {
+        // Explicit full IRIs in the synthetic placeholder namespace must NOT get the
+        // standalone aggregate exception (with or without DISTINCT, alone or alongside a
+        // synthetic prefixed call resolving to the same IRI).
+        for bad_subquery in [
+            "SELECT (<urn:sparkles:spin-subquery-check:p0/f>(?v) AS ?x) (COUNT(?v) AS ?c) WHERE { ?s <urn:p> ?v }",
+            "SELECT (<urn:sparkles:spin-subquery-check:p0/f>(DISTINCT ?v) AS ?x) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(?v) AS ?a) (<urn:sparkles:spin-subquery-check:p0/f>(?w) AS ?b) (COUNT(?v) AS ?c) WHERE { ?s <urn:p> ?v ; <urn:q> ?w }",
+            "SELECT (COUNT(afn:variance(COUNT(?v))) AS ?c) WHERE { ?s <urn:p> ?v }",
+        ] {
+            let mut g_bad = parse_ttl(
+                r#"
+                ex:q a sp:Construct ;
+                  sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "x" ] ] ) ;
+                  sp:where ( [ a sp:SubQuery ; sp:query ex:inner ] ) .
+                "#,
+            );
+            g_bad.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/inner"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(bad_subquery),
+            ));
+            assert!(
+                serialize_query(&g_bad, &ex("q")).is_err(),
+                "must reject explicit placeholder IRI / nested aggregate: {bad_subquery}"
+            );
+        }
+
+        // Valid ungrouped explicit IRI in that namespace, grouped explicit IRI on a grouped
+        // variable, ungrouped synthetic prefixed call, and aggregate/scalar wrappers remain valid.
+        for ok_subquery in [
+            "SELECT (<urn:sparkles:spin-subquery-check:p0/f>(?v) AS ?x) WHERE { ?s <urn:p> ?v }",
+            "SELECT ?v (<urn:sparkles:spin-subquery-check:p0/f>(?v) AS ?x) (COUNT(?s) AS ?c) WHERE { ?s <urn:p> ?v } GROUP BY ?v",
+            "SELECT ?s (afn:variance(?v) AS ?x) WHERE { ?s <urn:p> ?v }",
+            "SELECT (afn:variance(COUNT(?v)) AS ?x) WHERE { ?s <urn:p> ?v }",
+            "SELECT (COUNT(xsd:double(?v)) AS ?c) WHERE { ?s <urn:p> ?v }",
+        ] {
+            let mut g_ok = parse_ttl(
+                r#"
+                ex:q a sp:Construct ;
+                  sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "x" ] ] ) ;
+                  sp:where ( [ a sp:SubQuery ; sp:query ex:inner ] ) .
+                "#,
+            );
+            g_ok.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/inner"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(ok_subquery),
+            ));
+            assert!(
+                serialize_query(&g_ok, &ex("q")).is_ok(),
+                "must accept valid standalone subquery: {ok_subquery}"
+            );
+        }
     }
 }

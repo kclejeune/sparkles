@@ -174,5 +174,26 @@ IRIs in an `Arc<HashSet<NamedNode>>` and `with_custom_aggregate_functions` accep
 shared registry, avoiding a copy on each parser construction. Registration through
 `with_custom_aggregate_function` keeps copy-on-write behavior.
 
+Three further local helpers support bounded query parsing and standalone fragment
+validation:
+
+- **`SparqlSyntaxError::is_too_deep`.** Reports whether an error came from the nesting
+  and depth pre-scan (`SparqlSyntaxErrorKind::TooDeep`), so callers such as SPIN
+  dual-form translation can propagate limit refusals instead of treating them as
+  ordinary syntax errors.
+
+- **`SparqlParser::with_placeholder_prefix`.** Registers synthetic placeholder prefixes
+  for standalone fragment validation when real prefix declarations are not yet known.
+  Single-argument calls written with a synthetic prefixed name are admitted as potential
+  custom aggregates in grouped `SELECT` projections, with or without `DISTINCT`, while
+  explicit `<IRI>` calls and prefixes redeclared in the query prologue keep strict
+  validation.
+
+- **Bounded `BASE` IRI resolution.** `ParserState::parse_iri` parses absolute IRI
+  references directly with `Iri::parse` instead of routing them through
+  `base_iri.resolve`, and resolves relative references through `base_iri.resolve_into`
+  into a fresh `String`. This avoids retaining `base_iri.len()` excess capacity in every
+  parsed `NamedNode` when a query declares a long `BASE`.
+
 Drop this copy once a spargebra release supplies the remaining fixes and extensions,
 with the nesting check retained in Sparkles callers if upstream does not provide it.

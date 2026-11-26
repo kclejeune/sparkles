@@ -42,9 +42,8 @@ pub struct SparqlParser {
     prefixes: HashMap<String, String>,
     /// shared, so that a parser with many custom aggregates is cheap to clone
     custom_aggregate_functions: Arc<HashSet<NamedNode>>,
-    /// Optional placeholder namespace prefix whose single-argument custom function calls
-    /// may resolve to custom aggregates once real prefix declarations are supplied.
-    placeholder_aggregate_namespace: Option<&'static str>,
+    /// Prefix names registered as synthetic placeholders (see [`SparqlParser::with_placeholder_prefix`]).
+    placeholder_prefixes: HashSet<String>,
     /// Reject Jena ARQ's syntax extensions (see [`SparqlParser::with_arq_syntax`]).
     sparql_only: bool,
 }
@@ -128,14 +127,22 @@ impl SparqlParser {
         self
     }
 
-    /// Treats single-argument custom function calls whose resolved IRI starts with
-    /// `ns_prefix` as potentially aggregate-scoped during grouped `SELECT` projection
-    /// validation. Used for standalone fragment validation when real prefix bindings are
-    /// not yet known.
+    /// Registers a synthetic placeholder prefix used for standalone fragment validation
+    /// when real prefix declarations are not yet known. Single-argument calls written with
+    /// this prefixed name (and never explicit `<IRI>` references or prefixes redeclared in
+    /// the query prologue) are admitted as potential custom aggregates in grouped `SELECT`
+    /// projections, with or without `DISTINCT`.
     #[inline]
-    pub fn with_placeholder_aggregate_namespace(mut self, ns_prefix: &'static str) -> Self {
-        self.placeholder_aggregate_namespace = Some(ns_prefix);
-        self
+    pub fn with_placeholder_prefix(
+        mut self,
+        prefix_name: impl Into<String>,
+        placeholder_iri: impl Into<String>,
+    ) -> Result<Self, IriParseError> {
+        let name = prefix_name.into();
+        let iri = Iri::parse(placeholder_iri.into())?.into_inner();
+        self.placeholder_prefixes.insert(name.clone());
+        self.prefixes.insert(name, iri);
+        Ok(self)
     }
 
     /// Whether Jena ARQ's extensions of the SPARQL syntax are accepted (the default) or
@@ -178,7 +185,7 @@ impl SparqlParser {
             self.prefixes,
             self.custom_aggregate_functions,
         );
-        state.placeholder_aggregate_namespace = self.placeholder_aggregate_namespace;
+        state.placeholder_prefixes = self.placeholder_prefixes;
         state.arq = !self.sparql_only;
         #[cfg(feature = "standard-unicode-escaping")]
         let query = unescape_unicode_codepoints(query);
@@ -743,6 +750,7 @@ fn build_select(
 
     // GROUP BY
     let aggregates = state.aggregates.pop().unwrap_or_default();
+    let placeholder_calls = state.placeholder_calls.pop().unwrap_or_default();
     if group.is_none() && !aggregates.is_empty() {
         group = Some((vec![], vec![]));
     }
@@ -802,17 +810,18 @@ fn build_select(
                             );
                         }
                         if with_aggregate
-                            && !are_variables_bound(
-                                &expression,
-                                &visible,
-                                state.placeholder_aggregate_namespace,
-                            )
+                            && !are_variables_bound(&expression, &visible, &placeholder_calls)
                         {
                             // We validate projection variables if there is an aggregate
                             return Err(
                                 "The SELECT contains an expression with a variable that is unbound",
                             );
                         }
+                        let expression = if placeholder_calls.is_empty() {
+                            expression
+                        } else {
+                            restore_placeholder_calls(expression, &placeholder_calls)
+                        };
                         p = GraphPattern::Extend {
                             inner: Box::new(p),
                             variable: variable.clone(),
@@ -881,7 +890,7 @@ fn build_select(
 fn are_variables_bound(
     expression: &Expression,
     variables: &HashSet<Variable>,
-    placeholder_aggregate_namespace: Option<&str>,
+    placeholder_calls: &HashMap<Variable, (NamedNode, Expression)>,
 ) -> bool {
     match expression {
         Expression::NamedNode(_)
@@ -889,9 +898,11 @@ fn are_variables_bound(
         | Expression::Bound(_)
         | Expression::Coalesce(_)
         | Expression::Exists(_) => true,
-        Expression::Variable(var) => variables.contains(var),
+        Expression::Variable(var) => {
+            variables.contains(var) || placeholder_calls.contains_key(var)
+        }
         Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
-            are_variables_bound(e, variables, placeholder_aggregate_namespace)
+            are_variables_bound(e, variables, placeholder_calls)
         }
         Expression::Or(a, b)
         | Expression::And(a, b)
@@ -905,31 +916,125 @@ fn are_variables_bound(
         | Expression::Subtract(a, b)
         | Expression::Multiply(a, b)
         | Expression::Divide(a, b) => {
-            are_variables_bound(a, variables, placeholder_aggregate_namespace)
-                && are_variables_bound(b, variables, placeholder_aggregate_namespace)
+            are_variables_bound(a, variables, placeholder_calls)
+                && are_variables_bound(b, variables, placeholder_calls)
         }
         Expression::In(a, b) => {
-            are_variables_bound(a, variables, placeholder_aggregate_namespace)
+            are_variables_bound(a, variables, placeholder_calls)
                 && b.iter()
-                    .all(|b| are_variables_bound(b, variables, placeholder_aggregate_namespace))
+                    .all(|b| are_variables_bound(b, variables, placeholder_calls))
         }
-        Expression::FunctionCall(function, parameters) => {
-            if let Some(ns_prefix) = placeholder_aggregate_namespace
-                && parameters.len() == 1
-                && let Function::Custom(iri) = function
-                && iri.as_str().starts_with(ns_prefix)
-            {
-                return true;
-            }
-            parameters
-                .iter()
-                .all(|p| are_variables_bound(p, variables, placeholder_aggregate_namespace))
-        }
+        Expression::FunctionCall(_, parameters) => parameters
+            .iter()
+            .all(|p| are_variables_bound(p, variables, placeholder_calls)),
         Expression::If(a, b, c) => {
-            are_variables_bound(a, variables, placeholder_aggregate_namespace)
-                && are_variables_bound(b, variables, placeholder_aggregate_namespace)
-                && are_variables_bound(c, variables, placeholder_aggregate_namespace)
+            are_variables_bound(a, variables, placeholder_calls)
+                && are_variables_bound(b, variables, placeholder_calls)
+                && are_variables_bound(c, variables, placeholder_calls)
         }
+    }
+}
+
+fn restore_placeholder_calls(
+    expression: Expression,
+    placeholder_calls: &HashMap<Variable, (NamedNode, Expression)>,
+) -> Expression {
+    match expression {
+        Expression::Variable(var) => {
+            if let Some((iri, arg)) = placeholder_calls.get(&var) {
+                Expression::FunctionCall(
+                    Function::Custom(iri.clone()),
+                    vec![restore_placeholder_calls(arg.clone(), placeholder_calls)],
+                )
+            } else {
+                Expression::Variable(var)
+            }
+        }
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Bound(_)
+        | Expression::Exists(_) => expression,
+        Expression::UnaryPlus(e) => {
+            Expression::UnaryPlus(Box::new(restore_placeholder_calls(*e, placeholder_calls)))
+        }
+        Expression::UnaryMinus(e) => {
+            Expression::UnaryMinus(Box::new(restore_placeholder_calls(*e, placeholder_calls)))
+        }
+        Expression::Not(e) => {
+            Expression::Not(Box::new(restore_placeholder_calls(*e, placeholder_calls)))
+        }
+        Expression::Or(a, b) => Expression::Or(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::And(a, b) => Expression::And(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::Equal(a, b) => Expression::Equal(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::SameTerm(a, b) => Expression::SameTerm(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::Greater(a, b) => Expression::Greater(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::GreaterOrEqual(a, b) => Expression::GreaterOrEqual(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::Less(a, b) => Expression::Less(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::LessOrEqual(a, b) => Expression::LessOrEqual(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::Add(a, b) => Expression::Add(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::Subtract(a, b) => Expression::Subtract(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::Multiply(a, b) => Expression::Multiply(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::Divide(a, b) => Expression::Divide(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+        ),
+        Expression::In(a, b) => Expression::In(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            b.into_iter()
+                .map(|e| restore_placeholder_calls(e, placeholder_calls))
+                .collect(),
+        ),
+        Expression::FunctionCall(function, parameters) => Expression::FunctionCall(
+            function,
+            parameters
+                .into_iter()
+                .map(|p| restore_placeholder_calls(p, placeholder_calls))
+                .collect(),
+        ),
+        Expression::Coalesce(parameters) => Expression::Coalesce(
+            parameters
+                .into_iter()
+                .map(|p| restore_placeholder_calls(p, placeholder_calls))
+                .collect(),
+        ),
+        Expression::If(a, b, c) => Expression::If(
+            Box::new(restore_placeholder_calls(*a, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*b, placeholder_calls)),
+            Box::new(restore_placeholder_calls(*c, placeholder_calls)),
+        ),
     }
 }
 
@@ -1132,11 +1237,32 @@ enum Either<L, R> {
     Right(R),
 }
 
+fn has_iri_scheme(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    for b in bytes {
+        if b == b':' {
+            return true;
+        }
+        if !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) {
+            return false;
+        }
+    }
+    false
+}
+
 pub struct ParserState {
     base_iri: Option<Iri<String>>,
     prefixes: HashMap<String, String>,
     custom_aggregate_functions: Arc<HashSet<NamedNode>>,
-    placeholder_aggregate_namespace: Option<&'static str>,
+    placeholder_prefixes: HashSet<String>,
+    placeholder_calls: Vec<HashMap<Variable, (NamedNode, Expression)>>,
+    in_select_projection: Vec<bool>,
     used_bnodes: HashSet<BlankNode>,
     currently_used_bnodes: HashSet<BlankNode>,
     aggregates: Vec<Vec<(Variable, AggregateExpression)>>,
@@ -1154,7 +1280,9 @@ impl ParserState {
             base_iri,
             prefixes,
             custom_aggregate_functions,
-            placeholder_aggregate_namespace: None,
+            placeholder_prefixes: HashSet::new(),
+            placeholder_calls: Vec::new(),
+            in_select_projection: Vec::new(),
             used_bnodes: HashSet::new(),
             currently_used_bnodes: HashSet::new(),
             aggregates: Vec::new(),
@@ -1164,13 +1292,59 @@ impl ParserState {
 
     fn parse_iri(&self, iri: String) -> Result<Iri<String>, IriParseError> {
         if let Some(base_iri) = &self.base_iri {
-            base_iri.resolve(&iri)
+            if has_iri_scheme(&iri) {
+                return Iri::parse(iri);
+            }
+            let mut resolved = String::new();
+            base_iri.resolve_into(&iri, &mut resolved)?;
+            Ok(Iri::parse_unchecked(resolved))
         } else {
             Iri::parse(iri)
         }
     }
 
     fn new_aggregation(&mut self, agg: AggregateExpression) -> Result<Variable, &'static str> {
+        let agg = if let Some(calls) = self.placeholder_calls.last()
+            && !calls.is_empty()
+        {
+            match agg {
+                AggregateExpression::CountSolutions { distinct } => {
+                    AggregateExpression::CountSolutions { distinct }
+                }
+                AggregateExpression::FunctionCall {
+                    name,
+                    expr,
+                    distinct,
+                } => AggregateExpression::FunctionCall {
+                    name,
+                    expr: restore_placeholder_calls(expr, calls),
+                    distinct,
+                },
+                AggregateExpression::Fold {
+                    expr,
+                    value,
+                    distinct,
+                    order,
+                } => AggregateExpression::Fold {
+                    expr: restore_placeholder_calls(expr, calls),
+                    value: value.map(|v| restore_placeholder_calls(v, calls)),
+                    distinct,
+                    order: order
+                        .into_iter()
+                        .map(|o| match o {
+                            OrderExpression::Asc(e) => {
+                                OrderExpression::Asc(restore_placeholder_calls(e, calls))
+                            }
+                            OrderExpression::Desc(e) => {
+                                OrderExpression::Desc(restore_placeholder_calls(e, calls))
+                            }
+                        })
+                        .collect(),
+                },
+            }
+        } else {
+            agg
+        };
         let aggregates = self.aggregates.last_mut().ok_or("Unexpected aggregate")?;
         // SPARQL 1.2 §19.7: "The expression argument of an aggregate function cannot
         // contain an aggregate function." An aggregate call parsed inside `expr` has
@@ -1293,6 +1467,7 @@ parser! {
         }
 
         rule PrefixDecl() = i("PREFIX") _ ns:PNAME_NS() _ i:IRIREF() {
+            state.placeholder_prefixes.remove(ns);
             state.prefixes.insert(ns.into(), i.into_inner());
         }
 
@@ -1319,13 +1494,16 @@ parser! {
         }
 
         rule SelectClause() -> Selection = i("SELECT") _ Selection_init() o:SelectClause_option() _ v:SelectClause_variables() {
+            state.in_select_projection.pop();
             Selection {
                 option: o,
                 variables: v
             }
         }
         rule Selection_init() = {
-            state.aggregates.push(Vec::new())
+            state.aggregates.push(Vec::new());
+            state.placeholder_calls.push(HashMap::new());
+            state.in_select_projection.push(true);
         }
         rule SelectClause_option() -> SelectionOption =
             i("DISTINCT") { SelectionOption::Distinct } /
@@ -2678,9 +2856,19 @@ parser! {
             i("REPLACE") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ "," _ d:Expression() _ ")" { Expression::FunctionCall(Function::Replace, vec![a, b, c, d]) } /
             i("REPLACE") _ "(" _ a:Expression() _ "," _ b:Expression() _ "," _ c:Expression() _ ")" { Expression::FunctionCall(Function::Replace, vec![a, b, c]) }
 
-        rule ExistsFunc() -> Expression = i("EXISTS") _ p:GroupGraphPattern() { Expression::Exists(Box::new(p)) }
+        rule Exists_enter() = {
+            state.in_select_projection.push(false);
+        }
 
-        rule NotExistsFunc() -> Expression = i("NOT") _ i("EXISTS") _ p:GroupGraphPattern() { Expression::Not(Box::new(Expression::Exists(Box::new(p)))) }
+        rule ExistsFunc() -> Expression = i("EXISTS") _ Exists_enter() p:GroupGraphPattern() {
+            state.in_select_projection.pop();
+            Expression::Exists(Box::new(p))
+        }
+
+        rule NotExistsFunc() -> Expression = i("NOT") _ i("EXISTS") _ Exists_enter() p:GroupGraphPattern() {
+            state.in_select_projection.pop();
+            Expression::Not(Box::new(Expression::Exists(Box::new(p))))
+        }
 
         rule Aggregate() -> AggregateExpression =
             i("COUNT") _ "(" _ i("DISTINCT") _ "*" _ ")" { AggregateExpression::CountSolutions { distinct: true } } /
@@ -2708,8 +2896,9 @@ parser! {
             arq() name:ArqAggregateKeyword() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
             arq() i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
             arq() i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
-            name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" {?
-                if state.custom_aggregate_functions.contains(&name) {
+            name_and_synth:iri_with_synthetic_flag() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" {?
+                let (name, is_synth) = name_and_synth;
+                if is_synth || state.custom_aggregate_functions.contains(&name) {
                     Ok(AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true })
                 } else {
                     Err("This custom function is a regular function and not an aggregate function")
@@ -2740,9 +2929,19 @@ parser! {
             i("VAR_POP") { arq_aggregate("var_pop") }
 
         rule iriOrFunction() -> Expression =
-            i: iri() _ a: ArgList() {?
+            i_and_synth: iri_with_synthetic_flag() _ a: ArgList() {?
+                let (i, is_synth) = i_and_synth;
                 if state.custom_aggregate_functions.contains(&i) {
                     Err("This custom function is an aggregate function and not a regular function")
+                } else if is_synth
+                    && a.len() == 1
+                    && state.in_select_projection.last() == Some(&true)
+                    && let Some(calls) = state.placeholder_calls.last_mut()
+                {
+                    let arg = a.into_iter().next().unwrap();
+                    let var = variable();
+                    calls.insert(var.clone(), (i, arg));
+                    Ok(Expression::Variable(var))
                 } else {
                     Ok(Expression::FunctionCall(Function::Custom(i), a))
                 }
@@ -2797,9 +2996,18 @@ parser! {
             NamedNode::from(i)
         }
 
-        rule PrefixedName() -> Iri<String> = PNAME_LN() /
+        rule iri_with_synthetic_flag() -> (NamedNode, bool) =
+            i:IRIREF() { (NamedNode::from(i), false) } /
+            i:PrefixedName_with_flag() { (NamedNode::from(i.0), i.1) }
+
+        rule PrefixedName() -> Iri<String> = i:PrefixedName_with_flag() { i.0 }
+
+        rule PrefixedName_with_flag() -> (Iri<String>, bool) = PNAME_LN_with_flag() /
             ns:PNAME_NS() {? if let Some(iri) = state.prefixes.get(ns).cloned() {
-                Iri::parse(iri).map_err(|_| "prefix IRI parsing failed")
+                let is_synth = state.placeholder_prefixes.contains(ns);
+                Iri::parse(iri)
+                    .map(|i| (i, is_synth))
+                    .map_err(|_| "prefix IRI parsing failed")
             } else {
                 Err("Prefix not found")
             } }
@@ -2827,14 +3035,19 @@ parser! {
             ns
         }
 
-        rule PNAME_LN() -> Iri<String> = ns:PNAME_NS() local:$(PN_LOCAL()) {?
+        rule PNAME_LN() -> Iri<String> = i:PNAME_LN_with_flag() { i.0 }
+
+        rule PNAME_LN_with_flag() -> (Iri<String>, bool) = ns:PNAME_NS() local:$(PN_LOCAL()) {?
             if let Some(base) = state.prefixes.get(ns) {
+                let is_synth = state.placeholder_prefixes.contains(ns);
                 let mut iri = String::with_capacity(base.len() + local.len());
                 iri.push_str(base);
                 for chunk in local.split('\\') { // We remove \
                     iri.push_str(chunk);
                 }
-                Iri::parse(iri).map_err(|_| "IRI parsing failed")
+                Iri::parse(iri)
+                    .map(|i| (i, is_synth))
+                    .map_err(|_| "IRI parsing failed")
             } else {
                 Err("Prefix not found")
             }

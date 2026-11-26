@@ -1318,6 +1318,60 @@ fn indexed_placeholder_ns(idx: usize) -> String {
     format!("{PLACEHOLDER_PREFIX_BASE}p{idx}/")
 }
 
+/// Build a bounded-length placeholder namespace IRI whose RFC 3987 / `oxiri` parser end
+/// state matches `real_ns`, so `spargebra` validates every `prefix:local` expansion with
+/// the same syntax rules as `real_ns` (such as rejecting a second `#` when `real_ns`
+/// already has a fragment) without copying long caller namespaces into preflight buffers.
+fn state_preserving_placeholder_ns(prefix: &str, real_ns: &str, idx: usize) -> Result<String> {
+    let parsed = oxiri::Iri::parse(real_ns)
+        .map_err(|e| anyhow!("invalid namespace IRI for prefix {prefix:?}: {e}"))?;
+    if parsed.fragment().is_some() {
+        return Ok(format!("{PLACEHOLDER_PREFIX_BASE}p{idx}/#"));
+    }
+    if parsed.query().is_some() {
+        return Ok(format!("{PLACEHOLDER_PREFIX_BASE}p{idx}/?"));
+    }
+    let path = parsed.path();
+    let authority = parsed.authority();
+    if !path.is_empty() {
+        if authority.is_none() && path == "/" {
+            return Ok(format!("p{idx}:/"));
+        }
+        return Ok(format!("{PLACEHOLDER_PREFIX_BASE}p{idx}/"));
+    }
+    let Some(auth) = authority else {
+        return Ok(format!("p{idx}:"));
+    };
+    if auth.is_empty() {
+        return Ok(format!("p{idx}://"));
+    }
+    let (has_userinfo, host_port) = match auth.split_once('@') {
+        Some((_, rest)) => (true, rest),
+        None => (false, auth),
+    };
+    if host_port.is_empty() {
+        return Ok(format!("p{idx}://u@"));
+    }
+    if host_port.starts_with('[') {
+        let has_port = host_port
+            .split_once(']')
+            .is_some_and(|(_, after)| after.starts_with(':'));
+        return Ok(match (has_userinfo, has_port) {
+            (true, true) => format!("p{idx}://u@[::1]:0"),
+            (true, false) => format!("p{idx}://u@[::1]"),
+            (false, true) => format!("p{idx}://[::1]:0"),
+            (false, false) => format!("p{idx}://[::1]"),
+        });
+    }
+    let has_port = host_port.contains(':');
+    Ok(match (has_userinfo, has_port) {
+        (true, true) => format!("p{idx}://u@h:0"),
+        (true, false) => format!("p{idx}://u@h"),
+        (false, true) => format!("p{idx}://h:0"),
+        (false, false) => format!("p{idx}://h"),
+    })
+}
+
 /// Whether `ns` is a prefix of any custom aggregate IRI registered by
 /// [`sparkles_core::sparql::aggext::register`]. Every such namespace is short (<= 63 bytes),
 /// so emitting the real `PREFIX` declaration for it in subquery preflight cannot cause
@@ -1401,6 +1455,12 @@ pub(crate) fn admit_resolved_prefixed_iris(
                         "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
                     )));
                 }
+                total_resolved = total_resolved.saturating_add(ns_len);
+                if total_resolved > max_resolved_bytes {
+                    return Err(limit_err(format!(
+                        "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
+                    )));
+                }
                 local_prefixes.insert(prefix, ns_len);
                 i += 3;
                 continue;
@@ -1416,6 +1476,12 @@ pub(crate) fn admit_resolved_prefixed_iris(
             if base_len > MAX_OUTPUT_BYTES {
                 return Err(limit_err(format!(
                     "SPIN resolved IRI exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+                )));
+            }
+            total_resolved = total_resolved.saturating_add(base_len);
+            if total_resolved > max_resolved_bytes {
+                return Err(limit_err(format!(
+                    "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
                 )));
             }
             i += 2;
@@ -1469,33 +1535,18 @@ pub(crate) fn admit_resolved_prefixed_iris(
     Ok(())
 }
 
-fn unescape_pn_local(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\'
-            && let Some(next) = chars.next()
-        {
-            out.push(next);
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// Validate that `text` represents a single valid SPARQL `SubSelect` (starting with `SELECT`,
 /// balanced `{}` braces that cannot escape the subquery block, and no dataset clauses or
 /// prologue), charging `budget`.
 ///
 /// When `known_prefixes` is `Some`, only declared prefixes are emitted; namespaces that can
 /// resolve to a registered custom aggregate keep their real (short) IRI while other declared
-/// prefixes use fixed-length indexed placeholder namespaces so discarded structural candidates
-/// never amplify long caller namespaces during preflight. When `None` (standalone
-/// serialization without a prefix table), indexed placeholder namespaces are emitted for all
-/// prefixes and both `DISTINCT` and non-`DISTINCT` single-argument placeholder calls are
-/// admitted as potential custom aggregates so missing prefix declarations do not reject
-/// valid standalone fragments.
+/// prefixes use bounded-length placeholders preserving the real namespace's RFC 3987 parser
+/// end state so discarded structural candidates never amplify long caller namespaces while
+/// preserving real IRI validity for local fallbacks. When `None` (standalone serialization
+/// without a prefix table), synthetic placeholder prefixes are registered on `SparqlParser`
+/// so both `DISTINCT` and non-`DISTINCT` single-argument prefixed calls are admitted as
+/// potential custom aggregates while explicit `<IRI>` calls stay strictly validated.
 pub(crate) fn validate_subquery_text(
     text: &str,
     known_prefixes: Option<&FxHashMap<&str, &str>>,
@@ -1516,10 +1567,9 @@ pub(crate) fn validate_subquery_text(
     let mut brace_depth: isize = 0;
     let mut prefix_indices: FxHashMap<&str, usize> = FxHashMap::default();
     let mut used_prefixes: Vec<(&str, String)> = Vec::new();
-    let mut distinct_agg_tokens: Vec<(usize, &str)> = Vec::new();
     let mut resolved_iri_bytes = 0usize;
     let max_resolved_bytes = budget.remaining_bytes();
-    for (idx, tok) in tokens.iter().enumerate() {
+    for tok in &tokens {
         match tok.kind {
             TokKind::LBrace => brace_depth += 1,
             TokKind::RBrace => {
@@ -1534,13 +1584,18 @@ pub(crate) fn validate_subquery_text(
                         Some(existing)
                     } else {
                         let effective_ns = match known_prefixes {
-                            Some(prefix_map) => prefix_map.get(prefix).map(|&ns| {
-                                if could_resolve_to_registered_aggregate(ns) {
+                            Some(prefix_map) => match prefix_map.get(prefix) {
+                                Some(&ns) => Some(if could_resolve_to_registered_aggregate(ns) {
                                     ns.to_string()
                                 } else {
-                                    indexed_placeholder_ns(used_prefixes.len())
-                                }
-                            }),
+                                    state_preserving_placeholder_ns(
+                                        prefix,
+                                        ns,
+                                        used_prefixes.len(),
+                                    )?
+                                }),
+                                None => None,
+                            },
                             None => Some(indexed_placeholder_ns(used_prefixes.len())),
                         };
                         if let Some(ns) = effective_ns {
@@ -1564,16 +1619,6 @@ pub(crate) fn validate_subquery_text(
                             return Err(limit_err(format!(
                                 "SPIN query exceeds maximum resolved IRI size ({max_resolved_bytes} bytes)"
                             )));
-                        }
-                        if known_prefixes.is_none()
-                            && tokens
-                                .get(idx + 1)
-                                .is_some_and(|t| t.kind == TokKind::LParen)
-                            && tokens
-                                .get(idx + 2)
-                                .is_some_and(|t| t.is_word(text, "DISTINCT"))
-                        {
-                            distinct_agg_tokens.push((slot, local));
                         }
                     }
                 }
@@ -1603,31 +1648,32 @@ pub(crate) fn validate_subquery_text(
         )));
     }
 
-    let mut wrapped = String::with_capacity(wrapped_len);
-    for (p, ns) in &used_prefixes {
-        wrapped.push_str("PREFIX ");
-        wrapped.push_str(p);
-        wrapped.push_str(": <");
-        wrapped.push_str(ns);
-        wrapped.push_str(">\n");
-    }
-    wrapped.push_str("SELECT * WHERE { {\n");
-    wrapped.push_str(text);
-    wrapped.push_str("\n} }");
-
     let mut parser = sparkles_core::sparql::aggext::register(spargebra::SparqlParser::new());
-    if known_prefixes.is_none() {
-        parser = parser.with_placeholder_aggregate_namespace(PLACEHOLDER_PREFIX_BASE);
-        let mut seen_aggs: FxHashSet<NamedNode> = FxHashSet::default();
-        for (slot, local) in distinct_agg_tokens {
-            let iri_str = format!("{}{}", used_prefixes[slot].1, unescape_pn_local(local));
-            if let Ok(iri) = NamedNode::new(iri_str)
-                && seen_aggs.insert(iri.clone())
-            {
-                parser = parser.with_custom_aggregate_function(iri);
-            }
+    let wrapped = if known_prefixes.is_none() {
+        for (p, ns) in &used_prefixes {
+            parser = parser
+                .with_placeholder_prefix(*p, ns.as_str())
+                .map_err(|e| anyhow!("invalid sp:SubQuery placeholder prefix {p:?}: {e}"))?;
         }
-    }
+        let mut w = String::with_capacity(text.len() + "SELECT * WHERE { {\n\n} }".len());
+        w.push_str("SELECT * WHERE { {\n");
+        w.push_str(text);
+        w.push_str("\n} }");
+        w
+    } else {
+        let mut w = String::with_capacity(wrapped_len);
+        for (p, ns) in &used_prefixes {
+            w.push_str("PREFIX ");
+            w.push_str(p);
+            w.push_str(": <");
+            w.push_str(ns);
+            w.push_str(">\n");
+        }
+        w.push_str("SELECT * WHERE { {\n");
+        w.push_str(text);
+        w.push_str("\n} }");
+        w
+    };
     let parsed = parser.parse_query(&wrapped).map_err(|e| {
         if e.is_too_deep() {
             limit_err(format!("invalid sp:SubQuery sp:text: {e}"))

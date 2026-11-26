@@ -362,9 +362,8 @@ pub(crate) fn serialize_query_with_bindings_measured(
         used_var_names: FxHashSet::default(),
     };
     ser.write_query(query, 0, false)?;
-    let peak = ser.peak_live_output_bytes;
     let sparql = ser.resolve_anon_var_collisions()?;
-    Ok((sparql, peak))
+    Ok((sparql, ser.peak_live_output_bytes))
 }
 
 /// Append `s` to `out`, refusing output larger than `limit`.
@@ -855,25 +854,70 @@ impl Serializer<'_, '_, '_, '_> {
         Ok(())
     }
 
-    fn flatten_segments(self) -> String {
+    fn flatten_segments_into_bytes(&mut self) -> Vec<u8> {
+        let out = std::mem::take(&mut self.out);
         if self.segments.is_empty() {
-            return self.out;
+            return out.into_bytes();
         }
-        let total = self.segments_bytes.saturating_add(self.out.len());
-        let mut iter = self.segments.into_iter().chain(std::iter::once(self.out));
-        let mut out = iter.next().unwrap_or_default();
-        if total > out.len() {
-            out.reserve_exact(total - out.len());
+        let mut parts = std::mem::take(&mut self.segments);
+        parts.push(out);
+        let total = self
+            .segments_bytes
+            .saturating_add(parts.last().map_or(0, String::len));
+        self.segments_bytes = 0;
+
+        // Reuse the largest owned segment buffer in-place so flattening a small SELECT
+        // header onto a large WHERE buffer never allocates a second copy of the large
+        // segment.
+        let mut max_idx = 0usize;
+        let mut max_len = 0usize;
+        for (i, seg) in parts.iter().enumerate() {
+            if seg.len() > max_len {
+                max_len = seg.len();
+                max_idx = i;
+            }
         }
-        for seg in iter {
-            out.push_str(&seg);
+        let prefix_len: usize = parts[..max_idx].iter().map(String::len).sum();
+        let mut bytes = std::mem::take(&mut parts[max_idx]).into_bytes();
+        let orig_len = bytes.len();
+        if total > orig_len {
+            bytes.reserve_exact(total - orig_len);
         }
-        out
+        let mut remaining_parts_bytes = total.saturating_sub(orig_len);
+        #[cfg(test)]
+        {
+            let live = total.saturating_add(remaining_parts_bytes);
+            if live > self.peak_live_output_bytes {
+                self.peak_live_output_bytes = live;
+            }
+        }
+        if prefix_len > 0 {
+            bytes.resize(prefix_len + orig_len, 0);
+            bytes.copy_within(0..orig_len, prefix_len);
+            let mut pos = 0usize;
+            for seg in &mut parts[..max_idx] {
+                let s = std::mem::take(seg);
+                let len = s.len();
+                bytes[pos..pos + len].copy_from_slice(s.as_bytes());
+                pos += len;
+                remaining_parts_bytes = remaining_parts_bytes.saturating_sub(len);
+            }
+        }
+        for seg in &mut parts[max_idx + 1..] {
+            let s = std::mem::take(seg);
+            let len = s.len();
+            bytes.extend_from_slice(s.as_bytes());
+            remaining_parts_bytes = remaining_parts_bytes.saturating_sub(len);
+        }
+        debug_assert_eq!(remaining_parts_bytes, 0);
+        debug_assert_eq!(bytes.len(), total);
+        bytes
     }
 
-    fn resolve_anon_var_collisions(mut self) -> Result<String> {
+    fn resolve_anon_var_collisions(&mut self) -> Result<String> {
         if self.anon_vars.is_empty() {
-            return Ok(self.flatten_segments());
+            let bytes = self.flatten_segments_into_bytes();
+            return Ok(String::from_utf8(bytes).expect("SPIN output is valid UTF-8"));
         }
         let count = self.anon_vars.len();
         let has_collision = (0..count).any(|id| {
@@ -881,7 +925,8 @@ impl Serializer<'_, '_, '_, '_> {
             self.used_var_names.contains(&name) || self.bindings.contains_key(&name)
         });
         if !has_collision {
-            return Ok(self.flatten_segments());
+            let bytes = self.flatten_segments_into_bytes();
+            return Ok(String::from_utf8(bytes).expect("SPIN output is valid UTF-8"));
         }
         let mut final_names = Vec::with_capacity(count);
         let mut next_n = 1usize;
@@ -896,25 +941,45 @@ impl Serializer<'_, '_, '_, '_> {
                 }
             }
         }
-        let mut rebuilt = String::with_capacity(self.logical_out_len().min(MAX_OUTPUT_BYTES));
-        let mut spans = self.anon_var_spans.into_iter().peekable();
-        let mut seg_base = 0usize;
-        for seg in self.segments.into_iter().chain(std::iter::once(self.out)) {
-            let seg_end = seg_base + seg.len();
-            let mut cursor = seg_base;
-            while let Some(&(start, end, id)) = spans.peek() {
-                if start >= seg_end {
-                    break;
-                }
-                spans.next();
-                push_str_bounded(&mut rebuilt, &seg[cursor - seg_base..start - seg_base])?;
-                push_str_bounded(&mut rebuilt, &final_names[id])?;
-                cursor = end;
-            }
-            push_str_bounded(&mut rebuilt, &seg[cursor - seg_base..])?;
-            seg_base = seg_end;
+        let total = self.logical_out_len();
+        let mut final_len = total;
+        for &(start, end, id) in &self.anon_var_spans {
+            let orig = end - start;
+            let rep = final_names[id].len();
+            debug_assert!(rep >= orig);
+            final_len = final_len.saturating_add(rep - orig);
         }
-        Ok(rebuilt)
+        if final_len > MAX_OUTPUT_BYTES {
+            return Err(limit_err(format!(
+                "serialized SPIN query exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
+            )));
+        }
+        let mut bytes = self.flatten_segments_into_bytes();
+        if final_len > total {
+            bytes.reserve_exact(final_len - total);
+            bytes.resize(final_len, 0);
+        }
+        #[cfg(test)]
+        if final_len > self.peak_live_output_bytes {
+            self.peak_live_output_bytes = final_len;
+        }
+        // Rewrite colliding anonymous variable names in-place from right to left so
+        // finalization never allocates a second copy of the output buffer.
+        let mut read_end = total;
+        let mut write_end = final_len;
+        for (start, end, id) in std::mem::take(&mut self.anon_var_spans).into_iter().rev() {
+            let tail_len = read_end - end;
+            write_end -= tail_len;
+            if tail_len > 0 && write_end != end {
+                bytes.copy_within(end..read_end, write_end);
+            }
+            let rep = final_names[id].as_bytes();
+            write_end -= rep.len();
+            bytes[write_end..write_end + rep.len()].copy_from_slice(rep);
+            read_end = start;
+        }
+        debug_assert_eq!(read_end, write_end);
+        Ok(String::from_utf8(bytes).expect("SPIN output is valid UTF-8"))
     }
 
     fn template_bnode_label(&mut self, b: &BlankNode) -> String {
