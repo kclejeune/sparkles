@@ -1071,16 +1071,6 @@ impl Vocab {
         self.get_with_shared_prefix(id, |_, key| f(key))
     }
 
-    /// [`Vocab::get_with`] reusing the caller's scratch buffer across calls.
-    pub(crate) fn get_with_in<T>(
-        &self,
-        id: u64,
-        key: &mut Vec<u8>,
-        mut f: impl FnMut(&[u8]) -> T,
-    ) -> Option<T> {
-        self.get_with_shared_prefix_in(id, key, |_, k| f(k))
-    }
-
     /// Decode a key with the length of its common prefix with the preceding key.
     /// Both vocabulary codecs store that length for keys after the first in a block.
     /// For the first key of a block, the prefix length is unknown.

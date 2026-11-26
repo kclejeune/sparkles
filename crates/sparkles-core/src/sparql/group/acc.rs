@@ -248,9 +248,8 @@ impl Accumulator for Running {
                 let id = batch.value(row);
                 let state = &mut self.states[slot as usize];
                 if state.sum_deferred()
-                    || !state.add_admitted(ctx, agg, id, &mut |old, new| {
-                        sum_budget.replace(old, new)
-                    })?
+                    || !state
+                        .add_admitted(ctx, agg, id, &mut |old, new| sum_budget.replace(old, new))?
                 {
                     sum_budget.defer(ctx, slot, id)?;
                     state.defer_sum();

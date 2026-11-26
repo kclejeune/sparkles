@@ -436,11 +436,11 @@ impl Head {
                         } else {
                             step
                         };
-                        let slots_bytes =
-                            (len as u64).saturating_mul(size_of::<SortKey>() as u64);
+                        let slots_bytes = (len as u64).saturating_mul(size_of::<SortKey>() as u64);
                         bytes = bytes.saturating_add(slots_bytes);
                         if bytes > charge.bytes()
-                            && (key_step == 0 || charge.resize(bytes.saturating_add(key_step)).is_err())
+                            && (key_step == 0
+                                || charge.resize(bytes.saturating_add(key_step)).is_err())
                         {
                             charge.resize(bytes)?;
                         }

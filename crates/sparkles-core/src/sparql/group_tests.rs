@@ -318,7 +318,7 @@ fn running_sum_tracks_big_number_subtotal_growth() {
     let mut right = Running::new(&sum_agg, true);
     right.init(1);
     fold(&ctx, &mut right, &[big_id], &[0]);
-    left.merge(&ctx, &mut right, &[0]).unwrap();
+    left.merge(&ctx, &mut right, &[0], &mut |_| Ok(())).unwrap();
     assert!(
         left.take_growth() >= 1_500,
         "expected merge growth for big-number SUM"

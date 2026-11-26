@@ -2860,32 +2860,37 @@ impl Ctx {
         key: &mut Vec<u8>,
         mut f: impl FnMut(&[u8]) -> T,
     ) -> Result<Option<T>> {
-        if !self.envelope_refuses() {
-            let mut err = None;
-            let found = self
+        self.check_memory_failure()?;
+        if self.is_strict_decode() {
+            self.check()?;
+            return self
                 .snap
                 .generation
                 .vocab
-                .get_with_in(id, key, |k| match self.reserve_decode_checked(k.len()) {
-                    Ok(()) => Some(f(k)),
-                    Err(e) => {
-                        err = Some(e);
-                        None
-                    }
-                })
-                .flatten();
-            return match err {
-                Some(e) => Err(e),
-                None => Ok(found),
-            };
+                .get_with_controlled(
+                    id,
+                    |need| self.reserve_decode_checked(need),
+                    |_| self.check(),
+                    |k| {
+                        id::validate_key_framing(k)?;
+                        Ok(f(k))
+                    },
+                )
+                .and_then(|opt| opt.transpose());
         }
-        self.check_memory_failure()?;
-        self.snap.generation.vocab.get_with_checked_in(
-            id,
-            key,
-            |need| self.reserve_decode_checked(need),
-            |k| f(k),
-        )
+        self.snap
+            .generation
+            .vocab
+            .get_with_checked_in(
+                id,
+                key,
+                |need| self.reserve_decode_checked(need),
+                |k| {
+                    id::validate_key_framing(k)?;
+                    Ok(f(k))
+                },
+            )
+            .and_then(|opt| opt.transpose())
     }
 
     /// The row limit of intermediate results.
@@ -4184,7 +4189,7 @@ impl Ctx {
             // Compact triple keys can hide a component vector and boxed triple
             // at each level, even when there is very little lexical text, while
             // wide triple terms still need the legacy eightfold envelope floor.
-            Ok(output_key_bytes(self, key, 0)?.max(envelope))
+            Ok(output_key_bytes(self, key)?.max(envelope))
         } else {
             Ok(envelope)
         }

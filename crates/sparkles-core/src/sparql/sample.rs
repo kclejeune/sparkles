@@ -498,7 +498,7 @@ mod tests {
         )]];
         let filter = Expr::Bound(v);
         let text = filter.display(&ctx);
-        prepare(&ctx, &leaves, std::slice::from_ref(&filter)).unwrap();
+        prepare(&ctx, &leaves, std::slice::from_ref(&filter), None).unwrap();
         let cached = ctx.sampled(&text).expect("pure FILTER was sampled");
 
         let mut next = Ctx::new(ctx.snap.clone());
@@ -507,13 +507,13 @@ mod tests {
         next.var(&"padding".repeat(SETUP / 7));
         next.mem_limit = 16 * 1024;
         let peak = crate::test_alloc::record_peak_live(|| {
-            prepare(&next, &leaves, std::slice::from_ref(&filter)).unwrap();
+            prepare(&next, &leaves, std::slice::from_ref(&filter), None).unwrap();
         });
         assert_eq!(next.sampled(&text), Some(cached));
         assert!(peak < SETUP / 2, "cache hit allocated {peak} bytes");
         let miss = Expr::Not(Box::new(filter));
         let text = miss.display(&next);
-        prepare(&next, &leaves, &[miss]).unwrap();
+        prepare(&next, &leaves, &[miss], None).unwrap();
         assert_eq!(next.sampled(&text), None);
     }
 
@@ -547,7 +547,7 @@ mod tests {
             1.0,
             String::new(),
         )]];
-        prepare(&ctx, &leaves, &[filter]).unwrap();
+        prepare(&ctx, &leaves, &[filter], None).unwrap();
         assert_eq!(ctx.sampled(&text), None);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }

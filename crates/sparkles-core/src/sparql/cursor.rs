@@ -11199,6 +11199,9 @@ mod retained_variable_tests {
 
             drop(spec);
             drop(node);
+            // Cursor-mode vocabulary prefetch retains idle optional headroom on the
+            // decode envelope until cursor work teardown releases it.
+            ctx.release_work();
             assert_eq!(ctx.live_bytes(), 0);
             drop(ctx);
             assert_eq!(pool.granted(), 0);

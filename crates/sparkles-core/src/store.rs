@@ -3465,7 +3465,11 @@ impl Store {
         limit: C,
         r: crate::history::Resolved,
         live: Arc<Snapshot>,
-    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
         if r.commit.seq == live.commit {
             limit.check(history_limited::SHARED_SNAPSHOT_BYTES)?;
             return Ok((

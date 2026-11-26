@@ -68,7 +68,7 @@ impl Store {
         let at = At::Commit(seq);
         let resolved = self.resolve_in(&at, head, &limit)?;
         self.snapshot_at_resolved(&at, limit, resolved, live)
-            .map(|(snapshot, _)| snapshot)
+            .map(|(snapshot, _, _)| snapshot)
     }
 
     /// An unresolved time has no honest commit number after catalog pruning.

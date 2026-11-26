@@ -219,7 +219,7 @@ pub(crate) enum BatchBudget<'a> {
     SpillSum(SumBudget<'a>),
 }
 
-impl BatchBudget<'_> {
+impl<'a> BatchBudget<'a> {
     pub(super) fn retain(&mut self, bytes: u64) -> Result<()> {
         match self {
             Self::Retain(f) => f(bytes),
@@ -227,7 +227,7 @@ impl BatchBudget<'_> {
         }
     }
 
-    pub(super) fn sum_budget(&mut self) -> Option<&mut SumBudget<'_>> {
+    pub(super) fn sum_budget(&mut self) -> Option<&mut SumBudget<'a>> {
         match self {
             Self::Retain(_) => None,
             Self::SpillSum(b) => Some(b),
