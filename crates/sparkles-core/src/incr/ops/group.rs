@@ -21,9 +21,11 @@ use crate::sparql::expr::Expr;
 use crate::sparql::group::acc::{self, Accumulator, Arg, Batch};
 use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use spargebra::algebra::{AggregateFunction, Expression};
 use std::fmt;
+
+type HbMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
 
 /// Checkpoint encoding version of [`Group`]'s state. Unknown versions are refused with
 /// [`Error::Unsupported`].
@@ -92,7 +94,7 @@ pub struct Group {
     /// no `GROUP BY`: one group, present even without rows
     pub implicit: bool,
     /// key -> dense slot in `slots` and every accumulator in `accs`
-    index: FxHashMap<Row, u32>,
+    index: HbMap<Row, u32>,
     slots: Vec<GroupMeta>,
     /// one retractable accumulator per aggregate, sharing slots `0..slots.len()`
     accs: Vec<Box<dyn Accumulator>>,
@@ -154,7 +156,7 @@ impl Group {
             keys,
             aggs,
             implicit,
-            index: FxHashMap::default(),
+            index: HbMap::default(),
             slots: Vec::new(),
             accs,
             gann: None,
@@ -177,7 +179,7 @@ impl Group {
     }
 
     fn clear_state(&mut self) {
-        self.index = FxHashMap::default();
+        self.index = HbMap::default();
         self.slots = Vec::new();
         for acc in &mut self.accs {
             acc.clear();
@@ -191,7 +193,7 @@ impl Group {
         const SHRINK_MIN_CAP: usize = 64;
         if self.slots.is_empty() {
             self.slots = Vec::new();
-            self.index = FxHashMap::default();
+            self.index = HbMap::default();
             for acc in &mut self.accs {
                 acc.clear();
             }
@@ -204,9 +206,18 @@ impl Group {
         {
             self.slots.shrink_to(self.slots.len() * 2);
         }
-        if self.index.capacity() >= SHRINK_MIN_CAP && self.index.len() * 4 <= self.index.capacity()
+        let index_entry_bytes = std::mem::size_of::<(Row, u32)>() + 1;
+        let index_alloc = self.index.allocation_size();
+        if index_alloc >= SHRINK_MIN_CAP * index_entry_bytes
+            && self
+                .index
+                .len()
+                .saturating_mul(index_entry_bytes)
+                .saturating_mul(4)
+                <= index_alloc
         {
-            self.index.shrink_to(self.index.len() * 2);
+            self.index
+                .shrink_to(self.index.len() + self.index.len() / 2);
         }
         for acc in &mut self.accs {
             acc.shrink_unused();
@@ -217,13 +228,16 @@ impl Group {
     }
 
     #[cfg(test)]
-    pub(crate) fn backing_capacities(&self) -> (usize, usize) {
-        (self.slots.capacity(), self.index.capacity())
+    pub(crate) fn backing_allocations(&self) -> (usize, usize) {
+        (
+            self.slots.capacity() * std::mem::size_of::<GroupMeta>(),
+            self.index.allocation_size(),
+        )
     }
 
     #[cfg(test)]
-    pub(crate) fn gann_capacity(&self) -> usize {
-        self.gann.as_ref().map_or(0, |m| m.capacity())
+    pub(crate) fn gann_allocation_size(&self) -> usize {
+        self.gann.as_ref().map_or(0, |m| m.allocation_size())
     }
 
     fn push_group(&mut self, key: Row) -> u32 {
@@ -610,8 +624,7 @@ impl Group {
         let out_row_bytes = (self.keys.len() + self.aggs.len()) as u64 * 8;
         let live_rows = self.slots.len() as u64 * (key_row_bytes * 2 + out_row_bytes);
         let slots_buf = self.slots.capacity() as u64 * std::mem::size_of::<GroupMeta>() as u64;
-        let index_buf =
-            self.index.capacity() as u64 * (std::mem::size_of::<(Row, u32)>() as u64 + 8);
+        let index_buf = self.index.allocation_size() as u64;
         let accs_bytes: u64 = self.accs.iter().map(|a| a.retained_bytes()).sum();
         live_rows
             + slots_buf

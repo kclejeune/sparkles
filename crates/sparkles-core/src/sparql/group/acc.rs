@@ -21,10 +21,15 @@ use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
 use crate::sparql::value::{NumOp, Value, arith, exact_sum, order_cmp};
 use oxsdatatypes::{Decimal, Double, Float};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashSet};
 use spargebra::algebra::AggregateFunction;
 use std::any::Any;
 use std::cmp::Ordering;
+
+type HbMap<K, V> = hashbrown::HashMap<K, V, FxBuildHasher>;
+
+/// Largest byte length a Rust `Vec<u8>` or `String` allocation can represent.
+const MAX_ALLOC_BYTES: usize = isize::MAX as usize;
 
 /// Where an aggregate's argument comes from in a batch.
 #[derive(Clone, Copy)]
@@ -130,11 +135,17 @@ fn shrink_vec<T>(v: &mut Vec<T>) {
     }
 }
 
-fn shrink_map<K: Eq + std::hash::Hash, V>(m: &mut FxHashMap<K, V>) {
+fn shrink_map<K: Eq + std::hash::Hash, V>(m: &mut HbMap<K, V>) {
+    let entry_bytes = size_of::<(K, V)>() + 1;
     if m.is_empty() {
-        *m = FxHashMap::default();
-    } else if m.capacity() >= SHRINK_MIN_CAP && m.len() * 4 <= m.capacity() {
-        m.shrink_to(m.len() * 2);
+        *m = HbMap::default();
+    } else {
+        let alloc = m.allocation_size();
+        if alloc >= SHRINK_MIN_CAP * entry_bytes
+            && m.len().saturating_mul(entry_bytes).saturating_mul(4) <= alloc
+        {
+            m.shrink_to(m.len() + m.len() / 2);
+        }
     }
 }
 
@@ -175,15 +186,60 @@ pub(crate) fn finish_best(ctx: &Ctx, is_min: bool, errs: u64, best: Option<Id>) 
     }
 }
 
-/// Shared finalization for `GROUP_CONCAT` across one-off and retractable accumulators.
-pub(crate) fn finish_concat(ctx: &Ctx, distinct: bool, empty: bool, ok: bool, text: String) -> Id {
+fn concat_is_undef(ctx: &Ctx, distinct: bool, empty: bool, ok: bool) -> bool {
     let nothing = empty && distinct && ctx.aggregate_errors.distinct_concat_of_nothing_unbound();
-    if ok && !nothing {
-        // SPARQL 1.1: the result is a simple literal
-        ctx.intern_value(&Value::Str(text.into()))
-    } else {
-        Id::UNDEF
+    !ok || nothing
+}
+
+/// Shared finalization for `GROUP_CONCAT` across one-off and retractable accumulators.
+/// Encodes directly into a simple-literal vocabulary key without intermediate `Arc<str>`
+/// or `oxrdf::Literal` copies, admitting any scratch growth before reserving it.
+pub(crate) fn finish_concat(
+    ctx: &Ctx,
+    distinct: bool,
+    empty: bool,
+    ok: bool,
+    text: String,
+) -> Result<Id> {
+    if concat_is_undef(ctx, distinct, empty, ok) {
+        return Ok(Id::UNDEF);
     }
+    if text.is_empty() {
+        let id = ctx.intern_key(&[b'"', crate::id::KEY_SEP]);
+        ctx.check()?;
+        return Ok(id);
+    }
+    let len = text.len();
+    let Some(key_len) = len.checked_add(2).filter(|&n| n <= MAX_ALLOC_BYTES) else {
+        return Err(Error::BudgetExceeded(crate::error::Budget {
+            kind: crate::error::BudgetKind::Memory,
+            limit: ctx.mem_limit,
+            requested: (len as u64).saturating_add(2),
+        }));
+    };
+    let mut key = text.into_bytes();
+    let _scratch = if key.capacity() < key_len {
+        let charge = ctx.charge(key_len as u64)?;
+        key.try_reserve_exact(key_len - len).map_err(|_| {
+            Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                limit: ctx.mem_limit,
+                requested: key_len as u64,
+            })
+        })?;
+        Some(charge)
+    } else {
+        None
+    };
+    key.push(0);
+    key.copy_within(0..len, 1);
+    key[0] = b'"';
+    key.push(crate::id::KEY_SEP);
+    let id = ctx.intern_key(&key);
+    drop(key);
+    drop(_scratch);
+    ctx.check()?;
+    Ok(id)
 }
 
 /// How one aggregate folds the rows of its groups. `merge` serves item 1066's parallel
@@ -668,9 +724,9 @@ struct SumState {
     /// The integer sum, in wrapping arithmetic so that removals stay exact
     int: i128,
     /// The decimal values as counts by their 128-bit encoding
-    decs: FxHashMap<i128, i64>,
-    floats: FxHashMap<u32, i64>,
-    doubles: FxHashMap<u64, i64>,
+    decs: HbMap<i128, i64>,
+    floats: HbMap<u32, i64>,
+    doubles: HbMap<u64, i64>,
 }
 
 impl SumState {
@@ -779,8 +835,9 @@ impl SumState {
     }
 
     fn map_bytes(&self) -> u64 {
-        (self.floats.capacity() + self.doubles.capacity()) as u64 * 24
-            + self.decs.capacity() as u64 * 40
+        (self.floats.allocation_size()
+            + self.doubles.allocation_size()
+            + self.decs.allocation_size()) as u64
     }
 
     fn save(&self, w: &mut Writer) {
@@ -1149,9 +1206,10 @@ impl Accumulator for Ordered {
                 let strings = ctx.aggregate_errors.concat_strings_only();
                 let charge = ctx.charge(0)?;
                 let mut charged = 0u64;
-                let mut out = String::new();
+                let mut key: Vec<u8> = Vec::new();
                 let mut empty = true;
-                for (v, n) in &m.vals {
+                let total_vals = m.vals.len();
+                for (idx, (v, n)) in m.vals.iter().enumerate() {
                     if *n <= 0 {
                         continue;
                     }
@@ -1169,32 +1227,38 @@ impl Accumulator for Ordered {
                         continue;
                     }
                     let seps = if empty { reps - 1 } else { reps };
-                    let added = reps
-                        .checked_mul(s.len() as u64)
-                        .and_then(|b| {
-                            seps.checked_mul(separator.len() as u64)
-                                .and_then(|sb| b.checked_add(sb))
-                        })
-                        .and_then(|b| usize::try_from(b).ok());
-                    let Some(added) = added else {
+                    let added_u64 = reps.checked_mul(s.len() as u64).and_then(|b| {
+                        seps.checked_mul(separator.len() as u64)
+                            .and_then(|sb| b.checked_add(sb))
+                    });
+                    if added_u64 == Some(0) {
+                        empty = false;
+                        continue;
+                    }
+                    let prefix_len = if key.is_empty() {
+                        1u64
+                    } else {
+                        key.len() as u64
+                    };
+                    let total_u64 = added_u64
+                        .and_then(|a| prefix_len.checked_add(a))
+                        .and_then(|n| n.checked_add(1));
+                    let Some(final_key_len) = total_u64
+                        .and_then(|n| usize::try_from(n).ok())
+                        .filter(|&n| n <= MAX_ALLOC_BYTES)
+                    else {
                         return Err(Error::BudgetExceeded(crate::error::Budget {
                             kind: crate::error::BudgetKind::Memory,
                             limit: ctx.mem_limit,
-                            requested: u64::MAX,
+                            requested: total_u64.unwrap_or(u64::MAX),
                         }));
                     };
-                    let Some(new_len) = out.len().checked_add(added) else {
-                        return Err(Error::BudgetExceeded(crate::error::Budget {
-                            kind: crate::error::BudgetKind::Memory,
-                            limit: ctx.mem_limit,
-                            requested: u64::MAX,
-                        }));
-                    };
-                    let need = new_len as u64;
+                    let need = final_key_len as u64;
                     if need > charged {
                         charge.add(need - charged)?;
                         charged = need;
                     }
+                    let has_more_vals = idx + 1 < total_vals;
                     let mut rem = reps;
                     while rem > 0 {
                         ctx.check()?;
@@ -1202,37 +1266,63 @@ impl Accumulator for Ordered {
                         let chunk_seps = if empty { chunk - 1 } else { chunk };
                         let chunk_bytes =
                             (chunk as usize) * s.len() + (chunk_seps as usize) * separator.len();
-                        let next_len = out.len() + chunk_bytes;
-                        if next_len > out.capacity() {
+                        let next_len =
+                            (if key.is_empty() { 1 } else { key.len() }) + chunk_bytes + 1;
+                        if next_len > key.capacity() {
+                            let doubled = key.capacity().saturating_mul(2).min(MAX_ALLOC_BYTES);
                             let cap_bound = if rem == chunk {
-                                let amortized = new_len.max(out.capacity().saturating_mul(2));
-                                if amortized > new_len
-                                    && (amortized as u64) > charged
-                                    && charge.add(amortized as u64 - charged).is_ok()
-                                {
-                                    charged = amortized as u64;
-                                    amortized
+                                if has_more_vals {
+                                    let amortized = final_key_len.max(doubled);
+                                    if amortized > final_key_len {
+                                        let extra = (amortized as u64).saturating_sub(charged);
+                                        if extra == 0 || charge.add(extra).is_ok() {
+                                            charged = charged.max(amortized as u64);
+                                            amortized
+                                        } else {
+                                            final_key_len
+                                        }
+                                    } else {
+                                        final_key_len
+                                    }
                                 } else {
-                                    new_len
+                                    final_key_len
                                 }
                             } else {
-                                next_len.max(out.capacity().saturating_mul(2)).min(new_len)
+                                next_len.max(doubled).min(final_key_len)
                             };
-                            if cap_bound > out.capacity() {
-                                out.reserve_exact(cap_bound - out.len());
+                            if cap_bound > key.capacity() {
+                                key.try_reserve_exact(cap_bound - key.len()).map_err(|_| {
+                                    Error::BudgetExceeded(crate::error::Budget {
+                                        kind: crate::error::BudgetKind::Memory,
+                                        limit: ctx.mem_limit,
+                                        requested: cap_bound as u64,
+                                    })
+                                })?;
                             }
+                        }
+                        if key.is_empty() {
+                            key.push(b'"');
                         }
                         for _ in 0..chunk {
                             if !empty {
-                                out.push_str(separator);
+                                key.extend_from_slice(separator.as_bytes());
                             }
                             empty = false;
-                            out.push_str(&s);
+                            key.extend_from_slice(s.as_bytes());
                         }
                         rem -= chunk;
                     }
                 }
-                let id = finish_concat(ctx, *distinct, empty, true, out);
+                if concat_is_undef(ctx, *distinct, empty, true) {
+                    return Ok(Id::UNDEF);
+                }
+                let id = if key.is_empty() {
+                    ctx.intern_key(&[b'"', crate::id::KEY_SEP])
+                } else {
+                    key.push(crate::id::KEY_SEP);
+                    ctx.intern_key(&key)
+                };
+                drop(key);
                 drop(charge);
                 ctx.check()?;
                 Ok(id)
@@ -1325,8 +1415,8 @@ impl Accumulator for Ordered {
 
 #[derive(Clone)]
 enum DistinctGroup {
-    Values(FxHashMap<Id, i64>),
-    Rows(FxHashMap<Box<[Id]>, i64>),
+    Values(HbMap<Id, i64>),
+    Rows(HbMap<Box<[Id]>, i64>),
 }
 
 /// Retractable `DISTINCT` wrapper over any retractable accumulator. Each group counts
@@ -1352,9 +1442,9 @@ impl RetractableDistinct {
 
     fn empty_group(&self) -> DistinctGroup {
         if self.star {
-            DistinctGroup::Rows(FxHashMap::default())
+            DistinctGroup::Rows(HbMap::default())
         } else {
-            DistinctGroup::Values(FxHashMap::default())
+            DistinctGroup::Values(HbMap::default())
         }
     }
 }
@@ -1560,10 +1650,9 @@ impl Accumulator for RetractableDistinct {
             .iter()
             .map(|g| match g {
                 DistinctGroup::Rows(m) => {
-                    m.len() as u64 * (self.row_width as u64 * 8)
-                        + m.capacity() as u64 * (size_of::<(Box<[Id]>, i64)>() as u64 + 16)
+                    m.len() as u64 * (self.row_width as u64 * 8) + m.allocation_size() as u64
                 }
-                DistinctGroup::Values(m) => m.capacity() as u64 * 24,
+                DistinctGroup::Values(m) => m.allocation_size() as u64,
             })
             .sum();
         outer + own + self.inner.retained_bytes()
@@ -1745,13 +1834,7 @@ impl Accumulator for Concat {
                 empty: true,
             },
         );
-        Ok(finish_concat(
-            ctx,
-            self.distinct,
-            state.empty,
-            state.ok,
-            state.text,
-        ))
+        finish_concat(ctx, self.distinct, state.empty, state.ok, state.text)
     }
 
     fn group_bytes(&self) -> u64 {

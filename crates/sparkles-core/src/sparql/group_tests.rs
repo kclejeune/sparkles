@@ -773,6 +773,138 @@ fn ordered_concat_admits_growth_before_allocating_and_polls_repetitions() {
             .and_then(|v| v.lexical().ok().map(|l| l.to_string())),
         Some(String::new())
     );
+
+    // 5. Finalization under a 64 KiB limit for a 48 KiB result must not allocate unbudgeted
+    //    intermediate copies: an already-stored key succeeds within budget, and a brand-new key
+    //    is refused before allocating its retained vocabulary copy (both `Ordered` and `Concat`).
+    let store = Store::in_memory(StoreOptions::default());
+    let chunk_a = "a".repeat(1024);
+    let existing_48k = "a".repeat(48 * 1024);
+    crate::sparql::update::update(
+        &store,
+        &format!("INSERT DATA {{ <http://ex/s> <http://ex/p> \"{existing_48k}\" . }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let snap = store.snapshot();
+    let existing_id = snap
+        .lookup_key(&crate::id::term_key(&oxrdf::Term::Literal(
+            oxrdf::Literal::new_simple_literal(&existing_48k),
+        )))
+        .expect("48 KiB literal stored in snapshot");
+
+    let mut existing_ctx = Ctx::new(snap.clone());
+    existing_ctx.mem_limit = 64 * 1024;
+    let existing_ctx = existing_ctx.into_shared();
+    let chunk_a_id = existing_ctx.intern_value(&Value::Str(chunk_a.clone().into()));
+    let mut acc_existing = retractable(&empty_agg, 1).unwrap();
+    acc_existing.init(1);
+    acc_existing
+        .add_batch(
+            &existing_ctx,
+            &Batch {
+                table: &table,
+                arg: Arg::Column(&[chunk_a_id]),
+                rows: None,
+                weights: Some(&[48]),
+                base: 0,
+            },
+            &[0],
+        )
+        .unwrap();
+    let got_existing = acc_existing.read(&existing_ctx, 0).unwrap();
+    assert_eq!(got_existing, existing_id);
+    assert!(
+        existing_ctx.mem_peak() <= 64 * 1024,
+        "existing 48 KiB GROUP_CONCAT exceeded 64 KiB budget: {}",
+        existing_ctx.mem_peak()
+    );
+
+    let mut new_ctx = Ctx::new(snap.clone());
+    new_ctx.mem_limit = 64 * 1024;
+    let new_ctx = new_ctx.into_shared();
+    let chunk_b_id = new_ctx.intern_value(&Value::Str("b".repeat(1024).into()));
+    let mut acc_new = retractable(&empty_agg, 1).unwrap();
+    acc_new.init(1);
+    acc_new
+        .add_batch(
+            &new_ctx,
+            &Batch {
+                table: &table,
+                arg: Arg::Column(&[chunk_b_id]),
+                rows: None,
+                weights: Some(&[48]),
+                base: 0,
+            },
+            &[0],
+        )
+        .unwrap();
+    let err = acc_new
+        .read(&new_ctx, 0)
+        .expect_err("new 48 KiB key plus 48 KiB key buffer must exceed 64 KiB budget");
+    assert!(
+        matches!(err, crate::Error::BudgetExceeded(_)),
+        "got {err:?}"
+    );
+    assert!(
+        new_ctx.mem_peak() <= 64 * 1024,
+        "mem_peak {} exceeded 64 KiB budget during finalization",
+        new_ctx.mem_peak()
+    );
+
+    // One-off `Concat::finish` shares the same direct key-encoding finalization path.
+    let mut one_off_existing_ctx = Ctx::new(snap);
+    one_off_existing_ctx.mem_limit = 64 * 1024;
+    let one_off_existing_ctx = one_off_existing_ctx.into_shared();
+    let chunk_a_one_off = one_off_existing_ctx.intern_value(&Value::Str(chunk_a.into()));
+    let mut concat_acc = Concat::new(&empty_agg);
+    concat_acc.init(1);
+    let vals_48 = vec![chunk_a_one_off; 48];
+    let slots_48 = vec![0u32; 48];
+    fold(&one_off_existing_ctx, &mut concat_acc, &vals_48, &slots_48);
+    let got_one_off = concat_acc.finish(&one_off_existing_ctx, 0).unwrap();
+    assert_eq!(got_one_off, existing_id);
+    assert!(
+        one_off_existing_ctx.mem_peak() <= 64 * 1024,
+        "one-off Concat::finish exceeded 64 KiB budget: {}",
+        one_off_existing_ctx.mem_peak()
+    );
+
+    // 6. Unrepresentable lengths (> isize::MAX) are rejected before the first reservation even
+    //    under a permissive memory limit.
+    let permissive = ctx().into_shared();
+    let two_bytes = permissive.intern_value(&Value::Str("ab".into()));
+    let one_byte = permissive.intern_value(&Value::Str("a".into()));
+    let mut acc_overflow = retractable(&empty_agg, 1).unwrap();
+    acc_overflow.init(2);
+    acc_overflow
+        .add_batch(
+            &permissive,
+            &Batch {
+                table: &table,
+                arg: Arg::Column(&[two_bytes, one_byte]),
+                rows: None,
+                weights: Some(&[(isize::MAX / 2) as i64 + 1, isize::MAX as i64]),
+                base: 0,
+            },
+            &[0, 1],
+        )
+        .unwrap();
+    let peak_before = permissive.mem_peak();
+    for slot in [0, 1] {
+        let err = acc_overflow
+            .read(&permissive, slot)
+            .expect_err("expected BudgetExceeded for unrepresentable String/Vec length");
+        assert!(
+            matches!(err, crate::Error::BudgetExceeded(_)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            permissive.mem_peak(),
+            peak_before,
+            "unrepresentable GROUP_CONCAT length (slot {slot}) must not charge or allocate"
+        );
+    }
 }
 
 #[test]

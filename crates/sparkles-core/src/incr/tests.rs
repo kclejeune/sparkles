@@ -1617,13 +1617,17 @@ fn view_group_budget_reclaims_backing_allocations_after_deletions() {
             step(&s, &mut c);
             let group = find_group(&c.root).expect("Group operator");
             let peak_bytes = group.bytes();
-            let (peak_slots_cap, peak_idx_cap) = group.backing_capacities();
-            let peak_gann_cap = group.gann_capacity();
-            assert!(peak_slots_cap >= 1000 && peak_idx_cap >= 1000);
+            let (peak_slots_alloc, peak_idx_alloc) = group.backing_allocations();
+            let peak_gann_alloc = group.gann_allocation_size();
+            assert!(peak_slots_alloc > 0 && peak_idx_alloc > 0);
             if !prov.is_none() {
                 assert!(
-                    peak_gann_cap >= 1000,
-                    "expected provenance gann capacity >= 1000, got {peak_gann_cap}: {q}"
+                    peak_gann_alloc >= 1000 * 16,
+                    "expected provenance gann backing allocation for 1000 groups, got {peak_gann_alloc}: {q}"
+                );
+                assert!(
+                    peak_bytes >= peak_gann_alloc as u64 + peak_idx_alloc as u64,
+                    "group.bytes() ({peak_bytes}) must include full index and gann backing allocations"
                 );
             }
             // COUNT stores Vec<AggState> per slot; Group::bytes() must not undercount at 8 B/group.
@@ -1643,23 +1647,23 @@ fn view_group_budget_reclaims_backing_allocations_after_deletions() {
             step(&s, &mut c);
             let group = find_group(&c.root).expect("Group operator");
             let shrunk_bytes = group.bytes();
-            let (shrunk_slots_cap, shrunk_idx_cap) = group.backing_capacities();
-            let shrunk_gann_cap = group.gann_capacity();
+            let (shrunk_slots_alloc, shrunk_idx_alloc) = group.backing_allocations();
+            let shrunk_gann_alloc = group.gann_allocation_size();
             assert!(
                 shrunk_bytes < peak_bytes / 2,
                 "expected shrunk bytes {shrunk_bytes} < peak/2 ({}) ({prov:?}): {q}",
                 peak_bytes / 2
             );
-            assert!(shrunk_slots_cap < peak_slots_cap && shrunk_idx_cap < peak_idx_cap);
+            assert!(shrunk_slots_alloc < peak_slots_alloc && shrunk_idx_alloc < peak_idx_alloc);
             if !prov.is_none() {
                 assert!(
-                    shrunk_gann_cap < peak_gann_cap,
-                    "expected gann capacity {shrunk_gann_cap} < peak {peak_gann_cap}: {q}"
+                    shrunk_gann_alloc < peak_gann_alloc,
+                    "expected gann backing allocation {shrunk_gann_alloc} < peak {peak_gann_alloc}: {q}"
                 );
             }
             check(&s, &c, q, "after partial drain");
 
-            // Drain the remaining 150 groups -> 0 bytes and 0 retained backing capacity.
+            // Drain the remaining 150 groups -> 0 bytes and 0 retained backing allocation.
             let mut del2 = String::from(PREFIX);
             del2.push_str("DELETE DATA { ");
             for i in 850..1000 {
@@ -1675,16 +1679,71 @@ fn view_group_budget_reclaims_backing_allocations_after_deletions() {
                 "drained group must report 0 bytes ({prov:?}): {q}"
             );
             assert_eq!(
-                group.backing_capacities(),
+                group.backing_allocations(),
                 (0, 0),
                 "drained group must release backing allocations ({prov:?}): {q}"
             );
             assert_eq!(
-                group.gann_capacity(),
+                group.gann_allocation_size(),
                 0,
-                "drained group must release gann capacity ({prov:?}): {q}"
+                "drained group must release gann backing allocation ({prov:?}): {q}"
             );
             check(&s, &c, q, "after full drain");
+
+            // Tombstone-heavy partial drain: 224 groups -> delete 100 (124 live, 256-bucket
+            // table kept and fully charged) -> delete 74 more (50 live, backing shrinks).
+            if !prov.is_none() {
+                let mut ins224 = String::from(PREFIX);
+                ins224.push_str("INSERT DATA { ");
+                for i in 0..224 {
+                    ins224.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+                }
+                ins224.push('}');
+                upd(&s, &ins224).unwrap();
+                step(&s, &mut c);
+                let g224 = find_group(&c.root).expect("Group operator");
+                let alloc224 = g224.gann_allocation_size();
+                assert!(alloc224 > 0);
+
+                let mut del100 = String::from(PREFIX);
+                del100.push_str("DELETE DATA { ");
+                for i in 0..100 {
+                    del100.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+                }
+                del100.push('}');
+                upd(&s, &del100).unwrap();
+                step(&s, &mut c);
+                let g124 = find_group(&c.root).expect("Group operator");
+                assert_eq!(g124.gann_allocation_size(), alloc224);
+                assert!(
+                    g124.bytes() >= alloc224 as u64,
+                    "group.bytes() must charge full tombstone-bearing gann allocation"
+                );
+
+                let mut del74 = String::from(PREFIX);
+                del74.push_str("DELETE DATA { ");
+                for i in 100..174 {
+                    del74.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+                }
+                del74.push('}');
+                upd(&s, &del74).unwrap();
+                step(&s, &mut c);
+                let g50 = find_group(&c.root).expect("Group operator");
+                assert!(
+                    g50.gann_allocation_size() < alloc224,
+                    "tombstone-heavy gann must shrink below {alloc224}, got {}",
+                    g50.gann_allocation_size()
+                );
+
+                let mut del_rest = String::from(PREFIX);
+                del_rest.push_str("DELETE DATA { ");
+                for i in 174..224 {
+                    del_rest.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+                }
+                del_rest.push('}');
+                upd(&s, &del_rest).unwrap();
+                step(&s, &mut c);
+            }
 
             // Re-populate and rebuild on an empty store -> clear_state drops allocations too.
             upd(&s, &ins).unwrap();
@@ -1694,8 +1753,8 @@ fn view_group_budget_reclaims_backing_allocations_after_deletions() {
             c.build(empty.snapshot(), &Control::none()).unwrap();
             let group = find_group(&c.root).expect("Group operator");
             assert_eq!(group.bytes(), 0);
-            assert_eq!(group.backing_capacities(), (0, 0));
-            assert_eq!(group.gann_capacity(), 0);
+            assert_eq!(group.backing_allocations(), (0, 0));
+            assert_eq!(group.gann_allocation_size(), 0);
         }
     }
 }
