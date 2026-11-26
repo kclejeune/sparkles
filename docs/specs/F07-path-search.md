@@ -278,12 +278,15 @@ ranking, with Yen's spurs carrying their accumulated prefix cost and weight rang
 check and fallback. Unbound ends in weighted `path:shortest` with `path:maxLength` run a
 one-ended Pareto-pruned search. When a reverse search for an unbound source encounters wide
 weights or overflow, it finishes the reverse search to record each node's minimum backward
-edge distance and the shortest alternative reverse route length for nodes with multiple
-non-backtracking routes, reconstructs sources with a unique simple route within
-`path:maxLength` directly, and re-solves only sources whose reverse tree path hits an
-alternative within the remaining edge budget in source order pruned by those backward edge
-distances. Weighted `path:allShortest` with `path:maxLength` requires both ends bound because
-it enumerates tied short paths through Yen's algorithm. Lengths still count edges.
+edge distance and the shortest budget admitting two simple suffixes with distinct first
+edges. A suffix that returns to the node it would extend is deferred until the search can
+check for an exit that avoids that node. The postpass uses the shortest-hop tree and keeps
+extra hop information at branches. The query memory budget covers those hops and the
+postpass frontier. A source reconstructs directly when its reverse tree path has no
+competing suffix within the remaining edge budget. The other sources run bounded searches
+in source order, pruned by the minimum backward edge distances. Weighted `path:allShortest`
+with `path:maxLength` requires both ends bound because it enumerates tied short paths through
+Yen's algorithm. Lengths still count edges.
 
 The cost of a path is the sum of its weights, added in double-double arithmetic, and
 `path:cost` is that sum rounded to the nearest double. Two paths tie in the shortest modes
@@ -955,13 +958,14 @@ both the eager engine and the streaming cursor reader.
   one-ended Pareto-pruned search over `(node, length)` up to `maxLength`, so weighted
   `path:shortest` with `path:maxLength` now answers unbound targets and unbound sources as
   well as bound pairs. When a reverse search for an unbound source encounters wide weights
-  or overflow with `maxLength > 1`, both engines finish the reverse search to obtain each
-  reached node's exact minimum edge distance to the target and the set of nodes reached by
-  multiple reverse relaxations. When no node is reached more than once, or for any source
-  whose reverse parent chain avoids those nodes, the unique route reconstructs directly from
-  the reverse tree without extra visits; only multi-route sources and sources whose reverse
-  tree path passes through one run source-order bounded forward searches pruned by those
-  minimum backward edge distances so reported costs match bound-pair and forward searches.
+  or overflow with `maxLength > 1`, both engines retain the minimum backward edge
+  distances and record in `direct_multi` the shortest budget admitting two simple suffixes
+  with distinct first edges. The postpass follows deferred hops through the reverse
+  search's topology to find exits that avoid the node the hop would revisit. A source's
+  reverse tree path reconstructs directly when no competing suffix fits the remaining
+  edge budget. The other sources run bounded searches in source order, pruned by the
+  minimum backward edge distances. Eager direct reconstruction transfers its edge-buffer
+  charge to the result.
   Weighted `path:allShortest` with `path:maxLength` continues to run Yen's algorithm with
   length-bounded spurs and therefore still requires both ends bound.
 * **Tests.** `pathsearch.rs` adds unit tests for Pareto frontier pruning and lower-bound
@@ -980,7 +984,9 @@ both the eager engine and the streaming cursor reader.
   four-edge cycle ranking, shared-prefix Yen spur ranking, variable-source wide-weight
   cross-form ranking, visit-budget preservation on unique-route reverse wide-weight graphs
   (separate single-edge paths, a 500-edge chain, and a chain beside a wide-weight diamond),
-  streaming eager weight lookups on a 5,000-reifier edge, eager frontier memory
+  self-loops and cycles within tight visit budgets, deferred backtracks with a valid exit,
+  remaining edge budgets on shared prefixes, eager edge-buffer charge transfer, streaming
+  eager weight lookups on a 5,000-reifier edge, eager frontier memory
   pre-admission and release across repeated pairs, single-visit `VIRT` pruning, and eager
   mid-relaxation cancellation.
   `crates/sparkles-core/tests/cursor_pathsearch.rs` verifies eager and streaming parity,

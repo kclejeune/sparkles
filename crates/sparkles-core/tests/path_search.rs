@@ -2969,21 +2969,28 @@ fn weighted_bounded_variable_source_self_loop_and_remaining_budget() {
             "remaining-budget ({lim}): ex:u1 must take unique 4-edge route"
         );
     }
+}
 
-    // 6. Soundness of 2-cycle backtrack propagation: `v -> x1` is a reverse backtrack of
-    //    `x1 -> v -> t` (when `x1 -> v -> t` is cheaper than `x1 -> x2 -> t`), yet `x1` has
-    //    the alternative exit `x1 -> x2 -> t`, so `v -> x1 -> x2 -> t` IS a valid simple path
-    //    and `s -> pnode -> v` must still re-solve in source order and select the 5-edge path.
+#[test]
+fn weighted_bounded_variable_source_backtrack_with_exit() {
+    // The reverse search prefers x1 -> v -> t to the three tiny edges via x2 and x3.
+    // The edge v -> x1 needs that longer exit to avoid returning to v. In source order
+    // the four tiny weights round away, so s must take the six-edge path.
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
     let backtrack_exit_ttl = format!(
         "ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} .\n\
          ex:v ex:p2 ex:t {{| ex:w {} |}} .\n\
          ex:x1 ex:p2 ex:v {{| ex:w {} |}} .\n\
          ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} .\n\
-         ex:x2 ex:p ex:t {{| ex:w {} |}} .\n",
+         ex:x2 ex:p ex:x3 {{| ex:w {} |}} . ex:x3 ex:p ex:t {{| ex:w {} |}} .\n",
         dbl(1.0),
         dbl(m),
         dbl(d),
         dbl(0.0),
+        dbl(e),
         dbl(e),
         dbl(e),
         dbl(e),
@@ -2995,14 +3002,53 @@ fn weighted_bounded_variable_source_self_loop_and_remaining_budget() {
             &format!(
                 "SELECT ?src ?c ?l WHERE {{ SERVICE path:search {{ [] path:source ?src ; \
                  path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
-                 path:maxLength 5{lim} ; path:cost ?c ; path:length ?l }} }}"
+                 path:maxLength 6{lim} ; path:cost ?c ; path:length ?l }} }}"
             ),
         );
         let row_s = r.iter().find(|row| row["src"] == "s").unwrap();
-        assert_eq!(
-            row_s["l"], "5",
-            "backtrack-with-exit ({lim}): ex:s must still re-solve to 5-edge route"
-        );
+        assert_eq!(row_s["l"], "6", "backtrack with exit ({lim}): {row_s:?}");
         assert_eq!(row_s["c"].parse::<f64>().unwrap(), 1.0);
     }
+}
+
+#[test]
+fn weighted_bounded_variable_source_parallel_backtrack_visit_budget() {
+    let store = store_of(
+        "ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} . \
+         ex:a ex:p ex:c {| ex:w 1.0e0 |} . \
+         ex:c ex:p ex:a {| ex:w 1.0e0 |} . \
+         ex:c ex:p2 ex:a {| ex:w 1.0e0 |} .",
+    );
+    let r = rows(
+        &store,
+        "SELECT ?src ?c ?l WHERE { SERVICE path:search { [] path:source ?src ; \
+         path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+         path:maxLength 3 ; path:maxVisited 4 ; path:limit 1 ; path:cost ?c ; path:length ?l } }",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["src"], "a");
+    assert_eq!(r[0]["l"], "1");
+    assert_eq!(r[0]["c"].parse::<f64>().unwrap(), 1.0);
+}
+
+#[test]
+fn weighted_bounded_variable_source_long_backtrack_visit_budget() {
+    let store = store_of(
+        "ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} . \
+         ex:a ex:p ex:d {| ex:w 1.0e0 |} . \
+         ex:d ex:p ex:c {| ex:w 1.0e0 |} . \
+         ex:c ex:p ex:a {| ex:w 1.0e0 |} .",
+    );
+    let r = rows(
+        &store,
+        "SELECT ?src ?c ?l WHERE { SERVICE path:search { [] path:source ?src ; \
+         path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+         path:maxLength 4 ; path:maxVisited 5 ; path:limit 1 ; path:cost ?c ; path:length ?l } }",
+    );
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["src"], "a");
+    assert_eq!(r[0]["l"], "1");
+    assert_eq!(r[0]["c"].parse::<f64>().unwrap(), 1.0);
 }

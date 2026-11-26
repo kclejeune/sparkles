@@ -1345,8 +1345,9 @@ impl PrefixCost {
 /// tree or, for a reverse search where wide weights or overflow occurred alongside at least
 /// one multi-route node, the reverse tree together with exact minimum backward edge
 /// distances (`bwd_dist`) and the shortest length at which each multi-route node has a
-/// second non-backtracking route (`direct_multi`) so unique-route sources still reconstruct
-/// directly while sources with a competing route within `max_len` re-solve in source order.
+/// second simple route with a distinct first edge (`direct_multi`). Unique-route sources
+/// reconstruct directly while sources with a competing route within `max_len` re-solve
+/// in source order.
 enum BoundedTreeOutcome {
     Tree(ChargedBoundedTree),
     ReverseWide {
@@ -1368,114 +1369,205 @@ fn bounded_weights_too_wide(max_len: u32, wmin: f64, wmax: f64) -> bool {
     ratio > WIDE_WEIGHTS || (max_len as f64) * ratio > ((1u64 << 51) as f64)
 }
 
-/// Record a non-self-loop reverse relaxation reaching `y` at length `nl` from `(u, l)`.
-/// Direct 1-hop backtracks to `(u, l)`'s own reverse parent `y` cannot extend into a
-/// simple path unless `u` itself has another route to the target; defer them in
-/// `backtrack_parent` (at most one entry per settled node `u`) and propagate after the
-/// reverse search only if `u` becomes multi-route.
-#[allow(clippy::too_many_arguments)]
-fn record_reverse_multi_relax<C: ByteCharge>(
-    u: u64,
-    l: u32,
-    y: u64,
-    nl: u32,
-    parent: &HbMap<(u64, u32), Parent>,
-    dist: &HbMap<u64, Vec<(u32, Cost)>>,
-    virt_first_len: &mut Option<u32>,
-    direct_multi: &mut HbMap<u64, u32>,
-    backtrack_parent: &mut HbMap<u64, u64>,
-    charge: &mut C,
-    base: u64,
-) -> Result<u64> {
-    debug_assert_ne!(y, u);
-    if l > 0 && parent.get(&(u, l)).is_some_and(|p| p.node == y) {
-        match backtrack_parent.get(&u).copied() {
-            Some(prev_y) if prev_y == y => return Ok(base),
-            None => {
-                let (_, next_base) = insert_hb_map(backtrack_parent, u, y, charge, base)?;
-                return Ok(next_base);
-            }
-            Some(_) => {
-                // `u` was settled at two different lengths with distinct parents, so `u`
-                // already has multiple routes; fall through to record `y` conservatively.
-            }
-        }
-    }
-    let first_len = if y == VIRT {
-        match *virt_first_len {
-            None => {
-                *virt_first_len = Some(nl);
-                return Ok(base);
-            }
-            Some(fl) => {
-                if nl < fl {
-                    *virt_first_len = Some(nl);
-                }
-                fl
-            }
-        }
-    } else {
-        let Some(fl) = dist.get(&y).and_then(|v| v.first()).map(|&(fl, _)| fl) else {
-            return Ok(base);
-        };
-        fl
-    };
-    let alt_len = first_len.max(nl);
-    if direct_multi.get(&y).is_some_and(|&prev| prev <= alt_len) {
-        return Ok(base);
-    }
-    let (_, next_base) = insert_hb_map(direct_multi, y, alt_len, charge, base)?;
-    Ok(next_base)
+/// Outgoing hops collected from the first reverse expansion of each destination.
+/// A node with only one hop already has it in the reverse tree. At a branch, retain
+/// each distinct edge's destination, including repeated destinations for parallel edges.
+#[derive(Default)]
+struct ReverseAlternatives {
+    hops: HbMap<u64, Vec<u64>>,
+    bytes: u64,
 }
 
-/// Propagate `direct_multi` across deferred 1-hop backtrack edges (`u -> parent(u)`) when
-/// `u` gained an alternative route to the target. Because `backtrack_parent` has out-degree
-/// at most one and `next_alt` strictly increases up to `max_len`, each seed walk terminates
-/// in at most `max_len` steps.
-#[allow(clippy::too_many_arguments)]
-fn propagate_reverse_backtracks<C: ByteCharge>(
-    ctx: &Ctx,
-    max_len: u32,
-    best_len: &HbMap<u64, u32>,
-    backtrack_parent: &HbMap<u64, u64>,
-    direct_multi: &mut HbMap<u64, u32>,
-    charge: &mut C,
-    base: u64,
-) -> Result<u64> {
-    if direct_multi.is_empty() || backtrack_parent.is_empty() {
-        return Ok(base);
+impl ReverseAlternatives {
+    fn record<C: ByteCharge>(
+        &mut self,
+        y: u64,
+        u: u64,
+        first_hop: Option<u64>,
+        charge: &mut C,
+        base: u64,
+    ) -> Result<()> {
+        let Some(first_hop) = first_hop else {
+            return Ok(());
+        };
+        let next_base = if let Some(hops) = self.hops.get_mut(&y) {
+            push_vec(hops, u, charge, base)?
+        } else {
+            let mut hops = Vec::new();
+            let next_base = push_vec(&mut hops, first_hop, charge, base)?;
+            let next_base = push_vec(&mut hops, u, charge, next_base)?;
+            insert_hb_map(&mut self.hops, y, hops, charge, next_base)?.1
+        };
+        self.bytes = self.bytes.saturating_add(next_base.saturating_sub(base));
+        Ok(())
     }
-    let seeds_bytes = vec_bytes::<(u64, u32)>(direct_multi.len());
-    charge.resize(base.saturating_add(seeds_bytes))?;
-    let mut seeds = Vec::with_capacity(direct_multi.len());
-    seeds.extend(direct_multi.iter().map(|(&k, &v)| (k, v)));
-    let actual_seeds_bytes = vec_bytes::<(u64, u32)>(seeds.capacity());
-    let mut cur_base = base.saturating_add(actual_seeds_bytes);
-    charge.resize(cur_base)?;
-    for (mut cur, mut alt) in seeds {
+
+    /// Find the shortest length at which two distinct first edges can reach the root.
+    /// The shortest-hop tree supplies a suffix for each edge. Defer edges whose tree
+    /// suffix returns to their source until the postpass can check for an exit.
+    fn competing_lengths<C: ByteCharge>(
+        self,
+        ctx: &Ctx,
+        max_len: u32,
+        tree: &ReverseHopTree<'_>,
+        charge: &mut C,
+        base: u64,
+    ) -> Result<HbMap<u64, u32>> {
         let mut steps = 0usize;
-        while let Some(&y) = backtrack_parent.get(&cur) {
+        let mut poll = || {
             steps += 1;
             if steps.is_multiple_of(4096) {
                 ctx.check()?;
             }
-            let next_alt = alt
-                .saturating_add(1)
-                .max(best_len.get(&y).copied().unwrap_or(0));
-            if next_alt > max_len {
-                break;
+            Ok(())
+        };
+        let mut direct_multi = HbMap::default();
+        let mut seeds = Vec::new();
+        let mut cur_base = base.saturating_add(self.bytes);
+        for (&y, hops) in &self.hops {
+            poll()?;
+            let mut shortest = None;
+            let mut second = None;
+            for &u in hops {
+                poll()?;
+                let len = tree.dist[&u] + 1;
+                if tree.returns_to(u, y, &mut poll)? {
+                    cur_base = push_vec(&mut seeds, (y, u), charge, cur_base)?;
+                } else if shortest.is_none_or(|first| len < first) {
+                    second = shortest;
+                    shortest = Some(len);
+                } else {
+                    second = Some(second.map_or(len, |old: u32| old.min(len)));
+                }
             }
-            if direct_multi.get(&y).is_some_and(|&prev| prev <= next_alt) {
-                break;
+            if let Some(len) = second {
+                (_, cur_base) = insert_hb_map(&mut direct_multi, y, len, charge, cur_base)?;
             }
-            (_, cur_base) = insert_hb_map(direct_multi, y, next_alt, charge, cur_base)?;
-            cur = y;
-            alt = next_alt;
         }
+        propagate_reverse_backtracks(
+            max_len,
+            tree,
+            &self.hops,
+            &seeds,
+            &mut direct_multi,
+            charge,
+            cur_base,
+            &mut poll,
+        )?;
+        drop(seeds);
+        drop(self);
+        charge.resize(base.saturating_add(map_bytes(&direct_multi)))?;
+        Ok(direct_multi)
     }
-    let final_base = cur_base.saturating_sub(actual_seeds_bytes);
-    charge.resize(final_base)?;
-    Ok(final_base)
+}
+
+struct ReverseHopTree<'a> {
+    parent: &'a HbMap<(u64, u32), Parent>,
+    dist: &'a HbMap<u64, u32>,
+}
+
+impl ReverseHopTree<'_> {
+    /// A minimum-length label's parent has minimum distance one less, so only
+    /// the ancestor at the forbidden node's depth can match it.
+    fn returns_to(
+        &self,
+        mut node: u64,
+        forbidden: u64,
+        poll: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        if forbidden == VIRT {
+            return Ok(false);
+        }
+        let mut len = self.dist[&node];
+        let depth = self.dist[&forbidden];
+        while len > depth {
+            poll()?;
+            node = self.parent[&(node, len)].node;
+            len -= 1;
+        }
+        Ok(node == forbidden)
+    }
+}
+
+/// For each group of deferred edges from y, look for a suffix that avoids y in the
+/// already-expanded topology. The breadth-first walk stops following a branch when
+/// its shortest-hop tree suffix avoids y. That suffix gives the exact remaining
+/// distance, and any repeats with the walk's prefix can be removed. Keeping all
+/// first hops here matters when the shortest competing suffix itself returns to y.
+#[allow(clippy::too_many_arguments)]
+fn propagate_reverse_backtracks<C: ByteCharge>(
+    max_len: u32,
+    tree: &ReverseHopTree<'_>,
+    hops: &HbMap<u64, Vec<u64>>,
+    seeds: &[(u64, u64)],
+    direct_multi: &mut HbMap<u64, u32>,
+    charge: &mut C,
+    mut base: u64,
+    poll: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let mut queue = Vec::new();
+    let mut seen = HbSet::default();
+    let mut seeds = seeds.iter().copied().peekable();
+    while let Some(&(y, _)) = seeds.peek() {
+        queue.clear();
+        seen.clear();
+        let mut alt = direct_multi.get(&y).copied();
+        let mut walk_base = base
+            .saturating_add(vec_bytes::<(u64, u32)>(queue.capacity()))
+            .saturating_add(set_bytes(&seen));
+        while let Some((_, u)) = seeds.next_if(|&(source, _)| source == y) {
+            poll()?;
+            let lower = tree.dist[&u] + 1;
+            if lower > max_len || alt.is_some_and(|len| lower >= len) {
+                continue;
+            }
+            let (new, next_base) = insert_hb_set(&mut seen, u, charge, walk_base)?;
+            walk_base = next_base;
+            if new {
+                walk_base = push_vec(&mut queue, (u, 1u32), charge, walk_base)?;
+            }
+        }
+        let mut i = 0;
+        while let Some(&(u, prefix)) = queue.get(i) {
+            poll()?;
+            i += 1;
+            let suffix = tree.dist[&u];
+            let Some(lower) = prefix.checked_add(suffix) else {
+                continue;
+            };
+            if lower > max_len || alt.is_some_and(|len| lower >= len) {
+                continue;
+            }
+            if !tree.returns_to(u, y, poll)? {
+                alt = Some(lower);
+                continue;
+            }
+            let parent = tree.parent[&(u, suffix)].node;
+            let next_hops = hops
+                .get(&u)
+                .map_or(std::slice::from_ref(&parent), Vec::as_slice);
+            for &v in next_hops {
+                poll()?;
+                if v != y {
+                    let (new, next_base) = insert_hb_set(&mut seen, v, charge, walk_base)?;
+                    walk_base = next_base;
+                    if new {
+                        walk_base = push_vec(&mut queue, (v, prefix + 1), charge, walk_base)?;
+                    }
+                }
+            }
+        }
+        if let Some(len) = alt {
+            (_, walk_base) = insert_hb_map(direct_multi, y, len, charge, walk_base)?;
+        }
+        base = walk_base
+            .saturating_sub(vec_bytes::<(u64, u32)>(queue.capacity()))
+            .saturating_sub(set_bytes(&seen));
+    }
+    drop(queue);
+    drop(seen);
+    charge.resize(base)?;
+    Ok(())
 }
 
 /// Whether any node along the reverse parent chain from `(m, len)` back to `(root, 0)`
@@ -3295,30 +3387,25 @@ impl<'a> Engine<'a> {
         let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
         let mut order: Vec<(u64, u32)> = Vec::new();
         let mut heap: BoundedHeap = BinaryHeap::new();
-        let mut direct_multi: HbMap<u64, u32> = HbMap::default();
-        let mut backtrack_parent: HbMap<u64, u64> = HbMap::default();
-        let mut virt_first_len: Option<u32> = None;
+        let mut alternatives = ReverseAlternatives::default();
         let mut best_virt: Option<(Cost, u32)> = None;
         let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
         let mut wide = false;
         let track_reverse_wide = !forward && max_len > 1;
-        #[allow(clippy::too_many_arguments)]
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
                            parent: &HbMap<(u64, u32), Parent>,
                            order: &Vec<(u64, u32)>,
                            heap: &BoundedHeap,
-                           direct_multi: &HbMap<u64, u32>,
-                           backtrack_parent: &HbMap<u64, u64>| {
+                           alternative_bytes: u64| {
             map_bytes(best_len)
                 .saturating_add(map_bytes(dist))
                 .saturating_add(dist_vec_bytes)
                 .saturating_add(map_bytes(parent))
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
-                .saturating_add(map_bytes(direct_multi))
-                .saturating_add(map_bytes(backtrack_parent))
+                .saturating_add(alternative_bytes)
         };
         let mut base = 0u64;
         (_, base) = pareto_insert_charged(
@@ -3347,8 +3434,7 @@ impl<'a> Engine<'a> {
                 &parent,
                 &order,
                 &heap,
-                &direct_multi,
-                &backtrack_parent,
+                alternatives.bytes,
             );
             let (prev, next_base) = insert_hb_map(&mut best_len, u, l, &mut work, cur_base)?;
             if prev.is_none() && u != root {
@@ -3365,12 +3451,14 @@ impl<'a> Engine<'a> {
                 &parent,
                 &order,
                 &heap,
-                &direct_multi,
-                &backtrack_parent,
+                alternatives.bytes,
             );
             let mut out_steps = Vec::new();
             self.expand_one_charged(u, forward, &mut out_steps, &mut work, loc)?;
             let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            // Re-expanding a shorter label sees the same edges. A boundary label
+            // is counted as settled but does not expand.
+            let record_hops = track_reverse_wide && prev.is_none_or(|len| len == max_len);
             let nl = l + 1;
             for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
                 if idx.is_multiple_of(4096) {
@@ -3382,7 +3470,7 @@ impl<'a> Engine<'a> {
                 if y == u {
                     continue;
                 }
-                if track_reverse_wide {
+                if record_hops {
                     let cur_base = local_bytes(
                         &best_len,
                         &dist,
@@ -3390,23 +3478,16 @@ impl<'a> Engine<'a> {
                         &parent,
                         &order,
                         &heap,
-                        &direct_multi,
-                        &backtrack_parent,
+                        alternatives.bytes,
                     )
                     .saturating_add(out_bytes);
-                    let _ = record_reverse_multi_relax(
-                        u,
-                        l,
-                        y,
-                        nl,
-                        &parent,
-                        &dist,
-                        &mut virt_first_len,
-                        &mut direct_multi,
-                        &mut backtrack_parent,
-                        &mut work,
-                        cur_base,
-                    )?;
+                    let first_len = if y == VIRT {
+                        best_virt.map(|(_, len)| len)
+                    } else {
+                        dist.get(&y).and_then(|v| v.first()).map(|&(len, _)| len)
+                    };
+                    let first_hop = first_len.map(|len| parent[&(y, len)].node);
+                    alternatives.record(y, u, first_hop, &mut work, cur_base)?;
                 }
                 if best_len.get(&y).is_some_and(|&bl| y == VIRT || nl >= bl) {
                     continue;
@@ -3445,8 +3526,7 @@ impl<'a> Engine<'a> {
                     &parent,
                     &order,
                     &heap,
-                    &direct_multi,
-                    &backtrack_parent,
+                    alternatives.bytes,
                 )
                 .saturating_add(out_bytes);
                 if y == VIRT {
@@ -3490,34 +3570,25 @@ impl<'a> Engine<'a> {
                 &parent,
                 &order,
                 &heap,
-                &direct_multi,
-                &backtrack_parent,
+                alternatives.bytes,
             ))?;
         }
         drop(dist);
         drop(heap);
-        if wide && !direct_multi.is_empty() {
-            let prop_base = map_bytes(&parent)
+        let direct_multi = if wide && !alternatives.hops.is_empty() {
+            let base = map_bytes(&parent)
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
-                .saturating_add(map_bytes(&best_len))
-                .saturating_add(map_bytes(&direct_multi))
-                .saturating_add(map_bytes(&backtrack_parent));
-            let _ = propagate_reverse_backtracks(
-                self.ctx,
-                max_len,
-                &best_len,
-                &backtrack_parent,
-                &mut direct_multi,
-                &mut work,
-                prop_base,
-            )?;
-            drop(backtrack_parent);
-            work.resize(
-                map_bytes(&parent)
-                    .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
-                    .saturating_add(map_bytes(&best_len))
-                    .saturating_add(map_bytes(&direct_multi)),
-            )?;
+                .saturating_add(map_bytes(&best_len));
+            let tree = ReverseHopTree {
+                parent: &parent,
+                dist: &best_len,
+            };
+            alternatives.competing_lengths(self.ctx, max_len, &tree, &mut work, base)?
+        } else {
+            drop(alternatives);
+            HbMap::default()
+        };
+        if !direct_multi.is_empty() {
             return Ok((
                 BoundedTreeOutcome::ReverseWide {
                     order,
@@ -3529,8 +3600,6 @@ impl<'a> Engine<'a> {
             ));
         }
         drop(best_len);
-        drop(direct_multi);
-        drop(backtrack_parent);
         work.resize(map_bytes(&parent).saturating_add(vec_bytes::<(u64, u32)>(order.capacity())))?;
         Ok((BoundedTreeOutcome::Tree((order, parent)), work))
     }
@@ -8127,30 +8196,25 @@ impl SearchContext {
         let mut parent: HbMap<(u64, u32), Parent> = HbMap::default();
         let mut order: Vec<(u64, u32)> = Vec::new();
         let mut heap: BoundedHeap = BinaryHeap::new();
-        let mut direct_multi: HbMap<u64, u32> = HbMap::default();
-        let mut backtrack_parent: HbMap<u64, u64> = HbMap::default();
-        let mut virt_first_len: Option<u32> = None;
+        let mut alternatives = ReverseAlternatives::default();
         let mut best_virt: Option<(Cost, u32)> = None;
         let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
         let mut wide = false;
         let track_reverse_wide = !forward && max_len > 1;
-        #[allow(clippy::too_many_arguments)]
         let local_bytes = |best_len: &HbMap<u64, u32>,
                            dist: &HbMap<u64, Vec<(u32, Cost)>>,
                            dist_vec_bytes: u64,
                            parent: &HbMap<(u64, u32), Parent>,
                            order: &Vec<(u64, u32)>,
                            heap: &BoundedHeap,
-                           direct_multi: &HbMap<u64, u32>,
-                           backtrack_parent: &HbMap<u64, u64>| {
+                           alternative_bytes: u64| {
             map_bytes(best_len)
                 .saturating_add(map_bytes(dist))
                 .saturating_add(dist_vec_bytes)
                 .saturating_add(map_bytes(parent))
                 .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
                 .saturating_add(vec_bytes::<Reverse<(Cost, u32, u64)>>(heap.capacity()))
-                .saturating_add(map_bytes(direct_multi))
-                .saturating_add(map_bytes(backtrack_parent))
+                .saturating_add(alternative_bytes)
         };
         let mut base = self.retained_bytes().saturating_add(outer_bytes);
         (_, base) = pareto_insert_charged(
@@ -8182,8 +8246,7 @@ impl SearchContext {
                     &parent,
                     &order,
                     &heap,
-                    &direct_multi,
-                    &backtrack_parent,
+                    alternatives.bytes,
                 ));
             let (prev, next_base) = insert_hb_map(&mut best_len, u, l, charge, cur_base)?;
             if prev.is_none() && u != root {
@@ -8200,12 +8263,14 @@ impl SearchContext {
                 &parent,
                 &order,
                 &heap,
-                &direct_multi,
-                &backtrack_parent,
+                alternatives.bytes,
             ));
             let mut out_steps: Vec<(u64, Step)> = Vec::new();
             self.expand(ctx, spec, &[u], forward, &mut out_steps, charge, loc)?;
             let out_bytes = vec_bytes::<(u64, Step)>(out_steps.capacity());
+            // Re-expanding a shorter label sees the same edges. A boundary label
+            // is counted as settled but does not expand.
+            let record_hops = track_reverse_wide && prev.is_none_or(|len| len == max_len);
             let nl = l + 1;
             for (idx, (_, st)) in out_steps.iter().copied().enumerate() {
                 if idx.is_multiple_of(4096) {
@@ -8217,7 +8282,7 @@ impl SearchContext {
                 if y == u {
                     continue;
                 }
-                if track_reverse_wide {
+                if record_hops {
                     let cur_base = self
                         .retained_bytes()
                         .saturating_add(outer_bytes)
@@ -8228,23 +8293,16 @@ impl SearchContext {
                             &parent,
                             &order,
                             &heap,
-                            &direct_multi,
-                            &backtrack_parent,
+                            alternatives.bytes,
                         ))
                         .saturating_add(out_bytes);
-                    let _ = record_reverse_multi_relax(
-                        u,
-                        l,
-                        y,
-                        nl,
-                        &parent,
-                        &dist,
-                        &mut virt_first_len,
-                        &mut direct_multi,
-                        &mut backtrack_parent,
-                        charge,
-                        cur_base,
-                    )?;
+                    let first_len = if y == VIRT {
+                        best_virt.map(|(_, len)| len)
+                    } else {
+                        dist.get(&y).and_then(|v| v.first()).map(|&(len, _)| len)
+                    };
+                    let first_hop = first_len.map(|len| parent[&(y, len)].node);
+                    alternatives.record(y, u, first_hop, charge, cur_base)?;
                 }
                 if best_len.get(&y).is_some_and(|&bl| y == VIRT || nl >= bl) {
                     continue;
@@ -8272,8 +8330,7 @@ impl SearchContext {
                         &parent,
                         &order,
                         &heap,
-                        &direct_multi,
-                        &backtrack_parent,
+                        alternatives.bytes,
                     ))
                     .saturating_add(out_bytes);
                 let w = self.weight(ctx, spec, &e.map(real), charge, step_outer)?;
@@ -8333,40 +8390,31 @@ impl SearchContext {
                         &parent,
                         &order,
                         &heap,
-                        &direct_multi,
-                        &backtrack_parent,
+                        alternatives.bytes,
                     )),
             )?;
         }
         drop(dist);
         drop(heap);
-        if wide && !direct_multi.is_empty() {
-            let prop_base = self
+        let direct_multi = if wide && !alternatives.hops.is_empty() {
+            let base = self
                 .retained_bytes()
                 .saturating_add(outer_bytes)
-                .saturating_add(map_bytes(&parent))
-                .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
-                .saturating_add(map_bytes(&best_len))
-                .saturating_add(map_bytes(&direct_multi))
-                .saturating_add(map_bytes(&backtrack_parent));
-            let _ = propagate_reverse_backtracks(
-                ctx,
-                max_len,
-                &best_len,
-                &backtrack_parent,
-                &mut direct_multi,
-                charge,
-                prop_base,
-            )?;
-            drop(backtrack_parent);
-            charge.resize(
-                self.retained_bytes()
-                    .saturating_add(outer_bytes)
-                    .saturating_add(map_bytes(&parent))
-                    .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
-                    .saturating_add(map_bytes(&best_len))
-                    .saturating_add(map_bytes(&direct_multi)),
-            )?;
+                .saturating_add(
+                    map_bytes(&parent)
+                        .saturating_add(vec_bytes::<(u64, u32)>(order.capacity()))
+                        .saturating_add(map_bytes(&best_len)),
+                );
+            let tree = ReverseHopTree {
+                parent: &parent,
+                dist: &best_len,
+            };
+            alternatives.competing_lengths(ctx, max_len, &tree, charge, base)?
+        } else {
+            drop(alternatives);
+            HbMap::default()
+        };
+        if !direct_multi.is_empty() {
             return Ok(BoundedTreeOutcome::ReverseWide {
                 order,
                 parent,
@@ -8375,8 +8423,6 @@ impl SearchContext {
             });
         }
         drop(best_len);
-        drop(direct_multi);
-        drop(backtrack_parent);
         charge.resize(
             self.retained_bytes()
                 .saturating_add(outer_bytes)
@@ -14273,6 +14319,50 @@ mod tree_tests {
             opt_cost_min(Some(Cost::INFINITE), Some(Cost::of(5.0))),
             Some(Cost::of(5.0))
         );
+    }
+
+    #[test]
+    fn reverse_backtracks_poll_across_short_walks() {
+        use std::sync::atomic::Ordering;
+
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let root = 0;
+        let mut dist = HbMap::default();
+        dist.insert(root, 0);
+        let mut parent = HbMap::default();
+        let link = |node| Parent {
+            node,
+            p: 0,
+            rev: false,
+        };
+        let pairs = (1..1024).step_by(2).map(|y| (y, y + 1));
+        for (y, u) in pairs.clone() {
+            dist.insert(y, 1);
+            dist.insert(u, 2);
+            parent.insert((y, 1), link(root));
+            parent.insert((u, 2), link(y));
+        }
+        let tree = ReverseHopTree {
+            parent: &parent,
+            dist: &dist,
+        };
+        let base = map_bytes(&parent).saturating_add(map_bytes(&dist));
+        let mut charge = ctx.charge(base).unwrap();
+        let mut alternatives = ReverseAlternatives::default();
+        for (y, u) in pairs {
+            alternatives
+                .record(y, u, Some(root), &mut charge, base + alternatives.bytes)
+                .unwrap();
+        }
+
+        // Each of the 512 branches contributes four steps to seed collection and
+        // four to seed starts and walks. Cancellation must reach the shared poll.
+        ctx.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            alternatives.competing_lengths(&ctx, 3, &tree, &mut charge, base),
+            Err(Error::Cancelled)
+        ));
     }
 
     /// Regression for Sol r4 P3: eager direct reconstruction in `ReverseWide` must transfer

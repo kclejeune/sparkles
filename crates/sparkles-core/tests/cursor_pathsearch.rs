@@ -1783,3 +1783,107 @@ fn bounded_weighted_reverse_wide_self_loop_and_remaining_budget() {
     let (rows_rem, _, _) = drain_strict(&rem_snap, &format!("{P}{q_rem}"), &opts, 16);
     assert_eq!(rows_rem.len(), 25);
 }
+
+#[test]
+fn bounded_weighted_reverse_parallel_backtrack_visit_budget() {
+    let store = Store::in_memory(StoreOptions::default());
+    load(
+        &store,
+        "@prefix ex: <http://example.org/> . \
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} . \
+         ex:a ex:p ex:c {| ex:w 1.0e0 |} . \
+         ex:c ex:p ex:a {| ex:w 1.0e0 |} . \
+         ex:c ex:p2 ex:a {| ex:w 1.0e0 |} .",
+        RdfFormat::Turtle,
+    );
+    let q = "SELECT ?src ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+        path:maxLength 3 ; path:maxVisited 4 ; path:length ?l } }";
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+    // The first source has one simple route. A later pull can spend visits on c,
+    // which has two distinct routes through its parallel predicates.
+    let cursor_opts = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let mut cursor = select_cursor(snap, &format!("{P}{q}"), &opts, &cursor_opts).unwrap();
+    let batch = cursor.next_batch().unwrap().unwrap();
+    assert_eq!(
+        batch.row(0).unwrap().values(),
+        &[
+            Some(Term::NamedNode(
+                oxrdf::NamedNode::new("http://example.org/a").unwrap()
+            )),
+            Some(Term::Literal(1.into())),
+        ]
+    );
+}
+
+#[test]
+fn bounded_weighted_reverse_long_backtrack_visit_budget() {
+    let store = Store::in_memory(StoreOptions::default());
+    load(
+        &store,
+        "@prefix ex: <http://example.org/> . \
+         ex:a ex:p ex:t {| ex:w 1.0e0 |} . \
+         ex:b ex:p ex:t {| ex:w 1.0e12 |} . \
+         ex:a ex:p ex:d {| ex:w 1.0e0 |} . \
+         ex:d ex:p ex:c {| ex:w 1.0e0 |} . \
+         ex:c ex:p ex:a {| ex:w 1.0e0 |} .",
+        RdfFormat::Turtle,
+    );
+    let q = "SELECT ?src ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+        path:maxLength 4 ; path:maxVisited 5 ; path:length ?l } }";
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+    let (rows, _, _) = drain_strict(&snap, &format!("{P}{q}"), &opts, 16);
+    assert_eq!(rows.len(), 4);
+    assert_parity(&snap, q, &opts, true);
+}
+
+#[test]
+fn bounded_weighted_reverse_backtrack_with_exit() {
+    // The reverse search prefers x1 -> v -> t to the three tiny edges via x2 and x3.
+    // The edge v -> x1 needs that longer exit to avoid returning to v. In source order
+    // the four tiny weights round away, so s must take the six-edge path.
+    let m = 2f64.powi(-53);
+    let d = 2f64.powi(-105);
+    let e = d / 2.0;
+    let dbl = |w: f64| format!("\"{w:?}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    let backtrack_exit_ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:pnode {{| ex:w {} |}} . ex:pnode ex:p ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p2 ex:t {{| ex:w {} |}} .\n\
+         ex:x1 ex:p2 ex:v {{| ex:w {} |}} .\n\
+         ex:v ex:p ex:x1 {{| ex:w {} |}} . ex:x1 ex:p ex:x2 {{| ex:w {} |}} .\n\
+         ex:x2 ex:p ex:x3 {{| ex:w {} |}} . ex:x3 ex:p ex:t {{| ex:w {} |}} .\n",
+        dbl(1.0),
+        dbl(m),
+        dbl(d),
+        dbl(0.0),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+        dbl(e),
+    );
+    let store = Store::in_memory(StoreOptions::default());
+    load(&store, &backtrack_exit_ttl, RdfFormat::Turtle);
+    let q = "SELECT ?src ?l { SERVICE path:search { [] path:source ?src ; \
+        path:target ex:t ; path:predicate ex:p , ex:p2 ; path:weight ex:w ; \
+        path:maxLength 6 ; path:length ?l } }";
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+    let (rows, _, _) = drain_strict(&snap, &format!("{P}{q}"), &opts, 16);
+    let expected = bag(vec![vec![
+        Some(Term::NamedNode(
+            oxrdf::NamedNode::new("http://example.org/s").unwrap(),
+        )),
+        Some(Term::Literal(6.into())),
+    ]]);
+    assert!(rows.contains(&expected[0]), "{rows:?}");
+    assert_parity(&snap, q, &opts, true);
+}
