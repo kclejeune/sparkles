@@ -1593,6 +1593,23 @@ in `recall` and the brief.
   checked against a mock provider that records what it received; an import with an
   allow-listed test key left in place; `secretPatterns` from an existing `memory.json`
   read as `redaction.patterns`.
+- **Outcome (delivered for item 77).** `sparkles-memory-import::redact::Policy` now
+  combines built-in and dataset regular expressions, optional high-entropy detection
+  (excluding 40- and 64-character hex hashes and canonical UUIDs), opt-in personal data
+  detectors (`email`, `phone`, `payment-card` with Luhn verification, `iban` with
+  ISO 13616 mod-97 verification, and `ip`), exact known-value Aho-Corasick matching
+  (values of at least 8 characters, never logged or returned), and regex allow-lists.
+  `MemorySettings.redaction` (`memory.json` format 4 when present, keeping format 1 to 3
+  otherwise) configures `patterns`, `entropy`, `personal`, `allow`, `knownValues`,
+  `everywhere`, and `serverIngest` (`redact`, `refuse`, or `off`, defaulting to `redact`),
+  while `imports.secretPatterns` remains accepted and merged with `redaction.patterns`.
+  The CLI (`sparkles memory import` and `sync`, including `--redact-known-values` and
+  `known-values` in `memory.toml`), `register_source` (for `imports.base` or every graph
+  when `redaction.everywhere` is true), and server-side document, claims, and table
+  mapping ingestion all apply this policy before storage or model calls and report
+  `redactions` counts by detector. Unit and HTTP tests verify detector behavior, server
+  secret redaction against a mock provider, `refuse` and `off` modes, allow-lists,
+  `everywhere`, CSV sample redaction, legacy `secretPatterns`, and `memory.json` format 4.
 
 ### Shared memory workflows
 
