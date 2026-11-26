@@ -178,6 +178,32 @@ fn parse_hex4(bytes: &[u8]) -> Option<u32> {
 const PARSER_STATE_BYTES: usize = 1;
 const PARSER_STATE_MIN_CAP: usize = 8;
 
+/// Diagnostic `String` lengths allocated by `json-event-parser 0.2.3`'s
+/// `LowLevelJsonParser` when reporting syntax errors (including recovery paths that hold
+/// the diagnostic concurrently with `buffered_event`).
+const OBJECT_COLON_DIAGNOSTIC_BYTES: u64 = "Object keys must be strings".len() as u64;
+const ARRAY_COMMA_DIAGNOSTIC_BYTES: u64 =
+    "Array values must be followed by a comma to add a new value or a squared bracket to end the array"
+        .len() as u64;
+const OBJECT_COMMA_DIAGNOSTIC_BYTES: u64 =
+    "Object values must be followed by a comma to add a new value or a curly bracket to end the object"
+        .len() as u64;
+const TRAILING_COMMA_DIAGNOSTIC_BYTES: u64 = "Trailing commas are not allowed".len() as u64;
+const ROOT_DONE_DIAGNOSTIC_BYTES: u64 = "The JSON already contains one root element".len() as u64;
+const VALUE_SYNTAX_DIAGNOSTIC_BYTES: u64 =
+    "Unexpected closing square bracket, no array to close".len() as u64;
+/// Peak heap bytes for `format!`-built diagnostics in `JsonLexer` and `check_stack_size`
+/// (messages are at most ~82 bytes, so `String` growth peaks at 64 + 128 = 192 bytes).
+const LEXER_DIAGNOSTIC_PEAK_BYTES: u64 = 192;
+/// `LowLevelJsonParser`'s default `MAX_STATE_STACK_SIZE`.
+const PARSER_MAX_STATE_STACK_SIZE: usize = 65_536;
+
+/// Inline bitset capacity (1,024 nested containers) so valid Sparkles nesting depths keep
+/// container ancestry stack-only with zero heap overhead.
+const INLINE_CONTAINER_WORDS: usize = 16;
+const INLINE_CONTAINER_BITS: usize = INLINE_CONTAINER_WORDS * 64;
+const OVERFLOW_BITS_MIN_CAP: usize = 4;
+
 fn stack_bytes_for_cap(cap: usize) -> u64 {
     (cap as u64).saturating_mul(PARSER_STATE_BYTES as u64)
 }
@@ -186,71 +212,463 @@ fn next_stack_cap(depth: usize) -> usize {
     depth.max(PARSER_STATE_MIN_CAP).next_power_of_two()
 }
 
-/// Conservative peak heap bytes `LowLevelJsonParser::parse_next` may hold or allocate
-/// while processing the next token in `slice`:
-/// - its live `state_stack` plus reallocation peak when the next token opens `[` or `{`;
-/// - an owned decoded `String` (plus `from_utf8_lossy` chunk) when a JSON string has
-///   escapes or non-ASCII bytes;
-/// - an owned `String` clone in `LowLevelJsonParser::buffered_event` when error recovery
-///   on a missing `:` (`ObjectColon`) or `,` (`ArrayCommaOrEnd`) buffers a borrowed
-///   plain-ASCII string or number event.
-fn parser_step_peak(mut slice: &[u8], allow_bom: bool, depth: usize, stack_cap: usize) -> u64 {
-    if allow_bom && slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        slice = &slice[3..];
+/// Mirrors `LowLevelJsonParser`'s exact top-of-stack grammar state across `parse_next`
+/// calls (until the first syntax error or `Eof`, after which `svcread` stops parsing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParserState {
+    RootValue,
+    RootDone,
+    ObjectKey,
+    ObjectKeyOrEnd,
+    ObjectColon,
+    ObjectValue,
+    ObjectCommaOrEnd,
+    ArrayValue,
+    ArrayValueOrEnd,
+    ArrayCommaOrEnd,
+}
+
+/// Exact shadow of `LowLevelJsonParser`'s grammar state, stack depth/capacity, and
+/// `JsonLexer::is_start` flag so `parser_step_peak` charges recovery clones and
+/// diagnostics only on actual error paths and charges zero copy bytes on valid borrowed
+/// tokens.
+struct ParserGrammar {
+    top: ParserState,
+    depth: usize,
+    stack_cap: usize,
+    lexer_at_start: bool,
+    /// Bit `i` is `1` when open container level `i` is an object (`ObjectCommaOrEnd`
+    /// when resumed) and `0` when it is an array (`ArrayCommaOrEnd` when resumed).
+    inline_bits: [u64; INLINE_CONTAINER_WORDS],
+    overflow_bits: Vec<u64>,
+}
+
+impl ParserGrammar {
+    fn new() -> Self {
+        Self {
+            top: ParserState::RootValue,
+            depth: 0,
+            stack_cap: 0,
+            lexer_at_start: true,
+            inline_bits: [0; INLINE_CONTAINER_WORDS],
+            overflow_bits: Vec::new(),
+        }
     }
-    slice = skip_json_ws(slice);
-    // `LowLevelJsonParser::parse_next` loops past a single `:` or `,` separator and
-    // decodes the following value or key in the same call. When a separator IS present,
-    // `apply_new_token` either errors on the separator without lexing the following token
-    // or transitions cleanly to `ObjectValue`/`ObjectKey`/`ArrayValue`, so `owned_event`
-    // error recovery cannot fire on a following borrowed ASCII string or number.
-    let mut skipped_sep = false;
-    if matches!(slice.first(), Some(b':' | b',')) {
-        skipped_sep = true;
-        slice = skip_json_ws(&slice[1..]);
+
+    fn depth(&self) -> usize {
+        self.depth
     }
-    let live_stack = stack_bytes_for_cap(stack_cap);
-    match slice.first().copied() {
-        Some(b'[' | b'{') => {
-            let next_depth = depth.saturating_add(1);
-            if next_depth > stack_cap {
-                vec_growth_peak(stack_cap, next_depth.max(PARSER_STATE_MIN_CAP))
-                    .saturating_mul(PARSER_STATE_BYTES as u64)
+
+    fn live_stack_bytes(&self) -> u64 {
+        stack_bytes_for_cap(self.stack_cap).saturating_add(
+            (self.overflow_bits.capacity() as u64).saturating_mul(size_of::<u64>() as u64),
+        )
+    }
+
+    fn push_stack_peak_bytes(&self) -> u64 {
+        let next_depth = self.depth.saturating_add(1);
+        let parser_stack = if next_depth > self.stack_cap {
+            vec_growth_peak(self.stack_cap, next_depth.max(PARSER_STATE_MIN_CAP))
+                .saturating_mul(PARSER_STATE_BYTES as u64)
+        } else {
+            stack_bytes_for_cap(self.stack_cap)
+        };
+        let overflow_stack = if next_depth > INLINE_CONTAINER_BITS {
+            let need_words = (next_depth - INLINE_CONTAINER_BITS).div_ceil(64);
+            let cur_cap = self.overflow_bits.capacity();
+            if need_words > cur_cap {
+                vec_growth_peak(cur_cap, need_words.max(OVERFLOW_BITS_MIN_CAP))
+                    .saturating_mul(size_of::<u64>() as u64)
             } else {
-                live_stack
+                (cur_cap as u64).saturating_mul(size_of::<u64>() as u64)
+            }
+        } else {
+            (self.overflow_bits.capacity() as u64).saturating_mul(size_of::<u64>() as u64)
+        };
+        parser_stack.saturating_add(overflow_stack)
+    }
+
+    fn set_container_bit(&mut self, level: usize, is_object: bool) {
+        if level < INLINE_CONTAINER_BITS {
+            let word = &mut self.inline_bits[level / 64];
+            let mask = 1u64 << (level % 64);
+            if is_object {
+                *word |= mask;
+            } else {
+                *word &= !mask;
+            }
+        } else {
+            let bit = level - INLINE_CONTAINER_BITS;
+            let word_idx = bit / 64;
+            if word_idx >= self.overflow_bits.len() {
+                self.overflow_bits.resize(word_idx + 1, 0);
+            }
+            let mask = 1u64 << (bit % 64);
+            if is_object {
+                self.overflow_bits[word_idx] |= mask;
+            } else {
+                self.overflow_bits[word_idx] &= !mask;
             }
         }
-        Some(b'"') => live_stack.saturating_add(string_token_scratch(slice, !skipped_sep)),
-        Some(b'-' | b'0'..=b'9') if !skipped_sep => {
-            live_stack.saturating_add(number_token_len(slice) as u64)
+    }
+
+    fn is_object_at(&self, level: usize) -> bool {
+        if level < INLINE_CONTAINER_BITS {
+            (self.inline_bits[level / 64] & (1u64 << (level % 64))) != 0
+        } else {
+            let bit = level - INLINE_CONTAINER_BITS;
+            let word_idx = bit / 64;
+            self.overflow_bits
+                .get(word_idx)
+                .is_some_and(|w| (*w & (1u64 << (bit % 64))) != 0)
         }
-        _ => live_stack,
+    }
+
+    /// Record whether `JsonLexer::is_start` cleared when `parse_next` inspected
+    /// `input_len` bytes with `ending`.
+    fn note_lexer_call(&mut self, input_len: usize, ending: bool) {
+        if self.lexer_at_start && (input_len >= 3 || ending) {
+            self.lexer_at_start = false;
+        }
+    }
+
+    /// Advance across a valid separator consumed by `parse_next` before returning `None`.
+    fn on_incomplete(&mut self, consumed: &[u8]) {
+        match self.top {
+            ParserState::ObjectColon if consumed.contains(&b':') => {
+                self.top = ParserState::ObjectValue;
+            }
+            ParserState::ObjectCommaOrEnd if consumed.contains(&b',') => {
+                self.top = ParserState::ObjectKey;
+            }
+            ParserState::ArrayCommaOrEnd if consumed.contains(&b',') => {
+                self.top = ParserState::ArrayValue;
+            }
+            _ => {}
+        }
+    }
+
+    /// Advance after `parse_next` emitted a valid `JsonEvent`.
+    fn on_event(&mut self, event: &JsonEvent<'_>) {
+        match event {
+            JsonEvent::StartObject => {
+                self.set_container_bit(self.depth, true);
+                self.depth += 1;
+                if self.depth > self.stack_cap {
+                    self.stack_cap = next_stack_cap(self.depth);
+                }
+                self.top = ParserState::ObjectKeyOrEnd;
+            }
+            JsonEvent::StartArray => {
+                self.set_container_bit(self.depth, false);
+                self.depth += 1;
+                if self.depth > self.stack_cap {
+                    self.stack_cap = next_stack_cap(self.depth);
+                }
+                self.top = ParserState::ArrayValueOrEnd;
+            }
+            JsonEvent::EndObject | JsonEvent::EndArray => {
+                self.depth = self.depth.saturating_sub(1);
+                self.top = if self.depth == 0 {
+                    ParserState::RootDone
+                } else if self.is_object_at(self.depth - 1) {
+                    ParserState::ObjectCommaOrEnd
+                } else {
+                    ParserState::ArrayCommaOrEnd
+                };
+            }
+            JsonEvent::ObjectKey(_) => {
+                self.top = ParserState::ObjectColon;
+            }
+            JsonEvent::String(_)
+            | JsonEvent::Number(_)
+            | JsonEvent::Boolean(_)
+            | JsonEvent::Null => {
+                self.top = if self.depth == 0 {
+                    ParserState::RootDone
+                } else if self.is_object_at(self.depth - 1) {
+                    ParserState::ObjectCommaOrEnd
+                } else {
+                    ParserState::ArrayCommaOrEnd
+                };
+            }
+            JsonEvent::Eof => {}
+        }
     }
 }
 
-fn number_token_len(slice: &[u8]) -> usize {
+enum TokenScratch {
+    /// Complete or incomplete token whose lexer scratch (or recovery clone) is `bytes`.
+    /// When `reaches_parser` is true, `apply_new_token` will process the token and any
+    /// syntax-error diagnostic can coexist with `bytes`.
+    Ok { bytes: u64, reaches_parser: bool },
+    /// Lexer fails before `apply_new_token`; `bytes` already covers the lexer diagnostic.
+    LexerErr(u64),
+}
+
+fn eof_diagnostic_bytes(state: ParserState) -> u64 {
+    match state {
+        ParserState::RootDone => 0,
+        ParserState::ObjectColon | ParserState::ObjectKey | ParserState::ObjectKeyOrEnd => {
+            OBJECT_COLON_DIAGNOSTIC_BYTES
+        }
+        ParserState::ObjectCommaOrEnd => OBJECT_COMMA_DIAGNOSTIC_BYTES,
+        ParserState::ArrayCommaOrEnd => ARRAY_COMMA_DIAGNOSTIC_BYTES,
+        ParserState::RootValue
+        | ParserState::ObjectValue
+        | ParserState::ArrayValueOrEnd
+        | ParserState::ArrayValue => VALUE_SYNTAX_DIAGNOSTIC_BYTES,
+    }
+}
+
+/// Conservative peak heap bytes `LowLevelJsonParser::parse_next` may hold or allocate
+/// while processing the next token in `slice`:
+/// - its live `state_stack` (and any overflow bitset) plus reallocation peak when the
+///   next token opens `[` or `{`;
+/// - an owned decoded `String` (plus `from_utf8_lossy` chunk) when a JSON string has
+///   escapes or non-ASCII bytes;
+/// - an owned `String` clone in `LowLevelJsonParser::buffered_event` plus the coexisting
+///   diagnostic `String` when error recovery on a missing `:` (`ObjectColon`) or `,`
+///   (`ArrayCommaOrEnd`) buffers a borrowed plain-ASCII string or number event;
+/// - bounded parser or lexer syntax-error diagnostics on malformed input.
+fn parser_step_peak(mut slice: &[u8], ending: bool, grammar: &ParserGrammar) -> u64 {
+    let live_stack = grammar.live_stack_bytes();
+    if grammar.lexer_at_start {
+        if slice.len() < 3 && !ending {
+            return live_stack;
+        }
+        if slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            slice = &slice[3..];
+        }
+    }
+    slice = skip_json_ws(slice);
+    // `LowLevelJsonParser::parse_next` loops past a valid `:` or `,` separator and
+    // decodes the following value or key in the same call. Advance the effective state
+    // only when the separator is valid for the tracked grammar state.
+    let mut state = grammar.top;
+    match (state, slice.first().copied()) {
+        (ParserState::ObjectColon, Some(b':')) => {
+            state = ParserState::ObjectValue;
+            slice = skip_json_ws(&slice[1..]);
+        }
+        (ParserState::ObjectCommaOrEnd, Some(b',')) => {
+            state = ParserState::ObjectKey;
+            slice = skip_json_ws(&slice[1..]);
+        }
+        (ParserState::ArrayCommaOrEnd, Some(b',')) => {
+            state = ParserState::ArrayValue;
+            slice = skip_json_ws(&slice[1..]);
+        }
+        _ => {}
+    }
+
+    let Some(&first) = slice.first() else {
+        if !ending || state == ParserState::RootDone {
+            return live_stack;
+        }
+        return live_stack.saturating_add(eof_diagnostic_bytes(state));
+    };
+
+    // Only `ObjectColon` (without `:`) and `ArrayCommaOrEnd` (without `,` or `]`)
+    // invoke error recovery that clones a borrowed string or number into
+    // `buffered_event` while holding the diagnostic `String`.
+    let recovery_diag = match (state, first) {
+        (ParserState::ObjectColon, _) => Some(OBJECT_COLON_DIAGNOSTIC_BYTES),
+        (ParserState::ArrayCommaOrEnd, b']') => None,
+        (ParserState::ArrayCommaOrEnd, _) => Some(ARRAY_COMMA_DIAGNOSTIC_BYTES),
+        _ => None,
+    };
+    let may_clone_borrowed = recovery_diag.is_some();
+
+    let fixed_diag = recovery_diag.or(match (state, first) {
+        (ParserState::RootDone, _) => Some(ROOT_DONE_DIAGNOSTIC_BYTES),
+        (ParserState::ObjectCommaOrEnd, b'}') => None,
+        (ParserState::ObjectCommaOrEnd, _) => Some(OBJECT_COMMA_DIAGNOSTIC_BYTES),
+        (ParserState::ObjectKeyOrEnd, b'}' | b'"') => None,
+        (ParserState::ObjectKeyOrEnd, _) => Some(OBJECT_COLON_DIAGNOSTIC_BYTES),
+        (ParserState::ObjectKey, b'"') => None,
+        (ParserState::ObjectKey, b'}') => Some(TRAILING_COMMA_DIAGNOSTIC_BYTES),
+        (ParserState::ObjectKey, _) => Some(OBJECT_COLON_DIAGNOSTIC_BYTES),
+        (ParserState::ArrayValue, b']') => Some(TRAILING_COMMA_DIAGNOSTIC_BYTES),
+        (ParserState::ArrayValueOrEnd, b']') => None,
+        (
+            ParserState::RootValue
+            | ParserState::ObjectValue
+            | ParserState::ArrayValueOrEnd
+            | ParserState::ArrayValue,
+            b'[' | b'{' | b'"' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n',
+        ) => None,
+        (
+            ParserState::RootValue
+            | ParserState::ObjectValue
+            | ParserState::ArrayValueOrEnd
+            | ParserState::ArrayValue,
+            _,
+        ) => Some(VALUE_SYNTAX_DIAGNOSTIC_BYTES),
+        (ParserState::ObjectColon | ParserState::ArrayCommaOrEnd, _) => None,
+    });
+
+    match first {
+        b'[' | b'{' => {
+            let pushes_container = matches!(
+                state,
+                ParserState::RootValue
+                    | ParserState::ObjectValue
+                    | ParserState::ArrayValueOrEnd
+                    | ParserState::ArrayValue
+                    | ParserState::ObjectColon
+                    | ParserState::ArrayCommaOrEnd
+            );
+            let stack_peak = if pushes_container {
+                grammar.push_stack_peak_bytes()
+            } else {
+                live_stack
+            };
+            let diag = if pushes_container && grammar.depth() > PARSER_MAX_STATE_STACK_SIZE {
+                LEXER_DIAGNOSTIC_PEAK_BYTES
+            } else {
+                fixed_diag.unwrap_or(0)
+            };
+            stack_peak.saturating_add(diag)
+        }
+        b'"' => match string_token_scratch(slice, ending, may_clone_borrowed) {
+            TokenScratch::Ok {
+                bytes,
+                reaches_parser,
+            } => {
+                let diag = if reaches_parser {
+                    fixed_diag.unwrap_or(0)
+                } else {
+                    0
+                };
+                live_stack.saturating_add(bytes).saturating_add(diag)
+            }
+            TokenScratch::LexerErr(bytes) => live_stack.saturating_add(bytes),
+        },
+        b'-' | b'0'..=b'9' => match number_token_scratch(slice, ending, may_clone_borrowed) {
+            TokenScratch::Ok {
+                bytes,
+                reaches_parser,
+            } => {
+                let diag = if reaches_parser {
+                    fixed_diag.unwrap_or(0)
+                } else {
+                    0
+                };
+                live_stack.saturating_add(bytes).saturating_add(diag)
+            }
+            TokenScratch::LexerErr(bytes) => live_stack.saturating_add(bytes),
+        },
+        b't' | b'f' | b'n' => match constant_token_scratch(slice, ending) {
+            TokenScratch::Ok {
+                bytes,
+                reaches_parser,
+            } => {
+                let diag = if reaches_parser {
+                    fixed_diag.unwrap_or(0)
+                } else {
+                    0
+                };
+                live_stack.saturating_add(bytes).saturating_add(diag)
+            }
+            TokenScratch::LexerErr(bytes) => live_stack.saturating_add(bytes),
+        },
+        b'}' | b']' | b',' | b':' => live_stack.saturating_add(fixed_diag.unwrap_or(0)),
+        _ => live_stack.saturating_add(LEXER_DIAGNOSTIC_PEAK_BYTES),
+    }
+}
+
+fn number_token_scratch(slice: &[u8], ending: bool, may_clone_borrowed: bool) -> TokenScratch {
     let Some((&first, rest)) = slice.split_first() else {
-        return 0;
+        return TokenScratch::Ok {
+            bytes: 0,
+            reaches_parser: false,
+        };
     };
     let mut phase = match first {
         b'-' => NumberPhase::AfterSign,
         b'0' => NumberPhase::AfterZero,
         b'1'..=b'9' => NumberPhase::IntDigits,
-        _ => return 0,
+        _ => return TokenScratch::LexerErr(LEXER_DIAGNOSTIC_PEAK_BYTES),
     };
     let mut len = 1usize;
+    let mut terminated = false;
     for &b in rest {
         if phase.advance(b) {
+            terminated = true;
             break;
         }
         len += 1;
     }
-    len
+    let incomplete_phase = matches!(
+        phase,
+        NumberPhase::AfterSign
+            | NumberPhase::FracStart
+            | NumberPhase::ExpStart
+            | NumberPhase::ExpSign
+    );
+    if terminated {
+        if incomplete_phase {
+            return TokenScratch::LexerErr(LEXER_DIAGNOSTIC_PEAK_BYTES);
+        }
+        return TokenScratch::Ok {
+            bytes: if may_clone_borrowed { len as u64 } else { 0 },
+            reaches_parser: true,
+        };
+    }
+    if !ending {
+        return TokenScratch::Ok {
+            bytes: 0,
+            reaches_parser: false,
+        };
+    }
+    if incomplete_phase {
+        return TokenScratch::LexerErr(VALUE_SYNTAX_DIAGNOSTIC_BYTES);
+    }
+    TokenScratch::Ok {
+        bytes: if may_clone_borrowed { len as u64 } else { 0 },
+        reaches_parser: true,
+    }
 }
 
-fn string_token_scratch(slice: &[u8], may_clone_borrowed: bool) -> u64 {
+fn constant_token_scratch(slice: &[u8], ending: bool) -> TokenScratch {
+    let expected: &[u8] = match slice.first().copied() {
+        Some(b't') => b"true",
+        Some(b'f') => b"false",
+        Some(b'n') => b"null",
+        _ => return TokenScratch::LexerErr(LEXER_DIAGNOSTIC_PEAK_BYTES),
+    };
+    if slice.len() < expected.len() {
+        return if ending {
+            TokenScratch::LexerErr(VALUE_SYNTAX_DIAGNOSTIC_BYTES)
+        } else {
+            TokenScratch::Ok {
+                bytes: 0,
+                reaches_parser: false,
+            }
+        };
+    }
+    if slice.starts_with(expected) {
+        return TokenScratch::Ok {
+            bytes: 0,
+            reaches_parser: true,
+        };
+    }
+    let alpha = slice.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    if alpha == slice.len() && !ending {
+        return TokenScratch::Ok {
+            bytes: 0,
+            reaches_parser: false,
+        };
+    }
+    TokenScratch::LexerErr(LEXER_DIAGNOSTIC_PEAK_BYTES)
+}
+
+fn string_token_scratch(slice: &[u8], ending: bool, may_clone_borrowed: bool) -> TokenScratch {
     let mut has_escape = false;
     let mut has_non_ascii = false;
+    let mut has_lexer_error = false;
+    let mut closed = false;
     let mut decoded = 0usize;
     let mut i = 1usize;
     while i < slice.len() {
@@ -276,26 +694,46 @@ fn string_token_scratch(slice: &[u8], may_clone_borrowed: bool) -> u64 {
                     if let Some(cp) = cp
                         && char::from_u32(cp).is_none()
                     {
+                        if !(0xD800..=0xDBFF).contains(&cp) {
+                            has_lexer_error = true;
+                        }
                         // Surrogate code unit: `read_string` consumes 6 more bytes and
                         // pushes at most one 4-byte UTF-8 character.
                         if i + 6 > slice.len() {
                             break;
                         }
+                        let tail = &slice[i..i + 6];
+                        if !tail.starts_with(b"\\u")
+                            || !parse_hex4(&tail[2..])
+                                .is_some_and(|lo| (0xDC00..=0xDFFF).contains(&lo))
+                        {
+                            has_lexer_error = true;
+                        }
                         i += 6;
                         decoded = decoded.saturating_add(4);
                     } else {
+                        if cp.is_none() {
+                            has_lexer_error = true;
+                        }
                         // Single BMP scalar or invalid hex -> `U+FFFD` (at most 3 bytes).
                         decoded = decoded.saturating_add(3);
                     }
                 }
                 _ => {
-                    // Unrecognized 2-byte escape pushes `U+FFFD` (3 UTF-8 bytes).
+                    // Unrecognized 2-byte escape pushes `U+FFFD` (3 UTF-8 bytes) and
+                    // records a lexer syntax error.
+                    has_lexer_error = true;
                     decoded = decoded.saturating_add(3);
                     i += 1;
                 }
             }
         } else if b == b'"' {
+            closed = true;
             break;
+        } else if b < 0x20 {
+            has_lexer_error = true;
+            decoded = decoded.saturating_add(1);
+            i += 1;
         } else if !b.is_ascii() {
             has_non_ascii = true;
             decoded = decoded.saturating_add(3);
@@ -307,17 +745,54 @@ fn string_token_scratch(slice: &[u8], may_clone_borrowed: bool) -> u64 {
     }
     let decoded = decoded as u64;
     if !has_escape && !has_non_ascii {
-        return if may_clone_borrowed { decoded } else { 0 };
+        if has_lexer_error {
+            return TokenScratch::LexerErr(LEXER_DIAGNOSTIC_PEAK_BYTES);
+        }
+        if !closed {
+            return if ending {
+                TokenScratch::LexerErr(VALUE_SYNTAX_DIAGNOSTIC_BYTES)
+            } else {
+                TokenScratch::Ok {
+                    bytes: 0,
+                    reaches_parser: false,
+                }
+            };
+        }
+        return TokenScratch::Ok {
+            bytes: if may_clone_borrowed { decoded } else { 0 },
+            reaches_parser: true,
+        };
     }
     // `String::new(); string.push_str(prefix)` allocates `prefix.len()` without rounding
     // to a power of two; a subsequent push can double `old_cap` to `2 * old_cap`, giving
     // an old + new reallocation peak bounded by `3 * decoded + 16`. When `has_escape`
     // and `has_non_ascii` both hold, an owned `from_utf8_lossy` chunk buffer can coexist
     // with `string` during `push_str`, bounded by `4 * decoded + 24`.
-    if has_escape && has_non_ascii {
+    let mut scratch = if has_escape && has_non_ascii {
         decoded.saturating_mul(4).saturating_add(24)
     } else {
         decoded.saturating_mul(3).saturating_add(16)
+    };
+    if has_non_ascii && std::str::from_utf8(&slice[1..i]).is_err() {
+        has_lexer_error = true;
+    }
+    if has_lexer_error {
+        scratch = scratch.saturating_add(LEXER_DIAGNOSTIC_PEAK_BYTES);
+        return TokenScratch::LexerErr(scratch);
+    }
+    if !closed {
+        return TokenScratch::Ok {
+            bytes: if ending {
+                scratch.max(VALUE_SYNTAX_DIAGNOSTIC_BYTES)
+            } else {
+                scratch
+            },
+            reaches_parser: false,
+        };
+    }
+    TokenScratch::Ok {
+        bytes: scratch,
+        reaches_parser: true,
     }
 }
 
@@ -537,8 +1012,7 @@ pub(super) struct Start {
     pub(super) late: bool,
     parser: LowLevelJsonParser,
     ending: bool,
-    depth: usize,
-    stack_cap: usize,
+    grammar: ParserGrammar,
     in_head: bool,
 }
 
@@ -561,15 +1035,15 @@ fn json_start_inner(
     ctx: &Ctx,
 ) -> io::Result<(Start, usize)> {
     let mut parser = LowLevelJsonParser::new();
+    let mut grammar = ParserGrammar::new();
     let mut bytes = Vec::new();
     let (mut at, mut ending) = (0usize, false);
-    let (mut depth, mut stack_cap, mut in_head, mut vars, mut seen_token) =
-        (0usize, 0usize, false, false, false);
+    let (mut in_head, mut vars, mut seen_token) = (false, false, false);
     let mut incomplete_retries = 0usize;
     loop {
         let prev_at = at;
-        if at < bytes.len() {
-            let step_peak = parser_step_peak(&bytes[at..], !seen_token, depth, stack_cap);
+        if at < bytes.len() || ending {
+            let step_peak = parser_step_peak(&bytes[at..], ending, &grammar);
             if step_peak > 0 {
                 let parse_peak = (bytes.capacity() as u64).saturating_add(step_peak);
                 if parse_peak > charge.bytes() {
@@ -578,48 +1052,48 @@ fn json_start_inner(
             }
         }
         let result = parser.parse_next(&bytes[at..], ending);
+        grammar.note_lexer_call(bytes.len() - prev_at, ending);
         at += result.consumed_bytes;
         if result.event.is_some() {
             seen_token = true;
+        } else {
+            grammar.on_incomplete(&bytes[prev_at..at]);
         }
         // `Some(late)` once the order is known
         let decided = match result.event {
             None if ending => Some(false),
             None => None,
             Some(Err(_)) | Some(Ok(JsonEvent::Eof)) => Some(false),
-            Some(Ok(event)) => match event {
-                JsonEvent::StartObject | JsonEvent::StartArray => {
-                    depth += 1;
-                    if depth > stack_cap {
-                        stack_cap = next_stack_cap(depth);
+            Some(Ok(event)) => {
+                let prev_depth = grammar.depth();
+                grammar.on_event(&event);
+                match event {
+                    JsonEvent::StartObject | JsonEvent::StartArray => continue,
+                    JsonEvent::EndObject | JsonEvent::EndArray => {
+                        if prev_depth == 2 && in_head && event == JsonEvent::EndObject {
+                            in_head = false;
+                        }
+                        if grammar.depth() == 0 {
+                            Some(false)
+                        } else {
+                            continue;
+                        }
                     }
-                    continue;
-                }
-                JsonEvent::EndObject | JsonEvent::EndArray => {
-                    if depth == 2 && in_head && event == JsonEvent::EndObject {
-                        in_head = false;
-                    }
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        Some(false)
-                    } else {
+                    JsonEvent::ObjectKey(key) if prev_depth == 1 => match key.as_ref() {
+                        "results" => Some(!vars),
+                        "boolean" => Some(false),
+                        other => {
+                            in_head = other == "head";
+                            continue;
+                        }
+                    },
+                    JsonEvent::ObjectKey(key) if prev_depth == 2 && in_head && key == "vars" => {
+                        vars = true;
                         continue;
                     }
+                    _ => continue,
                 }
-                JsonEvent::ObjectKey(key) if depth == 1 => match key.as_ref() {
-                    "results" => Some(!vars),
-                    "boolean" => Some(false),
-                    other => {
-                        in_head = other == "head";
-                        continue;
-                    }
-                },
-                JsonEvent::ObjectKey(key) if depth == 2 && in_head && key == "vars" => {
-                    vars = true;
-                    continue;
-                }
-                _ => continue,
-            },
+            }
         };
         if let Some(late) = decided {
             return Ok((
@@ -629,8 +1103,7 @@ fn json_start_inner(
                     late,
                     parser,
                     ending,
-                    depth,
-                    stack_cap,
+                    grammar,
                     in_head,
                 },
                 incomplete_retries,
@@ -662,7 +1135,7 @@ fn json_start_inner(
         if at < bytes.len() {
             incomplete_retries += 1;
         }
-        let mut incomplete = IncompleteToken::from_slice(&bytes[at..], !seen_token);
+        let mut incomplete = IncompleteToken::from_slice(&bytes[at..], grammar.lexer_at_start);
         loop {
             ctx.check().map_err(io::Error::other)?;
             let start = bytes.len();
@@ -670,7 +1143,7 @@ fn json_start_inner(
                 .checked_add(READ_STEP)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "JSON head too large"))?;
             let peak = vec_growth_peak(bytes.capacity(), next_len)
-                .saturating_add(stack_bytes_for_cap(stack_cap));
+                .saturating_add(grammar.live_stack_bytes());
             let target = if charge.is_cursor() {
                 (next_len as u64)
                     .saturating_mul(head_factor())
@@ -728,8 +1201,7 @@ fn read_late_json_inner(
         decided: mut at,
         mut parser,
         mut ending,
-        mut depth,
-        mut stack_cap,
+        mut grammar,
         mut in_head,
         ..
     } = start;
@@ -738,8 +1210,9 @@ fn read_late_json_inner(
     let mut links_depth = 0usize;
     let mut incomplete_retries = 0usize;
     loop {
-        if at < bytes.len() {
-            let step_peak = parser_step_peak(&bytes[at..], false, depth, stack_cap);
+        let prev_at = at;
+        if at < bytes.len() || ending {
+            let step_peak = parser_step_peak(&bytes[at..], ending, &grammar);
             if step_peak > 0 {
                 let parse_peak = (bytes.capacity() as u64).saturating_add(step_peak);
                 if parse_peak > charge.bytes() {
@@ -748,6 +1221,7 @@ fn read_late_json_inner(
             }
         }
         let result = parser.parse_next(&bytes[at..], ending);
+        grammar.note_lexer_call(bytes.len() - prev_at, ending);
         at += result.consumed_bytes;
         match result.event {
             None if ending => {
@@ -756,18 +1230,21 @@ fn read_late_json_inner(
                     "unexpected end of JSON response",
                 ));
             }
-            None => {}
+            None => {
+                grammar.on_incomplete(&bytes[prev_at..at]);
+            }
             Some(Err(e)) => {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
             Some(Ok(JsonEvent::Eof)) => {
-                if depth != 0 {
+                if grammar.depth() != 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "unexpected end of JSON response",
                     ));
                 }
                 drop(parser);
+                drop(grammar);
                 let target = (bytes.capacity() as u64)
                     .saturating_add((bytes.len() as u64).saturating_mul(buffered_factor()))
                     .saturating_add(SLACK);
@@ -777,6 +1254,8 @@ fn read_late_json_inner(
                 return Ok((bytes, incomplete_retries));
             }
             Some(Ok(event)) => {
+                let prev_depth = grammar.depth();
+                grammar.on_event(&event);
                 if expect_links_array {
                     expect_links_array = false;
                     if event != JsonEvent::StartArray {
@@ -785,20 +1264,15 @@ fn read_late_json_inner(
                             "SPARQL JSON results links must be an array",
                         ));
                     }
-                    depth += 1;
-                    if depth > stack_cap {
-                        stack_cap = next_stack_cap(depth);
-                    }
                     in_links = true;
-                    links_depth = depth;
+                    links_depth = grammar.depth();
                     continue;
                 }
-                if in_links && depth == links_depth {
+                if in_links && prev_depth == links_depth {
                     match event {
                         JsonEvent::String(_) => continue,
                         JsonEvent::EndArray => {
                             in_links = false;
-                            depth = depth.saturating_sub(1);
                             continue;
                         }
                         _ => {
@@ -810,22 +1284,13 @@ fn read_late_json_inner(
                     }
                 }
                 match event {
-                    JsonEvent::StartObject | JsonEvent::StartArray => {
-                        depth += 1;
-                        if depth > stack_cap {
-                            stack_cap = next_stack_cap(depth);
-                        }
+                    JsonEvent::EndObject if prev_depth == 2 && in_head => {
+                        in_head = false;
                     }
-                    JsonEvent::EndObject | JsonEvent::EndArray => {
-                        if depth == 2 && in_head && event == JsonEvent::EndObject {
-                            in_head = false;
-                        }
-                        depth = depth.saturating_sub(1);
-                    }
-                    JsonEvent::ObjectKey(key) if depth == 1 => {
+                    JsonEvent::ObjectKey(key) if prev_depth == 1 => {
                         in_head = key.as_ref() == "head";
                     }
-                    JsonEvent::ObjectKey(key) if depth == 2 && in_head && key == "links" => {
+                    JsonEvent::ObjectKey(key) if prev_depth == 2 && in_head && key == "links" => {
                         expect_links_array = true;
                     }
                     _ => {}
@@ -859,7 +1324,7 @@ fn read_late_json_inner(
             // size the buffered replay reserve against bytes actually received so a tiny
             // complete response is not rejected before the read can observe EOF.
             let vec_peak =
-                vec_growth_peak(cap, next_len).saturating_add(stack_bytes_for_cap(stack_cap));
+                vec_growth_peak(cap, next_len).saturating_add(grammar.live_stack_bytes());
             if vec_peak > charge.bytes() {
                 charge.resize(vec_peak).map_err(io::Error::other)?;
             }
@@ -871,7 +1336,7 @@ fn read_late_json_inner(
                 let replay_target = (bytes.capacity() as u64)
                     .saturating_add((bytes.len() as u64).saturating_mul(buffered_factor()))
                     .saturating_add(SLACK)
-                    .max((bytes.capacity() as u64).saturating_add(stack_bytes_for_cap(stack_cap)));
+                    .max((bytes.capacity() as u64).saturating_add(grammar.live_stack_bytes()));
                 if replay_target > charge.bytes() {
                     charge.resize(replay_target).map_err(io::Error::other)?;
                 }
@@ -1189,7 +1654,7 @@ mod tests {
         );
     }
 
-    /// `lexer_token_scratch` pre-admits strings immediately following `,` or `:`,
+    /// `parser_step_peak` pre-admits strings immediately following `,` or `:`,
     /// non-power-of-two initial string growth when an escape follows a long ASCII prefix,
     /// and 2 -> 3 byte `U+FFFD` expansion on invalid ASCII escapes.
     #[test]
@@ -1818,6 +2283,185 @@ mod tests {
             let mut staging = eager_charge(&ctx).unwrap();
             let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
             assert!(!start.late);
+        }
+    }
+
+    /// Error-recovery admission covers the diagnostic `String` that coexists with
+    /// `buffered_event` at exact byte boundaries, while valid borrowed strings and
+    /// numbers (first array value, first object key, and continuations after a consumed
+    /// `,` or `:` separator) reserve zero copy space.
+    #[test]
+    fn eager_json_probe_bounds_recovery_diagnostics_and_skips_valid_borrowed_copies() {
+        let store = Store::in_memory(StoreOptions::default());
+
+        struct Chunked(VecDeque<Vec<u8>>);
+        impl Read for Chunked {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let Some(chunk) = self.0.pop_front() else {
+                    return Ok(0);
+                };
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    self.0.push_front(chunk[n..].to_vec());
+                }
+                Ok(n)
+            }
+        }
+
+        // 1. Exact-boundary missing-colon recovery: 4,096 B staging + 8 B stack +
+        // 3,000 B cloned value + 27 B diagnostic = 7,131 B. Must refuse at 7,104 B and
+        // 7,130 B, and admit at 7,131 B (for both plain ASCII string and plain number).
+        let colon_str = format!(r#"{{"head":{{"x" "{}"}}}}"#, "a".repeat(3_000));
+        let colon_num = format!(r#"{{"head":{{"x" {}}}}}"#, "9".repeat(3_000));
+        assert!(colon_str.len() < READ_STEP && colon_num.len() < READ_STEP);
+        for payload in [colon_str.as_bytes(), colon_num.as_bytes()] {
+            for limit in [7_104u64, 7_130u64] {
+                let mut raw = Ctx::new(store.snapshot());
+                raw.mem_limit = limit;
+                let ctx = Arc::new(raw);
+                ctx.attach_owner();
+                let mut cur = io::Cursor::new(payload);
+                let mut staging = eager_charge(&ctx).unwrap();
+                let err = json_start(&mut cur, &mut staging, &ctx).err().unwrap();
+                assert!(
+                    matches!(
+                        crate::codec::io_error(err),
+                        Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+                    ),
+                    "missing-colon recovery must refuse under {limit}-byte grant"
+                );
+            }
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 7_131;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+            let mut cur = io::Cursor::new(payload);
+            let mut staging = eager_charge(&ctx).unwrap();
+            let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+            assert!(!start.late);
+        }
+
+        // 2. Exact-boundary missing-comma array recovery: 4,096 B staging + 8 B stack +
+        // 3,000 B cloned string + 97 B diagnostic = 7,201 B. Must refuse at 7,104 B and
+        // 7,200 B, and admit at 7,201 B.
+        let comma_str = format!(r#"{{"head":{{"links":["ok" "{}"]}}}}"#, "b".repeat(3_000));
+        assert!(comma_str.len() < READ_STEP);
+        for limit in [7_104u64, 7_200u64] {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = limit;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+            let mut cur = io::Cursor::new(comma_str.as_bytes());
+            let mut staging = eager_charge(&ctx).unwrap();
+            let err = json_start(&mut cur, &mut staging, &ctx).err().unwrap();
+            assert!(
+                matches!(
+                    crate::codec::io_error(err),
+                    Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+                ),
+                "missing-comma array recovery must refuse under {limit}-byte grant"
+            );
+        }
+        {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 7_201;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+            let mut cur = io::Cursor::new(comma_str.as_bytes());
+            let mut staging = eager_charge(&ctx).unwrap();
+            let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+            assert!(!start.late);
+        }
+
+        // 3. Valid 3,000-byte plain ASCII first array value (`ArrayValueOrEnd`) and first
+        // object key (`ObjectKeyOrEnd`) emit borrowed events without copying and finish
+        // the probe under a 6 KiB (and even exact 4,104 B) staging grant.
+        let first_link = format!(
+            r#"{{"head":{{"links":["{}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+            "a".repeat(3_000)
+        );
+        let first_key = format!(
+            r#"{{"head":{{"{}":1,"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+            "k".repeat(3_000)
+        );
+        assert!(first_link.len() < READ_STEP && first_key.len() < READ_STEP);
+        for payload in [first_link.as_bytes(), first_key.as_bytes()] {
+            for limit in [4_104u64, 6 << 10] {
+                let mut raw = Ctx::new(store.snapshot());
+                raw.mem_limit = limit;
+                let ctx = Arc::new(raw);
+                ctx.attach_owner();
+                let mut cur = io::Cursor::new(payload);
+                let mut staging = eager_charge(&ctx).unwrap();
+                let start = json_start(&mut cur, &mut staging, &ctx).unwrap();
+                assert!(!start.late);
+            }
+        }
+
+        // 4. Valid continuations after a consumed `,` or `:` separator in an earlier
+        // read (`ArrayCommaOrEnd -> ArrayValue`, `ObjectColon -> ObjectValue`) reserve
+        // zero copy space for 9,000-byte plain borrowed strings and numbers (staging
+        // grows 4,096 -> 8,192 -> 16,384 with peak 24,584 B, fitting under 25,000 B,
+        // whereas a false 9,000 B copy charge would demand 16,384 + 8 + 9,000 = 25,392 B).
+        let continuation_cases = [
+            (
+                br#"{"head":{"links":["ok","#.to_vec(),
+                format!(
+                    r#""{}"],"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+                    "c".repeat(9_000)
+                )
+                .into_bytes(),
+            ),
+            (
+                br#"{"head":{"ext":"#.to_vec(),
+                format!(
+                    r#""{}","vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+                    "d".repeat(9_000)
+                )
+                .into_bytes(),
+            ),
+            (
+                br#"{"head":{"ext":"#.to_vec(),
+                format!(
+                    r#"{},"vars":["s"]}},"results":{{"bindings":[]}}}}"#,
+                    "7".repeat(9_000)
+                )
+                .into_bytes(),
+            ),
+        ];
+        for (c1, c2) in continuation_cases {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 25_000;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+            let mut body = Chunked(VecDeque::from([c1, c2]));
+            let mut staging = eager_charge(&ctx).unwrap();
+            let start = json_start(&mut body, &mut staging, &ctx).unwrap();
+            assert!(!start.late);
+        }
+
+        // 5. Contrast: when chunk 1 ends right after an object key WITHOUT `:`, chunk 2's
+        // 9,000-byte plain ASCII string still triggers missing-colon recovery and refuses
+        // under 25,000 B (16,384 + 8 + 9,000 + 27 = 25,419 > 25,000).
+        {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 25_000;
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+            let mut body = Chunked(VecDeque::from([
+                br#"{"head":{"ext""#.to_vec(),
+                format!(r#" "{}"}}}}"#, "e".repeat(9_000)).into_bytes(),
+            ]));
+            let mut staging = eager_charge(&ctx).unwrap();
+            let err = json_start(&mut body, &mut staging, &ctx).err().unwrap();
+            assert!(
+                matches!(
+                    crate::codec::io_error(err),
+                    Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+                ),
+                "chunk-split missing-colon recovery must still refuse under 25,000 B"
+            );
         }
     }
 
