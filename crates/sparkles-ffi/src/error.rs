@@ -42,6 +42,8 @@ pub enum FfiError {
         kind: ErrorKind,
         /// the engine's message (not `message`, which the Kotlin exception has already)
         detail: String,
+        /// stable machine code from `sparkles::Error::code`, when available
+        code: Option<String>,
         /// for `BudgetExceeded`: which budget (`rows`, `memory`, …), its limit and the
         /// amount asked for
         budget: Option<String>,
@@ -64,6 +66,7 @@ impl FfiError {
         FfiError::Engine {
             kind,
             detail: message.into(),
+            code: None,
             budget: None,
             limit: None,
             requested: None,
@@ -86,6 +89,7 @@ impl From<sparkles::Error> for FfiError {
     fn from(e: sparkles::Error) -> FfiError {
         use sparkles::Error as E;
         let message = e.to_string();
+        let code = Some(e.code().to_string());
         let kind = match &e {
             E::Io(_) => ErrorKind::Io,
             E::SparqlSyntax(_) => ErrorKind::SparqlSyntax,
@@ -96,6 +100,7 @@ impl From<sparkles::Error> for FfiError {
                 return FfiError::Engine {
                     kind: ErrorKind::BudgetExceeded,
                     detail: message,
+                    code,
                     budget: Some(b.kind.as_str().to_string()),
                     limit: Some(b.limit),
                     requested: Some(b.requested),
@@ -126,9 +131,48 @@ impl From<sparkles::Error> for FfiError {
                 sparkles::patch::PatchErrorKind::Term => ErrorKind::Invalid,
                 sparkles::patch::PatchErrorKind::PrevMismatch => ErrorKind::Conflict,
             },
+            E::Managed(m) => {
+                use sparkles::managed::ManagedErrorKind as K;
+                match m.kind {
+                    K::UnsupportedProfile => ErrorKind::Unsupported,
+                    K::Unavailable | K::HoldsUnavailable => ErrorKind::Corrupt,
+                    K::EvidenceUnavailable => ErrorKind::NotFound,
+                    K::IncompleteEvidence
+                    | K::UnanchoredEvidence
+                    | K::SpanMismatch
+                    | K::OriginNotReproduced => ErrorKind::Invalid,
+                    K::Protected
+                    | K::HoldConflict
+                    | K::HoldsLimit
+                    | K::ImmutableRecordConflict
+                    | K::HeadChanged
+                    | K::IdempotencyConflict
+                    | K::AuthorityChanged
+                    | K::PolicyChanged
+                    | K::TargetChanged
+                    | K::DecisionSuperseded
+                    | K::TargetWithdrawn
+                    | K::EvidenceConflict
+                    | K::ProjectionUnavailable
+                    | K::IdentityConflict
+                    | K::ConfigurationHistoryInactive
+                    | K::LeaseLost
+                    | K::PublicationConflict
+                    | K::JobsOverloaded
+                    | K::JobsRecovering
+                    | K::EvidenceSettingsDrift => ErrorKind::Conflict,
+                }
+            }
             _ => ErrorKind::Other,
         };
-        FfiError::new(kind, message)
+        FfiError::Engine {
+            kind,
+            detail: message,
+            code,
+            budget: None,
+            limit: None,
+            requested: None,
+        }
     }
 }
 

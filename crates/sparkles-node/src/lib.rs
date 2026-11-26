@@ -54,6 +54,38 @@ fn err(e: EngineError) -> napi::Error {
         EngineError::Component(c) if c.code == "invalid-manchester" => "InvalidInputError",
         // a strict classification that would leave axioms out
         EngineError::Component(c) if c.component == "classifier" => "UnsupportedError",
+        EngineError::Managed(m) => {
+            use sparkles::managed::ManagedErrorKind as K;
+            match m.kind {
+                K::UnsupportedProfile => "UnsupportedError",
+                K::Unavailable | K::HoldsUnavailable => "StorageError",
+                K::EvidenceUnavailable => "NotFoundError",
+                K::IncompleteEvidence
+                | K::UnanchoredEvidence
+                | K::SpanMismatch
+                | K::OriginNotReproduced => "InvalidInputError",
+                K::Protected
+                | K::HoldConflict
+                | K::HoldsLimit
+                | K::ImmutableRecordConflict
+                | K::HeadChanged
+                | K::IdempotencyConflict
+                | K::AuthorityChanged
+                | K::PolicyChanged
+                | K::TargetChanged
+                | K::DecisionSuperseded
+                | K::TargetWithdrawn
+                | K::EvidenceConflict
+                | K::ProjectionUnavailable
+                | K::IdentityConflict
+                | K::ConfigurationHistoryInactive
+                | K::LeaseLost
+                | K::PublicationConflict
+                | K::JobsOverloaded
+                | K::JobsRecovering
+                | K::EvidenceSettingsDrift => "ConflictError",
+            }
+        }
         _ => "StorageError",
     };
     let details = match &e {
@@ -76,6 +108,7 @@ fn err(e: EngineError) -> napi::Error {
             .map(|f| f.json())
             .unwrap_or_else(|| json!({})),
         EngineError::Component(c) if c.component == "classifier" => json!({ "code": c.code }),
+        EngineError::Managed(m) => json!({ "code": m.code }),
         EngineError::Io(io) => json!({
             "errno": io.raw_os_error(),
             "code": if io.kind() == std::io::ErrorKind::NotFound {"ENOENT"} else {"EIO"},

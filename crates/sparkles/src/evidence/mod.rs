@@ -89,6 +89,8 @@ pub fn profile(version: u32) -> Option<&'static Profile> {
     (version == V1.version).then_some(&V1)
 }
 
+#[doc(hidden)]
+pub mod binding;
 pub mod propose;
 pub mod resolve;
 pub mod review;
