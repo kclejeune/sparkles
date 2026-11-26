@@ -1376,52 +1376,49 @@ impl Circuit {
         self.inferred = InferredFootprint::default();
         self.budget.shrink_state_to(0);
         // Freeze the live evidence configuration and its managed generation once before
-        // deciding whether to mask so `evidence_key`, `managed_generation`, and the
-        // prepared mask all come from the exact same `ManagedVersion`. Unrestricted
-        // circuits and non-evidence states skip cloning the `Snapshot` so they add zero
-        // peak memory overhead.
+        // deciding whether to mask so `evidence_key`, `managed_generation`, and every
+        // downstream evaluation (including `Pass::ctx` expression masking and
+        // `Pass::evaluate` recomputes on the no-policy path) observe the exact same
+        // `ManagedVersion`. Unrestricted circuits skip pinning so they add zero overhead.
+        // Keep the original unpinned `snap` in `self.snap` for subsequent drift detection.
         let mut _prepared_mask: Option<crate::access::PreparedView> = None;
         let (ev_gen, ev_key, eval_snap) =
             match self.access.as_ref().filter(|a| !a.reads_everything()) {
                 Some(a) => {
-                    let (ev_gen, ev_key) = snap.evidence_visibility_stamp();
-                    if ev_key.is_some() {
-                        let frozen_snap = snap.pin_live_evidence();
-                        let ev_gen = frozen_snap.managed_generation();
-                        let ev_key = frozen_snap.evidence_visibility_key();
-                        let eval_snap = if frozen_snap.has_evidence_projection_or_unavailable() {
-                            self.budget.set_local_limit(self.max_memory_bytes);
-                            let local_limit = self
-                                .budget
-                                .handle()
-                                .remaining_local()
-                                .or(self.max_memory_bytes)
-                                .unwrap_or(u64::MAX);
-                            let (parent, grant) = self
-                                .budget
-                                .handle()
-                                .preparation_parent(self.pool.as_ref())?;
-                            let prep = crate::access::Preparation::with_parent(
-                                control.clone(),
-                                local_limit,
-                                parent,
-                                grant,
-                            )?;
-                            let prepared = a.masked_controlled(&frozen_snap, &prep)?;
-                            let masked = prepared.snapshot_arc();
-                            _prepared_mask = Some(prepared);
-                            masked
-                        } else {
-                            snap.clone()
-                        };
-                        drop(frozen_snap);
-                        (ev_gen, ev_key, eval_snap)
+                    let frozen_snap = snap.pin_live_evidence();
+                    let ev_gen = frozen_snap.managed_generation();
+                    let ev_key = frozen_snap.evidence_visibility_key();
+                    let eval_snap = if frozen_snap.has_evidence_projection_or_unavailable() {
+                        self.budget.set_local_limit(self.max_memory_bytes);
+                        let local_limit = self
+                            .budget
+                            .handle()
+                            .remaining_local()
+                            .or(self.max_memory_bytes)
+                            .unwrap_or(u64::MAX);
+                        let (parent, grant) = self
+                            .budget
+                            .handle()
+                            .preparation_parent(self.pool.as_ref())?;
+                        let prep = crate::access::Preparation::with_parent(
+                            control.clone(),
+                            local_limit,
+                            parent,
+                            grant,
+                        )?;
+                        let prepared = a.masked_controlled(&frozen_snap, &prep)?;
+                        let masked = prepared.snapshot_arc();
+                        _prepared_mask = Some(prepared);
+                        masked
                     } else {
-                        (ev_gen, None, snap.clone())
-                    }
+                        frozen_snap
+                    };
+                    (ev_gen, ev_key, eval_snap)
                 }
                 None => (0, None, snap.clone()),
             };
+        #[cfg(test)]
+        circuit_test_hook(CircuitTestPhase::AfterBuildSample);
         let vis = Vis::new(self.access.as_ref(), &eval_snap);
         let (mut p, root) = self.pass(eval_snap, None, &[], &[], &vis, control);
         let width = root.schema.len();
@@ -1805,7 +1802,14 @@ impl Circuit {
             }
         }
         let ev_restricted = self.access.as_ref().is_some_and(|a| !a.reads_everything());
-        let (new_gen, new_ev_key) = snap.evidence_visibility_stamp();
+        let (eval_snap, new_gen, new_ev_key) = if ev_restricted {
+            let frozen = snap.pin_live_evidence();
+            let new_gen = frozen.managed_generation();
+            let new_ev_key = frozen.evidence_visibility_key();
+            (frozen, new_gen, new_ev_key)
+        } else {
+            (snap.clone(), 0, None)
+        };
         let ev_active_or_changed = ev_restricted
             && (new_ev_key.is_some()
                 || self.evidence_key.is_some()
@@ -1818,7 +1822,9 @@ impl Circuit {
             let (diff, lease) = self.reset_charged(d, control)?;
             return Ok(ChargedAdvance::Reset(diff, lease));
         }
-        let vis = Vis::new(self.access.as_ref(), &snap);
+        #[cfg(test)]
+        circuit_test_hook(CircuitTestPhase::AfterAdvanceSample);
+        let vis = Vis::new(self.access.as_ref(), &eval_snap);
         // protections that depend on the data make the whole query one `recompute`
         // node, and a change anywhere, even in a graph the principal cannot read, can
         // change what they hide: every change runs the pass. Inference makes the whole
@@ -1830,7 +1836,7 @@ impl Circuit {
                     inf,
                     &self.pattern,
                     self.dataset.is_some(),
-                    &snap,
+                    &eval_snap,
                     &d.added,
                     &d.removed,
                     &vis,
@@ -1855,7 +1861,7 @@ impl Circuit {
             }
             let old = d.old()?;
             let (mut p, root) =
-                self.pass(snap.clone(), Some(old), &d.added, &d.removed, &vis, control);
+                self.pass(eval_snap, Some(old), &d.added, &d.removed, &vis, control);
             p.full = true;
             let res = Self::run_delta(root, &mut p);
             let stats = p.stats;
@@ -1871,12 +1877,12 @@ impl Circuit {
             (
                 d.added
                     .iter()
-                    .filter(|q| vis.visible(&snap, q))
+                    .filter(|q| vis.visible(&eval_snap, q))
                     .copied()
                     .collect(),
                 d.removed
                     .iter()
-                    .filter(|q| vis.visible(&snap, q))
+                    .filter(|q| vis.visible(&eval_snap, q))
                     .copied()
                     .collect(),
             )
@@ -1901,7 +1907,7 @@ impl Circuit {
             return Ok(ChargedAdvance::Skipped);
         }
         let old = d.old()?;
-        let (mut p, root) = self.pass(snap.clone(), Some(old), &added, &removed, &vis, control);
+        let (mut p, root) = self.pass(eval_snap, Some(old), &added, &removed, &vis, control);
         let res = Self::run_delta(root, &mut p);
         let stats = p.stats;
         drop(p);
@@ -2159,9 +2165,291 @@ impl Circuit {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CircuitTestPhase {
+    AfterBuildSample,
+    AfterAdvanceSample,
+}
+
+#[cfg(test)]
+type CircuitTestHookFn = Box<dyn FnMut(CircuitTestPhase) + 'static>;
+
+#[cfg(test)]
+thread_local! {
+    static CIRCUIT_TEST_HOOK: std::cell::RefCell<Option<CircuitTestHookFn>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn circuit_test_hook(phase: CircuitTestPhase) {
+    CIRCUIT_TEST_HOOK.with(|slot| {
+        if let Some(cb) = slot.borrow_mut().as_mut() {
+            cb(phase);
+        }
+    });
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::sparql::{QueryOptions, parse_query, update};
+
+    struct CircuitHookGuard;
+
+    impl Drop for CircuitHookGuard {
+        fn drop(&mut self) {
+            CIRCUIT_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+
+    fn set_circuit_test_hook(cb: impl FnMut(CircuitTestPhase) + 'static) -> CircuitHookGuard {
+        CIRCUIT_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(cb));
+        });
+        CircuitHookGuard
+    }
+
+    fn enable_evidence_policy_for_test(store: &Store, output_iri: &str) {
+        use crate::evidence::{ClaimKind, ConflictMode, Policy, Settings};
+        use crate::managed::{OwnerEntry, OwnerKind};
+
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".to_string()],
+            proposals: vec!["urn:ev:proposals".to_string()],
+            decisions: vec!["urn:ev:decisions".to_string()],
+            supports: vec!["urn:ev:supports".to_string()],
+            projections: vec![output_iri.to_string()],
+            policies: [(
+                "p".to_string(),
+                Policy {
+                    version: 1,
+                    admitted_kinds: vec![ClaimKind::Reported],
+                    required_scope: Vec::new(),
+                    conflicts: ConflictMode::AdmitLabelled,
+                    boundary: vec!["urn:ev:sources".to_string(), "urn:ev:proposals".to_string()],
+                    decisions: "urn:ev:decisions".to_string(),
+                    supports: "urn:ev:supports".to_string(),
+                    output: output_iri.to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&Control::none()).unwrap();
+        let bytes = canonical.bytes().to_vec();
+        store
+            .enable_managed(
+                OwnerKind::Evidence,
+                OwnerEntry::for_settings(1, settings.managed_graphs(), &bytes),
+                &bytes,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn no_policy_circuit_build_and_advance_pin_sampled_evidence_across_expression_and_recompute_evaluation()
+     {
+        use crate::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+        use crate::access::{GraphAccess, GraphRule, Graphs};
+        use crate::incr::compile::compile;
+
+        const PUBLIC: &str = "urn:public";
+        const OUTPUT: &str = "urn:ev:accepted";
+        let query = format!(
+            "SELECT ?k WHERE {{ \
+                GRAPH <{PUBLIC}> {{ ?k <urn:p> ?v }} \
+                FILTER EXISTS {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} }} \
+            }}"
+        );
+        let parsed = parse_query(&query, None, &[]).unwrap();
+
+        // 1. `Circuit::build` on the no-policy fast path: publishing an Evidence policy
+        //    between sampling and `Pass::ctx()` expression evaluation must NOT leak the
+        //    newly published policy into `Pass::ctx` (`GraphAccess::masked`), while
+        //    `circuit.snap` stays unpinned for drift detection.
+        {
+            let store = Arc::new(Store::in_memory(crate::store::StoreOptions::default()));
+            update::update(
+                &store,
+                &format!(
+                    "INSERT DATA {{ \
+                        GRAPH <{PUBLIC}> {{ <urn:k1> <urn:p> 1 }} \
+                        GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} \
+                    }}"
+                ),
+                &Default::default(),
+            )
+            .unwrap();
+            let access = Arc::new(GraphAccess::graphs(
+                Graphs::Only(GraphRule::new([PUBLIC, OUTPUT], &[])),
+                Graphs::none(),
+            ));
+            let compiled = compile(&parsed, None).unwrap();
+            let mut circuit = Circuit::new(compiled, Some(access));
+            let s = Arc::clone(&store);
+            let mut fired = false;
+            let _guard = set_circuit_test_hook(move |phase| {
+                if phase == CircuitTestPhase::AfterBuildSample && !fired {
+                    fired = true;
+                    enable_evidence_policy_for_test(&s, OUTPUT);
+                }
+            });
+            circuit.build(store.snapshot(), &Control::none()).unwrap();
+            assert_eq!(
+                circuit.result.total(),
+                1,
+                "build must evaluate FILTER EXISTS under its sampled no-policy state"
+            );
+            assert_eq!(circuit.evidence_key(), None);
+            assert_eq!(circuit.managed_generation(), 0);
+            let stored_snap = circuit.snap.as_ref().expect("stored snapshot");
+            assert!(
+                stored_snap.pinned_evidence.is_none(),
+                "stored circuit snapshot must remain unpinned for live drift detection"
+            );
+            let (live_gen, live_key) = stored_snap.evidence_visibility_stamp();
+            assert!(live_gen > 0 && live_key.is_some());
+        }
+
+        // 2. Incremental `Circuit::advance_charged` on the no-policy fast path: publishing
+        //    an Evidence policy between sampling and `Pass::ctx()` must keep the delta
+        //    pass pinned to the sampled no-policy state and leave `circuit.snap` unpinned.
+        {
+            let store = Arc::new(Store::in_memory(crate::store::StoreOptions::default()));
+            update::update(
+                &store,
+                &format!(
+                    "INSERT DATA {{ \
+                        GRAPH <{PUBLIC}> {{ <urn:k1> <urn:p> 1 }} \
+                        GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} \
+                    }}"
+                ),
+                &Default::default(),
+            )
+            .unwrap();
+            let access = Arc::new(GraphAccess::graphs(
+                Graphs::Only(GraphRule::new([PUBLIC, OUTPUT], &[])),
+                Graphs::none(),
+            ));
+            let compiled = compile(&parsed, None).unwrap();
+            let mut circuit = Circuit::new(compiled, Some(access));
+            circuit.build(store.snapshot(), &Control::none()).unwrap();
+            let prev_seq = store.head_commit().seq;
+            assert_eq!(circuit.result.total(), 1);
+
+            update::update(
+                &store,
+                &format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:k2> <urn:p> 2 }} }}"),
+                &Default::default(),
+            )
+            .unwrap();
+            let delta = DeltaSet::read(&store, prev_seq, &Control::none());
+            let s = Arc::clone(&store);
+            let mut fired = false;
+            let _guard = set_circuit_test_hook(move |phase| {
+                if phase == CircuitTestPhase::AfterAdvanceSample && !fired {
+                    fired = true;
+                    enable_evidence_policy_for_test(&s, OUTPUT);
+                }
+            });
+            match circuit.advance(&delta, &Control::none()).unwrap() {
+                Advance::Changed(rows) => assert_eq!(rows.len(), 1),
+                Advance::Skipped => {
+                    panic!("incremental advance must emit Changed, got Skipped")
+                }
+                Advance::Reset(_) => {
+                    panic!("incremental advance must retain sampled no-policy state, got Reset")
+                }
+            }
+            assert_eq!(circuit.result.total(), 2);
+            let stored_snap = circuit.snap.as_ref().expect("stored snapshot");
+            assert!(stored_snap.pinned_evidence.is_none());
+            let (live_gen, live_key) = stored_snap.evidence_visibility_stamp();
+            assert!(live_gen > 0 && live_key.is_some());
+        }
+
+        // 3. Whole-query `Circuit::advance_charged` (`whole == true` via data-dependent
+        //    triple protection): publishing an Evidence policy between sampling and
+        //    `Pass::evaluate()` recompute must retain the sampled no-policy state while
+        //    leaving `circuit.snap` unpinned for drift detection.
+        {
+            let store = Arc::new(Store::in_memory(crate::store::StoreOptions::default()));
+            update::update(
+                &store,
+                &format!(
+                    "INSERT DATA {{ \
+                        GRAPH <{PUBLIC}> {{ <urn:k1> <urn:p> 1 }} \
+                        GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} \
+                    }}"
+                ),
+                &Default::default(),
+            )
+            .unwrap();
+            let access = Arc::new(GraphAccess::with_triples(
+                Graphs::Only(GraphRule::new([PUBLIC, OUTPUT], &[])),
+                Graphs::none(),
+                TripleRules {
+                    rules: vec![Rule {
+                        protection: Arc::new(Protection {
+                            name: "hide-other".into(),
+                            predicates: Some(vec!["urn:other".into()]),
+                            classes: None,
+                            subclasses: false,
+                            graphs: Some(Graphs::Only(GraphRule::new([PUBLIC], &[]))),
+                            pattern: Some("?s <urn:neverMatches> ?o".into()),
+                            prefixes: Default::default(),
+                            hide_inferences: false,
+                        }),
+                        read: Graphs::none(),
+                        write: Graphs::none(),
+                    }],
+                    caller: Caller::default(),
+                    limits: Limits::default(),
+                },
+            ));
+            let whole = super::super::runtime::whole_reason(Some(&access));
+            assert!(whole.is_some());
+            let compiled = compile(&parsed, whole).unwrap();
+            let mut circuit = Circuit::new(compiled, Some(access));
+            circuit.build(store.snapshot(), &Control::none()).unwrap();
+            let prev_seq = store.head_commit().seq;
+            assert_eq!(circuit.result.total(), 1);
+
+            update::update(
+                &store,
+                &format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:k2> <urn:p> 2 }} }}"),
+                &Default::default(),
+            )
+            .unwrap();
+            let delta = DeltaSet::read(&store, prev_seq, &Control::none());
+            let s = Arc::clone(&store);
+            let mut fired = false;
+            let _guard = set_circuit_test_hook(move |phase| {
+                if phase == CircuitTestPhase::AfterAdvanceSample && !fired {
+                    fired = true;
+                    enable_evidence_policy_for_test(&s, OUTPUT);
+                }
+            });
+            match circuit.advance(&delta, &Control::none()).unwrap() {
+                Advance::Changed(rows) => assert_eq!(rows.len(), 1),
+                Advance::Skipped => {
+                    panic!("whole-query advance must emit Changed, got Skipped")
+                }
+                Advance::Reset(_) => {
+                    panic!("whole-query advance must retain sampled no-policy state, got Reset")
+                }
+            }
+            assert_eq!(circuit.result.total(), 2);
+            let stored_snap = circuit.snap.as_ref().expect("stored snapshot");
+            assert!(stored_snap.pinned_evidence.is_none());
+            let (live_gen, live_key) = stored_snap.evidence_visibility_stamp();
+            assert!(live_gen > 0 && live_key.is_some());
+        }
+    }
 
     #[test]
     fn root_absorbs_long_property_path_witness_without_an_effective_copy() {

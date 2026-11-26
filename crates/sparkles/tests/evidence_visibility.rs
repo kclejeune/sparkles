@@ -1436,7 +1436,8 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
     //    distinct timestamps, clear the policy before `feature_active`'s child commit so the
     //    child commit exposes `cve-1` while the fork commit hides it, and assert the resolved
     //    commit sequence on every `At::Time` call.
-    let clock_ms = Arc::new(std::sync::atomic::AtomicI64::new(1_700_000_010_000));
+    let prev_feature_ts = feature.head_commit().timestamp_ms;
+    let clock_ms = Arc::new(std::sync::atomic::AtomicI64::new(prev_feature_ts + 10_000));
     let clk = clock_ms.clone();
     feature.set_clock(Arc::new(move || {
         clk.load(std::sync::atomic::Ordering::Acquire)
@@ -1451,6 +1452,10 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
     let fork_cleared_commit = feature.head_commit();
     let fork_cleared_seq = fork_cleared_commit.seq;
     let fork_cleared_ts = fork_cleared_commit.timestamp_ms;
+    assert!(
+        fork_cleared_ts > prev_feature_ts,
+        "first controlled commit timestamp must strictly exceed inherited head timestamp"
+    );
 
     // Re-enable the review policy at the SAME commit `fork_cleared_seq` and bind a named pin
     // on `feature` carrying the active policy configuration.
@@ -3036,28 +3041,14 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
         "StoredFact with ev:skolemMap must be rejected"
     );
 
-    // 2. Combined memory cap on snapshot_at_limited: pick a cap that independently admits BOTH
-    //    the historical configuration pin alone (measured on the live commit with only 4 KiB
-    //    snapshot charge) AND the identical historical data charge alone (measured on an
-    //    unactivated control store with the exact same historical commits), yet fails when
-    //    their combined charge exceeds the cap.
-    let mut bulk = String::from("INSERT DATA { GRAPH <");
-    bulk.push_str(PUBLIC);
-    bulk.push_str("> { ");
-    for i in 0..250 {
-        bulk.push_str(&format!("<urn:hist:s{i}> <urn:hist:p> <urn:hist:o{i}> . "));
-    }
-    bulk.push_str("} }");
-    ds.update(&bulk).unwrap();
-    let hist_seq = ds.store().head_commit().seq;
-    // Advance head so `hist_seq` is a non-live historical commit with a non-trivial delta.
-    let follow_up =
-        format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:hist:after> <urn:hist:p> 1 }} }}");
-    ds.update(&follow_up).unwrap();
-    let head_seq = ds.store().head_commit().seq;
-
-    // Identical unactivated control dataset carrying the same historical data without
-    // configuration-history pinning.
+    // 2. Combined memory cap on snapshot_at_limited: use two dedicated fresh stores with
+    //    identical RDF deltas so the unactivated control carries the exact same historical
+    //    data charge as the activated store, then pick a cap that independently admits BOTH
+    //    the historical configuration pin alone (measured on the activated live commit with
+    //    only 4 KiB snapshot charge) AND the identical historical data charge alone
+    //    (measured on the unactivated control store), yet fails when their combined charge
+    //    exceeds the cap.
+    let ds_act = configured(true);
     let ds_ctrl = Dataset::memory();
     ds_ctrl
         .store()
@@ -3066,11 +3057,49 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
             ..Default::default()
         })
         .unwrap();
+    assert_eq!(ds_act.store().snapshot().delta.inserts(), 0);
+    assert_eq!(ds_act.store().snapshot().delta.deletes(), 0);
+    assert_eq!(ds_ctrl.store().snapshot().delta.inserts(), 0);
+    assert_eq!(ds_ctrl.store().snapshot().delta.deletes(), 0);
+
+    let mut bulk = String::from("INSERT DATA { GRAPH <");
+    bulk.push_str(PUBLIC);
+    bulk.push_str("> { ");
+    for i in 0..250 {
+        bulk.push_str(&format!("<urn:hist:s{i}> <urn:hist:p> <urn:hist:o{i}> . "));
+    }
+    bulk.push_str("} }");
+    let follow_up =
+        format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:hist:after> <urn:hist:p> 1 }} }}");
+
+    ds_act.update(&bulk).unwrap();
+    let hist_seq = ds_act.store().head_commit().seq;
+    // Advance head so `hist_seq` is a non-live historical commit with a non-trivial delta.
+    ds_act.update(&follow_up).unwrap();
+    let head_seq = ds_act.store().head_commit().seq;
+
     ds_ctrl.update(&bulk).unwrap();
     let ctrl_hist_seq = ds_ctrl.store().head_commit().seq;
     ds_ctrl.update(&follow_up).unwrap();
 
     let ho = HistoryOptions::default();
+    let (act_hist_snap, _) = ds_act
+        .store()
+        .snapshot_at(&At::Commit(hist_seq), &ho)
+        .unwrap();
+    let (ctrl_hist_snap, _) = ds_ctrl
+        .store()
+        .snapshot_at(&At::Commit(ctrl_hist_seq), &ho)
+        .unwrap();
+    assert_eq!(
+        (act_hist_snap.delta.inserts(), act_hist_snap.delta.deletes()),
+        (
+            ctrl_hist_snap.delta.inserts(),
+            ctrl_hist_snap.delta.deletes()
+        ),
+        "activated and control stores must carry identical RDF deltas at the tested historical commit"
+    );
+
     let min_cap = |store: &sparkles::store::Store, seq: u64| -> u64 {
         let mut lo = 0u64;
         let mut hi = 4 << 20;
@@ -3087,7 +3116,7 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
         }
         hi
     };
-    let live_plus_pin_min = min_cap(ds.store(), head_seq);
+    let live_plus_pin_min = min_cap(ds_act.store(), head_seq);
     let hist_data_only_min = min_cap(ds_ctrl.store(), ctrl_hist_seq);
     assert!(
         hist_data_only_min > 4096,
@@ -3097,7 +3126,8 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
     // their combined peak (`hist_data_only_min` + pin peak).
     let combined_cap = live_plus_pin_min.max(hist_data_only_min) + 2048;
     assert!(
-        ds.store()
+        ds_act
+            .store()
             .snapshot_at_limited(&At::Commit(head_seq), &ho, combined_cap)
             .is_ok(),
         "configuration pinning alone must succeed at {combined_cap} (min {live_plus_pin_min})"
@@ -3109,7 +3139,7 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
             .is_ok(),
         "identical historical data alone must succeed at {combined_cap} (min {hist_data_only_min})"
     );
-    let cap_err = ds
+    let cap_err = ds_act
         .store()
         .snapshot_at_limited(&At::Commit(hist_seq), &ho, combined_cap)
         .err();
@@ -3118,7 +3148,8 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
         "cap {combined_cap} (admitting pin alone at {live_plus_pin_min} and data alone at {hist_data_only_min}) must fail combined delta + pin on hist_seq, got {cap_err:?}"
     );
     assert!(
-        ds.store()
+        ds_act
+            .store()
             .snapshot_at_limited(&At::Commit(hist_seq), &ho, 16 << 20)
             .is_ok(),
         "generous cap must admit combined historical delta + pin"
