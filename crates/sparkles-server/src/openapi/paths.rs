@@ -1457,7 +1457,7 @@ fn ontology(p: &mut Paths) {
     });
     p.add(
         read(op(POST, "/$/ontology/{ds}/patterns/preview", "previewOntologyPatterns", "Ontology", "Preview axioms generated from a table"))
-            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the ontology's entity tag and commit headers for `If-Match` on apply.")
+            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the pattern preview entity tag (encoding the head commit, import-target digest, and dataset prefix binding digest) and commit headers for `If-Match` on apply.")
             .see("ontology")
             .param("at")
             .param("timeout")
@@ -1523,7 +1523,7 @@ fn ontology(p: &mut Paths) {
     );
     p.add(
         write_params(op(POST, "/$/ontology/{ds}/patterns/apply", "applyOntologyPatterns", "Ontology", "Generate and commit axioms from a table"))
-            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: \"abort\"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: \"skip\"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.")
+            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target and dataset prefix binding digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: \"abort\"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: \"skip\"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.")
             .see("ontology")
             .param("ifMatch")
             .body(
@@ -1558,11 +1558,23 @@ fn ontology(p: &mut Paths) {
                 })),
                 apply_headers,
             )
-            .errors(&[400, 403, 404, 408, 412, 413, 507])
+            .errors(&[400, 403, 404, 408, 413])
+            .resp_h(
+                "412",
+                "Precondition failed (`If-Match` did not match the current head, import-target digest, or dataset prefix binding digest), or a dry-run precondition failure report.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [sref("DryRunReport"), sref("Error")] } } })),
+                dry_run_headers.clone(),
+            )
             .resp_h(
                 "422",
                 "Pattern evaluation errors (`pattern-errors`), write validation refusal, or a dry-run validation rejection report.",
                 Some(json!({ "application/json": { "schema": { "anyOf": [pattern_errors, sref("DryRunReport"), sref("Error")] } } })),
+                dry_run_headers.clone(),
+            )
+            .resp_h(
+                "507",
+                "Projected RDF triple or payload budget refusal (`triple-limit`), storage limit refusal, or a dry-run storage refusal report.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [sref("DryRunReport"), sref("Error")] } } })),
                 dry_run_headers,
             ),
     );

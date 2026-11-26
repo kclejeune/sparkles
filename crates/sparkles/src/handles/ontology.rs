@@ -1941,7 +1941,7 @@ fn snapshot_assertion_quads(
     txn: Option<&crate::store::WriteTxn<'_>>,
 ) -> Result<Option<Vec<[Id; 4]>>> {
     use sparkles_owl::AxiomKind as K;
-    if !ax.annotations.is_empty() {
+    if !ax.annotations.is_empty() || write::axiom_triple_count(ax) != 1 {
         return Ok(None);
     }
     let mut fresh = || oxrdf::BlankNode::new_unchecked(format!("{FRESH}x"));

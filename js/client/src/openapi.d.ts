@@ -2632,7 +2632,7 @@ export interface paths {
         put?: never;
         /**
          * Generate and commit axioms from a table
-         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: "abort"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: "skip"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.
+         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target and dataset prefix binding digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: "abort"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: "skip"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.
          */
         post: operations["applyOntologyPatterns"];
         delete?: never;
@@ -2652,7 +2652,7 @@ export interface paths {
         put?: never;
         /**
          * Preview axioms generated from a table
-         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the ontology's entity tag and commit headers for `If-Match` on apply.
+         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the pattern preview entity tag (encoding the head commit, import-target digest, and dataset prefix binding digest) and commit headers for `If-Match` on apply.
          */
         post: operations["previewOntologyPatterns"];
         delete?: never;
@@ -21488,7 +21488,19 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
-            412: components["responses"]["PreconditionFailed"];
+            /** @description Precondition failed (`If-Match` did not match the current head, import-target digest, or dataset prefix binding digest), or a dry-run precondition failure report. */
+            412: {
+                headers: {
+                    /** @description Present and `true` on dry-run responses. */
+                    "Sparkles-Dry-Run"?: boolean;
+                    /** @description The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses. */
+                    "Sparkles-Dry-Run-Outcome"?: "commit" | "no-change" | "precondition-failed" | "rejected" | "storage-refused";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DryRunReport"] | components["schemas"]["Error"];
+                };
+            };
             413: components["responses"]["PayloadTooLarge"];
             /** @description Pattern evaluation errors (`pattern-errors`), write validation refusal, or a dry-run validation rejection report. */
             422: {
@@ -21520,7 +21532,19 @@ export interface operations {
                     } | components["schemas"]["DryRunReport"] | components["schemas"]["Error"];
                 };
             };
-            507: components["responses"]["InsufficientStorage"];
+            /** @description Projected RDF triple or payload budget refusal (`triple-limit`), storage limit refusal, or a dry-run storage refusal report. */
+            507: {
+                headers: {
+                    /** @description Present and `true` on dry-run responses. */
+                    "Sparkles-Dry-Run"?: boolean;
+                    /** @description The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses. */
+                    "Sparkles-Dry-Run-Outcome"?: "commit" | "no-change" | "precondition-failed" | "rejected" | "storage-refused";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DryRunReport"] | components["schemas"]["Error"];
+                };
+            };
             default: components["responses"]["Error"];
         };
     };

@@ -142,9 +142,12 @@ fn plan_pattern_write(
     limits: &Limits,
     cancel_fn: &mut dyn FnMut() -> Result<(), CancelReason>,
 ) -> std::result::Result<PlannedPatternWrite, PlanError> {
+    let max_projected_bytes = limits.max_total_expanded_bytes.saturating_mul(2);
     let mut new_indices: Vec<usize> = Vec::new();
     let mut existing_count = 0usize;
     let mut statuses: Vec<&'static str> = Vec::with_capacity(result.axioms.len());
+    let mut estimated_triples = 0usize;
+    let mut estimated_bytes = 0usize;
     for (i, item) in result.axioms.iter().enumerate() {
         if i.is_multiple_of(64) {
             cancel_fn().map_err(PlanError::Cancel)?;
@@ -156,6 +159,20 @@ fn plan_pattern_write(
             existing_count += 1;
             statuses.push("existing");
         } else {
+            let (triples, bytes) = owl_write::axiom_projection_cost(&item.axiom);
+            estimated_triples = estimated_triples.saturating_add(triples);
+            estimated_bytes = estimated_bytes.saturating_add(bytes);
+            if estimated_triples > limits.max_triples {
+                return Err(PlanError::TripleLimit(format!(
+                    "projected RDF triples exceeded the limit of {}",
+                    limits.max_triples
+                )));
+            }
+            if estimated_bytes > max_projected_bytes {
+                return Err(PlanError::TripleLimit(format!(
+                    "projected RDF payload exceeded the {max_projected_bytes} byte limit"
+                )));
+            }
             new_indices.push(i);
             statuses.push("new");
         }
@@ -199,28 +216,6 @@ fn plan_pattern_write(
         Vec::new()
     };
 
-    let max_projected_bytes = limits.max_total_expanded_bytes.saturating_mul(2);
-    let mut estimated_triples = 0usize;
-    let mut estimated_bytes = 0usize;
-    for (i, &idx) in new_indices.iter().enumerate() {
-        if i.is_multiple_of(64) {
-            cancel_fn().map_err(PlanError::Cancel)?;
-        }
-        let (triples, bytes) = owl_write::axiom_projection_cost(&result.axioms[idx].axiom);
-        estimated_triples = estimated_triples.saturating_add(triples);
-        estimated_bytes = estimated_bytes.saturating_add(bytes);
-        if estimated_triples > limits.max_triples {
-            return Err(PlanError::TripleLimit(format!(
-                "projected RDF triples exceeded the limit of {}",
-                limits.max_triples
-            )));
-        }
-        if estimated_bytes > max_projected_bytes {
-            return Err(PlanError::TripleLimit(format!(
-                "projected RDF payload exceeded the {max_projected_bytes} byte limit"
-            )));
-        }
-    }
     for (i, e) in auto_declarations.iter().enumerate() {
         if i.is_multiple_of(64) {
             cancel_fn().map_err(PlanError::Cancel)?;
@@ -786,36 +781,105 @@ fn eval_error(e: EvalError) -> ApiError {
     }
 }
 
-fn diagnostics_json(res: &PatternResult) -> Vec<J> {
-    res.diagnostics
-        .iter()
-        .map(|d| {
-            json!({
-                "row": d.row,
-                "column": d.column,
-                "severity": d.severity.as_str(),
-                "code": d.code,
-                "message": d.message,
-            })
-        })
-        .collect()
+fn headers_bounded(headers: &[String], used: &mut usize, max_bytes: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for h in headers {
+        if *used >= max_bytes {
+            break;
+        }
+        let entry_bytes = serde_json::to_string(h)
+            .map_or(usize::MAX, |s| s.len())
+            .saturating_add(1);
+        if used.saturating_add(entry_bytes) > max_bytes {
+            break;
+        }
+        *used = used.saturating_add(entry_bytes);
+        out.push(h.clone());
+    }
+    out
 }
 
-fn pattern_summary_json(res: &PatternResult) -> J {
-    json!({
+fn diagnostics_json_bounded(
+    res: &PatternResult,
+    used: &mut usize,
+    max_bytes: usize,
+) -> (Vec<J>, bool) {
+    let mut out = Vec::new();
+    let mut truncated = res.diagnostics_truncated;
+    for d in &res.diagnostics {
+        if *used >= max_bytes {
+            truncated = true;
+            break;
+        }
+        let entry = json!({
+            "row": d.row,
+            "column": d.column,
+            "severity": d.severity.as_str(),
+            "code": d.code,
+            "message": d.message,
+        });
+        let entry_bytes = serde_json::to_string(&entry)
+            .map_or(usize::MAX, |s| s.len())
+            .saturating_add(1);
+        if used.saturating_add(entry_bytes) > max_bytes {
+            truncated = true;
+            break;
+        }
+        *used = used.saturating_add(entry_bytes);
+        out.push(entry);
+    }
+    (out, truncated)
+}
+
+fn pattern_summary_json_bounded(res: &PatternResult, max_bytes: usize) -> J {
+    let shell = json!({
         "delimiter": res.delimiter.as_str(),
-        "headers": res.headers,
+        "headers": [],
         "rowsProcessed": res.rows_processed,
         "rowsSkipped": res.rows_skipped,
         "rowsWithErrors": res.rows_with_errors,
         "generated": res.axioms.len(),
         "valid": res.is_valid(),
-        "diagnostics": diagnostics_json(res),
-        "diagnosticsTruncated": res.diagnostics_truncated,
+        "diagnostics": [],
+        "diagnosticsTruncated": false,
+    });
+    let mut used = serde_json::to_string(&shell).map_or(256, |s| s.len());
+    let headers = headers_bounded(&res.headers, &mut used, max_bytes);
+    let (diagnostics, diagnostics_truncated) = diagnostics_json_bounded(res, &mut used, max_bytes);
+    json!({
+        "delimiter": res.delimiter.as_str(),
+        "headers": headers,
+        "rowsProcessed": res.rows_processed,
+        "rowsSkipped": res.rows_skipped,
+        "rowsWithErrors": res.rows_with_errors,
+        "generated": res.axioms.len(),
+        "valid": res.is_valid(),
+        "diagnostics": diagnostics,
+        "diagnosticsTruncated": diagnostics_truncated,
     })
 }
 
-fn pattern_errors_response(result: &PatternResult) -> Response {
+/// Exact upper bound on the extra serialized JSON bytes that `write_response` appends when
+/// receipt negotiation (`receipt=true` or `Accept: application/x-sparkles+json`) is active.
+fn receipt_extra_bytes(
+    ds: &Dataset,
+    receipt: &sparkles::commit::Receipt,
+    restricted: bool,
+) -> usize {
+    let Ok(J::Object(mut rm)) = serde_json::to_value(receipt) else {
+        return 0;
+    };
+    if restricted {
+        rm.remove("validation");
+        if let Some(c) = rm.get_mut("commit") {
+            redact_commit_json(c);
+        }
+    }
+    rm.insert("dataset".into(), ds.name.clone().into());
+    serde_json::to_string(&rm).map_or(0, |s| s.len())
+}
+
+fn pattern_errors_response(result: &PatternResult, max_response_bytes: usize) -> Response {
     let message = if result.budget_exceeded {
         format!(
             "pattern evaluation exceeded a request budget ({} error(s)); no changes were committed",
@@ -833,14 +897,26 @@ fn pattern_errors_response(result: &PatternResult) -> Response {
             result.rows_with_errors,
         )
     };
+    let shell = json!({
+        "error": message,
+        "code": "pattern-errors",
+        "rowsProcessed": result.rows_processed,
+        "rowsSkipped": result.rows_skipped,
+        "rowsWithErrors": result.rows_with_errors,
+        "diagnostics": [],
+        "diagnosticsTruncated": false,
+    });
+    let mut used = serde_json::to_string(&shell).map_or(256, |s| s.len());
+    let (diagnostics, diagnostics_truncated) =
+        diagnostics_json_bounded(result, &mut used, max_response_bytes);
     let err_body = json!({
         "error": message,
         "code": "pattern-errors",
         "rowsProcessed": result.rows_processed,
         "rowsSkipped": result.rows_skipped,
         "rowsWithErrors": result.rows_with_errors,
-        "diagnostics": diagnostics_json(result),
-        "diagnosticsTruncated": result.diagnostics_truncated,
+        "diagnostics": diagnostics,
+        "diagnosticsTruncated": diagnostics_truncated,
     });
     (StatusCode::UNPROCESSABLE_ENTITY, Json(err_body)).into_response()
 }
@@ -934,18 +1010,46 @@ pub(crate) async fn preview(
         }
         let manch_r = manchester::Renderer::of_vocabulary(&render_vocab);
 
-        // Account for fixed envelope, headers, diagnostics, and auto-declarations BEFORE
-        // rendering axioms, using actual JSON-serialized byte lengths so escaping is never
-        // undercounted and even the first axiom respects `max_response_bytes`.
-        let diagnostics_val = diagnostics_json(&result);
-        let headers_bytes = serde_json::to_string(&result.headers).map_or(0, |s| s.len());
-        let diagnostics_bytes = serde_json::to_string(&diagnostics_val).map_or(0, |s| s.len());
-        let mut rendered_bytes = 512usize
-            .saturating_add(headers_bytes)
-            .saturating_add(diagnostics_bytes);
+        let target_graph = parsed
+            .target
+            .as_ref()
+            .or_else(|| opened.graphs.first())
+            .map_or("default", GraphRef::as_str);
+        let graph_strs: Vec<&str> = opened.graphs.iter().map(GraphRef::as_str).collect();
+
+        // Measure the exact serialized empty-array scalar envelope BEFORE filling headers,
+        // diagnostics, auto-declarations, or axioms, and use size-limited renderers so
+        // oversized entries (e.g. long ontology labels in Manchester syntax) never allocate
+        // past the remaining response allowance.
+        let shell = json!({
+            "dataset": ds.name,
+            "commit": opened.snapshot.commit,
+            "graphs": graph_strs,
+            "target": target_graph,
+            "delimiter": result.delimiter.as_str(),
+            "headers": [],
+            "valid": result.is_valid(),
+            "rowsProcessed": result.rows_processed,
+            "rowsSkipped": result.rows_skipped,
+            "rowsWithErrors": result.rows_with_errors,
+            "generated": result.axioms.len(),
+            "newAxioms": planned.new_indices.len(),
+            "existingAxioms": planned.existing_count,
+            "autoDeclarations": [],
+            "estimatedTriples": planned.estimated_triples,
+            "axioms": [],
+            "axiomsTruncated": false,
+            "diagnostics": [],
+            "diagnosticsTruncated": false,
+        });
+        let mut rendered_bytes = serde_json::to_string(&shell).map_or(512, |s| s.len());
+
+        let headers_val = headers_bounded(&result.headers, &mut rendered_bytes, max_response_bytes);
+        let (diagnostics_val, diagnostics_truncated) =
+            diagnostics_json_bounded(&result, &mut rendered_bytes, max_response_bytes);
 
         let mut truncated = result.axioms.len() > parsed.limit;
-        let mut auto_decl_json: Vec<J> = Vec::with_capacity(planned.auto_declarations.len());
+        let mut auto_decl_json: Vec<J> = Vec::new();
         for (i, e) in planned.auto_declarations.iter().enumerate() {
             if i.is_multiple_of(64) {
                 cancel_fn().map_err(|r| eval_error(r.into()))?;
@@ -969,7 +1073,7 @@ pub(crate) async fn preview(
             auto_decl_json.push(entry);
         }
 
-        let mut axioms_json: Vec<J> = Vec::with_capacity(result.axioms.len().min(parsed.limit));
+        let mut axioms_json: Vec<J> = Vec::new();
         for (i, (item, status)) in result
             .axioms
             .iter()
@@ -980,12 +1084,20 @@ pub(crate) async fn preview(
             if i.is_multiple_of(64) {
                 cancel_fn().map_err(|r| eval_error(r.into()))?;
             }
-            if rendered_bytes >= max_response_bytes {
+            let rem = max_response_bytes.saturating_sub(rendered_bytes.saturating_add(1));
+            if rem == 0 || !sparkles::owl::json::axiom_fits_bytes(&item.axiom, rem) {
                 truncated = true;
                 break;
             }
-            let ofn = ofn_r.axiom(&item.axiom);
-            let manchester = manch_r.axiom(&item.axiom);
+            let Some(ofn) = ofn_r.axiom_bounded(&item.axiom, rem) else {
+                truncated = true;
+                break;
+            };
+            let manch_rem = rem.saturating_sub(ofn.len());
+            let Ok(manchester) = manch_r.axiom_bounded(&item.axiom, manch_rem) else {
+                truncated = true;
+                break;
+            };
             let ax_json = sparkles::owl::json::axiom(&item.axiom);
             let entry = json!({
                 "type": item.axiom.axiom_type().name(),
@@ -1006,19 +1118,13 @@ pub(crate) async fn preview(
             axioms_json.push(entry);
         }
 
-        let target_graph = parsed
-            .target
-            .as_ref()
-            .or_else(|| opened.graphs.first())
-            .map_or("default", GraphRef::as_str);
-
         let body = json!({
             "dataset": ds.name,
             "commit": opened.snapshot.commit,
-            "graphs": opened.graphs.iter().map(GraphRef::as_str).collect::<Vec<_>>(),
+            "graphs": graph_strs,
             "target": target_graph,
             "delimiter": result.delimiter.as_str(),
-            "headers": result.headers,
+            "headers": headers_val,
             "valid": result.is_valid(),
             "rowsProcessed": result.rows_processed,
             "rowsSkipped": result.rows_skipped,
@@ -1031,7 +1137,7 @@ pub(crate) async fn preview(
             "axioms": axioms_json,
             "axiomsTruncated": truncated,
             "diagnostics": diagnostics_val,
-            "diagnosticsTruncated": result.diagnostics_truncated,
+            "diagnosticsTruncated": diagnostics_truncated,
         });
 
         let seq = opened.snapshot.commit;
@@ -1223,7 +1329,7 @@ pub(crate) async fn apply(
         let (e, (result, used_prefixes)) = match (res, dry) {
             (Ok(pair), _) => pair,
             (Err(EditFromHeadError::Build(ApplyBuildError::PatternErrors(result))), _) => {
-                return Ok(pattern_errors_response(&result));
+                return Ok(pattern_errors_response(&result, max_response_bytes));
             }
             (Err(EditFromHeadError::Build(ApplyBuildError::TripleLimit(msg))), _) => {
                 return Err(err_code(
@@ -1249,11 +1355,26 @@ pub(crate) async fn apply(
             }
         };
 
-        let pattern_json = pattern_summary_json(&result);
-        let pattern_bytes = serde_json::to_string(&pattern_json).map_or(0, |s| s.len());
-        let remaining_bytes = max_response_bytes.saturating_sub(pattern_bytes);
+        let receipt_bytes = if wanted {
+            receipt_extra_bytes(&ds, &e.receipt, restricted)
+        } else {
+            0
+        };
+        let edit_shell_bytes = sparkles::handles::ontology::wire::edit_body_shell_bytes(&e);
+        // Reserve space for the edit shell, negotiated receipt fields, and `,"pattern":` key.
+        let pattern_budget = max_response_bytes.saturating_sub(
+            edit_shell_bytes
+                .saturating_add(receipt_bytes)
+                .saturating_add(11),
+        );
+        let pattern_json = pattern_summary_json_bounded(&result, pattern_budget);
+        let pattern_bytes = serde_json::to_string(&pattern_json)
+            .map_or(0, |s| s.len())
+            .saturating_add(11);
+        let remaining_for_edit =
+            max_response_bytes.saturating_sub(receipt_bytes.saturating_add(pattern_bytes));
         let render = Renderer::new(used_prefixes.iter().map(|(p, n)| (p.as_str(), n.as_str())));
-        let mut body = edit_body_bounded(&e, &render, remaining_bytes);
+        let mut body = edit_body_bounded(&e, &render, remaining_for_edit);
         if let Some(map) = body.as_object_mut() {
             map.insert("pattern".to_string(), pattern_json);
         }

@@ -261,6 +261,29 @@ pub fn axiom_json(ax: &Axiom, graph: Option<&str>, r: &Renderer) -> J {
     j
 }
 
+/// Like [`axiom_json`], returning `None` before materializing OFN or JSON trees if the
+/// rendered axiom cannot fit within `max_bytes`.
+pub fn axiom_json_bounded(
+    ax: &Axiom,
+    graph: Option<&str>,
+    r: &Renderer,
+    max_bytes: usize,
+) -> Option<J> {
+    if !sparkles_owl::json::axiom_fits_bytes(ax, max_bytes) {
+        return None;
+    }
+    let ofn = r.axiom_bounded(ax, max_bytes)?;
+    let mut j = json!({
+        "type": ax.axiom_type().name(),
+        "ofn": ofn,
+        "axiom": sparkles_owl::json::axiom(ax),
+    });
+    if let Some(g) = graph {
+        j["graph"] = g.into();
+    }
+    Some(j)
+}
+
 /// The JSON of a page of axioms.
 pub fn page_body(name: &str, o: &Opened, req: &OntologyRequest, r: &Renderer, page: &Page) -> J {
     let next = page.offset + page.items.len();
@@ -316,22 +339,46 @@ pub fn edit_body(e: &EditOutcome, r: &Renderer) -> J {
     edit_body_bounded(e, r, usize::MAX)
 }
 
-/// Like [`edit_body`], additionally capping the serialized JSON byte footprint of
-/// `absent`, `declared`, `addedAxioms`, and `removedAxioms` at `max_bytes` (including the
-/// first rendered entry) and marking `axiomsTruncated` when any entry is omitted.
+/// Serialized byte length of the empty-array scalar envelope of [`edit_body_bounded`].
+pub fn edit_body_shell_bytes(e: &EditOutcome) -> usize {
+    let shell = json!({
+        "added": e.added,
+        "present": e.present,
+        "removed": e.removed,
+        "absent": [],
+        "declared": [],
+        "addedAxioms": [],
+        "removedAxioms": [],
+        "axiomsTruncated": false,
+        "inserted": e.inserted,
+        "deleted": e.deleted,
+        "kept": e.kept,
+        "committed": e.receipt.committed,
+    });
+    serde_json::to_string(&shell).map_or(256, |s| s.len())
+}
+
+/// Like [`edit_body`], additionally capping the serialized JSON byte footprint of the
+/// entire body (shell plus `absent`, `declared`, `addedAxioms`, and `removedAxioms`) at
+/// `max_bytes` (including the first rendered entry), stopping before rendering oversized
+/// entries and marking `axiomsTruncated` when any entry is omitted.
 pub fn edit_body_bounded(e: &EditOutcome, r: &Renderer, max_bytes: usize) -> J {
-    let mut used = 256usize;
+    let mut used = edit_body_shell_bytes(e);
     let mut truncated = e.added_axioms.len() > MAX_LIMIT || e.removed_axioms.len() > MAX_LIMIT;
 
     let mut absent = Vec::new();
     for a in &e.absent {
-        if used >= max_bytes {
+        let rem = max_bytes.saturating_sub(used.saturating_add(3));
+        if rem == 0 {
             truncated = true;
             break;
         }
-        let s = r.axiom(a);
+        let Some(s) = r.axiom_bounded(a, rem) else {
+            truncated = true;
+            break;
+        };
         let entry_bytes = serde_json::to_string(&s)
-            .map_or(s.len().saturating_add(2), |j| j.len())
+            .map_or(usize::MAX, |j| j.len())
             .saturating_add(1);
         if used.saturating_add(entry_bytes) > max_bytes {
             truncated = true;
@@ -343,13 +390,17 @@ pub fn edit_body_bounded(e: &EditOutcome, r: &Renderer, max_bytes: usize) -> J {
 
     let mut declared = Vec::new();
     for d in &e.declared {
-        if used >= max_bytes {
+        let rem = max_bytes.saturating_sub(used.saturating_add(3));
+        if rem == 0 {
             truncated = true;
             break;
         }
-        let s = r.entity(d);
+        let Some(s) = r.entity_bounded(d, rem) else {
+            truncated = true;
+            break;
+        };
         let entry_bytes = serde_json::to_string(&s)
-            .map_or(s.len().saturating_add(2), |j| j.len())
+            .map_or(usize::MAX, |j| j.len())
             .saturating_add(1);
         if used.saturating_add(entry_bytes) > max_bytes {
             truncated = true;
@@ -362,11 +413,15 @@ pub fn edit_body_bounded(e: &EditOutcome, r: &Renderer, max_bytes: usize) -> J {
     let mut list_bounded = |l: &[Axiom]| -> Vec<J> {
         let mut out = Vec::new();
         for a in l.iter().take(MAX_LIMIT) {
-            if used >= max_bytes {
+            let rem = max_bytes.saturating_sub(used.saturating_add(1));
+            if rem == 0 {
                 truncated = true;
                 break;
             }
-            let j = axiom_json(a, None, r);
+            let Some(j) = axiom_json_bounded(a, None, r, rem) else {
+                truncated = true;
+                break;
+            };
             let entry_bytes = serde_json::to_string(&j)
                 .map_or(usize::MAX, |s| s.len())
                 .saturating_add(1);

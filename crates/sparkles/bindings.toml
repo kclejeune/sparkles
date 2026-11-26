@@ -856,6 +856,16 @@ python = "Dataset.ontology.parse"
 jvm = "SparklesOnt.parse"
 node = "Dataset.ontology.parse"
 
+["ontology.patterns.apply"]
+python = "planned: pattern apply binding over sparkles_owl::patterns + ontology.edit_from_head"
+jvm = "planned: pattern apply binding over sparkles_owl::patterns + ontology.edit_from_head"
+node = "planned: pattern apply binding over sparkles_owl::patterns + ontology.edit_from_head"
+
+["ontology.patterns.preview"]
+python = "planned: pattern preview binding over sparkles_owl::patterns + ontology.open"
+jvm = "planned: pattern preview binding over sparkles_owl::patterns + ontology.open"
+node = "planned: pattern preview binding over sparkles_owl::patterns + ontology.open"
+
 ["ontology.remove_entity"]
 python = "Dataset.ontology.remove_entity"
 jvm = "SparklesOnt.removeEntity"

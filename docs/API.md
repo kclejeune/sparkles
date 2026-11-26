@@ -2679,22 +2679,22 @@ placeholders and optional `iri`, `slug`, `str`, `lang(...)`, and `type(...)` fil
 alongside optional `declarations`, per-column `split` delimiters, and axiom `annotations`.
 Inputs are bounded at 2 MiB, 5,000 data rows, 128 columns, 50,000 unique generated
 axioms, 100,000 evaluation attempts, 250,000 projected triples, 1,000 recorded
-diagnostics, and 256 split values or rule combinations per row. The answer reports row
-counts, generated axioms with their `new` or `existing` status against both terminology
-and stored assertions, auto-declarations, estimated RDF triples, and per-row diagnostics,
-together with the ontology's entity tag and commit headers.
+diagnostics, and 256 split values or rule combinations per row. The answer reports row counts, generated axioms with their `new` or `existing` status
+against both terminology and stored assertions, auto-declarations, estimated RDF triples,
+and per-row diagnostics, together with the pattern preview entity tag (covering the head
+commit, import targets, and dataset prefix bindings) and commit headers.
 
 `POST /$/ontology/{ds}/patterns/apply` evaluates the table and specification under the
 writer lock against the head snapshot and commits all generated axioms in one atomic
 ontology edit, requiring dataset write access on the `update` endpoint. It enforces
 read-only mode, protected branches, target graph write grants, `If-Match` preconditions
-including import-target digest parity for ontology entity tags, `receipt=true`, `message`,
-and `dryRun=true` preview parity before reporting pattern diagnostics. With `onError` set
-to `abort` (the default), any error refuses the commit with `422` (`pattern-errors`) and
-writes nothing. With `onError` set to `skip`, erroneous rows are discarded atomically,
-valid rows are committed, and diagnostics are returned alongside the edit outcome under
-`pattern`. Request-wide budget failures and structural specification errors refuse the
-commit under either error policy.
+including import-target and dataset prefix binding digest parity for ontology and pattern
+preview entity tags, `receipt=true`, `message`, and `dryRun=true` preview parity before
+reporting pattern diagnostics. With `onError` set to `abort` (the default), any error
+refuses the commit with `422` (`pattern-errors`) and writes nothing. With `onError` set to
+`skip`, erroneous rows are discarded atomically, valid rows are committed, and diagnostics
+are returned alongside the edit outcome under `pattern`. Request-wide budget failures and
+structural specification errors refuse the commit under either error policy.
 
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 

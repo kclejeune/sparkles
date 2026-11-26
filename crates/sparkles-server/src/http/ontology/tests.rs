@@ -3892,10 +3892,11 @@ async fn patterns_r2_triple_limit_parity_dry_run_precondition_prefix_etag_and_re
         "expected replicated >A expansion-bytes-limit diagnostic: {prj}"
     );
 
-    // Preview response byte ceiling must also cap even entry 0 when tight.
+    // Preview response byte ceiling must cap the full serialized response (including
+    // entry 0, long ontology labels, and diagnostics).
     {
         let lim = sparkles::owl::patterns::Limits::default();
-        *s._state.pattern_test_limits.lock() = Some((lim, 600));
+        *s._state.pattern_test_limits.lock() = Some((lim, 420));
     }
     let small_ok_body = json!({
         "table": {
@@ -3914,6 +3915,12 @@ async fn patterns_r2_triple_limit_parity_dry_run_precondition_prefix_etag_and_re
     )
     .await;
     assert_eq!(prev_capped.status, StatusCode::OK, "{}", prev_capped.text());
+    assert!(
+        prev_capped.body.len() <= 420,
+        "preview response exceeded 420-byte cap: {} bytes: {}",
+        prev_capped.body.len(),
+        prev_capped.text()
+    );
     let pcj = prev_capped.json();
     assert_eq!(pcj["axiomsTruncated"], true, "{pcj}");
     assert_eq!(
@@ -3922,12 +3929,69 @@ async fn patterns_r2_triple_limit_parity_dry_run_precondition_prefix_etag_and_re
         "entry 0 must not bypass tight preview response byte cap: {pcj}"
     );
 
-    // Apply response byte ceiling bounds addedAxioms while still committing cleanly.
-    let apply_capped = post(&s.app, "/$/ontology/h/patterns/apply", small_ok_body).await;
+    // Preview with an existing long ontology label must bail out in Manchester bounded
+    // rendering and stay within the serialized response byte ceiling.
+    let long_label = "L".repeat(2_000);
+    let add_long_label = post(
+        &s.app,
+        "/$/ontology/h/axioms",
+        json!({
+            "add": [format!("AnnotationAssertion(rdfs:label <http://ex.org/Person> \"{long_label}\")")]
+        }),
+    )
+    .await;
+    assert_eq!(
+        add_long_label.status,
+        StatusCode::OK,
+        "{}",
+        add_long_label.text()
+    );
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 1_200));
+    }
+    let prev_long_label = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        small_ok_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        prev_long_label.status,
+        StatusCode::OK,
+        "{}",
+        prev_long_label.text()
+    );
+    assert!(
+        prev_long_label.body.len() <= 1_200,
+        "preview with long ontology label exceeded 1200-byte cap: {} bytes",
+        prev_long_label.body.len()
+    );
+    let pllj = prev_long_label.json();
+    assert_eq!(pllj["axiomsTruncated"], true, "{pllj}");
+
+    // Apply response byte ceiling bounds addedAxioms and serialized body length (without
+    // and with receipt=true).
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 1_200));
+    }
+    let apply_capped = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply",
+        small_ok_body.clone(),
+    )
+    .await;
     assert_eq!(
         apply_capped.status,
         StatusCode::OK,
         "{}",
+        apply_capped.text()
+    );
+    assert!(
+        apply_capped.body.len() <= 1_200,
+        "apply response exceeded 1200-byte cap: {} bytes: {}",
+        apply_capped.body.len(),
         apply_capped.text()
     );
     let acj = apply_capped.json();
@@ -3937,6 +4001,140 @@ async fn patterns_r2_triple_limit_parity_dry_run_precondition_prefix_etag_and_re
         acj["addedAxioms"].as_array().unwrap().len() < acj["added"].as_u64().unwrap() as usize,
         "apply response byte cap must bound rendered addedAxioms: {acj}"
     );
+
+    let receipt_body = json!({
+        "table": {
+            "data": "ID,Parent\nID,SC %\nex:RecA,ex:Person\nex:RecB,ex:Person\nex:RecC,ex:Person\nex:RecD,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let apply_receipt_capped = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?receipt=true",
+        receipt_body,
+    )
+    .await;
+    assert_eq!(
+        apply_receipt_capped.status,
+        StatusCode::OK,
+        "{}",
+        apply_receipt_capped.text()
+    );
+    assert!(
+        apply_receipt_capped.body.len() <= 1_200,
+        "apply?receipt=true response exceeded 1200-byte cap: {} bytes: {}",
+        apply_receipt_capped.body.len(),
+        apply_receipt_capped.text()
+    );
+    let arcj = apply_receipt_capped.json();
+    assert_eq!(arcj["committed"], true, "{arcj}");
+    assert_eq!(arcj["axiomsTruncated"], true, "{arcj}");
+    assert!(
+        arcj["commit"].is_object(),
+        "receipt must be present: {arcj}"
+    );
+
+    // OFN `# "` comment bypass and ROBOT `I <data-prop>` typed literal prefix expansion
+    // are both caught under tight expanded-byte limits on HTTP preview.
+    let add_dp = post(
+        &s.app,
+        "/$/ontology/h/axioms",
+        json!({ "add": ["Declaration(DataProperty(<http://ex.org/score>))"] }),
+    )
+    .await;
+    assert_eq!(add_dp.status, StatusCode::OK, "{}", add_dp.text());
+    {
+        let lim = sparkles::owl::patterns::Limits {
+            max_total_expanded_bytes: 1_200,
+            ..sparkles::owl::patterns::Limits::default()
+        };
+        *s._state.pattern_test_limits.lock() = Some((lim, 64 * 1024));
+    }
+    let long_ns = format!("http://ex.org/{}/", "p".repeat(500));
+    let ofn_comment_body = json!({
+        "table": { "data": "a\nx\n" },
+        "spec": {
+            "mode": "pattern",
+            "prefixes": { "p": long_ns },
+            "rules": [{
+                "syntax": "functional",
+                "template": "# \"\nSubClassOf(p:${a} ObjectIntersectionOf(p:1 p:2 p:3 p:4))"
+            }]
+        }
+    });
+    let prev_ofn_comment = post(&s.app, "/$/ontology/h/patterns/preview", ofn_comment_body).await;
+    assert_eq!(
+        prev_ofn_comment.status,
+        StatusCode::OK,
+        "{}",
+        prev_ofn_comment.text()
+    );
+    let pocj = prev_ofn_comment.json();
+    assert_eq!(pocj["valid"], false, "{pocj}");
+    assert!(
+        pocj["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "expansion-bytes-limit"),
+        "OFN comment quote bypass must hit expansion-bytes-limit: {pocj}"
+    );
+
+    let dp_lit_body = json!({
+        "table": {
+            "data": "ID,Score\nID,I ex:score\nex:i1,\"\"\"1\"\"^^p:t\"\nex:i2,\"\"\"2\"\"^^p:t\"\nex:i3,\"\"\"3\"\"^^p:t\"\nex:i4,\"\"\"4\"\"^^p:t\"\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/", "p": format!("http://ex.org/{}/", "q".repeat(500)) }
+        }
+    });
+    let prev_dp_lit = post(&s.app, "/$/ontology/h/patterns/preview", dp_lit_body).await;
+    assert_eq!(prev_dp_lit.status, StatusCode::OK, "{}", prev_dp_lit.text());
+    let pdlj = prev_dp_lit.json();
+    assert_eq!(pdlj["valid"], false, "{pdlj}");
+    assert!(
+        pdlj["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "expansion-bytes-limit"),
+        "ROBOT I <data-prop> typed literal expansion must hit expansion-bytes-limit: {pdlj}"
+    );
+
+    // Multi-triple unannotated axiom exceeding max_triples is refused cleanly with 507
+    // without materializing RDF triples during presence checks.
+    {
+        let lim = sparkles::owl::patterns::Limits {
+            max_triples: 5,
+            ..sparkles::owl::patterns::Limits::default()
+        };
+        *s._state.pattern_test_limits.lock() = Some((lim, 64 * 1024));
+    }
+    let multi_triple_body = json!({
+        "table": { "data": "c\nex:Complex\n" },
+        "spec": {
+            "mode": "pattern",
+            "prefixes": { "ex": "http://ex.org/" },
+            "rules": [{
+                "syntax": "functional",
+                "template": "SubClassOf(${c} ObjectIntersectionOf(ex:C1 ex:C2 ex:C3 ex:C4))"
+            }]
+        }
+    });
+    let prev_multi = post(&s.app, "/$/ontology/h/patterns/preview", multi_triple_body).await;
+    assert_eq!(
+        prev_multi.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        prev_multi.text()
+    );
+    assert_eq!(prev_multi.json()["code"], "triple-limit");
 
     *s._state.pattern_test_limits.lock() = None;
 }
