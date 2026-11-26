@@ -1603,6 +1603,7 @@ fn resolve_and_describe_inner(
     let mut contributing_datasets: usize = 0;
     let mut single_history: Option<Resolved> = None;
     let mut saw_history_gone = false;
+    let mut deferred_error: Option<ApiError> = None;
 
     // Seed common semantic-web prefixes plus the matched resource's own namespaces.
     for (p, ns) in [
@@ -1624,23 +1625,24 @@ fn resolve_and_describe_inner(
         if hooks.expire_deadline_before_dataset == Some(idx) {
             deadline.expire_now();
         }
-        let readability_established = contributing_datasets > 0;
+        let readability_established = contributing_datasets > 0 || saw_history_gone;
         let mut opts = CallerContext::for_caller(st, &plan.ds, principal).read_options();
         opts.grant = grant.clone();
         opts.timeout = match deadline.left() {
             Ok(t) => t,
             Err(e) => {
-                // Once an earlier dataset has contributed readable triples, propagate
-                // timeout rather than returning an incomplete description as an unmarked
-                // 200. Before any readable triple is established, keep the generic 404
-                // because `live_is_readable` cannot run under the expired deadline.
-                if effective_at.is_some()
-                    && !matches!(e, sparkles::Error::Cancelled)
-                    && !readability_established
-                {
+                // Once an earlier dataset has established readability, propagate timeout
+                // rather than returning an incomplete description as an unmarked 200.
+                // Before readability is established, record the first operational error
+                // and keep the generic 404 unless a later dataset proves readability.
+                if matches!(e, sparkles::Error::Cancelled) {
+                    return Err(ApiError::from(e));
+                }
+                if effective_at.is_some() && !readability_established {
+                    deferred_error.get_or_insert_with(|| ApiError::from(e));
                     continue;
                 }
-                return Err(ApiError::from(e));
+                return Err(deferred_error.take().unwrap_or_else(|| ApiError::from(e)));
             }
         };
         let mut desc = plan.describe.clone();
@@ -1671,8 +1673,9 @@ fn resolve_and_describe_inner(
                             &deadline,
                         )
                     {
-                        return Err(ApiError::from(e));
+                        return Err(deferred_error.take().unwrap_or_else(|| ApiError::from(e)));
                     }
+                    deferred_error.get_or_insert_with(|| ApiError::from(e));
                     continue;
                 }
             };
@@ -1699,6 +1702,9 @@ fn resolve_and_describe_inner(
                                 &mut charge,
                                 &deadline,
                             ) {
+                                if let Some(err) = deferred_error.take() {
+                                    return Err(err);
+                                }
                                 saw_history_gone = true;
                             }
                             continue;
@@ -1716,8 +1722,11 @@ fn resolve_and_describe_inner(
                                     &deadline,
                                 )
                             {
-                                return Err(ApiError::from(other));
+                                return Err(deferred_error
+                                    .take()
+                                    .unwrap_or_else(|| ApiError::from(other)));
                             }
+                            deferred_error.get_or_insert_with(|| ApiError::from(other));
                             continue;
                         }
                     }
@@ -1730,6 +1739,9 @@ fn resolve_and_describe_inner(
                     if let Some(r) = reserved {
                         charge.release(r);
                     }
+                    if matches!(e, sparkles::Error::Cancelled) {
+                        return Err(ApiError::from(e));
+                    }
                     if readability_established
                         || live_is_readable(
                             st,
@@ -1741,8 +1753,9 @@ fn resolve_and_describe_inner(
                             &deadline,
                         )
                     {
-                        return Err(ApiError::from(e));
+                        return Err(deferred_error.take().unwrap_or_else(|| ApiError::from(e)));
                     }
+                    deferred_error.get_or_insert_with(|| ApiError::from(e));
                     continue;
                 }
             };
@@ -1767,8 +1780,10 @@ fn resolve_and_describe_inner(
             Err(e) => {
                 drop(snap);
                 charge.release(snap_charge);
+                if matches!(e, sparkles::Error::Cancelled) {
+                    return Err(ApiError::from(e));
+                }
                 if effective_at.is_some()
-                    && !matches!(e, sparkles::Error::Cancelled)
                     && !readability_established
                     && !live_is_readable(
                         st,
@@ -1780,9 +1795,10 @@ fn resolve_and_describe_inner(
                         &deadline,
                     )
                 {
+                    deferred_error.get_or_insert_with(|| ApiError::from(e));
                     continue;
                 }
-                return Err(ApiError::from(e));
+                return Err(deferred_error.take().unwrap_or_else(|| ApiError::from(e)));
             }
         };
         let res = match sparkles::sparql::query(snap.clone(), &sparql, &opts) {
@@ -1790,8 +1806,10 @@ fn resolve_and_describe_inner(
             Err(e) => {
                 drop(snap);
                 charge.release(snap_charge);
+                if matches!(e, sparkles::Error::Cancelled) {
+                    return Err(ApiError::from(e));
+                }
                 if effective_at.is_some()
-                    && !matches!(e, sparkles::Error::Cancelled)
                     && !readability_established
                     && !live_is_readable(
                         st,
@@ -1803,11 +1821,23 @@ fn resolve_and_describe_inner(
                         &deadline,
                     )
                 {
+                    deferred_error.get_or_insert_with(|| ApiError::from(e));
                     continue;
                 }
-                return Err(ApiError::from(e));
+                return Err(deferred_error.take().unwrap_or_else(|| ApiError::from(e)));
             }
         };
+        // If an earlier dataset hit a suppressed operational error before readability was
+        // established, propagate that error as soon as a later dataset produces readable
+        // triples rather than returning an incomplete 200 OK.
+        if !res.triples().is_empty()
+            && let Some(err) = deferred_error.take()
+        {
+            drop(res);
+            drop(snap);
+            charge.release(snap_charge);
+            return Err(err);
+        }
         if res.describe_truncated {
             truncated = true;
         }

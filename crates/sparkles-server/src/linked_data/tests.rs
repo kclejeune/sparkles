@@ -2082,6 +2082,517 @@ async fn multi_dataset_historical_deadline_expiry_propagates_timeout_only_after_
 }
 
 #[tokio::test]
+async fn multi_dataset_historical_deferred_error_propagates_in_both_dataset_orders() {
+    // 1. Cold persistent replay failure (`snapshot_for_limited`) in both dataset orders:
+    //    `[a_fail, b_small]` (failing dataset sorts first) and `[a_small, z_fail]`
+    //    (contributing dataset sorts first).
+    let cold_cap: u64 = 512 * 1024;
+    for (failing_ds_name, small_ds_name) in [("a_fail", "b_small"), ("z_fail", "a_small")] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let st = Arc::new(
+                AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30))
+                    .unwrap(),
+            );
+            st.create(failing_ds_name, DbType::Persistent).unwrap();
+            st.create(small_ds_name, DbType::Persistent).unwrap();
+            let app = crate::http::router(st.clone());
+
+            let big_hist = "h".repeat(8 * 1024);
+            let mut fail_ttl = format!(
+                "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                 @prefix mdef: <http://example.org/mdef/> .\n\
+                 mdef:Shared rdfs:label \"From failing historical\" ;\n\
+                   rdfs:comment \"{big_hist}\" .\n\
+                 mdef:OnlyInFailing rdfs:label \"Only in failing historical\" .\n"
+            );
+            for i in 0..600 {
+                fail_ttl.push_str(&format!(
+                    "mdef:Pad{i} rdfs:comment \"padding-entry-{i:04}-payload-for-wal-replay\" .\n"
+                ));
+            }
+            let put_fail = send(
+                &app,
+                Request::put(format!(
+                    "/{failing_ds_name}/data?graph=http%3A%2F%2Fexample.org%2Fmdef%2Fg_fail"
+                ))
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from(fail_ttl))
+                .unwrap(),
+            )
+            .await;
+            assert!(put_fail.status.is_success(), "{}", put_fail.text());
+
+            let put_small = send(
+                &app,
+                Request::put(format!(
+                    "/{small_ds_name}/data?graph=http%3A%2F%2Fexample.org%2Fmdef%2Fg_small"
+                ))
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from(
+                    "<http://example.org/mdef/Shared> <http://www.w3.org/2000/01/rdf-schema#comment> \"From small historical\" .\n",
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert!(put_small.status.is_success(), "{}", put_small.text());
+
+            for ds_name in [failing_ds_name, small_ds_name] {
+                let snap = send(
+                    &app,
+                    post_json(
+                        &format!("/$/snapshots/{ds_name}"),
+                        json!({"name": "v1"}),
+                        None,
+                    ),
+                )
+                .await;
+                assert_eq!(snap.status, StatusCode::CREATED, "{}", snap.text());
+            }
+
+            // Clear `Shared` and `OnlyInFailing` from `failing_ds_name`'s live snapshot so
+            // its live readability probe returns empty, while advancing `small_ds_name`'s head
+            // so `snapshot:v1` is historical on both datasets.
+            let clear_fail_live = send(
+                &app,
+                Request::put(format!(
+                    "/{failing_ds_name}/data?graph=http%3A%2F%2Fexample.org%2Fmdef%2Fg_fail"
+                ))
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from(
+                    "<http://example.org/mdef/OtherLive> <http://www.w3.org/2000/01/rdf-schema#label> \"live head\" .\n",
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert!(
+                clear_fail_live.status.is_success(),
+                "{}",
+                clear_fail_live.text()
+            );
+
+            let advance_small = send(
+                &app,
+                Request::post(format!(
+                    "/{small_ds_name}/data?graph=http%3A%2F%2Fexample.org%2Fmdef%2Fg_small"
+                ))
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from(
+                    "<http://example.org/mdef/OtherSmall> <http://www.w3.org/2000/01/rdf-schema#label> \"live head\" .\n",
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert!(
+                advance_small.status.is_success(),
+                "{}",
+                advance_small.text()
+            );
+
+            let reg = send(
+                &app,
+                post_json(
+                    "/$/resources",
+                    json!({
+                        "id": "mdef",
+                        "kind": "vocabulary",
+                        "title": "Multi-dataset deferred error vocab",
+                        "namespaces": [{"prefix": "mdef", "iri": "http://example.org/mdef/"}],
+                        "graphs": [
+                            {"dataset": failing_ds_name, "graph": "http://example.org/mdef/g_fail"},
+                            {"dataset": small_ds_name, "graph": "http://example.org/mdef/g_small"}
+                        ]
+                    }),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
+
+            // Uncapped sanity check: the same request merges triples from both datasets.
+            let uncapped = send(
+                &app,
+                get_req(
+                    &format!(
+                        "/$/ld/doc?iri={}&at=snapshot:v1",
+                        enc("http://example.org/mdef/Shared")
+                    ),
+                    Some("text/turtle"),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(uncapped.status, StatusCode::OK, "{}", uncapped.text());
+            let body = uncapped.text();
+            assert!(
+                body.contains("From failing historical") && body.contains("From small historical"),
+                "uncapped lookup for ({failing_ds_name}, {small_ds_name}) must merge both datasets: {body}"
+            );
+        }
+
+        // Reopen cold with a 512 KiB query memory ceiling: large enough for `small_ds`'s
+        // cold replay (~340 KiB peak, ~130 KiB retained), query, and response, but well
+        // below `failing_ds`'s >1.3 MiB cold replay footprint.
+        let mut st =
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        st.limits.query_memory_bytes = Some(cold_cap);
+        let st = Arc::new(st);
+
+        let fail_ds = crate::http::dataset(&st, failing_ds_name)
+            .ok()
+            .expect("failing dataset");
+        let small_ds = crate::http::dataset(&st, small_ds_name)
+            .ok()
+            .expect("small dataset");
+        assert!(
+            matches!(
+                fail_ds.store.snapshot_at_limited_bytes(
+                    &sparkles::history::At::Snapshot("v1".to_string()),
+                    &sparkles::history::HistoryOptions::default(),
+                    cold_cap,
+                ),
+                Err(sparkles::Error::BudgetExceeded(b))
+                    if b.kind == sparkles::BudgetKind::Memory
+            ),
+            "cold replay on {failing_ds_name} must exceed {cold_cap} bytes"
+        );
+        let (small_snap, _, small_retained) = small_ds
+            .store
+            .snapshot_at_limited_bytes(
+                &sparkles::history::At::Snapshot("v1".to_string()),
+                &sparkles::history::HistoryOptions::default(),
+                cold_cap,
+            )
+            .expect("small dataset historical snapshot must fit within cold_cap");
+        let small_opts = sparkles::sparql::QueryOptions {
+            default_graph_uris: vec!["http://example.org/mdef/g_small".to_string()],
+            max_memory_bytes: Some(cold_cap - small_retained),
+            ..Default::default()
+        };
+        let small_res = sparkles::sparql::query(
+            small_snap,
+            "DESCRIBE <http://example.org/mdef/Shared>",
+            &small_opts,
+        )
+        .expect("small dataset query must succeed under remaining cold_cap");
+        assert!(!small_res.triples().is_empty());
+        let live_opts = sparkles::sparql::QueryOptions {
+            default_graph_uris: vec!["http://example.org/mdef/g_fail".to_string()],
+            ..Default::default()
+        };
+        let live_fail = sparkles::sparql::query(
+            fail_ds.store.snapshot(),
+            "DESCRIBE <http://example.org/mdef/Shared>",
+            &live_opts,
+        )
+        .unwrap();
+        assert!(
+            live_fail.triples().is_empty(),
+            "failing dataset live probe for Shared must be empty"
+        );
+        drop(fail_ds);
+        drop(small_ds);
+
+        let app = crate::http::router(st);
+
+        // `Shared` is readable in `small_ds_name`, so both dataset orders MUST return 507
+        // rather than emitting `small_ds_name`'s partial subset as an unmarked 200 OK.
+        let shared = send(
+            &app,
+            get_req(
+                &format!(
+                    "/$/ld/doc?iri={}&at=snapshot:v1",
+                    enc("http://example.org/mdef/Shared")
+                ),
+                Some("text/turtle"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            shared.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "cold replay order ({failing_ds_name}, {small_ds_name}) must return 507, got {}",
+            shared.text()
+        );
+
+        // `OnlyInFailing` has no readable triple on any dataset (neither live nor small_ds),
+        // so both dataset orders MUST preserve generic 404 linked-data-not-found.
+        let hidden = send(
+            &app,
+            get_req(
+                &format!(
+                    "/$/ld/doc?iri={}&at=snapshot:v1",
+                    enc("http://example.org/mdef/OnlyInFailing")
+                ),
+                Some("text/turtle"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            hidden.status,
+            StatusCode::NOT_FOUND,
+            "cold replay order ({failing_ds_name}, {small_ds_name}) must keep 404 when unreadable, got {}",
+            hidden.text()
+        );
+        assert_eq!(hidden.json()["code"], "linked-data-not-found");
+    }
+
+    // 2. Post-replay `sparql::query` memory failure in both dataset orders using in-memory
+    //    retained snapshots (`snapshot_for_limited` succeeds, `sparql::query` fails under
+    //    the 1 KiB remainder on the failing dataset while the small dataset succeeds).
+    for (failing_ds_name, small_ds_name) in
+        [("a_mem_fail", "b_mem_small"), ("z_mem_fail", "a_mem_small")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        st.create(failing_ds_name, DbType::Mem).unwrap();
+        st.create(small_ds_name, DbType::Mem).unwrap();
+        let setup_app = crate::http::router(st.clone());
+
+        let big_shared = "x".repeat(8 * 1024);
+        let big_only = "y".repeat(8 * 1024);
+        let mut fail_ttl = format!(
+            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+             @prefix mdefm: <http://example.org/mdefm/> .\n\
+             mdefm:Shared rdfs:label \"From mem failing\" ;\n\
+               rdfs:comment \"{big_shared}\" .\n\
+             mdefm:OnlyInFailing rdfs:comment \"{big_only}\" .\n"
+        );
+        for i in 0..400 {
+            fail_ttl.push_str(&format!(
+                "mdefm:Pad{i} rdfs:comment \"padding-entry-{i:04}-payload-for-retained-delta\" .\n"
+            ));
+        }
+        let put_fail = send(
+            &setup_app,
+            Request::put(format!(
+                "/{failing_ds_name}/data?graph=http%3A%2F%2Fexample.org%2Fmdefm%2Fg_fail"
+            ))
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(fail_ttl))
+            .unwrap(),
+        )
+        .await;
+        assert!(put_fail.status.is_success(), "{}", put_fail.text());
+
+        let put_small = send(
+            &setup_app,
+            Request::put(format!(
+                "/{small_ds_name}/data?graph=http%3A%2F%2Fexample.org%2Fmdefm%2Fg_small"
+            ))
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://example.org/mdefm/Shared> <http://www.w3.org/2000/01/rdf-schema#comment> \"From mem small\" .\n",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert!(put_small.status.is_success(), "{}", put_small.text());
+
+        for ds_name in [failing_ds_name, small_ds_name] {
+            let snap = send(
+                &setup_app,
+                post_json(
+                    &format!("/$/snapshots/{ds_name}"),
+                    json!({"name": "v1"}),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(snap.status, StatusCode::CREATED, "{}", snap.text());
+        }
+
+        let clear_fail_live = send(
+            &setup_app,
+            Request::put(format!(
+                "/{failing_ds_name}/data?graph=http%3A%2F%2Fexample.org%2Fmdefm%2Fg_fail"
+            ))
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://example.org/mdefm/OtherLive> <http://www.w3.org/2000/01/rdf-schema#label> \"live head\" .\n",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert!(
+            clear_fail_live.status.is_success(),
+            "{}",
+            clear_fail_live.text()
+        );
+
+        let advance_small = send(
+            &setup_app,
+            Request::post(format!(
+                "/{small_ds_name}/data?graph=http%3A%2F%2Fexample.org%2Fmdefm%2Fg_small"
+            ))
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://example.org/mdefm/OtherSmall> <http://www.w3.org/2000/01/rdf-schema#label> \"live head\" .\n",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert!(
+            advance_small.status.is_success(),
+            "{}",
+            advance_small.text()
+        );
+
+        let reg = send(
+            &setup_app,
+            post_json(
+                "/$/resources",
+                json!({
+                    "id": "mdefm",
+                    "kind": "vocabulary",
+                    "title": "Multi-dataset post-replay deferred error vocab",
+                    "namespaces": [{"prefix": "mdefm", "iri": "http://example.org/mdefm/"}],
+                    "graphs": [
+                        {"dataset": failing_ds_name, "graph": "http://example.org/mdefm/g_fail"},
+                        {"dataset": small_ds_name, "graph": "http://example.org/mdefm/g_small"}
+                    ]
+                }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
+
+        let uncapped = send(
+            &setup_app,
+            get_req(
+                &format!(
+                    "/$/ld/doc?iri={}&at=snapshot:v1",
+                    enc("http://example.org/mdefm/Shared")
+                ),
+                Some("text/turtle"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(uncapped.status, StatusCode::OK, "{}", uncapped.text());
+        let body = uncapped.text();
+        assert!(
+            body.contains("From mem failing") && body.contains("From mem small"),
+            "uncapped mem lookup for ({failing_ds_name}, {small_ds_name}) must merge both datasets: {body}"
+        );
+
+        let fail_ds = crate::http::dataset(&st, failing_ds_name)
+            .ok()
+            .expect("failing mem dataset");
+        let small_ds = crate::http::dataset(&st, small_ds_name)
+            .ok()
+            .expect("small mem dataset");
+        let (_, _, fail_retained) = fail_ds
+            .store
+            .snapshot_at_limited_bytes(
+                &sparkles::history::At::Snapshot("v1".to_string()),
+                &sparkles::history::HistoryOptions::default(),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+        let mem_cap = fail_retained + 1024;
+        let (fail_snap, _, check_retained) = fail_ds
+            .store
+            .snapshot_at_limited_bytes(
+                &sparkles::history::At::Snapshot("v1".to_string()),
+                &sparkles::history::HistoryOptions::default(),
+                mem_cap,
+            )
+            .expect("failing mem dataset snapshot lookup must succeed under mem_cap");
+        assert_eq!(check_retained, fail_retained);
+        let q_opts = sparkles::sparql::QueryOptions {
+            default_graph_uris: vec!["http://example.org/mdefm/g_fail".to_string()],
+            max_memory_bytes: Some(mem_cap - fail_retained),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                sparkles::sparql::query(
+                    fail_snap,
+                    "DESCRIBE <http://example.org/mdefm/Shared>",
+                    &q_opts,
+                ),
+                Err(sparkles::Error::BudgetExceeded(b))
+                    if b.kind == sparkles::BudgetKind::Memory
+            ),
+            "post-replay query on {failing_ds_name} must fail under remainder {}",
+            mem_cap - fail_retained
+        );
+        let (small_snap, _, small_retained) = small_ds
+            .store
+            .snapshot_at_limited_bytes(
+                &sparkles::history::At::Snapshot("v1".to_string()),
+                &sparkles::history::HistoryOptions::default(),
+                mem_cap,
+            )
+            .expect("small mem dataset snapshot must fit under mem_cap");
+        let small_opts = sparkles::sparql::QueryOptions {
+            default_graph_uris: vec!["http://example.org/mdefm/g_small".to_string()],
+            max_memory_bytes: Some(mem_cap - small_retained),
+            ..Default::default()
+        };
+        let small_res = sparkles::sparql::query(
+            small_snap,
+            "DESCRIBE <http://example.org/mdefm/Shared>",
+            &small_opts,
+        )
+        .expect("small mem dataset query must succeed under mem_cap");
+        assert!(!small_res.triples().is_empty());
+
+        drop(setup_app);
+        drop(fail_ds);
+        drop(small_ds);
+        let mut st = Arc::try_unwrap(st).ok().expect("unique AppState");
+        st.limits.query_memory_bytes = Some(mem_cap);
+        let app = crate::http::router(Arc::new(st));
+
+        let shared = send(
+            &app,
+            get_req(
+                &format!(
+                    "/$/ld/doc?iri={}&at=snapshot:v1",
+                    enc("http://example.org/mdefm/Shared")
+                ),
+                Some("text/turtle"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            shared.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "post-replay order ({failing_ds_name}, {small_ds_name}) must return 507, got {}",
+            shared.text()
+        );
+
+        let hidden = send(
+            &app,
+            get_req(
+                &format!(
+                    "/$/ld/doc?iri={}&at=snapshot:v1",
+                    enc("http://example.org/mdefm/OnlyInFailing")
+                ),
+                Some("text/turtle"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            hidden.status,
+            StatusCode::NOT_FOUND,
+            "post-replay order ({failing_ds_name}, {small_ds_name}) must keep 404 when unreadable, got {}",
+            hidden.text()
+        );
+        assert_eq!(hidden.json()["code"], "linked-data-not-found");
+    }
+}
+
+#[tokio::test]
 async fn linked_data_enforces_query_memory_pool_grant_across_blocking() {
     let dir = tempfile::tempdir().unwrap();
     // Small query pool (32 KiB) with NO per-query memory ceiling: only the pool grant
