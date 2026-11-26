@@ -226,6 +226,7 @@ with Catalog(path / "catalog") as cat:
     work = aliases[0]
     alias = cat.get_by_id(ds.dataset_id)
     calls = {
+        "omitted": lambda: alias.branches.update("work", protected=True),
         "note": lambda: alias.branches.update("work", note="replacement"),
         "none": lambda: alias.branches.update("work", note=None),
         "delete": lambda: alias.branches.delete("work"),
@@ -243,6 +244,8 @@ with Catalog(path / "catalog") as cat:
                 try:
                     if operation == "thread-note":
                         alias.branches.update("work", note="waited")
+                    elif operation == "thread-none":
+                        alias.branches.update("work", note=None)
                     else:
                         alias.branches.delete("work")
                 except BaseException as error:
@@ -276,6 +279,8 @@ with Catalog(path / "catalog") as cat:
     if operation.startswith("thread"):
         if operation == "thread-note":
             assert ds.branches.get("work")["note"] == "waited"
+        elif operation == "thread-none":
+            assert ds.branches.get("work")["note"] is None
         else:
             assert [b["name"] for b in ds.branches.list()] == ["main", "peer"]
     else:
@@ -288,14 +293,23 @@ with Catalog(path / "catalog") as cat:
             assert ds.branch("work").dataset_id != old_id
         else:
             calls[operation]()
-            # Explicit None currently means omission, tracked by roadmap 755.
-            expected = "replacement" if operation == "note" else "original"
-            assert ds.branches.get("work")["note"] == expected
+            if operation == "note":
+                assert ds.branches.get("work")["note"] == "replacement"
+            elif operation == "none":
+                assert ds.branches.get("work")["note"] is None
+            elif operation == "omitted":
+                info = ds.branches.get("work")
+                assert info["note"] == "original" and info["protected"] is True
+            else:
+                assert ds.branches.get("work")["note"] == "original"
 '''
 
 
 @pytest.mark.parametrize("kind", ["mem", "persistent"])
-@pytest.mark.parametrize("operation", ["note", "none", "delete", "force", "get", "thread-note", "thread-delete"])
+@pytest.mark.parametrize(
+    "operation",
+    ["omitted", "note", "none", "delete", "force", "get", "thread-note", "thread-none", "thread-delete"],
+)
 def test_branch_transaction_owner(tmp_path: Path, kind: str, operation: str) -> None:
     result = subprocess.run(
         [sys.executable, "-c", BRANCH_TRANSACTION_CALL, str(tmp_path), kind, operation],
@@ -327,6 +341,10 @@ with Catalog(root / "catalog") as cat:
         assert ds.branches.get("broken")["broken"] is True
         updated = ds.branches.update("broken", note="metadata only")
         assert updated["broken"] is True and updated["note"] == "metadata only"
+        kept = ds.branches.update("broken", protected=True)
+        assert kept["broken"] is True and kept["protected"] is True and kept["note"] == "metadata only"
+        cleared = ds.branches.update("broken", note=None)
+        assert cleared["broken"] is True and cleared["note"] is None
     else:
         # Damage only after main opens, so force-delete remains available even
         # though opening this cold branch's Store will now fail.

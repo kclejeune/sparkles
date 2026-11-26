@@ -6469,7 +6469,8 @@ schedule, and `sparkles.preview_schedule` previews one.
 A history diff iterates over `(op, Quad)` pairs, where `op` is `"+"` or `"-"`.
 `history.changes(after)` returns a fixed page of commit changes, and each commit change
 iterates over the same pairs. Snapshots, commits and backup records are immutable.
-`settings` holds the compaction, DESCRIBE, quota, retention and change-log settings.
+`branches.update(name, note=None)` clears an existing branch note, whereas omitting `note`
+leaves it unchanged. `settings` holds the compaction, DESCRIBE, quota, retention and change-log settings.
 `reasoning` holds materialization, its status and diagnostics, and the RDFS
 configuration. `validation` holds SHACL, ShEx and the write guard, and `indexes.geo`
 controls spatial indexing. These handles replace the earlier flat administration

@@ -1443,15 +1443,23 @@ caller's ownership checked before any wait or mutation.
 
 ### Python note argument presence
 
-`branches.update(name, note=None)` currently has the same effect as omitting `note`
-and leaves its existing value unchanged. PyO3 extracts either form as the outer
-`Option::None`, so the implementation does not reach its intended explicit clearing
-case. A string still sets the note. Roadmap item 755 owns the correction and needs a
-bounded presence or sentinel design that preserves existing calls and agrees with
-the runtime signature and type stub. Its acceptance covers omission, explicit
-clearing, string notes, invalid values, transaction-owner refusal and both memory and
-persistent datasets. The two post-release failures that exposed this distinction are
-separate from the branch ownership repair.
+Roadmap item 755 resolved argument presence for `Branches.update`. `PyBranches::update`
+now accepts a private `BranchNoteArg` extractor whose PyO3 signature default is
+`BranchNoteArg::Omitted`. PyO3 evaluates that default only when the caller omits `note`,
+leaving the stored note unchanged, while an explicit `note=None` passes through
+`FromPyObject` as `BranchNoteArg::Clear` and calls `Dataset::set_branch_note(name, None)`.
+Explicit string values still set the note, including the empty string, and any other type
+raises `TypeError`, including `Ellipsis` so no sentinel value collides with Python inputs.
+
+The runtime signature exposes `note=...` as a keyword-only parameter and agrees with
+`note: str | None = ...` in `python/sparkles/_sparkles.pyi` under `mypy.stubtest` and
+static `mypy` checks. Transaction-owner refusal in `PyBranches::metadata` continues to
+refuse omitted, string, and explicit `None` note updates when the calling thread owns a
+write transaction on that branch, while another thread waits and applies the clear after
+release. Regression tests in `tests/test_handles.py`, `tests/test_catalog_transactions.py`,
+and `tests/test_stubs.py` cover omission, explicit clearing, string notes, invalid types,
+overlong notes, broken-branch metadata clearing, transaction-owner refusals, runtime and
+stub signatures, and both memory and persistent datasets.
 
 ### Scope changes
 
