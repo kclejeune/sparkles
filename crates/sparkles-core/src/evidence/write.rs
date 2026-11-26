@@ -1946,8 +1946,9 @@ impl<'a> Reads<'a> {
         Ok(self.single_object_id(g, s, graph_prot_pred)? == Some(g_nonce_id))
     }
 
-    /// A protected record identifies its publisher through its availability receipt.
-    /// Legacy projection withdrawals can remove other edges, including wasGeneratedBy.
+    /// A record and its publisher can lose a shared quad when an output support
+    /// is withdrawn. A surviving publication edge and current protection on
+    /// either endpoint can still identify record history.
     pub fn has_published_operation_in_output(
         &self,
         graph: &str,
@@ -1956,40 +1957,57 @@ impl<'a> Reads<'a> {
         let Some(nonce) = nonce else {
             return Ok(false);
         };
-        let (Some(g), Some(protection), Some(nonce), Some(receipt), Some(rdf_type), Some(op_class)) = (
-            self.preparation.lookup_iri(self.snap, graph)?,
-            self.preparation
-                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+        let iri = |value: &str| self.preparation.lookup_iri(self.snap, value);
+        let (Some(g), Some(protection), Some(nonce)) = (
+            iri(graph)?,
+            iri(&format!("{EV}graphProtection"))?,
             self.preparation
                 .lookup_term(self.snap, &string(&nonce.to_string()))?,
-            self.preparation
-                .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?,
-            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
-            self.preparation
-                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
         ) else {
             return Ok(false);
         };
+        let receipt = iri(&format!("{EV}availabilityReceipt"))?;
+        let generated = iri(&format!("{PROV}wasGeneratedBy"))?;
+        let operation_type = iri(RDF_TYPE)?.zip(iri(&format!("{EV}Operation"))?);
+        let is_iri = |id| {
+            self.preparation.with_term(self.snap, id, |term| {
+                Ok(matches!(term, Some(Term::NamedNode(_))))
+            })
+        };
         let mut found = false;
-        self.for_each_pos_intersection_in_graph(
-            g,
-            &[(rdf_type, op_class), (protection, nonce)],
-            |op| {
-                if self.preparation.with_term(self.snap, op, |term| {
-                    Ok(matches!(term, Some(Term::NamedNode(_))))
-                })? {
-                    self.for_each_pos_intersection_in_graph(
-                        g,
-                        &[(receipt, op), (protection, nonce)],
-                        |_| {
-                            found = true;
-                            Ok(false)
-                        },
-                    )?;
+        self.for_each_pos_intersection_in_graph(g, &[(protection, nonce)], |subject| {
+            // A protected record still identifies the publisher if the latter
+            // has lost its type or nonce.
+            if let Some(receipt) = receipt {
+                self.preparation.scan(
+                    self.snap,
+                    Perm::Gspo,
+                    &[g.0, subject.0, receipt.0],
+                    |quad| {
+                        found = is_iri(quad[2])?;
+                        Ok(!found)
+                    },
+                )?;
+            }
+            if !found
+                && let Some((p, class)) = operation_type
+                && self.contains_id(subject, p, class, g)?
+                && is_iri(subject)?
+            {
+                // A protected operation can still have an incoming publication
+                // edge if the record lost its nonce or its availability receipt.
+                for edge in [receipt, generated].into_iter().flatten() {
+                    self.for_each_pos_intersection_in_graph(g, &[(edge, subject)], |_| {
+                        found = true;
+                        Ok(false)
+                    })?;
+                    if found {
+                        break;
+                    }
                 }
-                Ok(!found)
-            },
-        )?;
+            }
+            Ok(!found)
+        })?;
         Ok(found)
     }
 

@@ -2384,9 +2384,10 @@ last support can therefore remove a publication link or receipt field. Format 2 
 owner and nonce but has no per-triple origin or history of graph roles.
 
 On upgrade, the store checks every branch in the family before marking a dedicated
-output as `projectionOnly`. An `ev:Operation` and a record naming it as its
-`ev:availabilityReceipt`, both carrying the current protection, suffice to preserve
-the graph even if a withdrawal removed `prov:wasGeneratedBy`. A projected copy of
+output as `projectionOnly`. The graph retains record history if a record carrying
+the current protection names a publisher IRI through `ev:availabilityReceipt`.
+It also retains history if a record names a currently protected `ev:Operation`
+through `ev:availabilityReceipt` or `prov:wasGeneratedBy`. A projected copy of
 that evidence receives the same protection. A projected operation description alone
 does not establish record history. Format 4 prevents new mixed histories. The writer
 rejects record writes to outputs marked `projectionOnly`. Moving such an output into a
@@ -2400,11 +2401,12 @@ payload conflict, a read grant or a projection to that receipt.
 
 If the operation is absent from current record-role graphs, replay checks former
 record graphs among the unmarked outputs. In a graph with receipt history under its
-current nonce, a surviving description at the deterministic operation IRI reserves
-the key even if the stored key, commit or publication link has disappeared. A
-protected `ev:Operation` bearing the stored key must also be accounted for. The dataset,
-principal and stored key determine its operation IRI, so another principal can use
-the same key independently. An unrelated record receipt establishes graph history only.
+current nonce, a surviving operation field at the deterministic IRI or a protected
+record naming that IRI through a receipt or generation edge reserves the key.
+A protected `ev:Operation` bearing the requested key must also be accounted for.
+If a live support owns the matching key quad, the requested key, dataset and
+surviving principal association can still identify another principal's operation.
+That principal's use of the key is independent. An unrelated record receipt establishes graph history only.
 
 Replay excludes every triple owned by a live support of the output's current review
 policy from the receipt evidence. The remaining operation description must contain

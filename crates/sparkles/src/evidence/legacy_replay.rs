@@ -6,7 +6,7 @@ use super::{
     operation_id, operation_iri,
 };
 use crate::access::Reservation;
-use oxrdf::{Literal, vocab::xsd};
+use oxrdf::{Literal, Triple, vocab::xsd};
 use sparkles_core::evidence::write::{RecordedOperation, StoredQuad};
 
 const ASSOCIATED: &str = "http://www.w3.org/ns/prov#wasAssociatedWith";
@@ -136,6 +136,106 @@ impl State<'_> {
         Ok(Description { quads, _held: held })
     }
 
+    fn legacy_unowned(
+        &mut self,
+        subject: &NamedNode,
+        predicate: &str,
+        object: &Term,
+        owner: Option<&PolicyGraphs>,
+    ) -> Result<bool> {
+        let Some(owner) = owner else { return Ok(true) };
+        let triple = Triple::new(
+            subject.clone(),
+            NamedNode::new_unchecked(predicate),
+            object.clone(),
+        );
+        Ok(!self.owned(&triple, owner)?)
+    }
+
+    /// Probe only fields written by publish_quads. Unrelated properties on a
+    /// fresh operation IRI must not consume the receipt description's row limit.
+    fn legacy_operation_field(
+        &mut self,
+        operation: &NamedNode,
+        graph: &G,
+        owner: Option<&PolicyGraphs>,
+    ) -> Result<bool> {
+        for class in [ev("Operation").as_str(), ACTIVITY] {
+            let object = Term::from(NamedNode::new_unchecked(class));
+            if self
+                .reads
+                .contains(operation.as_str(), RDF_TYPE, &object, graph.0.as_str())?
+                && self.legacy_unowned(operation, RDF_TYPE, &object, owner)?
+            {
+                return Ok(true);
+            }
+        }
+        for predicate in [
+            ASSOCIATED,
+            ENDED,
+            PROV_USED,
+            &ev("datasetId"),
+            &ev("branchId"),
+            &ev("commit"),
+            &ev("payloadDigest"),
+            &ev("graphProtection"),
+            &ev("idempotencyKey"),
+            &ev("sourceHold"),
+        ] {
+            let mut held = self.reads.preparation().reserve(0)?;
+            let (objects, more) = self.reads.objects_up_to_held(
+                operation.as_str(),
+                predicate,
+                graph.0.as_str(),
+                MAX_EVIDENCE,
+                &mut held,
+            )?;
+            for object in objects {
+                if self.legacy_unowned(operation, predicate, &object, owner)? {
+                    return Ok(true);
+                }
+            }
+            if more {
+                return Err(ambiguous_legacy_replay());
+            }
+        }
+        Ok(false)
+    }
+
+    /// A record can retain the only evidence of a named operation. Both its
+    /// nonce and the edge to the operation must survive support exclusion.
+    fn legacy_record_names(
+        &mut self,
+        operation: &NamedNode,
+        graph: &G,
+        nonce: Uuid,
+        owner: Option<&PolicyGraphs>,
+    ) -> Result<bool> {
+        let protection = NamedNode::new_unchecked(ev("graphProtection"));
+        let marker = Term::from(Literal::new_simple_literal(nonce.to_string()));
+        let target = Term::from(operation.clone());
+        for predicate in [ev("availabilityReceipt").as_str(), PROV_WAS_GENERATED_BY] {
+            let mut held = self.reads.preparation().reserve(0)?;
+            let (records, more) = self.reads.subjects_matching_up_to_held(
+                &[(predicate, &target), (protection.as_str(), &marker)],
+                graph.0.as_str(),
+                MAX_EVIDENCE,
+                &mut held,
+            )?;
+            for record in records {
+                if self.legacy_unowned(&record, predicate, &target, owner)?
+                    && self.legacy_unowned(&record, protection.as_str(), &marker, owner)?
+                {
+                    return Ok(true);
+                }
+            }
+            if more {
+                return Err(ambiguous_legacy_replay());
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn legacy_publisher(
         &mut self,
         graphs: &[G],
@@ -168,11 +268,15 @@ impl State<'_> {
                 MAX_EVIDENCE,
                 &mut held,
             )?;
-            let named =
-                self.reads
-                    .subject_triples(probe.operation_iri.as_str(), graph.0.as_str(), 1)?
-                    != 0;
-            if (!named && keyed.is_empty())
+            let owner = settings
+                .policies
+                .iter()
+                .find(|(_, policy)| policy.output == graph.0.as_str())
+                .map(|(name, policy)| PolicyGraphs::new(name, policy, capability))
+                .transpose()?;
+            let named = self.legacy_operation_field(&probe.operation_iri, graph, owner.as_ref())?
+                || self.legacy_record_names(&probe.operation_iri, graph, nonce, owner.as_ref())?;
+            if (!named && keyed.is_empty() && !more)
                 || !self
                     .reads
                     .has_published_operation_in_output(graph.0.as_str(), graph.1)?
@@ -182,12 +286,6 @@ impl State<'_> {
             if more {
                 return Err(ambiguous_legacy_replay());
             }
-            let owner = settings
-                .policies
-                .iter()
-                .find(|(_, policy)| policy.output == graph.0.as_str())
-                .map(|(name, policy)| PolicyGraphs::new(name, policy, capability))
-                .transpose()?;
             for other in keyed.iter().filter(|iri| *iri != &probe.operation_iri) {
                 // A key can legitimately occur under another principal. Its unowned
                 // description must account for that subject's deterministic identity.
@@ -195,10 +293,16 @@ impl State<'_> {
                 let principal = description
                     .iri(ASSOCIATED)?
                     .ok_or_else(ambiguous_legacy_replay)?;
-                let stored_key = description
-                    .literal(&ev("idempotencyKey"), xsd::STRING)?
-                    .value();
-                if operation_iri(operation_id(dataset, principal, stored_key)) != *other {
+                // If the raw matching key was shared, the index still gives its
+                // value. It can identify the other principal's IRI, but only an
+                // unowned key can authenticate a replay below.
+                let predicate = ev("idempotencyKey");
+                let other_key = if description.single(&predicate)?.is_some() {
+                    description.literal(&predicate, xsd::STRING)?.value()
+                } else {
+                    key
+                };
+                if operation_iri(operation_id(dataset, principal, other_key)) != *other {
                     return Err(ambiguous_legacy_replay());
                 }
             }

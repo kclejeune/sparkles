@@ -3225,6 +3225,9 @@ fn keyed_replay_finds_operation_after_supports_becomes_dedicated_output() {
 
 enum LegacyChange {
     WithdrawMetadata(&'static str),
+    WithdrawProjectionField(&'static str),
+    PropertyOnFreshOperation(NamedNode),
+    SharedKeyOtherPrincipal,
     ReplaceCommit,
     ProjectExtraCommit,
     ConflictingCommit,
@@ -3271,6 +3274,36 @@ fn legacy_replay_reserves_a_stored_key_even_on_a_different_operation_iri() {
 #[test]
 fn legacy_replay_ignores_a_key_on_a_non_operation_record() {
     check_keyed_replay_in_former_supports(true, Some(LegacyChange::KeyOnProjection));
+}
+
+#[test]
+fn legacy_replay_reserves_the_sole_publishers_key_after_withdrawal() {
+    for change in [
+        LegacyChange::WithdrawMetadata("a ev:Operation"),
+        LegacyChange::WithdrawMetadata("ev:graphProtection ?o"),
+        LegacyChange::WithdrawProjectionField("ev:availabilityReceipt ?o"),
+        LegacyChange::WithdrawProjectionField("ev:graphProtection ?o"),
+    ] {
+        check_keyed_replay_in_former_supports(false, Some(change));
+    }
+}
+
+#[test]
+fn legacy_replay_ignores_a_projected_property_on_a_fresh_operation() {
+    for predicate in [
+        oxrdf::vocab::rdfs::LABEL.into_owned(),
+        iri(&format!("{EV}idempotencyKey")),
+    ] {
+        check_keyed_replay_in_former_supports(
+            true,
+            Some(LegacyChange::PropertyOnFreshOperation(predicate)),
+        );
+    }
+}
+
+#[test]
+fn legacy_replay_scopes_a_live_shared_key_to_its_original_principal() {
+    check_keyed_replay_in_former_supports(true, Some(LegacyChange::SharedKeyOtherPrincipal));
 }
 
 #[test]
@@ -3434,16 +3467,36 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
         drop(ds);
         let ds = legacy_projection_writer(&root, SUPPORTS);
         let triples = match case {
-            LegacyChange::WithdrawMetadata(field) => {
+            LegacyChange::WithdrawMetadata(field)
+            | LegacyChange::WithdrawProjectionField(field) => {
+                let subject = if matches!(case, LegacyChange::WithdrawProjectionField(_)) {
+                    projection
+                } else {
+                    op
+                };
                 let result = ds
                     .construct(&format!(
                     "PREFIX ev: <{EV}> PREFIX prov: <http://www.w3.org/ns/prov#>
-                     CONSTRUCT {{ {op} {field} }} WHERE {{ GRAPH <{SUPPORTS}> {{ {op} {field} }} }}"
+                     CONSTRUCT {{ {subject} {field} }} WHERE {{ GRAPH <{SUPPORTS}> {{ {subject} {field} }} }}"
                 ))
                     .unwrap();
                 assert_eq!(result.len(), 1, "{field}");
                 result.triples().to_vec()
             }
+            LegacyChange::PropertyOnFreshOperation(ref predicate) => vec![Triple::new(
+                evidence::operation_iri(evidence::operation_id(
+                    ds.dataset_id(),
+                    &opts.principal,
+                    "extra-key",
+                )),
+                predicate.clone(),
+                oxrdf::Literal::new_simple_literal("extra-key"),
+            )],
+            LegacyChange::SharedKeyOtherPrincipal => vec![Triple::new(
+                op.clone(),
+                iri(&format!("{EV}idempotencyKey")),
+                oxrdf::Literal::new_simple_literal(opts.idempotency_key.as_deref().unwrap()),
+            )],
             LegacyChange::ConflictingKey | LegacyChange::KeyOnProjection => vec![Triple::new(
                 if matches!(case, LegacyChange::KeyOnProjection) {
                     projection.clone()
@@ -3525,7 +3578,10 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
         drop(ds);
         legacy_settings(&root, &s2);
         let ds = Dataset::open(&root).unwrap();
-        if matches!(case, LegacyChange::KeyOnProjection) {
+        if matches!(
+            case,
+            LegacyChange::KeyOnProjection | LegacyChange::PropertyOnFreshOperation(_)
+        ) {
             opts.idempotency_key = Some("extra-key".into());
             assert!(reconcile(&ds, "main", None, &opts).unwrap().committed);
             return;
@@ -3541,6 +3597,15 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                     .unwrap()
             );
         };
+        if matches!(case, LegacyChange::SharedKeyOtherPrincipal) {
+            assert_conflict(&opts);
+            opts.principal = iri("urn:principal:other-reviewer");
+            let independent = reconcile(&ds, "main", None, &opts).unwrap();
+            assert!(independent.committed && !independent.replayed);
+            assert_eq!(independent.policy_version, 2);
+            assert_ne!(independent.operation, first.operation);
+            return;
+        }
         if matches!(
             case,
             LegacyChange::ConflictingCommit | LegacyChange::ConflictingKey
@@ -3555,7 +3620,9 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
         }
         if matches!(
             case,
-            LegacyChange::WithdrawMetadata(_) | LegacyChange::ReplaceCommit
+            LegacyChange::WithdrawMetadata(_)
+                | LegacyChange::WithdrawProjectionField(_)
+                | LegacyChange::ReplaceCommit
         ) {
             assert_conflict(&opts);
             withdraw(&ds, &claims[0]);
@@ -3563,10 +3630,15 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                 !ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {shared} }} }}"))
                     .unwrap()
             );
-            assert!(
-                ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {link} }} }}"))
-                    .unwrap()
-            );
+            if !matches!(
+                case,
+                LegacyChange::WithdrawProjectionField("ev:availabilityReceipt ?o")
+            ) {
+                assert!(
+                    ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {link} }} }}"))
+                        .unwrap()
+                );
+            }
             if !matches!(case, LegacyChange::WithdrawMetadata("ev:idempotencyKey ?o")) {
                 assert!(ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {op} <{EV}idempotencyKey> \"dedicated-output-replay-key\" }} }}")).unwrap());
             }
@@ -3580,6 +3652,20 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                 );
             }
             assert_conflict(&opts);
+            if !reuse_projection {
+                let head = ds.store().head_commit().seq;
+                assert_eq!(
+                    code(reconcile(&ds, "other", Some(1), &reviewer())),
+                    "immutable-record-conflict"
+                );
+                assert_eq!(ds.store().head_commit().seq, head);
+                evidence::configure(&ds, &s2, &Control::none()).unwrap();
+                let registry = ds.store().managed_graphs().unwrap().unwrap();
+                let entry = &registry.owners[&OwnerKind::Evidence];
+                assert!(!entry.projection_only.contains(SUPPORTS));
+                assert_eq!(entry.protections[SUPPORTS], nonce_before);
+                assert_conflict(&opts);
+            }
             return;
         }
         if matches!(case, LegacyChange::WithdrawLink) {
