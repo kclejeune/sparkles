@@ -368,6 +368,9 @@ struct Prepared {
     projection_graphs: Vec<String>,
     /// the run's evidence under a review policy
     evidence: Option<Evidence>,
+    /// managed-registry generation and evidence visibility key frozen before reading
+    /// an ordinary (non-review-policy) snapshot view
+    evidence_guard: Option<(u64, Option<String>)>,
     /// the claims behind each entity's label and type lines
     entity_claims: HashMap<String, Vec<u32>>,
     /// the positions in the previous build's pairs of those that have ended
@@ -510,6 +513,7 @@ impl Run<'_> {
         footprint: &Footprint,
         graphs: &[String],
         evidence: Option<&EvidenceCheck>,
+        evidence_guard: Option<&(u64, Option<String>)>,
     ) -> Result<(), RunError> {
         let live: GraphragSettings =
             crate::settings::effective(self.st, &self.ds, &crate::settings::GRAPHRAG);
@@ -530,6 +534,17 @@ impl Run<'_> {
             return Err(RunError::Refused(
                 "the community role's providers changed during the run; start a new run".into(),
             ));
+        }
+        if let Some((start_gen, start_ev_key)) = evidence_guard {
+            let live_snap = self.ds.store.snapshot();
+            if self.ds.store.managed_generation() != *start_gen
+                || live_snap.evidence_visibility_key() != *start_ev_key
+            {
+                return Err(RunError::Refused(
+                    "the principal's view or the access policy changed during the run; start a new run"
+                        .into(),
+                ));
+            }
         }
         if &self.footprint(&principal, footprint.source_commit, graphs, None)? != footprint {
             return Err(RunError::Refused(
@@ -613,12 +628,20 @@ impl Run<'_> {
             self.limits,
             &opts,
         )?;
-        let view = match &ev {
-            Some(e) => BuildView::Source {
-                source: e.read_source(),
-                commit: e.commit(),
-            },
-            None => BuildView::Snapshot(self.ds.store.snapshot()),
+        let (view, evidence_guard) = match &ev {
+            Some(e) => (
+                BuildView::Source {
+                    source: e.read_source(),
+                    commit: e.commit(),
+                },
+                None,
+            ),
+            None => {
+                let managed_gen = self.ds.store.managed_generation();
+                let snap = self.ds.store.snapshot().pin_live_evidence();
+                let ev_key = snap.evidence_visibility_key();
+                (BuildView::Snapshot(snap), Some((managed_gen, ev_key)))
+            }
         };
         let output: Option<String> = ev.as_ref().map(|e| e.policy.output.clone());
         let ctl = sparkles::algo::Control::new(self.cancel.clone(), None, u64::MAX);
@@ -992,6 +1015,7 @@ impl Run<'_> {
             footprint,
             projection_graphs: footprint_graphs,
             evidence: ev,
+            evidence_guard,
             entity_claims,
             ended,
             revisions,
@@ -1880,6 +1904,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         &prep.footprint,
         &prep.projection_graphs,
         ev_check.as_ref(),
+        prep.evidence_guard.as_ref(),
     )?;
     let ledger = r.ledger()?;
     let tokenizers = Tokenizers::default();
@@ -1895,6 +1920,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         let mode = r.mode;
         let limits = r.limits;
         let ev_check = ev_check.clone();
+        let evidence_guard = prep.evidence_guard.clone();
         Arc::new(move || {
             let run = Run {
                 st: &st,
@@ -1907,8 +1933,15 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 cancel: cancel.clone(),
                 limits,
             };
-            run.recheck(&models, &pairs, &footprint, &graphs, ev_check.as_ref())
-                .map_err(|e| e.to_string())
+            run.recheck(
+                &models,
+                &pairs,
+                &footprint,
+                &graphs,
+                ev_check.as_ref(),
+                evidence_guard.as_ref(),
+            )
+            .map_err(|e| e.to_string())
         })
     };
     let admission =
@@ -2104,6 +2137,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 &prep.footprint,
                 &prep.projection_graphs,
                 ev_check.as_ref(),
+                prep.evidence_guard.as_ref(),
             )?;
             let res = r.write_report(
                 &models,
@@ -2239,6 +2273,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             &prep.footprint,
             &prep.projection_graphs,
             ev_check.as_ref(),
+            prep.evidence_guard.as_ref(),
         )?;
         // a review or another writer changed a report link since the run read it: the
         // run's plan no longer describes the graph, and committing would undo that change

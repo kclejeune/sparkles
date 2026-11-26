@@ -139,30 +139,50 @@ fn access_changed() -> LiveEvent {
 
 struct Stream {
     st: Arc<AppState>,
+    ds: Arc<Dataset>,
     live: Arc<LiveQuery>,
     coalesce: Duration,
     queue: std::collections::VecDeque<Event>,
     /// the caller, whose views were decided under its authority: a policy change or
     /// the revocation of its own credential ends the stream
     principal: Principal,
+    /// whether `principal` is restricted on this dataset, so dataset evidence changes
+    /// must invalidate queued events and end the stream
+    restricted: bool,
+    /// dataset managed-registry generation when the subscription opened
+    managed_gen: u64,
+    /// evidence visibility key when the subscription opened
+    evidence_key: Option<String>,
     done: bool,
     /// an event read while coalescing that does not merge
     pending: Option<LiveEvent>,
 }
 
 impl Stream {
+    fn access_current(&self) -> bool {
+        if !self.st.access_current(&self.principal) {
+            return false;
+        }
+        if !self.restricted {
+            return true;
+        }
+        self.ds.store.managed_generation() == self.managed_gen
+            && self.evidence_key.as_deref() != Some("unavailable")
+            && self.ds.store.snapshot().evidence_visibility_key() == self.evidence_key
+    }
+
     async fn recv(&mut self) -> Option<LiveEvent> {
         loop {
             if self.st.phase() == crate::obs::Phase::Draining {
                 return None;
             }
-            if !self.st.access_current(&self.principal) {
+            if !self.access_current() {
                 return Some(access_changed());
             }
             tokio::select! {
                 e = self.live.recv() => {
                     // an event read after the access ended is not sent
-                    if e.is_some() && !self.st.access_current(&self.principal) {
+                    if e.is_some() && !self.access_current() {
                         return Some(access_changed());
                     }
                     return e;
@@ -176,7 +196,7 @@ impl Stream {
         loop {
             // Checked before every event, so the rest of a paged snapshot and events
             // read or merged under an access that has since ended are dropped.
-            if !self.done && !self.st.access_current(&self.principal) {
+            if !self.done && !self.access_current() {
                 self.queue.clear();
                 self.pending = None;
                 self.done = true;
@@ -205,7 +225,7 @@ impl Stream {
                 // Waits at most a second at a time, so an access that ends while
                 // diffs are merged ends the stream instead of sending them.
                 while let Some(left) = until.checked_duration_since(Instant::now()) {
-                    if !self.st.access_current(&self.principal) {
+                    if !self.access_current() {
                         break;
                     }
                     let tick = left.min(Duration::from_secs(1));
@@ -222,7 +242,7 @@ impl Stream {
                     }
                 }
                 // the check at the top of the loop sends the error instead
-                if !self.st.access_current(&self.principal) {
+                if !self.access_current() {
                     continue;
                 }
                 // a merge that cancels out sends nothing
@@ -270,6 +290,13 @@ pub(super) async fn live(
         },
     };
     let access = p.view(&ds.name, crate::auth::Endpoint::Query);
+    let restricted = access.as_ref().is_some_and(|a| !a.reads_everything());
+    let managed_gen = ds.store.managed_generation();
+    let evidence_key = if restricted {
+        ds.store.snapshot().evidence_visibility_key()
+    } else {
+        None
+    };
     let o = LiveOptions {
         after,
         max_memory_bytes: None,
@@ -279,10 +306,14 @@ pub(super) async fn live(
     let live = blocking(move || Ok(ds2.dataset.live_as(&query, access, &o)?)).await?;
     let stream = Stream {
         st: st.clone(),
+        ds: ds.clone(),
         live: Arc::new(live),
         coalesce,
         queue: Default::default(),
         principal: p,
+        restricted,
+        managed_gen,
+        evidence_key,
         done: false,
         pending: None,
     };

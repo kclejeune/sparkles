@@ -169,7 +169,13 @@ impl Runtime {
                 if let Some((c, c_lease)) = change {
                     self.publish(st, before, c, c_lease, true, deferred);
                 }
-                if std::mem::take(&mut st.rebased) {
+                let ev_restricted = st
+                    .circuit
+                    .access
+                    .as_ref()
+                    .is_some_and(|a| !a.reads_everything())
+                    && st.circuit.evidence_key().is_some();
+                if std::mem::take(&mut st.rebased) || ev_restricted {
                     st.clear_history();
                 }
             }
@@ -208,7 +214,8 @@ impl Runtime {
         }
         if from >= head.commit && ev_changed {
             // Managed settings, protection nonces, or availability changed without an RDF
-            // commit: clear commit-keyed replay history and rebuild/reset at `head`.
+            // commit: rebuild at `head`, clear replay history, and replace subscriber queues
+            // with a fresh reset so no superseded events or same-commit replay diffs remain.
             cell.info.lock().status = Status::Building;
             let t0 = Instant::now();
             match st
@@ -216,13 +223,15 @@ impl Runtime {
                 .reset_charged(&DeltaSet::at(head), &self.control())
             {
                 Ok((c, c_lease)) => {
+                    drop(c);
+                    drop(c_lease);
                     self.counters.resets.fetch_add(1, Ordering::Relaxed);
                     cell.info.lock().status = Status::Ready;
                     self.note_pass(cell, st, t0.elapsed(), false);
-                    st.clear_history();
-                    self.publish(st, from, c, c_lease, true, deferred);
+                    self.publish_evidence_reset(st, deferred);
                 }
                 Err(e) => {
+                    st.clear_history();
                     self.fail(cell, st, &e, deferred);
                     return true;
                 }
@@ -230,6 +239,7 @@ impl Runtime {
             self.live_budgets(st, deferred);
             return true;
         }
+        let prev_ev = st.circuit.evidence_key().map(str::to_string);
         let d = deltas
             .entry(from)
             .or_insert_with(|| Arc::new(DeltaSet::read(store, from, &Control::none())))
@@ -266,9 +276,23 @@ impl Runtime {
                 }
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, took, false);
-                self.publish(st, from, c, c_lease, true, deferred);
+                let ev_now_changed =
+                    restricted && (ev_changed || st.circuit.evidence_key() != prev_ev.as_deref());
+                if ev_now_changed {
+                    drop(c);
+                    drop(c_lease);
+                    self.publish_evidence_reset(st, deferred);
+                } else {
+                    self.publish(st, from, c, c_lease, true, deferred);
+                    if restricted && st.circuit.evidence_key().is_some() {
+                        st.clear_history();
+                    }
+                }
             }
             Err(e) => {
+                if restricted {
+                    st.clear_history();
+                }
                 self.fail(cell, st, &e, deferred);
                 return true;
             }
@@ -378,6 +402,51 @@ impl Runtime {
             crate::incr::circuit::into_arc_rows(decoded, &mut lease).ok()?,
             lease,
         ))
+    }
+
+    /// Clear commit-keyed replay history and replace every live subscriber's queued
+    /// events with a fresh `reset` reflecting the circuit's current evidence view.
+    fn publish_evidence_reset(&self, st: &mut Slot, deferred: &mut DeferredDrops) {
+        st.prune_dead_subs();
+        st.clear_history();
+        if st.subs.is_empty() {
+            return;
+        }
+        let to = st.circuit.applied;
+        let event_rows = st
+            .circuit
+            .ordered_row_count()
+            .unwrap_or_else(|| st.circuit.result.len());
+        if event_rows > crate::incr::live::QUEUE_ROWS {
+            for s in &mut st.subs {
+                if let Some(sh) = s.shared.upgrade() {
+                    deferred.queued.extend(sh.mark_overflow());
+                    s.last = to;
+                    self.counters.live_events.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        let (event, mut event_lease) = match st.event_budgeted(true) {
+            Ok(pair) => pair,
+            Err(e) => {
+                st.fail_live_subs(&e, deferred);
+                return;
+            }
+        };
+        let shared_lease = st.detach_event_lease(&mut event_lease);
+        for s in &mut st.subs {
+            if let Some(sh) = s.shared.upgrade() {
+                s.last = to;
+                deferred
+                    .queued
+                    .extend(sh.replace_leased(event.clone(), shared_lease.clone()));
+                self.counters.live_events.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        deferred
+            .queued
+            .push(crate::incr::live::QueuedEvent::new(event, shared_lease));
     }
 
     /// Send the change `c` from commit `from` to the circuit's commit to the

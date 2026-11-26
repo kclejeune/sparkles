@@ -1364,15 +1364,16 @@ impl Circuit {
                     .remaining_local()
                     .or(self.max_memory_bytes)
                     .unwrap_or(u64::MAX);
-                let prep = match self.budget.handle().child_parent(self.pool.as_ref())? {
-                    Some((parent, grant)) => crate::access::Preparation::with_parent(
-                        control.clone(),
-                        local_limit,
-                        parent,
-                        grant,
-                    )?,
-                    None => crate::access::Preparation::new(control.clone(), local_limit)?,
-                };
+                let (parent, grant) = self
+                    .budget
+                    .handle()
+                    .preparation_parent(self.pool.as_ref())?;
+                let prep = crate::access::Preparation::with_parent(
+                    control.clone(),
+                    local_limit,
+                    parent,
+                    grant,
+                )?;
                 let prepared = a.masked_controlled(&snap, &prep)?;
                 let masked = prepared.snapshot_arc();
                 _prepared_mask = Some(prepared);

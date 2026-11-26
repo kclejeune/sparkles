@@ -358,6 +358,42 @@ impl Shared {
         displaced
     }
 
+    /// Replace all queued data events with `e` (a fresh `reset` or terminal `Error`),
+    /// returning displaced events to drop outside locks so a subscriber cannot observe
+    /// superseded pre-change events ahead of the replacement.
+    pub(crate) fn replace_leased(
+        &self,
+        e: LiveEvent,
+        lease: Option<Arc<QueuedLease>>,
+    ) -> Vec<QueuedEvent> {
+        let mut q = self.queue.lock();
+        if q.closed {
+            return vec![QueuedEvent::new(e, lease)];
+        }
+        let mut displaced: Vec<QueuedEvent> = q.events.drain(..).collect();
+        q.rows = 0;
+        q.bytes = 0;
+        q.overflow = false;
+        let end = matches!(e, LiveEvent::Error { .. });
+        let rows = e.rows();
+        let bytes = lease.as_ref().map_or(0, |l| l.bytes);
+        if (rows > QUEUE_ROWS || bytes > self.byte_limit) && !end {
+            displaced.push(QueuedEvent::new(e, lease));
+            q.overflow = true;
+        } else {
+            q.rows = rows;
+            q.bytes = bytes;
+            q.events.push_back(QueuedEvent::new(e, lease));
+        }
+        if end {
+            q.closed = true;
+        }
+        drop(q);
+        self.cv.notify_all();
+        self.notify.notify_one();
+        displaced
+    }
+
     /// End the stream and take its data events. A terminal error can still be read
     /// after runtime shutdown, and it carries no event lease.
     pub(crate) fn close(&self, keep_error: bool) -> VecDeque<QueuedEvent> {

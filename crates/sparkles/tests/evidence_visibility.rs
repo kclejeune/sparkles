@@ -1429,7 +1429,113 @@ fn limited_history_apis_and_inherited_named_snapshot_preserve_pinned_config() {
         .store()
         .snapshot_at_with_branch(&feature2, &At::Commit(fork_seq), &HistoryOptions::default())
         .unwrap();
-    assert!(!ask_in(unbounded_fork_snap, reader_meta));
+    assert!(!ask_in(unbounded_fork_snap, reader_meta.clone()));
+
+    // 6. Distinguish logical branch binding from physical commit binding at the SAME RDF commit
+    //    (and under `At::Time`): commit `fork_cleared_seq` on `feature` is recorded under the
+    //    cleared (no-policy) settings so `reader_meta` CAN see `cve-1` via its physical binding,
+    //    while a named pin at the SAME RDF commit after re-enabling the policy binds the active
+    //    policy so a branch forked from that pin HIDES `cve-1` at both `At::Commit` and `At::Time`.
+    let feature_ds = ds.branch("feature").unwrap();
+    feature_ds
+        .update(&format!(
+            "INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:marker> <urn:step> 2 }} }}"
+        ))
+        .unwrap();
+    let fork_cleared_commit = feature.head_commit();
+    let fork_cleared_seq = fork_cleared_commit.seq;
+    let fork_cleared_ts = fork_cleared_commit.timestamp_ms;
+
+    // Re-enable the review policy at the SAME commit `fork_cleared_seq` and bind a named pin
+    // on `feature` carrying the active policy configuration.
+    evidence::configure(&ds, &two_boundary_settings(), &Control::none()).unwrap();
+    assert_eq!(feature.head_commit().seq, fork_cleared_seq);
+    let ev_active_pin = ds
+        .store()
+        .evidence_view_with_branch(&feature, &At::Head, &prep(64 << 20))
+        .unwrap();
+    feature
+        .create_bound_snapshot(
+            "pin-fork-active-same-seq",
+            &ev_active_pin,
+            &Default::default(),
+        )
+        .unwrap();
+
+    // Fork `feature_active` from `feature` at `pin-fork-active-same-seq` and advance it by one
+    // commit so `fork_cleared_seq` is non-head on `feature_active`.
+    ds.store()
+        .create_branch(
+            "feature_active",
+            &sparkles::branch::BranchOptions {
+                from: "feature".into(),
+                at: At::Snapshot("pin-fork-active-same-seq".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let feature_active_ds = ds.branch("feature_active").unwrap();
+    feature_active_ds
+        .update(&format!(
+            "INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:marker> <urn:step> 3 }} }}"
+        ))
+        .unwrap();
+    let feature_active = ds.store().branch("feature_active").unwrap();
+
+    // On `feature` itself, the physical commit `fork_cleared_seq` was written with no policy ->
+    // `reader_meta` sees `cve-1` (`true`).
+    let (phys_commit_snap, _, _) = ds
+        .store()
+        .snapshot_at_with_branch(
+            &feature,
+            &At::Commit(fork_cleared_seq),
+            &HistoryOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        ask_in(phys_commit_snap, reader_meta.clone()),
+        "physical commit written without policy must expose cve-1 to reader_meta"
+    );
+    let (phys_time_snap, _, _) = ds
+        .store()
+        .snapshot_at_with_branch(
+            &feature,
+            &At::Time(fork_cleared_ts),
+            &HistoryOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        ask_in(phys_time_snap, reader_meta.clone()),
+        "At::Time resolving to physical no-policy commit on feature must expose cve-1"
+    );
+
+    // On `feature_active`, the SAME RDF commit `fork_cleared_seq` (selected by `At::Commit` and
+    // `At::Time`) carries `feature_active`'s logical branch binding from `pin-fork-active-same-seq`
+    // (active policy) -> `reader_meta` must NOT see `cve-1` (`false`)!
+    let (branch_commit_snap, _, _) = ds
+        .store()
+        .snapshot_at_with_branch(
+            &feature_active,
+            &At::Commit(fork_cleared_seq),
+            &HistoryOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        !ask_in(branch_commit_snap, reader_meta.clone()),
+        "logical branch binding at fork_cleared_seq must hide cve-1 from reader_meta"
+    );
+    let (branch_time_snap, _, _) = ds
+        .store()
+        .snapshot_at_with_branch(
+            &feature_active,
+            &At::Time(fork_cleared_ts),
+            &HistoryOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        !ask_in(branch_time_snap, reader_meta),
+        "At::Time resolving to logical branch fork_cleared_seq must hide cve-1 from reader_meta"
+    );
 }
 
 #[test]
@@ -2134,12 +2240,110 @@ fn circuit_build_masking_obeys_cancel_and_memory_budget() {
     assert!(matches!(err, Error::Cancelled), "got {err:?}");
 
     // 2. Tight circuit memory cap refuses evidence masking.
-    let mut c_mem = sparkles::incr::Circuit::new(compiled, Some(reader_a));
+    let mut c_mem = sparkles::incr::Circuit::new(compiled.clone(), Some(reader_a.clone()));
     c_mem.max_memory_bytes = Some(512);
     let err = c_mem
         .build(ds.store().snapshot(), &Control::none())
         .expect_err("tiny circuit budget must refuse evidence masking");
     assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+
+    // 3. Unpooled standalone circuit must charge evidence masking and operator initialization
+    //    against the SAME local cap (not separate allowances).
+    //    A 2-way join over 150 tags produces 22,500 rows so operator state (`init_min`) is
+    //    large (~2.5 MiB) and 100% deterministic, while 5 unbacked triples in OUTPUT give a
+    //    smaller deterministic `mask_retained` (~640 KiB) whose worst-case 7-way masking peak
+    //    sits well below `init_min`.
+    let mut insert_public = String::from("INSERT DATA { GRAPH <");
+    insert_public.push_str(PUBLIC);
+    insert_public.push_str("> { ");
+    for i in 0..150 {
+        insert_public.push_str(&format!(
+            "<urn:release> <urn:tag> \"tag-payload-{i:04}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" . "
+        ));
+    }
+    insert_public.push_str("} }");
+    ds.update(&insert_public).unwrap();
+    {
+        let cap = ds
+            .store()
+            .managed_writer(sparkles::managed::OwnerKind::Evidence, uuid::Uuid::new_v4())
+            .unwrap();
+        let mut t = ds.store().write();
+        t.set_managed(cap).unwrap();
+        let mut labels = std::collections::HashMap::new();
+        for i in 0..5 {
+            let q = Quad::new(
+                iri(&format!("urn:unbacked:{i}")),
+                iri("urn:p"),
+                iri(&format!("urn:val:{i}")),
+                GraphName::NamedNode(iri(OUTPUT)),
+            );
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        t.commit().unwrap();
+    }
+    let reader_both = reading(&[OUTPUT, DECISIONS, SUPPORTS, CLAIMS_A, SOURCES_A, PUBLIC]);
+    let combined_q = sparkles::sparql::parse_query(
+        &format!(
+            "SELECT ?o (COUNT(*) AS ?n) WHERE {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> ?o }} GRAPH <{PUBLIC}> {{ <urn:release> <urn:tag> ?t1 . <urn:release> <urn:tag> ?t2 }} }} GROUP BY ?o"
+        ),
+        None,
+        &[],
+    )
+    .unwrap();
+    let combined_compiled = sparkles::incr::compile(&combined_q, None).unwrap();
+    let snap = ds.store().snapshot();
+
+    // Measure the deterministic retained reservation of the prepared mask.
+    let mask_retained = {
+        let p = prep(16 << 20);
+        let _prepared = reader_both.masked_controlled(&snap, &p).unwrap();
+        p.limit() - p.available_bytes()
+    };
+    // Binary-search the deterministic minimum cap for unrestricted operator initialization alone.
+    let mut lo = 0u64;
+    let mut hi = 32 << 20;
+    while lo + 256 < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mut c = sparkles::incr::Circuit::new(combined_compiled.clone(), None);
+        c.max_memory_bytes = Some(mid);
+        if c.build(snap.clone(), &Control::none()).is_ok() {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let init_min = hi;
+    assert!(
+        mask_retained > 4096 && init_min > mask_retained,
+        "expected init_min ({init_min}) > mask_retained ({mask_retained}) > 4096"
+    );
+    // Pick a cap that exceeds `init_min` (so operator init alone succeeds) and comfortably
+    // exceeds masking alone, yet is strictly less than `mask_retained + init_min` so the
+    // unpooled circuit's combined live memory (mask reservation + operator init) must refuse.
+    let tight_combined = init_min + (mask_retained / 2);
+    assert!(
+        sparkles::access::Preparation::new(Control::none(), tight_combined)
+            .and_then(|p| reader_both.masked_controlled(&snap, &p))
+            .is_ok(),
+        "masking alone must fit within {tight_combined} (mask_retained={mask_retained}, init_min={init_min})"
+    );
+    let mut c_unrestricted = sparkles::incr::Circuit::new(combined_compiled.clone(), None);
+    c_unrestricted.max_memory_bytes = Some(tight_combined);
+    c_unrestricted
+        .build(snap.clone(), &Control::none())
+        .expect("operator init alone must fit within tight_combined");
+
+    let mut c_combined = sparkles::incr::Circuit::new(combined_compiled, Some(reader_both));
+    c_combined.max_memory_bytes = Some(tight_combined);
+    let err = c_combined
+        .build(snap, &Control::none())
+        .expect_err("unpooled circuit must refuse when mask + operator init exceed combined cap");
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded for unpooled combined cap (mask_retained={mask_retained}, init_min={init_min}, cap={tight_combined}), got {err:?}"
+    );
 }
 
 #[test]
@@ -2628,6 +2832,14 @@ fn cold_branch_named_snapshot_and_earlier_stored_fact_without_opening_branch() {
 
     // Reopen ONLY the main store: `cold-br` is cold and must NOT be opened!
     let reopened = Dataset::open(dir.path()).unwrap();
+    assert!(
+        reopened
+            .store()
+            .try_resident_branch(br_id, &Default::default())
+            .unwrap()
+            .is_none(),
+        "cold branch must not be resident before lookup"
+    );
     let (cold_snap, _, _) = reopened
         .store()
         .snapshot_of_branch_limited(
@@ -2637,6 +2849,14 @@ fn cold_branch_named_snapshot_and_earlier_stored_fact_without_opening_branch() {
             64 << 20,
         )
         .unwrap();
+    assert!(
+        reopened
+            .store()
+            .try_resident_branch(br_id, &Default::default())
+            .unwrap()
+            .is_none(),
+        "cold branch must remain non-resident after snapshot_of_branch_limited"
+    );
 
     let authorized = reading(&[OUTPUT, DECISIONS, SUPPORTS, CLAIMS_A, SOURCES_A, PUBLIC]);
     let unauthorized = reading(&[OUTPUT, DECISIONS, SUPPORTS, CLAIMS_A, SOURCES_A]);
@@ -2664,6 +2884,14 @@ fn cold_branch_named_snapshot_and_earlier_stored_fact_without_opening_branch() {
     )
     .unwrap();
     assert!(!deny.boolean);
+    assert!(
+        reopened
+            .store()
+            .try_resident_branch(br_id, &Default::default())
+            .unwrap()
+            .is_none(),
+        "cold branch must remain non-resident after cold StoredFact verification"
+    );
 }
 
 #[test]
@@ -2767,19 +2995,64 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
         "StoredFact with ev:skolemMap must be rejected"
     );
 
-    // 2. Tight memory cap on snapshot_at_limited refuses combined snapshot + pinned config.
+    // 2. Combined memory cap on snapshot_at_limited: pick a cap that admits BOTH the
+    //    historical configuration pin alone (measured on the live commit with only 4 KiB
+    //    snapshot charge) AND the non-live historical delta alone, yet fails when their
+    //    combined charge exceeds the cap.
+    let mut bulk = String::from("INSERT DATA { GRAPH <");
+    bulk.push_str(PUBLIC);
+    bulk.push_str("> { ");
+    for i in 0..80 {
+        bulk.push_str(&format!("<urn:hist:s{i}> <urn:hist:p> <urn:hist:o{i}> . "));
+    }
+    bulk.push_str("} }");
+    ds.update(&bulk).unwrap();
+    let hist_seq = ds.store().head_commit().seq;
+    // Advance head so `hist_seq` is a non-live historical commit with a non-trivial delta.
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:hist:after> <urn:hist:p> 1 }} }}"
+    ))
+    .unwrap();
     let head_seq = ds.store().head_commit().seq;
+    let ho = HistoryOptions::default();
+    let mut lo = 0u64;
+    let mut hi = 4 << 20;
+    while lo + 256 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if ds
+            .store()
+            .snapshot_at_limited(&At::Commit(head_seq), &ho, mid)
+            .is_ok()
+        {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let live_plus_pin_min = hi;
+    // `live_plus_pin_min` strictly covers configuration decoding + pinning (> 64 KiB).
+    // Adding 2 KiB guarantees pinning alone fits comfortably, while `hist_seq`'s non-live
+    // snapshot delta pushes `delta + pin_peak` past `combined_cap`.
+    let combined_cap = live_plus_pin_min + 2048;
+    assert!(
+        ds.store()
+            .snapshot_at_limited(&At::Commit(head_seq), &ho, combined_cap)
+            .is_ok(),
+        "configuration pinning alone must succeed at {combined_cap}"
+    );
     let cap_err = ds
         .store()
-        .snapshot_at_limited(
-            &At::Commit(head_seq),
-            &HistoryOptions::default(),
-            4096 + 1024,
-        )
+        .snapshot_at_limited(&At::Commit(hist_seq), &ho, combined_cap)
         .err();
     assert!(
         matches!(cap_err, Some(Error::BudgetExceeded(_))),
-        "cap that cannot fit snapshot + pinned config must return BudgetExceeded, got {cap_err:?}"
+        "cap {combined_cap} (admitting pin alone at {live_plus_pin_min}) must fail combined delta + pin on hist_seq, got {cap_err:?}"
+    );
+    assert!(
+        ds.store()
+            .snapshot_at_limited(&At::Commit(hist_seq), &ho, 16 << 20)
+            .is_ok(),
+        "generous cap must admit combined historical delta + pin"
     );
 
     // 3. Combined max_hidden cap counts ordinary hidden triples + evidence hidden triples together.
@@ -2852,4 +3125,501 @@ fn skolem_map_rejection_pin_budget_combined_max_hidden_and_secondary_surface() {
             "forms surface must not expose hidden projected triple: {rendered}"
         );
     }
+}
+
+#[test]
+fn live_query_fresh_attach_resume_and_same_commit_reset_invalidate_evidence() {
+    use sparkles::incr::{LiveEvent, LiveOptions, Runtime, RuntimeOptions};
+
+    let ds = configured(false);
+    let ca = propose_in(&ds, SOURCES_A, CLAIMS_A, "src-a", "a1", affected());
+    decide(&ds, &ca, Disposition::Accepted, None);
+    let c1 = ds.store().head_commit().seq;
+
+    let reader_a = reading(&[OUTPUT, DECISIONS, SUPPORTS, CLAIMS_A, SOURCES_A]);
+    let q =
+        format!("SELECT ?o WHERE {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> ?o }} }}");
+    let rt = Runtime::open(None, ds.store().dataset_id(), RuntimeOptions::default());
+
+    // Initial live subscriber warms the shared cell into `Status::Ready`.
+    let sub1 = rt
+        .live(
+            ds.store(),
+            &q,
+            Some(reader_a.clone()),
+            &LiveOptions::default(),
+        )
+        .unwrap();
+    let first = sub1
+        .next_timeout(std::time::Duration::from_secs(2))
+        .expect("initial snapshot event");
+    match first {
+        LiveEvent::Snapshot { rows, reset, .. } => {
+            assert!(!reset);
+            assert_eq!(rows.len(), 1, "expected cve-1 before detach");
+        }
+        other => panic!("expected initial Snapshot, got {other:?}"),
+    }
+
+    // 1. Detach + re-configure at the SAME RDF commit without running `rt.round(...)`.
+    //    A fresh live subscriber joining the already-Ready cell must NOT see the stale row!
+    ds.store()
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, OUTPUT)
+        .unwrap();
+    evidence::configure(&ds, &two_boundary_settings(), &Control::none()).unwrap();
+    assert_eq!(ds.store().head_commit().seq, c1);
+
+    let sub_fresh = rt
+        .live(
+            ds.store(),
+            &q,
+            Some(reader_a.clone()),
+            &LiveOptions::default(),
+        )
+        .unwrap();
+    match sub_fresh
+        .next_timeout(std::time::Duration::from_secs(2))
+        .expect("fresh attach event")
+    {
+        LiveEvent::Snapshot { rows, .. } => {
+            assert!(
+                rows.is_empty(),
+                "fresh live subscriber joining Ready cell after same-commit detach saw stale rows: {rows:?}"
+            );
+        }
+        other => panic!("expected Snapshot for fresh attach, got {other:?}"),
+    }
+    // Existing subscriber `sub1` must receive a `reset` replacing its view.
+    match sub1
+        .next_timeout(std::time::Duration::from_secs(2))
+        .expect("reset event for existing subscriber")
+    {
+        LiveEvent::Snapshot { rows, reset, .. } => {
+            assert!(reset, "expected reset snapshot after same-commit detach");
+            assert!(rows.is_empty(), "expected empty reset rows, got {rows:?}");
+        }
+        other => panic!("expected reset Snapshot for sub1, got {other:?}"),
+    }
+
+    // 2. On a fresh dataset, accept cve-1 at `c1` and cve-2 at `c2`, advance via `rt2.round`,
+    //    then detach + re-configure at the SAME commit `c2` and run `rt2.round` (testing
+    //    `Runtime::advance` same-commit reset + `publish_evidence_reset` + `resume`).
+    let ds2 = configured(false);
+    let ca2 = propose_in(&ds2, SOURCES_A, CLAIMS_A, "src-a", "a1", affected());
+    decide(&ds2, &ca2, Disposition::Accepted, None);
+    let c1_b = ds2.store().head_commit().seq;
+    let rt2 = Runtime::open(None, ds2.store().dataset_id(), RuntimeOptions::default());
+    let sub2 = rt2
+        .live(
+            ds2.store(),
+            &q,
+            Some(reader_a.clone()),
+            &LiveOptions::default(),
+        )
+        .unwrap();
+    let _ = sub2
+        .next_timeout(std::time::Duration::from_secs(2))
+        .expect("sub2 initial snapshot");
+
+    let c2_claim = propose_in(
+        &ds2,
+        SOURCES_A,
+        CLAIMS_A,
+        "src-a2",
+        "a2",
+        Triple::new(iri("urn:release"), iri("urn:affectedBy"), iri("urn:cve-2")),
+    );
+    decide(&ds2, &c2_claim, Disposition::Accepted, None);
+    let c2 = ds2.store().head_commit().seq;
+    assert!(c2 > c1_b);
+    assert!(rt2.round(ds2.store()));
+    // Drain the c2 update on `sub2`.
+    let _ = sub2.next_timeout(std::time::Duration::from_secs(2));
+
+    ds2.store()
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, OUTPUT)
+        .unwrap();
+    evidence::configure(&ds2, &two_boundary_settings(), &Control::none()).unwrap();
+    assert_eq!(ds2.store().head_commit().seq, c2);
+    assert!(rt2.round(ds2.store()));
+
+    // Existing subscriber must receive a `reset` (NOT a `Diff` with removed rows).
+    match sub2
+        .next_timeout(std::time::Duration::from_secs(2))
+        .expect("same-commit advance reset")
+    {
+        LiveEvent::Snapshot { rows, reset, .. } => {
+            assert!(reset, "same-commit evidence change must emit reset");
+            assert!(rows.is_empty(), "expected empty rows after detach");
+        }
+        other => panic!("expected reset Snapshot after same-commit advance, got {other:?}"),
+    }
+
+    // 3. Resuming at `after == c2` (same commit) and `after == c1_b` (earlier commit) must both
+    //    emit a fresh `reset` rather than silence (`None`) or a diff with removed rows!
+    for after in [c2, c1_b] {
+        let resumed = rt2
+            .live(
+                ds2.store(),
+                &q,
+                Some(reader_a.clone()),
+                &LiveOptions {
+                    after: Some(after),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        match resumed
+            .next_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|| panic!("expected reset event when resuming after {after}"))
+        {
+            LiveEvent::Snapshot { rows, reset, .. } => {
+                assert!(reset, "resume after {after} must emit reset");
+                assert!(
+                    rows.is_empty(),
+                    "resumed live query after {after} leaked rows: {rows:?}"
+                );
+            }
+            other => panic!("resume after {after} must emit reset Snapshot, got {other:?}"),
+        }
+    }
+
+    // 4. Even after removing the policy completely at the same commit, resuming with `after == c2`
+    //    must still emit a fresh `reset` (because commit numbers cannot establish evidence state).
+    ds2.store()
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, OUTPUT)
+        .unwrap();
+    let mut cleared = two_boundary_settings();
+    cleared.policies.clear();
+    cleared.projections.clear();
+    evidence::configure(&ds2, &cleared, &Control::none()).unwrap();
+    assert_eq!(ds2.store().head_commit().seq, c2);
+
+    let resumed_post_removal = rt2
+        .live(
+            ds2.store(),
+            &q,
+            Some(reader_a),
+            &LiveOptions {
+                after: Some(c2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    match resumed_post_removal
+        .next_timeout(std::time::Duration::from_secs(2))
+        .expect("expected reset after post-removal resume")
+    {
+        LiveEvent::Snapshot { reset, .. } => {
+            assert!(reset, "post-removal same-commit resume must emit reset");
+        }
+        other => panic!("expected reset Snapshot after policy removal, got {other:?}"),
+    }
+}
+
+#[test]
+fn legacy_family_history_and_changes_refused_after_policy_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    // Legacy (non-activated) persistent family: configure review policy and accept projection.
+    evidence::configure(&ds, &two_boundary_settings(), &Control::none()).unwrap();
+    let ca = propose_in(&ds, SOURCES_A, CLAIMS_A, "src-a", "a1", affected());
+    decide(&ds, &ca, Disposition::Accepted, None);
+    ds.store().flush_change_log().unwrap();
+
+    // Detach all managed graphs, disable the evidence profile and clear policies, and delete
+    // the projected quad so live reads are empty.
+    for g in two_boundary_settings().managed_graphs() {
+        ds.store()
+            .detach_managed(sparkles::managed::OwnerKind::Evidence, &g)
+            .unwrap();
+    }
+    let mut disabled = two_boundary_settings();
+    disabled.enabled = false;
+    disabled.policies.clear();
+    disabled.projections.clear();
+    evidence::configure(&ds, &disabled, &Control::none()).unwrap();
+    ds.update(&format!(
+        "DELETE DATA {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} }}"
+    ))
+    .unwrap();
+    ds.store().flush_change_log().unwrap();
+
+    let reader_out = reading(&[OUTPUT]);
+    let queries = [
+        (
+            "streaming",
+            "PREFIX hist: <urn:x-sparkles:history#> \
+             SELECT ?o ?c WHERE { SERVICE hist:changes { \
+               ?e hist:subject <urn:release> ; hist:predicate <urn:affectedBy> ; \
+                  hist:object ?o ; hist:commit ?c . } }",
+        ),
+        (
+            "bounded",
+            "PREFIX hist: <urn:x-sparkles:history#> \
+             SELECT ?o ?c WHERE { SERVICE hist:changes { \
+               ?e hist:subject <urn:release> ; hist:predicate <urn:affectedBy> ; \
+                  hist:object ?o ; hist:commit ?c ; hist:limit 5 . } }",
+        ),
+        (
+            "correlated",
+            "PREFIX hist: <urn:x-sparkles:history#> \
+             SELECT ?o ?c WHERE { VALUES ?s { <urn:release> } \
+               SERVICE hist:changes { \
+                 ?e hist:subject ?s ; hist:predicate <urn:affectedBy> ; \
+                    hist:object ?o ; hist:commit ?c . } }",
+        ),
+    ];
+
+    for (label, q) in queries {
+        let err = sparkles::sparql::query(
+            ds.store().snapshot(),
+            q,
+            &QueryOptions {
+                graphs: Some(reader_out.clone()),
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap_or_else(|| {
+            panic!("legacy post-removal {label} SPARQL HISTORY must refuse restricted reader")
+        });
+        assert!(
+            matches!(err, Error::NotPermitted(_)),
+            "legacy {label}: expected NotPermitted, got {err:?}"
+        );
+        // Unrestricted caller succeeds and sees the recorded projected change.
+        let ok =
+            sparkles::sparql::query(ds.store().snapshot(), q, &QueryOptions::default()).unwrap();
+        assert!(!ok.rows().unwrap().is_empty());
+    }
+
+    // Store::history_changes and Store::changes must also refuse restricted callers!
+    let hist_err = ds
+        .store()
+        .history_changes(&sparkles::store::HistoryQuery {
+            access: Some(reader_out.clone()),
+            ..Default::default()
+        })
+        .err();
+    assert!(
+        matches!(hist_err, Some(Error::NotPermitted(_))),
+        "legacy post-removal Store::history_changes must refuse restricted caller, got {hist_err:?}"
+    );
+    let changes_err = ds
+        .store()
+        .changes(
+            0,
+            &sparkles::store::ChangesOptions {
+                graphs: Some(reader_out),
+                ..Default::default()
+            },
+        )
+        .err();
+    assert!(
+        matches!(changes_err, Some(Error::NotPermitted(_))),
+        "legacy post-removal Store::changes must refuse restricted caller, got {changes_err:?}"
+    );
+
+    // Unrestricted Store::history_changes and Store::changes still succeed.
+    assert!(
+        !ds.store()
+            .history_changes(&sparkles::store::HistoryQuery::default())
+            .unwrap()
+            .changes
+            .is_empty()
+    );
+    assert!(
+        !ds.store()
+            .changes(0, &sparkles::store::ChangesOptions::default())
+            .unwrap()
+            .commits
+            .is_empty()
+    );
+}
+
+#[test]
+fn resident_wal_replay_tight_cap_drops_boundary_cursor_before_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    drop(ds);
+    sparkles::migrate::activate_configuration_history(dir.path(), false, &prep(64 << 20)).unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    evidence::configure(&ds, &two_boundary_settings(), &Control::none()).unwrap();
+
+    // Commit a large transaction (~300 quads, > 10 KiB WAL txn) containing a StoredFact anchor.
+    let mut bulk = String::from("INSERT DATA { GRAPH <");
+    bulk.push_str(PUBLIC);
+    bulk.push_str("> { <urn:wal:s> <urn:wal:p> <urn:wal:o> . ");
+    for i in 0..300 {
+        bulk.push_str(&format!("<urn:wal:b{i}> <urn:wal:p> <urn:wal:v{i}> . "));
+    }
+    bulk.push_str("} }");
+    ds.update(&bulk).unwrap();
+    let c1 = ds.store().head_commit().seq;
+
+    let (claim_iri, claim_dig, _) = propose_fact_in(
+        &ds,
+        &ds,
+        SOURCES_A,
+        CLAIMS_A,
+        "wal-tight",
+        affected(),
+        StoredFactRef {
+            dataset: ds.store().dataset_id(),
+            branch: ds.store().branch_id(),
+            commit: c1,
+            graph: GraphIdentity::Named(iri(PUBLIC)),
+            expected: Triple::new(iri("urn:wal:s"), iri("urn:wal:p"), iri("urn:wal:o")),
+            anchor: None,
+        },
+    );
+    decide(&ds, &(claim_iri, claim_dig), Disposition::Accepted, None);
+    drop(ds);
+
+    // Reopen so the history cache is cold and `HistoryOrigin::snapshot_at_commit` must scan
+    // and replay `wal.log` for `c1`.
+    let reopened = Dataset::open(dir.path()).unwrap();
+    let reader_full = reading(&[OUTPUT, DECISIONS, SUPPORTS, CLAIMS_A, SOURCES_A, PUBLIC]);
+    let snap = reopened.store().snapshot();
+
+    // Verify a bounded cap (3 MiB) admits single-cursor WAL replay + masking for the 300-quad
+    // transaction while a sub-replay cap (512 KiB) fails cleanly with `BudgetExceeded`.
+    let prepared = reader_full
+        .masked_controlled(&snap, &prep(3 << 20))
+        .unwrap();
+    let expected_obj = Term::NamedNode(iri("urn:cve-1"));
+    let expected_graph = Term::NamedNode(iri(OUTPUT));
+    let mut saw_cve = false;
+    prepared
+        .for_each_visible_quad(|q| {
+            if snap.term(q[2]).as_ref() == Some(&expected_obj)
+                && snap.term(q[3]).as_ref() == Some(&expected_graph)
+            {
+                saw_cve = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(saw_cve, "tight-cap WAL replay must verify cve-1");
+    // Drop `prepared` so the controlled weak mask cache clears and the next call must replay WAL.
+    drop(prepared);
+    let too_small = reader_full.masked_controlled(&snap, &prep(512 << 10)).err();
+    assert!(
+        matches!(too_small, Some(Error::BudgetExceeded(_))),
+        "sub-replay cap must return BudgetExceeded, got {too_small:?}"
+    );
+}
+
+#[test]
+fn named_pin_replacement_expiry_and_missing_config_document_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    drop(ds);
+    sparkles::migrate::activate_configuration_history(dir.path(), false, &prep(64 << 20)).unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    evidence::configure(&ds, &two_boundary_settings(), &Control::none()).unwrap();
+    let ca = propose_in(&ds, SOURCES_A, CLAIMS_A, "src-a", "a1", affected());
+    decide(&ds, &ca, Disposition::Accepted, None);
+    let c1 = ds.store().head_commit().seq;
+
+    let reader_meta = reading(&[OUTPUT, DECISIONS, SUPPORTS]);
+    let ask_at = |store: &sparkles::store::Store, at: &At| -> sparkles::Result<bool> {
+        let (snap, _) = store.snapshot_at(at, &HistoryOptions::default())?;
+        Ok(sparkles::sparql::query(
+            snap,
+            &format!("ASK {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} }}"),
+            &QueryOptions {
+                graphs: Some(reader_meta.clone()),
+                ..Default::default()
+            },
+        )?
+        .boolean)
+    };
+
+    // 1. Named pin bound to active policy hides `cve-1`.
+    let ev_active = ds
+        .store()
+        .evidence_view(&At::Commit(c1), &prep(64 << 20))
+        .unwrap();
+    ds.store()
+        .create_bound_snapshot("pin-replace", &ev_active, &Default::default())
+        .unwrap();
+    assert!(
+        !ask_at(ds.store(), &At::Snapshot("pin-replace".into())).unwrap(),
+        "active-policy pin must hide cve-1"
+    );
+
+    // 2. Replace `pin-replace` with a pin bound after policy removal at the same commit:
+    //    visibility must update to reflect the replacement binding.
+    ds.store()
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, OUTPUT)
+        .unwrap();
+    let mut cleared = two_boundary_settings();
+    cleared.policies.clear();
+    cleared.projections.clear();
+    evidence::configure(&ds, &cleared, &Control::none()).unwrap();
+    let ev_cleared = ds
+        .store()
+        .evidence_view(&At::Head, &prep(64 << 20))
+        .unwrap();
+    assert!(ds.store().delete_snapshot("pin-replace").unwrap());
+    ds.store()
+        .create_bound_snapshot("pin-replace", &ev_cleared, &Default::default())
+        .unwrap();
+    assert!(
+        ask_at(ds.store(), &At::Snapshot("pin-replace".into())).unwrap(),
+        "replaced pin bound to cleared settings must reflect updated binding"
+    );
+
+    // 3. Expired named pin must lapse on history_tick and not fall back to live settings.
+    let expired_ms = 1_000i64; // far in the past (1970)
+    ds.store()
+        .create_snapshot_with("pin-expired", &At::Commit(c1), None, Some(expired_ms))
+        .unwrap();
+    ds.store().history_tick().unwrap();
+    let exp_err = ds
+        .store()
+        .snapshot_at(
+            &At::Snapshot("pin-expired".into()),
+            &HistoryOptions::default(),
+        )
+        .err();
+    assert!(
+        exp_err.is_some(),
+        "expired named pin must be rejected rather than falling back to live settings"
+    );
+
+    // 4. Deleting the persisted configuration-history generation documents must cause
+    //    restricted historical reads at `At::Commit(c1)` to fail closed (NOT fall back to
+    //    the cleared live settings!).
+    let ev_hist_dir = dir.path().join("evidence-history");
+    assert!(ev_hist_dir.exists(), "expected evidence-history directory");
+    let mut removed_any = false;
+    for entry in std::fs::read_dir(&ev_hist_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() {
+            for sub in std::fs::read_dir(&path).unwrap() {
+                let sub = sub.unwrap().path();
+                if sub.is_file() {
+                    std::fs::remove_file(&sub).unwrap();
+                    removed_any = true;
+                }
+            }
+        } else if path.is_file() {
+            std::fs::remove_file(&path).unwrap();
+            removed_any = true;
+        }
+    }
+    assert!(
+        removed_any,
+        "expected at least one configuration document to delete"
+    );
+
+    let missing_doc_err = ask_at(ds.store(), &At::Commit(c1)).err();
+    assert!(
+        missing_doc_err.is_some(),
+        "missing configuration generation document must fail closed for restricted reader (not fall back to cleared live settings)"
+    );
 }

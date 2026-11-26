@@ -748,6 +748,20 @@ impl Snapshot {
         }
     }
 
+    /// Freeze this snapshot's live evidence projection visibility configuration into
+    /// `pinned_evidence` so subsequent reads and disclosure captures observe the exact
+    /// configuration governing the read even if live settings change later.
+    pub fn pin_live_evidence(self: &Arc<Self>) -> Arc<Self> {
+        if self.pinned_evidence.is_some() {
+            return Arc::clone(self);
+        }
+        let config = self.evidence_projection_config();
+        Arc::new(Snapshot {
+            pinned_evidence: Some(config),
+            ..(**self).clone()
+        })
+    }
+
     /// Stable cache-key suffix capturing this snapshot's active support-aware projection
     /// visibility configuration, if any (or `"unavailable"` when fail-closed).
     pub fn evidence_visibility_key(&self) -> Option<String> {
@@ -806,7 +820,15 @@ impl Snapshot {
         match state.as_ref() {
             crate::managed::ManagedState::Unavailable { .. } => true,
             crate::managed::ManagedState::Installed(installed) => {
-                if installed.configuration_history.is_some() {
+                if installed.configuration_history.is_some()
+                    || installed
+                        .graphs
+                        .owners
+                        .contains_key(&crate::managed::OwnerKind::Evidence)
+                    || installed
+                        .settings
+                        .contains_key(&crate::managed::OwnerKind::Evidence)
+                {
                     return true;
                 }
                 match installed.evidence_visibility() {
@@ -2699,7 +2721,7 @@ impl Store {
             // registry or of its history root, before anything is written.
             managed_history::check_activated_registry(root, state.as_ref())?;
             if let Some(state) = state {
-                family.managed.store(Some(Arc::new(state)));
+                family.store_managed(Some(Arc::new(state)));
             }
         } else {
             commit::check_dataset_compatibility(root)?;
@@ -3563,6 +3585,16 @@ impl Store {
         match state.as_ref() {
             crate::managed::ManagedState::Unavailable { .. } => true,
             crate::managed::ManagedState::Installed(installed) => {
+                if installed
+                    .graphs
+                    .owners
+                    .contains_key(&crate::managed::OwnerKind::Evidence)
+                    || installed
+                        .settings
+                        .contains_key(&crate::managed::OwnerKind::Evidence)
+                {
+                    return true;
+                }
                 match installed.evidence_visibility() {
                     crate::access::triples::evidence::EvidenceConfig::Unavailable(_) => true,
                     crate::access::triples::evidence::EvidenceConfig::Active(cfg) => {

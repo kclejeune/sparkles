@@ -276,13 +276,29 @@ impl Slot {
         )))
     }
 
+    /// Whether `snap`'s support-aware evidence visibility configuration differs from the
+    /// key this restricted circuit was built with, or is currently unavailable.
+    pub(super) fn evidence_mismatch(&self, snap: &crate::store::Snapshot) -> bool {
+        let restricted = self
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        if !restricted {
+            return false;
+        }
+        let snap_ev = snap.evidence_visibility_key();
+        self.circuit.evidence_key() != snap_ev.as_deref()
+            || snap_ev.as_deref() == Some("unavailable")
+    }
+
     /// End all active live subscribers on this slot with an error event and lower
     /// `local_limit` accordingly without failing co-located named views.
     pub(super) fn fail_live_subs(&mut self, e: &Error, deferred: &mut DeferredDrops) {
         let (code, message) = super::round::failure(e);
         for s in self.subs.drain(..) {
             if let Some(sh) = s.shared.upgrade() {
-                deferred.queued.extend(sh.push_leased(
+                deferred.queued.extend(sh.replace_leased(
                     LiveEvent::Error {
                         code: code.clone(),
                         message: message.clone(),
@@ -307,6 +323,27 @@ impl Slot {
         &mut self,
         shared: &Arc<Shared>,
     ) -> (crate::incr::live::QueuedEvent, Vec<MemoryLease>) {
+        if self
+            .circuit
+            .snap
+            .as_ref()
+            .is_some_and(|s| self.evidence_mismatch(s))
+        {
+            self.subs
+                .retain(|s| !std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)));
+            self.recompute_local_limit();
+            let retired = self.circuit.drain_retired();
+            return (
+                crate::incr::live::QueuedEvent::new(
+                    LiveEvent::Error {
+                        code: "access-changed".into(),
+                        message: "the evidence configuration changed; reconnect to read under the new rules".into(),
+                    },
+                    None,
+                ),
+                retired,
+            );
+        }
         let applied = self.circuit.applied;
         let event = self.event_budgeted(true).and_then(|(event, lease)| {
             if lease.bytes() <= shared.byte_limit() {

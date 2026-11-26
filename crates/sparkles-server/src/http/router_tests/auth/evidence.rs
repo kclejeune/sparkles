@@ -1387,6 +1387,10 @@ password = "{ra}"
 dataset = "ev"
 level = "read"
 graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}", "urn:x-sparkles:graphrag:*"]
+[[users.grants]]
+dataset = "evlive"
+level = "read"
+graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"]
 "#,
             rout = h("rout-pw"),
             ra = h("ra-pw"),
@@ -1858,4 +1862,699 @@ graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"
             "MCP pin selection ({label}) leaked projected triple after live policy removal"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn production_graphrag_build_ask_history_and_live_sse_evidence_visibility() {
+    use crate::models::mock::{self, MockModel};
+    use crate::models::{Models, ModelsConfig};
+    use sparkles::evidence::{
+        self as ev_api, ClaimInput, ClaimKind, ConflictMode, DecisionInput, Disposition,
+        EvidenceInput, Polarity, Policy, ProposeOptions, RecordKey, RecordRef, RecordVersion,
+        ReviewOptions, Settings, Sha256Digest, SourceContent, SourceRevisionInput,
+    };
+    use sparkles::task::Control;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const SOURCES_A: &str = "urn:ev:sources-a";
+    const CLAIMS_A: &str = "urn:ev:claims-a";
+    const DECISIONS: &str = "urn:ev:decisions";
+    const SUPPORTS: &str = "urn:ev:supports";
+    const ACCEPTED: &str = "urn:ev:accepted";
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[users]]
+name = "rout"
+password = "{rout}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ACCEPTED}", "urn:x-sparkles:graphrag:*"]
+
+[[users]]
+name = "ra"
+password = "{ra}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}", "urn:x-sparkles:graphrag:*"]
+[[users.grants]]
+dataset = "evlive"
+level = "read"
+graphs = ["{ACCEPTED}", "{DECISIONS}", "{SUPPORTS}", "{CLAIMS_A}", "{SOURCES_A}"]
+"#,
+            rout = h("rout-pw"),
+            ra = h("ra-pw"),
+        ),
+        ..Default::default()
+    });
+    let ds = s.state.attach("ev", DbType::Memory, None).unwrap();
+    ds.store
+        .activate_memory_configuration_history(
+            &sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap(),
+        )
+        .unwrap();
+
+    let settings = Settings {
+        enabled: true,
+        source_records: vec![SOURCES_A.into()],
+        proposals: vec![CLAIMS_A.into()],
+        decisions: vec![DECISIONS.into()],
+        supports: vec![SUPPORTS.into()],
+        projections: vec![ACCEPTED.into()],
+        policies: [(
+            "main".to_string(),
+            Policy {
+                version: 1,
+                admitted_kinds: vec![ClaimKind::Reported],
+                required_scope: Vec::new(),
+                conflicts: ConflictMode::AdmitLabelled,
+                boundary: vec![SOURCES_A.into(), CLAIMS_A.into()],
+                decisions: DECISIONS.into(),
+                supports: SUPPORTS.into(),
+                output: ACCEPTED.into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Settings::default()
+    };
+    let mut cleared = settings.clone();
+    cleared.policies.clear();
+    cleared.projections.clear();
+
+    ev_api::configure(&ds.dataset, &settings, &Control::none()).unwrap();
+
+    let iri = |u: &str| oxrdf::NamedNode::new(u).unwrap();
+    let sha = |t: &str| Sha256Digest::of_bytes(t.as_bytes(), &Control::none()).unwrap();
+    let all = || Some(Arc::new(sparkles::access::GraphAccess::all()));
+
+    // Propose & accept 3 connected facts in ACCEPTED so GraphRAG community detection forms a community.
+    let triples = [
+        (
+            "c1",
+            oxrdf::Triple::new(
+                iri("urn:release:a"),
+                iri("http://ex/knows"),
+                iri("urn:release:b"),
+            ),
+        ),
+        (
+            "c2",
+            oxrdf::Triple::new(
+                iri("urn:release:b"),
+                iri("http://ex/knows"),
+                iri("urn:release:c"),
+            ),
+        ),
+        (
+            "c3",
+            oxrdf::Triple::new(
+                iri("urn:release:c"),
+                iri("http://ex/knows"),
+                iri("urn:release:a"),
+            ),
+        ),
+    ];
+    let claims: Vec<ClaimInput> = triples
+        .iter()
+        .map(|(k, prop)| ClaimInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new(format!("claim-{k}")).unwrap(),
+            occurrence_key: RecordKey::new(*k).unwrap(),
+            revision: RecordRef::Local(RecordKey::new("rev-a").unwrap()),
+            proposition: prop.clone(),
+            kind: ClaimKind::Reported,
+            polarity: Polarity::Positive,
+            attributed_author: iri("urn:author"),
+            scope: Default::default(),
+            confidence: Default::default(),
+            validity: None,
+        })
+        .collect();
+    let input = EvidenceInput {
+        revisions: vec![SourceRevisionInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("rev-a").unwrap(),
+            source: iri("urn:source:a"),
+            source_key: RecordKey::new("src-a").unwrap(),
+            upstream_version: None,
+            content: SourceContent::MetadataOnly {
+                digest: sha("src-a"),
+            },
+            metadata: Default::default(),
+            times: Default::default(),
+            lineage: Default::default(),
+        }],
+        claims,
+        ..Default::default()
+    };
+    let mut po = ProposeOptions::new(iri("urn:importer"));
+    po.source_graph = Some(iri(SOURCES_A));
+    po.proposal_graph = Some(iri(CLAIMS_A));
+    let p = ev_api::propose(
+        None,
+        &ds.dataset,
+        &ds.dataset,
+        &input,
+        &po,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let decisions: Vec<DecisionInput> = p
+        .records
+        .iter()
+        .filter(|r| r.key.starts_with("claim-"))
+        .enumerate()
+        .map(|(i, rec)| DecisionInput {
+            key: format!("d{i}"),
+            target: rec.iri.clone(),
+            target_digest: rec.digest,
+            disposition: Disposition::Accepted,
+            supersedes: None,
+        })
+        .collect();
+    let mut ro = ReviewOptions::new(iri("urn:reviewer"));
+    ro.if_head = Some(ds.store.head_commit().seq);
+    ev_api::review(
+        None,
+        &ds.dataset,
+        &ds.dataset,
+        "main",
+        1,
+        &decisions,
+        &ro,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+
+    // Shared toggle to make the mock model remove the evidence policy mid-operation (same commit!).
+    let remove_mid_call = Arc::new(AtomicBool::new(false));
+    let ds_hook = ds.clone();
+    let cleared_hook = cleared.clone();
+    let remove_flag = remove_mid_call.clone();
+    let mock = MockModel::start(move |r, _| {
+        let body = r.body.to_string();
+        let is_summary = body.contains("rows of a query result");
+        let is_community = body.contains("community") && body.contains("findings");
+        if is_community {
+            if remove_flag.swap(false, Ordering::AcqRel) {
+                ds_hook
+                    .store
+                    .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
+                    .unwrap();
+                ev_api::configure(&ds_hook.dataset, &cleared_hook, &Control::none()).unwrap();
+            }
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "title": "Release community",
+                        "summary": "Secret projected graphrag build summary.",
+                        "findings": [{ "text": "Connected releases.", "entities": [1], "cites": [1] }],
+                        "rating": 5
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if is_summary {
+            if remove_flag.swap(false, Ordering::AcqRel) {
+                ds_hook
+                    .store
+                    .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
+                    .unwrap();
+                ev_api::configure(&ds_hook.dataset, &cleared_hook, &Control::none()).unwrap();
+            }
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "text": "Secret projected ask answer [1].",
+                        "citations": [1]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        let mut draft = serde_json::json!({
+            "query": format!("SELECT ?s ?o WHERE {{ GRAPH <{ACCEPTED}> {{ ?s <http://ex/knows> ?o }} }}"),
+            "explanation": "Lists known links in the accepted projection graph.",
+            "assumptions": [],
+            "clarify": { "question": "", "choices": [] },
+            "graph": { "subject": "", "predicate": "", "object": "" }
+        });
+        if body.contains("ScopedDraft") {
+            draft["scope"] = serde_json::json!("local");
+        }
+        (200, mock::openai(&draft.to_string()))
+    });
+
+    let cfg = serde_json::json!({
+        "providers": {
+            "p": {
+                "kind": "openai",
+                "endpoint": mock.url(),
+                "requestTimeoutSecs": 5,
+                "allowedModels": ["m"],
+                "structuredOutput": "json-schema"
+            }
+        },
+        "roles": {
+            "community": [{ "provider": "p", "model": "m" }],
+            "draft": [{ "provider": "p", "model": "m" }],
+            "summarize": [{ "provider": "p", "model": "m" }]
+        }
+    });
+    let models = Models::new(
+        ModelsConfig::parse(&cfg.to_string()).unwrap(),
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+    );
+    s.state.models.store(Some(Arc::new(models)));
+
+    // Enable assistant with send: "rows" so both GraphRAG builds and Ask summaries run.
+    let assist_put = call(
+        &s.app,
+        "PUT",
+        "/$/assistant/ev",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({ "enabled": true, "send": "rows" }).to_string(),
+    )
+    .await;
+    assert_eq!(assist_put.status, StatusCode::OK, "{}", assist_put.text());
+
+    // 1. Production GraphRAG build over ACCEPTED (ordinary build without explicit reviewPolicy).
+    let gr_settings: crate::graphrag::settings::GraphragSettings =
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "principal": "alice",
+            "projection": { "graphs": [ACCEPTED] },
+            "levels": 1,
+            "minCommunitySize": 2
+        }))
+        .unwrap();
+    crate::settings::store_runtime(
+        &s.state,
+        &ds,
+        &crate::settings::GRAPHRAG,
+        &serde_json::to_value(&gr_settings).unwrap(),
+    )
+    .unwrap();
+
+    // 1a. Mid-build same-commit policy removal must cause the production build to refuse
+    //     rather than publishing an unflagged footprint!
+    remove_mid_call.store(true, Ordering::Release);
+    let st_ref = s.state.clone();
+    let ds_ref = ds.clone();
+    let gs_ref = gr_settings.clone();
+    let mid_res = tokio::task::spawn_blocking(move || {
+        crate::graphrag::build::run(&crate::graphrag::build::Run {
+            st: &st_ref,
+            ds: ds_ref,
+            settings: gs_ref,
+            mode: crate::graphrag::build::Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: "ev-mid-remove".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            limits: Default::default(),
+        })
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(mid_res, Err(crate::graphrag::build::RunError::Refused(_))),
+        "same-commit policy removal during GraphRAG build must refuse publication, got {mid_res:?}"
+    );
+
+    // 1b. Re-enable policy and run a normal production build to completion: it persists a v2
+    //     footprint with `evidence_gated = true` that stays hidden from `rout` even after
+    //     subsequent policy removal.
+    ev_api::configure(&ds.dataset, &settings, &Control::none()).unwrap();
+    let st_ref = s.state.clone();
+    let ds_ref = ds.clone();
+    let gs_ref = gr_settings.clone();
+    let ok_build = tokio::task::spawn_blocking(move || {
+        crate::graphrag::build::run(&crate::graphrag::build::Run {
+            st: &st_ref,
+            ds: ds_ref,
+            settings: gs_ref,
+            mode: crate::graphrag::build::Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: "ev-full-build".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            limits: Default::default(),
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        ok_build.written > 0,
+        "expected written community report: {ok_build:?}"
+    );
+
+    // Remove the review policy AFTER the build, then query REPORTS as `alice` and `rout`.
+    ds.store
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
+        .unwrap();
+    ev_api::configure(&ds.dataset, &cleared, &Control::none()).unwrap();
+
+    let report_q = format!("SELECT ?s ?o WHERE {{ GRAPH <{REPORTS}> {{ ?s ?p ?o }} }}");
+    let alice_rep = call(
+        &s.app,
+        "POST",
+        "/ev/sparql",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/sparql-query"),
+            ("accept", "application/sparql-results+json"),
+        ],
+        &report_q,
+    )
+    .await;
+    assert_eq!(alice_rep.status, StatusCode::OK, "{}", alice_rep.text());
+    assert!(
+        alice_rep
+            .text()
+            .contains("Secret projected graphrag build summary."),
+        "admin must see built GraphRAG report: {}",
+        alice_rep.text()
+    );
+    let rout_rep = call(
+        &s.app,
+        "POST",
+        "/ev/sparql",
+        &[
+            ("authorization", &b("rout")),
+            ("content-type", "application/sparql-query"),
+            ("accept", "application/sparql-results+json"),
+        ],
+        &report_q,
+    )
+    .await;
+    assert_eq!(rout_rep.status, StatusCode::OK, "{}", rout_rep.text());
+    assert!(
+        !rout_rep
+            .text()
+            .contains("Secret projected graphrag build summary."),
+        "production GraphRAG build report leaked to restricted reader after policy removal: {}",
+        rout_rep.text()
+    );
+
+    // 2. Production HTTP Ask + persisted `GET /$/asks/ev` retrieval.
+    // 2a. Restricted `ra` asks while policy is active (and `alice` also asks), then remove policy
+    //     AFTER Ask completes -> `GET /$/asks/ev` for restricted `ra` must return `answerWithheld: true`
+    //     with no answer text, while `alice` sees her stored answer.
+    ev_api::configure(&ds.dataset, &settings, &Control::none()).unwrap();
+    let ask_alice = call(
+        &s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({ "question": "What releases know each other?", "drafts": 1, "shapeCheck": false }).to_string(),
+    )
+    .await;
+    assert_eq!(ask_alice.status, StatusCode::OK, "{}", ask_alice.text());
+    let ask_ra = call(
+        &s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("ra")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({ "question": "What releases know each other?", "drafts": 1, "shapeCheck": false }).to_string(),
+    )
+    .await;
+    assert_eq!(ask_ra.status, StatusCode::OK, "{}", ask_ra.text());
+
+    ds.store
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
+        .unwrap();
+    ev_api::configure(&ds.dataset, &cleared, &Control::none()).unwrap();
+
+    let asks_alice = call(
+        &s.app,
+        "GET",
+        "/$/asks/ev",
+        &[("authorization", &b("alice"))],
+        "",
+    )
+    .await;
+    assert_eq!(asks_alice.status, StatusCode::OK, "{}", asks_alice.text());
+    assert!(
+        asks_alice.text().contains("Secret projected ask answer"),
+        "admin must see stored ask answer: {}",
+        asks_alice.text()
+    );
+    let asks_ra = call(
+        &s.app,
+        "GET",
+        "/$/asks/ev",
+        &[("authorization", &b("ra"))],
+        "",
+    )
+    .await;
+    assert_eq!(asks_ra.status, StatusCode::OK, "{}", asks_ra.text());
+    assert!(
+        !asks_ra.text().contains("Secret projected ask answer"),
+        "stored ask answer leaked to restricted reader after policy removal: {}",
+        asks_ra.text()
+    );
+    assert_eq!(
+        asks_ra.json()["asks"][0]["answerWithheld"],
+        serde_json::json!(true),
+        "expected answerWithheld: true for ra: {}",
+        asks_ra.text()
+    );
+
+    // 2b. Same-commit policy removal DURING Ask (after SPARQL reads ACCEPTED, before finish
+    //     captures the footprint) must withhold the footprint so `ra` still cannot see it!
+    ev_api::configure(&ds.dataset, &settings, &Control::none()).unwrap();
+    let commit_before_ask = ds.store.head_commit().seq;
+    remove_mid_call.store(true, Ordering::Release);
+    let ask_mid = call(
+        &s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("ra")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({ "question": "Mid-ask policy removal check?", "drafts": 1, "shapeCheck": false }).to_string(),
+    )
+    .await;
+    assert_eq!(ask_mid.status, StatusCode::OK, "{}", ask_mid.text());
+    assert_eq!(
+        ds.store.head_commit().seq,
+        commit_before_ask,
+        "policy removal during ask must be same-commit"
+    );
+    let asks_ra_mid = call(
+        &s.app,
+        "GET",
+        "/$/asks/ev",
+        &[("authorization", &b("ra"))],
+        "",
+    )
+    .await;
+    assert_eq!(asks_ra_mid.status, StatusCode::OK, "{}", asks_ra_mid.text());
+    let asks_list = asks_ra_mid.json()["asks"].as_array().unwrap().clone();
+    assert!(
+        asks_list.len() >= 2,
+        "expected both ask records for ra: {asks_list:?}"
+    );
+    for rec in &asks_list {
+        assert_eq!(
+            rec["answerWithheld"],
+            serde_json::json!(true),
+            "every ask informed under active or mid-flight removed policy must be withheld from ra: {rec}"
+        );
+        assert!(rec.get("answer").is_none());
+    }
+
+    // 3. HTTP SSE `GET /evlive/live` must terminate with `access-changed` on same-commit detach
+    //    and return a fresh empty `reset` on reconnect with `Last-Event-ID`.
+    let ds_live = s.state.attach("evlive", DbType::Memory, None).unwrap();
+    ev_api::configure(&ds_live.dataset, &settings, &Control::none()).unwrap();
+    let p2 = ev_api::propose(
+        None,
+        &ds_live.dataset,
+        &ds_live.dataset,
+        &EvidenceInput {
+            revisions: vec![SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: RecordKey::new("rev-live").unwrap(),
+                source: iri("urn:source:live"),
+                source_key: RecordKey::new("src-live").unwrap(),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly {
+                    digest: sha("src-live"),
+                },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+            }],
+            claims: vec![ClaimInput {
+                version: RecordVersion::V1,
+                key: RecordKey::new("claim-live").unwrap(),
+                occurrence_key: RecordKey::new("clive").unwrap(),
+                revision: RecordRef::Local(RecordKey::new("rev-live").unwrap()),
+                proposition: oxrdf::Triple::new(
+                    iri("urn:live:s"),
+                    iri("http://ex/knows"),
+                    iri("urn:live:o"),
+                ),
+                kind: ClaimKind::Reported,
+                polarity: Polarity::Positive,
+                attributed_author: iri("urn:author"),
+                scope: Default::default(),
+                confidence: Default::default(),
+                validity: None,
+            }],
+            ..Default::default()
+        },
+        &po,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let rec_live = p2.records.iter().find(|r| r.key == "claim-live").unwrap();
+    let mut ro2 = ReviewOptions::new(iri("urn:reviewer"));
+    ro2.if_head = Some(ds_live.store.head_commit().seq);
+    ev_api::review(
+        None,
+        &ds_live.dataset,
+        &ds_live.dataset,
+        "main",
+        1,
+        &[DecisionInput {
+            key: "dlive".into(),
+            target: rec_live.iri.clone(),
+            target_digest: rec_live.digest,
+            disposition: Disposition::Accepted,
+            supersedes: None,
+        }],
+        &ro2,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+
+    let live_commit = ds_live.store.head_commit().seq;
+    let live_q =
+        format!("SELECT ?o WHERE {{ GRAPH <{ACCEPTED}> {{ <urn:live:s> <http://ex/knows> ?o }} }}");
+    let live_uri = format!(
+        "/evlive/live?query={}",
+        url::form_urlencoded::byte_serialize(live_q.as_bytes()).collect::<String>()
+    );
+    let resp = s
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&live_uri)
+                .header("authorization", b("ra"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body();
+    use http_body_util::BodyExt;
+    let first_chunk = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("timed out waiting for initial SSE frame")
+        .expect("stream ended early")
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let first_text = String::from_utf8_lossy(&first_chunk);
+    assert!(
+        first_text.contains("urn:live:o"),
+        "expected initial live snapshot to include urn:live:o: {first_text}"
+    );
+
+    // Detach + re-configure at the SAME commit -> open SSE stream must emit `access-changed`!
+    ds_live
+        .store
+        .detach_managed(sparkles::managed::OwnerKind::Evidence, ACCEPTED)
+        .unwrap();
+    ev_api::configure(&ds_live.dataset, &settings, &Control::none()).unwrap();
+    assert_eq!(ds_live.store.head_commit().seq, live_commit);
+
+    let mut saw_access_changed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    let txt = String::from_utf8_lossy(&data);
+                    if txt.contains("access-changed") {
+                        saw_access_changed = true;
+                        break;
+                    }
+                }
+            }
+            Ok(None) => break,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_access_changed,
+        "HTTP SSE stream must emit access-changed on same-commit evidence detach"
+    );
+
+    // Reconnecting with `Last-Event-ID: live_commit` must emit a `reset` with 0 rows!
+    let resp2 = s
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&live_uri)
+                .header("authorization", b("ra"))
+                .header("last-event-id", live_commit.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let mut body2 = resp2.into_body();
+    let reconnect_chunk = tokio::time::timeout(Duration::from_secs(5), body2.frame())
+        .await
+        .expect("timed out waiting for reconnect SSE frame")
+        .expect("reconnect stream ended early")
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let reconnect_text = String::from_utf8_lossy(&reconnect_chunk);
+    assert!(
+        reconnect_text.contains("event: reset") && !reconnect_text.contains("urn:live:o"),
+        "reconnected SSE stream across same-commit detach must emit empty reset: {reconnect_text}"
+    );
 }

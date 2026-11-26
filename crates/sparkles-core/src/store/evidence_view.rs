@@ -1175,18 +1175,23 @@ impl HistoryOrigin {
                     seq: entry.base.seq,
                     offset: 0,
                 };
-                let cursor_limit = budget.owned_limit()?;
-                let mut cursor = wal::WalCursor::open_with(&wal_path, from, &cursor_limit, 0)?;
-                let mut target = None;
-                while let Some((found, _, _)) = cursor.next_with(&cursor_limit, 0)? {
-                    if found == seq {
-                        target = Some(cursor.position());
-                        break;
+                // Scope the boundary-finding cursor so its BufReader and transaction
+                // buffer are released before `apply_forward` opens its replay cursor.
+                let target = {
+                    let cursor_limit = budget.owned_limit()?;
+                    let mut cursor = wal::WalCursor::open_with(&wal_path, from, &cursor_limit, 0)?;
+                    let mut target = None;
+                    while let Some((found, _, _)) = cursor.next_with(&cursor_limit, 0)? {
+                        if found == seq {
+                            target = Some(cursor.position());
+                            break;
+                        }
+                        if found > seq {
+                            break;
+                        }
                     }
-                    if found > seq {
-                        break;
-                    }
-                }
+                    target
+                };
                 let Some(target) = target else {
                     return Ok(None);
                 };

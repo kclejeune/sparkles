@@ -907,6 +907,7 @@ pub struct AnswerAccess {
 /// The access record of an ask over `snap`, the state its answer read (`None` when
 /// that state cannot be opened, which keeps no footprint), read through `view`
 /// (`None`: unrestricted) by `principal`.
+#[cfg(test)]
 pub fn answer_access(
     snap: Option<&Arc<sparkles::store::Snapshot>>,
     view: Option<&Arc<sparkles::access::GraphAccess>>,
@@ -914,6 +915,19 @@ pub fn answer_access(
     dataset: &str,
     branch: Option<&str>,
     principal: &str,
+) -> AnswerAccess {
+    answer_access_with_policy(snap, view, caller, dataset, branch, principal, false)
+}
+
+/// [`answer_access`] with explicit `review_policy` provenance.
+pub fn answer_access_with_policy(
+    snap: Option<&Arc<sparkles::store::Snapshot>>,
+    view: Option<&Arc<sparkles::access::GraphAccess>>,
+    caller: &sparkles::access::Caller,
+    dataset: &str,
+    branch: Option<&str>,
+    principal: &str,
+    review_policy: bool,
 ) -> AnswerAccess {
     use crate::graphrag::guard::{CaptureInput, capture, capture_guarded};
     use crate::graphrag::settings::is_guarded;
@@ -963,7 +977,7 @@ pub fn answer_access(
             graphs,
             reports: &[],
             snap: Some(snap.as_ref()),
-            review_policy: false,
+            review_policy,
         };
         if of_guarded {
             capture_guarded(&i).ok()

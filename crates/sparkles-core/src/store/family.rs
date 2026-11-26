@@ -20,6 +20,9 @@ pub(crate) struct Family {
     /// created before it was enabled, so they cannot diverge. Shared with snapshots via
     /// `Arc` without retaining `Family` or its root process lock.
     pub(crate) managed: Arc<arc_swap::ArcSwapOption<crate::managed::ManagedState>>,
+    /// Monotonic counter incremented whenever `managed` changes (including same-commit
+    /// detach, nonce rotation, policy edits, or unavailability transitions).
+    managed_generation: std::sync::atomic::AtomicU64,
     /// The durable source holds of main and every branch (see [`crate::holds`]).
     pub(crate) holds: crate::holds::FamilyHolds,
     /// Selection made under this opening's actual root process exclusion. This
@@ -38,10 +41,22 @@ impl Family {
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
             managed: Arc::new(arc_swap::ArcSwapOption::empty()),
+            managed_generation: std::sync::atomic::AtomicU64::new(0),
             holds: Default::default(),
             origin,
             _owner_lock: owner_lock,
         })
+    }
+
+    pub(crate) fn store_managed(&self, state: Option<Arc<crate::managed::ManagedState>>) {
+        self.managed.store(state);
+        self.managed_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn managed_generation(&self) -> u64 {
+        self.managed_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(super) fn select_opening_origin(
