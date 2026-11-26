@@ -839,7 +839,23 @@ async fn mcp_task_retains_credit_across_get_task_and_releases_on_ttl() {
     assert_eq!(again["result"]["status"], "completed", "{again}");
     assert_eq!(again["result"]["result"]["isError"], false);
 
-    // A stdio response frame may still hold credit after the client reads its reply.
+    // The stdio writer releases the tasks/get frame before writing the uncredited
+    // discovery reply, so any remaining credit belongs to the retained task.
+    let discovery = send_recv_until(
+        &mut cw,
+        &mut lines,
+        json!({
+            "jsonrpc": "2.0",
+            "id": poll_id + 1,
+            "method": "server/discover",
+            "params": {"_meta": modern_meta(true)}
+        }),
+        tokio::time::Instant::now() + Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("server/discover failed: {e}"));
+    assert_eq!(discovery["id"], poll_id + 1);
+    assert_eq!(discovery["result"]["resultType"], "complete", "{discovery}");
     assert!(pool.granted() > 0, "completed task must still hold credit");
 
     // Advance past the task TTL: automatic eviction timer must drop the retained result

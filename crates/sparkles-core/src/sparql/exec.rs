@@ -3533,8 +3533,6 @@ fn lexical_check(
         k
     };
     let mut read = Vec::new();
-    let find_scratch = ctx.charge(0)?;
-    let mut find_reserved = 0u64;
     // the key of the prefix, grown a character at a time, without its 0xFF
     let mut probe = vec![b'"'];
     // the proper prefixes, shortest first: once one is greater than the k-th
@@ -3544,16 +3542,7 @@ fn lexical_check(
             ctx.check()?;
         }
         probe.push(crate::id::KEY_SEP);
-        let found = vocab.find_with_controlled(
-            &probe,
-            |need| {
-                let bytes = (need as u64).saturating_mul(2);
-                find_scratch.add(bytes.saturating_sub(find_reserved))?;
-                find_reserved = find_reserved.max(bytes);
-                Ok(())
-            },
-            |_| ctx.check(),
-        )?;
+        let found = vocab.find_exact_controlled(&probe, |_| ctx.check())?;
         probe.pop();
         let mut utf8 = [0; 4];
         probe.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());

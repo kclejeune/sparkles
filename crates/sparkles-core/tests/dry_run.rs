@@ -1148,6 +1148,72 @@ fn replay_preview_projects_a_wal_commit_marker_for_every_source_step() {
     assert_eq!(projected_append, main.wal_bytes() - before);
 }
 
+#[test]
+fn replay_preview_quota_counts_vocabulary_framing_from_earlier_steps() {
+    use sparkles_core::vocab::delta::CHUNK_HEADER;
+
+    let dir = tempfile::tempdir().unwrap();
+    let main = Store::open(
+        &dir.path().join("replay-vocab"),
+        StoreOptions {
+            wal_prealloc_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    upd(
+        &main,
+        "INSERT DATA {<urn:base> <urn:p> 0}",
+        Default::default(),
+    )
+    .unwrap();
+    main.create_branch("dev", &Default::default()).unwrap();
+    let dev = main.branch("dev").unwrap();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:new> <urn:p> 1}",
+        Default::default(),
+    )
+    .unwrap();
+    main.set_quota(Some(u64::MAX)).unwrap();
+    let first = replay_preview(&main, Default::default());
+    let first_pending = first.storage.projected.unwrap() - first.storage.used.unwrap();
+
+    let wal = dev.wal_bytes();
+    upd(
+        &dev,
+        "INSERT DATA {<urn:base> <urn:p> 2}",
+        Default::default(),
+    )
+    .unwrap();
+    let second_pending = dev.wal_bytes() - wal;
+    let quota = main.disk_usage() + first_pending + CHUNK_HEADER as u64 + second_pending - 1;
+    main.set_quota(Some(quota)).unwrap();
+
+    let head = main.snapshot().commit;
+    let preview = replay_preview(&main, Default::default());
+    assert_eq!(main.snapshot().commit, head);
+    let actual = main
+        .merge(
+            "dev",
+            "main",
+            &sparkles_core::branch::MergeOptions {
+                replay: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(main.snapshot().commit, head + 1, "only the first step fits");
+    assert!(matches!(&actual, Error::BudgetExceeded(budget)
+        if budget.kind == sparkles_core::BudgetKind::DatasetBytes && budget.requested == quota + 1));
+    assert_eq!(preview.outcome(), Outcome::StorageRefused);
+    assert_eq!(preview.storage.projected, Some(quota + 1));
+    assert_eq!(
+        preview.storage.refused.unwrap().to_string(),
+        actual.to_string()
+    );
+}
+
 /// A dry run of a transactional load or replace into an in-memory store over its limit
 /// reports the first refusal the write itself meets. Both parse their sources before the
 /// guard validates, so the memory refusal comes before a rejection. A load opens its

@@ -533,7 +533,7 @@ impl Terms {
                 return Err(err.into());
             }
         };
-        if let Some(id) = self.lookup_key_controlled(key.as_slice(), &budget, &mut check)? {
+        if let Some(id) = self.lookup_key_controlled(key.as_slice(), &mut check)? {
             return Ok(id.0);
         }
         check()?;
@@ -546,15 +546,15 @@ impl Terms {
         }
     }
 
-    /// Strict [`try_id_for_key`](Self::try_id_for_key) that admits vocabulary
-    /// reconstruction scratch against the term table's budget and polls live controls.
+    /// Strict [`try_id_for_key`](Self::try_id_for_key) that polls live controls
+    /// and admits a new local key against the term table's budget.
     pub(crate) fn try_id_for_key_controlled(
         &self,
         key: &[u8],
         mut check: impl FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<u64> {
         let budget = self.budget();
-        if let Some(id) = self.lookup_key_controlled(key, &budget, &mut check)? {
+        if let Some(id) = self.lookup_key_controlled(key, &mut check)? {
             return Ok(id.0);
         }
         check()?;
@@ -582,29 +582,10 @@ impl Terms {
     fn lookup_key_controlled(
         &self,
         key: &[u8],
-        budget: &Arc<Budget>,
         check: &mut impl FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<Option<Id>> {
-        let check = std::cell::RefCell::new(check);
-        let scratch = std::cell::RefCell::new(Held::new(budget));
-        self.snap.lookup_key_controlled(
-            key,
-            |old, new| -> anyhow::Result<()> {
-                if let Err(err) = scratch.borrow_mut().try_set(old.saturating_add(new)) {
-                    (check.borrow_mut())()?;
-                    return Err(err.into());
-                }
-                Ok(())
-            },
-            |capacity| -> anyhow::Result<()> {
-                if let Err(err) = scratch.borrow_mut().try_set(capacity) {
-                    (check.borrow_mut())()?;
-                    return Err(err.into());
-                }
-                Ok(())
-            },
-            || (check.borrow_mut())(),
-        )
+        self.snap
+            .lookup_key_controlled(key, |_, _| Ok(()), |_| Ok(()), check)
     }
 
     /// The id of the IRI or literal with vocabulary key `key`: in the store, else a

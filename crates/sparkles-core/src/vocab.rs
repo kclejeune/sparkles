@@ -1984,39 +1984,14 @@ impl Vocab {
         Ok(result)
     }
 
-    pub(crate) fn find_with_controlled(
-        &self,
-        key: &[u8],
-        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
-        checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
-    ) -> crate::error::Result<std::result::Result<u64, u64>> {
-        self.find_with_controlled_capacity(key, |_, new| reserve(new), |_| Ok(()), checkpoint)
-    }
-
-    pub(crate) fn find_with_controlled_capacity<E: From<crate::error::Error>>(
-        &self,
-        key: &[u8],
-        grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
-        settled: impl FnMut(usize) -> std::result::Result<(), E>,
-        checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
-    ) -> std::result::Result<std::result::Result<u64, u64>, E> {
-        let mut scratch = ControlledScratch {
-            grow,
-            settled,
-            checkpoint,
-        };
-        let _timer = ioacct::timer(Phase::VocabRead);
-        self.find_with::<true, _, E>(key, &mut scratch)
-    }
-
     /// Exact controlled search over the base vocabulary whose work and scratch stay
     /// bounded by `key`: compares directly against `key` using the sorted front-coding
     /// invariant without allocating a reconstruction buffer for sibling entries.
-    pub(crate) fn find_exact_controlled(
+    pub(crate) fn find_exact_controlled<E: From<crate::error::Error>>(
         &self,
         key: &[u8],
-        mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
-    ) -> crate::error::Result<std::result::Result<u64, u64>> {
+        mut checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<std::result::Result<u64, u64>, E> {
         let Some(b) = self.find_block_with::<true, _, _>(
             key,
             &mut ControlledScratch {
@@ -2049,7 +2024,8 @@ impl Vocab {
             if at == 0 && entry.shared != 0 {
                 return Err(crate::error::Error::Corrupt(
                     "first vocabulary block entry has non-zero shared prefix".into(),
-                ));
+                )
+                .into());
             }
             if at > 0 && entry.shared > div {
                 continue;
@@ -2572,9 +2548,8 @@ impl Vocab {
     }
 
     /// Unified binary search over front-coded blocks, generic over [`BlockScratch`].
-    /// Under [`Unlimited`], narrows with the sparse index and uses the zero-rebuild
-    /// LCP in-block scan; under checked or polling controls, admits reconstruction
-    /// scratch and compares cooperatively.
+    /// Under [`Unlimited`], uses the zero-rebuild LCP in-block scan. The checked
+    /// projection path admits its reconstruction scratch.
     #[inline(always)]
     fn find_with<const P: bool, S: BlockScratch<E>, E>(
         &self,
@@ -5072,24 +5047,16 @@ mod tests {
                 assert_eq!(actual.as_ref(), Some(key));
                 assert_eq!(
                     vocab
-                        .find_with_controlled(key, |_| Ok(()), |_| Ok(()))
+                        .find_exact_controlled(key, |_| Ok::<_, crate::Error>(()))
                         .unwrap(),
-                    vocab.find(key)
-                );
-                assert_eq!(
-                    vocab.find_exact_controlled(key, |_| Ok(())).unwrap(),
                     vocab.find(key)
                 );
                 let mut absent = key.clone();
                 absent.push(0);
                 assert_eq!(
                     vocab
-                        .find_with_controlled(&absent, |_| Ok(()), |_| Ok(()))
+                        .find_exact_controlled(&absent, |_| Ok::<_, crate::Error>(()))
                         .unwrap(),
-                    vocab.find(&absent)
-                );
-                assert_eq!(
-                    vocab.find_exact_controlled(&absent, |_| Ok(())).unwrap(),
                     vocab.find(&absent)
                 );
             }
@@ -5104,6 +5071,69 @@ mod tests {
                     .unwrap(),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn controlled_vocab_short_hit_and_miss_fit_after_an_oversized_sibling() {
+        use crate::builder::VocabCodec;
+        use crate::error::{Budget, BudgetKind, Error};
+        use crate::store::{Store, StoreOptions};
+
+        for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+            let store = Store::in_memory(StoreOptions {
+                build: crate::builder::BuildOptions {
+                    vocab_codec: Some(codec),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let long = "b".repeat(120 * 1024);
+            crate::sparql::update::update(
+                &store,
+                &format!(r#"INSERT DATA {{ <urn:s> <urn:p> "a", "{long}", "c" }}"#),
+                &Default::default(),
+            )
+            .unwrap();
+            store.compact().unwrap();
+            let snap = store.snapshot();
+            assert_eq!(snap.generation.vocab_codec(), codec);
+            let vocab = &snap.generation.vocab;
+            let long_key = crate::id::term_key(&oxrdf::Literal::new_simple_literal(long).into());
+            let long_id = vocab.find(&long_key).unwrap() as usize;
+            let block = long_id / FC_BLOCK;
+            let mut position = vocab.block_offset(block);
+            let long_entry = (0..=long_id % FC_BLOCK)
+                .map(|at| vocab.entry_controlled(&mut position, at == 0).unwrap())
+                .last()
+                .unwrap();
+            assert_eq!(long_entry.coded, codec == VocabCodec::Fsst);
+            for value in ["c", "bb"] {
+                let key = crate::id::term_key(&oxrdf::Literal::new_simple_literal(value).into());
+                let (Ok(at) | Err(at)) = vocab.find(&key);
+                assert!(at > long_id as u64 && at as usize / FC_BLOCK == block);
+                let limit = (key.len() + 1) as u64;
+                let actual = snap.lookup_key_controlled(
+                    &key,
+                    |old, new| {
+                        let requested = (old + new) as u64;
+                        if requested <= limit {
+                            Ok(())
+                        } else {
+                            Err(Error::BudgetExceeded(Budget {
+                                kind: BudgetKind::Memory,
+                                limit,
+                                requested,
+                            }))
+                        }
+                    },
+                    |_| Ok(()),
+                    || Ok(()),
+                );
+                let expected = snap.lookup_key(&key);
+                assert_eq!(expected.is_some(), value == "c");
+                assert_eq!(actual.unwrap(), expected, "{codec}: {value}");
+            }
         }
     }
 
@@ -5135,7 +5165,7 @@ mod tests {
                 let got = vocab
                     .find_exact_controlled(key, |_| {
                         checks += 1;
-                        Ok(())
+                        Ok::<_, crate::Error>(())
                     })
                     .unwrap();
                 assert_eq!(got, vocab.find(key));
@@ -5156,7 +5186,9 @@ mod tests {
                 b"<urn:g:zzz",
             ] {
                 assert_eq!(
-                    vocab.find_exact_controlled(probe, |_| Ok(())).unwrap(),
+                    vocab
+                        .find_exact_controlled(probe, |_| Ok::<_, crate::Error>(()))
+                        .unwrap(),
                     vocab.find(probe),
                     "probe={:?} fsst={fsst}",
                     String::from_utf8_lossy(probe)
@@ -6293,7 +6325,7 @@ mod tests {
                 Err(Error::Timeout)
             ));
             assert!(matches!(
-                v.find_with_controlled(&keys[17], |_| Ok(()), |_| Err(Error::Cancelled)),
+                v.find_exact_controlled(&keys[17], |_| Err(Error::Cancelled)),
                 Err(Error::Cancelled)
             ));
             for &id in &sample_ids {
@@ -6301,7 +6333,7 @@ mod tests {
                 assert_eq!(v.find(k), Ok(id));
                 assert_eq!(v.find_with_checked(k, |_| Ok(())).unwrap(), Ok(id));
                 assert_eq!(
-                    v.find_with_controlled(k, |_| Ok(()), |_| Ok(())).unwrap(),
+                    v.find_exact_controlled(k, |_| Ok::<_, Error>(())).unwrap(),
                     Ok(id)
                 );
                 let fallible = v.get_with_fallible(id, |_| Ok(()), |b| b.to_vec()).unwrap();

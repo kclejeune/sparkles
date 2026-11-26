@@ -61,33 +61,13 @@ enum CachedSnapshot {
     Missing,
 }
 
-/// Resolve a vocabulary key in `snap` outside `cache.kept.lock()`, admitting any base
-/// vocabulary reconstruction scratch to `budget` and polling `controls`.
+/// Resolve a vocabulary key in `snap` outside `cache.kept.lock()`, polling `controls`.
 fn lookup_key_controlled_in_snap(
     snap: &Snapshot,
     key: &[u8],
-    budget: &Arc<Budget>,
     controls: &DiagnosticControls,
 ) -> anyhow::Result<Option<Id>> {
-    let scratch = std::cell::RefCell::new(Held::new(budget));
-    snap.lookup_key_controlled(
-        key,
-        |old, new| -> anyhow::Result<()> {
-            if let Err(err) = scratch.borrow_mut().try_set(old.saturating_add(new)) {
-                check(controls)?;
-                return Err(err.into());
-            }
-            Ok(())
-        },
-        |capacity| -> anyhow::Result<()> {
-            if let Err(err) = scratch.borrow_mut().try_set(capacity) {
-                check(controls)?;
-                return Err(err.into());
-            }
-            Ok(())
-        },
-        || check(controls),
-    )
+    snap.lookup_key_controlled(key, |_, _| Ok(()), |_| Ok(()), || check(controls))
 }
 
 // The lexical key encoding for an IRI is '<' followed by its UTF-8 bytes.
@@ -228,7 +208,7 @@ fn snapshot_cached_typings(
             .as_ref()
             .is_some_and(|(previous, _)| Arc::ptr_eq(previous, &snap))
         {
-            let ty_id = lookup_key_controlled_in_snap(&snap, RDF_TYPE_KEY, budget, controls)?;
+            let ty_id = lookup_key_controlled_in_snap(&snap, RDF_TYPE_KEY, controls)?;
             resolved = Some((Arc::clone(&snap), ty_id));
         }
         let ty_id = resolved.as_ref().and_then(|(_, id)| *id);

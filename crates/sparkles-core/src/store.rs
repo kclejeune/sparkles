@@ -1076,7 +1076,7 @@ impl Snapshot {
     }
 
     /// Id of a term if it exists in this snapshot, checking live controls and admitting
-    /// the probe and coexisting vocabulary reconstruction buffers before allocating.
+    /// the probe before allocating.
     pub fn lookup_term_controlled(
         &self,
         t: &Term,
@@ -1102,21 +1102,13 @@ impl Snapshot {
                 }
                 id::write_term_ref_key(t.as_ref(), &mut key);
                 debug_assert_eq!(key.len(), len);
-                self.lookup_key_controlled(
-                    &key,
-                    |old, new| {
-                        let bytes = key.capacity().saturating_add(old).saturating_add(new);
-                        admit(bytes)
-                    },
-                    |_| Ok(()),
-                    check,
-                )
+                self.find_key_controlled(&key, check)
             }
         }
     }
 
     /// Id of an IRI if it exists in this snapshot, checking live controls and admitting
-    /// the probe and coexisting vocabulary reconstruction buffers before allocating.
+    /// the probe before allocating.
     pub fn lookup_iri_controlled(
         &self,
         iri: &str,
@@ -1137,41 +1129,40 @@ impl Snapshot {
         key.push(b'<');
         key.extend_from_slice(iri.as_bytes());
         debug_assert_eq!(key.len(), len);
-        self.lookup_key_controlled(
-            &key,
-            |old, new| {
-                let bytes = key.capacity().saturating_add(old).saturating_add(new);
-                admit(bytes)
-            },
-            |_| Ok(()),
-            check,
-        )
+        self.find_key_controlled(&key, check)
     }
 
-    /// Id of a vocabulary key if it exists in this snapshot, checking live controls and
-    /// admitting coexisting vocabulary reconstruction buffers during growth, then only the
-    /// settled scratch allocation.
+    /// Id of a vocabulary key if it exists in this snapshot, checking live controls.
+    /// The allocation callbacks are retained for callers of this API. The search
+    /// compares directly against the supplied key and needs no reconstruction buffer.
     pub fn lookup_key_controlled<E: From<Error>>(
         &self,
         key: &[u8],
-        grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
-        settled: impl FnMut(usize) -> std::result::Result<(), E>,
+        _grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
+        _settled: impl FnMut(usize) -> std::result::Result<(), E>,
+        check: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<Id>, E> {
+        self.find_key_controlled(key, check)
+    }
+
+    fn find_key_controlled<E: From<Error>>(
+        &self,
+        key: &[u8],
         mut check: impl FnMut() -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<Id>, E> {
         check()?;
-        let found =
-            match self
+        let found = match self
+            .generation
+            .vocab
+            .find_exact_controlled(key, |_| check())?
+        {
+            Ok(i) => Some(Id::vocab(i)),
+            Err(_) => self
                 .generation
-                .vocab
-                .find_with_controlled_capacity(key, grow, settled, |_| check())?
-            {
-                Ok(i) => Some(Id::vocab(i)),
-                Err(_) => self
-                    .generation
-                    .dvocab
-                    .find_prepared(key, self.dvocab_len, &mut check)?
-                    .map(Id::delta),
-            };
+                .dvocab
+                .find_prepared(key, self.dvocab_len, &mut check)?
+                .map(Id::delta),
+        };
         check()?;
         Ok(found)
     }

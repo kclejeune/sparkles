@@ -210,7 +210,8 @@ impl Store {
         }
         let inferred: Arc<[u8]> = crate::id::iri_key(INFERRED_GRAPH).into();
         let mut terms_from = txn.mark.entries();
-        let mut extra = 0u64;
+        let mut vocab_file_is_empty = txn.mark.file_is_empty();
+        let mut fenced_extra = 0u64;
         for (index, &(branch_id, seq)) in commits.iter().enumerate() {
             txn.opts.check()?;
             options.progress.report(
@@ -293,10 +294,13 @@ impl Store {
             let wal_bytes = txn
                 .wal_bytes()
                 .saturating_add((index as u64).saturating_mul(WAL_REC as u64));
-            extra = extra
-                .saturating_add(txn.pending_storage_bytes(terms_from, txn.opts.message.as_deref()));
-            terms_from = txn.base.generation.dvocab.len();
-            let storage = txn.preview_storage(inserts, wal_bytes.saturating_add(extra));
+            let pending = txn.pending_storage_bytes(terms_from, txn.opts.message.as_deref());
+            let storage = txn.preview_storage(
+                inserts,
+                wal_bytes
+                    .saturating_add(fenced_extra)
+                    .saturating_add(pending),
+            );
             let refused = precondition
                 .as_ref()
                 .is_some_and(|outcome| outcome.is_err())
@@ -316,6 +320,13 @@ impl Store {
                 }
                 return Err(Error::DryRun(Box::new(preview)));
             }
+            // This step's admission counts the pending term payload. The next step sees
+            // these terms on disk with their chunk headers and, on first use, the file header.
+            let vocab = &txn.base.generation.dvocab;
+            let framing = vocab.framing_bytes(terms_from, vocab_file_is_empty);
+            fenced_extra = fenced_extra.saturating_add(pending).saturating_add(framing);
+            vocab_file_is_empty &= framing == 0;
+            terms_from = vocab.len();
         }
         let mut unchanged = report.clone();
         unchanged.up_to_date = true;

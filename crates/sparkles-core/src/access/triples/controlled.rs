@@ -1141,6 +1141,29 @@ fn permutation_mutation_bound(ins: &KeySet, del: &KeySet) -> u64 {
         .saturating_add(KeySet::level_bound())
 }
 
+/// The budget observation can become stale before a concurrent reservation.
+fn reserve_mutation_batch(
+    preparation: &Preparation,
+    owned: &Reservation,
+    bound: u64,
+    writers: u64,
+    max_batch: usize,
+) -> Result<(usize, Reservation)> {
+    let room = preparation.available_room();
+    // Size the batch against the retained charge and a fraction of current headroom.
+    let share = (owned.bytes() / 4).max(room / 8 / writers).min(room);
+    let mut batch = usize::try_from(share / bound)
+        .unwrap_or(usize::MAX)
+        .clamp(1, max_batch);
+    loop {
+        match preparation.reserve(bound.saturating_mul(batch as u64)) {
+            Ok(held) => return Ok((batch, held)),
+            Err(Error::BudgetExceeded(_)) if batch > 1 => batch /= 2,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Hide `hidden` in one permutation: remove the keys the delta inserted and add the
 /// others to its deletions. Returns the admission of the nodes the writes allocated.
 fn write_permutation(
@@ -1158,15 +1181,13 @@ fn write_permutation(
     let mut at = 0;
     while at < hidden.len() {
         let bound = permutation_mutation_bound(ins, del);
-        // A batch admits at most a quarter of what the writes already own, or an eighth
-        // of the room the cap leaves each of the seven writers, so headroom stays small
-        // next to the charge and the cap while admissions stay few.
-        let share = (owned.bytes() / 4).max(preparation.room() / 8 / Perm::ALL.len() as u64);
-        let batch = usize::try_from(share / bound.max(1))
-            .unwrap_or(usize::MAX)
-            .clamp(1, 4096)
-            .min(hidden.len() - at);
-        let mut headroom = preparation.reserve(bound.saturating_mul(batch as u64))?;
+        let (batch, mut headroom) = reserve_mutation_batch(
+            preparation,
+            owned,
+            bound,
+            Perm::ALL.len() as u64,
+            (hidden.len() - at).min(4096),
+        )?;
         let mut allocated = 0u64;
         let written = (at..at + batch).try_for_each(|index| {
             if index.is_multiple_of(64) {
@@ -1217,11 +1238,8 @@ fn write_reifiers(
             let bound = reifiers_ins
                 .mutation_bound()
                 .saturating_add(KeySet::level_bound());
-            let share = (owned.bytes() / 4).max(preparation.room() / 8);
-            let batch = usize::try_from(share / bound.max(1))
-                .unwrap_or(usize::MAX)
-                .clamp(1, pending.len() - at);
-            let mut headroom = preparation.reserve(bound.saturating_mul(batch as u64))?;
+            let (batch, mut headroom) =
+                reserve_mutation_batch(preparation, owned, bound, 1, pending.len() - at)?;
             let mut allocated = 0u64;
             for key in &pending[at..at + batch] {
                 reifiers_ins.remove_metered(key, &mut allocated);
@@ -1297,29 +1315,46 @@ fn apply_controlled(
     // Declared after the reservations, so an early return drops the copied nodes
     // before it releases their admission.
     let mut delta = snap.delta.clone();
-    let sets: Vec<(Perm, &mut KeySet, &mut KeySet)> = Perm::ALL
-        .into_iter()
-        .zip(delta.ins.iter_mut().zip(delta.del.iter_mut()))
-        .map(|(perm, (ins, del))| (perm, ins, del))
-        .collect();
-    let parallel_headroom = sets.iter().fold(0u64, |sum, (_, ins, del)| {
-        sum.saturating_add(permutation_mutation_bound(ins, del))
-    });
-    let write = |(perm, ins, del), owned: &mut Reservation| {
-        write_permutation(perm, ins, del, &hidden, &inserted, preparation, owned)
-    };
-    // Each running permutation needs space for at least one mutation. Serialize under
-    // a tighter cap so permutations can reuse the headroom returned after each write.
-    if !hidden.is_empty() && parallel_headroom <= preparation.available_room() {
-        use rayon::prelude::*;
-        sets.into_par_iter()
-            .zip(copies.par_iter_mut())
-            .map(|(set, owned)| write(set, owned))
-            .collect::<Result<()>>()?;
-    } else {
-        for (set, owned) in sets.into_iter().zip(&mut copies) {
-            write(set, owned)?;
+    let parallel_headroom = delta
+        .ins
+        .iter()
+        .zip(&delta.del)
+        .fold(0u64, |sum, (ins, del)| {
+            sum.saturating_add(permutation_mutation_bound(ins, del))
+        });
+    let write = |delta: &mut Delta, copies: &mut [Reservation], parallel| {
+        let write_one = |((perm, (ins, del)), owned)| {
+            write_permutation(perm, ins, del, &hidden, &inserted, preparation, owned)
+        };
+        if parallel {
+            use rayon::prelude::*;
+            Perm::ALL
+                .into_par_iter()
+                .zip(delta.ins.par_iter_mut().zip(delta.del.par_iter_mut()))
+                .zip(copies.par_iter_mut())
+                .map(write_one)
+                .collect::<Result<()>>()
+        } else {
+            Perm::ALL
+                .into_iter()
+                .zip(delta.ins.iter_mut().zip(delta.del.iter_mut()))
+                .zip(copies)
+                .try_for_each(write_one)
         }
+    };
+    // The first batch can fit concurrently even when later batches cannot. Wait for
+    // the parallel writers to stop and drop their copied nodes before releasing their
+    // reservations. Serial writers can then reuse the same transient headroom.
+    let parallel = !hidden.is_empty() && parallel_headroom <= preparation.available_room();
+    match write(&mut delta, &mut copies, parallel) {
+        Err(Error::BudgetExceeded(_)) if parallel => {
+            delta = snap.delta.clone();
+            for copy in &mut copies {
+                copy.release_to(0);
+            }
+            write(&mut delta, &mut copies, false)?;
+        }
+        result => result?,
     }
     write_reifiers(
         &snap.generation,
@@ -1517,6 +1552,102 @@ mod tests {
         assert!(legacy_mask.retained >= legacy.delta.unshared_bytes(|| Ok(())).unwrap().0);
         drop(prepared);
         assert_eq!(prep.inner_used(), before);
+    }
+
+    fn two_base_quads() -> Arc<Snapshot> {
+        let store = crate::store::Store::in_memory(Default::default());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:s> <urn:p> 1, 2 }",
+            &Default::default(),
+        )
+        .unwrap();
+        store.compact().unwrap();
+        store.snapshot()
+    }
+
+    fn hide_base_quads(
+        snap: &Snapshot,
+        preparation: &Preparation,
+    ) -> Result<(Arc<Snapshot>, Reservation)> {
+        let mut hidden = Buffer::new(preparation)?;
+        snap.for_each_quad(|quad| hidden.push(Perm::Spo.to_key(quad)))?;
+        assert_eq!(hidden.len(), 2);
+        apply_controlled(snap, hidden, "test", preparation)
+    }
+
+    #[test]
+    fn mask_writes_fit_under_a_tight_backing_grant() {
+        let snap = two_base_quads();
+        let bound = permutation_mutation_bound(
+            &snap.delta.ins[Perm::Spo.index()],
+            &snap.delta.del[Perm::Spo.index()],
+        );
+        // The grant can admit one mutation at a time, even after earlier writers keep
+        // copies, but it cannot admit the first writer's two-mutation batch.
+        let pool = crate::sparql::pool::QueryPool::new(bound * 19 / 10);
+        let grant = Arc::new(pool.empty_grant());
+        let preparation = Preparation::with_grant(Control::none(), 1 << 30, grant.clone()).unwrap();
+        let before = grant.used();
+        let (masked, held) = hide_base_quads(&snap, &preparation).unwrap();
+        assert_eq!(masked.len(), 0);
+        assert!(masked.delta.del.iter().all(|set| set.len() == 2));
+        assert_eq!(grant.used() - before, held.bytes());
+        drop(masked);
+        drop(held);
+        assert_eq!(grant.used(), before);
+    }
+
+    #[test]
+    fn parallel_mask_retries_serially_after_a_later_batch_is_refused() {
+        use sparkles_budget::{MemoryDomain, ParentRefused, Scope};
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        let snap = two_base_quads();
+        let initial_bound = permutation_mutation_bound(&KeySet::new(), &KeySet::new());
+        let later_bound = initial_bound + KeySet::level_bound();
+        let refused = Arc::new(AtomicBool::new(false));
+        let used = Arc::new(AtomicU64::new(0));
+        let admitted = used.clone();
+        let released = used.clone();
+        let hit = refused.clone();
+        // Simulate a transient backing refusal after a parallel writer has kept the
+        // first deletion leaf. The next reservation of the same size can succeed.
+        let parent = MemoryDomain::unpooled().parent(
+            move |bytes| {
+                if bytes == later_bound && !hit.swap(true, Ordering::Relaxed) {
+                    return Err(ParentRefused::Limit {
+                        limit: later_bound - 1,
+                        requested: later_bound,
+                        scope: Scope::Work,
+                    });
+                }
+                admitted.fetch_add(bytes, Ordering::Relaxed);
+                Ok(())
+            },
+            move |bytes| {
+                released.fetch_sub(bytes, Ordering::Relaxed);
+            },
+        );
+        let preparation = Preparation::for_view_rebuild(
+            &crate::sparql::QueryOptions {
+                cancel: Some(Arc::new(AtomicBool::new(false))),
+                max_memory_bytes: Some(8 * initial_bound),
+                ..Default::default()
+            },
+            parent,
+            None,
+        )
+        .unwrap();
+        let before = used.load(Ordering::Relaxed);
+        let (masked, held) = hide_base_quads(&snap, &preparation).unwrap();
+        assert!(refused.load(Ordering::Relaxed));
+        assert_eq!(masked.len(), 0);
+        assert!(masked.delta.del.iter().all(|set| set.len() == 2));
+        assert_eq!(used.load(Ordering::Relaxed) - before, held.bytes());
+        drop(masked);
+        drop(held);
+        assert_eq!(used.load(Ordering::Relaxed), before);
     }
 
     #[test]
