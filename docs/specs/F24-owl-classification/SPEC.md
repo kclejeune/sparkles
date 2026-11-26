@@ -174,6 +174,26 @@ from 146.6 to 138.6 ms. Items 590 and 664 wait for item 1254, since on `ore_ont_
 the index build and the checks before it are 0.47 of a run
 that starts again.
 
+Item 664 extends incremental OWL 2 EL classification to edits involving individuals,
+nominals, assertions, keys, context merges, universal roles and conditional worlds. Plain
+EL terminologies without individuals keep the zero-overhead bitset invalidation path of
+item 1256. Strictly EL runs that enter Phase 2 record an acyclic `real_parent` forest for
+`real` reachability, pre-broadcast grounded supports for derived global universal facts,
+per-merge causal context and real-reachability dependencies for `HasKey` merges and
+per-world context, expression, key, named-individual and datatype-checker dependencies for
+cached conditional worlds. Incremental invalidation compares the old and new indexes,
+propagates through backward existential edges, nominal members, real-context nominal
+merges, the `real_parent` forest and `HasKey` dependencies, re-seeds kept contexts that
+retain an alternative real predecessor and reuses unaffected cached conditional worlds
+while replaying sticky datatype-checker rows. A kept run restarts cleanly when a
+previously broadcast global universal fact loses all grounded supports or when a tight
+memory budget refuses the dependency tables, and `Interner::met_individuals` filters
+removed individuals out of live nominals and `Saturation::describe`. Targeted and
+randomized differential tests in `crates/sparkles-owl/tests/el_incremental_individuals.rs`,
+`tests/classify.rs` and `tests/incremental_sweep.rs` verify exact taxonomy, consistency
+and `describe` parity against fresh full runs and confirm that unaffected contexts and
+conditional worlds are not recomputed.
+
 Item 804 delivers the sixth phase's rooted run as the option `Limits::rooted`, off by
 default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) and
 [item 804's departures](#item-804s-departures-from-the-journals-rules) describe. With it,
@@ -1168,11 +1188,12 @@ inferred read is refused, since a classification reads the asserted axioms. The 
 keeps its last classification of an ontology for callers who read every graph, without
 assertions, keyed by the graphs, imports and mode. A compatible classification at the
 same commit answers from the retained result. At a later commit eligible EL additions
-and removals reuse affected contexts, as do edits of class axioms after a Horn run
-without individuals and a disjunctive run that does not count, while the other Horn and
-disjunctive runs rebuild after edits. Item 753 covers incremental native DL maintenance
-under item 603, and item 664
-covers the EL individual, merge, key and world invalidation gaps. One kept classification
+and removals, including edits involving individuals, nominals, keys, merges, universal
+roles and conditional worlds, reuse unaffected contexts and worlds, as do edits of class
+axioms after a Horn run without individuals and a disjunctive run that does not count,
+while the other Horn and disjunctive runs rebuild after edits. Item 753 covers incremental
+native DL maintenance under item 603, and item 664 delivered the EL individual, merge, key
+and world invalidation tracking. One kept classification
 runs at a time, and a second caller waits for it under
 its own deadline. The dataset keeps the saturation and the ontology it read, whose axioms
 the open ontology shares, and at the next commit it passes the saturation the axioms
@@ -1357,7 +1378,9 @@ report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the r
 each construct, the reports of excluded axioms, the bounds, incremental runs, a
 comparison with an independent naive completion procedure for EL++ on random ontologies
 of up to twenty axioms, incremental against full runs on random changes for both
-`Classifier` and `Saturation`, and in `tests/incremental_sweep.rs` incremental against
+`Classifier` and `Saturation`, in `tests/el_incremental_individuals.rs` targeted and
+randomized differential runs over edits of assertions, nominals, merges, keys, universal
+roles and conditional worlds, and in `tests/incremental_sweep.rs` incremental against
 full runs on edits of class axioms beside fixed self restrictions, reflexive roles,
 chains, ranges, individuals and the top and bottom properties, the same taxonomy on one, two and eight threads for an
 ontology of 3,000 classes, and an estimate that bounds a run with its taxonomy. Unit
@@ -1373,7 +1396,7 @@ taxonomy.
 **Roadmap follow-ups.** An MCP tool is item 586. Complete reasoning with
 individuals and datatypes was item 587, with item 605. The literals and datatypes the
 classifier cannot compare and chains through the top property are item 663, and
-incremental runs that follow merges, keys and worlds are item 664. Reads that
+incremental runs that follow merges, keys and worlds were item 664. Reads that
 answer from the classification are item 588. DL queries answer from the kept classifier
 through `Classifier::saturate` and `Classifier::describe`, as
 [U12's DL Query outcome](../U12-ontology-workbench/SPEC.md#dl-query) describes.
@@ -5967,8 +5990,8 @@ peak of a kept run on four threads is 1.3 to 1.45 times that of the first run, 2
 against 147 MB for the Gene Ontology and 863 against 651 MB for ChEBI lite, since the
 run holds the last index and the chunks of the parallel normalization at once.
 
-Item 590 owns assertion retention and item 664 owns EL individual, merge, key and world
-invalidation. Coordinate their dependency records before making those changes eligible
+Item 590 owns assertion retention, and item 664 delivered EL individual, merge, key and
+world invalidation. Coordinate their dependency records before making those changes eligible
 for native DL reuse. Terminology-only maintenance can ship with a safe full fallback
 before those items finish. Item 589 owns durable automatic scheduling after item 339.
 
