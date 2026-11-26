@@ -895,17 +895,19 @@ impl Asking<'_, '_> {
             return self.given(&q);
         }
         // C22 §7 / C25 item 811: the reports a global answer may use, and the explicit
-        // global mode. With reviewPolicy only reports read under that policy are used,
-        // and with matchingPolicy report identities are resolved through its map.
-        if self.o.mode != AskMode::Local {
+        // global mode. Explicit global loads findings and resolves report identities up
+        // front; auto mode probes report availability without resolving report entities
+        // so local questions do not pay resolution cost or fail on report-only limits.
+        if self.o.mode == AskMode::Global {
             match self.report_selection() {
-                Ok(reports) => self.reports = reports,
+                Ok(Some(sel)) => return self.global(sel),
+                Ok(None) => self.reports = None,
                 Err(e) => return self.error(&e.code, e.message),
             }
-            if self.o.mode == AskMode::Global
-                && let Some(sel) = self.reports.take()
-            {
-                return self.global(sel);
+        } else if self.o.mode == AskMode::Auto {
+            match self.report_probe() {
+                Ok(reports) => self.reports = reports,
+                Err(e) => return self.error(&e.code, e.message),
             }
         }
         if self.pair(Role::Draft).is_none() {
@@ -1290,36 +1292,47 @@ impl Asking<'_, '_> {
             .filter_map(|e| e["candidates"][0]["iri"].as_str().map(Value::from))
             .take(MAX_COMMUNITIES)
             .collect();
-        if !linked.is_empty()
-            && self.o.report_context
-            && let Ok(v) = self.ground_tool(
+        if !linked.is_empty() && self.o.report_context {
+            let mut community_args = json!({
+                "seeds": linked,
+                "hops": 0,
+                "maxTriples": 1,
+                "communities": true,
+                "format": "json",
+            });
+            if let Some(p) = &self.o.review_policy {
+                community_args["reviewPolicy"] = p.clone().into();
+                community_args["maxClaims"] = 1.into();
+            }
+            if let Ok(v) = self.ground_tool(
                 profile::Stage::CommunityRecall,
                 "recall",
-                json!({ "seeds": linked, "hops": 0, "maxTriples": 1, "communities": true, "format": "json" }),
+                community_args,
                 true,
-            )
-        {
-            let v = match v {
-                Value::String(t) => serde_json::from_str(&t).unwrap_or_default(),
-                v => v,
-            };
-            let reports: Vec<&Value> = v["communities"]["reports"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .take(MAX_COMMUNITIES)
-                .collect();
-            if !reports.is_empty() {
-                ctx.push_str("\nCommunities of the entities the question names, from the dataset's community reports:\n");
-                for r in &reports {
-                    ctx.push_str(&format!(
-                        "{} {}: {}\n",
-                        r["community"].as_str().unwrap_or(""),
-                        Value::from(r["title"].as_str().unwrap_or("")),
-                        Value::from(prompts::cut(r["summary"].as_str().unwrap_or(""), 600))
-                    ));
+            ) {
+                let v = match v {
+                    Value::String(t) => serde_json::from_str(&t).unwrap_or_default(),
+                    v => v,
+                };
+                let reports: Vec<&Value> = v["communities"]["reports"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(MAX_COMMUNITIES)
+                    .collect();
+                if !reports.is_empty() {
+                    ctx.push_str("\nCommunities of the entities the question names, from the dataset's community reports:\n");
+                    for r in &reports {
+                        ctx.push_str(&format!(
+                            "{} {}: {}\n",
+                            r["community"].as_str().unwrap_or(""),
+                            Value::from(r["title"].as_str().unwrap_or("")),
+                            Value::from(prompts::cut(r["summary"].as_str().unwrap_or(""), 600))
+                        ));
+                    }
+                    ground_event["communities"] =
+                        reports.iter().map(|r| r["iri"].clone()).collect();
                 }
-                ground_event["communities"] = reports.iter().map(|r| r["iri"].clone()).collect();
             }
         }
         ground_event["entities"] = Value::Array(entities);
@@ -1853,12 +1866,31 @@ impl Asking<'_, '_> {
             };
             let mut ran: Option<(String, RunResult)> = None;
             if scoped && value["scope"].as_str() == Some("global") {
-                let sel = self.reports.take().unwrap_or(Value::Null);
-                self.emit(
-                    "scope",
-                    &json!({ "scope": "global", "provider": pair.provider, "model": pair.model }),
-                );
-                return self.global(sel);
+                let _ = self.reports.take();
+                let fenced = self.o.review_policy.is_some() || self.o.matching_policy.is_some();
+                if fenced && !self.authority_current() {
+                    self.withheld = true;
+                    return json!({});
+                }
+                // Re-read the full report selection (with findings and resolved identities)
+                // on entry to global() so the reports SSE event and map/reduce calls reflect
+                // the current reports, policy and matching map.
+                match self.report_selection() {
+                    Ok(Some(sel)) => {
+                        self.emit(
+                            "scope",
+                            &json!({ "scope": "global", "provider": pair.provider, "model": pair.model }),
+                        );
+                        return self.global(sel);
+                    }
+                    Ok(None) => {
+                        if fenced {
+                            self.withheld = true;
+                            return json!({});
+                        }
+                    }
+                    Err(e) => return self.error(&e.code, e.message),
+                }
             }
             // the vote runs each draft's query, so a preview that runs nothing asks once
             let (value, level, pair) = if attempt == 1 && self.o.drafts > 1 && self.o.run {

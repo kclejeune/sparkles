@@ -381,6 +381,47 @@ fn a_kept_answer_stores_its_cited_claims() {
     assert!(plain.get("claims").is_none());
 }
 
+/// `stored_answer` persists `global.reviewPolicy` when present and omits it otherwise.
+#[test]
+fn stored_answer_persists_global_review_policy() {
+    let out = json!({
+        "mode": "global",
+        "points": [{ "n": 1, "text": "Acme payments.", "reports": ["urn:r:main"] }],
+        "reports": [{ "iri": "urn:r:main", "title": "Main Policy Community" }],
+        "global": {
+            "level": 0,
+            "ranking": "rating",
+            "reviewPolicy": {
+                "name": "main",
+                "iri": "urn:x-sparkles:evidence:policy:main",
+                "version": 1,
+            },
+        },
+        "summary": { "text": "Main summary [1].", "citations": [1] },
+    });
+    let kept = crate::assistant::stored_answer(&out, &Value::Null).unwrap();
+    assert_eq!(
+        kept["global"]["reviewPolicy"],
+        json!({
+            "name": "main",
+            "iri": "urn:x-sparkles:evidence:policy:main",
+            "version": 1,
+        })
+    );
+    let unpolicied = crate::assistant::stored_answer(
+        &json!({
+            "mode": "global",
+            "points": [{ "n": 1, "text": "Plain.", "reports": ["urn:r:plain"] }],
+            "reports": [{ "iri": "urn:r:plain", "title": "Plain" }],
+            "global": { "level": 0, "ranking": "rating" },
+            "summary": { "text": "Plain [1].", "citations": [1] },
+        }),
+        &Value::Null,
+    )
+    .unwrap();
+    assert!(unpolicied["global"].get("reviewPolicy").is_none());
+}
+
 /// A supplied query has no linked entities, so no claim reaches the summary, whatever
 /// the claims name.
 #[tokio::test(flavor = "multi_thread")]
@@ -524,6 +565,25 @@ async fn global_answer_filters_by_review_policy_and_resolves_report_identities()
                 200,
                 mock::openai(
                     &json!({ "text": "Fallback local answer [1].", "citations": [1] }).to_string(),
+                ),
+            );
+        }
+        if body.contains("\"scope\"")
+            || body.contains("Classify the question")
+            || body.contains("scope") && body.contains("global")
+        {
+            return (
+                200,
+                mock::openai(
+                    &json!({
+                        "scope": "global",
+                        "query": "",
+                        "explanation": "Whole-dataset overview.",
+                        "assumptions": [],
+                        "clarify": { "question": "", "choices": [] },
+                        "graph": { "subject": "", "predicate": "", "object": "" }
+                    })
+                    .to_string(),
                 ),
             );
         }
@@ -675,7 +735,7 @@ async fn global_answer_filters_by_review_policy_and_resolves_report_identities()
     <{cc}> <urn:claim:main-1> ;
     <{cd}> <urn:decision:main-1> .
 
-  <urn:c:other> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:other> .
+  <urn:c:other> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{member}> <http://example.org/resource/acme> ; <{report}> <urn:r:other> .
   <urn:r:other> a <{report_cls}> ;
     <http://www.w3.org/2000/01/rdf-schema#label> "Other Policy Community" ;
     <{summary}> "OTHER_ONLY_TEXT summary." ;
@@ -690,7 +750,7 @@ async fn global_answer_filters_by_review_policy_and_resolves_report_identities()
     <{about}> <http://example.org/resource/bob> ;
     <{cites}> <<( <http://example.org/resource/bob> <http://example.org/ontology#leads> <http://example.org/resource/ops> )>> .
 
-  <urn:c:plain> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:plain> .
+  <urn:c:plain> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{member}> <http://example.org/resource/acme> ; <{report}> <urn:r:plain> .
   <urn:r:plain> a <{report_cls}> ;
     <http://www.w3.org/2000/01/rdf-schema#label> "Unpolicied Community" ;
     <{summary}> "PLAIN_ONLY_TEXT summary." ;
@@ -706,6 +766,7 @@ async fn global_answer_filters_by_review_policy_and_resolves_report_identities()
         community = gr("Community"),
         level = gr("level"),
         count = gr("memberCount"),
+        member = gr("member"),
         report = gr("report"),
         report_cls = gr("Report"),
         summary = gr("summary"),
@@ -848,6 +909,102 @@ async fn global_answer_filters_by_review_policy_and_resolves_report_identities()
         );
     }
 
+    // 3b) Local mode with reviewPolicy="unused" also excludes other/plain communities from
+    //     local community grounding even though acme is a gr:member of both.
+    let before = m.requests().len();
+    let local_unused = ask(
+        &app,
+        json!({
+            "question": "Which teams does Acme have?",
+            "mode": "local",
+            "reviewPolicy": "unused",
+        }),
+    )
+    .await;
+    assert_eq!(local_unused["outcome"], "answered", "{local_unused}");
+    assert_eq!(local_unused["mode"], "local", "{local_unused}");
+    for req in &m.requests()[before..] {
+        let s = req.body.to_string();
+        assert!(
+            !s.contains("OTHER_ONLY_TEXT") && !s.contains("PLAIN_ONLY_TEXT"),
+            "excluded community leaked into local grounding: {s}"
+        );
+    }
+
+    // 3c) mode="auto" routes global questions with reviewPolicy and matchingPolicy to global.
+    let auto_global = ask(
+        &app,
+        json!({
+            "question": "What are the main themes across the organisation?",
+            "mode": "auto",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        }),
+    )
+    .await;
+    assert_eq!(auto_global["outcome"], "answered", "{auto_global}");
+    assert_eq!(auto_global["mode"], "global", "{auto_global}");
+    assert_eq!(auto_global["global"]["reviewPolicy"]["name"], "main");
+    assert_eq!(auto_global["resolution"]["policy"], "people");
+    assert_eq!(auto_global["reports"][0]["iri"], "urn:r:main");
+
+    // 3d) SSE `reports` event omits policy/resolution fields when neither request policy is
+    //     given (even though urn:r:main records gr:reviewPolicy), and includes them when
+    //     policies are requested.
+    let sse_reports_event = |body: Value| {
+        let router = app.clone();
+        async move {
+            let req = Request::post("/org/ask")
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let (st, text) = send(&router, req).await;
+            assert_eq!(st, StatusCode::OK, "{text}");
+            let mut ev = None;
+            for block in text.split("\n\n") {
+                if block.contains("event: reports") {
+                    for line in block.lines() {
+                        if let Some(d) = line.strip_prefix("data: ") {
+                            ev = Some(serde_json::from_str::<Value>(d).unwrap());
+                        }
+                    }
+                }
+            }
+            ev.expect("reports SSE event")
+        }
+    };
+    let unpolicied_ev = sse_reports_event(json!({
+        "question": "What are the main themes across the organisation?",
+        "mode": "global",
+    }))
+    .await;
+    assert!(
+        unpolicied_ev.get("reviewPolicy").is_none(),
+        "{unpolicied_ev}"
+    );
+    assert!(unpolicied_ev.get("resolution").is_none(), "{unpolicied_ev}");
+    for r in unpolicied_ev["reports"].as_array().unwrap() {
+        assert!(r.get("reviewPolicy").is_none(), "{unpolicied_ev}");
+    }
+    let policied_ev = sse_reports_event(json!({
+        "question": "What are the main themes across the organisation?",
+        "mode": "global",
+        "reviewPolicy": "main",
+        "matchingPolicy": "people",
+    }))
+    .await;
+    assert_eq!(policied_ev["reviewPolicy"]["name"], "main", "{policied_ev}");
+    assert_eq!(
+        policied_ev["resolution"]["policy"], "people",
+        "{policied_ev}"
+    );
+    assert_eq!(
+        policied_ev["reports"][0]["reviewPolicy"]["iri"],
+        main_policy_iri.as_str(),
+        "{policied_ev}"
+    );
+
     // 4) Splitting the identity match while the reduce call runs withholds the global answer
     //    with 403 forbidden.
     let ds_hook = ds.clone();
@@ -897,4 +1054,557 @@ async fn global_answer_filters_by_review_policy_and_resolves_report_identities()
             && withheld.get("resolution").is_none(),
         "{withheld}"
     );
+}
+
+/// Run an MCP tool directly against `st` on dataset `org` as a local admin principal.
+fn mcp_tool(
+    st: &Arc<AppState>,
+    name: &str,
+    args: Value,
+) -> Result<Value, crate::mcp::errors::ToolError> {
+    let mut call = crate::mcp::Call {
+        arrived: std::time::Instant::now(),
+        cancel: Default::default(),
+        request_id: "t".into(),
+        principal: crate::auth::Principal::local(),
+        headers: None,
+        held: None,
+        grant: None,
+        preparation: None,
+    };
+    let Value::Object(mut m) = args else {
+        panic!("arguments must be an object");
+    };
+    m.insert("dataset".into(), "org".into());
+    let server = crate::mcp::McpServer::new(st.clone(), crate::mcp::McpConfig::default());
+    Ok(match server.run_now(name, m, &mut call)? {
+        crate::mcp::Outcome::Structured(v) => v,
+        crate::mcp::Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
+    })
+}
+
+/// D1: `community_reports` applies `reviewPolicy` before search bounds and rank fusion,
+/// so > 50 stronger off-policy hits cannot displace an eligible report or alter its score.
+#[cfg(feature = "text")]
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_scoped_search_excludes_off_policy_hits_from_slots_and_scores() {
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+    const OTHER_DEC: &str = "urn:ev:other-decisions";
+    const OTHER_SUP: &str = "urn:ev:other-supports";
+    const OTHER_OUT: &str = "urn:ev:other-accepted";
+
+    let m = mock(Arc::new(OnceLock::new()));
+    let (st, _app) = app(&m.url()).await;
+    let ds = dataset(&st);
+
+    let mut cfg = settings();
+    cfg.decisions.push(OTHER_DEC.into());
+    cfg.supports.push(OTHER_SUP.into());
+    cfg.projections.push(OTHER_OUT.into());
+    cfg.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: vec![],
+            conflicts: ConflictMode::AdmitLabelled,
+            boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+            decisions: OTHER_DEC.into(),
+            supports: OTHER_SUP.into(),
+            output: OTHER_OUT.into(),
+        },
+    );
+    evidence::configure(&ds, &cfg, &Control::none()).unwrap();
+    ds.indexes()
+        .text()
+        .enable(sparkles::text::TextConfig::default())
+        .unwrap();
+
+    let gr = crate::graphrag::guard::gr;
+    let main_iri = sparkles::evidence::review::policy_iri("main");
+    let other_iri = sparkles::evidence::review::policy_iri("other");
+    let mut trig = format!("<{REPORTS}> {{\n");
+    // One low-rated eligible report under "main" matching "zephyr".
+    trig.push_str(&format!(
+        r#"
+  <urn:c:main-z> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:main-z> .
+  <urn:r:main-z> a <{report_cls}> ;
+    <http://www.w3.org/2000/01/rdf-schema#label> "Quiet Main Report" ;
+    <{summary}> "Mentions zephyr once." ;
+    <{status}> "reviewed" ;
+    <{rating}> 1 ;
+    <{rp}> <{main_iri}> ;
+    <{pv}> 1 ;
+    <{finding}> <urn:r:main-z#f1> .
+  <urn:r:main-z#f1> <{order}> 1 ; <{text}> "Single zephyr note." .
+"#,
+        community = gr("Community"),
+        level = gr("level"),
+        count = gr("memberCount"),
+        report = gr("report"),
+        report_cls = gr("Report"),
+        summary = gr("summary"),
+        status = gr("status"),
+        rating = gr("rating"),
+        rp = gr("reviewPolicy"),
+        pv = gr("policyVersion"),
+        finding = gr("finding"),
+        order = gr("order"),
+        text = gr("text"),
+        main_iri = main_iri.as_str(),
+    ));
+    // Fifteen high-rated eligible "main" reports that do NOT mention "zephyr".
+    for i in 0..15 {
+        trig.push_str(&format!(
+            r#"
+  <urn:c:main-fill-{i}> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:main-fill-{i}> .
+  <urn:r:main-fill-{i}> a <{report_cls}> ;
+    <http://www.w3.org/2000/01/rdf-schema#label> "High Rated Unrelated {i}" ;
+    <{summary}> "Unrelated operations overview." ;
+    <{status}> "reviewed" ;
+    <{rating}> 9 ;
+    <{rp}> <{main_iri}> ;
+    <{pv}> 1 .
+"#,
+            community = gr("Community"),
+            level = gr("level"),
+            count = gr("memberCount"),
+            report = gr("report"),
+            report_cls = gr("Report"),
+            summary = gr("summary"),
+            status = gr("status"),
+            rating = gr("rating"),
+            rp = gr("reviewPolicy"),
+            pv = gr("policyVersion"),
+            main_iri = main_iri.as_str(),
+        ));
+    }
+    // Sixty stronger off-policy reports (> LIST_DEPTH=50) repeating "zephyr".
+    for i in 0..60 {
+        let policy_line = if i % 2 == 0 {
+            format!(
+                "<{}> <{}> ; <{}> 1 ;",
+                gr("reviewPolicy"),
+                other_iri.as_str(),
+                gr("policyVersion")
+            )
+        } else {
+            String::new()
+        };
+        trig.push_str(&format!(
+            r#"
+  <urn:c:off-{i}> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:off-{i}> .
+  <urn:r:off-{i}> a <{report_cls}> ;
+    <http://www.w3.org/2000/01/rdf-schema#label> "zephyr zephyr zephyr off {i}" ;
+    <{summary}> "zephyr zephyr zephyr zephyr summary {i}" ;
+    <{status}> "reviewed" ;
+    <{rating}> 10 ;
+    {policy_line}
+    <{finding}> <urn:r:off-{i}#f1> .
+  <urn:r:off-{i}#f1> <{order}> 1 ; <{text}> "zephyr zephyr zephyr finding {i}" .
+"#,
+            community = gr("Community"),
+            level = gr("level"),
+            count = gr("memberCount"),
+            report = gr("report"),
+            report_cls = gr("Report"),
+            summary = gr("summary"),
+            status = gr("status"),
+            rating = gr("rating"),
+            finding = gr("finding"),
+            order = gr("order"),
+            text = gr("text"),
+        ));
+    }
+    trig.push_str("}\n");
+    ds.store()
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    let state_ds = st.get("org").unwrap();
+    crate::settings::store_runtime(
+        &st,
+        &state_ds,
+        &crate::settings::GRAPHRAG,
+        &json!({ "enabled": true, "principal": "local", "projection": { "graphs": ["urn:g:org"] } }),
+    )
+    .unwrap();
+
+    let first = mcp_tool(
+        &st,
+        "community_reports",
+        json!({ "query": "zephyr", "reviewPolicy": "main", "limit": 5 }),
+    )
+    .unwrap();
+    assert_eq!(first["available"], true, "{first}");
+    assert_eq!(first["ranking"], "search", "{first}");
+    assert_eq!(first["reports"][0]["iri"], "urn:r:main-z", "{first}");
+    let score_before = first["reports"][0]["score"].as_f64().unwrap();
+
+    // Add 20 more stronger off-policy "zephyr" reports: the eligible report's selection
+    // and fused RRF score must stay identical.
+    let mut extra = format!("<{REPORTS}> {{\n");
+    for i in 60..80 {
+        extra.push_str(&format!(
+            r#"
+  <urn:c:off-{i}> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:off-{i}> .
+  <urn:r:off-{i}> a <{report_cls}> ;
+    <http://www.w3.org/2000/01/rdf-schema#label> "zephyr zephyr zephyr zephyr extra {i}" ;
+    <{summary}> "zephyr zephyr zephyr zephyr extra summary {i}" ;
+    <{status}> "reviewed" ;
+    <{rating}> 10 ;
+    <{rp}> <{other_iri}> ;
+    <{pv}> 1 .
+"#,
+            community = gr("Community"),
+            level = gr("level"),
+            count = gr("memberCount"),
+            report = gr("report"),
+            report_cls = gr("Report"),
+            summary = gr("summary"),
+            status = gr("status"),
+            rating = gr("rating"),
+            rp = gr("reviewPolicy"),
+            pv = gr("policyVersion"),
+            other_iri = other_iri.as_str(),
+        ));
+    }
+    extra.push_str("}\n");
+    ds.store()
+        .load(&[Source::from_bytes(
+            extra.into_bytes(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+
+    let second = mcp_tool(
+        &st,
+        "community_reports",
+        json!({ "query": "zephyr", "reviewPolicy": "main", "limit": 5 }),
+    )
+    .unwrap();
+    assert_eq!(second["ranking"], "search", "{second}");
+    assert_eq!(second["reports"][0]["iri"], "urn:r:main-z", "{second}");
+    assert_eq!(
+        second["reports"][0]["score"].as_f64().unwrap(),
+        score_before,
+        "excluded hits altered eligible report score"
+    );
+}
+
+/// D2 + D4 + L2:
+/// - Reports exceeding 10,000 referenced entities refuse explicit `mode: "global"` with
+///   `422 incomplete-evidence` (0 model calls), while exact-linked `mode: "auto"` still
+///   answers locally.
+/// - Replacing a selected report mid-flight withholds the global answer with `403`.
+/// - Detaching a matching-map output graph refuses `community_reports` and Ask with
+///   `503 projection-unavailable` before any model call.
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_mode_ignores_report_entity_cap_for_local_and_enforces_global_limits() {
+    use sparkles::evidence::{IdentityInput, IdentityRelation, MatchingPolicy, MethodRef};
+
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+    const IDENTITIES: &str = "urn:ev:identities";
+    const MAPS: &str = "urn:ev:maps";
+    const MAP: &str = "urn:ev:map";
+
+    let hook: Arc<Hook> = Arc::new(OnceLock::new());
+    let hook_c = hook.clone();
+    let m = MockModel::start(move |r, _| {
+        let body = r.body.to_string();
+        if body.contains("\"Points\"") || body.contains("pick out what bears") {
+            return (
+                200,
+                mock::openai(
+                    &json!({
+                        "points": [{
+                            "text": "Overview point.",
+                            "score": 90,
+                            "reports": ["R1"],
+                            "findings": ["F1.1"]
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if body.contains("\"GlobalAnswer\"") || body.contains("Points from the community reports") {
+            if let Some(h) = hook_c.get() {
+                h();
+            }
+            return (
+                200,
+                mock::openai(
+                    &json!({
+                        "text": "Global summary [1].",
+                        "citations": [1]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if is_summary(r) {
+            return (
+                200,
+                mock::openai(
+                    &json!({ "text": "Local Acme teams [1].", "citations": [1], "claimCitations": [] })
+                        .to_string(),
+                ),
+            );
+        }
+        (200, mock::openai(&draft(EASY)))
+    });
+
+    let (st, app) = app(&m.url()).await;
+    let ds = dataset(&st);
+
+    let mut cfg = settings();
+    cfg.projections.push(MAP.into());
+    cfg.identity.extend([IDENTITIES.into(), MAPS.into()]);
+    cfg.matching_policies.insert(
+        "people".into(),
+        MatchingPolicy {
+            version: 1,
+            boundary: vec![IDENTITIES.into()],
+            decisions: "urn:ev:decisions".into(),
+            maps: MAPS.into(),
+            output: MAP.into(),
+        },
+    );
+    evidence::configure(&ds, &cfg, &Control::none()).unwrap();
+
+    // Accept one identity match so the matching map has a live revision to check/detach.
+    let mut po = ProposeOptions::new(iri("urn:principal:matcher"));
+    po.identity_graph = Some(iri(IDENTITIES));
+    let prop = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &EvidenceInput {
+            identities: vec![IdentityInput {
+                version: RecordVersion::V1,
+                key: RecordKey::new("m1").unwrap(),
+                occurrence_key: RecordKey::new("occ-m1").unwrap(),
+                entities: vec![
+                    iri("http://example.org/resource/alice"),
+                    iri("http://example.org/resource/alice_dup"),
+                ],
+                relation: IdentityRelation::PossibleMatch,
+                preferred: Some(iri("http://example.org/resource/alice")),
+                attributed_author: iri("urn:matcher"),
+                method: Some(MethodRef {
+                    method: iri("urn:method"),
+                    version: RecordKey::new("1").unwrap(),
+                }),
+            }],
+            ..Default::default()
+        },
+        &po,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let mut ro = ReviewOptions::new(iri("urn:principal:reviewer"));
+    ro.if_head = Some(ds.store().head_commit().seq);
+    evidence::review(
+        None,
+        &ds,
+        &ds,
+        "people",
+        1,
+        &[DecisionInput {
+            key: "dm1".into(),
+            target: prop.records[0].iri.clone(),
+            target_digest: prop.records[0].digest,
+            disposition: Disposition::Accepted,
+            supersedes: None,
+        }],
+        &ro,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+
+    let gr = crate::graphrag::guard::gr;
+    let main_iri = sparkles::evidence::review::policy_iri("main");
+    let mut trig = format!(
+        r#"<{REPORTS}> {{
+  <urn:c:huge> a <{community}> ; <{level}> 0 ; <{count}> 10005 ; <{report}> <urn:r:huge> .
+  <urn:r:huge> a <{report_cls}> ;
+    <http://www.w3.org/2000/01/rdf-schema#label> "Huge Community" ;
+    <{summary}> "References over 10,000 entities." ;
+    <{status}> "reviewed" ;
+    <{rating}> 8 ;
+    <{rp}> <{main_iri}> ;
+    <{pv}> 1 ;
+    <{finding}> <urn:r:huge#f1> .
+  <urn:r:huge#f1> <{order}> 1 ; <{text}> "Huge finding." .
+"#,
+        community = gr("Community"),
+        level = gr("level"),
+        count = gr("memberCount"),
+        report = gr("report"),
+        report_cls = gr("Report"),
+        summary = gr("summary"),
+        status = gr("status"),
+        rating = gr("rating"),
+        rp = gr("reviewPolicy"),
+        pv = gr("policyVersion"),
+        finding = gr("finding"),
+        order = gr("order"),
+        text = gr("text"),
+        main_iri = main_iri.as_str(),
+    );
+    let about_pred = gr("about");
+    for i in 0..10_005 {
+        trig.push_str(&format!(
+            "  <urn:r:huge#f1> <{about_pred}> <http://example.org/ent/{i}> .\n"
+        ));
+    }
+    trig.push_str("}\n");
+    ds.store()
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    let state_ds = st.get("org").unwrap();
+    crate::settings::store_runtime(
+        &st,
+        &state_ds,
+        &crate::settings::GRAPHRAG,
+        &json!({ "enabled": true, "principal": "local", "projection": { "graphs": ["urn:g:org"] } }),
+    )
+    .unwrap();
+
+    // 1) Explicit global mode fails with 422 incomplete-evidence and costs 0 model calls.
+    let before = m.requests().len();
+    let err = ask_with(
+        &app,
+        json!({
+            "question": "Which teams does Acme have?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        }),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    assert_eq!(err["error"]["code"], "incomplete-evidence", "{err}");
+    assert_eq!(m.requests().len(), before);
+
+    // 2) Exact-linked mode="auto" on the exact same fixture succeeds locally!
+    let auto_local = ask(
+        &app,
+        json!({
+            "question": "Which teams does Acme have?",
+            "mode": "auto",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        }),
+    )
+    .await;
+    assert_eq!(auto_local["outcome"], "answered", "{auto_local}");
+    assert_eq!(auto_local["mode"], "local", "{auto_local}");
+
+    // 3) Replace the huge report with a small report, then mutate the report mid-flight
+    //    during reduce -> 403 forbidden.
+    ds.update(&format!("CLEAR GRAPH <{REPORTS}>")).unwrap();
+    let small_trig = format!(
+        r#"<{REPORTS}> {{
+  <urn:c:small> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:small> .
+  <urn:r:small> a <{report_cls}> ;
+    <http://www.w3.org/2000/01/rdf-schema#label> "Small Community" ;
+    <{summary}> "Original summary." ;
+    <{status}> "reviewed" ;
+    <{rating}> 8 ;
+    <{rp}> <{main_iri}> ;
+    <{pv}> 1 ;
+    <{finding}> <urn:r:small#f1> .
+  <urn:r:small#f1> <{order}> 1 ;
+    <{text}> "Original finding." ;
+    <{about}> <http://example.org/resource/alice_dup> .
+}}"#,
+        community = gr("Community"),
+        level = gr("level"),
+        count = gr("memberCount"),
+        report = gr("report"),
+        report_cls = gr("Report"),
+        summary = gr("summary"),
+        status = gr("status"),
+        rating = gr("rating"),
+        rp = gr("reviewPolicy"),
+        pv = gr("policyVersion"),
+        finding = gr("finding"),
+        order = gr("order"),
+        text = gr("text"),
+        about = gr("about"),
+        main_iri = main_iri.as_str(),
+    );
+    ds.store()
+        .load(&[Source::from_bytes(
+            small_trig.into_bytes(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+
+    let ds_mut = ds.clone();
+    let mutated = std::sync::atomic::AtomicBool::new(false);
+    let summary_pred = gr("summary");
+    let _ = hook.set(Box::new(move || {
+        if !mutated.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            ds_mut
+                .update(&format!(
+                    "DELETE DATA {{ GRAPH <{REPORTS}> {{ <urn:r:small> <{summary_pred}> \"Original summary.\" }} }}; \
+                     INSERT DATA {{ GRAPH <{REPORTS}> {{ <urn:r:small> <{summary_pred}> \"Replaced summary.\" }} }}"
+                ))
+                .unwrap();
+        }
+    }));
+    let replaced = ask_with(
+        &app,
+        json!({
+            "question": "What are the main themes across the organisation?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        }),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    assert_eq!(replaced["error"]["code"], "forbidden", "{replaced}");
+
+    // 4) Detaching the matching map's output graph refuses community_reports and Ask
+    //    with 503 projection-unavailable before any model call.
+    evidence::detach(&ds, MAP).unwrap();
+    let before = m.requests().len();
+    let tool_err = mcp_tool(
+        &st,
+        "community_reports",
+        json!({ "reviewPolicy": "main", "matchingPolicy": "people" }),
+    )
+    .unwrap_err();
+    assert_eq!(tool_err.status, 503, "{tool_err:?}");
+    assert_eq!(
+        tool_err.code.as_ref(),
+        "projection-unavailable",
+        "{tool_err:?}"
+    );
+
+    let ask_err = ask_with(
+        &app,
+        json!({
+            "question": "What are the main themes across the organisation?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        }),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+    assert_eq!(
+        ask_err["error"]["code"], "projection-unavailable",
+        "{ask_err}"
+    );
+    assert_eq!(m.requests().len(), before);
 }

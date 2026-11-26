@@ -15,7 +15,7 @@ use crate::graphrag::read::{self, Filter, ReportRef};
 use crate::mcp::Outcome;
 use crate::mcp::errors::{ErrorContext, ToolError};
 use crate::mcp::tools::{Tools, bounded, parse};
-use oxrdf::NamedNode;
+use oxrdf::{Literal, NamedNode, Term};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -24,6 +24,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub(crate) const MAX_LIMIT: u64 = 100;
 /// The most distinct report entities one call resolves through a matching policy.
 const MAX_REPORT_ENTITIES: usize = 10_000;
+/// The most member IRI entries serialized across `resolution.entities` and all
+/// per-report `identities` arrays in one `community_reports` response.
+const MAX_IDENTITY_MEMBER_ENTRIES: usize = 8_192;
+/// The upper bound on aggregate identity bytes across `resolution.entities` and
+/// per-report `identities` arrays in one `community_reports` response.
+const MAX_IDENTITY_BYTES: usize = 2 << 20;
+/// Approximate JSON framing bytes per serialized identity object.
+const IDENTITY_ENTRY_OVERHEAD: usize = 80;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -56,13 +64,94 @@ pub(crate) enum Selection {
     },
 }
 
-fn identity_json(entity: &str, d: &ResolvedDoc) -> Value {
+fn identity_json(entity: &str, d: &ResolvedDoc, member_cap: usize) -> Value {
+    let shown = d.members.len().min(member_cap);
     json!({
         "entity": entity,
         "representative": d.representative.as_str(),
-        "members": d.members.iter().map(NamedNode::as_str).collect::<Vec<_>>(),
-        "membersComplete": d.complete,
+        "members": d.members[..shown].iter().map(NamedNode::as_str).collect::<Vec<_>>(),
+        "membersComplete": d.complete && shown == d.members.len(),
     })
+}
+
+/// Choose the largest uniform per-entity member cap so that the aggregate identity
+/// payload across `resolution.entities` and every report's `identities` stays within
+/// `max_members` member entries and `max_bytes` bytes. Refuses with `422
+/// incomplete-evidence` if even the bare `entity -> representative` entries exceed
+/// `max_bytes`.
+fn budget_identities(
+    doc: &ResolutionDoc,
+    report_entities: &[Vec<String>],
+    max_members: usize,
+    max_bytes: usize,
+) -> Result<usize, ToolError> {
+    let mut copies: BTreeMap<&str, usize> = BTreeMap::new();
+    for ents in report_entities {
+        for e in ents {
+            if doc.entities.get(e.as_str()).is_some_and(|d| d.named) {
+                *copies.entry(e.as_str()).or_insert(1) += 1;
+            }
+        }
+    }
+    if copies.is_empty() {
+        return Ok(usize::MAX);
+    }
+    let mut base_bytes = 0usize;
+    let mut max_len = 0usize;
+    let mut entries: Vec<(usize, &ResolvedDoc)> = Vec::with_capacity(copies.len());
+    for (iri, count) in copies {
+        let d = &doc.entities[iri];
+        let per_copy = iri
+            .len()
+            .saturating_add(d.representative.as_str().len())
+            .saturating_add(IDENTITY_ENTRY_OVERHEAD);
+        base_bytes = base_bytes.saturating_add(count.saturating_mul(per_copy));
+        max_len = max_len.max(d.members.len());
+        entries.push((count, d));
+    }
+    if base_bytes > max_bytes {
+        return Err(ToolError::new(
+            "incomplete-evidence",
+            422,
+            format!(
+                "the resolved identities for the selected reports exceed the {} byte response budget",
+                max_bytes
+            ),
+        ));
+    }
+    let fits = |k: usize| -> bool {
+        let mut total_members = 0usize;
+        let mut total_bytes = base_bytes;
+        for &(count, d) in &entries {
+            let take = d.members.len().min(k);
+            total_members = total_members.saturating_add(count.saturating_mul(take));
+            if total_members > max_members {
+                return false;
+            }
+            let mbytes: usize = d.members[..take]
+                .iter()
+                .map(|m| m.as_str().len().saturating_add(3))
+                .sum();
+            total_bytes = total_bytes.saturating_add(count.saturating_mul(mbytes));
+            if total_bytes > max_bytes {
+                return false;
+            }
+        }
+        true
+    };
+    if fits(max_len) {
+        return Ok(max_len);
+    }
+    let (mut lo, mut hi) = (0usize, max_len);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(lo)
 }
 
 fn resolution_json(doc: &ResolutionDoc, entities: &[Value]) -> Value {
@@ -77,8 +166,11 @@ fn resolution_json(doc: &ResolutionDoc, entities: &[Value]) -> Value {
 
 /// The JSON form of a report. When `resolution` is `Some`, each finding includes its
 /// `about` entity IRIs and the report includes the mapped `identities` its findings
-/// reference.
-pub(crate) fn report_json(r: &ReportRef, resolution: Option<&ResolutionDoc>) -> Value {
+/// reference, each capped to `member_cap` cluster members.
+pub(crate) fn report_json(
+    r: &ReportRef,
+    resolution: Option<(&ResolutionDoc, &[String], usize)>,
+) -> Value {
     let mut v = json!({
         "iri": r.iri,
         "community": r.community,
@@ -116,17 +208,17 @@ pub(crate) fn report_json(r: &ReportRef, resolution: Option<&ResolutionDoc>) -> 
             "configuration": p.configuration,
         });
     }
-    if let Some(doc) = resolution {
-        let mut ids: BTreeMap<String, Value> = BTreeMap::new();
-        for f in &r.findings {
-            for n in read::finding_entity_iris(&f.about, &f.cites) {
-                if let Some(d) = doc.entities.get(n.as_str()).filter(|d| d.named) {
-                    ids.entry(n.as_str().to_string())
-                        .or_insert_with(|| identity_json(n.as_str(), d));
-                }
-            }
-        }
-        v["identities"] = Value::Array(ids.into_values().collect());
+    if let Some((doc, entities, member_cap)) = resolution {
+        let ids: Vec<Value> = entities
+            .iter()
+            .filter_map(|e| {
+                doc.entities
+                    .get(e.as_str())
+                    .filter(|d| d.named)
+                    .map(|d| identity_json(e.as_str(), d, member_cap))
+            })
+            .collect();
+        v["identities"] = Value::Array(ids);
     }
     v
 }
@@ -220,12 +312,17 @@ impl Tools<'_> {
                 reports,
             } => {
                 let mut resolved_entities: Vec<Value> = Vec::new();
+                let mut report_entities: Vec<Vec<String>> = Vec::new();
+                let mut member_cap = usize::MAX;
                 if let (Some(v), Some(doc)) = (&view, resolution.as_mut()) {
                     let mut seen: BTreeSet<String> = BTreeSet::new();
                     let mut wanted: Vec<NamedNode> = Vec::new();
+                    report_entities.reserve(reports.len());
                     for rep in &reports {
+                        let mut rep_seen: BTreeSet<String> = BTreeSet::new();
                         for f in &rep.findings {
                             for n in read::finding_entity_iris(&f.about, &f.cites) {
+                                rep_seen.insert(n.as_str().to_string());
                                 if seen.insert(n.as_str().to_string()) {
                                     if wanted.len() >= MAX_REPORT_ENTITIES {
                                         return Err(ToolError::new(
@@ -240,12 +337,20 @@ impl Tools<'_> {
                                 }
                             }
                         }
+                        report_entities.push(rep_seen.into_iter().collect());
                     }
                     doc.read(v, &wanted, &r, &control)
                         .map_err(|e| policy_error("matchingPolicy", e, &ctx))?;
+                    let max_bytes = self.cfg().max_bytes.min(MAX_IDENTITY_BYTES);
+                    member_cap = budget_identities(
+                        doc,
+                        &report_entities,
+                        MAX_IDENTITY_MEMBER_ENTRIES,
+                        max_bytes,
+                    )?;
                     for iri in &seen {
                         if let Some(d) = doc.entities.get(iri.as_str()).filter(|d| d.named) {
-                            resolved_entities.push(identity_json(iri, d));
+                            resolved_entities.push(identity_json(iri, d, member_cap));
                         }
                     }
                 }
@@ -257,7 +362,16 @@ impl Tools<'_> {
                     "levels": levels.iter().map(|(l, n)| json!({ "level": l, "reports": n })).collect::<Vec<_>>(),
                     "ranking": ranking,
                     "stale": reports.iter().filter(|r| r.status == crate::graphrag::store::Status::Stale).count(),
-                    "reports": reports.iter().map(|rep| report_json(rep, resolution.as_ref())).collect::<Vec<_>>(),
+                    "reports": reports
+                        .iter()
+                        .enumerate()
+                        .map(|(i, rep)| {
+                            let res = resolution
+                                .as_ref()
+                                .map(|doc| (doc, report_entities[i].as_slice(), member_cap));
+                            report_json(rep, res)
+                        })
+                        .collect::<Vec<_>>(),
                 });
                 if let Some(doc) = &resolution {
                     j["resolution"] = resolution_json(doc, &resolved_entities);
@@ -332,7 +446,9 @@ impl Tools<'_> {
         let mut ranking = "rating";
         let mut reports = Vec::new();
         if let Some(q) = query {
-            let hits = self.report_hits(ds, r, q, &graph).map_err(eng)?;
+            let hits = self
+                .report_hits(ds, r, q, &graph, level, filter, limit)
+                .map_err(eng)?;
             if !hits.is_empty() {
                 let names: Vec<String> = hits.iter().map(|(r, _)| r.clone()).collect();
                 let found = r
@@ -387,17 +503,51 @@ impl Tools<'_> {
         })
     }
 
-    /// The reports a search for `q` finds in `graph`, best first, with their fused
-    /// scores. A hit on a finding counts for its report. A dataset without a usable
-    /// index finds none.
+    /// The eligible reports at `level` matching `filter` that a search for `q` finds in
+    /// `graph`, best first, with their fused scores. A hit on a finding counts for its
+    /// report, and eligibility is applied before the search limit and rank fusion so
+    /// excluded hits consume no slots and cannot change eligible ranks or scores.
+    #[allow(clippy::too_many_arguments)]
     fn report_hits(
         &self,
         ds: &crate::state::Dataset,
         r: &Reader,
         q: &str,
         graph: &str,
+        level: u32,
+        filter: Filter<'_>,
+        limit: usize,
     ) -> Result<Vec<(String, f64)>, sparkles::error::Error> {
-        let graphs = [NamedNode::new_unchecked(graph)];
+        let depth = limit.max(super::link::LIST_DEPTH);
+        let policy_clause = filter.policy_clause()?;
+        let values = filter.values();
+        let report_pat = format!(
+            "{values} ?c a <{community}> ; <{lv}> ?l ; <{report}> ?r . FILTER(?l = {level}) ?r <{status}> ?status{policy_clause} .",
+            community = crate::graphrag::guard::gr("Community"),
+            lv = crate::graphrag::guard::gr("level"),
+            report = crate::graphrag::guard::gr("report"),
+            status = crate::graphrag::guard::gr("status"),
+        );
+        let eligible_subjects = format!(
+            "{{ {report_pat} BIND(?r AS ?s) }} UNION {{ {report_pat} ?r <{finding}> ?s . }}",
+            finding = crate::graphrag::guard::gr("finding"),
+        );
+        let run_ranked =
+            |search_call: &str| -> Result<Vec<(NamedNode, f64)>, sparkles::error::Error> {
+                let sparql = format!(
+                    "SELECT ?r (MAX(?score) AS ?best) WHERE {{ GRAPH <{graph}> {{ {eligible_subjects} {search_call} . }} }} GROUP BY ?r ORDER BY DESC(?best) ?r LIMIT {depth}"
+                );
+                Ok(r.rows(&sparql, Vec::new())?
+                    .into_iter()
+                    .filter_map(|row| match row.as_slice() {
+                        [Some(Term::NamedNode(rep)), Some(Term::Literal(sc))] => {
+                            let score: f64 = sc.value().parse().ok()?;
+                            score.is_finite().then_some((rep.clone(), score))
+                        }
+                        _ => None,
+                    })
+                    .collect())
+            };
         let mut lists: Vec<HashMap<String, usize>> = Vec::new();
         if ds.dataset.indexes().text().enabled()
             && let Some(plain) = plain_query(q)
@@ -415,33 +565,39 @@ impl Tools<'_> {
                     .collect(),
                 _ => Vec::new(),
             };
-            match self.text_hits(r, &preds, &plain, &graphs) {
-                Ok(h) => lists.push(rank_terms(h.into_iter().map(|(s, sc, _)| (s, sc)))),
+            let mut args: Vec<String> = preds.iter().map(ToString::to_string).collect();
+            args.push(Literal::new_simple_literal(&plain).to_string());
+            let call = format!(
+                "(?s ?score) <http://jena.apache.org/text#query> ({})",
+                args.join(" ")
+            );
+            match run_ranked(&call) {
+                Ok(h) if !h.is_empty() => lists.push(rank_terms(h.into_iter())),
+                Ok(_) => {}
                 Err(e) if unavailable(&e) => {}
                 Err(e) => return Err(e),
             }
         }
-        // every index that may embed report text, each its own ranked list
+        // every index that may embed report text, each its own ranked list, restricted
+        // to the eligible report and finding subjects via candidates:join
+        let vec_k = depth.saturating_mul(4);
         for pred in report_embeddings(ds) {
-            match self.vector_hits(r, &pred, q, &graphs) {
-                Ok(h) => lists.push(rank_terms(h.into_iter())),
+            let call = format!(
+                "(?s ?score) <{}> ({pred} {} {vec_k} \"metric:cosine\" \"candidates:join\")",
+                sparkles::vector::VECTOR_SEARCH,
+                Literal::new_simple_literal(q)
+            );
+            match run_ranked(&call) {
+                Ok(h) if !h.is_empty() => lists.push(rank_terms(h.into_iter())),
+                Ok(_) => {}
                 Err(e) if unavailable(&e) => {}
                 Err(e) => return Err(e),
             }
         }
-        let lists = lists.iter().map(|l| {
-            // a report's best subject counts once per list
-            let mut best: HashMap<String, usize> = HashMap::new();
-            for (s, rank) in l {
-                let rep = read::report_of_finding(s).unwrap_or(s).to_string();
-                let e = best.entry(rep).or_insert(*rank);
-                if *rank < *e {
-                    *e = *rank;
-                }
-            }
-            (1.0, best)
-        });
-        Ok(sparkles::rank::fuse_rrf(lists, super::RRF_K))
+        Ok(sparkles::rank::fuse_rrf(
+            lists.into_iter().map(|l| (1.0, l)),
+            super::RRF_K,
+        ))
     }
 }
 
@@ -467,4 +623,61 @@ fn report_embeddings(ds: &crate::state::Dataset) -> Vec<NamedNode> {
         })
         .map(|s| super::iri(&s.predicate))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn budget_identities_bounds_large_shared_cluster_across_reports() {
+        let rep = NamedNode::new_unchecked("http://example.org/entity/m000");
+        let members: Arc<[NamedNode]> = (0..500)
+            .map(|i| NamedNode::new_unchecked(format!("http://example.org/entity/m{i:03}")))
+            .collect::<Vec<_>>()
+            .into();
+        let mut doc = ResolutionDoc::new("people", 1);
+        let mut report_ents = Vec::new();
+        for i in 0..200 {
+            let iri = format!("http://example.org/entity/m{i:03}");
+            doc.entities.insert(
+                iri.clone(),
+                ResolvedDoc {
+                    representative: rep.clone(),
+                    members: Arc::clone(&members),
+                    complete: true,
+                    named: true,
+                },
+            );
+            report_ents.push(iri);
+        }
+        // Three reports each referencing all 200 members of the same 500-member cluster
+        // (800 identity copies total -> 400,000 raw member IRIs if unbounded).
+        let reports = vec![report_ents.clone(), report_ents.clone(), report_ents];
+        let cap = budget_identities(
+            &doc,
+            &reports,
+            MAX_IDENTITY_MEMBER_ENTRIES,
+            MAX_IDENTITY_BYTES,
+        )
+        .unwrap();
+        assert!(cap < 500, "expected budget truncation, got cap={cap}");
+        assert!(
+            cap * 800 <= MAX_IDENTITY_MEMBER_ENTRIES,
+            "cap {cap} exceeds aggregate member budget"
+        );
+        let item = identity_json(
+            "http://example.org/entity/m001",
+            &doc.entities["http://example.org/entity/m001"],
+            cap,
+        );
+        assert_eq!(item["members"].as_array().unwrap().len(), cap);
+        assert_eq!(item["membersComplete"], false);
+
+        // If even bare entity -> representative entries exceed max_bytes, refuse with 422.
+        let err = budget_identities(&doc, &reports, MAX_IDENTITY_MEMBER_ENTRIES, 1024).unwrap_err();
+        assert_eq!(err.code.as_ref(), "incomplete-evidence");
+        assert_eq!(err.status, 422);
+    }
 }

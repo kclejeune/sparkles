@@ -80,7 +80,7 @@ impl Filter<'_> {
     }
 
     /// The statuses as a SPARQL `VALUES` block for `?status`.
-    fn values(&self) -> String {
+    pub(crate) fn values(&self) -> String {
         let v: Vec<String> = Status::ALL
             .into_iter()
             .filter(|s| self.admits(*s))
@@ -90,7 +90,7 @@ impl Filter<'_> {
     }
 
     /// A required `gr:reviewPolicy` pattern on `?r` when filtering by policy IRI.
-    fn policy_clause(&self) -> Result<String, Error> {
+    pub(crate) fn policy_clause(&self) -> Result<String, Error> {
         let Some(p) = self.review_policy_iri else {
             return Ok(String::new());
         };
@@ -429,7 +429,7 @@ fn with_findings_in(
                     x.decisions.push(n.as_str().to_string());
                 }
             }
-            (Some(_), Some(t)) => {
+            (Some(p), Some(t)) if p == gr("cites") => {
                 let t = t.to_string();
                 if !x.cites.contains(&t) {
                     x.cites.push(t);

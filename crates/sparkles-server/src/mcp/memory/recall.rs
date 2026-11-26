@@ -510,7 +510,7 @@ impl Tools<'_> {
                 if let Term::NamedNode(n) = seed
                     && let Some(e) = doc.entities.get(n.as_str())
                 {
-                    for m in &e.members {
+                    for m in e.members.iter() {
                         if present.insert(Term::NamedNode(m.clone()).to_string()) {
                             joined.push((Term::NamedNode(m.clone()), None));
                             joined_ranks.push(rank);
@@ -683,7 +683,11 @@ impl Tools<'_> {
                     ));
                 }
             };
-            self.seed_communities(&ds, &r, &entities, level)
+            let community_filter = crate::graphrag::read::Filter {
+                reviewed_only: false,
+                review_policy_iri: claims.as_ref().map(|c| c.policy.iri.as_str()),
+            };
+            self.seed_communities(&ds, &r, &entities, level, community_filter)
                 .map_err(eng)?
         } else {
             Communities::default()
@@ -952,6 +956,7 @@ impl Tools<'_> {
         r: &Reader,
         entities: &[Entity],
         level: Option<u32>,
+        filter: crate::graphrag::read::Filter<'_>,
     ) -> Result<Communities, Error> {
         use crate::graphrag::read;
         let settings: crate::graphrag::settings::GraphragSettings =
@@ -979,8 +984,7 @@ impl Tools<'_> {
             .collect();
         seeds.sort();
         let members: Vec<String> = seeds.iter().map(|(_, s)| s.clone()).collect();
-        let found =
-            r.reports_of_members(&opts, &graph, &members, level, read::Filter::default())?;
+        let found = r.reports_of_members(&opts, &graph, &members, level, filter)?;
         let mut reports: Vec<(read::ReportRef, Vec<usize>)> = Vec::new();
         for (m, rep) in found {
             let n = seeds.iter().find(|(_, s)| *s == m).map_or(0, |(n, _)| *n);
@@ -2457,10 +2461,13 @@ impl ClaimsDoc {
     }
 }
 
+/// The most retained IRI bytes one [`ResolutionDoc`] holds across chunks.
+const MAX_RESOLUTION_BYTES: usize = 16 << 20;
+
 /// One entity of the resolution map.
 pub(super) struct ResolvedDoc {
     pub(super) representative: NamedNode,
-    pub(super) members: Vec<NamedNode>,
+    pub(super) members: std::sync::Arc<[NamedNode]>,
     pub(super) complete: bool,
     /// whether the map names the entity, rather than resolving it to itself
     pub(super) named: bool,
@@ -2473,6 +2480,11 @@ pub(super) struct ResolutionDoc {
     pub(super) revision: Option<NamedNode>,
     pub(super) number: u64,
     pub(super) entities: HashMap<String, ResolvedDoc>,
+    /// Deduplicated cluster member slices keyed by representative IRI so many entities
+    /// in one large cluster share one allocation.
+    clusters: HashMap<String, std::sync::Arc<[NamedNode]>>,
+    /// Retained IRI bytes across `entities` keys/representatives and unique `clusters`.
+    retained_bytes: usize,
     /// whether the map's header has been read
     read: bool,
 }
@@ -2485,8 +2497,24 @@ impl ResolutionDoc {
             revision: None,
             number: 0,
             entities: HashMap::new(),
+            clusters: HashMap::new(),
+            retained_bytes: 0,
             read: false,
         }
+    }
+
+    fn charge_retained(&mut self, bytes: usize) -> Result<(), Error> {
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        if self.retained_bytes > MAX_RESOLUTION_BYTES {
+            return Err(sparkles::managed::ManagedError::error(
+                sparkles::managed::ManagedErrorKind::IncompleteEvidence,
+                format!(
+                    "resolved identity clusters exceed {} MiB",
+                    MAX_RESOLUTION_BYTES >> 20
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve the entities of `named` not resolved yet, at `view`.
@@ -2509,6 +2537,7 @@ impl ResolutionDoc {
         let chunks = wanted
             .chunks(sparkles::evidence::MAX_RESOLVE)
             .chain(header.as_deref());
+        let empty_members: std::sync::Arc<[NamedNode]> = std::sync::Arc::from([]);
         for chunk in chunks {
             self.read = true;
             let got = sparkles::evidence::resolve_entities_at(
@@ -2522,11 +2551,29 @@ impl ResolutionDoc {
             self.number = got.number;
             for e in got.entities {
                 let named = e.members.len() > 1 || e.representative != e.entity;
+                let entry_bytes = e.entity.as_str().len() + e.representative.as_str().len();
+                self.charge_retained(entry_bytes)?;
+                let members = if named {
+                    if let Some(existing) = self.clusters.get(e.representative.as_str()) {
+                        std::sync::Arc::clone(existing)
+                    } else {
+                        let cluster_bytes: usize = e.members.iter().map(|m| m.as_str().len()).sum();
+                        self.charge_retained(cluster_bytes)?;
+                        let shared: std::sync::Arc<[NamedNode]> = std::sync::Arc::from(e.members);
+                        self.clusters.insert(
+                            e.representative.as_str().to_string(),
+                            std::sync::Arc::clone(&shared),
+                        );
+                        shared
+                    }
+                } else {
+                    std::sync::Arc::clone(&empty_members)
+                };
                 self.entities.insert(
                     e.entity.as_str().to_string(),
                     ResolvedDoc {
                         representative: e.representative,
-                        members: e.members,
+                        members,
                         complete: e.members_complete,
                         named,
                     },

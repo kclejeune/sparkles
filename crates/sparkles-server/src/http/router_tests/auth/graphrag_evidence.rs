@@ -1816,4 +1816,63 @@ async fn global_ask_and_community_reports_enforce_policy_and_footprint_authoriza
         let s = req.body.to_string();
         assert!(!s.contains("People who work together"), "{s}");
     }
+
+    // 5) Mid-flight authority reload during map/reduce is caught by AuthorityFence and
+    //    withholds the global answer with 403 forbidden.
+    let reload_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reload_flag = reload_done.clone();
+    let e_reload = e.clone();
+    let fenced_mock = MockModel::start(move |r, _| {
+        let body = r.body.to_string();
+        if body.contains("\"Points\"") || body.contains("pick out what bears") {
+            if !reload_flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                e_reload.s.auth().reload().unwrap();
+            }
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "points": [{
+                            "text": "Should be withheld.",
+                            "score": 85,
+                            "reports": ["R1"],
+                            "findings": ["F1.1"]
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        (
+            200,
+            mock::openai(
+                &serde_json::json!({ "text": "Should not reach reduce [1].", "citations": [1] })
+                    .to_string(),
+            ),
+        )
+    });
+    e.s.state.models.store(Some(models_all(&fenced_mock.url())));
+    let res = call(
+        &e.s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.text());
+    assert_eq!(res.json()["error"]["code"], "forbidden");
+    assert!(reload_done.load(std::sync::atomic::Ordering::SeqCst));
+    // AuthorityFence stopped reduce before calling the provider a second time.
+    assert_eq!(fenced_mock.requests().len(), 1);
 }
