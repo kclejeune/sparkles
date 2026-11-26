@@ -751,6 +751,13 @@ fn build_select(
     // GROUP BY
     let aggregates = state.aggregates.pop().unwrap_or_default();
     let placeholder_calls = state.placeholder_calls.pop().unwrap_or_default();
+    let _ = state.aggregate_arg_depth.pop();
+    let agg_vars: HashSet<Variable> =
+        if !state.inferred_synthetic_aggregates.is_empty() && !placeholder_calls.is_empty() {
+            aggregates.iter().map(|(v, _)| v.clone()).collect()
+        } else {
+            HashSet::new()
+        };
     if group.is_none() && !aggregates.is_empty() {
         group = Some((vec![], vec![]));
     }
@@ -816,6 +823,17 @@ fn build_select(
                             return Err(
                                 "The SELECT contains an expression with a variable that is unbound",
                             );
+                        }
+                        if !state.inferred_synthetic_aggregates.is_empty()
+                            && !placeholder_calls.is_empty()
+                            && has_nested_inferred_aggregate(
+                                &expression,
+                                &placeholder_calls,
+                                &agg_vars,
+                                &state.inferred_synthetic_aggregates,
+                            )
+                        {
+                            return Err("Aggregate functions cannot be nested");
                         }
                         let expression = if placeholder_calls.is_empty() {
                             expression
@@ -890,7 +908,7 @@ fn build_select(
 fn are_variables_bound(
     expression: &Expression,
     variables: &HashSet<Variable>,
-    placeholder_calls: &HashMap<Variable, (NamedNode, Expression)>,
+    placeholder_calls: &HashMap<Variable, (NamedNode, Vec<Expression>, bool)>,
 ) -> bool {
     match expression {
         Expression::NamedNode(_)
@@ -899,7 +917,10 @@ fn are_variables_bound(
         | Expression::Coalesce(_)
         | Expression::Exists(_) => true,
         Expression::Variable(var) => {
-            variables.contains(var) || placeholder_calls.contains_key(var)
+            variables.contains(var)
+                || placeholder_calls
+                    .get(var)
+                    .is_some_and(|(_, _, allow_unbound)| *allow_unbound)
         }
         Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
             are_variables_bound(e, variables, placeholder_calls)
@@ -935,16 +956,220 @@ fn are_variables_bound(
     }
 }
 
+fn collect_placeholder_iris(
+    expression: &Expression,
+    placeholder_calls: &HashMap<Variable, (NamedNode, Vec<Expression>, bool)>,
+    out: &mut HashSet<NamedNode>,
+) {
+    match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Bound(_)
+        | Expression::Exists(_) => {}
+        Expression::Variable(var) => {
+            if let Some((iri, args, _)) = placeholder_calls.get(var) {
+                out.insert(iri.clone());
+                for arg in args {
+                    collect_placeholder_iris(arg, placeholder_calls, out);
+                }
+            }
+        }
+        Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
+            collect_placeholder_iris(e, placeholder_calls, out);
+        }
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => {
+            collect_placeholder_iris(a, placeholder_calls, out);
+            collect_placeholder_iris(b, placeholder_calls, out);
+        }
+        Expression::In(a, b) => {
+            collect_placeholder_iris(a, placeholder_calls, out);
+            for e in b {
+                collect_placeholder_iris(e, placeholder_calls, out);
+            }
+        }
+        Expression::FunctionCall(_, parameters) | Expression::Coalesce(parameters) => {
+            for p in parameters {
+                collect_placeholder_iris(p, placeholder_calls, out);
+            }
+        }
+        Expression::If(a, b, c) => {
+            collect_placeholder_iris(a, placeholder_calls, out);
+            collect_placeholder_iris(b, placeholder_calls, out);
+            collect_placeholder_iris(c, placeholder_calls, out);
+        }
+    }
+}
+
+fn expression_contains_aggregate_or_inferred(
+    expression: &Expression,
+    placeholder_calls: &HashMap<Variable, (NamedNode, Vec<Expression>, bool)>,
+    agg_vars: &HashSet<Variable>,
+    inferred: &HashSet<NamedNode>,
+) -> bool {
+    match expression {
+        Expression::NamedNode(_) | Expression::Literal(_) | Expression::Exists(_) => false,
+        Expression::Variable(var) | Expression::Bound(var) => {
+            if agg_vars.contains(var) {
+                return true;
+            }
+            if let Some((iri, args, _)) = placeholder_calls.get(var) {
+                return inferred.contains(iri)
+                    || args.iter().any(|arg| {
+                        expression_contains_aggregate_or_inferred(
+                            arg,
+                            placeholder_calls,
+                            agg_vars,
+                            inferred,
+                        )
+                    });
+            }
+            false
+        }
+        Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
+            expression_contains_aggregate_or_inferred(e, placeholder_calls, agg_vars, inferred)
+        }
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => {
+            expression_contains_aggregate_or_inferred(a, placeholder_calls, agg_vars, inferred)
+                || expression_contains_aggregate_or_inferred(
+                    b,
+                    placeholder_calls,
+                    agg_vars,
+                    inferred,
+                )
+        }
+        Expression::In(a, b) => {
+            expression_contains_aggregate_or_inferred(a, placeholder_calls, agg_vars, inferred)
+                || b.iter().any(|e| {
+                    expression_contains_aggregate_or_inferred(
+                        e,
+                        placeholder_calls,
+                        agg_vars,
+                        inferred,
+                    )
+                })
+        }
+        Expression::FunctionCall(_, parameters) | Expression::Coalesce(parameters) => {
+            parameters.iter().any(|p| {
+                expression_contains_aggregate_or_inferred(p, placeholder_calls, agg_vars, inferred)
+            })
+        }
+        Expression::If(a, b, c) => {
+            expression_contains_aggregate_or_inferred(a, placeholder_calls, agg_vars, inferred)
+                || expression_contains_aggregate_or_inferred(
+                    b,
+                    placeholder_calls,
+                    agg_vars,
+                    inferred,
+                )
+                || expression_contains_aggregate_or_inferred(
+                    c,
+                    placeholder_calls,
+                    agg_vars,
+                    inferred,
+                )
+        }
+    }
+}
+
+fn has_nested_inferred_aggregate(
+    expression: &Expression,
+    placeholder_calls: &HashMap<Variable, (NamedNode, Vec<Expression>, bool)>,
+    agg_vars: &HashSet<Variable>,
+    inferred: &HashSet<NamedNode>,
+) -> bool {
+    match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Bound(_)
+        | Expression::Exists(_) => false,
+        Expression::Variable(var) => {
+            if let Some((iri, args, _)) = placeholder_calls.get(var) {
+                if inferred.contains(iri) {
+                    return args.iter().any(|arg| {
+                        expression_contains_aggregate_or_inferred(
+                            arg,
+                            placeholder_calls,
+                            agg_vars,
+                            inferred,
+                        )
+                    });
+                }
+                return args.iter().any(|arg| {
+                    has_nested_inferred_aggregate(arg, placeholder_calls, agg_vars, inferred)
+                });
+            }
+            false
+        }
+        Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
+            has_nested_inferred_aggregate(e, placeholder_calls, agg_vars, inferred)
+        }
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => {
+            has_nested_inferred_aggregate(a, placeholder_calls, agg_vars, inferred)
+                || has_nested_inferred_aggregate(b, placeholder_calls, agg_vars, inferred)
+        }
+        Expression::In(a, b) => {
+            has_nested_inferred_aggregate(a, placeholder_calls, agg_vars, inferred)
+                || b.iter().any(|e| {
+                    has_nested_inferred_aggregate(e, placeholder_calls, agg_vars, inferred)
+                })
+        }
+        Expression::FunctionCall(_, parameters) | Expression::Coalesce(parameters) => parameters
+            .iter()
+            .any(|p| has_nested_inferred_aggregate(p, placeholder_calls, agg_vars, inferred)),
+        Expression::If(a, b, c) => {
+            has_nested_inferred_aggregate(a, placeholder_calls, agg_vars, inferred)
+                || has_nested_inferred_aggregate(b, placeholder_calls, agg_vars, inferred)
+                || has_nested_inferred_aggregate(c, placeholder_calls, agg_vars, inferred)
+        }
+    }
+}
+
 fn restore_placeholder_calls(
     expression: Expression,
-    placeholder_calls: &HashMap<Variable, (NamedNode, Expression)>,
+    placeholder_calls: &HashMap<Variable, (NamedNode, Vec<Expression>, bool)>,
 ) -> Expression {
     match expression {
         Expression::Variable(var) => {
-            if let Some((iri, arg)) = placeholder_calls.get(&var) {
+            if let Some((iri, args, _)) = placeholder_calls.get(&var) {
                 Expression::FunctionCall(
                     Function::Custom(iri.clone()),
-                    vec![restore_placeholder_calls(arg.clone(), placeholder_calls)],
+                    args.iter()
+                        .cloned()
+                        .map(|arg| restore_placeholder_calls(arg, placeholder_calls))
+                        .collect(),
                 )
             } else {
                 Expression::Variable(var)
@@ -1261,8 +1486,11 @@ pub struct ParserState {
     prefixes: HashMap<String, String>,
     custom_aggregate_functions: Arc<HashSet<NamedNode>>,
     placeholder_prefixes: HashSet<String>,
-    placeholder_calls: Vec<HashMap<Variable, (NamedNode, Expression)>>,
+    placeholder_calls: Vec<HashMap<Variable, (NamedNode, Vec<Expression>, bool)>>,
     in_select_projection: Vec<bool>,
+    aggregate_arg_depth: Vec<usize>,
+    inferred_synthetic_aggregates: HashSet<NamedNode>,
+    synthetic_calls_in_aggregates: HashSet<NamedNode>,
     used_bnodes: HashSet<BlankNode>,
     currently_used_bnodes: HashSet<BlankNode>,
     aggregates: Vec<Vec<(Variable, AggregateExpression)>>,
@@ -1283,6 +1511,9 @@ impl ParserState {
             placeholder_prefixes: HashSet::new(),
             placeholder_calls: Vec::new(),
             in_select_projection: Vec::new(),
+            aggregate_arg_depth: Vec::new(),
+            inferred_synthetic_aggregates: HashSet::new(),
+            synthetic_calls_in_aggregates: HashSet::new(),
             used_bnodes: HashSet::new(),
             currently_used_bnodes: HashSet::new(),
             aggregates: Vec::new(),
@@ -1303,10 +1534,34 @@ impl ParserState {
         }
     }
 
-    fn new_aggregation(&mut self, agg: AggregateExpression) -> Result<Variable, &'static str> {
+    fn new_aggregation(
+        &mut self,
+        agg: AggregateExpression,
+        inferred_synth_agg: Option<NamedNode>,
+    ) -> Result<Variable, &'static str> {
         let agg = if let Some(calls) = self.placeholder_calls.last()
             && !calls.is_empty()
         {
+            match &agg {
+                AggregateExpression::CountSolutions { .. } => {}
+                AggregateExpression::FunctionCall { expr, .. } => {
+                    collect_placeholder_iris(expr, calls, &mut self.synthetic_calls_in_aggregates);
+                }
+                AggregateExpression::Fold {
+                    expr, value, order, ..
+                } => {
+                    collect_placeholder_iris(expr, calls, &mut self.synthetic_calls_in_aggregates);
+                    if let Some(v) = value {
+                        collect_placeholder_iris(v, calls, &mut self.synthetic_calls_in_aggregates);
+                    }
+                    for o in order {
+                        let e = match o {
+                            OrderExpression::Asc(e) | OrderExpression::Desc(e) => e,
+                        };
+                        collect_placeholder_iris(e, calls, &mut self.synthetic_calls_in_aggregates);
+                    }
+                }
+            }
             match agg {
                 AggregateExpression::CountSolutions { distinct } => {
                     AggregateExpression::CountSolutions { distinct }
@@ -1345,6 +1600,12 @@ impl ParserState {
         } else {
             agg
         };
+        if let Some(name) = inferred_synth_agg {
+            self.inferred_synthetic_aggregates.insert(name.clone());
+            if self.synthetic_calls_in_aggregates.contains(&name) {
+                return Err("Aggregate functions cannot be nested");
+            }
+        }
         let aggregates = self.aggregates.last_mut().ok_or("Unexpected aggregate")?;
         // SPARQL 1.2 §19.7: "The expression argument of an aggregate function cannot
         // contain an aggregate function." An aggregate call parsed inside `expr` has
@@ -1489,21 +1750,39 @@ parser! {
             })
         }
 
-        rule SubSelect() -> GraphPattern = s:SelectClause() _ w:WhereClause() _ g:GroupClause()? _ h:HavingClause()? _ o:OrderClause()? _ l:LimitOffsetClauses()? _ v:ValuesClause() {?
-            build_select(s, w, g, h, o, l, v, state)
-        }
-
-        rule SelectClause() -> Selection = i("SELECT") _ Selection_init() o:SelectClause_option() _ v:SelectClause_variables() {
-            state.in_select_projection.pop();
-            Selection {
-                option: o,
-                variables: v
+        rule SubSelect() -> GraphPattern = s:SelectClause() _ rest:SubSelect_rest()? {?
+            if let Some((w, g, h, o, l, v)) = rest {
+                build_select(s, w, g, h, o, l, v, state)
+            } else {
+                state.aggregates.pop();
+                state.placeholder_calls.pop();
+                state.aggregate_arg_depth.pop();
+                Err("Expected subselect body")
             }
         }
+        rule SubSelect_rest() -> (GraphPattern, Option<(Vec<Variable>, Vec<(Expression, Variable)>)>, Option<Expression>, Option<Vec<OrderExpression>>, Option<(usize, Option<usize>)>, Option<GraphPattern>) =
+            w:WhereClause() _ g:GroupClause()? _ h:HavingClause()? _ o:OrderClause()? _ l:LimitOffsetClauses()? _ v:ValuesClause() {
+                (w, g, h, o, l, v)
+            }
+
+        rule SelectClause() -> Selection = i("SELECT") _ Selection_init() res:SelectClause_body()? {?
+            state.in_select_projection.pop();
+            if let Some((option, variables)) = res {
+                Ok(Selection { option, variables })
+            } else {
+                state.aggregates.pop();
+                state.placeholder_calls.pop();
+                state.aggregate_arg_depth.pop();
+                Err("Expected SELECT clause variables")
+            }
+        }
+        rule SelectClause_body() -> (SelectionOption, SelectionVariables) =
+            o:SelectClause_option() _ v:SelectClause_variables() { (o, v) }
         rule Selection_init() = {
             state.aggregates.push(Vec::new());
             state.placeholder_calls.push(HashMap::new());
             state.in_select_projection.push(true);
+            state.aggregate_arg_depth.push(0);
         }
         rule SelectClause_option() -> SelectionOption =
             i("DISTINCT") { SelectionOption::Distinct } /
@@ -2747,7 +3026,7 @@ parser! {
         rule BrackettedExpression() -> Expression = "(" _ e:Expression() _ ")" { e }
 
         rule BuiltInCall() -> Expression =
-            a:Aggregate() {? state.new_aggregation(a).map(Into::into) } /
+            a:Aggregate_or_inferred() {? state.new_aggregation(a.0, a.1).map(Into::into) } /
             i("STR") _ "(" _ e:Expression() _ ")" { Expression::FunctionCall(Function::Str, vec![e]) } /
             i("LANG") _ "(" _ e:Expression() _ ")" { Expression::FunctionCall(Function::Lang, vec![e]) } /
             i("LANGMATCHES") _ "(" _ a:Expression() _ "," _ b:Expression() _ ")" { Expression::FunctionCall(Function::LangMatches, vec![a, b]) } /
@@ -2858,59 +3137,108 @@ parser! {
 
         rule Exists_enter() = {
             state.in_select_projection.push(false);
+            state.aggregate_arg_depth.push(0);
         }
 
-        rule ExistsFunc() -> Expression = i("EXISTS") _ Exists_enter() p:GroupGraphPattern() {
+        rule ExistsBody() -> GraphPattern = &['{'] Exists_enter() p:GroupGraphPattern()? {?
             state.in_select_projection.pop();
+            state.aggregate_arg_depth.pop();
+            p.ok_or("Expected group graph pattern")
+        }
+
+        rule ExistsFunc() -> Expression = i("EXISTS") _ p:ExistsBody() {
             Expression::Exists(Box::new(p))
         }
 
-        rule NotExistsFunc() -> Expression = i("NOT") _ i("EXISTS") _ Exists_enter() p:GroupGraphPattern() {
-            state.in_select_projection.pop();
+        rule NotExistsFunc() -> Expression = i("NOT") _ i("EXISTS") _ p:ExistsBody() {
             Expression::Not(Box::new(Expression::Exists(Box::new(p))))
         }
 
+        rule Aggregate_enter() = {
+            if let Some(depth) = state.aggregate_arg_depth.last_mut() {
+                *depth += 1;
+            }
+        }
+
+        rule AggExpr() -> Expression = Aggregate_enter() e:Expression()? {?
+            if let Some(depth) = state.aggregate_arg_depth.last_mut() {
+                *depth -= 1;
+            }
+            e.ok_or("Expected aggregate expression")
+        }
+
+        rule AggFoldBody() -> AggregateExpression = Aggregate_enter() f:AggFoldBody_inner()? {?
+            if let Some(depth) = state.aggregate_arg_depth.last_mut() {
+                *depth -= 1;
+            }
+            f.ok_or("Expected FOLD arguments")
+        }
+
+        rule AggFoldBody_inner() -> AggregateExpression =
+            d:Fold_distinct()? expr:Expression() _ value:Fold_value()? order:Fold_order()? {
+                AggregateExpression::Fold { expr, value, distinct: d.is_some(), order: order.unwrap_or_default() }
+            }
+
+        rule KnownCustomAggregateName() -> NamedNode = name_and_synth:iri_with_synthetic_flag() {?
+            let (name, is_synth) = name_and_synth;
+            if state.custom_aggregate_functions.contains(&name)
+                || (is_synth && state.inferred_synthetic_aggregates.contains(&name))
+            {
+                Ok(name)
+            } else {
+                Err("This custom function is a regular function and not an aggregate function")
+            }
+        }
+
+        rule Aggregate_or_inferred() -> (AggregateExpression, Option<NamedNode>) =
+            a:Aggregate() { (a, None) } /
+            name_and_synth:iri_with_synthetic_flag() _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" {?
+                let (name, is_synth) = name_and_synth;
+                if is_synth {
+                    Ok((
+                        AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name.clone()), expr, distinct: true },
+                        Some(name),
+                    ))
+                } else if state.custom_aggregate_functions.contains(&name) {
+                    Ok((
+                        AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true },
+                        None,
+                    ))
+                } else {
+                    Err("This custom function is a regular function and not an aggregate function")
+                }
+            } /
+            name:KnownCustomAggregateName() _ "(" _ expr:AggExpr() _ ")" {
+                (
+                    AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false },
+                    None,
+                )
+            }
+
         rule Aggregate() -> AggregateExpression =
             i("COUNT") _ "(" _ i("DISTINCT") _ "*" _ ")" { AggregateExpression::CountSolutions { distinct: true } } /
-            i("COUNT") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Count, expr, distinct: true } } /
+            i("COUNT") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Count, expr, distinct: true } } /
             i("COUNT") _ "(" _ "*" _ ")" { AggregateExpression::CountSolutions { distinct: false } } /
-            i("COUNT") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Count, expr, distinct: false } } /
-            i("SUM") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sum, expr, distinct: true } } /
-            i("SUM") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sum, expr, distinct: false } } /
-            i("MIN") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Min, expr, distinct: true } } /
-            i("MIN") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Min, expr, distinct: false } } /
-            i("MAX") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Max, expr, distinct: true } } /
-            i("MAX") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Max, expr, distinct: false } } /
-            i("AVG") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Avg, expr, distinct: true } } /
-            i("AVG") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Avg, expr, distinct: false } } /
-            i("SAMPLE") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sample, expr, distinct: true } } /
-            i("SAMPLE") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sample, expr, distinct: false } } /
-            i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:Expression() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: true } } /
-            i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: true } } /
-            i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: false } } /
-            i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: false } } /
-            arq() i("FOLD") _ "(" _ d:Fold_distinct()? expr:Expression() _ value:Fold_value()? order:Fold_order()? ")" {
-                AggregateExpression::Fold { expr, value, distinct: d.is_some(), order: order.unwrap_or_default() }
-            } /
-            arq() name:ArqAggregateKeyword() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
-            arq() name:ArqAggregateKeyword() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
-            arq() i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
-            arq() i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
-            name_and_synth:iri_with_synthetic_flag() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" {?
-                let (name, is_synth) = name_and_synth;
-                if is_synth || state.custom_aggregate_functions.contains(&name) {
-                    Ok(AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true })
-                } else {
-                    Err("This custom function is a regular function and not an aggregate function")
-                }
-            } /
-            name:iri() _ "(" _ expr:Expression() _ ")" {?
-                if state.custom_aggregate_functions.contains(&name) {
-                    Ok(AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false })
-                } else {
-                    Err("This custom function is a regular function and not an aggregate function")
-                }
-            }
+            i("COUNT") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Count, expr, distinct: false } } /
+            i("SUM") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sum, expr, distinct: true } } /
+            i("SUM") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sum, expr, distinct: false } } /
+            i("MIN") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Min, expr, distinct: true } } /
+            i("MIN") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Min, expr, distinct: false } } /
+            i("MAX") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Max, expr, distinct: true } } /
+            i("MAX") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Max, expr, distinct: false } } /
+            i("AVG") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Avg, expr, distinct: true } } /
+            i("AVG") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Avg, expr, distinct: false } } /
+            i("SAMPLE") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sample, expr, distinct: true } } /
+            i("SAMPLE") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Sample, expr, distinct: false } } /
+            i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: true } } /
+            i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: true } } /
+            i("GROUP_CONCAT") _ "(" _ expr:AggExpr() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: false } } /
+            i("GROUP_CONCAT") _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: false } } /
+            arq() i("FOLD") _ "(" _ f:AggFoldBody() ")" { f } /
+            arq() name:ArqAggregateKeyword() _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
+            arq() name:ArqAggregateKeyword() _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
+            arq() i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ i("DISTINCT") _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
+            arq() i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ expr:AggExpr() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } }
 
         // the parts of ARQ's FOLD after `FOLD(`
         rule Fold_distinct() -> () = i("DISTINCT") _ { }
@@ -2931,19 +3259,24 @@ parser! {
         rule iriOrFunction() -> Expression =
             i_and_synth: iri_with_synthetic_flag() _ a: ArgList() {?
                 let (i, is_synth) = i_and_synth;
-                if state.custom_aggregate_functions.contains(&i) {
-                    Err("This custom function is an aggregate function and not a regular function")
-                } else if is_synth
-                    && a.len() == 1
-                    && state.in_select_projection.last() == Some(&true)
-                    && let Some(calls) = state.placeholder_calls.last_mut()
+                if state.custom_aggregate_functions.contains(&i)
+                    || (is_synth && state.inferred_synthetic_aggregates.contains(&i))
                 {
-                    let arg = a.into_iter().next().unwrap();
-                    let var = variable();
-                    calls.insert(var.clone(), (i, arg));
-                    Ok(Expression::Variable(var))
+                    Err("This custom function is an aggregate function and not a regular function")
                 } else {
-                    Ok(Expression::FunctionCall(Function::Custom(i), a))
+                    let allow_unbound =
+                        is_synth && a.len() == 1 && state.in_select_projection.last() == Some(&true);
+                    let in_agg =
+                        is_synth && state.aggregate_arg_depth.last().copied().unwrap_or(0) > 0;
+                    if (allow_unbound || in_agg)
+                        && let Some(calls) = state.placeholder_calls.last_mut()
+                    {
+                        let var = variable();
+                        calls.insert(var.clone(), (i, a, allow_unbound));
+                        Ok(Expression::Variable(var))
+                    } else {
+                        Ok(Expression::FunctionCall(Function::Custom(i), a))
+                    }
                 }
             } /
             // an IRI followed by `(` that is no argument list is a custom aggregate with

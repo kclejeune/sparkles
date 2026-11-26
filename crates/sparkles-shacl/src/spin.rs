@@ -177,7 +177,7 @@ impl<'a> ExtraTypes<'a> {
 /// along with the active prefix environment for validating textual subqueries.
 pub(crate) struct CandidateCheck<'a> {
     pub(crate) prefix_head: &'a str,
-    pub(crate) prefixes: FxHashMap<&'a str, &'a str>,
+    pub(crate) prefixes: template::KnownPrefixes<'a>,
     pub(crate) require_construct: bool,
 }
 
@@ -185,7 +185,7 @@ impl CandidateCheck<'_> {
     pub(crate) fn validate(&self, sparql: &str, budget: &mut rdf::WorkBudget) -> Result<Query> {
         template::admit_resolved_prefixed_iris(
             sparql,
-            Some(&self.prefixes),
+            Some(&self.prefixes.map),
             budget.remaining_bytes(),
         )?;
         let full_len = self.prefix_head.len().saturating_add(sparql.len());
@@ -403,7 +403,7 @@ pub(crate) fn translate_with_extra_types(
     };
     let check = CandidateCheck {
         prefix_head: &head,
-        prefixes: prefix_map,
+        prefixes: template::KnownPrefixes::new(prefix_map),
         require_construct: true,
     };
     for (class, rule) in pairs {
@@ -419,7 +419,7 @@ pub(crate) fn translate_with_extra_types(
         // longer variable name
         template::admit_resolved_prefixed_iris(
             &text,
-            Some(&check.prefixes),
+            Some(&check.prefixes.map),
             rule_budget.remaining_bytes(),
         )
         .with_context(|| format!("the SPARQL query of the SPIN rule {rule}"))?;
@@ -3225,7 +3225,7 @@ mod tests {
         bindings.insert("arg".to_string(), Some(ex("Val")));
         let mut budget = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
         let gr = crate::shapes::G { g: &g };
-        let (q, peak_live) = super::rdf::serialize_query_with_bindings_measured(
+        let (q, peaks) = super::rdf::serialize_query_with_bindings_measured(
             &gr,
             &Term::NamedNode(sel),
             &bindings,
@@ -3234,13 +3234,21 @@ mod tests {
         )
         .unwrap();
         assert!(
-            peak_live <= super::rdf::MAX_OUTPUT_BYTES,
-            "live output bytes ({peak_live}) must stay within MAX_OUTPUT_BYTES ({})",
+            peaks.serialization_live <= super::rdf::MAX_OUTPUT_BYTES,
+            "serialization live output bytes ({}) must stay within MAX_OUTPUT_BYTES ({})",
+            peaks.serialization_live,
             super::rdf::MAX_OUTPUT_BYTES
         );
         assert!(
-            peak_live < 700 * 1024,
-            "joining and finalizing 600 KiB WHERE must not duplicate buffer bytes (peak={peak_live})"
+            peaks.finalization_live <= super::rdf::MAX_OUTPUT_BYTES,
+            "single-dominant-segment finalization live bytes ({}) must stay within MAX_OUTPUT_BYTES ({})",
+            peaks.finalization_live,
+            super::rdf::MAX_OUTPUT_BYTES
+        );
+        assert!(
+            peaks.finalization_live < 700 * 1024,
+            "joining and finalizing 600 KiB WHERE must not duplicate buffer bytes (peak={})",
+            peaks.finalization_live
         );
         assert!(parse_query(&q, None, &[]).is_ok(), "invalid SPARQL output");
         assert!(q.contains("SELECT ?arg ?_spin_v1 WHERE {"), "{}", &q[..120]);
@@ -3512,5 +3520,337 @@ mod tests {
                 "must accept valid standalone subquery: {ok_subquery}"
             );
         }
+    }
+
+    #[test]
+    fn round6_compact_prefix_declarations_and_keyword_gluing_admitted() {
+        let long_base = format!("https://example.org/{}/", "a".repeat(200_000));
+
+        // 1. Compact `PREFIXp: <ns/>`, `PREFIXp:<ns/>`, and `PREFIX:<ns/>` under a 200 KiB BASE
+        //    followed by 16 prefixed-name uses exceed the 2 MiB resolved-IRI budget and must be
+        //    refused before parsing — both without a caller prefix and when overriding a short
+        //    caller prefix `p: <http://short.example/>`.
+        for (decl, use_prefix) in [
+            ("PREFIXp: <ns/>\n", "p"),
+            ("PREFIXp:<ns/>\n", "p"),
+            ("PREFIX:<ns/>\n", ""),
+            ("VERSION\"1.2\" PREFIXp:<ns/>\n", "p"),
+        ] {
+            let mut query =
+                format!("BASE <{long_base}>\n{decl}CONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{\n");
+            for i in 0..16 {
+                query.push_str(&format!("  ?this {use_prefix}:a{i} ?v{i} .\n"));
+            }
+            query.push('}');
+            let mut g = parse_ttl(r#"ex:Person spin:rule ex:r ."#);
+            g.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/r"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(query),
+            ));
+            for caller_prefixes in [
+                vec![],
+                vec![("p".to_string(), "http://short.example/".to_string())],
+                vec![(String::new(), "http://short.example/".to_string())],
+            ] {
+                let err = translate(&g, &caller_prefixes).unwrap_err();
+                assert!(
+                    format!("{err:#}").contains("maximum resolved IRI size"),
+                    "decl={decl:?} caller={caller_prefixes:?}: {err:#}"
+                );
+            }
+        }
+
+        // 2. Compact keyword-glued prefixed names in the query body (`FILTERp:f0(?x)`) under a
+        //    200 KiB resolved namespace must also be refused before parsing.
+        let mut glued = format!(
+            "BASE <{long_base}>\nPREFIXp:<ns/>\nCONSTRUCT {{ ?this <urn:ok> 1 }} WHERE {{\n  ?this <urn:in> ?x .\n"
+        );
+        for i in 0..16 {
+            glued.push_str(&format!("  FILTERp:f{i}(?x)\n"));
+        }
+        glued.push('}');
+        let mut g_glued = parse_ttl(r#"ex:Person spin:rule ex:r ."#);
+        g_glued.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/r"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(glued),
+        ));
+        let err = translate(&g_glued, &[]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("maximum resolved IRI size"),
+            "{err:#}"
+        );
+
+        // 3. A prefixed name literally named `PREFIXp:` in the body (declared in the prologue)
+        //    must NOT be misread as a prologue declaration and must succeed.
+        let mut g_body_prefix = parse_ttl(r#"ex:Person spin:rule ex:r ."#);
+        g_body_prefix.insert(&Triple::new(
+            NamedNode::new_unchecked("http://example.org/r"),
+            super::vocab::sp::TEXT,
+            Literal::new_simple_literal(
+                "PREFIX PREFIXp: <http://short.example/>\n\
+                 CONSTRUCT { ?this <urn:ok> 1 } WHERE { PREFIXp: <urn:p> ?this }",
+            ),
+        ));
+        assert!(translate(&g_body_prefix, &[]).is_ok());
+    }
+
+    #[test]
+    fn round6_standalone_inferred_aggregate_nesting_and_speculative_exists() {
+        let wrap_subquery = |subquery: &str| {
+            let mut g = parse_ttl(
+                r#"
+                ex:q a sp:Construct ;
+                  sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "x" ] ] ) ;
+                  sp:where ( [ a sp:SubQuery ; sp:query ex:inner ] ) .
+                "#,
+            );
+            g.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/inner"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(subquery),
+            ));
+            g
+        };
+
+        // R6-2: Nested calls to a synthetic prefixed name already proven to be a custom
+        // aggregate via DISTINCT must be rejected in BOTH projection orders, and explicit
+        // placeholder IRIs must NOT inherit the inferred aggregate classification.
+        for bad_subquery in [
+            "SELECT (p:f(DISTINCT ?v) AS ?a) (COUNT(p:f(?v)) AS ?b) WHERE { ?s <urn:p> ?v }",
+            "SELECT (COUNT(p:f(?v)) AS ?b) (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(DISTINCT ?v) AS ?a) (p:f(COUNT(?v)) AS ?b) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(COUNT(?v)) AS ?b) (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(DISTINCT ?v) AS ?a) (p:f(p:f(?v)) AS ?b) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(p:f(?v)) AS ?b) (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(DISTINCT p:f(?v)) AS ?a) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(DISTINCT ?v) AS ?a) (<urn:sparkles:spin-subquery-check:p0/f>(?v) AS ?b) WHERE { ?s <urn:p> ?v }",
+        ] {
+            let g_bad = wrap_subquery(bad_subquery);
+            assert!(
+                serialize_query(&g_bad, &ex("q")).is_err(),
+                "must reject nested inferred aggregate / explicit IRI: {bad_subquery}"
+            );
+        }
+
+        // Valid non-nested combinations in both orders, explicit scalar IRI inside COUNT
+        // alongside synthetic DISTINCT in both orders, and R6-3 speculative EXISTS / NOT EXISTS
+        // inside a nested GROUP BY prefixed call before `p:median(?v)`.
+        for ok_subquery in [
+            "SELECT (p:f(DISTINCT ?v) AS ?a) (p:f(?v) AS ?b) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(?v) AS ?b) (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(DISTINCT ?v) AS ?a) (COUNT(<urn:sparkles:spin-subquery-check:p0/f>(?v)) AS ?b) WHERE { ?s <urn:p> ?v }",
+            "SELECT (COUNT(<urn:sparkles:spin-subquery-check:p0/f>(?v)) AS ?b) (p:f(DISTINCT ?v) AS ?a) WHERE { ?s <urn:p> ?v }",
+            "SELECT (IF(EXISTS { SELECT ?t WHERE { ?t <urn:q> ?u } GROUP BY EXISTSfoo:f(?t) ?t }, p:median(?v), 0) AS ?x) (COUNT(?v) AS ?c) WHERE { ?s <urn:p> ?v }",
+            "SELECT (IF(NOT EXISTS { SELECT ?t WHERE { ?t <urn:q> ?u } GROUP BY EXISTSfoo:f(?t) ?t }, p:median(?v), 0) AS ?x) (COUNT(?v) AS ?c) WHERE { ?s <urn:p> ?v }",
+        ] {
+            let g_ok = wrap_subquery(ok_subquery);
+            assert!(
+                serialize_query(&g_ok, &ex("q")).is_ok(),
+                "must accept valid standalone subquery: {ok_subquery}"
+            );
+        }
+    }
+
+    #[test]
+    fn round6_preflight_namespace_classification_cached_and_budgeted() {
+        let long_ns = format!("http://example.org/{}/", "a".repeat(200_000));
+        let mut map = rustc_hash::FxHashMap::default();
+        map.insert("long", long_ns.as_str());
+        let env = super::template::KnownPrefixes::new(map);
+        let mut budget = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        for i in 0..25 {
+            let frag = format!("SELECT ?s WHERE {{ ?s long:p{i} ?o }}");
+            super::template::validate_subquery_text(&frag, Some(&env), &mut budget).unwrap();
+        }
+        assert_eq!(
+            env.classification_scans(),
+            1,
+            "200 KiB caller namespace must be classified only once across 25 fragments"
+        );
+
+        // Fresh classification must charge `WorkBudget` before scanning a long namespace.
+        let mut tiny_map = rustc_hash::FxHashMap::default();
+        tiny_map.insert("long", long_ns.as_str());
+        let env_tiny = super::template::KnownPrefixes::new(tiny_map);
+        let mut tiny_budget = super::rdf::WorkBudget::new(100);
+        let err = super::template::validate_subquery_text(
+            "SELECT ?s WHERE { ?s long:p ?o }",
+            Some(&env_tiny),
+            &mut tiny_budget,
+        )
+        .unwrap_err();
+        assert!(
+            super::rdf::is_limit_or_cycle_error(&err),
+            "tight budget must reject before scanning 200 KiB namespace: {err:#}"
+        );
+        assert_eq!(
+            env_tiny.classification_scans(),
+            0,
+            "budget exhaustion must occur before running oxiri::Iri::parse"
+        );
+    }
+
+    #[test]
+    fn round6_two_large_segments_bound_serialization_and_finalization() {
+        // Bound SELECT with ~450 KiB before a nested bound SELECT and ~450 KiB inside the
+        // nested SELECT (total ~900 KiB <= MAX_OUTPUT_BYTES), plus anonymous-variable
+        // collision rewriting. Serialization live output must stay <= MAX_OUTPUT_BYTES and
+        // multi-segment finalization logical bytes must stay <= MAX_RETAINED_BYTES.
+        let mut g = parse_ttl(
+            r#"
+            ex:sel a sp:Select ;
+              sp:resultVariables ( [ sp:varName "arg" ] [ sp:varName "_spin_v1" ] ) ;
+              sp:limit 3 .
+            "#,
+        );
+        let sel = NamedNode::new_unchecked("http://example.org/sel");
+        let anon_var = BlankNode::new_unchecked("anonV");
+        g.insert(&Triple::new(
+            anon_var.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::VARIABLE_CLS,
+        ));
+        let payload_a = "a".repeat(450 * 1024);
+        let tp_before = BlankNode::new_unchecked("tpBefore");
+        g.insert(&Triple::new(
+            tp_before.clone(),
+            super::vocab::sp::SUBJECT,
+            anon_var,
+        ));
+        g.insert(&Triple::new(
+            tp_before.clone(),
+            super::vocab::sp::PREDICATE,
+            NamedNode::new_unchecked("http://example.org/p1"),
+        ));
+        g.insert(&Triple::new(
+            tp_before.clone(),
+            super::vocab::sp::OBJECT,
+            Literal::new_simple_literal(payload_a),
+        ));
+
+        let inner_sq = BlankNode::new_unchecked("innerSq");
+        let inner_sel = BlankNode::new_unchecked("innerSel");
+        let inner_var = BlankNode::new_unchecked("innerArg");
+        let tp_inside = BlankNode::new_unchecked("tpInside");
+        let payload_b = "b".repeat(450 * 1024);
+        g.insert(&Triple::new(
+            inner_sq.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::SUB_QUERY,
+        ));
+        g.insert(&Triple::new(
+            inner_sq.clone(),
+            super::vocab::sp::QUERY_PROP,
+            inner_sel.clone(),
+        ));
+        g.insert(&Triple::new(
+            inner_sel.clone(),
+            crate::vocab::rdf::TYPE,
+            super::vocab::sp::SELECT,
+        ));
+        g.insert(&Triple::new(
+            inner_var.clone(),
+            super::vocab::sp::VAR_NAME,
+            Literal::new_simple_literal("arg"),
+        ));
+        let rv = BlankNode::new_unchecked("innerRv");
+        g.insert(&Triple::new(
+            rv.clone(),
+            crate::vocab::rdf::FIRST,
+            inner_var.clone(),
+        ));
+        g.insert(&Triple::new(
+            rv.clone(),
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g.insert(&Triple::new(
+            inner_sel.clone(),
+            super::vocab::sp::RESULT_VARIABLES,
+            rv,
+        ));
+        g.insert(&Triple::new(
+            tp_inside.clone(),
+            super::vocab::sp::SUBJECT,
+            inner_var,
+        ));
+        g.insert(&Triple::new(
+            tp_inside.clone(),
+            super::vocab::sp::PREDICATE,
+            NamedNode::new_unchecked("http://example.org/p2"),
+        ));
+        g.insert(&Triple::new(
+            tp_inside.clone(),
+            super::vocab::sp::OBJECT,
+            Literal::new_simple_literal(payload_b),
+        ));
+        let ic = BlankNode::new_unchecked("ic");
+        g.insert(&Triple::new(
+            ic.clone(),
+            crate::vocab::rdf::FIRST,
+            tp_inside,
+        ));
+        g.insert(&Triple::new(
+            ic.clone(),
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g.insert(&Triple::new(inner_sel, super::vocab::sp::WHERE, ic));
+
+        let oc2 = BlankNode::new_unchecked("oc2");
+        let oc1 = BlankNode::new_unchecked("oc1");
+        g.insert(&Triple::new(
+            oc2.clone(),
+            crate::vocab::rdf::FIRST,
+            inner_sq,
+        ));
+        g.insert(&Triple::new(
+            oc2.clone(),
+            crate::vocab::rdf::REST,
+            crate::vocab::rdf::NIL,
+        ));
+        g.insert(&Triple::new(
+            oc1.clone(),
+            crate::vocab::rdf::FIRST,
+            tp_before,
+        ));
+        g.insert(&Triple::new(oc1.clone(), crate::vocab::rdf::REST, oc2));
+        g.insert(&Triple::new(sel.clone(), super::vocab::sp::WHERE, oc1));
+
+        let mut bindings = rustc_hash::FxHashMap::default();
+        bindings.insert("arg".to_string(), Some(ex("Val")));
+        let mut budget = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        let gr = crate::shapes::G { g: &g };
+        let (q, peaks) = super::rdf::serialize_query_with_bindings_measured(
+            &gr,
+            &Term::NamedNode(sel),
+            &bindings,
+            None,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(q.len() > 900 * 1024 && q.len() <= super::rdf::MAX_OUTPUT_BYTES);
+        assert!(
+            peaks.serialization_live <= super::rdf::MAX_OUTPUT_BYTES,
+            "serialization live bytes ({}) must stay within MAX_OUTPUT_BYTES ({})",
+            peaks.serialization_live,
+            super::rdf::MAX_OUTPUT_BYTES
+        );
+        assert!(
+            peaks.finalization_live <= super::rdf::MAX_RETAINED_BYTES,
+            "two-segment finalization logical bytes ({}) must stay within MAX_RETAINED_BYTES ({})",
+            peaks.finalization_live,
+            super::rdf::MAX_RETAINED_BYTES
+        );
+        assert!(
+            peaks.finalization_live < 1_450 * 1024,
+            "two 450 KiB segments with largest-segment reuse must stay near 1,350 KiB (peak={})",
+            peaks.finalization_live
+        );
+        assert!(parse_query(&q, None, &[]).is_ok(), "invalid SPARQL output");
+        assert!(q.contains("?_spin_v2 <http://example.org/p1>"));
+        assert!(q.contains("<http://example.org/Val> <http://example.org/p2>"));
     }
 }

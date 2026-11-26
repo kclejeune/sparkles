@@ -1,7 +1,8 @@
 //! Bounded SPARQL 1.1 serializer for SPIN RDF syntax (`http://spinrdf.org/sp#`).
 
 use super::template::{
-    collect_sparql_text_vars, substitute_sparql_text_with_exported, validate_subquery_text,
+    KnownPrefixes, collect_sparql_text_vars, substitute_sparql_text_with_exported,
+    validate_subquery_text,
 };
 use super::vocab::{
     SP_NS, aggregate_fn, binary_op, builtin_fn, is_sp_expression_type, is_structural_sp_class, sp,
@@ -313,7 +314,7 @@ pub(crate) fn serialize_query_with_bindings(
     g: &G<'_>,
     query: &Term,
     bindings: &FxHashMap<String, Option<Term>>,
-    known_prefixes: Option<&FxHashMap<&str, &str>>,
+    known_prefixes: Option<&KnownPrefixes<'_>>,
     budget: &mut WorkBudget,
 ) -> Result<String> {
     let mut ser = Serializer {
@@ -326,6 +327,8 @@ pub(crate) fn serialize_query_with_bindings(
         out: String::new(),
         reserved_out_bytes: 0,
         #[cfg(test)]
+        peak_serialization_output_bytes: 0,
+        #[cfg(test)]
         peak_live_output_bytes: 0,
         ancestors: FxHashSet::default(),
         anon_vars: FxHashMap::default(),
@@ -337,14 +340,30 @@ pub(crate) fn serialize_query_with_bindings(
     ser.resolve_anon_var_collisions()
 }
 
+/// Logical live-output byte watermarks recorded across owned serializer buffers in tests.
+///
+/// - `serialization_live`: peak logical bytes across `segments + out + reserved_out_bytes`
+///   during `write_query`, strictly enforced `<= MAX_OUTPUT_BYTES`.
+/// - `finalization_live`: peak logical bytes across serialization and finalization,
+///   including the transient coexistence of the single destination buffer and unconsumed
+///   segments during multi-segment flattening (`final_len + (total - max_segment_len) <=
+///   MAX_RETAINED_BYTES`). This measures logical owned bytes and does not observe
+///   allocator-internal transient overlap if `reserve_exact` moves the surviving buffer.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SerializationPeakBytes {
+    pub(crate) serialization_live: usize,
+    pub(crate) finalization_live: usize,
+}
+
 #[cfg(test)]
 pub(crate) fn serialize_query_with_bindings_measured(
     g: &G<'_>,
     query: &Term,
     bindings: &FxHashMap<String, Option<Term>>,
-    known_prefixes: Option<&FxHashMap<&str, &str>>,
+    known_prefixes: Option<&KnownPrefixes<'_>>,
     budget: &mut WorkBudget,
-) -> Result<(String, usize)> {
+) -> Result<(String, SerializationPeakBytes)> {
     let mut ser = Serializer {
         g: *g,
         bindings,
@@ -354,6 +373,7 @@ pub(crate) fn serialize_query_with_bindings_measured(
         segments_bytes: 0,
         out: String::new(),
         reserved_out_bytes: 0,
+        peak_serialization_output_bytes: 0,
         peak_live_output_bytes: 0,
         ancestors: FxHashSet::default(),
         anon_vars: FxHashMap::default(),
@@ -363,7 +383,13 @@ pub(crate) fn serialize_query_with_bindings_measured(
     };
     ser.write_query(query, 0, false)?;
     let sparql = ser.resolve_anon_var_collisions()?;
-    Ok((sparql, ser.peak_live_output_bytes))
+    Ok((
+        sparql,
+        SerializationPeakBytes {
+            serialization_live: ser.peak_serialization_output_bytes,
+            finalization_live: ser.peak_live_output_bytes,
+        },
+    ))
 }
 
 /// Append `s` to `out`, refusing output larger than `limit`.
@@ -594,10 +620,10 @@ struct OutputCheckpoint {
     anon_spans_len: usize,
 }
 
-struct Serializer<'g, 'b, 'p, 'w> {
+struct Serializer<'g, 'b, 'p, 'k, 'w> {
     g: G<'g>,
     bindings: &'b FxHashMap<String, Option<Term>>,
-    known_prefixes: Option<&'p FxHashMap<&'p str, &'p str>>,
+    known_prefixes: Option<&'p KnownPrefixes<'k>>,
     budget: &'w mut WorkBudget,
     /// Completed owned output segments preceding `out`, moved without copying when
     /// joining buffered `SELECT` `WHERE` clauses.
@@ -605,6 +631,8 @@ struct Serializer<'g, 'b, 'p, 'w> {
     segments_bytes: usize,
     out: String,
     reserved_out_bytes: usize,
+    #[cfg(test)]
+    peak_serialization_output_bytes: usize,
     #[cfg(test)]
     peak_live_output_bytes: usize,
     ancestors: FxHashSet<Term>,
@@ -619,7 +647,7 @@ struct Serializer<'g, 'b, 'p, 'w> {
     used_var_names: FxHashSet<String>,
 }
 
-impl Serializer<'_, '_, '_, '_> {
+impl Serializer<'_, '_, '_, '_, '_> {
     fn logical_out_len(&self) -> usize {
         self.segments_bytes.saturating_add(self.out.len())
     }
@@ -637,6 +665,9 @@ impl Serializer<'_, '_, '_, '_> {
                 .segments_bytes
                 .saturating_add(self.out.len())
                 .saturating_add(self.reserved_out_bytes);
+            if live > self.peak_serialization_output_bytes {
+                self.peak_serialization_output_bytes = live;
+            }
             if live > self.peak_live_output_bytes {
                 self.peak_live_output_bytes = live;
             }
@@ -854,10 +885,32 @@ impl Serializer<'_, '_, '_, '_> {
         Ok(())
     }
 
-    fn flatten_segments_into_bytes(&mut self) -> Vec<u8> {
+    /// Flatten `self.segments` and `self.out` into one owned UTF-8 byte buffer, reserving
+    /// `extra_capacity` bytes in the same `reserve_exact` call when anonymous-variable
+    /// collision rewriting will expand the buffer in-place.
+    ///
+    /// Reuses the largest owned segment buffer in-place so flattening a small `SELECT` header
+    /// onto a large `WHERE` buffer never allocates a second copy of the dominant segment. For
+    /// multiple large segments whose sum fits in `MAX_OUTPUT_BYTES`, the destination buffer
+    /// and remaining unconsumed segments briefly coexist for `final_len + (total - max_len)`
+    /// logical bytes (`<= MAX_RETAINED_BYTES`). Note that `reserve_exact` on the surviving
+    /// buffer may still perform an allocator-internal moving `realloc`, which the logical
+    /// byte counter cannot observe.
+    fn flatten_segments_into_bytes(&mut self, extra_capacity: usize) -> Vec<u8> {
         let out = std::mem::take(&mut self.out);
         if self.segments.is_empty() {
-            return out.into_bytes();
+            let mut bytes = out.into_bytes();
+            if extra_capacity > 0 {
+                bytes.reserve_exact(extra_capacity);
+            }
+            #[cfg(test)]
+            {
+                let live = bytes.len().saturating_add(extra_capacity);
+                if live > self.peak_live_output_bytes {
+                    self.peak_live_output_bytes = live;
+                }
+            }
+            return bytes;
         }
         let mut parts = std::mem::take(&mut self.segments);
         parts.push(out);
@@ -866,9 +919,6 @@ impl Serializer<'_, '_, '_, '_> {
             .saturating_add(parts.last().map_or(0, String::len));
         self.segments_bytes = 0;
 
-        // Reuse the largest owned segment buffer in-place so flattening a small SELECT
-        // header onto a large WHERE buffer never allocates a second copy of the large
-        // segment.
         let mut max_idx = 0usize;
         let mut max_len = 0usize;
         for (i, seg) in parts.iter().enumerate() {
@@ -880,13 +930,14 @@ impl Serializer<'_, '_, '_, '_> {
         let prefix_len: usize = parts[..max_idx].iter().map(String::len).sum();
         let mut bytes = std::mem::take(&mut parts[max_idx]).into_bytes();
         let orig_len = bytes.len();
-        if total > orig_len {
-            bytes.reserve_exact(total - orig_len);
+        let target_cap = total.saturating_add(extra_capacity);
+        if target_cap > orig_len {
+            bytes.reserve_exact(target_cap - orig_len);
         }
         let mut remaining_parts_bytes = total.saturating_sub(orig_len);
         #[cfg(test)]
         {
-            let live = total.saturating_add(remaining_parts_bytes);
+            let live = target_cap.saturating_add(remaining_parts_bytes);
             if live > self.peak_live_output_bytes {
                 self.peak_live_output_bytes = live;
             }
@@ -916,7 +967,7 @@ impl Serializer<'_, '_, '_, '_> {
 
     fn resolve_anon_var_collisions(&mut self) -> Result<String> {
         if self.anon_vars.is_empty() {
-            let bytes = self.flatten_segments_into_bytes();
+            let bytes = self.flatten_segments_into_bytes(0);
             return Ok(String::from_utf8(bytes).expect("SPIN output is valid UTF-8"));
         }
         let count = self.anon_vars.len();
@@ -925,7 +976,7 @@ impl Serializer<'_, '_, '_, '_> {
             self.used_var_names.contains(&name) || self.bindings.contains_key(&name)
         });
         if !has_collision {
-            let bytes = self.flatten_segments_into_bytes();
+            let bytes = self.flatten_segments_into_bytes(0);
             return Ok(String::from_utf8(bytes).expect("SPIN output is valid UTF-8"));
         }
         let mut final_names = Vec::with_capacity(count);
@@ -954,9 +1005,8 @@ impl Serializer<'_, '_, '_, '_> {
                 "serialized SPIN query exceeds maximum output size ({MAX_OUTPUT_BYTES} bytes)"
             )));
         }
-        let mut bytes = self.flatten_segments_into_bytes();
+        let mut bytes = self.flatten_segments_into_bytes(final_len - total);
         if final_len > total {
-            bytes.reserve_exact(final_len - total);
             bytes.resize(final_len, 0);
         }
         #[cfg(test)]

@@ -187,7 +187,10 @@ validation:
   Single-argument calls written with a synthetic prefixed name are admitted as potential
   custom aggregates in grouped `SELECT` projections, with or without `DISTINCT`, while
   explicit `<IRI>` calls and prefixes redeclared in the query prologue keep strict
-  validation.
+  validation. A synthetic prefixed call using `DISTINCT` also fixes that synthetic
+  prefixed name as an aggregate across the parse so nested calls to the same prefixed
+  name are rejected in either projection order without affecting explicit `<IRI>` calls,
+  and parser context stacks unwind across failed PEG alternatives.
 
 - **Bounded `BASE` IRI resolution.** `ParserState::parse_iri` parses absolute IRI
   references directly with `Iri::parse` instead of routing them through
