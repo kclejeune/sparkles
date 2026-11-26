@@ -822,6 +822,47 @@ fn classify_el_and_horn_partial_under_deadline() {
                 (false, hi)
             };
 
+        // Sweep `(lo_bound, hi_bound)`, allowing one bounded revisit of
+        // `(refined_hi, hi_bound)` if a fast outlier tightened the cap below `hi_bound`
+        // and then timed out on its boundary retry.
+        let sweep_range = |lo_bound: u64,
+                           hi_bound: u64,
+                           first_pass_start: usize,
+                           trace: &mut Vec<(u64, Probe)>| {
+            let mut cur_lo = lo_bound;
+            let mut pass_start = first_pass_start;
+            let mut last_hi = hi_bound;
+            for _ in 0..2 {
+                let (found, refined_hi) = sweep_bracket(cur_lo, hi_bound, pass_start, trace);
+                if found {
+                    return (true, refined_hi);
+                }
+                last_hi = refined_hi;
+                let boundary_timed_out = trace
+                    .last()
+                    .is_some_and(|&(_, outcome)| outcome == Probe::TimedOut);
+                if !boundary_timed_out || refined_hi <= cur_lo || refined_hi >= hi_bound {
+                    break;
+                }
+                cur_lo = refined_hi;
+                pass_start = trace.len();
+            }
+            (false, last_hi)
+        };
+
+        // Advance the upward growth cursor monotonically past the completed bracket
+        // endpoint; when growth timed out all the way to `limit`, advance to any
+        // strictly higher sweep cap below `limit` so recovery can continue toward `limit`.
+        let next_growth_hi = |prev_hi: u64, complete_hi: Option<u64>, refined_hi: u64| {
+            if let Some(hi) = complete_hi {
+                hi
+            } else if refined_hi > prev_hi && refined_hi < limit {
+                refined_hi
+            } else {
+                limit
+            }
+        };
+
         // Adaptive fallback if machine speed shifted sharply relative to calibration.
         // First bracket an upper bound if every seed timed out.
         if !saw_partial && hi_complete.is_none() {
@@ -832,7 +873,7 @@ fn classify_el_and_horn_partial_under_deadline() {
         }
         let mut phase3_hi = hi_complete.unwrap_or(limit);
         if !saw_partial {
-            let (found, refined_hi) = sweep_bracket(0, phase3_hi, 0, &mut trace);
+            let (found, refined_hi) = sweep_range(0, phase3_hi, 0, &mut trace);
             saw_partial = found;
             phase3_hi = refined_hi;
         }
@@ -845,35 +886,25 @@ fn classify_el_and_horn_partial_under_deadline() {
         // If a fast outlier completion capped the downward/dyadic search below a shifted
         // partial window, allow bounded upward recovery probes past that cap up to `limit`
         // and sweep each newly bracketed upper range.
-        if !saw_partial && phase3_hi < limit {
-            let mut prev_hi = phase3_hi;
+        if !saw_partial {
+            let mut growth_hi = next_growth_hi(0, hi_complete, phase3_hi);
             for _ in 0..3 {
-                if prev_hi >= limit {
+                if growth_hi >= limit {
                     break;
                 }
                 let pass_start = trace.len();
-                let (found, next_complete) = grow_from(prev_hi, &mut trace);
+                let (found, next_complete) = grow_from(growth_hi, &mut trace);
                 if found {
                     saw_partial = true;
                     break;
                 }
                 let upper = next_complete.unwrap_or(limit);
-                let (found, refined_hi) = sweep_bracket(prev_hi, upper, pass_start, &mut trace);
+                let (found, refined_hi) = sweep_range(growth_hi, upper, pass_start, &mut trace);
                 if found {
                     saw_partial = true;
                     break;
                 }
-                let Some(next_hi) = next_complete else {
-                    break;
-                };
-                prev_hi = if trace
-                    .last()
-                    .is_some_and(|&(_, outcome)| outcome == Probe::TimedOut)
-                {
-                    refined_hi
-                } else {
-                    next_hi
-                };
+                growth_hi = next_growth_hi(growth_hi, next_complete, refined_hi);
             }
         }
         assert!(
