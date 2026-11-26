@@ -13971,9 +13971,44 @@ it answers `422 incomplete-evidence`.
 A map follows the matches of the identity graphs it was built from. When one of them
 leaves the boundary, or is detached and protected again so that its proposals no longer
 authenticate, reviews and reads under the policy answer `503 projection-unavailable`
-until the boundary is restored. A graph added to the boundary keeps the map available.
-No operation rebuilds a map from its decisions after such a change, so a new matching
-policy with its own maps and output graphs starts a new map.
+until the boundary is restored or an administrator rebuilds the map. A new graph added
+to the boundary with no current accepted proposals keeps the map available for unmasked
+callers, while an added boundary graph that holds current accepted proposals answers
+`503 projection-unavailable` until rebuilt. A caller whose view masks triples also
+receives `503 projection-unavailable` whenever the boundary includes an added identity
+graph not yet recorded on the latest revision, so the map status never discloses
+whether a masked acceptance exists in the added graph.
+
+`POST /$/evidence/{ds}/identities/rebuild` rebuilds a matching policy's resolution map
+on `main` or on a selected `?branch=NAME`. It needs unrestricted `admin` on the dataset
+or branch and refuses when the server is read-only or when declared and recorded evidence
+settings differ (`409 evidence-settings-drift`). Its body is `{"policy", "policyVersion"?,
+"ifHead"?, "idempotencyKey"?, "dryRun"?, "message"?}`. The operation recomputes the
+clusters of the policy's current authenticated accepted decisions whose targets remain
+authenticated identity proposals in the current protected identity graphs of the boundary,
+checks all current effective separations, rewrites the output graph atomically to match
+those clusters and appends a fresh `ev:ResolutionMap` revision with the current graph
+and boundary protections. The answer is `{operation, committed, replayed, commit,
+branchId, policy, policyVersion, revision, number, previous, boundary, changed, dryRun?}`,
+where `changed` names the inserted and removed output triples and `changed.map` records
+the new revision, its predecessor, the decisions added and ended, and the entities whose
+selected representative changed. A replay with the same `idempotencyKey` and payload
+returns the first receipt with an empty `changed`. After the rebuild succeeds, reviews
+and `POST /{ds}/claims/identities` reads resume normally.
+
+| Status and code | Meaning |
+|---|---|
+| `400` | The body is malformed or names no matching policy. |
+| `403` | The server is read-only or the caller lacks unrestricted `admin` on the dataset or branch. |
+| `409 policy-changed` | `policyVersion` does not match the policy's current version. |
+| `409 head-changed` | `ifHead` is not the branch head, or the head moved while the rebuild read it. |
+| `409 identity-conflict` | The current effective accepted decisions would put two entities of an accepted separation in one cluster. |
+| `409 idempotency-conflict` | The idempotency key was used with a different payload. |
+| `409 immutable-record-conflict` | A target has multiple current decisions or the maps graph has a numbering gap or conflicting record identity. |
+| `409 unsupported-profile` | The evidence profile is disabled or a policy graph (`decisions`, `maps` or `output`) is detached. |
+| `409 evidence-settings-drift` | The declared and recorded evidence settings differ. |
+| `422 incomplete-evidence` | The policy's decisions, revision chain, identifiers or output graph exceed the operation's bounds. |
+| `503 authority-changed` | The caller's credential or the access policy changed before the commit published. |
 
 `POST /{ds}/claims/identities` with `{"policy", "entities"}` reads the current map. It
 needs `read` on the dataset or branch through the query endpoint and read grants on the
@@ -13995,7 +14030,7 @@ it.
 | `400` | The body is malformed or the policy is unknown. |
 | `403` | The caller may not read a graph of the policy. |
 | `422 incomplete-evidence` | A cluster's records exceed 10,000. |
-| `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, or the output holds a map without a revision. |
+| `503 projection-unavailable` | A graph of the policy was detached and protected again, an identity graph the map was built from left the boundary, an added boundary graph holds current accepted proposals or is unrecorded under a triple-masked view, or the output holds a map without a revision. |
 
 `GET /$/server` lists the route in `capabilities.claims.identities`.
 

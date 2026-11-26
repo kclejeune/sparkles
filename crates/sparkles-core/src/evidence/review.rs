@@ -153,6 +153,21 @@ pub fn withdrawal_payload_digest(
     frame.finish()
 }
 
+/// The payload digest of a resolution-map rebuild request, compared when its
+/// idempotency key repeats.
+pub fn rebuild_map_payload_digest(
+    policy: &str,
+    version: Option<u32>,
+    control: &Control,
+) -> Result<Sha256Digest> {
+    let mut frame = FrameHash::new(b"sparkles-evidence-map-rebuild-v1", control)?;
+    frame.field(1, policy.as_bytes())?;
+    if let Some(version) = version {
+        frame.field(2, &version.to_be_bytes())?;
+    }
+    frame.finish()
+}
+
 fn planned(
     key: &str,
     kind: RecordKind,

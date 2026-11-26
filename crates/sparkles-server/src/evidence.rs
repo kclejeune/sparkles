@@ -38,6 +38,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(get_settings).put(put_settings),
         )
         .route("/$/evidence/{ds}/detach", post(detach))
+        .route(
+            "/$/evidence/{ds}/identities/rebuild",
+            post(review::rebuild_identities),
+        )
         .route("/$/evidence/{ds}/holds", get(list_holds).post(acquire_hold))
         .route("/$/evidence/{ds}/holds/{id}", delete(release_hold))
         .route("/{ds}/claims/resolve", post(resolve))
@@ -772,16 +776,27 @@ pub(crate) fn execute(
 ) -> ApiResult<J> {
     // Keep admission ownership even when the caller drops its transport future.
     let _grant = execution.grant.clone();
-    if st.read_only && matches!(operation, "propose" | "review" | "withdraw") {
+    if st.read_only
+        && matches!(
+            operation,
+            "propose" | "review" | "withdraw" | "rebuild-identities"
+        )
+    {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let main = crate::http::main_dataset(&st, &name)?;
-    if matches!(operation, "propose" | "review" | "withdraw") {
+    if matches!(
+        operation,
+        "propose" | "review" | "withdraw" | "rebuild-identities"
+    ) {
         crate::settings::evidence::require_reconciled(&st, &main)?;
         return match operation {
             "propose" => claims::propose_now(st, name, principal, bytes, execution),
             "review" => review::review_now(st, name, principal, bytes, execution),
             "withdraw" => review::withdraw_now(st, name, principal, bytes, execution),
+            "rebuild-identities" => {
+                review::rebuild_identities_now(st, name, principal, bytes, execution)
+            }
             _ => unreachable!("unregistered evidence write"),
         };
     }

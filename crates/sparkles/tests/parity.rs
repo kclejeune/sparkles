@@ -520,6 +520,14 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("resolveIdentities", "evidence.resolve_entities", |ds| {
             let _ = sparkles::evidence::resolve_entities(ds, ds, "", &[], None, &any());
         }),
+        op!(
+            "rebuildIdentityMap",
+            "evidence.rebuild_resolution_map",
+            |ds| {
+                let _ =
+                    sparkles::evidence::rebuild_resolution_map(ds, ds, "", None, &any(), &any());
+            }
+        ),
         op!("listEvidenceDependents", "evidence.find_dependents", |ds| {
             let _ = sparkles::evidence::find_dependents(ds, ds, &[], false, None, &any());
         }),

@@ -1148,7 +1148,19 @@ fn a_resolution_of_every_member_reads_its_cluster_once() {
 
 /// A caller whose view hides `predicate` in `graph`.
 fn masking(predicate: &str, graph: &str) -> Option<Arc<GraphAccess>> {
+    masking_with_limit(predicate, graph, None)
+}
+
+fn masking_with_limit(
+    predicate: &str,
+    graph: &str,
+    max_hidden: Option<u64>,
+) -> Option<Arc<GraphAccess>> {
     use sparkles::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    let mut limits = Limits::default();
+    if let Some(max_hidden) = max_hidden {
+        limits.max_hidden = max_hidden;
+    }
     Some(Arc::new(GraphAccess::with_triples(
         Graphs::All,
         Graphs::All,
@@ -1168,7 +1180,7 @@ fn masking(predicate: &str, graph: &str) -> Option<Arc<GraphAccess>> {
                 write: Graphs::none(),
             }],
             caller: Caller::default(),
-            limits: Limits::default(),
+            limits,
         },
     )))
 }
@@ -1350,4 +1362,1423 @@ fn a_resolution_leaves_out_masked_proposals_and_decisions() {
     let targets = masking(&format!("{EV}target"), DECISIONS);
     let r = read(&["b"], targets);
     assert!(r[0].decisions.is_empty(), "{r:?}");
+}
+
+/// Removing an identity graph from the boundary makes the map unavailable; an
+/// administered rebuild recomputes the clusters in the new boundary, rewrites the output
+/// graph atomically, records the new boundary in a fresh map revision, conforms to the
+/// v1 shapes, supports dry-run and idempotent replay, exposes changed identities for
+/// dependents and restores reviews and reads.
+#[test]
+fn rebuilding_after_boundary_removal_recomputes_clusters_and_restores_operations() {
+    let ds = configured();
+    let ab = propose_in(
+        &ds,
+        HIDDEN,
+        proposal(
+            "ab",
+            IdentityRelation::PossibleMatch,
+            &["a", "b"],
+            Some("b"),
+        ),
+    );
+    let bc = matched(&ds, "bc", &["b", "c"], Some("c"));
+    let de = matched(&ds, "de", &["d", "e"], None);
+    let ef = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("ef", IdentityRelation::PossibleMatch, &["e", "f"], None),
+    );
+    let dab = accept(&ds, "ab", &ab);
+    let dbc = accept(&ds, "bc", &bc);
+    let dde = accept(&ds, "de", &de);
+    let r4 = review(&ds, &[decision("ef", &ef, Disposition::Accepted, None)]).unwrap();
+    let def = r4.decisions[0].iri.clone();
+    let rev4 = r4.map_revision.clone().unwrap();
+    assert_eq!(map(&ds), pairs(&["a b", "b b", "c b", "d d", "e d", "f d"]));
+
+    // An assessment that consumes rev4 so we can verify dependents discovery after rebuild.
+    let mut po = ProposeOptions::new(iri("urn:principal:analyst"));
+    po.proposal_graph = Some(iri(CLAIMS));
+    let assessed = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &EvidenceInput {
+            assessments: vec![evidence::AssessmentInput {
+                version: RecordVersion::V1,
+                key: key("a1"),
+                occurrence_key: key("a1"),
+                target: evidence::RecordRef::Existing(ab.0.clone()),
+                conclusion: oxrdf::Term::NamedNode(iri("urn:conclusion:ok")),
+                method: evidence::MethodRef {
+                    method: iri("urn:method:check"),
+                    version: key("1"),
+                },
+                configuration_digest: format!("sha256:{}", "1".repeat(64)).parse().unwrap(),
+                evaluated_at: oxrdf::Literal::new_typed_literal(
+                    "2026-01-02T00:00:00Z",
+                    oxrdf::vocab::xsd::DATE_TIME,
+                ),
+                attributed_evaluator: iri("urn:analyst"),
+                scope: Default::default(),
+                inputs: vec![evidence::RecordRef::Existing(rev4.clone())],
+                confidence: None,
+            }],
+            ..Default::default()
+        },
+        &po,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let assessment = assessed.records[0].iri.clone();
+
+    // Remove HIDDEN from the boundary -> projection-unavailable.
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let cg = matched(&ds, "cg", &["c", "g"], None);
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("cg", &cg, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("b")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+
+    // Dry run previews the rebuild without committing or changing the map.
+    let head = ds.store().head_commit().seq;
+    let mut dry = ReviewOptions::new(iri("urn:principal:admin"));
+    dry.dry_run = true;
+    dry.if_head = Some(head);
+    let preview =
+        evidence::rebuild_resolution_map(&ds, &ds, "people", Some(1), &dry, &Control::none())
+            .unwrap();
+    assert!(!preview.committed);
+    assert!(!preview.replayed);
+    assert!(preview.preview.is_some());
+    assert_eq!(preview.number, 5);
+    assert_eq!(preview.previous.as_ref(), Some(&rev4));
+    assert_eq!(preview.boundary, vec![iri(IDENTITY)]);
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("b")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+
+    // Actual rebuild with idempotency key.
+    let mut admin = ReviewOptions::new(iri("urn:principal:admin"));
+    admin.idempotency_key = Some("rebuild-after-boundary-removal".into());
+    admin.if_head = Some(head);
+    let rebuilt =
+        evidence::rebuild_resolution_map(&ds, &ds, "people", Some(1), &admin, &Control::none())
+            .unwrap();
+    assert!(rebuilt.committed);
+    assert!(!rebuilt.replayed);
+    assert_eq!(rebuilt.number, 5);
+    assert_eq!(rebuilt.previous.as_ref(), Some(&rev4));
+    assert_eq!(rebuilt.boundary, vec![iri(IDENTITY)]);
+    let mc = rebuilt.changed.map.as_ref().unwrap();
+    assert_eq!(mc.revision, rebuilt.revision);
+    assert_eq!(mc.previous.as_ref(), Some(&rev4));
+    assert!(mc.decisions_added.is_empty());
+    let mut expected_ended = vec![dab, def];
+    expected_ended.sort();
+    assert_eq!(mc.decisions_ended, expected_ended);
+    assert_eq!(map(&ds), pairs(&["b c", "c c", "d d", "e d"]));
+
+    // Replay returns the first receipt with empty changed.
+    let replayed =
+        evidence::rebuild_resolution_map(&ds, &ds, "people", Some(1), &admin, &Control::none())
+            .unwrap();
+    assert!(!replayed.committed);
+    assert!(replayed.replayed);
+    assert_eq!(replayed.operation, rebuilt.operation);
+    assert_eq!(replayed.commit, rebuilt.commit);
+    assert_eq!(replayed.revision, rebuilt.revision);
+    assert_eq!(replayed.number, 5);
+    assert_eq!(replayed.previous.as_ref(), Some(&rev4));
+    assert_eq!(replayed.boundary, vec![iri(IDENTITY)]);
+    assert_eq!(replayed.changed, evidence::Changed::default());
+
+    // Different payload under same idempotency key -> idempotency-conflict.
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "idempotency-conflict"
+    );
+
+    // Dependents of the rebuilt operation's changed identities find the assessment on rev4.
+    let deps = evidence::find_dependents(
+        &ds,
+        &ds,
+        &rebuilt.changed.identities(),
+        false,
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(deps.dependents.len(), 1);
+    assert_eq!(deps.dependents[0].assessment, assessment);
+    assert_eq!(deps.dependents[0].on, rev4);
+
+    // Resolution reads succeed in the new boundary.
+    let resolved = evidence::resolve_entities(
+        &ds,
+        &ds,
+        "people",
+        &[e("a"), e("b"), e("d"), e("f")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(resolved.revision.as_ref(), Some(&rebuilt.revision));
+    assert_eq!(resolved.number, 5);
+    assert_eq!(resolved.entities[0].representative, e("a"));
+    assert_eq!(resolved.entities[0].members, vec![e("a")]);
+    assert!(resolved.entities[0].decisions.is_empty());
+    assert_eq!(resolved.entities[1].representative, e("c"));
+    assert_eq!(resolved.entities[1].members, vec![e("b"), e("c")]);
+    assert_eq!(resolved.entities[1].decisions, vec![dbc]);
+    assert_eq!(resolved.entities[2].representative, e("d"));
+    assert_eq!(resolved.entities[2].members, vec![e("d"), e("e")]);
+    assert_eq!(resolved.entities[2].decisions, vec![dde]);
+    assert_eq!(resolved.entities[3].representative, e("f"));
+
+    // Subsequent reviews succeed and chain from the rebuilt revision.
+    let r6 = review(&ds, &[decision("cg", &cg, Disposition::Accepted, None)]).unwrap();
+    assert_eq!(r6.changed.map.as_ref().unwrap().number, 6);
+    assert_eq!(
+        r6.changed.map.as_ref().unwrap().previous.as_ref(),
+        Some(&rebuilt.revision)
+    );
+    assert_eq!(map(&ds), pairs(&["b c", "c c", "d d", "e d", "g c"]));
+
+    // Written ResolutionMap records conform to the profile v1 SHACL shapes.
+    #[cfg(feature = "shacl")]
+    {
+        let copy = Dataset::memory();
+        let mut nt = String::new();
+        for g in [IDENTITY, DECISIONS, MAPS] {
+            for t in ds
+                .construct(&format!(
+                    "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}"
+                ))
+                .unwrap()
+                .iter()
+            {
+                nt.push_str(&format!("{t} .\n"));
+            }
+        }
+        copy.load_str(&nt, oxrdfio::RdfFormat::NTriples).unwrap();
+        let shapes = sparkles_shacl::Shapes::parse(
+            evidence::profile(1).unwrap().shapes,
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )
+        .unwrap();
+        let report = copy
+            .validation()
+            .shacl(&shapes, &Default::default())
+            .unwrap();
+        assert!(report.conforms, "SHACL violations: {report:?}");
+    }
+}
+
+/// Detaching and re-protecting an identity graph in the boundary invalidates its earlier
+/// proposals, so rebuild drops them, records the new protection nonce in the fresh map
+/// revision, and allows new proposals in that graph to be reviewed normally.
+#[test]
+fn rebuilding_after_detached_and_reprotected_identity_graph_restores_map() {
+    let ds = configured();
+    let ab = propose_in(
+        &ds,
+        HIDDEN,
+        proposal(
+            "ab",
+            IdentityRelation::PossibleMatch,
+            &["a", "b"],
+            Some("b"),
+        ),
+    );
+    let cd = matched(&ds, "cd", &["c", "d"], None);
+    let dab = accept(&ds, "ab", &ab);
+    let dcd = accept(&ds, "cd", &cd);
+    assert_eq!(map(&ds), pairs(&["a b", "b b", "c c", "d c"]));
+
+    evidence::detach(&ds, HIDDEN).unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("c")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+
+    let rebuilt = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(rebuilt.committed);
+    assert_eq!(rebuilt.number, 3);
+    assert_eq!(rebuilt.boundary, vec![iri(IDENTITY), iri(HIDDEN)]);
+    assert_eq!(
+        rebuilt.changed.map.as_ref().unwrap().decisions_ended,
+        vec![dab]
+    );
+    assert_eq!(map(&ds), pairs(&["c c", "d c"]));
+
+    // New proposal in the re-protected graph authenticates and reviews cleanly.
+    let xy = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("xy", IdentityRelation::PossibleMatch, &["x", "y"], None),
+    );
+    let dxy = accept(&ds, "xy", &xy);
+    assert_eq!(map(&ds), pairs(&["c c", "d c", "x x", "y x"]));
+    let resolved = evidence::resolve_entities(
+        &ds,
+        &ds,
+        "people",
+        &[e("c"), e("y")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(resolved.entities[0].decisions, vec![dcd]);
+    assert_eq!(resolved.entities[1].decisions, vec![dxy]);
+}
+
+/// Rebuilding recovers from a detached and re-protected output graph (stripping arbitrary
+/// quads written while detached), maps graph (whether cleared or kept), and decisions graph.
+#[test]
+fn rebuilding_recovers_after_output_maps_or_decisions_protection_change() {
+    // 1. Detached output graph edited with stray quads (named nodes, blank subject, blank
+    //    object, triple term containing a blank node, and CDT list containing a blank node),
+    //    then re-protected.
+    let ds = configured();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    accept(&ds, "ab", &ab);
+    evidence::detach(&ds, MAP).unwrap();
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{MAP}> {{ \
+            <urn:person:z> <urn:bogus> \"junk\" . \
+            <urn:person:a> <{EV}resolvesTo> <urn:person:z> . \
+            _:b0 <urn:bogus> \"bnode-subj\" . \
+            <urn:person:z> <urn:bogus> _:b1 . \
+            <urn:person:z> <urn:reifies> <<( _:b2 <urn:p> \"v\" )>> . \
+            <urn:person:z> <urn:list> \"[_:b3, 1]\"^^<http://w3id.org/awslabs/neptune/SPARQL-CDTs/List> \
+        }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("a")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+    let head = ds.store().head_commit().seq;
+    let mut dry_opts = ReviewOptions::new(iri("urn:principal:admin"));
+    dry_opts.dry_run = true;
+    let dry =
+        evidence::rebuild_resolution_map(&ds, &ds, "people", None, &dry_opts, &Control::none())
+            .unwrap();
+    assert!(!dry.committed);
+    assert_eq!(dry.changed.removed.len(), 6);
+    assert_eq!(
+        dry.preview
+            .as_ref()
+            .unwrap()
+            .commit
+            .as_ref()
+            .unwrap()
+            .deleted,
+        6,
+        "dry-run must physically delete all 6 detached quads including blank-node quads"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    let r = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(r.committed);
+    assert_eq!(r.number, 2);
+    assert!(r.previous.is_some());
+    assert_eq!(r.changed.removed.len(), 6);
+    assert_eq!(map(&ds), pairs(&["a a", "b a"]));
+    let remaining_quads = ds
+        .construct(&format!(
+            "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{MAP}> {{ ?s ?p ?o }} }}"
+        ))
+        .unwrap()
+        .len();
+    assert_eq!(
+        remaining_quads, 2,
+        "output graph must hold ONLY the 2 recomputed resolvesTo triples with no surviving blank-node quads"
+    );
+
+    // 2. Detached maps graph (not cleared) then re-protected -> starts a new authenticated
+    //    chain at the next revision number.
+    let ds = configured();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    let dab = accept(&ds, "ab", &ab);
+    evidence::detach(&ds, MAPS).unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("a")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+    let r = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(r.number, 2);
+    assert!(r.previous.is_none());
+    assert_eq!(r.changed.map.as_ref().unwrap().decisions_added, vec![dab]);
+    assert_eq!(map(&ds), pairs(&["a a", "b a"]));
+    let cd = matched(&ds, "cd", &["c", "d"], None);
+    accept(&ds, "cd", &cd);
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c"]));
+
+    // 3. Detached maps graph cleared, then re-protected -> rebuild mints revision 1.
+    let ds = configured();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    let dab = accept(&ds, "ab", &ab);
+    evidence::detach(&ds, MAPS).unwrap();
+    ds.update(&format!("CLEAR GRAPH <{MAPS}>")).unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    let r = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(r.number, 1);
+    assert!(r.previous.is_none());
+    assert_eq!(r.changed.map.as_ref().unwrap().decisions_added, vec![dab]);
+    assert_eq!(map(&ds), pairs(&["a a", "b a"]));
+
+    // 4. Detached decisions graph re-protected -> old decisions no longer authenticate,
+    //    rebuild clears the output graph and records a fresh revision.
+    let ds = configured();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    let dab = accept(&ds, "ab", &ab);
+    evidence::detach(&ds, DECISIONS).unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    let r = evidence::rebuild_resolution_map(
+        &ds,
+        &ds,
+        "people",
+        None,
+        &ReviewOptions::new(iri("urn:principal:admin")),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(r.number, 2);
+    assert_eq!(r.changed.map.as_ref().unwrap().decisions_ended, vec![dab]);
+    assert!(map(&ds).is_empty());
+    let resolved =
+        evidence::resolve_entities(&ds, &ds, "people", &[e("a")], all(), &Control::none()).unwrap();
+    assert_eq!(resolved.entities[0].representative, e("a"));
+}
+
+/// Preconditions, access refusals, separation conflicts on re-added boundary graphs,
+/// branch independence and persistent restart/reopen durability.
+#[test]
+fn rebuilding_checks_preconditions_conflicts_branch_and_restart_durability() {
+    let ds = configured();
+    let ab_hidden = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("ab", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    accept(&ds, "ab", &ab_hidden);
+
+    // Preconditions: unknown policy, stale policy version, stale head, masked/missing grants.
+    let admin = ReviewOptions::new(iri("urn:principal:admin"));
+    assert!(
+        evidence::rebuild_resolution_map(&ds, &ds, "nobody", None, &admin, &Control::none())
+            .is_err()
+    );
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            Some(99),
+            &admin,
+            &Control::none()
+        )),
+        "policy-changed"
+    );
+    let mut stale = admin.clone();
+    stale.if_head = Some(0);
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &stale,
+            &Control::none()
+        )),
+        "head-changed"
+    );
+    let mut masked_opts = admin.clone();
+    masked_opts.write = masking(&format!("{EV}entity"), HIDDEN);
+    assert!(matches!(
+        evidence::rebuild_resolution_map(&ds, &ds, "people", None, &masked_opts, &Control::none()),
+        Err(sparkles::Error::NotPermitted(_))
+    ));
+    let mut narrow_opts = admin.clone();
+    narrow_opts.write = Some(Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new([IDENTITY, DECISIONS, MAPS, MAP], &[])),
+        Graphs::All,
+    )));
+    assert!(matches!(
+        evidence::rebuild_resolution_map(&ds, &ds, "people", None, &narrow_opts, &Control::none()),
+        Err(sparkles::Error::NotPermitted(_))
+    ));
+
+    // Authority fence refusal writes nothing.
+    let head = ds.store().head_commit().seq;
+    let mut fenced = admin.clone();
+    fenced.authority = Some(Arc::new(Refuse));
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &fenced,
+            &Control::none()
+        )),
+        "authority-changed"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Re-adding a previously removed boundary graph whose accepted match conflicts with a
+    // separation accepted in the meantime makes reads and unrelated reviews refuse with
+    // projection-unavailable, and rebuild refuse with identity-conflict.
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    evidence::rebuild_resolution_map(&ds, &ds, "people", None, &admin, &Control::none()).unwrap();
+    assert!(map(&ds).is_empty());
+    let ab_apart = distinct(&ds, "ab-apart", &["a", "b"]);
+    accept(&ds, "apart", &ab_apart);
+    let cd_unrelated = matched(&ds, "cd-unrelated", &["c", "d"], None);
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("a")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("cd", &cd_unrelated, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "identity-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Non-conflicting re-add: removing HIDDEN, rebuilding, and re-adding HIDDEN requires a
+    // rebuild before reads or reviews can resume, and the rebuild restores the earlier match.
+    let readd = configured();
+    let ab_r = propose_in(
+        &readd,
+        HIDDEN,
+        proposal("ab-r", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    let cd_r = matched(&readd, "cd-r", &["c", "d"], None);
+    let ef_r = matched(&readd, "ef-r", &["e", "f"], None);
+    let dab_r = accept(&readd, "ab", &ab_r);
+    accept(&readd, "cd", &cd_r);
+    evidence::configure(
+        &readd,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let mut rb_opts = admin.clone();
+    rb_opts.idempotency_key = Some("replay-across-version".into());
+    let rb_v1 = evidence::rebuild_resolution_map(
+        &readd,
+        &readd,
+        "people",
+        Some(1),
+        &rb_opts,
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(map(&readd), pairs(&["c c", "d c"]));
+
+    // Idempotency replay succeeds even after the policy version is bumped to 2, returning
+    // the original receipt (policy_version == 1), while a different payload conflicts and a
+    // new key with version 1 returns policy-changed.
+    evidence::configure(
+        &readd,
+        &settings_with(2, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let replayed = evidence::rebuild_resolution_map(
+        &readd,
+        &readd,
+        "people",
+        Some(1),
+        &rb_opts,
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(replayed.replayed);
+    assert!(!replayed.committed);
+    assert_eq!(replayed.commit, rb_v1.commit);
+    assert_eq!(replayed.revision, rb_v1.revision);
+    assert_eq!(replayed.policy_version, 1);
+    assert_eq!(replayed.changed, evidence::Changed::default());
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &readd,
+            &readd,
+            "people",
+            Some(2),
+            &rb_opts,
+            &Control::none()
+        )),
+        "idempotency-conflict"
+    );
+    let mut new_key = admin.clone();
+    new_key.idempotency_key = Some("fresh-key-stale-version".into());
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &readd,
+            &readd,
+            "people",
+            Some(1),
+            &new_key,
+            &Control::none()
+        )),
+        "policy-changed"
+    );
+
+    // Re-add HIDDEN at version 2 -> reads and unrelated reviews refuse with
+    // projection-unavailable until rebuild restores ab_r.
+    evidence::configure(&readd, &settings(2), &Control::none()).unwrap();
+    let readd_head = readd.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &readd,
+            &readd,
+            "people",
+            &[e("a")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(evidence::review(
+            None,
+            &readd,
+            &readd,
+            "people",
+            2,
+            &[decision("ef", &ef_r, Disposition::Accepted, None)],
+            &{
+                let mut o = ReviewOptions::new(iri("urn:principal:reviewer"));
+                o.if_head = Some(readd_head);
+                o
+            },
+            &mut |_, _| all(),
+            &Control::none(),
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(readd.store().head_commit().seq, readd_head);
+    let restored = evidence::rebuild_resolution_map(
+        &readd,
+        &readd,
+        "people",
+        Some(2),
+        &admin,
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(restored.committed);
+    assert_eq!(
+        restored.changed.map.as_ref().unwrap().decisions_added,
+        vec![dab_r.clone()]
+    );
+    assert_eq!(map(&readd), pairs(&["a a", "b a", "c c", "d c"]));
+    let resolved =
+        evidence::resolve_entities(&readd, &readd, "people", &[e("a")], all(), &Control::none())
+            .unwrap();
+    assert_eq!(resolved.entities[0].members, vec![e("a"), e("b")]);
+    assert_eq!(resolved.entities[0].decisions, vec![dab_r]);
+
+    // Persistent dataset: branch rebuild and restart/reopen durability.
+    let dir = tempfile::tempdir().unwrap();
+    let rev_main;
+    {
+        let pds = Dataset::open(dir.path()).unwrap();
+        evidence::configure(&pds, &settings(1), &Control::none()).unwrap();
+        let ab = propose_in(
+            &pds,
+            HIDDEN,
+            proposal("ab", IdentityRelation::PossibleMatch, &["a", "b"], None),
+        );
+        let cd = matched(&pds, "cd", &["c", "d"], None);
+        accept(&pds, "ab", &ab);
+        accept(&pds, "cd", &cd);
+        pds.create_branch("dev", &Default::default()).unwrap();
+        let dev = pds.branch("dev").unwrap();
+        evidence::configure(
+            &pds,
+            &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+            &Control::none(),
+        )
+        .unwrap();
+        // Rebuild on dev independently of main.
+        let r_dev =
+            evidence::rebuild_resolution_map(&pds, &dev, "people", None, &admin, &Control::none())
+                .unwrap();
+        assert!(r_dev.committed);
+        assert_eq!(r_dev.number, 3);
+        // Main is still unavailable until rebuilt too.
+        assert_eq!(
+            code(evidence::resolve_entities(
+                &pds,
+                &pds,
+                "people",
+                &[e("c")],
+                all(),
+                &Control::none()
+            )),
+            "projection-unavailable"
+        );
+        let r_main =
+            evidence::rebuild_resolution_map(&pds, &pds, "people", None, &admin, &Control::none())
+                .unwrap();
+        rev_main = r_main.revision;
+    }
+    // Reopen from disk and verify map, reads and reviews survive restart.
+    let reopened = Dataset::open(dir.path()).unwrap();
+    let res = evidence::resolve_entities(
+        &reopened,
+        &reopened,
+        "people",
+        &[e("a"), e("c")],
+        all(),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(res.revision.as_ref(), Some(&rev_main));
+    assert_eq!(res.number, 3);
+    assert_eq!(res.entities[0].representative, e("a"));
+    assert_eq!(res.entities[1].representative, e("c"));
+    assert_eq!(res.entities[1].members, vec![e("c"), e("d")]);
+    let de = matched(&reopened, "de", &["d", "e"], None);
+    accept(&reopened, "de", &de);
+    assert_eq!(map(&reopened), pairs(&["c c", "d c", "e c"]));
+}
+
+/// Detached `maps` graphs with revision numbering gaps (including gaps jumped by
+/// exponential probing such as 1, 2, [missing 3], 4 or 1, 2, 3, [missing 4], 5, 6, 7) or
+/// stray/partial subjects at minted revision slots refuse with `immutable-record-conflict`
+/// and write nothing.
+#[test]
+fn rebuilding_refuses_maps_numbering_gaps_and_stray_minted_slots() {
+    let admin = ReviewOptions::new(iri("urn:principal:admin"));
+
+    // 1. Gap at 3 among revisions 1, 2, 3, 4 (exponential probe 1, 2, 4 jumps over 3).
+    let ds = configured();
+    let mut revs = Vec::new();
+    for i in 0..4 {
+        let p = matched(
+            &ds,
+            &format!("m{i}"),
+            &[&format!("a{i}"), &format!("b{i}")],
+            None,
+        );
+        let r = review(&ds, &[decision("x", &p, Disposition::Accepted, None)]).unwrap();
+        revs.push(r.map_revision.unwrap());
+    }
+    evidence::detach(&ds, MAPS).unwrap();
+    ds.update(&format!(
+        "DELETE WHERE {{ GRAPH <{MAPS}> {{ <{}> ?p ?o }} }}",
+        revs[2].as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds,
+            &ds,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // 2. Gap at 4 among revisions 1..=7 (exponential probe stops at 3).
+    let ds2 = configured();
+    let mut revs2 = Vec::new();
+    for i in 0..7 {
+        let p = matched(
+            &ds2,
+            &format!("n{i}"),
+            &[&format!("c{i}"), &format!("d{i}")],
+            None,
+        );
+        let r = review(&ds2, &[decision("x", &p, Disposition::Accepted, None)]).unwrap();
+        revs2.push(r.map_revision.unwrap());
+    }
+    evidence::detach(&ds2, MAPS).unwrap();
+    ds2.update(&format!(
+        "DELETE WHERE {{ GRAPH <{MAPS}> {{ <{}> ?p ?o }} }}",
+        revs2[3].as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds2, &settings(1), &Control::none()).unwrap();
+    let head2 = ds2.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds2,
+            &ds2,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds2.store().head_commit().seq, head2);
+
+    // 3. Stray untyped triple at minted slot 2 while slot 1 is absent (would otherwise let
+    //    rebuild mint rev 1 and immediately break `latest()`).
+    let ds3 = configured();
+    let p1 = matched(&ds3, "p1", &["e1", "f1"], None);
+    let p2 = matched(&ds3, "p2", &["e2", "f2"], None);
+    review(&ds3, &[decision("x", &p1, Disposition::Accepted, None)]).unwrap();
+    let rev2 = review(&ds3, &[decision("x", &p2, Disposition::Accepted, None)])
+        .unwrap()
+        .map_revision
+        .unwrap();
+    evidence::detach(&ds3, MAPS).unwrap();
+    ds3.update(&format!("CLEAR GRAPH <{MAPS}>")).unwrap();
+    ds3.update(&format!(
+        "INSERT DATA {{ GRAPH <{MAPS}> {{ <{}> <urn:bogus> \"stray\" }} }}",
+        rev2.as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds3, &settings(1), &Control::none()).unwrap();
+    let head3 = ds3.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds3,
+            &ds3,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds3.store().head_commit().seq, head3);
+
+    // 4. Deleted intermediate revision 3 among 1..=4 replaced by a junk-only subject at
+    //    revision 3's minted IRI must still refuse as a numbering gap with no commit.
+    let ds4 = configured();
+    let mut revs4 = Vec::new();
+    for i in 0..4 {
+        let p = matched(
+            &ds4,
+            &format!("j{i}"),
+            &[&format!("g{i}"), &format!("h{i}")],
+            None,
+        );
+        let r = review(&ds4, &[decision("x", &p, Disposition::Accepted, None)]).unwrap();
+        revs4.push(r.map_revision.unwrap());
+    }
+    evidence::detach(&ds4, MAPS).unwrap();
+    ds4.update(&format!(
+        "DELETE WHERE {{ GRAPH <{MAPS}> {{ <{}> ?p ?o }} }}",
+        revs4[2].as_str()
+    ))
+    .unwrap();
+    ds4.update(&format!(
+        "INSERT DATA {{ GRAPH <{MAPS}> {{ <{}> <urn:junk> \"occupant\" }} }}",
+        revs4[2].as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds4, &settings(1), &Control::none()).unwrap();
+    let head4 = ds4.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds4,
+            &ds4,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds4.store().head_commit().seq, head4);
+
+    // 5. Deleted intermediate revision 3 replaced by a subject with rdf:type and
+    //    ev:reviewPolicy preserved but an incorrectly typed ev:mapRevision literal
+    //    (`"3"@en` instead of `xsd:integer`) must refuse without committing.
+    let ds5 = configured();
+    let mut revs5 = Vec::new();
+    for i in 0..4 {
+        let p = matched(
+            &ds5,
+            &format!("t{i}"),
+            &[&format!("k{i}"), &format!("l{i}")],
+            None,
+        );
+        let r = review(&ds5, &[decision("x", &p, Disposition::Accepted, None)]).unwrap();
+        revs5.push(r.map_revision.unwrap());
+    }
+    let policy_iri = sparkles_core::evidence::review::policy_iri("people");
+    evidence::detach(&ds5, MAPS).unwrap();
+    ds5.update(&format!(
+        "DELETE WHERE {{ GRAPH <{MAPS}> {{ <{}> ?p ?o }} }}",
+        revs5[2].as_str()
+    ))
+    .unwrap();
+    ds5.update(&format!(
+        "INSERT DATA {{ GRAPH <{MAPS}> {{ <{}> a <{EV}ResolutionMap> ; <{EV}reviewPolicy> <{}> ; <{EV}mapRevision> \"3\"@en }} }}",
+        revs5[2].as_str(),
+        policy_iri.as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds5, &settings(1), &Control::none()).unwrap();
+    let head5 = ds5.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds5,
+            &ds5,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds5.store().head_commit().seq, head5);
+
+    // 6. Deleted intermediate revision 3 replaced by a subject carrying an extra
+    //    ev:reviewPolicy value alongside the expected policy must also refuse.
+    let ds6 = configured();
+    let mut revs6 = Vec::new();
+    for i in 0..4 {
+        let p = matched(
+            &ds6,
+            &format!("u{i}"),
+            &[&format!("m{i}"), &format!("n{i}")],
+            None,
+        );
+        let r = review(&ds6, &[decision("x", &p, Disposition::Accepted, None)]).unwrap();
+        revs6.push(r.map_revision.unwrap());
+    }
+    evidence::detach(&ds6, MAPS).unwrap();
+    ds6.update(&format!(
+        "DELETE WHERE {{ GRAPH <{MAPS}> {{ <{}> ?p ?o }} }}",
+        revs6[2].as_str()
+    ))
+    .unwrap();
+    ds6.update(&format!(
+        "INSERT DATA {{ GRAPH <{MAPS}> {{ <{}> a <{EV}ResolutionMap> ; <{EV}reviewPolicy> <{}>, <urn:policy:other> ; <{EV}mapRevision> 3 }} }}",
+        revs6[2].as_str(),
+        policy_iri.as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds6, &settings(1), &Control::none()).unwrap();
+    let head6 = ds6.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds6,
+            &ds6,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds6.store().head_commit().seq, head6);
+}
+
+/// Adding a new identity graph with more than 10,000 unreviewed proposals when the policy
+/// already holds more than 10,000 unrelated historical decisions keeps the map available
+/// for ordinary reads and reviews.
+#[test]
+fn added_boundary_graph_with_over_bound_unreviewed_proposals_and_unrelated_decisions_keeps_map_available()
+ {
+    let ds = Dataset::memory();
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    accept(&ds, "ab", &ab);
+    assert_eq!(map(&ds), pairs(&["a a", "b a"]));
+
+    // Build 10,500 unrelated historical decisions in DECISIONS targeting proposals in
+    // IDENTITY (21 batches of 500 rejected decisions) and 10,500 unreviewed proposals in
+    // HIDDEN (21 batches of 500).
+    for batch in 0..21usize {
+        let mut id_inputs = Vec::with_capacity(500);
+        let mut hidden_inputs = Vec::with_capacity(500);
+        for j in 0..500usize {
+            let idx = batch * 500 + j;
+            id_inputs.push(IdentityInput {
+                version: RecordVersion::V1,
+                key: key(&format!("p{j}")),
+                occurrence_key: key(&format!("hist-{idx}")),
+                entities: vec![e(&format!("hx{idx}")), e(&format!("hy{idx}"))],
+                relation: IdentityRelation::PossibleMatch,
+                preferred: None,
+                attributed_author: iri("urn:matcher"),
+                method: Some(evidence::MethodRef {
+                    method: iri("urn:method:names"),
+                    version: key("1"),
+                }),
+            });
+            hidden_inputs.push(IdentityInput {
+                version: RecordVersion::V1,
+                key: key(&format!("h{j}")),
+                occurrence_key: key(&format!("new-{idx}")),
+                entities: vec![e(&format!("nx{idx}")), e(&format!("ny{idx}"))],
+                relation: IdentityRelation::PossibleMatch,
+                preferred: None,
+                attributed_author: iri("urn:matcher"),
+                method: Some(evidence::MethodRef {
+                    method: iri("urn:method:names"),
+                    version: key("1"),
+                }),
+            });
+        }
+        let mut o_id = ProposeOptions::new(iri("urn:principal:matcher"));
+        o_id.identity_graph = Some(iri(IDENTITY));
+        let proposed = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                identities: id_inputs,
+                ..Default::default()
+            },
+            &o_id,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        let decs: Vec<DecisionInput> = proposed
+            .records
+            .iter()
+            .filter(|r| r.kind == evidence::RecordKind::IdentityProposal)
+            .map(|r| DecisionInput {
+                key: r.key.clone(),
+                target: r.iri.clone(),
+                target_digest: r.digest,
+                disposition: Disposition::Rejected,
+                supersedes: None,
+            })
+            .collect();
+        review(&ds, &decs).unwrap();
+
+        let mut o_hid = ProposeOptions::new(iri("urn:principal:matcher"));
+        o_hid.identity_graph = Some(iri(HIDDEN));
+        evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                identities: hidden_inputs,
+                ..Default::default()
+            },
+            &o_hid,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+    }
+
+    // Add HIDDEN to the boundary. Neither the >10,000 unrelated historical decisions nor
+    // the >10,000 unreviewed proposals in HIDDEN may make the map unavailable.
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+    let res =
+        evidence::resolve_entities(&ds, &ds, "people", &[e("a")], all(), &Control::none()).unwrap();
+    assert_eq!(res.entities[0].representative, e("a"));
+    assert_eq!(res.entities[0].members, vec![e("a"), e("b")]);
+
+    let cd = matched(&ds, "cd", &["c", "d"], None);
+    accept(&ds, "cd", &cd);
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c"]));
+}
+
+/// Two-state non-disclosure regression for a triple-masked acceptance on a re-added
+/// boundary graph: a caller whose view masks proposals in the added graph or decisions in
+/// the policy's decisions graph receives the exact same `projection-unavailable` refusal
+/// on unrelated reads and reviews whether or not the added graph holds a hidden current
+/// acceptance, and cannot publish a stale map revision, while an unrestricted caller
+/// keeps availability when no acceptance exists and still refuses a stale map.
+#[test]
+fn triple_masked_caller_cannot_infer_hidden_acceptance_on_added_boundary_graph() {
+    let admin = ReviewOptions::new(iri("urn:principal:admin"));
+
+    // State 1: HIDDEN removed, rebuilt, then re-added with an unreviewed proposal only.
+    let s1 = configured();
+    let _unreviewed = propose_in(
+        &s1,
+        HIDDEN,
+        proposal("ab-1", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    let cd1 = matched(&s1, "cd", &["c", "d"], None);
+    let ef1 = matched(&s1, "ef", &["e", "f"], None);
+    accept(&s1, "cd", &cd1);
+    evidence::configure(
+        &s1,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    evidence::rebuild_resolution_map(&s1, &s1, "people", None, &admin, &Control::none()).unwrap();
+    evidence::configure(&s1, &settings(1), &Control::none()).unwrap();
+
+    // State 2: Identical visible state, except HIDDEN holds a live accepted proposal.
+    let s2 = configured();
+    let ab2 = propose_in(
+        &s2,
+        HIDDEN,
+        proposal("ab-2", IdentityRelation::PossibleMatch, &["a", "b"], None),
+    );
+    let cd2 = matched(&s2, "cd", &["c", "d"], None);
+    let ef2 = matched(&s2, "ef", &["e", "f"], None);
+    accept(&s2, "ab", &ab2);
+    accept(&s2, "cd", &cd2);
+    evidence::configure(
+        &s2,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    evidence::rebuild_resolution_map(&s2, &s2, "people", None, &admin, &Control::none()).unwrap();
+    evidence::configure(&s2, &settings(1), &Control::none()).unwrap();
+
+    // Unrestricted caller: State 1 stays available, State 2 refuses as stale.
+    let ok1 =
+        evidence::resolve_entities(&s1, &s1, "people", &[e("c")], all(), &Control::none()).unwrap();
+    assert_eq!(ok1.entities[0].representative, e("c"));
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &s2,
+            &s2,
+            "people",
+            &[e("c")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+
+    let err_pair = |r: sparkles::Result<evidence::EntityResolution>| {
+        let e = r.unwrap_err();
+        (e.code().to_string(), e.to_string())
+    };
+    let review_err_pair = |ds: &Dataset, target: &Target, access: Option<Arc<GraphAccess>>| {
+        let head = ds.store().head_commit().seq;
+        let mut opts = ReviewOptions::new(iri("urn:principal:reviewer"));
+        opts.if_head = Some(head);
+        let r = evidence::review(
+            None,
+            ds,
+            ds,
+            "people",
+            1,
+            &[decision("ef", target, Disposition::Accepted, None)],
+            &opts,
+            &mut |_, _| access.clone(),
+            &Control::none(),
+        );
+        let e = r.unwrap_err();
+        assert_eq!(ds.store().head_commit().seq, head);
+        (e.code().to_string(), e.to_string())
+    };
+
+    // Both a proposal mask on HIDDEN and a decision mask on DECISIONS — including a tight
+    // `max_hidden = 1` ceiling that State 1 stays within and State 2's hidden decision
+    // rows would otherwise cross during mask preparation — must produce byte-identical
+    // `projection-unavailable` refusals across State 1 and State 2 with a matching-map
+    // message that does not claim a detachment or claim supports failure.
+    for mask in [
+        masking(&format!("{EV}entity"), HIDDEN),
+        masking(&format!("{EV}disposition"), DECISIONS),
+        masking_with_limit(&format!("{EV}disposition"), DECISIONS, Some(1)),
+    ] {
+        let r1 = err_pair(evidence::resolve_entities(
+            &s1,
+            &s1,
+            "people",
+            &[e("c")],
+            mask.clone(),
+            &Control::none(),
+        ));
+        let r2 = err_pair(evidence::resolve_entities(
+            &s2,
+            &s2,
+            "people",
+            &[e("c")],
+            mask.clone(),
+            &Control::none(),
+        ));
+        assert_eq!(r1.0, "projection-unavailable");
+        assert!(
+            r1.1.contains("resolution map")
+                && !r1.1.contains("supports")
+                && !r1.1.contains("detached and protected again"),
+            "unexpected refusal message: {}",
+            r1.1
+        );
+        assert_eq!(r1, r2);
+
+        let w1 = review_err_pair(&s1, &ef1, mask.clone());
+        let w2 = review_err_pair(&s2, &ef2, mask);
+        assert_eq!(w1.0, "projection-unavailable");
+        assert_eq!(w1, w2);
+        assert_eq!(w1, r1);
+    }
+
+    // After an admin rebuild records HIDDEN on the latest revision, masked reads resume
+    // under normal limits, while the tight `max_hidden = 1` limit on State 2 actually
+    // crosses the hidden-quad budget (proving the pre-rebuild refusal ran before mask
+    // preparation).
+    evidence::rebuild_resolution_map(&s2, &s2, "people", None, &admin, &Control::none()).unwrap();
+    let resumed = evidence::resolve_entities(
+        &s2,
+        &s2,
+        "people",
+        &[e("c")],
+        masking(&format!("{EV}entity"), HIDDEN),
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(resumed.entities[0].representative, e("c"));
+    assert_eq!(resumed.entities[0].members, vec![e("c"), e("d")]);
+    let post_rebuild_limited = evidence::resolve_entities(
+        &s2,
+        &s2,
+        "people",
+        &[e("c")],
+        masking_with_limit(&format!("{EV}disposition"), DECISIONS, Some(1)),
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            post_rebuild_limited,
+            sparkles::Error::BudgetExceeded(ref b)
+                if b.kind == sparkles_core::error::BudgetKind::HiddenQuads
+        ),
+        "expected HiddenQuads after rebuild under max_hidden=1, got {post_rebuild_limited:?}"
+    );
+}
+
+/// Adding a populated graph holding thousands of unrelated quads plus one current-epoch
+/// unreviewed proposal keeps reads and reviews available, and still refuses once an
+/// accepted decision exists for that proposal.
+#[test]
+fn added_boundary_graph_with_many_unrelated_quads_and_few_proposals() {
+    let ds = Dataset::memory();
+    let admin = ReviewOptions::new(iri("urn:principal:admin"));
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    accept(&ds, "ab", &ab);
+
+    // Populate HIDDEN with 5,000 unrelated quads while it is detached, then re-protect
+    // it with one current-epoch unreviewed proposal and add it to the boundary.
+    evidence::detach(&ds, HIDDEN).unwrap();
+    let mut inserts = String::from("INSERT DATA { GRAPH <");
+    inserts.push_str(HIDDEN);
+    inserts.push_str("> { ");
+    for i in 0..5_000usize {
+        inserts.push_str(&format!("<urn:bg:s{i}> <urn:bg:p> <urn:bg:o{i}> . "));
+    }
+    inserts.push_str("} }");
+    ds.update(&inserts).unwrap();
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let xy = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("xy", IdentityRelation::PossibleMatch, &["x", "y"], None),
+    );
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+
+    // Reads and reviews stay available because the added graph has no accepted proposal.
+    let res =
+        evidence::resolve_entities(&ds, &ds, "people", &[e("a")], all(), &Control::none()).unwrap();
+    assert_eq!(res.entities[0].representative, e("a"));
+    let cd = matched(&ds, "cd", &["c", "d"], None);
+    accept(&ds, "cd", &cd);
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c"]));
+
+    // Accept the proposal on HIDDEN, remove HIDDEN and rebuild, then add HIDDEN back
+    // (still carrying its 5,000 unrelated quads plus the accepted proposal). Both reads
+    // and reviews must now refuse, and the refused review must leave the head intact.
+    accept(&ds, "xy", &xy);
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c", "x x", "y x"]));
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    evidence::rebuild_resolution_map(&ds, &ds, "people", None, &admin, &Control::none()).unwrap();
+    let ef = matched(&ds, "ef", &["e", "f"], None);
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+
+    assert_eq!(
+        code(evidence::resolve_entities(
+            &ds,
+            &ds,
+            "people",
+            &[e("x")],
+            all(),
+            &Control::none()
+        )),
+        "projection-unavailable"
+    );
+    let head = ds.store().head_commit().seq;
+    let mut review_opts = ReviewOptions::new(iri("urn:principal:reviewer"));
+    review_opts.if_head = Some(head);
+    assert_eq!(
+        code(evidence::review(
+            None,
+            &ds,
+            &ds,
+            "people",
+            1,
+            &[decision("ef", &ef, Disposition::Accepted, None)],
+            &review_opts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Rebuilding restores reads and includes the accepted proposal from HIDDEN.
+    evidence::rebuild_resolution_map(&ds, &ds, "people", None, &admin, &Control::none()).unwrap();
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c", "x x", "y x"]));
+    let restored =
+        evidence::resolve_entities(&ds, &ds, "people", &[e("y")], all(), &Control::none()).unwrap();
+    assert_eq!(restored.entities[0].representative, e("x"));
 }

@@ -1803,3 +1803,678 @@ fn subjects_in_graphs_predicate_runs_outside_delta_vocab_lock() {
     assert_eq!(scan.items[0].0.as_str(), "urn:s:1");
     assert_eq!(scan.items[0].1.as_str(), g_delta);
 }
+
+/// An added boundary graph holding many unrelated or detached-epoch quads alongside a
+/// small number of current proposals must not walk the unrelated graph rows.
+#[test]
+fn has_live_accepted_in_graphs_skips_unrelated_quads_in_added_graph() {
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{GraphName, Quad};
+
+    let s = Store::in_memory(StoreOptions::default());
+    let added_graph = iri("urn:ev:added");
+    let other_graph = iri("urn:ev:other");
+    let decisions_graph = iri("urn:ev:decisions");
+    let policy = iri("urn:ev:policy:people");
+    let added_nonce = Uuid::new_v4();
+    let detached_nonce = Uuid::new_v4();
+    let other_nonce = Uuid::new_v4();
+    let decisions_nonce = Uuid::new_v4();
+
+    let rdf_type = iri(RDF_TYPE);
+    let proposal_cls = iri(&format!("{EV}IdentityProposal"));
+    let decision_cls = iri(&format!("{EV}ReviewDecision"));
+    let op_cls = iri(&format!("{EV}Operation"));
+    let policy_pred = iri(&format!("{EV}reviewPolicy"));
+    let target_pred = iri(&format!("{EV}target"));
+    let disp_pred = iri(&format!("{EV}disposition"));
+    let accepted = iri(&format!("{EV}Accepted"));
+    let receipt_pred = iri(&format!("{EV}availabilityReceipt"));
+    let prot_pred = iri(&format!("{EV}graphProtection"));
+    let prop_p = iri("urn:unrelated:p");
+
+    let mut quads: Vec<Quad> = Vec::with_capacity(21_000);
+    // 20,000 unrelated quads in the added graph.
+    for i in 0..20_000usize {
+        quads.push(Quad::new(
+            iri(&format!("urn:unrelated:s{i}")),
+            prop_p.clone(),
+            iri(&format!("urn:unrelated:o{i}")),
+            GraphName::NamedNode(added_graph.clone()),
+        ));
+    }
+    // 100 detached-epoch proposals in the added graph under an old nonce.
+    let detached_op = iri("urn:op:detached");
+    quads.push(Quad::new(
+        detached_op.clone(),
+        rdf_type.clone(),
+        op_cls.clone(),
+        GraphName::NamedNode(added_graph.clone()),
+    ));
+    quads.push(Quad::new(
+        detached_op.clone(),
+        prot_pred.clone(),
+        string(&detached_nonce.to_string()),
+        GraphName::NamedNode(added_graph.clone()),
+    ));
+    for i in 0..100usize {
+        let p = iri(&format!("urn:proposal:detached-{i}"));
+        quads.push(Quad::new(
+            p.clone(),
+            rdf_type.clone(),
+            proposal_cls.clone(),
+            GraphName::NamedNode(added_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            p.clone(),
+            receipt_pred.clone(),
+            detached_op.clone(),
+            GraphName::NamedNode(added_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            p,
+            prot_pred.clone(),
+            string(&detached_nonce.to_string()),
+            GraphName::NamedNode(added_graph.clone()),
+        ));
+    }
+    // 500 accepted decisions targeting proposals in `other_graph` so `c_accepted`,
+    // `c_policy`, and `c_proposals` are all much larger than `c_protected`.
+    let other_op = iri("urn:op:other");
+    quads.push(Quad::new(
+        other_op.clone(),
+        rdf_type.clone(),
+        op_cls.clone(),
+        GraphName::NamedNode(other_graph.clone()),
+    ));
+    quads.push(Quad::new(
+        other_op.clone(),
+        prot_pred.clone(),
+        string(&other_nonce.to_string()),
+        GraphName::NamedNode(other_graph.clone()),
+    ));
+    let dec_op = iri("urn:op:decisions");
+    quads.push(Quad::new(
+        dec_op.clone(),
+        rdf_type.clone(),
+        op_cls.clone(),
+        GraphName::NamedNode(decisions_graph.clone()),
+    ));
+    quads.push(Quad::new(
+        dec_op.clone(),
+        prot_pred.clone(),
+        string(&decisions_nonce.to_string()),
+        GraphName::NamedNode(decisions_graph.clone()),
+    ));
+    for i in 0..500usize {
+        let p = iri(&format!("urn:proposal:other-{i}"));
+        quads.push(Quad::new(
+            p.clone(),
+            rdf_type.clone(),
+            proposal_cls.clone(),
+            GraphName::NamedNode(other_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            p.clone(),
+            receipt_pred.clone(),
+            other_op.clone(),
+            GraphName::NamedNode(other_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            p.clone(),
+            prot_pred.clone(),
+            string(&other_nonce.to_string()),
+            GraphName::NamedNode(other_graph.clone()),
+        ));
+        let d = iri(&format!("urn:decision:other-{i}"));
+        quads.push(Quad::new(
+            d.clone(),
+            rdf_type.clone(),
+            decision_cls.clone(),
+            GraphName::NamedNode(decisions_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            d.clone(),
+            policy_pred.clone(),
+            policy.clone(),
+            GraphName::NamedNode(decisions_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            d.clone(),
+            target_pred.clone(),
+            p,
+            GraphName::NamedNode(decisions_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            d.clone(),
+            disp_pred.clone(),
+            accepted.clone(),
+            GraphName::NamedNode(decisions_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            d.clone(),
+            receipt_pred.clone(),
+            dec_op.clone(),
+            GraphName::NamedNode(decisions_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            d,
+            prot_pred.clone(),
+            string(&decisions_nonce.to_string()),
+            GraphName::NamedNode(decisions_graph.clone()),
+        ));
+    }
+    // 2 current-epoch unreviewed proposals in the added graph.
+    let added_op = iri("urn:op:added");
+    quads.push(Quad::new(
+        added_op.clone(),
+        rdf_type.clone(),
+        op_cls.clone(),
+        GraphName::NamedNode(added_graph.clone()),
+    ));
+    quads.push(Quad::new(
+        added_op.clone(),
+        prot_pred.clone(),
+        string(&added_nonce.to_string()),
+        GraphName::NamedNode(added_graph.clone()),
+    ));
+    let cur_p1 = iri("urn:proposal:added-1");
+    let cur_p2 = iri("urn:proposal:added-2");
+    for p in [&cur_p1, &cur_p2] {
+        quads.push(Quad::new(
+            p.clone(),
+            rdf_type.clone(),
+            proposal_cls.clone(),
+            GraphName::NamedNode(added_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            p.clone(),
+            receipt_pred.clone(),
+            added_op.clone(),
+            GraphName::NamedNode(added_graph.clone()),
+        ));
+        quads.push(Quad::new(
+            p.clone(),
+            prot_pred.clone(),
+            string(&added_nonce.to_string()),
+            GraphName::NamedNode(added_graph.clone()),
+        ));
+    }
+    let insert_all = |qs: &[Quad]| {
+        let mut t = s.write();
+        let mut labels = std::collections::HashMap::new();
+        for q in qs {
+            let ids = t.encode_quad(q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        t.commit().unwrap();
+    };
+    insert_all(&quads);
+
+    let snap = s.snapshot();
+    let prep = Preparation::new(crate::task::Control::none(), 1 << 20).unwrap();
+    let mut reads = Reads::new(&prep, &snap);
+    let (found, stats) = reads
+        .has_live_accepted_in_graphs_counted(
+            &[(added_graph.clone(), Some(added_nonce))],
+            &(decisions_graph.clone(), Some(decisions_nonce)),
+            &policy,
+        )
+        .unwrap();
+    assert!(!found);
+    // Only the 2 current proposals + 1 operation carry `added_nonce` (3 rows total),
+    // never the 20,000 unrelated quads or 100 detached-epoch proposals, and global
+    // prefixes are not even counted for a small current-nonce set.
+    assert_eq!(stats.count_calls, 1);
+    assert!(
+        stats.outer_rows <= 8,
+        "expected selective scan over current-epoch candidates, scanned {} outer rows",
+        stats.outer_rows
+    );
+
+    // Accepting one of the current proposals in `added_graph` must be detected while
+    // keeping outer work bounded.
+    let d_added = iri("urn:decision:added-1");
+    insert_all(&[
+        Quad::new(
+            d_added.clone(),
+            rdf_type,
+            decision_cls,
+            GraphName::NamedNode(decisions_graph.clone()),
+        ),
+        Quad::new(
+            d_added.clone(),
+            policy_pred,
+            policy.clone(),
+            GraphName::NamedNode(decisions_graph.clone()),
+        ),
+        Quad::new(
+            d_added.clone(),
+            target_pred,
+            cur_p1,
+            GraphName::NamedNode(decisions_graph.clone()),
+        ),
+        Quad::new(
+            d_added.clone(),
+            disp_pred,
+            accepted,
+            GraphName::NamedNode(decisions_graph.clone()),
+        ),
+        Quad::new(
+            d_added.clone(),
+            receipt_pred,
+            dec_op,
+            GraphName::NamedNode(decisions_graph.clone()),
+        ),
+        Quad::new(
+            d_added,
+            prot_pred,
+            string(&decisions_nonce.to_string()),
+            GraphName::NamedNode(decisions_graph.clone()),
+        ),
+    ]);
+    let snap2 = s.snapshot();
+    let mut reads2 = Reads::new(&prep, &snap2);
+    let (found2, stats2) = reads2
+        .has_live_accepted_in_graphs_counted(
+            &[(added_graph, Some(added_nonce))],
+            &(decisions_graph, Some(decisions_nonce)),
+            &policy,
+        )
+        .unwrap();
+    assert!(found2);
+    assert_eq!(stats2.count_calls, 1);
+    assert!(
+        stats2.outer_rows <= 8,
+        "expected selective scan on accepted match, scanned {} outer rows",
+        stats2.outer_rows
+    );
+}
+
+/// On a compacted multi-block base with large unrelated global `ev:IdentityProposal` and
+/// `ev:Accepted` ranges, candidate selection in `has_live_accepted_in_graphs_counted`
+/// must never walk interior block metadata linearly, must skip global counts when the
+/// added graph has few current-nonce rows, must keep metadata reads and edge decodes O(1)
+/// when global counts are needed, and must enforce `Preparation` cancellation and memory
+/// budgets on edge decodes.
+#[test]
+fn has_live_accepted_in_graphs_compacted_base_bounds_selection_and_obeys_preparation() {
+    use crate::error::BudgetKind;
+    use crate::index::Perm;
+    use crate::store::{Store, StoreOptions};
+    use crate::task::Control;
+    use oxrdf::{GraphName, Quad};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+
+    let added_graph = iri("urn:ev:added");
+    let large_added_graph = iri("urn:ev:large-added");
+    let decisions_graph = iri("urn:ev:decisions");
+    let policy = iri("urn:ev:policy:people");
+    let added_nonce = Uuid::new_v4();
+    let large_nonce = Uuid::new_v4();
+    let bulk_nonce = Uuid::new_v4();
+    let decisions_nonce = Uuid::new_v4();
+
+    let rdf_type = iri(RDF_TYPE);
+    let proposal_cls = iri(&format!("{EV}IdentityProposal"));
+    let decision_cls = iri(&format!("{EV}ReviewDecision"));
+    let op_cls = iri(&format!("{EV}Operation"));
+    let policy_pred = iri(&format!("{EV}reviewPolicy"));
+    let target_pred = iri(&format!("{EV}target"));
+    let disp_pred = iri(&format!("{EV}disposition"));
+    let accepted = iri(&format!("{EV}Accepted"));
+    let receipt_pred = iri(&format!("{EV}availabilityReceipt"));
+    let prot_pred = iri(&format!("{EV}graphProtection"));
+
+    let added_op = iri("urn:op:added");
+    let cur_p1 = iri("urn:proposal:added-1");
+    let cur_p2 = iri("urn:proposal:added-2");
+    let dec_op = iri("urn:op:decisions");
+    let other_p1 = iri("urn:proposal:policy-other-1");
+    let other_p2 = iri("urn:proposal:policy-other-2");
+    let other_d1 = iri("urn:decision:policy-other-1");
+    let other_d2 = iri("urn:decision:policy-other-2");
+
+    {
+        let mut t = s.write();
+        let mut labels = std::collections::HashMap::new();
+
+        // Pre-encode shared predicate/object/subject/graph IDs for fast multi-block fill:
+        // 1,000 subjects x 150 unrelated graphs = 150,000 rows per global prefix
+        // (5+ compacted blocks of 32,768 rows each in Perm::Pos).
+        let bulk_subjects: Vec<_> = (0..1_000usize)
+            .map(|i| {
+                t.intern_scoped(
+                    &oxrdf::Term::NamedNode(iri(&format!("urn:bulk:s{i}"))),
+                    &mut labels,
+                )
+                .unwrap()
+            })
+            .collect();
+        let bulk_graphs: Vec<_> = (0..150usize)
+            .map(|i| {
+                t.intern_scoped(
+                    &oxrdf::Term::NamedNode(iri(&format!("urn:bulk:g{i}"))),
+                    &mut labels,
+                )
+                .unwrap()
+            })
+            .collect();
+        let rdf_type_id = t
+            .intern_scoped(&oxrdf::Term::NamedNode(rdf_type.clone()), &mut labels)
+            .unwrap();
+        let proposal_cls_id = t
+            .intern_scoped(&oxrdf::Term::NamedNode(proposal_cls.clone()), &mut labels)
+            .unwrap();
+        let disp_pred_id = t
+            .intern_scoped(&oxrdf::Term::NamedNode(disp_pred.clone()), &mut labels)
+            .unwrap();
+        let accepted_id = t
+            .intern_scoped(&oxrdf::Term::NamedNode(accepted.clone()), &mut labels)
+            .unwrap();
+        let prot_pred_id = t
+            .intern_scoped(&oxrdf::Term::NamedNode(prot_pred.clone()), &mut labels)
+            .unwrap();
+        let bulk_nonce_id = t
+            .intern_scoped(&string(&bulk_nonce.to_string()), &mut labels)
+            .unwrap();
+        let large_nonce_id = t
+            .intern_scoped(&string(&large_nonce.to_string()), &mut labels)
+            .unwrap();
+        let large_graph_id = t
+            .intern_scoped(
+                &oxrdf::Term::NamedNode(large_added_graph.clone()),
+                &mut labels,
+            )
+            .unwrap();
+
+        for &g_id in &bulk_graphs {
+            for &s_id in &bulk_subjects {
+                t.insert([s_id, rdf_type_id, proposal_cls_id, g_id])
+                    .unwrap();
+                t.insert([s_id, disp_pred_id, accepted_id, g_id]).unwrap();
+            }
+        }
+        // Populate enough rows under `prot_pred` that `prot_pred` spans full 2,048-row
+        // segments in the compacted Perm::Pos index.
+        for &g_id in &bulk_graphs[..6] {
+            for &s_id in &bulk_subjects {
+                t.insert([s_id, prot_pred_id, bulk_nonce_id, g_id]).unwrap();
+            }
+        }
+        // 80 current-epoch non-proposal records in `large_added_graph` (> SMALL_PROTECTED_LIMIT)
+        // so candidate selection must compare against the multi-block global prefixes and
+        // choose the tiny 2-row `policy` prefix.
+        for &s_id in &bulk_subjects[..80] {
+            t.insert([s_id, prot_pred_id, large_nonce_id, large_graph_id])
+                .unwrap();
+        }
+
+        let mut push_quad = |q: Quad| {
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        };
+
+        // Small `added_graph`: 1 operation + 2 current-epoch unreviewed proposals (3 rows).
+        push_quad(Quad::new(
+            added_op.clone(),
+            rdf_type.clone(),
+            op_cls.clone(),
+            GraphName::NamedNode(added_graph.clone()),
+        ));
+        push_quad(Quad::new(
+            added_op.clone(),
+            prot_pred.clone(),
+            string(&added_nonce.to_string()),
+            GraphName::NamedNode(added_graph.clone()),
+        ));
+        for p in [&cur_p1, &cur_p2] {
+            push_quad(Quad::new(
+                p.clone(),
+                rdf_type.clone(),
+                proposal_cls.clone(),
+                GraphName::NamedNode(added_graph.clone()),
+            ));
+            push_quad(Quad::new(
+                p.clone(),
+                receipt_pred.clone(),
+                added_op.clone(),
+                GraphName::NamedNode(added_graph.clone()),
+            ));
+            push_quad(Quad::new(
+                p.clone(),
+                prot_pred.clone(),
+                string(&added_nonce.to_string()),
+                GraphName::NamedNode(added_graph.clone()),
+            ));
+        }
+
+        // Only 2 decisions under `policy` in `decisions_graph` (targeting unrelated proposals).
+        push_quad(Quad::new(
+            dec_op.clone(),
+            rdf_type.clone(),
+            op_cls.clone(),
+            GraphName::NamedNode(decisions_graph.clone()),
+        ));
+        push_quad(Quad::new(
+            dec_op.clone(),
+            prot_pred.clone(),
+            string(&decisions_nonce.to_string()),
+            GraphName::NamedNode(decisions_graph.clone()),
+        ));
+        for (d, target) in [(&other_d1, &other_p1), (&other_d2, &other_p2)] {
+            push_quad(Quad::new(
+                d.clone(),
+                rdf_type.clone(),
+                decision_cls.clone(),
+                GraphName::NamedNode(decisions_graph.clone()),
+            ));
+            push_quad(Quad::new(
+                d.clone(),
+                policy_pred.clone(),
+                policy.clone(),
+                GraphName::NamedNode(decisions_graph.clone()),
+            ));
+            push_quad(Quad::new(
+                d.clone(),
+                target_pred.clone(),
+                target.clone(),
+                GraphName::NamedNode(decisions_graph.clone()),
+            ));
+            push_quad(Quad::new(
+                d.clone(),
+                disp_pred.clone(),
+                accepted.clone(),
+                GraphName::NamedNode(decisions_graph.clone()),
+            ));
+            push_quad(Quad::new(
+                d.clone(),
+                receipt_pred.clone(),
+                dec_op.clone(),
+                GraphName::NamedNode(decisions_graph.clone()),
+            ));
+            push_quad(Quad::new(
+                d.clone(),
+                prot_pred.clone(),
+                string(&decisions_nonce.to_string()),
+                GraphName::NamedNode(decisions_graph.clone()),
+            ));
+        }
+        t.commit().unwrap();
+    }
+
+    s.compact().unwrap();
+    let snap = s.snapshot();
+    let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+
+    // Confirm the compacted Perm::Pos base genuinely spans 5+ blocks for each global prefix.
+    let rdf_type_id = prep.lookup_iri(&snap, RDF_TYPE).unwrap().unwrap();
+    let proposal_cls_id = prep
+        .lookup_iri(&snap, &format!("{EV}IdentityProposal"))
+        .unwrap()
+        .unwrap();
+    let disp_pred_id = prep
+        .lookup_iri(&snap, &format!("{EV}disposition"))
+        .unwrap()
+        .unwrap();
+    let accepted_id = prep
+        .lookup_iri(&snap, &format!("{EV}Accepted"))
+        .unwrap()
+        .unwrap();
+    let (p_lo, p_hi) = snap
+        .perm(Perm::Pos)
+        .block_range(&[rdf_type_id.0, proposal_cls_id.0]);
+    let (a_lo, a_hi) = snap
+        .perm(Perm::Pos)
+        .block_range(&[disp_pred_id.0, accepted_id.0]);
+    assert!(
+        p_hi - p_lo >= 5 && a_hi - a_lo >= 5,
+        "expected >= 5 compacted blocks per global prefix, got proposals={} accepted={}",
+        p_hi - p_lo,
+        a_hi - a_lo
+    );
+
+    // Case A: Small added_nonce (3 rows) scans `protected` directly without counting
+    // the multi-block global proposal/accepted/policy ranges.
+    let mut reads = Reads::new(&prep, &snap);
+    let (found, stats) = reads
+        .has_live_accepted_in_graphs_counted(
+            &[(added_graph.clone(), Some(added_nonce))],
+            &(decisions_graph.clone(), Some(decisions_nonce)),
+            &policy,
+        )
+        .unwrap();
+    assert!(!found);
+    assert_eq!(stats.count_calls, 1);
+    assert!(stats.metadata_reads <= 4, "stats={stats:?}");
+    assert!(stats.edge_decodes <= 2, "stats={stats:?}");
+    assert!(stats.outer_rows <= 8, "stats={stats:?}");
+
+    // Case B: Large added_nonce (80 rows > SMALL_PROTECTED_LIMIT) triggers all 4 counts,
+    // sums interior blocks in O(1) without walking the 10+ compacted blocks, and chooses
+    // the 2-row `policy` prefix.
+    let mut reads_large = Reads::new(&prep, &snap);
+    let (found_large, stats_large) = reads_large
+        .has_live_accepted_in_graphs_counted(
+            &[(large_added_graph.clone(), Some(large_nonce))],
+            &(decisions_graph.clone(), Some(decisions_nonce)),
+            &policy,
+        )
+        .unwrap();
+    assert!(!found_large);
+    assert_eq!(stats_large.count_calls, 4);
+    assert!(
+        stats_large.metadata_reads <= 16,
+        "expected O(1) metadata reads across {}+ compacted blocks, got {stats_large:?}",
+        (p_hi - p_lo) + (a_hi - a_lo)
+    );
+    assert!(stats_large.edge_decodes <= 8, "stats={stats_large:?}");
+    assert!(
+        stats_large.outer_rows <= 4,
+        "expected 2-row policy scan, got {stats_large:?}"
+    );
+
+    // Case C: Preparation cancellation and tight memory budget are enforced during
+    // compacted-base selection and edge decoding.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancelled_prep = Preparation::new(Control::with_cancel(cancel.clone()), 16 << 20).unwrap();
+    cancel.store(true, Ordering::Relaxed);
+    let mut reads_cancelled = Reads::new(&cancelled_prep, &snap);
+    assert!(matches!(
+        reads_cancelled.has_live_accepted_in_graphs_counted(
+            &[(large_added_graph.clone(), Some(large_nonce))],
+            &(decisions_graph.clone(), Some(decisions_nonce)),
+            &policy,
+        ),
+        Err(Error::Cancelled)
+    ));
+
+    // Reopen the store with a fresh cold block cache and run with a 16 KiB budget:
+    // large enough for vocab lookups (~5 KiB), too small for a 2,048-row prepared edge
+    // segment decode (~74 KiB).
+    drop(reads_cancelled);
+    drop(reads_large);
+    drop(reads);
+    drop(snap);
+    drop(s);
+    let s_cold = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let snap_cold = s_cold.snapshot();
+    let tight_prep = Preparation::new(Control::none(), 16 << 10).unwrap();
+    let mut reads_tight = Reads::new(&tight_prep, &snap_cold);
+    assert!(matches!(
+        reads_tight.has_live_accepted_in_graphs_counted(
+            &[(large_added_graph, Some(large_nonce))],
+            &(decisions_graph.clone(), Some(decisions_nonce)),
+            &policy,
+        ),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+    ));
+
+    // Positive detection on the compacted store when `cur_p1` is accepted.
+    {
+        let mut t = s_cold.write();
+        let mut labels = std::collections::HashMap::new();
+        let d_added = iri("urn:decision:added-compacted-1");
+        for q in [
+            Quad::new(
+                d_added.clone(),
+                rdf_type,
+                decision_cls,
+                GraphName::NamedNode(decisions_graph.clone()),
+            ),
+            Quad::new(
+                d_added.clone(),
+                policy_pred,
+                policy.clone(),
+                GraphName::NamedNode(decisions_graph.clone()),
+            ),
+            Quad::new(
+                d_added.clone(),
+                target_pred,
+                cur_p1,
+                GraphName::NamedNode(decisions_graph.clone()),
+            ),
+            Quad::new(
+                d_added.clone(),
+                disp_pred,
+                accepted,
+                GraphName::NamedNode(decisions_graph.clone()),
+            ),
+            Quad::new(
+                d_added.clone(),
+                receipt_pred,
+                dec_op,
+                GraphName::NamedNode(decisions_graph.clone()),
+            ),
+            Quad::new(
+                d_added,
+                prot_pred,
+                string(&decisions_nonce.to_string()),
+                GraphName::NamedNode(decisions_graph.clone()),
+            ),
+        ] {
+            let ids = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(ids).unwrap();
+        }
+        t.commit().unwrap();
+    }
+    s_cold.compact().unwrap();
+    let snap_after = s_cold.snapshot();
+    let mut reads_after = Reads::new(&prep, &snap_after);
+    let (found_after, stats_after) = reads_after
+        .has_live_accepted_in_graphs_counted(
+            &[(added_graph, Some(added_nonce))],
+            &(decisions_graph, Some(decisions_nonce)),
+            &policy,
+        )
+        .unwrap();
+    assert!(found_after);
+    assert_eq!(stats_after.count_calls, 1);
+    assert!(stats_after.metadata_reads <= 4, "stats={stats_after:?}");
+    assert!(stats_after.edge_decodes <= 2, "stats={stats_after:?}");
+    assert!(stats_after.outer_rows <= 8, "stats={stats_after:?}");
+}

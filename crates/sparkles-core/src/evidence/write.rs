@@ -60,7 +60,7 @@ use crate::{Error, Result};
 use base64::Engine as _;
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use sha1::{Digest as _, Sha1};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -1267,6 +1267,37 @@ const CACHE_START: u64 = 1024;
 /// coexist while the identities move into the set. The charge rounds up.
 const IDENTITY_START: u64 = 512;
 
+/// The result of [`Reads::graph_quads_diff_up_to`].
+pub struct GraphQuadsDiff {
+    /// Non-matching quads `([s, p, o, g], Triple)` not present in `keep`.
+    pub removed: Vec<([Id; 4], Triple)>,
+    /// Subset of `keep` that is already present in the graph.
+    pub present: HashSet<[Id; 3]>,
+    /// Whether the graph holds more than `limit` quads.
+    pub more: bool,
+}
+
+/// Instrumentation returned by [`Reads::has_live_accepted_in_graphs_counted`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BoundaryScanStats {
+    pub outer_rows: usize,
+    pub count_calls: usize,
+    pub metadata_reads: usize,
+    pub edge_decodes: usize,
+}
+
+impl BoundaryScanStats {
+    fn record_count(&mut self, work: crate::index::PreparedCountWork) {
+        self.count_calls += work.count_calls;
+        self.metadata_reads += work.metadata_reads;
+        self.edge_decodes += work.edge_decodes;
+    }
+}
+
+/// Added graphs with at most this many rows under their current protection nonces are
+/// scanned directly without counting or touching global proposal/decision prefixes.
+const SMALL_PROTECTED_LIMIT: u64 = 64;
+
 impl<'a> Reads<'a> {
     /// The preparation the reads are charged to.
     pub fn preparation(&self) -> &'a Preparation {
@@ -1809,6 +1840,496 @@ impl<'a> Reads<'a> {
             Ok(false)
         })?;
         Ok(found)
+    }
+
+    /// Look up the stored term ID of `iri` in this snapshot, caching the result under the
+    /// reader's preparation.
+    pub fn iri_id(&mut self, iri: &str) -> Result<Option<Id>> {
+        self.id(iri)
+    }
+
+    /// Whether any protected identity graph in `graphs` holds an authenticated
+    /// `ev:IdentityProposal` with a current authenticated `ev:Accepted` decision under
+    /// `policy` in `decisions`.
+    ///
+    /// Uses `Preparation`-controlled `Perm::Pos` prefix counts (O(log B) block search,
+    /// O(1) interior block sum, at most two prepared edge decodes) to pick the smallest
+    /// selective candidate set without walking unrelated quads in the added graphs or
+    /// populating per-proposal / per-graph entries in `Reads.ids`. When the added graphs
+    /// carry at most `SMALL_PROTECTED_LIMIT` rows under their current protection nonces,
+    /// those rows are scanned directly without touching global proposal/decision ranges.
+    pub fn has_live_accepted_in_graphs(
+        &mut self,
+        graphs: &[ProtectedGraph],
+        decisions: &ProtectedGraph,
+        policy: &NamedNode,
+    ) -> Result<bool> {
+        let (found, _) = self.has_live_accepted_in_graphs_counted(graphs, decisions, policy)?;
+        Ok(found)
+    }
+
+    pub(crate) fn has_live_accepted_in_graphs_counted(
+        &mut self,
+        graphs: &[ProtectedGraph],
+        decisions: &ProtectedGraph,
+        policy: &NamedNode,
+    ) -> Result<(bool, BoundaryScanStats)> {
+        let mut stats = BoundaryScanStats::default();
+        let Some(decisions_nonce) = decisions.1 else {
+            return Ok((false, stats));
+        };
+        let Some(decisions_g) = self.id(decisions.0.as_str())? else {
+            return Ok((false, stats));
+        };
+        let (
+            Some(rdf_type),
+            Some(identity_proposal),
+            Some(review_decision),
+            Some(review_policy),
+            Some(policy_id),
+            Some(target_pred),
+            Some(disposition_pred),
+            Some(accepted_obj),
+            Some(receipt_pred),
+            Some(protection_pred),
+            Some(operation_class),
+            Some(decisions_nonce_id),
+        ) = (
+            self.id(RDF_TYPE)?,
+            self.id(&format!("{EV}IdentityProposal"))?,
+            self.id(&format!("{EV}ReviewDecision"))?,
+            self.id(&format!("{EV}reviewPolicy"))?,
+            self.id(policy.as_str())?,
+            self.id(&format!("{EV}target"))?,
+            self.id(&format!("{EV}disposition"))?,
+            self.id(&format!("{EV}Accepted"))?,
+            self.id(&format!("{EV}availabilityReceipt"))?,
+            self.id(&format!("{EV}graphProtection"))?,
+            self.id(&format!("{EV}Operation"))?,
+            self.preparation
+                .lookup_term(self.snap, &string(&decisions_nonce.to_string()))?,
+        )
+        else {
+            return Ok((false, stats));
+        };
+        let supersedes_pred = self.id(&format!("{EV}supersedes"))?;
+        let prep = self.preparation;
+        let snap = self.snap;
+        let mut active: Vec<(Id, Id)> = Vec::new();
+        for (g, nonce) in graphs {
+            prep.check()?;
+            let Some(nonce) = nonce else {
+                continue;
+            };
+            let (Some(g_id), Some(g_nonce_id)) = (
+                prep.lookup_iri(snap, g.as_str())?,
+                prep.lookup_term(snap, &string(&nonce.to_string()))?,
+            ) else {
+                continue;
+            };
+            active.push((g_id, g_nonce_id));
+        }
+        active.sort_unstable();
+        active.dedup();
+        let mut keep = 0usize;
+        let mut c_protected = 0u64;
+        for i in 0..active.len() {
+            prep.check()?;
+            let (g_id, g_nonce_id) = active[i];
+            let (n, work) =
+                snap.count_prepared_with_work(Perm::Pos, &[protection_pred.0, g_nonce_id.0], prep)?;
+            stats.record_count(work);
+            if n > 0 {
+                c_protected = c_protected.saturating_add(n);
+                active[keep] = (g_id, g_nonce_id);
+                keep += 1;
+            }
+        }
+        active.truncate(keep);
+        if active.is_empty() {
+            return Ok((false, stats));
+        }
+        #[derive(Clone, Copy)]
+        enum CandidatePlan {
+            Protected,
+            Proposals,
+            Accepted,
+            Policy,
+        }
+        let plan = if c_protected <= SMALL_PROTECTED_LIMIT {
+            CandidatePlan::Protected
+        } else {
+            let (c_proposals, work) =
+                snap.count_prepared_with_work(Perm::Pos, &[rdf_type.0, identity_proposal.0], prep)?;
+            stats.record_count(work);
+            if c_proposals == 0 {
+                return Ok((false, stats));
+            }
+            let (c_accepted, work) = snap.count_prepared_with_work(
+                Perm::Pos,
+                &[disposition_pred.0, accepted_obj.0],
+                prep,
+            )?;
+            stats.record_count(work);
+            if c_accepted == 0 {
+                return Ok((false, stats));
+            }
+            let (c_policy, work) =
+                snap.count_prepared_with_work(Perm::Pos, &[review_policy.0, policy_id.0], prep)?;
+            stats.record_count(work);
+            if c_policy == 0 {
+                return Ok((false, stats));
+            }
+            let min_count = c_protected.min(c_proposals).min(c_accepted).min(c_policy);
+            if c_protected == min_count {
+                CandidatePlan::Protected
+            } else if c_proposals == min_count {
+                CandidatePlan::Proposals
+            } else if c_accepted == min_count {
+                CandidatePlan::Accepted
+            } else {
+                CandidatePlan::Policy
+            }
+        };
+        let one_id = |g_id: Id, s_id: Id, p_id: Id| -> Result<Option<Id>> {
+            let mut found = None;
+            let mut count = 0u8;
+            prep.scan(snap, Perm::Gspo, &[g_id.0, s_id.0, p_id.0], |q| {
+                count += 1;
+                if count == 1 {
+                    found = Some(q[2]);
+                    Ok(true)
+                } else {
+                    found = None;
+                    Ok(false)
+                }
+            })?;
+            Ok(found)
+        };
+        let is_named = |id: Id| -> Result<bool> {
+            prep.with_term(snap, id, |t| Ok(matches!(t, Some(Term::NamedNode(_)))))
+        };
+        let id_authenticated = |s_id: Id, g_id: Id, nonce_id: Id| -> Result<bool> {
+            let Some(op_id) = one_id(g_id, s_id, receipt_pred)? else {
+                return Ok(false);
+            };
+            if !snap.contains_prepared(&[op_id, rdf_type, operation_class, g_id], prep)? {
+                return Ok(false);
+            }
+            if one_id(g_id, op_id, protection_pred)? != Some(nonce_id)
+                || one_id(g_id, s_id, protection_pred)? != Some(nonce_id)
+            {
+                return Ok(false);
+            }
+            is_named(op_id)
+        };
+        let is_superseded = |d_id: Id| -> Result<bool> {
+            let Some(sup_pred) = supersedes_pred else {
+                return Ok(false);
+            };
+            let mut superseded = false;
+            prep.scan(snap, Perm::Pos, &[sup_pred.0, d_id.0], |q| {
+                if q[3] != decisions_g {
+                    return Ok(true);
+                }
+                let later = q[0];
+                if snap.contains_prepared(&[later, rdf_type, review_decision, decisions_g], prep)?
+                    && id_authenticated(later, decisions_g, decisions_nonce_id)?
+                    && is_named(later)?
+                {
+                    superseded = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            Ok(superseded)
+        };
+        let proposal_has_live_accepted = |p_id: Id, g_id: Id, g_nonce_id: Id| -> Result<bool> {
+            let mut p_live = false;
+            prep.scan(snap, Perm::Pos, &[target_pred.0, p_id.0], |dq| {
+                if dq[3] != decisions_g {
+                    return Ok(true);
+                }
+                let d_id = dq[0];
+                if !snap.contains_prepared(&[d_id, rdf_type, review_decision, decisions_g], prep)?
+                    || !snap
+                        .contains_prepared(&[d_id, review_policy, policy_id, decisions_g], prep)?
+                    || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
+                {
+                    return Ok(true);
+                }
+                if !id_authenticated(d_id, decisions_g, decisions_nonce_id)?
+                    || !is_named(d_id)?
+                    || is_superseded(d_id)?
+                {
+                    return Ok(true);
+                }
+                if id_authenticated(p_id, g_id, g_nonce_id)? && is_named(p_id)? {
+                    p_live = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            Ok(p_live)
+        };
+        let decision_targets_added_proposal = |d_id: Id| -> Result<bool> {
+            if !snap.contains_prepared(&[d_id, rdf_type, review_decision, decisions_g], prep)?
+                || !snap.contains_prepared(&[d_id, review_policy, policy_id, decisions_g], prep)?
+                || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
+            {
+                return Ok(false);
+            }
+            let mut targets_added = false;
+            let mut decision_checked = false;
+            let mut decision_ok = false;
+            prep.scan(
+                snap,
+                Perm::Gspo,
+                &[decisions_g.0, d_id.0, target_pred.0],
+                |tq| {
+                    let p_id = tq[2];
+                    prep.scan(
+                        snap,
+                        Perm::Spo,
+                        &[p_id.0, rdf_type.0, identity_proposal.0],
+                        |pq| {
+                            let g_id = pq[3];
+                            let mut idx = active.partition_point(|&(id, _)| id < g_id);
+                            while idx < active.len() && active[idx].0 == g_id {
+                                let g_nonce_id = active[idx].1;
+                                idx += 1;
+                                if !decision_checked {
+                                    decision_checked = true;
+                                    decision_ok =
+                                        id_authenticated(d_id, decisions_g, decisions_nonce_id)?
+                                            && is_named(d_id)?
+                                            && !is_superseded(d_id)?;
+                                }
+                                if !decision_ok {
+                                    return Ok(false);
+                                }
+                                if id_authenticated(p_id, g_id, g_nonce_id)? && is_named(p_id)? {
+                                    targets_added = true;
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        },
+                    )?;
+                    Ok(!targets_added && (!decision_checked || decision_ok))
+                },
+            )?;
+            Ok(targets_added)
+        };
+        let mut found_live = false;
+        match plan {
+            CandidatePlan::Protected => {
+                for &(g_id, g_nonce_id) in &active {
+                    prep.check()?;
+                    prep.scan(snap, Perm::Pos, &[protection_pred.0, g_nonce_id.0], |q| {
+                        stats.outer_rows += 1;
+                        if q[3] != g_id {
+                            return Ok(true);
+                        }
+                        let p_id = q[0];
+                        if !snap
+                            .contains_prepared(&[p_id, rdf_type, identity_proposal, g_id], prep)?
+                        {
+                            return Ok(true);
+                        }
+                        if proposal_has_live_accepted(p_id, g_id, g_nonce_id)? {
+                            found_live = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    })?;
+                    if found_live {
+                        return Ok((true, stats));
+                    }
+                }
+            }
+            CandidatePlan::Proposals => {
+                prep.scan(snap, Perm::Pos, &[rdf_type.0, identity_proposal.0], |q| {
+                    stats.outer_rows += 1;
+                    let g_id = q[3];
+                    let mut idx = active.partition_point(|&(id, _)| id < g_id);
+                    while idx < active.len() && active[idx].0 == g_id {
+                        let g_nonce_id = active[idx].1;
+                        idx += 1;
+                        if proposal_has_live_accepted(q[0], g_id, g_nonce_id)? {
+                            found_live = true;
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                })?;
+            }
+            CandidatePlan::Accepted => {
+                prep.scan(
+                    snap,
+                    Perm::Pos,
+                    &[disposition_pred.0, accepted_obj.0],
+                    |q| {
+                        stats.outer_rows += 1;
+                        if q[3] != decisions_g {
+                            return Ok(true);
+                        }
+                        if decision_targets_added_proposal(q[0])? {
+                            found_live = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    },
+                )?;
+            }
+            CandidatePlan::Policy => {
+                prep.scan(snap, Perm::Pos, &[review_policy.0, policy_id.0], |q| {
+                    stats.outer_rows += 1;
+                    if q[3] != decisions_g {
+                        return Ok(true);
+                    }
+                    if decision_targets_added_proposal(q[0])? {
+                        found_live = true;
+                        return Ok(false);
+                    }
+                    Ok(true)
+                })?;
+            }
+        }
+        Ok((found_live, stats))
+    }
+
+    /// Scan all quads in `g`, up to `limit`, returning:
+    /// - the non-matching quads `([s, p, o, g], Triple)` whose `[s, p, o]` is not in `keep`,
+    /// - the subset of `keep` that is present in `g`, and
+    /// - whether `g` holds more than `limit` quads.
+    ///
+    /// Raw rows are charged to the preparation while the scan runs. Retained entries in
+    /// `present` and each decoded removal (its vector slot and every cloned term) are
+    /// charged to `held` before allocation so the caller keeps them charged for as long
+    /// as it keeps `held`.
+    pub fn graph_quads_diff_up_to(
+        &mut self,
+        g: &str,
+        keep: &HashSet<[Id; 3]>,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<GraphQuadsDiff> {
+        let Some(g_id) = self.id(g)? else {
+            return Ok(GraphQuadsDiff {
+                removed: Vec::new(),
+                present: HashSet::new(),
+                more: false,
+            });
+        };
+        const ROW: u64 = std::mem::size_of::<[Id; 3]>() as u64;
+        const PRESENT_ENTRY: u64 = (std::mem::size_of::<[Id; 3]>() as u64 + 8) * 2;
+        const OUT_ENTRY: u64 = std::mem::size_of::<([Id; 4], Triple)>() as u64;
+        const CHUNK: usize = 4096;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut remove_rows: Vec<[Id; 3]> = Vec::new();
+        let mut present: HashSet<[Id; 3]> = HashSet::new();
+        let mut scanned = 0usize;
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g_id.0], |q| {
+                if scanned == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                scanned += 1;
+                let row = [q[0], q[1], q[2]];
+                if keep.contains(&row) {
+                    if present.len() == present.capacity() {
+                        let grow = present.capacity().clamp(16, CHUNK);
+                        held.grow_by(grow as u64 * PRESENT_ENTRY)?;
+                        present.reserve(grow);
+                    }
+                    present.insert(row);
+                } else {
+                    if remove_rows.len() == remove_rows.capacity() {
+                        let grow = remove_rows.capacity().clamp(16, CHUNK);
+                        rows_held.grow_by(grow as u64 * ROW)?;
+                        remove_rows.reserve_exact(grow);
+                    }
+                    remove_rows.push(row);
+                }
+                Ok(true)
+            })?;
+        fn term_bytes(t: &Term) -> u64 {
+            match t {
+                Term::NamedNode(n) => n.as_str().len() as u64,
+                Term::BlankNode(b) => b.as_str().len() as u64,
+                Term::Literal(l) => {
+                    l.value().len() as u64
+                        + l.datatype().as_str().len() as u64
+                        + l.language().map_or(0, |lang| lang.len() as u64)
+                }
+                Term::Triple(t) => {
+                    let s = match &t.subject {
+                        NamedOrBlankNode::NamedNode(n) => n.as_str().len() as u64,
+                        NamedOrBlankNode::BlankNode(b) => b.as_str().len() as u64,
+                    };
+                    std::mem::size_of::<Triple>() as u64
+                        + s
+                        + t.predicate.as_str().len() as u64
+                        + term_bytes(&t.object)
+                }
+            }
+        }
+        let mut out: Vec<([Id; 4], Triple)> = Vec::new();
+        for [s, p, o] in remove_rows {
+            if out.len() == out.capacity() {
+                let grow = if out.is_empty() {
+                    1
+                } else {
+                    out.capacity().min(256)
+                };
+                held.grow_by(grow as u64 * OUT_ENTRY)?;
+                out.reserve_exact(grow);
+            }
+            let Some(subject) = self.preparation.with_term(self.snap, s, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by(n.as_str().len() as u64)?;
+                    Ok(Some(NamedOrBlankNode::NamedNode(n.clone())))
+                }
+                Some(Term::BlankNode(b)) => {
+                    held.grow_by(b.as_str().len() as u64)?;
+                    Ok(Some(NamedOrBlankNode::BlankNode(b.clone())))
+                }
+                _ => Ok(None),
+            })?
+            else {
+                continue;
+            };
+            let Some(predicate) = self.preparation.with_term(self.snap, p, |t| match t {
+                Some(Term::NamedNode(n)) => {
+                    held.grow_by(n.as_str().len() as u64)?;
+                    Ok(Some(n.clone()))
+                }
+                _ => Ok(None),
+            })?
+            else {
+                continue;
+            };
+            let Some(object) = self.preparation.with_term(self.snap, o, |t| match t {
+                Some(t) => {
+                    held.grow_by(term_bytes(t))?;
+                    Ok(Some(t.clone()))
+                }
+                None => Ok(None),
+            })?
+            else {
+                continue;
+            };
+            out.push(([s, p, o, g_id], Triple::new(subject, predicate, object)));
+        }
+        drop(rows_held);
+        Ok(GraphQuadsDiff {
+            removed: out,
+            present,
+            more,
+        })
     }
 
     /// Whether the quad `s p o g` is in the snapshot. `o` is a ground term.

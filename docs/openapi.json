@@ -8511,6 +8511,281 @@
         ],
         "type": "object"
       },
+      "EvidenceIdentitiesRebuild": {
+        "additionalProperties": false,
+        "description": "Administered rebuild of a matching policy's resolution map in its current boundary.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "properties": {
+          "dryRun": {
+            "description": "Check and preview the rebuild without committing it.",
+            "type": "boolean"
+          },
+          "idempotencyKey": {
+            "description": "Makes a retry with the same payload answer the first receipt.",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ifHead": {
+            "description": "Publish only while this commit is the branch head, else `409 head-changed`.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "description": "The commit message.",
+            "type": "string"
+          },
+          "policy": {
+            "description": "The name of a matching policy of the evidence settings.",
+            "type": "string"
+          },
+          "policyVersion": {
+            "description": "Optional expected policy version, else `409 policy-changed`.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "policy"
+        ],
+        "type": "object"
+      },
+      "EvidenceIdentitiesRebuildResult": {
+        "additionalProperties": false,
+        "description": "The outcome of rebuilding a matching policy's resolution map.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "properties": {
+          "boundary": {
+            "description": "The protected identity graphs of the policy's boundary recorded on the revision, sorted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "branchId": {
+            "description": "The branch the commit published on.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "changed": {
+            "additionalProperties": false,
+            "description": "The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "properties": {
+              "inserted": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "map": {
+                "additionalProperties": false,
+                "description": "A review under a matching policy that changed which accepted decisions its resolution map follows.",
+                "properties": {
+                  "decisionsAdded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "decisionsEnded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "entities": {
+                    "description": "The entities whose selected entity changed.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "number": {
+                    "type": "integer"
+                  },
+                  "policy": {
+                    "description": "The matching policy.",
+                    "type": "string"
+                  },
+                  "previous": {
+                    "description": "The revision it follows, whose consumers may need review.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "revision": {
+                    "description": "The resolution map revision the operation published.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "policy",
+                  "revision",
+                  "number",
+                  "previous",
+                  "decisionsAdded",
+                  "decisionsEnded",
+                  "entities"
+                ],
+                "type": "object"
+              },
+              "removed": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "supportsAdded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "supportsEnded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "supportsAdded",
+              "supportsEnded",
+              "inserted",
+              "removed"
+            ],
+            "type": "object"
+          },
+          "commit": {
+            "description": "The publishing commit, the first one for a replay, or the head for a dry run.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "Whether this request published a commit.",
+            "type": "boolean"
+          },
+          "dryRun": {
+            "additionalProperties": false,
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "inserted": {
+                "type": "integer"
+              },
+              "wouldCommit": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wouldCommit",
+              "inserted",
+              "deleted",
+              "error"
+            ],
+            "type": "object"
+          },
+          "number": {
+            "description": "The revision number, from 1.",
+            "type": "integer"
+          },
+          "operation": {
+            "description": "The operation, the rebuilt revision's availability receipt.",
+            "type": "string"
+          },
+          "policy": {
+            "description": "The matching policy.",
+            "type": "string"
+          },
+          "policyVersion": {
+            "description": "The matching policy version recorded on the revision.",
+            "type": "integer"
+          },
+          "previous": {
+            "description": "The previous authenticated revision it follows, or `null` when none existed or earlier revisions no longer authenticate.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "replayed": {
+            "description": "Whether the idempotency key had published the same payload, whose receipt this is.",
+            "type": "boolean"
+          },
+          "revision": {
+            "description": "The resolution map revision published by the rebuild, also for a replay.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "committed",
+          "replayed",
+          "commit",
+          "branchId",
+          "policy",
+          "policyVersion",
+          "revision",
+          "number",
+          "previous",
+          "boundary",
+          "changed"
+        ],
+        "type": "object"
+      },
       "EvidenceIdentitiesResult": {
         "additionalProperties": false,
         "description": "What the current resolution map selects for each entity.",
@@ -35738,6 +36013,93 @@
           }
         ],
         "summary": "Release an evidence hold",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/identities/rebuild": {
+      "post": {
+        "description": "Needs unrestricted `admin` on the dataset or branch. Recomputes the clusters of the matching policy's current authenticated accepted decisions in its current protected identity-graph boundary, rewrites its output graph atomically and records the new protections and boundary in a fresh `ev:ResolutionMap` revision, restoring reviews and reads that answered `503 projection-unavailable`. Refusals write nothing: `400` for a malformed request or unknown matching policy, `403` for a read-only server or missing unrestricted admin grant, `409 policy-changed`, `409 head-changed`, `409 identity-conflict`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile`, `409 evidence-settings-drift`, `422 incomplete-evidence` and `503 authority-changed`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "operationId": "rebuildIdentityMap",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceIdentitiesRebuild"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceIdentitiesRebuildResult"
+                }
+              }
+            },
+            "description": "The rebuilt resolution map revision and what changed."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Rebuild a resolution map",
         "tags": [
           "Datasets"
         ],

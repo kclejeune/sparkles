@@ -4245,6 +4245,25 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(
+            POST,
+            "/$/evidence/{ds}/identities/rebuild",
+            "rebuildIdentityMap",
+            "Datasets",
+            "Rebuild a resolution map",
+        )
+        .doc("Needs unrestricted `admin` on the dataset or branch. Recomputes the clusters of the matching policy's current authenticated accepted decisions in its current protected identity-graph boundary, rewrites its output graph atomically and records the new protections and boundary in a fresh `ev:ResolutionMap` revision, restoring reviews and reads that answered `503 projection-unavailable`. Refusals write nothing: `400` for a malformed request or unknown matching policy, `403` for a read-only server or missing unrestricted admin grant, `409 policy-changed`, `409 head-changed`, `409 identity-conflict`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile`, `409 evidence-settings-drift`, `422 incomplete-evidence` and `503 authority-changed`.")
+        .see("evidence-identities")
+        .param("branch")
+        .json_body(true, "EvidenceIdentitiesRebuild")
+        .json(
+            "200",
+            "The rebuilt resolution map revision and what changed.",
+            "EvidenceIdentitiesRebuildResult",
+        )
+        .errors(&[400, 403, 404, 409, 422, 503]),
+    );
+    p.add(
+        op(
             GET,
             "/$/evidence/{ds}/holds",
             "listEvidenceHolds",

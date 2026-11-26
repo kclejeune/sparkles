@@ -879,20 +879,27 @@ struct Commit {
     preview: Option<Box<crate::preview::Preview>>,
 }
 
-/// Publish `batch` and the output changes as one commit of the evidence owner, from
-/// the head `expected` that the operation read.
+/// Publish `batch`, `raw_deletes` (physical quad IDs from the snapshot at `expected` in
+/// `expected_generation`) and `changes` as one commit of the evidence owner, from the
+/// head `expected` that the operation read.
 #[allow(clippy::too_many_arguments)]
 fn publish(
     main: &Dataset,
     logical: &Dataset,
     capability: ManagedWrite,
     expected: u64,
+    expected_generation: Option<u64>,
     batch: &Batch,
     skip: &[bool],
+    raw_deletes: &[[sparkles_core::id::Id; 4]],
     changes: &[(Quad, bool)],
     options: &Options,
     control: &Control,
 ) -> Result<Commit> {
+    debug_assert!(
+        raw_deletes.is_empty() || expected_generation.is_some(),
+        "physical raw_deletes require fencing expected_generation"
+    );
     let store = logical.store();
     let (release, before_publish) = publish_hook(options.authority.clone(), || Ok(None));
     let opts = crate::guard::WriteOptions {
@@ -917,6 +924,18 @@ fn publish(
             ),
         ));
     }
+    // Physical-ID deletions belong to `expected_generation`; a compaction at the same
+    // commit switches generations and renumbers vocabulary IDs.
+    if let Some(expected_gen) = expected_generation
+        && t.base().generation.uid != expected_gen
+    {
+        return Err(managed(
+            ManagedErrorKind::HeadChanged,
+            format!(
+                "the store generation changed at commit {expected} while the operation read it; retry"
+            ),
+        ));
+    }
     let head = t.base().commit;
     let (seq, time_ms) = t.managed_stamp()?;
     let quads = {
@@ -936,6 +955,11 @@ fn publish(
     for q in &quads {
         let ids = t.encode_quad(q, &mut labels)?;
         t.insert(ids)?;
+    }
+    // Physical-ID deletions target exact stored quads from `expected` without re-interning,
+    // so blank nodes, triple terms and composite literals containing blank nodes are removed.
+    for ids in raw_deletes {
+        t.delete(*ids)?;
     }
     for (q, insert) in changes {
         let ids = t.encode_quad(q, &mut labels)?;
@@ -1572,7 +1596,17 @@ pub fn review(
     check_identities(&mut state, &batch, &records, &skip)?;
     drop(state);
     let committed = publish(
-        main, logical, capability, if_head, &batch, &skip, &changes, options, control,
+        main,
+        logical,
+        capability,
+        if_head,
+        None,
+        &batch,
+        &skip,
+        &[],
+        &changes,
+        options,
+        control,
     )?;
     drop(held);
     Ok(Reviewed {
@@ -1980,8 +2014,10 @@ pub fn withdraw(
         logical,
         capability,
         head.commit,
+        None,
         &batch,
         &skip,
+        &[],
         &changes,
         options,
         control,

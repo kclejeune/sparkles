@@ -1488,3 +1488,381 @@ fn memory_source_rename_refuses(point: &'static str, expected_holds: usize) {
         expected_holds
     );
 }
+
+/// `POST /$/evidence/{ds}/identities/rebuild` (item 643): rebuilds a matching policy's
+/// resolution map after a boundary removal or detach-and-reprotect, supports dry-run,
+/// idempotency replay, branches and restart durability, and restores reviews and reads.
+#[tokio::test]
+async fn identity_map_rebuild_over_http_restores_reviews_reads_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_json = |boundary: &[&str]| {
+        json!({
+            "format": 1, "profile": 1, "enabled": true,
+            "sourceRecords": ["urn:ev:sources"], "proposals": ["urn:ev:claims"],
+            "decisions": ["urn:ev:decisions"],
+            "identity": ["urn:ev:identity", "urn:ev:identity2", "urn:ev:maps"],
+            "projections": ["urn:ev:map"],
+            "matchingPolicies": {"people": {
+                "version": 1,
+                "boundary": boundary,
+                "decisions": "urn:ev:decisions",
+                "maps": "urn:ev:maps",
+                "output": "urn:ev:map"
+            }}
+        })
+    };
+    let rev3_iri;
+    {
+        let state = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        state.attach("d", DbType::Persistent, None).unwrap();
+        let app = router(state.clone());
+        let ds = state.get("d").unwrap();
+        let post = |path: &str, body: J| {
+            let app = app.clone();
+            let path = path.to_string();
+            async move {
+                call(
+                    &app,
+                    "POST",
+                    &path,
+                    Some("application/json"),
+                    &body.to_string(),
+                )
+                .await
+            }
+        };
+        let (status, j) = call(
+            &app,
+            "PUT",
+            "/$/evidence/d/settings",
+            Some("application/json"),
+            &settings_json(&["urn:ev:identity", "urn:ev:identity2", "urn:ev:claims"]).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+
+        let propose = |graph: &str, occurrence: &str, entities: J| {
+            json!({
+                "identityGraph": graph,
+                "identities": [{
+                    "key": "p", "occurrenceKey": occurrence, "entities": entities,
+                    "relation": "possibleMatch", "author": "urn:matcher",
+                    "method": {"method": "urn:method:names", "version": "1"}
+                }]
+            })
+        };
+        let (s, p1) = post(
+            "/d/claims",
+            propose("urn:ev:identity2", "ab", json!(["urn:a", "urn:b"])),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{p1}");
+        let ab = p1["records"][0].clone();
+        let (s, p2) = post(
+            "/d/claims",
+            propose("urn:ev:identity", "cd", json!(["urn:c", "urn:d"])),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{p2}");
+        let cd = p2["records"][0].clone();
+
+        let review_body = |target: &J| {
+            json!({
+                "policy": "people", "policyVersion": 1, "ifHead": ds.store.head_commit().seq,
+                "decisions": [{
+                    "key": "x", "target": target["iri"], "targetDigest": target["recordDigest"],
+                    "disposition": "accepted"
+                }]
+            })
+        };
+        let (s, r1) = post("/d/claims/review", review_body(&ab)).await;
+        assert_eq!(s, StatusCode::OK, "{r1}");
+        let dab = r1["decisions"][0]["iri"].clone();
+        let (s, r2) = post("/d/claims/review", review_body(&cd)).await;
+        assert_eq!(s, StatusCode::OK, "{r2}");
+        let rev2 = r2["mapRevision"].clone();
+
+        // Create branch `dev` before the boundary change.
+        let (s, b) = call(
+            &app,
+            "POST",
+            "/$/branches/d",
+            Some("application/json"),
+            &json!({"name": "dev"}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+
+        // Remove urn:ev:identity2 from the boundary -> projection-unavailable.
+        let (s, j) = call(
+            &app,
+            "PUT",
+            "/$/evidence/d/settings",
+            Some("application/json"),
+            &settings_json(&["urn:ev:identity", "urn:ev:claims"]).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+        let (s, j) = post(
+            "/d/claims/identities",
+            json!({"policy": "people", "entities": ["urn:a", "urn:c"]}),
+        )
+        .await;
+        assert_eq!(
+            (s, j["code"].as_str()),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("projection-unavailable")
+            ),
+            "{j}"
+        );
+
+        // Malformed / invalid preconditions.
+        let (s, _) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "nobody"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "extra": 1}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, j) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "policyVersion": 9}),
+        )
+        .await;
+        assert_eq!(
+            (s, j["code"].as_str()),
+            (StatusCode::CONFLICT, Some("policy-changed")),
+            "{j}"
+        );
+        let (s, j) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "ifHead": 0}),
+        )
+        .await;
+        assert_eq!(
+            (s, j["code"].as_str()),
+            (StatusCode::CONFLICT, Some("head-changed")),
+            "{j}"
+        );
+
+        // Dry run does not commit.
+        let head = ds.store.head_commit().seq;
+        let (s, dry) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "policyVersion": 1, "ifHead": head, "dryRun": true}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{dry}");
+        assert_eq!(dry["committed"], false);
+        assert_eq!(dry["dryRun"]["wouldCommit"], true);
+        assert_eq!(ds.store.head_commit().seq, head);
+
+        // Commit rebuild with idempotency key.
+        let (s, rebuilt) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "policyVersion": 1, "ifHead": head, "idempotencyKey": "rb-1"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{rebuilt}");
+        assert_eq!(rebuilt["committed"], true);
+        assert_eq!(rebuilt["replayed"], false);
+        assert_eq!(rebuilt["number"], 3);
+        assert_eq!(rebuilt["previous"], rev2);
+        assert_eq!(rebuilt["boundary"], json!(["urn:ev:identity"]));
+        assert_eq!(rebuilt["changed"]["map"]["decisionsEnded"], json!([dab]));
+        rev3_iri = rebuilt["revision"].clone();
+
+        // Replay returns first receipt; changed payload conflicts.
+        let (s, replay) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "policyVersion": 1, "ifHead": head, "idempotencyKey": "rb-1"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{replay}");
+        assert_eq!(replay["committed"], false);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["revision"], rev3_iri);
+        assert_eq!(replay["boundary"], json!(["urn:ev:identity"]));
+        let (s, conflict) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "idempotencyKey": "rb-1"}),
+        )
+        .await;
+        assert_eq!(
+            (s, conflict["code"].as_str()),
+            (StatusCode::CONFLICT, Some("idempotency-conflict")),
+            "{conflict}"
+        );
+
+        // Replay of rb-1 (policyVersion: 1) still returns the original receipt after bumping
+        // policy version to 2, while a fresh key with policyVersion: 1 gets policy-changed.
+        let mut bumped = settings_json(&["urn:ev:identity", "urn:ev:claims"]);
+        bumped["matchingPolicies"]["people"]["version"] = json!(2);
+        let (s, j) = call(
+            &app,
+            "PUT",
+            "/$/evidence/d/settings",
+            Some("application/json"),
+            &bumped.to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+        let (s, replay_after_bump) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "policyVersion": 1, "ifHead": head, "idempotencyKey": "rb-1"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{replay_after_bump}");
+        assert_eq!(replay_after_bump["replayed"], true);
+        assert_eq!(replay_after_bump["committed"], false);
+        assert_eq!(replay_after_bump["policyVersion"], 1);
+        assert_eq!(replay_after_bump["revision"], rev3_iri);
+        let (s, stale_v) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "policyVersion": 1, "idempotencyKey": "rb-fresh"}),
+        )
+        .await;
+        assert_eq!(
+            (s, stale_v["code"].as_str()),
+            (StatusCode::CONFLICT, Some("policy-changed")),
+            "{stale_v}"
+        );
+        // Restore version 1 for subsequent steps in this fixture.
+        let (s, j) = call(
+            &app,
+            "PUT",
+            "/$/evidence/d/settings",
+            Some("application/json"),
+            &settings_json(&["urn:ev:identity", "urn:ev:claims"]).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+
+        // Reads and reviews succeed again on main.
+        let (s, read) = post(
+            "/d/claims/identities",
+            json!({"policy": "people", "entities": ["urn:a", "urn:d"]}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{read}");
+        assert_eq!(read["revision"], rev3_iri);
+        assert_eq!(read["entities"][0]["representative"], "urn:a");
+        assert_eq!(read["entities"][1]["representative"], "urn:c");
+
+        // Rebuild also works on a branch (?branch=dev).
+        let (s, dev_rb) = post(
+            "/$/evidence/d/identities/rebuild?branch=dev",
+            json!({"policy": "people"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{dev_rb}");
+        assert_eq!(dev_rb["committed"], true);
+        let (s, dev_read) = post(
+            "/d/claims/identities?branch=dev",
+            json!({"policy": "people", "entities": ["urn:a", "urn:d"]}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{dev_read}");
+        assert_eq!(dev_read["entities"][0]["representative"], "urn:a");
+        assert_eq!(dev_read["entities"][1]["representative"], "urn:c");
+
+        // Detach and re-protect the remaining identity graph -> projection-unavailable -> rebuild -> empty map.
+        let (s, _) = post("/$/evidence/d/detach", json!({"graph": "urn:ev:identity"})).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(
+            &app,
+            "PUT",
+            "/$/evidence/d/settings",
+            Some("application/json"),
+            &settings_json(&["urn:ev:identity", "urn:ev:claims"]).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, j) = post(
+            "/d/claims/identities",
+            json!({"policy": "people", "entities": ["urn:c"]}),
+        )
+        .await;
+        assert_eq!(
+            (s, j["code"].as_str()),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("projection-unavailable")
+            ),
+            "{j}"
+        );
+        let (s, rebuilt2) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{rebuilt2}");
+        assert_eq!(rebuilt2["number"], 4);
+        assert_eq!(rebuilt2["previous"], rev3_iri);
+    }
+
+    // Reopen persistent server state and verify rebuilt map survives restart.
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    if state.get("d").is_none() {
+        state.attach("d", DbType::Persistent, None).unwrap();
+    }
+    let app = router(state.clone());
+    let (s, read) = call(
+        &app,
+        "POST",
+        "/d/claims/identities",
+        Some("application/json"),
+        &json!({"policy": "people", "entities": ["urn:c"]}).to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{read}");
+    assert_eq!(read["number"], 4);
+    assert_eq!(read["entities"][0]["representative"], "urn:c");
+    assert_eq!(read["entities"][0]["members"], json!(["urn:c"]));
+    let (s, p3) = call(
+        &app,
+        "POST",
+        "/d/claims",
+        Some("application/json"),
+        &json!({
+            "identityGraph": "urn:ev:identity",
+            "identities": [{
+                "key": "p", "occurrenceKey": "xy", "entities": ["urn:x", "urn:y"],
+                "relation": "possibleMatch", "author": "urn:matcher",
+                "method": {"method": "urn:method:names", "version": "1"}
+            }]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{p3}");
+    let ds = state.get("d").unwrap();
+    let xy = &p3["records"][0];
+    let (s, r) = call(
+        &app,
+        "POST",
+        "/d/claims/review",
+        Some("application/json"),
+        &json!({
+            "policy": "people", "policyVersion": 1, "ifHead": ds.store.head_commit().seq,
+            "decisions": [{
+                "key": "x", "target": xy["iri"], "targetDigest": xy["recordDigest"],
+                "disposition": "accepted"
+            }]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert_eq!(r["changed"]["map"]["number"], 5);
+}

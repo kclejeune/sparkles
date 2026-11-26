@@ -390,6 +390,84 @@ struct IdentitiesRequest {
     entities: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RebuildIdentitiesRequest {
+    policy: String,
+    policy_version: Option<u32>,
+    if_head: Option<u64>,
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    message: Option<String>,
+}
+
+/// `POST /$/evidence/{ds}/identities/rebuild`: rebuild a matching policy's resolution map
+/// in the current boundary, rewriting the output graph atomically and recording the new
+/// protections and boundary in a fresh map revision. Needs unrestricted `admin` on `{ds}`.
+pub(super) async fn rebuild_identities(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(bytes): AdminBody,
+) -> ApiResult {
+    super::run_http("rebuild-identities", st, name, p, bytes).await
+}
+
+pub(super) fn rebuild_identities_now(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    bytes: axum::body::Bytes,
+    execution: super::Execution,
+) -> ApiResult<J> {
+    let r: RebuildIdentitiesRequest = body_of(&st, &bytes, "resolution map rebuild")?;
+    let branch = execution.branch.clone();
+    let prepared = prepare(
+        &st,
+        &name,
+        &p,
+        &branch,
+        &execution,
+        r.idempotency_key,
+        r.if_head,
+        r.dry_run,
+        r.message,
+    )?;
+    let here = crate::auth::on_branch(&prepared.main.name, &branch);
+    if p.restricted(&here) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!("rebuilding a resolution map needs unrestricted admin access on /{here}"),
+        ));
+    }
+    let rebuilt = sparkles::evidence::rebuild_resolution_map(
+        &prepared.main.dataset,
+        &prepared.logical.dataset,
+        &r.policy,
+        r.policy_version,
+        &prepared.options,
+        &prepared.control,
+    )?;
+    let mut out = json!({
+        "operation": rebuilt.operation.as_str(),
+        "committed": rebuilt.committed,
+        "replayed": rebuilt.replayed,
+        "commit": rebuilt.commit,
+        "branchId": rebuilt.branch,
+        "policy": rebuilt.policy.as_str(),
+        "policyVersion": rebuilt.policy_version,
+        "revision": rebuilt.revision.as_str(),
+        "number": rebuilt.number,
+        "previous": rebuilt.previous.as_ref().map(|p| p.as_str()),
+        "boundary": rebuilt.boundary.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+        "changed": changed_json(&rebuilt.changed),
+    });
+    preview_json(&mut out, rebuilt.preview.as_deref());
+    prepared.fence.check_uncommitted(rebuilt.committed)?;
+    Ok(out)
+}
+
 /// `POST /{ds}/claims/identities`: what the current resolution map of a matching
 /// policy selects for each entity. `200` with the map's revision and, for each entity,
 /// its representative, its cluster's members and the accepted decisions that join it.

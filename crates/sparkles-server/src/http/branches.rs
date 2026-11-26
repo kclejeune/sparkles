@@ -463,10 +463,13 @@ pub(crate) async fn select(
         let algo_run = seg == "algo" && path.ends_with("/run");
         // the memberships route answers `available: false` off main itself
         let memberships = seg == "graphrag" && path.ends_with("/memberships");
+        // rebuilding a resolution map works on any branch
+        let rebuild_identities = seg == "evidence" && path.ends_with("/identities/rebuild");
         if branch != MAIN
             && !clone
             && !algo_run
             && !memberships
+            && !rebuild_identities
             && !ADMIN_BRANCH_ROUTES.contains(&seg)
         {
             return bad_branch(format!("{path} does not take a branch"));
