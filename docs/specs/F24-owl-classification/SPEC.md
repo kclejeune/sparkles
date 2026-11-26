@@ -104,6 +104,21 @@ rules on ontologies with individuals, functional data properties and top propert
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.
 
+Item 694 exposes EL-only (ELK) classification across every user-facing surface and keys
+the dataset's kept classification cache by `el_only`. `POST /$/ontology/{ds}/classify`,
+`GET /$/ontology/{ds}/classification`, `POST /$/ontology/{ds}/dl-query` and
+`sparkles::handles::ontology::wire::call` accept `elOnly`, `sparkles ontology classify`
+(both standalone and chained) accepts `--el-only`, Python's `Dataset.ontology.classify`,
+`kept_classification` and `dl_query` accept `el_only`, Node.js's `dataset.ontology.classify`,
+`keptClassification` and `dlQuery` accept `elOnly`, and JVM's `ClassifyQuery`,
+`KeptClassificationQuery` and `DlQuery` expose `elOnly`. DL queries with `elOnly` run the
+EL classifier in EL-only mode against the dataset's EL-only kept saturation, report
+`reasoning.elOnly`, and refuse `reasoning=rl` or query expressions outside OWL 2 EL.
+`KeptCache` stores default (`el_only = false`) and EL-only (`el_only = true`) entries in
+separate slots so neither mode clobbers or mis-serves the other across classifications,
+incremental updates, kept reads and DL queries, while evicting the other slot if combined
+retained bytes exceed the one-gigabyte retention cap.
+
 Item 867 enables at-least restrictions above one beside individuals in the Horn rules,
 using Kazakov's Lemma 2 unfolding into fresh, pairwise disjoint subclasses of the filler
 up to `MAX_AT_LEAST`. For Horn ontologies with individuals, nominals, at-most-one

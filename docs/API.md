@@ -2243,8 +2243,9 @@ These facts do not establish classifier completeness or provide entailment proof
 
 `GET /$/ontology/{ds}/classification` reads an existing classification without running
 one. It never maps an ontology on a miss, reserves classifier workers, materializes
-inferences or writes. `graph`, `imports`, `mode`, `branch` and `at` select the asserted
-source. Its named-class capabilities are direct parent and child equivalence groups, roots,
+inferences or writes. `graph`, `imports`, `mode`, `branch`, `at` and `elOnly` select the
+asserted source and whether to read the kept default or EL-only classification. Its
+named-class capabilities are direct parent and child equivalence groups, roots,
 equivalent named classes and unsatisfiability. General property and individual entailments,
 classification justifications and inferred axiom listings remain separate work.
 
@@ -2376,20 +2377,24 @@ node 1 holds `owl:Nothing` and the unsatisfiable classes. `format=ofn` answers t
 taxonomy as a functional-style document of `EquivalentClasses` and `SubClassOf` axioms,
 as ELK and ROBOT write one, and it is `400` with `target`. `assertions: true` also
 classifies with the assertions the
-store holds, which can make the ontology inconsistent. `threads` asks for worker
+store holds, which can make the ontology inconsistent. `elOnly: true` in the body or the
+query string classifies by the OWL 2 EL rules alone, reproducing ELK's taxonomy and
+leaving out every axiom outside OWL 2 EL. `threads` asks for worker
 threads, which the algorithm pool admits up to its share for one call. `inferences` is
 `400`, since a classification reads the asserted axioms.
 
 The dataset keeps its last classification for callers who read every graph, without
-assertions. A classification of the same ontology at the same commit answers from it
-with `reused: true`. One at a later commit gives the kept classifier the axioms that
-changed, so that it saturates again only the classes those axioms can reach, and
-`stats.incremental` says so. A change to the property hierarchy, chains, reflexivity or
-ranges, or to an axiom with a data property or datatype, saturates everything again.
-The kept state costs memory for the time the dataset is open, about 115 MB estimated
-and 190 MB resident for GO, and it is dropped after a run whose estimate passes one
-gigabyte. A run is bounded by the request's deadline and memory budget, from indexing
-to the taxonomy, and answers `507` with `budget: "memory"` past the budget.
+assertions, keyed separately for default and EL-only (`elOnly`) runs so neither mode
+clobbers or mis-serves the other. A classification of the same ontology and mode at the
+same commit answers from it with `reused: true`. One at a later commit gives the kept
+classifier the axioms that changed, so that it saturates again only the classes those
+axioms can reach, and `stats.incremental` says so. A change to the property hierarchy,
+chains, reflexivity or ranges, or to an axiom with a data property or datatype, saturates
+everything again. The kept state costs memory for the time the dataset is open, about
+115 MB estimated and 190 MB resident for GO, and it is dropped after a run whose estimate
+passes one gigabyte, evicting the other mode's slot when both together pass that cap. A
+run is bounded by the request's deadline and memory budget, from indexing to the taxonomy,
+and answers `507` with `budget: "memory"` past the budget.
 
 `tier` names the rules that the ontology's axioms need, `el`, `horn` or `disjunctive`.
 `partial: true` in the body or the query string asks a classification run at any tier
@@ -2503,21 +2508,24 @@ class asked about is among its own equivalents.
 `reasoning` chooses the engine. `auto`, the default, uses the EL classifier when the
 expression and every logical axiom of the ontology are in OWL 2 EL, and the OWL 2 RL rules
 otherwise. `el` keeps to the classifier, which leaves out the axioms outside EL and lists
-them, and refuses an expression outside EL. `rl` asks for the rules. The classifier
-answers by reading `EquivalentClasses(urn:x-sparkles:dl-query C)` beside the ontology's
-axioms in the dataset's kept classification, saturating again only what that axiom and
-any change since the last run reach, and reading the answer from the saturated contexts
-without a taxonomy. The next run over the kept state lets the axiom go, the kept
-taxonomy stays as it was, and `incremental` is true when the kept state answered. Its class answers read the
-terminology, and its instances come from a classification with the assertions, which the
-dataset does not keep. Inside EL its answers are complete. The RL rules answer by demand
-reasoning over a copy in memory of the terminology, the defining axioms and the
-assertions, and derive only what the query's patterns need. Their instances are complete
-when the ontology and the expression are in OWL 2 RL, and their class answers can miss
-entailed subsumptions, since the RL rules are incomplete for classification.
+them, and refuses an expression outside EL. `rl` asks for the rules. `elOnly: true` runs
+the EL classifier by the OWL 2 EL rules alone, reproducing ELK against the dataset's
+EL-only kept saturation, and refuses `reasoning: "rl"` or an expression outside OWL 2 EL.
+The classifier answers by reading `EquivalentClasses(urn:x-sparkles:dl-query C)` beside
+the ontology's axioms in the dataset's kept classification for that mode, saturating again
+only what that axiom and any change since the last run reach, and reading the answer from
+the saturated contexts without a taxonomy. The next run over the kept state lets the axiom
+go, the kept taxonomy stays as it was, and `incremental` is true when the kept state
+answered. Its class answers read the terminology, and its instances come from a
+classification with the assertions, which the dataset does not keep. Inside EL its answers
+are complete. The RL rules answer by demand reasoning over a copy in memory of the
+terminology, the defining axioms and the assertions, and derive only what the query's
+patterns need. Their instances are complete when the ontology and the expression are in
+OWL 2 RL, and their class answers can miss entailed subsumptions, since the RL rules are
+incomplete for classification.
 
 The answer's `reasoning` names the `engine` and its `title`, says `why` it was chosen,
-whether the class answers are `complete` and whether the instances are
+reports `elOnly`, whether the class answers are `complete` and whether the instances are
 (`instancesComplete`), and lists under `gaps` the axioms outside the engine's profile or
 used in part, at most `limit` of `gapCount`, with notes on what the engine cannot tell.
 `satisfiable` and `consistent` come from the classifier and are null under the rules. A
@@ -2528,8 +2536,8 @@ caller whose grants limit endpoints needs the `query` endpoint.
   "expression": { "manchester": "Person and (teaches some Course)",
     "ofn": "ObjectIntersectionOf(:Person ObjectSomeValuesFrom(:teaches :Course))", "json": {} },
   "reasoning": { "engine": "el", "title": "OWL 2 EL classifier",
-    "why": "the expression and the ontology are inside OWL 2 EL", "complete": true,
-    "instancesComplete": true, "gapCount": 0, "gaps": [], "notes": [] },
+    "why": "the expression and the ontology are inside OWL 2 EL", "elOnly": false,
+    "complete": true, "instancesComplete": true, "gapCount": 0, "gaps": [], "notes": [] },
   "satisfiable": true, "consistent": true, "incremental": true, "elapsedMs": 1.8,
   "equivalents": ["http://ex.org/Teacher"], "directSuperclasses": ["http://ex.org/Person"],
   "subclasses": ["http://ex.org/Professor"], "instances": ["http://ex.org/ada"],
@@ -2552,9 +2560,11 @@ axiom with structural equality. Node.js's `dataset.ontology` has `summary`, `axi
 edit is its JSON form or a string in functional-style syntax with the dataset's
 prefixes. Manchester text that `parse` or `dl_query` cannot read raises Python's
 `InvalidInputError`, a `ValueError`, with `reason`, `start`, `end` and `candidates` as
-attributes, and Node.js's `InvalidInputError` with them under `details`. A
-classification's `partial` and `expansion` are keyword arguments in Python, options in
-Node.js and members of `ClassifyQuery` on the JVM. A partial run stops at the call's
+attributes, and Node.js's `InvalidInputError` with them under `details`. A classification's `el_only`, `partial` and `expansion` are keyword arguments in Python
+(with `el_only` also on `kept_classification` and `dl_query`), `elOnly`, `partial` and
+`expansion` are options in Node.js (with `elOnly` also on `keptClassification` and
+`dlQuery`), and `elOnly`, `partial` and `expansion` are members of `ClassifyQuery` on the
+JVM (with `elOnly` also on `KeptClassificationQuery` and `DlQuery`). A partial run stops at the call's
 `timeout`, which is in milliseconds in Node.js and is the `SparklesOperation` timeout on the
 JVM, or when the caller cancels it with Python's `cancel` token, Node.js's `signal` or the
 JVM's `SparklesOperation.cancel()`. In Node.js, a dataset that closes before the caller stops the call still fails it.
