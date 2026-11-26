@@ -570,7 +570,7 @@ impl Run<'_> {
     fn load_state(&self) -> Result<BuildState, RunError> {
         match self.ds.store.root() {
             Some(db) => BuildState::load(db).map_err(failed),
-            None => Ok(self.st.graphrag.state(&self.ds.name)),
+            None => Ok(self.st.graphrag.state(super::runtime::owner_id(&self.ds))),
         }
     }
 
@@ -578,7 +578,7 @@ impl Run<'_> {
         match self.ds.store.root() {
             Some(db) => s.save(db).map_err(failed),
             None => {
-                self.st.graphrag.set_state(&self.ds.name, s);
+                self.st.graphrag.set_state_if_live(self.st, &self.ds, s);
                 Ok(())
             }
         }
@@ -1366,6 +1366,19 @@ impl Run<'_> {
         if b.branch != sparkles::branch::MAIN {
             return Ok(None);
         }
+        #[cfg(test)]
+        fire_build_hook(BuildHookPoint::PrivateAdmit, &self.ds.name);
+        let _active_check = {
+            let _restore = self.st.restore_admission.lock();
+            if !super::refresh::is_live_dataset(self.st, &self.ds) {
+                return Ok(None);
+            }
+            self.st
+                .graphrag
+                .register_private_check(&self.ds.name, self.cancel.clone())
+        };
+        #[cfg(test)]
+        fire_build_hook(BuildHookPoint::PrivatePrepare, &self.ds.name);
         let prep = self.prepare(&principal, &previous)?;
         let (_, why) = self.plan_why(&prep, &previous);
         Ok(input_change(&prep, b, &why))
@@ -1460,8 +1473,10 @@ impl Run<'_> {
                 let dl = DatasetLedger::open(db).map_err(failed)?;
                 let st = self.st.clone();
                 let name = self.ds.name.clone();
+                let owner_id = owner.store.dataset_id();
                 dl.on_anomaly(Box::new(move |a| {
-                    st.graphrag.update(&name, |f| f.anomalies += 1);
+                    st.graphrag
+                        .update_if_live(&st, &name, owner_id, |f| f.anomalies += 1);
                     tracing::warn!(
                         target: "sparkles::graphrag",
                         "dataset {name}: accounting anomaly: provider {} reported {} tokens for a reservation of {}",
@@ -1474,7 +1489,7 @@ impl Run<'_> {
             None => Ledger::new(
                 b.tokens_per_build,
                 b.tokens_per_day,
-                self.st.graphrag.day(&owner.name),
+                self.st.graphrag.day_if_live(self.st, owner),
                 today,
             ),
         }))
@@ -1646,6 +1661,67 @@ fn write_commit(
 /// task and the listing of the new one are one step.
 static ADMISSION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BuildHookPoint {
+    SpawnPublish,
+    PrivateAdmit,
+    PrivatePrepare,
+    SaveState,
+}
+
+#[cfg(test)]
+type BuildHook = Box<dyn FnMut(BuildHookPoint, &str)>;
+
+#[cfg(test)]
+thread_local! {
+    static BUILD_HOOK: std::cell::RefCell<Option<BuildHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct BuildHookGuard;
+
+#[cfg(test)]
+impl Drop for BuildHookGuard {
+    fn drop(&mut self) {
+        BUILD_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_build_hook(f: impl FnMut(BuildHookPoint, &str) + 'static) -> BuildHookGuard {
+    BUILD_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    BuildHookGuard
+}
+
+#[cfg(test)]
+fn fire_build_hook(point: BuildHookPoint, name: &str) {
+    let f = BUILD_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = f {
+        f(point, name);
+        BUILD_HOOK.with(|h| {
+            if h.borrow().is_none() {
+                *h.borrow_mut() = Some(f);
+            }
+        });
+    }
+}
+
+struct AutoTaskGuard {
+    st: Arc<AppState>,
+    dataset: String,
+    task_id: String,
+}
+
+impl Drop for AutoTaskGuard {
+    fn drop(&mut self) {
+        self.st
+            .graphrag
+            .clear_auto_task(&self.dataset, &self.task_id);
+    }
+}
+
 /// Start a run as a task of kind [`TASK_KIND`], unless a GraphRAG task of the dataset is
 /// queued or running, whose id the error holds. `trigger` names why an automatic
 /// refresh started (§5), and the task's message says so.
@@ -1657,65 +1733,79 @@ pub fn spawn(
     confirmed: bool,
     trigger: Option<String>,
 ) -> Result<crate::state::Task, String> {
+    let is_auto = trigger.is_some();
+    let _restore = is_auto.then(|| st.restore_admission.lock());
     let _admission = ADMISSION.lock();
-    if trigger.is_some() && !super::refresh::is_live_dataset(st, &ds) {
+    if is_auto && !super::refresh::is_live_dataset(st, &ds) {
         return Err(format!("dataset /{} is no longer live", ds.name));
     }
     if let Some(id) = st.active_task(TASK_KIND, &ds.name) {
         return Err(id);
     }
+    #[cfg(test)]
+    if is_auto {
+        fire_build_hook(BuildHookPoint::SpawnPublish, &ds.name);
+    }
     let id = st.next_task_id();
     let task_id = id.clone();
     let st2 = st.clone();
     let ds_name = ds.name.clone();
-    Ok(
-        st.start_task_opts(id, TASK_KIND, &ds_name, None, true, move |h| {
-            let cancel = h.cancel_flag();
-            let r = Run {
-                st: &st2,
-                ds: ds.clone(),
-                settings,
-                mode,
-                confirmed,
-                task: Some(h),
-                task_id,
-                cancel: cancel.clone(),
-                limits: Limits::default(),
-            };
-            let prefix = match &trigger {
-                Some(t) => format!("automatic refresh ({t}): "),
-                None => String::new(),
-            };
-            match run(&r) {
-                Ok(o) => {
-                    let mut detail = serde_json::to_value(&o).unwrap_or(Value::Null);
-                    if let Some(t) = &trigger {
-                        detail["trigger"] = t.clone().into();
-                    }
-                    h.set_detail(detail);
-                    Ok(match &o.stopped {
-                        Some(why) => format!(
-                            "{prefix}{} reports written, {} pending: {why}",
-                            o.written, o.pending
-                        ),
-                        None => format!(
-                            "{prefix}{} reports written, {} kept, {} failed",
-                            o.written, o.kept, o.failed
-                        ),
-                    })
+    let auto_guard = is_auto.then(|| AutoTaskGuard {
+        st: st.clone(),
+        dataset: ds_name.clone(),
+        task_id: id.clone(),
+    });
+    if is_auto {
+        st.graphrag.set_auto_task(&ds_name, &id);
+    }
+    let task = st.start_task_opts(id, TASK_KIND, &ds_name, None, true, move |h| {
+        let _auto_guard = auto_guard;
+        let cancel = h.cancel_flag();
+        let r = Run {
+            st: &st2,
+            ds: ds.clone(),
+            settings,
+            mode,
+            confirmed,
+            task: Some(h),
+            task_id,
+            cancel: cancel.clone(),
+            limits: Limits::default(),
+        };
+        let prefix = match &trigger {
+            Some(t) => format!("automatic refresh ({t}): "),
+            None => String::new(),
+        };
+        match run(&r) {
+            Ok(o) => {
+                let mut detail = serde_json::to_value(&o).unwrap_or(Value::Null);
+                if let Some(t) = &trigger {
+                    detail["trigger"] = t.clone().into();
                 }
-                Err(RunError::Cancelled) => Err(sparkles::Error::Cancelled.into()),
-                Err(e) => Err(anyhow::anyhow!("{prefix}{e}")),
+                h.set_detail(detail);
+                Ok(match &o.stopped {
+                    Some(why) => format!(
+                        "{prefix}{} reports written, {} pending: {why}",
+                        o.written, o.pending
+                    ),
+                    None => format!(
+                        "{prefix}{} reports written, {} kept, {} failed",
+                        o.written, o.kept, o.failed
+                    ),
+                })
             }
-        }),
-    )
+            Err(RunError::Cancelled) => Err(sparkles::Error::Cancelled.into()),
+            Err(e) => Err(anyhow::anyhow!("{prefix}{e}")),
+        }
+    });
+    Ok(task)
 }
 
 /// The persisted state of a dataset's builds.
 pub fn state_of(st: &AppState, ds: &Dataset) -> Result<BuildState, String> {
     match ds.store.root() {
         Some(db) => BuildState::load(db).map_err(|e| e.to_string()),
-        None => Ok(st.graphrag.state(&ds.name)),
+        None => Ok(st.graphrag.state(super::runtime::owner_id(ds))),
     }
 }
 
@@ -2271,7 +2361,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         && r.ds.store.root().is_none()
     {
         // a dataset without a directory keeps its anomalies in the server
-        r.st.graphrag.record_anomaly(&r.ds.name, a.clone());
+        r.st.graphrag.record_anomaly_if_live(r.st, &r.ds, a.clone());
     }
     outcome.stopped = stopped.or_else(|| {
         anomaly.map(|a| {
@@ -2326,6 +2416,8 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             }
         })
         .collect();
+    #[cfg(test)]
+    fire_build_hook(BuildHookPoint::SaveState, &r.ds.name);
     r.save_state(BuildState {
         last_build: Some(BuildRecord {
             source_commit: prep.source_commit,
@@ -2349,11 +2441,12 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
     let phase = r.mode.as_str();
     let tokens = outcome.tokens;
     let stale = pending.len() as u64;
-    r.st.graphrag.update(&r.ds.name, |f| {
-        f.reports = statuses;
-        *f.tokens.entry(phase).or_default() += tokens;
-        f.stale = stale;
-    });
+    r.st.graphrag
+        .update_if_live(r.st, &r.ds.name, super::runtime::owner_id(&r.ds), |f| {
+            f.reports = statuses;
+            *f.tokens.entry(phase).or_default() += tokens;
+            f.stale = stale;
+        });
     Ok(outcome)
 }
 

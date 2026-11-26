@@ -378,7 +378,10 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
             .or_insert_with(|| Watch::for_dataset(&ds));
         if !w.same_dataset(&ds) {
             *w = Watch::for_dataset(&ds);
-            st.graphrag.detach_stale_circuit_for(&name, &ds);
+            st.graphrag
+                .detach_if_not_live_owner(&name, |n, dataset_id, runtime| {
+                    is_live_owner(st, n, dataset_id, runtime)
+                });
         }
         // Keep the internal F13 accumulator attached ahead of the debounce window so
         // commits arriving after startup, settings updates or policy reloads are counted
@@ -461,14 +464,18 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
         };
         #[cfg(test)]
         fire_tick_hook(TickHookPoint::BeforeSpawn, &name);
-        if !is_live_dataset(st, &ds) {
-            watches.remove(&name);
-            detach_if_not_live(st, &ds);
-            continue;
-        }
-        tracing::info!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {reason}");
-        match build::spawn(st, ds.clone(), settings, Mode::Refresh, true, Some(reason)) {
-            Ok(t) => w.task = Some(t.id),
+        match build::spawn(
+            st,
+            ds.clone(),
+            settings,
+            Mode::Refresh,
+            true,
+            Some(reason.clone()),
+        ) {
+            Ok(t) => {
+                tracing::info!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {reason}");
+                w.task = Some(t.id);
+            }
             Err(_) if !is_live_dataset(st, &ds) => {
                 watches.remove(&name);
                 detach_if_not_live(st, &ds);

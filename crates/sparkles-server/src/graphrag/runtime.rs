@@ -3,6 +3,7 @@
 
 use parking_lot::{Condvar, Mutex};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -109,17 +110,56 @@ pub struct Figures {
     pub anomalies: u64,
 }
 
+/// Per-dataset figures tagged with the owning dataset instance's UUID so delayed delete
+/// or rename cleanup never clears or overwrites a replacement dataset under the same name.
+struct OwnedFigures {
+    dataset_id: uuid::Uuid,
+    figures: Figures,
+}
+
+/// Canonical dataset UUID for `ds` (a branch shares its `main` dataset's identity).
+pub(crate) fn owner_id(ds: &crate::state::Dataset) -> uuid::Uuid {
+    ds.main()
+        .map_or_else(|| ds.store.dataset_id(), |m| m.store.dataset_id())
+}
+
+fn is_registered_owner(st: &crate::state::AppState, name: &str, dataset_id: uuid::Uuid) -> bool {
+    st.catalog
+        .get(name)
+        .is_some_and(|cur| cur.dataset_id() == dataset_id)
+}
+
+/// Removes a private check's cancellation handle when the check leaves preparation.
+pub(crate) struct PrivateCheckGuard {
+    checks: Arc<Mutex<HashMap<String, Vec<Arc<AtomicBool>>>>>,
+    dataset: String,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for PrivateCheckGuard {
+    fn drop(&mut self) {
+        let mut map = self.checks.lock();
+        if let Some(list) = map.get_mut(&self.dataset) {
+            list.retain(|c| !Arc::ptr_eq(c, &self.cancel));
+            if list.is_empty() {
+                map.remove(&self.dataset);
+            }
+        }
+    }
+}
+
 /// The server's GraphRAG state in memory.
 #[derive(Default)]
 pub struct Runtime {
     /// builds waiting for confirmation, by task id, with their dataset
     waiting: Mutex<HashMap<String, (String, Arc<Waiting>)>>,
-    figures: Mutex<BTreeMap<String, Figures>>,
-    /// the build state and the daily ledger of datasets without a directory
-    states: Mutex<HashMap<String, super::state::BuildState>>,
-    days: Mutex<HashMap<String, Arc<Mutex<super::budget::DayLedger>>>>,
-    /// the accounting anomalies of datasets without a directory
-    anomalies: Mutex<HashMap<String, Vec<super::budget::Anomaly>>>,
+    figures: Mutex<BTreeMap<String, OwnedFigures>>,
+    /// the build state and the daily ledger of datasets without a directory, keyed by
+    /// dataset UUID so renames carry state atomically and deletes never cross owners
+    states: Mutex<HashMap<uuid::Uuid, super::state::BuildState>>,
+    days: Mutex<HashMap<uuid::Uuid, Arc<Mutex<super::budget::DayLedger>>>>,
+    /// the accounting anomalies of datasets without a directory, keyed by dataset UUID
+    anomalies: Mutex<HashMap<uuid::Uuid, Vec<super::budget::Anomaly>>>,
     /// one lock per dataset, so that builds and reviews never interleave their commits
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// one lock per dataset ordering refresh circuit attach, replace and detach transitions
@@ -127,6 +167,10 @@ pub struct Runtime {
     circuit_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// internal F13 accumulator circuits for automatic refresh, one per dataset
     circuits: Mutex<HashMap<String, RefreshCircuit>>,
+    /// active automatic refresh private checks per dataset, cancelled if a restore reserves it
+    private_checks: Arc<Mutex<HashMap<String, Vec<Arc<AtomicBool>>>>>,
+    /// active automatic refresh task id per dataset, cancelled if an in-place restore begins
+    auto_tasks: Mutex<HashMap<String, String>>,
 }
 
 impl Runtime {
@@ -165,27 +209,87 @@ impl Runtime {
         }
     }
 
-    /// Change the figures of a dataset.
-    pub fn update(&self, dataset: &str, f: impl FnOnce(&mut Figures)) {
-        f(self.figures.lock().entry(dataset.to_string()).or_default());
+    /// Change the figures of a dataset only while `(dataset, dataset_id)` is still the
+    /// live registered instance in the catalog.
+    pub fn update_if_live(
+        &self,
+        st: &crate::state::AppState,
+        dataset: &str,
+        dataset_id: uuid::Uuid,
+        f: impl FnOnce(&mut Figures),
+    ) {
+        let mut map = self.figures.lock();
+        if !is_registered_owner(st, dataset, dataset_id) {
+            return;
+        }
+        let entry = map
+            .entry(dataset.to_string())
+            .or_insert_with(|| OwnedFigures {
+                dataset_id,
+                figures: Figures::default(),
+            });
+        if entry.dataset_id != dataset_id {
+            *entry = OwnedFigures {
+                dataset_id,
+                figures: Figures::default(),
+            };
+        }
+        f(&mut entry.figures);
     }
 
-    /// The build state of an in-memory dataset.
-    pub fn state(&self, dataset: &str) -> super::state::BuildState {
-        self.states.lock().get(dataset).cloned().unwrap_or_default()
+    /// The build state of an in-memory dataset instance.
+    pub fn state(&self, dataset_id: uuid::Uuid) -> super::state::BuildState {
+        self.states
+            .lock()
+            .get(&dataset_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
-    pub fn set_state(&self, dataset: &str, s: super::state::BuildState) {
-        self.states.lock().insert(dataset.to_string(), s);
+    /// Overwrite an in-memory dataset's build state directly (tests).
+    #[cfg(test)]
+    pub fn set_state(&self, dataset_id: uuid::Uuid, s: super::state::BuildState) {
+        self.states.lock().insert(dataset_id, s);
     }
 
-    /// The daily ledger of an in-memory dataset.
-    pub fn day(&self, dataset: &str) -> Arc<Mutex<super::budget::DayLedger>> {
+    /// Save an in-memory dataset's build state only while `ds` is still the live
+    /// registered dataset instance under `ds.name`.
+    pub fn set_state_if_live(
+        &self,
+        st: &crate::state::AppState,
+        ds: &crate::state::Dataset,
+        s: super::state::BuildState,
+    ) {
+        let id = owner_id(ds);
+        let mut map = self.states.lock();
+        if !is_registered_owner(st, &ds.name, id) {
+            return;
+        }
+        map.insert(id, s);
+    }
+
+    /// A snapshot of an in-memory dataset's daily ledger without allocating an entry.
+    pub fn day_snapshot(&self, dataset_id: uuid::Uuid) -> super::budget::DayLedger {
         self.days
             .lock()
-            .entry(dataset.to_string())
-            .or_default()
-            .clone()
+            .get(&dataset_id)
+            .map(|l| *l.lock())
+            .unwrap_or_default()
+    }
+
+    /// The daily ledger of an in-memory dataset, stored only while `owner` is still
+    /// registered in the catalog.
+    pub fn day_if_live(
+        &self,
+        st: &crate::state::AppState,
+        owner: &crate::state::Dataset,
+    ) -> Arc<Mutex<super::budget::DayLedger>> {
+        let id = owner.store.dataset_id();
+        let mut map = self.days.lock();
+        if !is_registered_owner(st, &owner.name, id) {
+            return Arc::new(Mutex::new(super::budget::DayLedger::default()));
+        }
+        map.entry(id).or_default().clone()
     }
 
     /// The lock that orders a dataset's GraphRAG commits.
@@ -197,29 +301,97 @@ impl Runtime {
             .clone()
     }
 
-    /// Keep an anomaly of a dataset without a directory, and count it (§3.5).
-    pub fn record_anomaly(&self, dataset: &str, a: super::budget::Anomaly) {
-        let mut all = self.anomalies.lock();
-        let list = all.entry(dataset.to_string()).or_default();
-        // the latest ones, as the dataset ledger's file keeps them
-        list.push(a);
-        let over = list.len().saturating_sub(super::ledger::MAX_ANOMALIES);
-        list.drain(..over);
-        drop(all);
-        self.update(dataset, |f| f.anomalies += 1);
+    /// Keep an anomaly of a dataset without a directory, and count it (§3.5), only while
+    /// `ds` is still the registered instance under `ds.name`.
+    pub fn record_anomaly_if_live(
+        &self,
+        st: &crate::state::AppState,
+        ds: &crate::state::Dataset,
+        a: super::budget::Anomaly,
+    ) {
+        let id = owner_id(ds);
+        {
+            let mut all = self.anomalies.lock();
+            if !is_registered_owner(st, &ds.name, id) {
+                return;
+            }
+            let list = all.entry(id).or_default();
+            // the latest ones, as the dataset ledger's file keeps them
+            list.push(a);
+            let over = list.len().saturating_sub(super::ledger::MAX_ANOMALIES);
+            list.drain(..over);
+        }
+        self.update_if_live(st, &ds.name, id, |f| f.anomalies += 1);
     }
 
     /// The anomalies of a dataset without a directory.
-    pub fn anomalies(&self, dataset: &str) -> Vec<super::budget::Anomaly> {
+    pub fn anomalies(&self, dataset_id: uuid::Uuid) -> Vec<super::budget::Anomaly> {
         self.anomalies
             .lock()
-            .get(dataset)
+            .get(&dataset_id)
             .cloned()
             .unwrap_or_default()
     }
 
     pub fn figures(&self) -> BTreeMap<String, Figures> {
-        self.figures.lock().clone()
+        self.figures
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.figures.clone()))
+            .collect()
+    }
+
+    /// Register an active private check's cancel flag for `dataset` until the guard drops.
+    /// Caller holds `AppState::restore_admission` so registration is ordered with restore
+    /// reservations.
+    pub(crate) fn register_private_check(
+        &self,
+        dataset: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> PrivateCheckGuard {
+        self.private_checks
+            .lock()
+            .entry(dataset.to_string())
+            .or_default()
+            .push(cancel.clone());
+        PrivateCheckGuard {
+            checks: self.private_checks.clone(),
+            dataset: dataset.to_string(),
+            cancel,
+        }
+    }
+
+    /// Cancel any in-flight private checks for `dataset` when a restore reserves it.
+    pub(crate) fn cancel_private_checks(&self, dataset: &str) {
+        if let Some(list) = self.private_checks.lock().get(dataset) {
+            for c in list {
+                c.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Record the currently admitted automatic refresh task for `dataset`.
+    pub(crate) fn set_auto_task(&self, dataset: &str, task_id: &str) {
+        self.auto_tasks
+            .lock()
+            .insert(dataset.to_string(), task_id.to_string());
+    }
+
+    /// Clear the recorded automatic refresh task for `dataset` if it still matches `task_id`.
+    pub(crate) fn clear_auto_task(&self, dataset: &str, task_id: &str) {
+        let mut map = self.auto_tasks.lock();
+        if map.get(dataset).is_some_and(|id| id == task_id) {
+            map.remove(dataset);
+        }
+    }
+
+    /// Cancel an active automatic refresh task for `dataset` when an in-place restore begins.
+    #[cfg_attr(not(any(test, feature = "backup")), allow(dead_code))]
+    pub(crate) fn cancel_auto_refresh(&self, st: &crate::state::AppState, dataset: &str) {
+        let id = self.auto_tasks.lock().get(dataset).cloned();
+        if let Some(id) = id {
+            let _ = st.cancel_task(&id);
+        }
     }
 
     /// The lock that serializes a dataset's refresh circuit lifecycle transitions.
@@ -337,14 +509,37 @@ impl Runtime {
         self.detach_circuit_locked(dataset);
     }
 
-    /// Drop the refresh circuit of `dataset` only when it belongs to a different dataset
-    /// instance than `ds`, serialized per dataset.
-    pub(crate) fn detach_stale_circuit_for(&self, dataset: &str, ds: &crate::state::Dataset) {
+    /// Drop the refresh circuit of `dataset` under `circuit_lock` when its owner is no
+    /// longer live according to `is_live`. Releases `circuits` before invoking `is_live`
+    /// and drops any removed handle outside `circuits`.
+    pub(crate) fn detach_if_not_live_owner(
+        &self,
+        dataset: &str,
+        is_live: impl Fn(&str, uuid::Uuid, &Weak<sparkles::incr::Runtime>) -> bool,
+    ) {
+        let lock = self.circuit_lock(dataset);
+        let _held = lock.lock();
+        let owner = self
+            .circuits
+            .lock()
+            .get(dataset)
+            .map(|c| (c.dataset_id, c.runtime.clone()));
+        if let Some((dataset_id, runtime)) = owner
+            && !is_live(dataset, dataset_id, &runtime)
+        {
+            let old = self.circuits.lock().remove(dataset);
+            drop(old);
+        }
+    }
+
+    /// Drop the refresh circuit of `dataset` only when it belongs to `dataset_id`,
+    /// serialized per dataset.
+    pub(crate) fn detach_circuit_for_id(&self, dataset: &str, dataset_id: uuid::Uuid) {
         let lock = self.circuit_lock(dataset);
         let _held = lock.lock();
         let old = {
             let mut map = self.circuits.lock();
-            if map.get(dataset).is_some_and(|c| !c.same_store(ds)) {
+            if map.get(dataset).is_some_and(|c| c.dataset_id == dataset_id) {
                 map.remove(dataset)
             } else {
                 None
@@ -353,13 +548,21 @@ impl Runtime {
         drop(old);
     }
 
-    /// Drop any refresh circuit attached for `dataset` and settle its views runtime when
-    /// it stays open (as on an in-memory dataset rename), so a re-attach under a new name
-    /// does not collide with an uncollected handle.
-    pub(crate) fn detach_circuit_and_settle(&self, dataset: &str) {
+    /// Drop the refresh circuit of `dataset` only when it belongs to `dataset_id` and
+    /// settle its views runtime when it stays open (as on an in-memory dataset rename),
+    /// so a re-attach under a new name does not collide with an uncollected handle and a
+    /// replacement dataset created under the old name is never touched.
+    pub(crate) fn detach_circuit_for_id_and_settle(&self, dataset: &str, dataset_id: uuid::Uuid) {
         let lock = self.circuit_lock(dataset);
         let _held = lock.lock();
-        let old = self.circuits.lock().remove(dataset);
+        let old = {
+            let mut map = self.circuits.lock();
+            if map.get(dataset).is_some_and(|c| c.dataset_id == dataset_id) {
+                map.remove(dataset)
+            } else {
+                None
+            }
+        };
         if let Some(old) = old {
             let rt = old.runtime.upgrade();
             drop(old);
@@ -371,66 +574,48 @@ impl Runtime {
         }
     }
 
-    /// Detach and settle the refresh circuit of `from`, and move in-memory GraphRAG
-    /// state (`states`, `days`, `anomalies`, `figures`) to `to` after a dataset rename.
-    pub(crate) fn rename(&self, from: &str, to: &str) {
-        self.detach_circuit_and_settle(from);
+    /// Detach and settle the refresh circuit of `from` belonging to `dataset_id`, and
+    /// move name-keyed `figures` belonging to `dataset_id` to `to` after a dataset rename.
+    /// Build state, daily ledgers and anomalies are keyed by `dataset_id` and are already
+    /// visible under `to` as soon as the catalog publishes the rename.
+    pub(crate) fn rename(&self, from: &str, to: &str, dataset_id: uuid::Uuid) {
+        self.detach_circuit_for_id_and_settle(from, dataset_id);
         if from == to {
             return;
         }
-        {
-            let mut map = self.states.lock();
-            match map.remove(from) {
-                Some(v) => {
-                    map.insert(to.to_string(), v);
-                }
-                None => {
-                    map.remove(to);
-                }
+        let mut map = self.figures.lock();
+        let moved = if map.get(from).is_some_and(|e| e.dataset_id == dataset_id) {
+            map.remove(from)
+        } else {
+            None
+        };
+        match moved {
+            Some(v) => {
+                map.insert(to.to_string(), v);
             }
-        }
-        {
-            let mut map = self.days.lock();
-            match map.remove(from) {
-                Some(v) => {
-                    map.insert(to.to_string(), v);
-                }
-                None => {
-                    map.remove(to);
-                }
-            }
-        }
-        {
-            let mut map = self.anomalies.lock();
-            match map.remove(from) {
-                Some(v) => {
-                    map.insert(to.to_string(), v);
-                }
-                None => {
-                    map.remove(to);
-                }
-            }
-        }
-        {
-            let mut map = self.figures.lock();
-            match map.remove(from) {
-                Some(v) => {
-                    map.insert(to.to_string(), v);
-                }
-                None => {
+            None => {
+                if map.get(to).is_some_and(|e| e.dataset_id != dataset_id) {
                     map.remove(to);
                 }
             }
         }
     }
 
-    /// Detach the refresh circuit of `dataset` and clear its in-memory state after deletion.
-    pub(crate) fn forget(&self, dataset: &str) {
-        self.detach_circuit(dataset);
-        self.states.lock().remove(dataset);
-        self.days.lock().remove(dataset);
-        self.anomalies.lock().remove(dataset);
-        self.figures.lock().remove(dataset);
+    /// Detach the refresh circuit of `dataset` and clear its in-memory state after
+    /// deletion, scoped strictly to `dataset_id` so delayed cleanup after `leaving` drops
+    /// never clears a replacement dataset created under the same name.
+    pub(crate) fn forget(&self, dataset: &str, dataset_id: Option<uuid::Uuid>) {
+        let Some(id) = dataset_id else {
+            return;
+        };
+        self.detach_circuit_for_id(dataset, id);
+        self.states.lock().remove(&id);
+        self.days.lock().remove(&id);
+        self.anomalies.lock().remove(&id);
+        let mut figures = self.figures.lock();
+        if figures.get(dataset).is_some_and(|e| e.dataset_id == id) {
+            figures.remove(dataset);
+        }
     }
 
     /// Keep only refresh circuits for datasets that remain live, dropping removed handles
@@ -450,19 +635,7 @@ impl Runtime {
             .cloned()
             .collect();
         for k in gone {
-            let lock = self.circuit_lock(&k);
-            let _held = lock.lock();
-            let owner = self
-                .circuits
-                .lock()
-                .get(&k)
-                .map(|c| (c.dataset_id, c.runtime.clone()));
-            if let Some((dataset_id, runtime)) = owner
-                && !is_live(&k, dataset_id, &runtime)
-            {
-                let old = self.circuits.lock().remove(&k);
-                drop(old);
-            }
+            self.detach_if_not_live_owner(&k, &is_live);
         }
     }
 }

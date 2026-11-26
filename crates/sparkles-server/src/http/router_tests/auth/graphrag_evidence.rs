@@ -526,7 +526,7 @@ async fn reports_under_a_policy_cite_claims_and_decisions() {
     }
     assert!(!fp[0][0].contains(SOURCES), "{}", fp[0][0]);
     // the state records the policy and the pairs of each report
-    let st = e.s.state.graphrag.state("ev");
+    let st = e.s.state.graphrag.state(ds.store().dataset_id());
     let last = st.last_build.unwrap();
     assert_eq!(last.policy.as_ref().unwrap().name, "main");
     assert_eq!(last.pairs.len(), 2, "{:?}", last.pairs);
@@ -893,11 +893,11 @@ async fn edits_keep_their_pairs_and_mismatches_are_rewritten() {
     assert_ne!(e.report_of("http://ex/x0"), edit);
     // a state that names another report than the graph links, as after a crash between
     // two level commits, rewrites it
-    let mut st = e.s.state.graphrag.state("ev");
+    let mut st = e.s.state.graphrag.state(ds.store().dataset_id());
     for c in &mut st.last_build.as_mut().unwrap().communities {
         c.report = Some("urn:uuid:00000000-0000-0000-0000-00000000dead".into());
     }
-    e.s.state.graphrag.set_state("ev", st);
+    e.s.state.graphrag.set_state(ds.store().dataset_id(), st);
     let (e2, s2) = (e.clone(), s.clone());
     let o = tokio::task::spawn_blocking(move || e2.run(s2, Mode::Refresh).unwrap())
         .await
@@ -1061,7 +1061,7 @@ async fn an_interrupted_policy_run_is_rewritten_without_the_policy() {
     tokio::task::spawn_blocking(move || e2.run(s2, Mode::Build).unwrap())
         .await
         .unwrap();
-    let before = e.s.state.graphrag.state("ev");
+    let before = e.s.state.graphrag.state(ds.store().dataset_id());
     let e2 = e.clone();
     tokio::task::spawn_blocking(move || {
         e2.run(
@@ -1073,7 +1073,9 @@ async fn an_interrupted_policy_run_is_rewritten_without_the_policy() {
     .await
     .unwrap();
     // the state as it was before the policy run saved its own
-    e.s.state.graphrag.set_state("ev", before);
+    e.s.state
+        .graphrag
+        .set_state(ds.store().dataset_id(), before);
     let (e2, s2) = (e.clone(), plain.clone());
     let o = tokio::task::spawn_blocking(move || e2.run(s2, Mode::Refresh).unwrap())
         .await
@@ -1138,7 +1140,7 @@ async fn private_checks_start_refreshes_only_for_changed_inputs() {
                 "SELECT ?s ?p ?o WHERE {{ GRAPH <{REPORTS}> {{ ?s ?p ?o }} }}"
             ))
         };
-        let state = || e.s.state.graphrag.state("ev");
+        let state = || e.s.state.graphrag.state(ds.store().dataset_id());
         let runs = |w: &HashMap<String, Watch>| w.get("ev").map_or(0, |w| w.private().runs);
         let sec = Duration::from_secs(1);
         let mut now = Instant::now();
@@ -1209,7 +1211,7 @@ async fn private_checks_start_refreshes_only_for_changed_inputs() {
         for c in &mut st.last_build.as_mut().unwrap().communities {
             c.report = Some("urn:uuid:00000000-0000-0000-0000-00000000dead".into());
         }
-        e.s.state.graphrag.set_state("ev", st);
+        e.s.state.graphrag.set_state(ds.store().dataset_id(), st);
         let mut w: HashMap<String, Watch> = HashMap::new();
         tick_once(&e.s.state, &mut w, now);
         assert_eq!(tasks().len(), 2, "{:?}", tasks());
@@ -1716,6 +1718,116 @@ async fn auto_circuit_counts_only_policy_readable_graphs_without_uncounted_fallb
             "failing evidence admission must detach the stale internal circuit"
         );
         assert_eq!(views.internal_count(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// A `Restore` reservation acquired right before `Run::private_check`'s preparation
+/// admission boundary prevents entering `prepare`, and a reservation acquired once
+/// preparation has been admitted (outside `restore_admission`) does not block on the
+/// scan and cancels the in-flight check promptly.
+#[tokio::test(flavor = "multi_thread")]
+async fn private_check_preparation_is_ordered_with_restore_reservation() {
+    use crate::graphrag::build::{BuildHookPoint, set_build_hook};
+    use crate::graphrag::refresh::{Watch, tick_once};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let e = Arc::new(env(true));
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        let e = e2;
+        let ds = e.dataset();
+        let a = propose(&ds, "advisory", leads());
+        decide(&ds, &a, Disposition::Accepted, 1);
+        let s = settings(serde_json::json!({
+            "projection": { "graphs": [ORG, "urn:ev:*"] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+        }));
+        e.run(s, Mode::Build).unwrap();
+
+        // 1. Reservation acquired right before private-check preparation admission must
+        // block entry into `prepare` and return `NotLive`.
+        let held_res: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let prepare_entered = Arc::new(AtomicBool::new(false));
+        let admit_hit = Arc::new(AtomicBool::new(false));
+        let held_hook = held_res.clone();
+        let prepare_hook = prepare_entered.clone();
+        let admit_hook = admit_hit.clone();
+        let st_hook = e.s.state.clone();
+        let _guard = set_build_hook(move |point, name| {
+            if point == BuildHookPoint::PrivateAdmit && name == "ev" {
+                admit_hook.store(true, Ordering::SeqCst);
+                let r = st_hook
+                    .reserve_restore("ev", "c25-before-private-admit")
+                    .unwrap();
+                *held_hook.lock() = Some(r);
+            } else if point == BuildHookPoint::PrivatePrepare && name == "ev" {
+                prepare_hook.store(true, Ordering::SeqCst);
+            }
+        });
+        let mut watches: HashMap<String, Watch> = HashMap::new();
+        let now = Instant::now();
+        tick_once(&e.s.state, &mut watches, now);
+        drop(_guard);
+        assert!(
+            admit_hit.load(Ordering::SeqCst),
+            "hook must fire right before private_check preparation admission"
+        );
+        assert!(
+            !prepare_entered.load(Ordering::SeqCst),
+            "restore reservation before private admission must prevent entering prepare"
+        );
+        assert!(
+            !watches.contains_key("ev"),
+            "watch must be removed when private check sees restore reservation"
+        );
+        assert!(e.s.state.tasks.lock().is_empty());
+        drop(held_res.lock().take());
+
+        // 2. Reservation acquired after private-check admission (before `prepare` scans)
+        // must succeed immediately (scan is outside `restore_admission`) and cancel the
+        // in-flight private check so no refresh task is admitted.
+        let held_res2: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let prepare_entered2 = Arc::new(AtomicBool::new(false));
+        let held_hook2 = held_res2.clone();
+        let prepare_hook2 = prepare_entered2.clone();
+        let st_hook2 = e.s.state.clone();
+        let _guard2 = set_build_hook(move |point, name| {
+            if point == BuildHookPoint::PrivatePrepare && name == "ev" {
+                prepare_hook2.store(true, Ordering::SeqCst);
+                // Must NOT deadlock: `restore_admission` has been released before `prepare`.
+                let r = st_hook2
+                    .reserve_restore("ev", "c25-during-private-prepare")
+                    .unwrap();
+                *held_hook2.lock() = Some(r);
+            }
+        });
+        withdraw(&ds, &a);
+        let mut watches2: HashMap<String, Watch> = HashMap::new();
+        tick_once(&e.s.state, &mut watches2, now + Duration::from_secs(5));
+        drop(_guard2);
+        assert!(
+            prepare_entered2.load(Ordering::SeqCst),
+            "second phase must reach post-admission prepare hook"
+        );
+        assert!(
+            held_res2.lock().is_some(),
+            "reserve_restore must succeed without blocking on private_check preparation"
+        );
+        assert!(
+            !watches2.contains_key("ev"),
+            "cancelled private check under restore reservation must resolve as NotLive"
+        );
+        assert!(
+            e.s.state.tasks.lock().is_empty(),
+            "cancelled private check must not spawn a refresh task"
+        );
+        drop(held_res2.lock().take());
     })
     .await
     .unwrap();

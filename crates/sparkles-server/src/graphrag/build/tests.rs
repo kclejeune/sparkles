@@ -1064,7 +1064,8 @@ async fn an_anomaly_leaves_the_rest_pending() {
             "{o:?}"
         );
         assert_eq!(f.mock.requests().len(), 1);
-        assert_eq!(f.st.graphrag.anomalies("org").len(), 1);
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        assert_eq!(f.st.graphrag.anomalies(ds.store.dataset_id()).len(), 1);
         assert_eq!(f.st.graphrag.figures()["org"].anomalies, 1);
     })
     .await
@@ -2041,10 +2042,13 @@ async fn circuit_refresh_detaches_and_reattaches_cleanly_on_rename() {
                 "{kind:?}: rename must preserve refresh baseline at destination without pre-seeding"
             );
             if kind == DbType::Mem {
+                let fresh = st.create("org", DbType::Mem).unwrap();
                 assert!(
-                    st.graphrag.state("org").last_build.is_none(),
-                    "in-memory rename must move old baseline away from source name"
+                    state_of(&st, &fresh).unwrap().last_build.is_none(),
+                    "fresh dataset created at the old name after rename must not inherit the moved baseline"
                 );
+                drop(fresh);
+                st.delete("org").unwrap();
             }
             // Give the renamed dataset a DIFFERENT projection so an uncollected old
             // handle on the shared in-memory views runtime would hit `internal-conflict`.
@@ -2219,11 +2223,12 @@ async fn circuit_refresh_stale_tick_does_not_clobber_or_detach_newer_circuit() {
                 store_settings(&st_hook, &ds_hook, &proj_c_hook);
                 // Simulate a build finishing at the current head before publishing proj_c.
                 let new_head = ds_hook.store.head_commit().seq;
-                let mut cur_state = st_hook.graphrag.state("org");
+                let ds_id = ds_hook.store.dataset_id();
+                let mut cur_state = st_hook.graphrag.state(ds_id);
                 if let Some(b) = cur_state.last_build.as_mut() {
                     b.source_commit = new_head;
                 }
-                st_hook.graphrag.set_state("org", cur_state);
+                st_hook.graphrag.set_state(ds_id, cur_state);
                 after_build(&st_hook, &ds_hook, new_head);
             }
         });
@@ -2251,7 +2256,8 @@ async fn circuit_refresh_stale_tick_does_not_clobber_or_detach_newer_circuit() {
         // 2. Stale `last_build = None` before `ensure_attached` locks must not detach a
         // first build's circuit published concurrently.
         let saved_state = state_of(&f.st, &ds).unwrap();
-        f.st.graphrag.set_state("org", Default::default());
+        f.st.graphrag
+            .set_state(ds.store.dataset_id(), Default::default());
         f.st.graphrag.detach_circuit("org");
         let mut w_nobuild: HashMap<String, Watch> = HashMap::new();
         tick_once(&f.st, &mut w_nobuild, now + Duration::from_secs(4));
@@ -2269,7 +2275,9 @@ async fn circuit_refresh_stale_tick_does_not_clobber_or_detach_newer_circuit() {
         let _guard = set_tick_hook(move |point, name| {
             if point == TickHookPoint::BeforeEnsureLock && name == "org" && !fired {
                 fired = true;
-                st_hook.graphrag.set_state("org", saved_state.clone());
+                st_hook
+                    .graphrag
+                    .set_state(ds_hook.store.dataset_id(), saved_state.clone());
                 after_build(&st_hook, &ds_hook, source_commit);
             }
         });
@@ -2294,7 +2302,9 @@ async fn circuit_refresh_stale_tick_does_not_clobber_or_detach_newer_circuit() {
                 fired = true;
                 let ds_new = st_hook.create("org_new", DbType::Mem).unwrap();
                 store_settings(&st_hook, &ds_new, &proj_a_hook);
-                st_hook.graphrag.set_state("org_new", saved_for_new.clone());
+                st_hook
+                    .graphrag
+                    .set_state(ds_new.store.dataset_id(), saved_for_new.clone());
                 after_build(&st_hook, &ds_new, 0);
             }
         });
@@ -2346,14 +2356,7 @@ async fn circuit_refresh_restore_reservation_mid_tick_blocks_admission() {
         let st_hook = f.st.clone();
         let _guard = set_tick_hook(move |point, name| {
             if point == TickHookPoint::BeforeSpawn && name == "org" {
-                let r = st_hook
-                    .catalog
-                    .reserve(
-                        "org",
-                        sparkles::catalog::ReservationKind::Restore,
-                        "restore-mid-tick",
-                    )
-                    .unwrap();
+                let r = st_hook.reserve_restore("org", "restore-mid-tick").unwrap();
                 *held_hook.lock() = Some(r);
             }
         });
@@ -2376,6 +2379,499 @@ async fn circuit_refresh_restore_reservation_mid_tick_blocks_admission() {
             "circuit must be detached once restore reservation is seen"
         );
         drop(held_res.lock().take());
+    })
+    .await
+    .unwrap();
+}
+
+/// R3-1: When a watch tracks dataset instance A, a tick snapshots replacement B, and
+/// before the watch reset runs B is deleted and C is created and publishes its circuit,
+/// the stale watch reset must not detach C's live circuit.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_stale_watch_reset_does_not_detach_current_circuit() {
+    use crate::graphrag::refresh::{TickHookPoint, Watch, due_reason, set_tick_hook, tick_once};
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.5 }
+        }));
+        f.run(s.clone(), Mode::Build).unwrap();
+        let ds_a = f.st.datasets().get("org").cloned().unwrap();
+        assert!(f.st.graphrag.has_refresh_circuit("org", &ds_a));
+
+        // First tick binds the watch to instance A.
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let now = Instant::now();
+        tick_once(&f.st, &mut w, now);
+        drop(ds_a);
+
+        // Replace A with B under the same name, with auto settings enabled.
+        f.st.delete("org").unwrap();
+        let ds_b = f.st.create("org", DbType::Mem).unwrap();
+        store_settings(&f.st, &ds_b, &s);
+        drop(ds_b);
+
+        // Pause B's tick right after B's settings are read (before the watch reset for A != B),
+        // replace B with C, and run a build on C so C publishes its live circuit.
+        let st_hook = f.st.clone();
+        let s_hook = s.clone();
+        let c_holder: Arc<parking_lot::Mutex<Option<Arc<Dataset>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let c_holder_cb = c_holder.clone();
+        let mut fired = false;
+        let _guard = set_tick_hook(move |point, name| {
+            if point == TickHookPoint::AfterSettings && name == "org" && !fired {
+                fired = true;
+                st_hook.delete("org").unwrap();
+                let ds_c = st_hook.create("org", DbType::Mem).unwrap();
+                ds_c.store
+                    .load(&[Source::from_bytes(
+                        data(4).into_bytes(),
+                        RdfFormat::TriG,
+                        None,
+                    )])
+                    .unwrap();
+                store_settings(&st_hook, &ds_c, &s_hook);
+                crate::settings::store_runtime(
+                    &st_hook,
+                    &ds_c,
+                    &crate::settings::ASSISTANT,
+                    &json!({ "send": "rows" }),
+                )
+                .unwrap();
+                run(&Run {
+                    st: &st_hook,
+                    ds: ds_c.clone(),
+                    settings: s_hook.clone(),
+                    mode: Mode::Build,
+                    confirmed: true,
+                    task: None,
+                    task_id: String::new(),
+                    cancel: Default::default(),
+                    limits: Default::default(),
+                })
+                .unwrap();
+                assert!(st_hook.graphrag.has_refresh_circuit("org", &ds_c));
+                *c_holder_cb.lock() = Some(ds_c);
+            }
+        });
+        tick_once(&f.st, &mut w, now + Duration::from_secs(1));
+        drop(_guard);
+
+        let ds_c = c_holder
+            .lock()
+            .take()
+            .expect("AfterSettings hook must have created and built C");
+        assert!(
+            f.st.graphrag.has_refresh_circuit("org", &ds_c),
+            "stale watch reset for retired B must not detach live C's circuit"
+        );
+        assert_eq!(ds_c.dataset.inner_state().views.internal_count(), 1);
+        sparkles::sparql::update::update(
+            &ds_c.store,
+            &format!(
+                "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/c_join> <http://ex/knows> <http://ex/x0> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let reason = due_reason(&f.st, &ds_c, &s, &mut Watch::default()).unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("c_join") && r.contains("joined")),
+            "C's surviving circuit must count writes after stale tick: {reason:?}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// R3-2: `build::spawn` for an automatic refresh and `AppState::reserve_restore` share
+/// one serialization boundary through task publication, so a restore reservation cannot
+/// interleave between `spawn`'s final liveness check and `start_task_opts`.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_spawn_and_restore_reservation_are_serialized() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1 }
+        }));
+        f.run(s.clone(), Mode::Build).unwrap();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+
+        // Pause inside `build::spawn` AFTER its final `is_live_dataset` check and BEFORE
+        // `start_task_opts` publishes the task. Attempt `reserve_restore` on another
+        // thread: it must block until `spawn` completes task publication, never interleaving.
+        let (started_tx, started_rx) = mpsc::channel();
+        let reserved_early = Arc::new(AtomicBool::new(false));
+        let reserved_early_cb = reserved_early.clone();
+        let st_hook = f.st.clone();
+        let join_handle: Arc<
+            parking_lot::Mutex<Option<std::thread::JoinHandle<sparkles::catalog::Reservation>>>,
+        > = Arc::new(parking_lot::Mutex::new(None));
+        let join_cb = join_handle.clone();
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        let hook_fired_cb = hook_fired.clone();
+
+        let _guard = set_build_hook(move |point, name| {
+            if point == BuildHookPoint::SpawnPublish && name == "org" {
+                hook_fired_cb.store(true, Ordering::SeqCst);
+                let st_t = st_hook.clone();
+                let flag = reserved_early_cb.clone();
+                let tx = started_tx.clone();
+                let t = std::thread::spawn(move || {
+                    tx.send(()).unwrap();
+                    let r = st_t.reserve_restore("org", "restore-serialized").unwrap();
+                    flag.store(true, Ordering::SeqCst);
+                    r
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                // Give the restore thread time to reach `restore_admission.lock()`.
+                std::thread::sleep(Duration::from_millis(40));
+                assert!(
+                    !reserved_early_cb.load(Ordering::SeqCst),
+                    "reserve_restore must block until automatic build::spawn finishes task publication"
+                );
+                *join_cb.lock() = Some(t);
+            }
+        });
+
+        let task = spawn(
+            &f.st,
+            ds.clone(),
+            s,
+            Mode::Refresh,
+            true,
+            Some("test auto trigger".into()),
+        )
+        .unwrap();
+        drop(_guard);
+        assert!(hook_fired.load(Ordering::SeqCst));
+
+        // Now that `spawn` released `restore_admission`, `reserve_restore` completes.
+        let res = join_handle
+            .lock()
+            .take()
+            .unwrap()
+            .join()
+            .expect("restore reservation thread must succeed after spawn publishes");
+        assert!(reserved_early.load(Ordering::SeqCst));
+        // Cancelling the auto refresh task drops its `ds` handle promptly.
+        f.st.graphrag.cancel_auto_refresh(&f.st, "org");
+        let end = Instant::now() + Duration::from_secs(10);
+        while f.st.active_task(TASK_KIND, "org").is_some() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            f.st.tasks
+                .lock()
+                .iter()
+                .any(|t| t.id == task.id && !t.active()),
+            "published automatic refresh task must terminate"
+        );
+        drop(res);
+    })
+    .await
+    .unwrap();
+}
+
+/// R3-3 & Neon P3-1: When static `--settings` already enables GraphRAG in automatic mode
+/// for the destination of an in-memory rename, a tick arriving right after
+/// `catalog.rename` and before `graphrag.rename` must immediately observe the carried
+/// baseline, never cache `no_build_head`, attach the circuit cleanly, and count the first
+/// post-rename commit incrementally.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_in_memory_rename_tick_before_state_move_attaches_circuit() {
+    use crate::graphrag::refresh::{Watch, due_reason, tick_once};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mock = MockModel::start(|r, _| (200, mock::openai(&answer(r))));
+    let dir = tempfile::tempdir().unwrap();
+    let models = models_for(&mock.url(), &json!({ "provider": "p", "model": "m" }));
+    let s_auto = settings(json!({
+        "projection": { "graphs": [ORG] },
+        "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.5 }
+    }));
+    let settings_file = dir.path().join("settings.json");
+    std::fs::write(
+        &settings_file,
+        serde_json::to_string_pretty(&json!({
+            "defaults": {
+                "assistant": { "send": "rows" },
+                "graphrag": s_auto
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut st = AppState::new(dir.path(), Default::default(), Duration::from_secs(30)).unwrap();
+    st.models = arc_swap::ArcSwapOption::from_pointee(models);
+    st.settings = crate::settings::Settings::load(&settings_file, st.models().as_deref()).unwrap();
+    let st = Arc::new(st);
+
+    let ds = st.create("org", DbType::Mem).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            data(4).into_bytes(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        let _mock = mock;
+        let _dir = dir;
+        run(&Run {
+            st: &st,
+            ds: ds.clone(),
+            settings: s_auto.clone(),
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: String::new(),
+            cancel: Default::default(),
+            limits: Default::default(),
+        })
+        .unwrap();
+        assert!(st.graphrag.has_refresh_circuit("org", &ds));
+        drop(ds);
+
+        // Run a tick right after `catalog.rename("org", "org2")` and BEFORE
+        // `graphrag.rename` runs, while static defaults already enable `auto` on `org2`.
+        let watches = Arc::new(parking_lot::Mutex::new(HashMap::<String, Watch>::new()));
+        let watches_cb = watches.clone();
+        let st_cb = st.clone();
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        let hook_fired_cb = hook_fired.clone();
+        let t0 = Instant::now();
+        let _guard = crate::state::tests::set_rename_after_catalog_hook(move |from, to| {
+            if from == "org" && to == "org2" {
+                hook_fired_cb.store(true, Ordering::SeqCst);
+                let mut w = watches_cb.lock();
+                tick_once(&st_cb, &mut w, t0);
+            }
+        });
+        st.rename("org", "org2").unwrap();
+        drop(_guard);
+        assert!(hook_fired.load(Ordering::SeqCst));
+
+        // Subsequent idle tick must keep the circuit attached (no cached `no_build_head`).
+        let mut w = watches.lock();
+        tick_once(&st, &mut w, t0 + Duration::from_millis(100));
+        let ds2 = st.datasets().get("org2").cloned().unwrap();
+        assert!(
+            st.graphrag.has_refresh_circuit("org2", &ds2),
+            "tick during in-memory rename window must see carried baseline and attach circuit"
+        );
+        assert_eq!(ds2.dataset.inner_state().views.internal_count(), 1);
+
+        // First post-rename write must be counted incrementally by the attached circuit.
+        sparkles::sparql::update::update(
+            &ds2.store,
+            &format!(
+                "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/post_rename> <http://ex/knows> <http://ex/x0> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let reason = due_reason(&st, &ds2, &s_auto, &mut Watch::default()).unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("post_rename") && r.contains("joined")),
+            "first post-rename commit must be counted incrementally: {reason:?}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// R3-4: (1) Delayed in-memory delete cleanup after `drop(leaving)` must not wipe a
+/// replacement dataset's circuit, baseline, daily ledger, anomalies, or figures; and
+/// (2) a retired in-memory build finishing `save_state` after deletion (with or without
+/// name reuse) must not resurrect stale state or overwrite the replacement's state.
+#[tokio::test(flavor = "multi_thread")]
+async fn circuit_refresh_in_memory_delete_and_retired_build_do_not_clobber_replacement() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let f = fixture_with(
+        4,
+        |r, _| (200, mock::openai(&answer(r))),
+        json!({ "provider": "p", "model": "m" }),
+    );
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "projection": { "graphs": [ORG] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1 }
+        }));
+
+        // --- Part 1: Delayed `graphrag.forget` after `drop(leaving)` ---
+        f.run(s.clone(), Mode::Build).unwrap();
+        let ds_a = f.st.datasets().get("org").cloned().unwrap();
+        let id_a = ds_a.store.dataset_id();
+        f.st.graphrag.record_anomaly_if_live(
+            &f.st,
+            &ds_a,
+            super::super::budget::Anomaly {
+                provider: "p".into(),
+                model: "m".into(),
+                source: super::super::budget::Source::ByteBound,
+                reserved: 10,
+                reported: 99,
+            },
+        );
+        assert!(f.st.graphrag.has_refresh_circuit("org", &ds_a));
+        drop(ds_a);
+
+        let st_cb = f.st.clone();
+        let s_cb = s.clone();
+        let ds_b_slot: Arc<parking_lot::Mutex<Option<Arc<Dataset>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let ds_b_cb = ds_b_slot.clone();
+        let delete_hook_fired = Arc::new(AtomicBool::new(false));
+        let delete_hook_flag = delete_hook_fired.clone();
+        let _guard = crate::state::tests::set_delete_after_leave_hook(move |name| {
+            if name == "org" {
+                delete_hook_flag.store(true, Ordering::SeqCst);
+                let ds_b = st_cb.create("org", DbType::Mem).unwrap();
+                ds_b.store
+                    .load(&[Source::from_bytes(
+                        data(4).into_bytes(),
+                        RdfFormat::TriG,
+                        None,
+                    )])
+                    .unwrap();
+                store_settings(&st_cb, &ds_b, &s_cb);
+                run(&Run {
+                    st: &st_cb,
+                    ds: ds_b.clone(),
+                    settings: s_cb.clone(),
+                    mode: Mode::Build,
+                    confirmed: true,
+                    task: None,
+                    task_id: String::new(),
+                    cancel: Default::default(),
+                    limits: Default::default(),
+                })
+                .unwrap();
+                st_cb.graphrag.record_anomaly_if_live(
+                    &st_cb,
+                    &ds_b,
+                    super::super::budget::Anomaly {
+                        provider: "p".into(),
+                        model: "m".into(),
+                        source: super::super::budget::Source::ByteBound,
+                        reserved: 20,
+                        reported: 200,
+                    },
+                );
+                *ds_b_cb.lock() = Some(ds_b);
+            }
+        });
+        assert!(f.st.delete("org").unwrap());
+        drop(_guard);
+        assert!(delete_hook_fired.load(Ordering::SeqCst));
+
+        let ds_b = ds_b_slot.lock().take().unwrap();
+        let id_b = ds_b.store.dataset_id();
+        assert_ne!(id_a, id_b);
+        assert!(
+            f.st.graphrag.has_refresh_circuit("org", &ds_b),
+            "delayed delete cleanup must not detach replacement B's circuit"
+        );
+        assert!(
+            state_of(&f.st, &ds_b).unwrap().last_build.is_some(),
+            "delayed delete cleanup must not clear replacement B's baseline"
+        );
+        assert!(
+            f.st.graphrag.day_snapshot(id_b).used > 0,
+            "delayed delete cleanup must not clear replacement B's daily ledger"
+        );
+        assert_eq!(
+            f.st.graphrag.anomalies(id_b).len(),
+            1,
+            "delayed delete cleanup must not clear replacement B's anomalies"
+        );
+        assert_eq!(
+            f.st.graphrag.figures()["org"].anomalies,
+            1,
+            "delayed delete cleanup must not clear replacement B's figures"
+        );
+        // Old instance A's UUID-keyed state was cleaned up.
+        assert!(f.st.graphrag.state(id_a).last_build.is_none());
+        assert!(f.st.graphrag.anomalies(id_a).is_empty());
+
+        // --- Part 2: Retired build finishing `save_state` after delete + name reuse ---
+        store_settings(&f.st, &ds_b, &s);
+        crate::settings::store_runtime(
+            &f.st,
+            &ds_b,
+            &crate::settings::ASSISTANT,
+            &json!({ "send": "rows" }),
+        )
+        .unwrap();
+        let st_cb2 = f.st.clone();
+        let s_cb2 = s.clone();
+        let ds_c_slot: Arc<parking_lot::Mutex<Option<Arc<Dataset>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let ds_c_cb = ds_c_slot.clone();
+        let save_hook_fired = Arc::new(AtomicBool::new(false));
+        let save_hook_flag = save_hook_fired.clone();
+        let _guard2 = set_build_hook(move |point, name| {
+            if point == BuildHookPoint::SaveState && name == "org" {
+                save_hook_flag.store(true, Ordering::SeqCst);
+                // Delete B while B's build is paused right before `save_state`, then
+                // recreate C under `"org"` without building C yet.
+                assert!(st_cb2.delete("org").unwrap());
+                let ds_c = st_cb2.create("org", DbType::Mem).unwrap();
+                store_settings(&st_cb2, &ds_c, &s_cb2);
+                *ds_c_cb.lock() = Some(ds_c);
+            }
+        });
+        run(&Run {
+            st: &f.st,
+            ds: ds_b.clone(),
+            settings: s.clone(),
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: String::new(),
+            cancel: Default::default(),
+            limits: Default::default(),
+        })
+        .unwrap();
+        drop(_guard2);
+        assert!(save_hook_fired.load(Ordering::SeqCst));
+
+        let ds_c = ds_c_slot.lock().take().unwrap();
+        let id_c = ds_c.store.dataset_id();
+        assert_ne!(id_b, id_c);
+        assert!(
+            state_of(&f.st, &ds_c).unwrap().last_build.is_none(),
+            "retired build on B must not publish its baseline to replacement C"
+        );
+        assert!(
+            f.st.graphrag.state(id_b).last_build.is_none(),
+            "retired build on deleted B must not resurrect B's state in memory"
+        );
+        assert!(
+            !f.st.graphrag.has_refresh_circuit("org", &ds_b)
+                && !f.st.graphrag.has_refresh_circuit("org", &ds_c),
+            "retired build on deleted B must not leave a circuit attached under org"
+        );
+        assert!(
+            !f.st.graphrag.figures().contains_key("org"),
+            "retired build on deleted B must not publish figures under org"
+        );
     })
     .await
     .unwrap();

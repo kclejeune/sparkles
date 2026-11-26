@@ -25,10 +25,11 @@ pub fn replace_in_place(
     keep: bool,
 ) -> Result<Arc<Dataset>, BackupError> {
     let r = st
-        .catalog
-        .reserve(name, sparkles::catalog::ReservationKind::Restore, task)
+        .reserve_restore(name, task)
         .map_err(|e| BackupError::new(Code::DatasetBusy, e.to_string()))?;
     crate::compaction::cancel(st, name);
+    #[cfg(feature = "mcp")]
+    st.graphrag.cancel_auto_refresh(st, name);
     let start = Instant::now();
     loop {
         let busy = st.get(name).is_some_and(|ds| Arc::strong_count(&ds) > 2);
