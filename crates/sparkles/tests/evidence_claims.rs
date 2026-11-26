@@ -794,3 +794,250 @@ fn records_beyond_the_bound_hide_only_their_claim() {
     .unwrap();
     assert_eq!(supports, vec![vec![a.0.clone()]]);
 }
+
+/// Indexed claim lookup matches full-scan semantics across multiple review policies,
+/// matching policies, withdrawals, historical views, branches, compaction, and visibility
+/// filters.
+#[test]
+fn indexed_about_preserves_policies_branches_history_withdrawals_and_visibility() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    let ds = Dataset::open(&root).unwrap();
+    drop(ds);
+    sparkles::migrate::activate_configuration_history(&root, false, &preparation()).unwrap();
+    let ds = Dataset::open(&root).unwrap();
+
+    const CLAIMS_B: &str = "urn:ev:claims-b";
+    const DECISIONS_B: &str = "urn:ev:decisions-b";
+    const SUPPORTS_B: &str = "urn:ev:supports-b";
+    const OUTPUT_B: &str = "urn:ev:accepted-b";
+    let mut s = settings(1);
+    s.proposals.push(CLAIMS_B.into());
+    s.decisions.push(DECISIONS_B.into());
+    s.supports.push(SUPPORTS_B.into());
+    s.projections.push(OUTPUT_B.into());
+    s.policies.insert(
+        "secondary".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::AdmitLabelled,
+            boundary: vec![SOURCES.into(), CLAIMS_B.into()],
+            decisions: DECISIONS_B.into(),
+            supports: SUPPORTS_B.into(),
+            output: OUTPUT_B.into(),
+        },
+    );
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    let c1 = claim(&ds, "advisory");
+    let mut o_b = ProposeOptions::new(iri("urn:principal:importer"));
+    o_b.proposal_graph = Some(iri(CLAIMS_B));
+    let c2_prop = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &occurrence(
+            "secondary-src",
+            Polarity::Negative,
+            Triple::new(iri("urn:other"), iri("urn:mentions"), iri("urn:release")),
+        ),
+        &o_b,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let c2_rec = c2_prop.records.iter().find(|r| r.key == "claim").unwrap();
+    let c2 = (c2_rec.iri.clone(), c2_rec.digest);
+
+    let seq_before_review = ds.store().head_commit().seq;
+    review(&ds, &c1, Disposition::Accepted, None);
+    let seq_after_review = ds.store().head_commit().seq;
+
+    // Fork a branch before withdrawing c1 on main, and propose a branch-only claim
+    ds.store()
+        .create_branch("feature", &Default::default())
+        .unwrap();
+    let feature = ds.branch("feature").unwrap();
+    let mut o_branch = ProposeOptions::new(iri("urn:principal:importer"));
+    o_branch.proposal_graph = Some(iri(CLAIMS));
+    let c_branch_prop = evidence::propose(
+        None,
+        &ds,
+        &feature,
+        &occurrence(
+            "branch-src",
+            Polarity::Positive,
+            Triple::new(iri("urn:release"), iri("urn:fixedIn"), iri("urn:patch-1")),
+        ),
+        &o_branch,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let c_branch_rec = c_branch_prop
+        .records
+        .iter()
+        .find(|r| r.key == "claim")
+        .unwrap();
+    let c_branch = (c_branch_rec.iri.clone(), c_branch_rec.digest);
+
+    // Withdraw c1 on main and compact main so claims live in reifiers.bin
+    withdraw(&ds, &c1);
+    ds.compact().unwrap();
+    assert!(ds.store().snapshot().generation.reifiers.file.is_some());
+
+    let about_ids = |main: &Dataset,
+                     branch: &Dataset,
+                     at: &At,
+                     policy: &str,
+                     access: Option<Arc<GraphAccess>>| {
+        let v = main
+            .store()
+            .evidence_view_with_branch(branch.store(), at, &preparation())
+            .unwrap();
+        evidence::with_policy_claims(&v, policy, access, &Control::none(), |c| {
+            c.about(&[iri("urn:release")])
+        })
+        .unwrap()
+        .into_iter()
+        .map(|o| (o.claim, o.state))
+        .collect::<Vec<_>>()
+    };
+
+    // Main head sees c1 as withdrawn, not c2 (outside main's boundary) and not c_branch
+    assert_eq!(
+        about_ids(&ds, &ds, &At::Head, "main", all()),
+        vec![(c1.0.clone(), ClaimState::Withdrawn)]
+    );
+    // Secondary policy sees only c2 (matched by object)
+    assert_eq!(
+        about_ids(&ds, &ds, &At::Head, "secondary", all()),
+        vec![(c2.0.clone(), ClaimState::Unreviewed)]
+    );
+    // Historical reads on main see exact prior states
+    assert_eq!(
+        about_ids(&ds, &ds, &At::Commit(seq_before_review), "main", all()),
+        vec![(c1.0.clone(), ClaimState::Unreviewed)]
+    );
+    assert_eq!(
+        about_ids(&ds, &ds, &At::Commit(seq_after_review), "main", all()),
+        vec![(c1.0.clone(), ClaimState::Accepted)]
+    );
+    // Feature branch sees c1 as accepted and c_branch as unreviewed (never withdrawn)
+    let mut expected_branch = vec![
+        (c1.0.clone(), ClaimState::Accepted),
+        (c_branch.0.clone(), ClaimState::Unreviewed),
+    ];
+    expected_branch.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        about_ids(&ds, &feature, &At::Head, "main", all()),
+        expected_branch
+    );
+    // Graph visibility filter hides claims when the proposal graph is unreadable
+    let no_claims = reading(&[SOURCES, DECISIONS, SUPPORTS, OUTPUT]);
+    assert!(about_ids(&ds, &ds, &At::Head, "main", no_claims).is_empty());
+    // Triple-level mask on withdrawal hides the withdrawn occurrence
+    let hide_w = masking("urn:x-sparkles:evidence:withdraws", CLAIMS);
+    assert!(about_ids(&ds, &ds, &At::Head, "main", hide_w).is_empty());
+
+    // Persistent reopen preserves reifiers.bin and exact results
+    drop(feature);
+    drop(ds);
+    let reopened = Dataset::open(&root).unwrap();
+    assert!(
+        reopened
+            .store()
+            .snapshot()
+            .generation
+            .reifiers
+            .file
+            .is_some()
+    );
+    assert_eq!(
+        about_ids(&reopened, &reopened, &At::Head, "main", all()),
+        vec![(c1.0.clone(), ClaimState::Withdrawn)]
+    );
+    assert_eq!(
+        about_ids(
+            &reopened,
+            &reopened,
+            &At::Commit(seq_after_review),
+            "main",
+            all()
+        ),
+        vec![(c1.0.clone(), ClaimState::Accepted)]
+    );
+}
+
+/// A proposal graph holding more than one million quads (above the legacy `MAX_CLAIM_SCAN`
+/// refusal threshold) returns matching claims directly through the reifier index without
+/// returning `incomplete-evidence`, both before and after compaction, under a tight
+/// preparation memory budget.
+#[test]
+fn proposal_graph_past_one_million_quads_resolves_via_reifier_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    let ds = Dataset::open(&root).unwrap();
+    // Bulk-load >1,000,000 unrelated quads into the proposal graph before enabling evidence
+    // protection, then activate configuration history, configure evidence, and propose
+    // authenticated claims into that same >1M-quad proposal graph.
+    let mut nq = String::with_capacity(48 << 20);
+    for i in 0..1_000_050u32 {
+        use std::fmt::Write;
+        writeln!(nq, "<urn:bg:s{i}> <urn:bg:p> <urn:bg:o{i}> <{CLAIMS}> .").unwrap();
+    }
+    ds.store()
+        .load(&[sparkles::io::Source::from_bytes(
+            nq.into_bytes(),
+            sparkles::io::RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    drop(ds);
+
+    sparkles::migrate::activate_configuration_history(&root, false, &preparation()).unwrap();
+    let ds = Dataset::open(&root).unwrap();
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+
+    let c_sub = claim(&ds, "advisory-sub");
+    let c_obj = propose(
+        &ds,
+        &occurrence(
+            "advisory-obj",
+            Polarity::Negative,
+            Triple::new(iri("urn:other"), iri("urn:mentions"), iri("urn:release")),
+        ),
+    );
+    review(&ds, &c_sub, Disposition::Accepted, None);
+    let mut expected = vec![c_sub.0.clone(), c_obj.0.clone()];
+    expected.sort();
+
+    // 1. Before compaction (base has >1M quads + delta has the new claims)
+    let tight = Preparation::new(Control::none(), 4 << 20).unwrap();
+    let v = ds.store().evidence_view(&At::Head, &tight).unwrap();
+    let got: Vec<NamedNode> =
+        evidence::with_policy_claims(&v, "main", all(), &Control::none(), |c| {
+            c.about(&[iri("urn:release")])
+        })
+        .unwrap()
+        .into_iter()
+        .map(|o| o.claim)
+        .collect();
+    assert_eq!(got, expected);
+
+    // 2. After compaction (base has >1M quads AND the claims live in reifiers.bin)
+    ds.compact().unwrap();
+    assert!(ds.store().snapshot().generation.reifiers.file.is_some());
+    let v = ds.store().evidence_view(&At::Head, &tight).unwrap();
+    let got: Vec<NamedNode> =
+        evidence::with_policy_claims(&v, "main", all(), &Control::none(), |c| {
+            c.about(&[iri("urn:release")])
+        })
+        .unwrap()
+        .into_iter()
+        .map(|o| o.claim)
+        .collect();
+    assert_eq!(got, expected);
+}

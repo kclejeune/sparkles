@@ -1031,6 +1031,83 @@ fn write_permutation(
     preparation.check()
 }
 
+/// Remove hidden inserted `rdf:reifies` quads from `delta.reifiers_ins`, admitting
+/// every copied path under `preparation` before mutating the persistent tree.
+fn write_reifiers(
+    generation: &crate::store::Generation,
+    reifiers_ins: &mut KeySet,
+    hidden: &[Key],
+    inserted: &[bool],
+    preparation: &Preparation,
+    owned: &mut Reservation,
+) -> Result<()> {
+    if reifiers_ins.is_empty() {
+        return Ok(());
+    }
+    const MAX_BATCH: usize = 64;
+    let mut pending = [[0u64; 4]; MAX_BATCH];
+    let mut count = 0usize;
+    let flush = |pending: &[Key],
+                 reifiers_ins: &mut KeySet,
+                 preparation: &Preparation,
+                 owned: &mut Reservation|
+     -> Result<()> {
+        let mut at = 0;
+        while at < pending.len() {
+            let bound = reifiers_ins
+                .mutation_bound()
+                .saturating_add(KeySet::level_bound());
+            let share = (owned.bytes() / 4).max(preparation.room() / 8);
+            let batch = usize::try_from(share / bound.max(1))
+                .unwrap_or(usize::MAX)
+                .clamp(1, pending.len() - at);
+            let mut headroom = preparation.reserve(bound.saturating_mul(batch as u64))?;
+            let mut allocated = 0u64;
+            for key in &pending[at..at + batch] {
+                reifiers_ins.remove_metered(key, &mut allocated);
+            }
+            let grown = headroom.grow_to(allocated);
+            if grown.is_ok() {
+                headroom.release_to(allocated);
+            }
+            owned.merge(headroom);
+            grown?;
+            at += batch;
+        }
+        Ok(())
+    };
+    for (index, key) in hidden.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            preparation.check()?;
+        }
+        if !inserted[index] {
+            continue;
+        }
+        let quad = Perm::Spo.to_quad(key);
+        let Some((hs, ho)) =
+            generation.is_rdf_reifies_triple_prepared(quad[1], quad[2], preparation)?
+        else {
+            continue;
+        };
+        for h in [hs, ho].into_iter().flatten() {
+            let reifier_key = [quad[3].0, h, quad[0].0, quad[2].0];
+            if !reifiers_ins.contains(&reifier_key) {
+                continue;
+            }
+            pending[count] = reifier_key;
+            count += 1;
+            if count == MAX_BATCH {
+                flush(&pending[..count], reifiers_ins, preparation, owned)?;
+                count = 0;
+            }
+        }
+    }
+    if count > 0 {
+        flush(&pending[..count], reifiers_ins, preparation, owned)?;
+    }
+    preparation.check()
+}
+
 fn apply_controlled(
     snap: &Snapshot,
     hidden: Buffer<Key>,
@@ -1057,6 +1134,7 @@ fn apply_controlled(
         .iter()
         .map(|_| preparation.reserve(0))
         .collect::<Result<Vec<_>>>()?;
+    let mut reifiers_owned = preparation.reserve(0)?;
     // Declared after the reservations, so an early return drops the copied nodes
     // before it releases their admission.
     let mut delta = snap.delta.clone();
@@ -1074,6 +1152,14 @@ fn apply_controlled(
             })
             .collect::<Result<()>>()?
     };
+    write_reifiers(
+        &snap.generation,
+        &mut delta.reifiers_ins,
+        &hidden,
+        &inserted,
+        preparation,
+        &mut reifiers_owned,
+    )?;
     forget_removed(&mut delta, &hidden, &inserted, preparation, &mut || {
         preparation.check()
     })?;
@@ -1081,6 +1167,7 @@ fn apply_controlled(
     for copy in copies {
         held.merge(copy);
     }
+    held.merge(reifiers_owned);
     held.merge(predicates);
     let retained = held.bytes().saturating_sub(SNAPSHOT_HEADERS);
     let mut text = Text::new(preparation)?;
@@ -1720,5 +1807,104 @@ mod tests {
         assert_eq!(snap.counts.live_view_count(), 0);
         assert!(snap.counts.view(&access.read_key()).is_none());
         assert_eq!(snap.counts.view_entry_count(), 0);
+    }
+
+    #[test]
+    fn write_reifiers_reserves_nothing_when_mask_touches_no_reifiers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(tmp.path(), Default::default()).unwrap();
+        let reifies = crate::reifiers::RDF_REIFIES;
+        // Base quad in compacted generation.
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { GRAPH <urn:g> { <urn:b1> <urn:secret_base> <urn:v1> } }",
+            &Default::default(),
+        )
+        .unwrap();
+        store.compact().unwrap();
+        // Delta holds both a visible reifier and an ordinary delta quad.
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{\
+                 <urn:c1> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> .\
+                 <urn:d1> <urn:secret_delta> <urn:v2> . }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        assert!(!snap.delta.reifiers_ins.is_empty());
+
+        let base_pred = snap.lookup_iri("urn:secret_base").unwrap();
+        let delta_pred = snap.lookup_iri("urn:secret_delta").unwrap();
+        let mut base_key = None;
+        let mut delta_key = None;
+        snap.for_each_quad(|q| {
+            if q[1] == base_pred {
+                base_key = Some(Perm::Spo.to_key(q));
+            } else if q[1] == delta_pred {
+                delta_key = Some(Perm::Spo.to_key(q));
+            }
+            Ok(())
+        })
+        .unwrap();
+        let base_key = base_key.unwrap();
+        let delta_key = delta_key.unwrap();
+
+        // A tight 1 KiB preparation is far below `reifiers_ins.mutation_bound()` (~42 KiB),
+        // yet hiding either a base quad or an ordinary delta quad must succeed with zero
+        // reservations and leave `reifiers_ins` structurally shared with the source delta.
+        assert!(1024 < snap.delta.reifiers_ins.mutation_bound());
+        for (hidden_key, is_inserted) in [(base_key, false), (delta_key, true)] {
+            let tight = Preparation::new(Control::none(), 1024).unwrap();
+            let mut owned = tight.reserve(0).unwrap();
+            let mut reifiers = snap.delta.reifiers_ins.clone();
+            write_reifiers(
+                &snap.generation,
+                &mut reifiers,
+                &[hidden_key],
+                &[is_inserted],
+                &tight,
+                &mut owned,
+            )
+            .expect("mask touching no reifiers must not refuse under a tight cap");
+            assert_eq!(owned.bytes(), 0);
+            assert!(reifiers.same(&snap.delta.reifiers_ins));
+        }
+
+        // End-to-end mask hiding only the base quad leaves `reifiers_ins` untouched.
+        let access = GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "hide-base".into(),
+                        predicates: Some(vec!["urn:secret_base".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        );
+        let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+        let prepared = prepare(&access, &snap, &prep).unwrap();
+        assert!(
+            prepared
+                .snapshot()
+                .delta
+                .reifiers_ins
+                .same(&snap.delta.reifiers_ins),
+            "hiding an unrelated base quad must not copy reifiers_ins"
+        );
     }
 }

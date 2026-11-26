@@ -55,20 +55,29 @@ pub(super) fn selected_metadata(
             if !wal_is_quad(record[0]) {
                 continue;
             }
+            let limit = budget.owned_limit()?;
             let held = history_limited::preparation_mutation_bytes(delta).saturating_add(buffers);
-            budget.owned_limit()?.check(held)?;
+            limit.check(held)?;
             let quad = std::array::from_fn(|j| {
                 Id(u64::from_le_bytes(
                     record[1 + j * 8..9 + j * 8].try_into().unwrap(),
                 ))
             });
             let key = Perm::Spo.to_key(&quad);
-            let in_base = spo.contains_with(cache, &key, &budget.owned_limit()?, held)?;
+            let in_base = spo.contains_with(cache, &key, &limit, held)?;
             let present = delta.ins[Perm::Spo.index()].contains(&key)
                 || (in_base && !delta.del[Perm::Spo.index()].contains(&key));
             touched.push((key, index, present, in_base));
             default_graph |= quad[3] == Id::DEFAULT_GRAPH;
-            apply(delta, &quad, record[0] == WAL_INSERT, in_base);
+            apply_with(
+                generation,
+                delta,
+                &quad,
+                record[0] == WAL_INSERT,
+                in_base,
+                &limit,
+                held,
+            )?;
         }
         budget.sort_by(&mut touched, |left, right| {
             left.0.cmp(&right.0).then(left.1.cmp(&right.1))

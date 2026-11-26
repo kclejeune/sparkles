@@ -31,7 +31,9 @@ const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
 /// The class of imported instruction documents, such as `AGENTS.md`.
 pub const MEM_INSTRUCTIONS: &str = "urn:x-sparkles:mem:Instructions";
 
-/// The most quads of one proposal graph that [`PolicyClaims::about`] reads.
+/// The most quads of one proposal graph that [`PolicyClaims::about`] scans when reading
+/// a legacy pre-index generation that lacks `reifiers.bin`. Indexed generations and
+/// deltas look up matching claims directly without scanning the graph.
 pub const MAX_CLAIM_SCAN: usize = 1_000_000;
 /// The most claims one call of [`PolicyClaims::states`] or [`PolicyClaims::about`]
 /// considers.
@@ -522,9 +524,11 @@ impl PolicyClaims<'_> {
     /// The occurrences the caller may see in the readable proposal graphs of the
     /// policy's boundary whose proposition has one of `entities` as its subject or
     /// object, in claim order. Each candidate passes [`Self::states`]' visibility check
-    /// before it is counted, so a hidden claim takes no place in the bound. Refuses as
-    /// `incomplete-evidence` when a graph holds more than [`MAX_CLAIM_SCAN`] quads or the
-    /// visible occurrences exceed [`MAX_CLAIMS`].
+    /// before it is counted, so a hidden claim takes no place in the bound. Uses the
+    /// reifier proposition-term index to read only matching claims; refuses as
+    /// `incomplete-evidence` when the visible occurrences exceed [`MAX_CLAIMS`] (or on a
+    /// legacy pre-index generation when a proposal graph holds more than
+    /// [`MAX_CLAIM_SCAN`] quads).
     pub fn about(&mut self, entities: &[NamedNode]) -> Result<Vec<ClaimOccurrence>> {
         let wanted: BTreeSet<String> = entities.iter().map(|e| e.as_str().to_string()).collect();
         if wanted.is_empty() {

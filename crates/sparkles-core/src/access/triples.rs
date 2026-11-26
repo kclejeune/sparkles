@@ -318,6 +318,19 @@ pub(crate) fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot 
         retained = retained
             .saturating_add(delta.remove_inserted_all_metered(&from_ins))
             .saturating_add(delta.predicate_bytes_bound());
+        if !delta.reifiers_ins.is_empty() {
+            let mut reifier_allocated = 0u64;
+            for q in &from_ins {
+                if let Some((hs, ho)) = snap.generation.is_rdf_reifies_triple(q[1], q[2]) {
+                    for h in [hs, ho].into_iter().flatten() {
+                        delta
+                            .reifiers_ins
+                            .remove_metered(&[q[3].0, h, q[0].0, q[2].0], &mut reifier_allocated);
+                    }
+                }
+            }
+            retained = retained.saturating_add(reifier_allocated);
+        }
     }
     Snapshot {
         delta,

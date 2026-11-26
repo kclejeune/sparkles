@@ -289,21 +289,21 @@ impl Snapshot {
         for q in added {
             let k = Perm::Spo.to_key(q);
             if delta.ins[spo].contains(&k) {
-                apply(&mut delta, q, false, false);
+                apply(&self.generation, &mut delta, q, false, false);
             } else if !delta.del[spo].contains(&k)
                 && self.perm(Perm::Spo).contains(&self.cache, &k)?
             {
-                apply(&mut delta, q, false, true);
+                apply(&self.generation, &mut delta, q, false, true);
             }
         }
         for q in removed {
             let k = Perm::Spo.to_key(q);
             if delta.del[spo].contains(&k) {
-                apply(&mut delta, q, true, true);
+                apply(&self.generation, &mut delta, q, true, true);
             } else if !delta.ins[spo].contains(&k)
                 && !self.perm(Perm::Spo).contains(&self.cache, &k)?
             {
-                apply(&mut delta, q, true, false);
+                apply(&self.generation, &mut delta, q, true, false);
             }
         }
         Ok(Snapshot {

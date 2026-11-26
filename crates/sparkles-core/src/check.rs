@@ -388,6 +388,7 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
         done.millis = vocab.millis;
         c.checks.push(done);
         c.patterns(&dir, &gen_name);
+        c.reifiers(&dir, &gen_name);
         // the catalog lags the WAL, so it is read first; the full-text index too
         let catalog = std::fs::read(root.join("commits.bin"));
         let t_text = Instant::now();
@@ -1261,6 +1262,67 @@ impl Checker<'_> {
                     "unreadable".to_string()
                 }
             },
+        };
+        self.checks.push(run.done(summary));
+    }
+
+    /// The reifier proposition-term index (`reifiers.bin`): its layout, and in a full
+    /// check its checksum, order and exact entries against POS. A version this build
+    /// does not read is a warning, since claim lookups fall back to scanning.
+    fn reifiers(&mut self, dir: &Path, name: &str) {
+        let mut run = Run::new("reifiers");
+        let file = format!("{name}/{}", crate::reifiers::FILE);
+        let recorded = self.meta.as_ref().and_then(|m| m.reifiers.clone());
+        let fsst = self
+            .meta
+            .as_ref()
+            .is_some_and(|m| m.has_feature(crate::builder::FEATURE_FSST_VOCAB));
+        let summary = match crate::reifiers::ReifierFile::open(dir) {
+            Ok(None) => {
+                if recorded
+                    .as_ref()
+                    .is_some_and(|r| r.entries > 0 || r.bytes > 0)
+                {
+                    run.add(
+                        Issue::warning(
+                            "meta.json records a reifier index but the file is missing: claim lookups fall back to scanning",
+                        )
+                        .file(&file),
+                    );
+                }
+                "none".to_string()
+            }
+            Err(e @ Error::Unsupported(_)) => {
+                run.add(Issue::warning(e.to_string()).file(&file));
+                "not used".to_string()
+            }
+            Err(e) => {
+                run.add(Issue::error(e.to_string()).file(&file));
+                "unreadable".to_string()
+            }
+            Ok(Some(f)) => {
+                if let Some(mismatch) =
+                    crate::reifiers::metadata_mismatch(dir, &f, recorded.as_ref())
+                {
+                    run.add(Issue::error(mismatch).file(&file));
+                }
+                if !self.full {
+                    format!("{} entries, {} bytes", f.entries(), f.bytes())
+                } else {
+                    match crate::reifiers::verify(dir, fsst, MAX_ISSUES) {
+                        Ok((problems, summary)) => {
+                            for p in problems {
+                                run.add(Issue::error(p).file(&file));
+                            }
+                            summary
+                        }
+                        Err(e) => {
+                            run.add(Issue::error(e.to_string()).file(&file));
+                            "unreadable".to_string()
+                        }
+                    }
+                }
+            }
         };
         self.checks.push(run.done(summary));
     }

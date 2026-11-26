@@ -202,6 +202,10 @@ pub struct IndexMeta {
     /// the member ignore it, and the file next to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patterns: Option<crate::patterns::PatternInfo>,
+    /// The generation's reifier proposition-term index (`reifiers.bin`). Absent in
+    /// generations written before item 766.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reifiers: Option<crate::reifiers::ReifierInfo>,
     /// The features of the generation that every reader of its format does not read
     /// (spec X11 §7.1), such as [`FEATURE_FSST_VOCAB`]. The list is always present from
     /// format 5, empty for a generation without one, and a reader refuses a generation
@@ -780,6 +784,10 @@ impl Builder {
             .find(&id::iri_key(oxrdf::vocab::rdf::TYPE.as_str()))
             .ok()
             .map(|i| Id::vocab(i).0);
+        let rdf_reifies = vocab
+            .find(crate::reifiers::RDF_REIFIES_KEY)
+            .ok()
+            .map(Id::vocab);
         drop(vocab);
         let plan = Plan::new(self.named_graphs.load(Ordering::Relaxed));
         let mut built = if total_in as usize <= self.opts.sort_mem_quads {
@@ -840,6 +848,19 @@ impl Builder {
             }
             None => crate::patterns::PatternInfo::skipped("turned off for this build"),
         };
+        let reifiers = if rdf_reifies.is_some() {
+            self.interrupted()?;
+            self.report("writing reifier index");
+            let vocab = Vocab::open_codec(&self.dir, fsst)?;
+            let pos = crate::index::PermIndex::open(&self.dir, Perm::Pos)?;
+            let info = crate::reifiers::build(&self.dir, &vocab, &pos, rdf_reifies, &|| {
+                self.interrupted()
+            })?;
+            self.phase_done("reifier index");
+            info
+        } else {
+            crate::reifiers::ReifierInfo::empty()
+        };
 
         let features: Vec<String> = match self.opts.vocab_codec.unwrap_or_default() {
             VocabCodec::Front => Vec::new(),
@@ -854,6 +875,7 @@ impl Builder {
             prefixes: std::mem::take(&mut *self.prefixes.lock()),
             created: now_rfc3339(),
             patterns: Some(patterns),
+            reifiers: Some(reifiers),
         };
         crate::store::write_synced(
             &self.dir.join("stats.json"),

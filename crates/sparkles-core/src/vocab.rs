@@ -2005,17 +2005,118 @@ impl Vocab {
     pub(crate) fn find_with_controlled_capacity<E: From<crate::error::Error>>(
         &self,
         key: &[u8],
-        grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
-        settled: impl FnMut(usize) -> std::result::Result<(), E>,
-        checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
+        mut grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
+        mut settled: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
     ) -> std::result::Result<std::result::Result<u64, u64>, E> {
-        let mut scratch = ControlledScratch {
-            grow,
-            settled,
-            checkpoint,
-        };
+        let (mut lo, mut hi) = (0usize, self.num_blocks());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if compare_prepared_bytes(self.block_first(mid), key, &mut checkpoint)?.is_le() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            checkpoint("completed vocabulary search")?;
+            return Ok(Err(0));
+        }
+        let b = lo - 1;
         let _timer = ioacct::timer(Phase::VocabRead);
-        self.find_with::<true, _, E>(key, &mut scratch)
+        let data = self.data.as_slice();
+        let mut position = self.block_offset(b);
+        let count = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
+        let prefix_cap = key.len().saturating_add(1);
+        let mut actual = Vec::new();
+        let read_entry = |position: &mut usize, first| {
+            if self.fsst.is_some() {
+                self.entry::<true>(data, position, first)
+            } else {
+                self.entry::<false>(data, position, first)
+            }
+        };
+        ioacct::vocab_blocks_scanned(1);
+        self.touch_block(b);
+        let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
+        for at in 0..count {
+            checkpoint("reconstructing vocabulary entry")?;
+            let id = (b * FC_BLOCK + at) as u64;
+            let entry = read_entry(&mut position, at == 0);
+            // Only the first `key.len() + 1` bytes of each sorted block entry are needed
+            // to determine exact ordering against `key` and to supply prefixes for later
+            // entries that diverge within `key.len()`. When `entry.shared >= prefix_cap`,
+            // the previous entry was already `< key` with length >= `prefix_cap`, so
+            // `entry` shares that differing prefix and is guaranteed `< key`.
+            if entry.shared >= prefix_cap {
+                continue;
+            }
+            actual.truncate(entry.shared);
+            let prefix = actual.len();
+            let want = prefix_cap - prefix;
+            let suffix = &data[entry.start..entry.start + entry.len];
+            let coded = entry.coded.then(|| {
+                self.fsst
+                    .as_ref()
+                    .expect("coded vocabulary metadata")
+                    .table(id)
+            });
+            let add = if let Some(table) = coded {
+                table.measure_prefix_controlled(
+                    suffix,
+                    want,
+                    |length| {
+                        let new = prefix.checked_add(length).ok_or_else(|| {
+                            crate::error::Error::invalid("vocabulary scratch overflows")
+                        })?;
+                        if new > actual.capacity() {
+                            grow(actual.capacity(), new)?;
+                        }
+                        Ok(())
+                    },
+                    &mut checkpoint,
+                )?
+            } else {
+                entry.len.min(want)
+            };
+            let total = prefix
+                .checked_add(add)
+                .ok_or_else(|| crate::error::Error::invalid("vocabulary scratch overflows"))?;
+            if total > actual.capacity() {
+                grow(actual.capacity(), total)?;
+                actual
+                    .try_reserve_exact(total - actual.len())
+                    .map_err(|_| crate::error::Error::invalid("vocabulary allocation failed"))?;
+                if actual.capacity() != total {
+                    return Err(crate::error::Error::invalid(
+                        "unsupported vocabulary scratch capacity",
+                    )
+                    .into());
+                }
+                settled(actual.capacity())?;
+            }
+            if let Some(table) = coded {
+                table.decode_controlled(suffix, add, &mut actual, &mut checkpoint)?;
+            } else {
+                for chunk in suffix[..add].chunks(1024) {
+                    actual.extend_from_slice(chunk);
+                    checkpoint("copying vocabulary suffix")?;
+                }
+            }
+            match compare_prepared_bytes(&actual, key, &mut checkpoint)? {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => {
+                    result = Ok(id);
+                    break;
+                }
+                std::cmp::Ordering::Greater => {
+                    result = Err(id);
+                    break;
+                }
+            }
+        }
+        checkpoint("completed vocabulary search")?;
+        Ok(result)
     }
 
     /// A serializer that already prefetched these blocks does not need dense hints
@@ -4992,6 +5093,70 @@ mod tests {
                     )
                     .unwrap(),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_find_bounds_prefix_with_giant_block_neighbors() {
+        let prefix = "a".repeat(120_000);
+        let giant1 = format!("(<urn:long:{prefix}1> <urn:p> <urn:o>)").into_bytes();
+        let giant2 = format!("(<urn:long:{prefix}2> <urn:p> <urn:o>)").into_bytes();
+        let target = crate::reifiers::RDF_REIFIES_KEY.to_vec();
+        let later = b"<urn:z_later>".to_vec();
+        let mut keys = vec![
+            giant1.clone(),
+            giant2.clone(),
+            target.clone(),
+            later.clone(),
+        ];
+        keys.sort();
+        assert!(keys.len() < FC_BLOCK, "all keys must share block 0");
+
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let vocab = Vocab::open(dir.path()).unwrap();
+
+            // Present short key after two giant triple terms sharing a 120 KiB prefix.
+            let mut peak = 0usize;
+            let found = vocab
+                .find_with_controlled_capacity(
+                    &target,
+                    |_old, new| {
+                        peak = peak.max(new);
+                        Ok::<(), crate::Error>(())
+                    },
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(found, vocab.find(&target), "fsst={fsst}");
+            assert!(
+                peak <= target.len() + 1,
+                "fsst={fsst}: controlled find requested {peak} bytes for a {}-byte key",
+                target.len()
+            );
+
+            // Absent short key sorting between giant triple terms and a later IRI.
+            let absent = b"<http://www.w3.org/1999/02/22-rdf-syntax-ns#absent>";
+            let mut absent_peak = 0usize;
+            let miss = vocab
+                .find_with_controlled_capacity(
+                    absent,
+                    |_old, new| {
+                        absent_peak = absent_peak.max(new);
+                        Ok::<(), crate::Error>(())
+                    },
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(miss, vocab.find(absent), "fsst={fsst}");
+            assert!(
+                absent_peak <= absent.len() + 1,
+                "fsst={fsst}: absent controlled find requested {absent_peak} bytes for a {}-byte key",
+                absent.len()
             );
         }
     }

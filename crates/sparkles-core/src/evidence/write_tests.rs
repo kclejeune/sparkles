@@ -301,9 +301,9 @@ fn reifiers_about_charges_the_identities_it_returns() {
         Ok(out)
     };
     assert_eq!(scan(16 << 20).unwrap().len(), 400);
-    // one scan keeps about 75 KiB of identities beside 64 KiB of rows, so it fits in
-    // 176 KiB, and two scans that keep the first one's identities do not
-    let one = Preparation::new(crate::task::Control::none(), 176 << 10).unwrap();
+    // one indexed lookup keeps about 75 KiB of identities beside ~14 KiB of matched ids,
+    // so it fits in 128 KiB, and two lookups that keep the first one's identities do not
+    let one = Preparation::new(crate::task::Control::none(), 128 << 10).unwrap();
     let mut reads = Reads::new(&one, &snap);
     let mut held = one.reserve(0).unwrap();
     assert!(
@@ -318,7 +318,7 @@ fn reifiers_about_charges_the_identities_it_returns() {
             .is_ok()
     );
     drop(held);
-    assert!(matches!(scan(176 << 10), Err(Error::BudgetExceeded(_))));
+    assert!(matches!(scan(128 << 10), Err(Error::BudgetExceeded(_))));
 }
 
 /// Each identity a `Reads` caches, found or not, is charged to its preparation.
@@ -476,4 +476,519 @@ fn plan_held_collects_local_and_cross_dataset_stored_facts_sorted_by_dataset() {
     expected.sort();
     assert_eq!(p.held_in(), expected);
     assert_eq!(p.held, [local]);
+}
+
+/// The reifier index returns identical subjects across delta writes, full compaction,
+/// base deletions, re-insertions, and persistent reopen, without scanning past a small
+/// fallback limit.
+#[test]
+fn reifiers_about_indexed_matches_across_compaction_deletes_and_large_graphs() {
+    use crate::store::{Store, StoreOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open(tmp.path(), StoreOptions::default()).unwrap();
+    let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+    let lookup = |snap: &Snapshot, entities: &[&str]| -> (Vec<String>, bool) {
+        let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+        let mut reads = Reads::new(&prep, snap);
+        let mut held = prep.reserve(0).unwrap();
+        let wanted: BTreeSet<String> = entities.iter().map(|e| e.to_string()).collect();
+        let (rows, more) = reads
+            .reifiers_about(reifies, "urn:g", &wanted, 5, &mut held)
+            .unwrap();
+        let mut names: Vec<String> = rows.into_iter().map(|n| n.into_string()).collect();
+        names.sort();
+        (names, more)
+    };
+
+    // Uncompacted delta: 20 unrelated quads + 2 matching claims (well past scan=5)
+    let mut data = String::from("INSERT DATA { GRAPH <urn:g> {");
+    for i in 0..20 {
+        data.push_str(&format!(
+            " <urn:other:{i}> <{reifies}> <<( <urn:u{i}> <urn:p> <urn:v{i}> )>> ."
+        ));
+    }
+    data.push_str(&format!(
+        " <urn:c1> <{reifies}> <<( <urn:target> <urn:p> <urn:o1> )>> .\
+          <urn:c2> <{reifies}> <<( <urn:s2> <urn:p> <urn:target> )>> .\
+          <urn:c3> <{reifies}> <<( <urn:s3> <urn:target> <urn:o3> )>> . }} }}"
+    ));
+    crate::sparql::update::update(&s, &data, &crate::sparql::QueryOptions::default()).unwrap();
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c1".into(), "urn:c2".into()], false)
+    );
+
+    // Full compaction writes reifiers.bin and preserves exact results
+    s.compact().unwrap();
+    assert!(s.snapshot().generation.reifiers.file.is_some());
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c1".into(), "urn:c2".into()], false)
+    );
+
+    // Delete a base reifier and insert a delta reifier in the same graph
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "DELETE DATA {{ GRAPH <urn:g> {{ <urn:c1> <{reifies}> <<( <urn:target> <urn:p> <urn:o1> )>> }} }};\
+             INSERT DATA {{ GRAPH <urn:g> {{ <urn:c4> <{reifies}> <<( <urn:target> <urn:p> <urn:target> )>> }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c2".into(), "urn:c4".into()], false)
+    );
+
+    // Re-insert the deleted base reifier (clears delta.del) and delete the delta reifier
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c1> <{reifies}> <<( <urn:target> <urn:p> <urn:o1> )>> }} }};\
+             DELETE DATA {{ GRAPH <urn:g> {{ <urn:c4> <{reifies}> <<( <urn:target> <urn:p> <urn:target> )>> }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c1".into(), "urn:c2".into()], false)
+    );
+
+    // Reopen persistent store and check
+    drop(s);
+    let s = Store::open(tmp.path(), StoreOptions::default()).unwrap();
+    assert!(s.snapshot().generation.reifiers.file.is_some());
+    assert_eq!(
+        lookup(&s.snapshot(), &["urn:target"]),
+        (vec!["urn:c1".into(), "urn:c2".into()], false)
+    );
+}
+
+#[test]
+fn reifiers_about_indexed_rejects_synthetic_hash_collision() {
+    use crate::store::{Store, StoreOptions};
+    let s = Store::in_memory(StoreOptions::default());
+    let reifies = crate::reifiers::RDF_REIFIES;
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{\
+             <urn:c_other> <{reifies}> <<( <urn:other_s> <urn:p> <urn:other_o> )>> .\
+             <urn:c_match> <{reifies}> <<( <urn:target> <urn:p> <urn:o> )>> . }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let mut snap = (*s.snapshot()).clone();
+    let g_id = snap.lookup_iri("urn:g").unwrap();
+    let c_other_id = snap.lookup_iri("urn:c_other").unwrap();
+    let other_tt = snap
+        .lookup_term(&Term::Triple(Box::new(Triple::new(
+            iri("urn:other_s"),
+            iri("urn:p"),
+            iri("urn:other_o"),
+        ))))
+        .unwrap();
+    // Inject a synthetic hash-collision key for <urn:target> pointing at c_other's valid
+    // rdf:reifies quad (whose triple term does not mention <urn:target>).
+    let target_hash = crate::reifiers::term_hash(b"urn:target");
+    snap.delta
+        .reifiers_ins
+        .insert([g_id.0, target_hash, c_other_id.0, other_tt.0]);
+
+    let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+    let mut reads = Reads::new(&prep, &snap);
+    let mut held = prep.reserve(0).unwrap();
+    let wanted: BTreeSet<String> = ["urn:target".to_string()].into();
+    let (rows, more) = reads
+        .reifiers_about(reifies, "urn:g", &wanted, 100, &mut held)
+        .unwrap();
+    assert!(!more);
+    assert_eq!(
+        rows.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+        vec!["urn:c_match"]
+    );
+}
+
+#[test]
+fn reifiers_about_indexed_respects_triple_masks_on_base_and_delta() {
+    use crate::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    use crate::access::{GraphAccess, Graphs};
+    use crate::index::Perm;
+    use crate::store::{Store, StoreOptions};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open(tmp.path(), StoreOptions::default()).unwrap();
+    let reifies = crate::reifiers::RDF_REIFIES;
+    // Base reifier in gen-0001 after compaction.
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{\
+             <urn:c_base> <{reifies}> <<( <urn:target> <urn:p> <urn:o1> )>> . }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    s.compact().unwrap();
+    assert!(s.snapshot().generation.reifiers.file.is_some());
+
+    // Delta reifier in the same graph.
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{\
+             <urn:c_delta> <{reifies}> <<( <urn:target> <urn:p> <urn:o2> )>> . }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let snap = s.snapshot();
+    assert!(!snap.delta.reifiers_ins.is_empty());
+
+    let lookup = |view: &Snapshot| -> Vec<String> {
+        let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+        let mut reads = Reads::new(&prep, view);
+        let mut held = prep.reserve(0).unwrap();
+        let wanted: BTreeSet<String> = ["urn:target".to_string()].into();
+        let (rows, more) = reads
+            .reifiers_about(reifies, "urn:g", &wanted, 100, &mut held)
+            .unwrap();
+        assert!(!more);
+        let mut names: Vec<String> = rows.into_iter().map(|n| n.into_string()).collect();
+        names.sort();
+        names
+    };
+    assert_eq!(lookup(&snap), vec!["urn:c_base", "urn:c_delta"]);
+
+    // 1. Legacy triple mask hiding both the base and delta rdf:reifies quads.
+    let mut hidden = Vec::new();
+    snap.for_each_quad(|q| {
+        if q[1] == snap.lookup_iri(reifies).unwrap() {
+            hidden.push(Perm::Spo.to_key(q));
+        }
+        Ok(())
+    })
+    .unwrap();
+    hidden.sort_unstable();
+    assert_eq!(hidden.len(), 2);
+    let legacy_masked = crate::access::triples::apply(&snap, hidden, "mask-reifies".into());
+    assert!(
+        legacy_masked.delta.reifiers_ins.is_empty(),
+        "legacy mask should remove hidden delta entries from reifiers_ins"
+    );
+    assert!(lookup(&legacy_masked).is_empty());
+
+    // 2. Controlled triple mask hiding rdf:reifies via GraphAccess rule.
+    let access = GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::none(),
+        TripleRules {
+            rules: vec![Rule {
+                protection: std::sync::Arc::new(Protection {
+                    name: "hide-reifies".into(),
+                    predicates: Some(vec![reifies.into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    );
+    let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+    let prepared = crate::access::triples::controlled::prepare(&access, &snap, &prep).unwrap();
+    assert!(
+        prepared.snapshot().delta.reifiers_ins.is_empty(),
+        "controlled mask should remove hidden delta entries from reifiers_ins"
+    );
+    assert!(lookup(prepared.snapshot()).is_empty());
+}
+
+#[test]
+fn reifiers_partial_compaction_rebuilds_and_removes_index() {
+    use crate::store::{CompactOptions, PartialMode, Store, StoreOptions};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open(tmp.path(), StoreOptions::default()).unwrap();
+    let reifies = crate::reifiers::RDF_REIFIES;
+    // Seed base vocabulary with all terms that subsequent partial-compaction edits reuse.
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{\
+             <urn:c1> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> .\
+             <urn:c2> <{reifies}> <<( <urn:e2> <urn:p> <urn:o2> )>> .\
+             <urn:c3> <urn:unused> <<( <urn:e1> <urn:p> <urn:o2> )>> . }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    s.compact().unwrap();
+    assert!(s.snapshot().generation.reifiers.file.is_some());
+
+    let lookup = |snap: &Snapshot, entity: &str| -> Vec<String> {
+        let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+        let mut reads = Reads::new(&prep, snap);
+        let mut held = prep.reserve(0).unwrap();
+        let wanted: BTreeSet<String> = [entity.to_string()].into();
+        let (rows, more) = reads
+            .reifiers_about(reifies, "urn:g", &wanted, 100, &mut held)
+            .unwrap();
+        assert!(!more);
+        let mut names: Vec<String> = rows.into_iter().map(|n| n.into_string()).collect();
+        names.sort();
+        names
+    };
+
+    // Edit using only existing base vocabulary IDs so PartialMode::Always runs partial compaction.
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "DELETE DATA {{ GRAPH <urn:g> {{ <urn:c1> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> }} }};\
+             INSERT DATA {{ GRAPH <urn:g> {{ <urn:c3> <{reifies}> <<( <urn:e1> <urn:p> <urn:o2> )>> }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let rep = s
+        .compact_with(&CompactOptions {
+            partial: Some(PartialMode::Always),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rep.mode, "partial", "{rep:?}");
+    assert!(s.snapshot().generation.reifiers.file.is_some());
+    assert_eq!(lookup(&s.snapshot(), "urn:e1"), vec!["urn:c3"]);
+    assert_eq!(lookup(&s.snapshot(), "urn:e2"), vec!["urn:c2"]);
+    let gdir = s.snapshot().generation.dir.clone().unwrap();
+    let (problems, _) = crate::reifiers::verify(&gdir, false, 10).unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
+
+    // Delete all remaining reifiers and run partial compaction: reifiers.bin should be absent.
+    crate::sparql::update::update(
+        &s,
+        &format!(
+            "DELETE DATA {{ GRAPH <urn:g> {{\
+             <urn:c2> <{reifies}> <<( <urn:e2> <urn:p> <urn:o2> )>> .\
+             <urn:c3> <{reifies}> <<( <urn:e1> <urn:p> <urn:o2> )>> }} }}"
+        ),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let rep = s
+        .compact_with(&CompactOptions {
+            partial: Some(PartialMode::Always),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rep.mode, "partial", "{rep:?}");
+    assert!(s.snapshot().generation.reifiers.file.is_none());
+    assert!(s.snapshot().generation.reifiers.is_indexed());
+    assert!(lookup(&s.snapshot(), "urn:e1").is_empty());
+    assert!(lookup(&s.snapshot(), "urn:e2").is_empty());
+}
+
+#[test]
+fn reifiers_dvocab_rollback_invalidates_cached_predicate_id() {
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{Store, StoreOptions};
+
+    let reifies = crate::reifiers::RDF_REIFIES;
+    let reifier_quad = oxrdf::Quad::new(
+        iri("urn:c_dry"),
+        iri(reifies),
+        Term::Triple(Box::new(Triple::new(
+            iri("urn:e1"),
+            iri("urn:p"),
+            iri("urn:o1"),
+        ))),
+        GraphName::NamedNode(iri("urn:g")),
+    );
+
+    // 1. Dry-run preview rollback alone (no second rollback before unrelated predicate reuse).
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Store::open(&tmp.path().join("dry"), StoreOptions::default()).unwrap();
+        let mut txn = s.write();
+        let ids = txn
+            .encode_quad(&reifier_quad, &mut Default::default())
+            .unwrap();
+        txn.insert(ids).unwrap();
+        let _preview = txn.preview(crate::preview::DryRun::default()).unwrap();
+
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            s.snapshot().delta.reifiers_ins.is_empty(),
+            "unrelated predicate reusing dry-run rolled-back slot must not populate reifiers_ins"
+        );
+    }
+
+    // 2. Explicit discard_terms rollback alone, followed by live vs reopened parity.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("discard");
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        {
+            let mut txn = s.write();
+            let ids = txn
+                .encode_quad(&reifier_quad, &mut Default::default())
+                .unwrap();
+            txn.insert(ids).unwrap();
+            txn.discard_terms().unwrap();
+        }
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            s.snapshot().delta.reifiers_ins.is_empty(),
+            "unrelated predicate reusing discard_terms slot must not populate reifiers_ins"
+        );
+
+        // Now write a real rdf:reifies quad on the persistent store and compare live vs reopened.
+        crate::sparql::update::update(
+            &s,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c_real> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> }} }}"
+            ),
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let live_keys: Vec<_> = s.snapshot().delta.reifiers_ins.iter().copied().collect();
+        assert_eq!(live_keys.len(), 2);
+        drop(s);
+
+        let reopened = Store::open(&root, StoreOptions::default()).unwrap();
+        let reopened_keys: Vec<_> = reopened
+            .snapshot()
+            .delta
+            .reifiers_ins
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(live_keys, reopened_keys);
+    }
+
+    // 3. Failed transactional load rollback alone (first quad interns rdf:reifies, second fails parse).
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        let bad_nq = format!(
+            "<urn:c_load> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> <urn:g> .\n\
+             not valid nquads\n"
+        );
+        assert!(
+            s.load(&[Source::from_bytes(
+                bad_nq.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .is_err()
+        );
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            s.snapshot().delta.reifiers_ins.is_empty(),
+            "unrelated predicate reusing failed-load rolled-back slot must not populate reifiers_ins"
+        );
+    }
+
+    // 4. Fork an in-memory branch after rollback and verify it did not inherit a stale predicate ID.
+    {
+        let mem_branch = Store::in_memory(StoreOptions::default());
+        {
+            let mut txn = mem_branch.write();
+            let ids = txn
+                .encode_quad(&reifier_quad, &mut Default::default())
+                .unwrap();
+            txn.insert(ids).unwrap();
+            txn.discard_terms().unwrap();
+        }
+        crate::sparql::update::update(
+            &mem_branch,
+            "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        mem_branch
+            .create_branch("dev", &Default::default())
+            .unwrap();
+        let dev = mem_branch.branch("dev").unwrap();
+        crate::sparql::update::update(
+            &dev,
+            "INSERT DATA { GRAPH <urn:g> { <urn:y> <urn:other_pred> <<( <urn:e2> <urn:p> <urn:o2> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(dev.snapshot().delta.reifiers_ins.is_empty());
+    }
+}
+
+#[test]
+fn in_memory_early_write_admission_charges_proposed_reifier_keys() {
+    use crate::Error;
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{ReplaceTarget, Store, StoreOptions};
+
+    let reifies = crate::reifiers::RDF_REIFIES;
+    // One reifier quad with distinct IRI subject & object projects 448 + 128 = 576 bytes.
+    // A cap of 500 sits strictly between the quad-only projection (448) and the full
+    // reifier-aware projection (576), so early admission must refuse before interning terms.
+    let nq = format!("<urn:c1> <{reifies}> <<( <urn:s1> <urn:p> <urn:o1> )>> <urn:g> .\n");
+    let opts = StoreOptions {
+        max_memory_bytes: Some(500),
+        ..Default::default()
+    };
+
+    // 1. Transactional replace.
+    let mem_replace = Store::in_memory(opts.clone());
+    let err = mem_replace
+        .replace(
+            ReplaceTarget::Named(iri("urn:g")),
+            &[Source::from_bytes(
+                nq.as_bytes().to_vec(),
+                RdfFormat::NQuads,
+                None,
+            )],
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::StorageFull(_)), "got {err}");
+    assert!(mem_replace.snapshot().is_empty());
+    assert_eq!(
+        mem_replace.snapshot().generation.dvocab.with(|v| v.len()),
+        0,
+        "early refusal of replace must not leak newly interned terms"
+    );
+
+    // 2. Transactional load.
+    let mem_load = Store::in_memory(opts);
+    let err = mem_load
+        .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+        .unwrap_err();
+    assert!(matches!(err, Error::StorageFull(_)), "got {err}");
+    assert!(mem_load.snapshot().is_empty());
+    assert_eq!(
+        mem_load.snapshot().generation.dvocab.with(|v| v.len()),
+        0,
+        "early refusal of load must not leak newly interned terms"
+    );
 }

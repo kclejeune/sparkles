@@ -503,26 +503,38 @@ impl SnapshotCharge {
 }
 
 // The cache's 448-byte/quad estimate is not an allocation bound: even a one-key
-// KeySet leaf reserves 65 keys. Bounded reads include sparse root capacity and the
-// predicate map as well. Leaves rebalance below 16 keys and branches below eight
-// children; 256 bytes per key plus 8 KiB per tree conservatively covers retained
-// node/vector capacity, Arc headers, and the per-predicate persistent map.
+// KeySet leaf reserves 65 keys. Bounded reads include sparse root capacity, the
+// predicate map, and the eighth `reifiers_ins` tree. Leaves rebalance below 16 keys and
+// branches below eight children; 256 bytes per key plus 8 KiB per tree conservatively
+// covers retained node/vector capacity, Arc headers, and the per-predicate persistent map.
 pub(super) fn preparation_delta_bytes(delta: &Delta) -> u64 {
     let quads = delta.inserts().saturating_add(delta.deletes()) as u64;
-    if quads == 0 {
+    let reifiers = delta.reifiers_ins.len() as u64;
+    if quads == 0 && reifiers == 0 {
         return 0;
     }
-    quads.saturating_mul(2048).saturating_add(128 << 10)
+    let base = quads.saturating_mul(2048).saturating_add(128 << 10);
+    if reifiers == 0 {
+        base
+    } else {
+        base.saturating_add(reifiers.saturating_mul(256))
+            .saturating_add(8 << 10)
+    }
 }
 
-// Mutation may copy/split two paths in each of seven insertion/deletion trees.
-// Count their transient storage while both the seed and working state remain live.
+// Mutation may copy/split paths in the seven insertion/deletion trees plus up to two
+// keys in `reifiers_ins`. Count their transient storage while both the seed and working
+// state remain live.
 pub(super) fn preparation_mutation_bytes(delta: &Delta) -> u64 {
     let quads = (delta.inserts().saturating_add(delta.deletes()) as u64).saturating_add(1);
+    let reifiers = (delta.reifiers_ins.len() as u64).saturating_add(2);
+    let perm_levels = u64::from(quads.ilog2()) / 3 + 2;
+    let reifier_levels = u64::from(reifiers.ilog2()) / 3 + 2;
     preparation_delta_bytes(delta)
-        .saturating_add(2048)
-        .saturating_add((u64::from(quads.ilog2()) / 3 + 2).saturating_mul(64 << 10))
-        .max(128 << 10)
+        .saturating_add(2048 + 512)
+        .saturating_add(perm_levels.saturating_mul(64 << 10))
+        .saturating_add(reifier_levels.saturating_mul(16 << 10))
+        .max(144 << 10)
 }
 
 #[cfg(test)]
@@ -843,5 +855,179 @@ mod tests {
         assert_eq!(history.misses, 1);
         assert_eq!(history.materializations, 0);
         assert!(history.cache.is_empty());
+    }
+
+    #[test]
+    fn historical_reifier_replay_dvocab_wait_observes_cancel_and_no_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(root.path(), StoreOptions::default()).unwrap());
+        let reifies = crate::reifiers::RDF_REIFIES;
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c1> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c2> <{reifies}> <<( <urn:e2> <urn:p> <urn:o2> )>> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let snapshot = store.snapshot();
+        // Hold dvocab write lock and call apply_forward directly with a ReadLimit to ensure
+        // reifier triple-term hashing acquires dvocab through controlled read_lock.
+        let held = snapshot.generation.dvocab.write_guard_for_test();
+        let wal_path = snapshot.generation.dir.as_ref().unwrap().join("wal.log");
+        let end = super::super::wal::WalPoint {
+            seq: snapshot.commit,
+            offset: std::fs::metadata(&wal_path).unwrap().len(),
+        };
+        let start = super::super::wal::WalPoint { seq: 0, offset: 0 };
+        let generation = snapshot.generation.clone();
+        let cache = snapshot.cache.clone();
+
+        // 1. Cancellation while dvocab write lock is held.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let gen_clone = generation.clone();
+        let cache_clone = cache.clone();
+        let wal_clone = wal_path.clone();
+        let task = std::thread::spawn(move || {
+            let options = HistoryOptions {
+                cancel: Some(signal),
+                deadline: None,
+            };
+            let limit = ReadLimit {
+                options: &options,
+                memory: Some(4 << 20),
+                held: 0,
+            };
+            let mut delta = Delta::default();
+            let res = super::super::wal::apply_forward(
+                &wal_clone,
+                &gen_clone,
+                &cache_clone,
+                &mut delta,
+                start,
+                end,
+                &limit,
+            );
+            send.send(res).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        cancel.store(true, Ordering::Relaxed);
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        assert!(matches!(result, Ok(Err(Error::Cancelled))));
+        drop(held);
+        task.join().unwrap();
+
+        // 2. no_wait refuses immediately while dvocab write lock is held.
+        struct NoWaitControl;
+        impl ReadControl for NoWaitControl {
+            fn check_read(&self) -> Result<()> {
+                Ok(())
+            }
+            fn no_wait(&self) -> bool {
+                true
+            }
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+        let held = snapshot.generation.dvocab.write_guard_for_test();
+        let control = NoWaitControl;
+        let limit = ReadLimit {
+            options: &control,
+            memory: Some(4 << 20),
+            held: 0,
+        };
+        let mut delta = Delta::default();
+        let err = super::super::wal::apply_forward(
+            &wal_path,
+            &generation,
+            &cache,
+            &mut delta,
+            start,
+            end,
+            &limit,
+        )
+        .unwrap_err();
+        drop(held);
+        assert!(
+            err.to_string().contains("no_wait"),
+            "expected no_wait refusal, got {err}"
+        );
+    }
+
+    #[test]
+    fn preparation_delta_and_mutation_bounds_cover_reifier_tree_splits() {
+        let store = Store::in_memory(StoreOptions::default());
+        let reifies = crate::reifiers::RDF_REIFIES;
+        // Seed one completely full 64-key leaf (32 distinct two-key reifiers) so the next
+        // two-key insert with a live cloned seed deterministically splits the leaf and
+        // grows `reifiers_ins` from depth 1 to depth 2.
+        let mut data = String::from("INSERT DATA { GRAPH <urn:g> {");
+        for i in 0..32u32 {
+            data.push_str(&format!(
+                " <urn:c{i}> <{reifies}> <<( <urn:s{i}> <urn:p> <urn:o{i}> )>> ."
+            ));
+        }
+        data.push_str(" } }");
+        crate::sparql::update::update(&store, &data, &Default::default()).unwrap();
+        let seed = store.snapshot();
+        assert_eq!(seed.delta.reifiers_ins.len(), 64);
+        assert_eq!(seed.delta.reifiers_ins.depth(), 1);
+
+        let before_mutation = preparation_mutation_bytes(&seed.delta);
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c32> <{reifies}> <<( <urn:s32> <urn:p> <urn:o32> )>> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let after = store.snapshot();
+        assert_eq!(after.delta.reifiers_ins.len(), 66);
+        assert_eq!(
+            after.delta.reifiers_ins.depth(),
+            2,
+            "65th key must split the full 64-key leaf into a depth-2 tree"
+        );
+        // Keep `seed` live while measuring unshared nodes copied/split in `after.delta`.
+        let (unshared, _) = after.delta.unshared_bytes(|| Ok(())).unwrap();
+        assert!(
+            unshared <= before_mutation,
+            "unshared={unshared} exceeded preparation_mutation_bytes={before_mutation}"
+        );
+        assert!(
+            preparation_delta_bytes(&after.delta) > preparation_delta_bytes(&seed.delta),
+            "retained delta estimate must grow with reifiers_ins"
+        );
+        // Compare against an identical-quad-count delta with no reifiers.
+        let plain = Store::in_memory(StoreOptions::default());
+        let mut plain_data = String::from("INSERT DATA { GRAPH <urn:g> {");
+        for i in 0..33u32 {
+            plain_data.push_str(&format!(" <urn:c{i}> <urn:plain> <urn:v{i}> ."));
+        }
+        plain_data.push_str(" } }");
+        crate::sparql::update::update(&plain, &plain_data, &Default::default()).unwrap();
+        let plain_snap = plain.snapshot();
+        assert_eq!(after.delta.inserts(), plain_snap.delta.inserts());
+        assert!(
+            preparation_delta_bytes(&after.delta) > preparation_delta_bytes(&plain_snap.delta),
+            "claim delta should charge more than equal-quad non-claim delta"
+        );
+        assert!(
+            super::super::delta_bytes(&after.delta) > super::super::delta_bytes(&plain_snap.delta),
+            "delta_bytes should charge reifiers_ins"
+        );
+        drop(seed);
     }
 }

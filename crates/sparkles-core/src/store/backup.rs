@@ -2836,6 +2836,7 @@ mod tests {
             "prefixes",
             "created",
             "patterns",
+            "reifiers",
             "features",
         ] {
             let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
@@ -2856,6 +2857,14 @@ mod tests {
                     changed[field] = serde_json::to_value(crate::patterns::PatternInfo::skipped(
                         "fingerprint-test-replacement",
                     ))
+                    .unwrap()
+                }
+                "reifiers" => {
+                    changed[field] = serde_json::to_value(crate::reifiers::ReifierInfo {
+                        format: crate::reifiers::VERSION,
+                        entries: 1,
+                        bytes: 88,
+                    })
                     .unwrap()
                 }
                 "features" => {
@@ -2900,6 +2909,53 @@ mod tests {
         );
         assert_eq!(leases(&store), 0);
         assert_eq!(preparation.room(), room);
+    }
+
+    #[test]
+    fn backup_and_restore_preserve_nonempty_reifier_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let store = Store::open(&src, StoreOptions::default()).unwrap();
+        let reifies = crate::reifiers::RDF_REIFIES;
+        upd(
+            &store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{\
+                 <urn:c1> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> .\
+                 <urn:c2> <{reifies}> <<( <urn:e2> <urn:p> <urn:o2> )>> . }} }}"
+            ),
+        );
+        store.compact().unwrap();
+        assert!(store.snapshot().generation.reifiers.file.is_some());
+
+        let capture = store.backup_capture("reifiers-roundtrip").unwrap();
+        let gen_name = store.snapshot().generation.name.clone();
+        assert!(
+            capture
+                .file(&format!("{gen_name}/{}", crate::reifiers::FILE))
+                .is_some(),
+            "persistent backup capture should include reifiers.bin"
+        );
+        capture.write_to(&dst).unwrap();
+        drop(capture);
+
+        let restored = Store::open(&dst, StoreOptions::default()).unwrap();
+        let snap = restored.snapshot();
+        assert!(snap.generation.reifiers.file.is_some());
+        assert!(snap.generation.reifiers.is_indexed());
+        let prep = crate::access::Preparation::new(crate::task::Control::none(), 16 << 20).unwrap();
+        let mut reads = crate::evidence::write::Reads::new(&prep, &snap);
+        let mut held = prep.reserve(0).unwrap();
+        let wanted: std::collections::BTreeSet<String> = ["urn:e1".to_string()].into();
+        let (rows, more) = reads
+            .reifiers_about(reifies, "urn:g", &wanted, 10, &mut held)
+            .unwrap();
+        assert!(!more);
+        assert_eq!(
+            rows.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+            vec!["urn:c1"]
+        );
     }
 
     #[cfg(unix)]

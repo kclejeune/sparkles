@@ -721,3 +721,71 @@ async fn declared_drift_refuses_policy_recall() {
     let r = recall(&s, "evr", json!({"seeds": ["urn:release"]})).await;
     assert_eq!(r["isError"], false, "{r}");
 }
+
+/// Recall over a compacted store with many unrelated claims finds only the matching
+/// occurrences through the reifier index, combining base (`reifiers.bin`) and delta claims.
+#[tokio::test]
+async fn recall_uses_reifier_index_across_compacted_base_and_delta() {
+    let s = server(true);
+    let ds = dataset(&s);
+    ds.update(
+        "INSERT DATA { <urn:release> <http://www.w3.org/2000/01/rdf-schema#label> \"Rel 1\" }",
+    )
+    .unwrap();
+    // Many unrelated claims plus one matching claim, then compact into reifiers.bin
+    for i in 0..40 {
+        propose(
+            &ds,
+            &format!("noise-{i}"),
+            Triple::new(
+                iri(&format!("urn:noise:s{i}")),
+                iri("urn:p"),
+                iri(&format!("urn:noise:o{i}")),
+            ),
+            Polarity::Positive,
+        );
+    }
+    let c_base = propose(&ds, "advisory-base", affected(), Polarity::Positive);
+    accept(&ds, &c_base);
+    ds.compact().unwrap();
+    assert!(ds.store().snapshot().generation.reifiers.file.is_some());
+
+    // Add a delta claim matching urn:release as the proposition object
+    let c_delta = propose(
+        &ds,
+        "advisory-delta",
+        Triple::new(
+            iri("urn:component"),
+            iri("urn:shippedIn"),
+            iri("urn:release"),
+        ),
+        Polarity::Negative,
+    );
+
+    let r = recall(
+        &s,
+        "evr",
+        json!({"seeds": ["urn:release"], "reviewPolicy": "main", "format": "json"}),
+    )
+    .await;
+    assert_eq!(r["isError"], false, "{r}");
+    let body: serde_json::Value =
+        serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    let occs = body["claims"]["occurrences"].as_array().unwrap();
+    let mut found: Vec<(String, String)> = occs
+        .iter()
+        .map(|o| {
+            (
+                o["claim"].as_str().unwrap().to_owned(),
+                o["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    found.sort();
+    let mut expected = vec![
+        (c_base.0.to_string(), "accepted".to_owned()),
+        (c_delta.0.to_string(), "unreviewed".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(found, expected);
+}

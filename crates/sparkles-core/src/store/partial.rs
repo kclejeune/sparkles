@@ -455,6 +455,17 @@ pub(crate) fn write(
             stats.quads
         )));
     }
+    let rdf_reifies = g
+        .vocab
+        .find(crate::reifiers::RDF_REIFIES_KEY)
+        .ok()
+        .map(Id::vocab);
+    let reifiers = if rdf_reifies.is_some() {
+        let pos = crate::index::PermIndex::open(dir, Perm::Pos)?;
+        crate::reifiers::build(dir, &g.vocab, &pos, rdf_reifies, &|| interrupt())?
+    } else {
+        crate::reifiers::ReifierInfo::empty()
+    };
     // the vocabulary is copied, and with it its features
     let features = g.meta.features.clone();
     let meta = IndexMeta {
@@ -466,6 +477,7 @@ pub(crate) fn write(
         prefixes,
         created: crate::builder::now_rfc3339(),
         patterns: Some(patterns),
+        reifiers: Some(reifiers),
     };
     write_synced(
         &dir.join("stats.json"),
