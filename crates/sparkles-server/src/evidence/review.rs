@@ -438,10 +438,7 @@ pub(super) fn rebuild_identities_now(
     if p.restricted(&here) {
         return Err(err(
             StatusCode::FORBIDDEN,
-            format!(
-                "rebuilding a resolution map needs unrestricted admin access on /{}",
-                prepared.main.name
-            ),
+            format!("rebuilding a resolution map needs unrestricted admin access on /{here}"),
         ));
     }
     let rebuilt = sparkles::evidence::rebuild_resolution_map(

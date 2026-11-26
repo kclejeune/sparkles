@@ -936,3 +936,187 @@ async fn identity_map_rebuild_requires_admin() {
     assert_eq!(r.json()["committed"], true);
     assert_eq!(r.json()["number"], 1);
 }
+
+/// `POST /$/evidence/{ds}/identities/rebuild` refuses restricted admins (including
+/// branch-scoped error formatting), allows branch-scoped unrestricted admins only on their
+/// branch, and refuses on a read-only server.
+#[tokio::test]
+async fn identity_map_rebuild_enforces_restricted_branch_and_read_only_admin() {
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[users]]
+name = "devadmin"
+password = "{devadmin}"
+[[users.grants]]
+dataset = "ev"
+level = "admin"
+branches = ["dev"]
+"#,
+            devadmin = h("devadmin-pw"),
+        ),
+        ..Default::default()
+    });
+    let alice = b("alice");
+    let devadmin = basic("devadmin", "devadmin-pw");
+    s.state.attach("ev", DbType::Persistent, None).unwrap();
+    let settings_body = serde_json::json!({
+        "format": 1, "profile": 1, "enabled": true,
+        "sourceRecords": ["urn:ev:sources"], "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "identity": ["urn:ev:identity", "urn:ev:maps"],
+        "projections": ["urn:ev:map"],
+        "matchingPolicies": {"people": {
+            "version": 1,
+            "boundary": ["urn:ev:identity", "urn:ev:claims"],
+            "decisions": "urn:ev:decisions",
+            "maps": "urn:ev:maps",
+            "output": "urn:ev:map"
+        }}
+    })
+    .to_string();
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/evidence/ev/settings",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &settings_body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/branches/ev",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        r#"{"name":"dev"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+
+    let req_body = serde_json::json!({"policy": "people"}).to_string();
+    // Restricted admin (hiding graphs) -> 403 on main and 403 naming `/ev@dev` on branch.
+    let mut restricted_admin = crate::auth::Principal::local();
+    restricted_admin.kind = crate::auth::Kind::User;
+    restricted_admin.name = "radmin".into();
+    restricted_admin = restricted_admin.hiding_graphs(&["urn:ev:private".into()]);
+    let exec = |branch: &str| crate::evidence::Execution {
+        branch: branch.into(),
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        deadline: None,
+        grant: None,
+    };
+    let main_err = crate::evidence::execute(
+        "rebuild-identities",
+        s.state.clone(),
+        "ev".into(),
+        restricted_admin.clone(),
+        axum::body::Bytes::from(req_body.clone()),
+        exec(sparkles::branch::MAIN),
+    )
+    .unwrap_err();
+    assert_eq!(main_err.0, StatusCode::FORBIDDEN, "{:?}", main_err.1);
+    let dev_err = crate::evidence::execute(
+        "rebuild-identities",
+        s.state.clone(),
+        "ev".into(),
+        restricted_admin.on_branch(Some("dev")),
+        axum::body::Bytes::from(req_body.clone()),
+        exec("dev"),
+    )
+    .unwrap_err();
+    assert_eq!(dev_err.0, StatusCode::FORBIDDEN, "{:?}", dev_err.1);
+    assert!(
+        dev_err.1.to_string().contains("/ev@dev"),
+        "expected branch name in error: {}",
+        dev_err.1
+    );
+
+    // Branch-scoped unrestricted admin -> refused on main, succeeds on ?branch=dev.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/identities/rebuild",
+        &[
+            ("authorization", &devadmin),
+            ("content-type", "application/json"),
+        ],
+        &req_body,
+    )
+    .await;
+    assert!(
+        matches!(r.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+        "{}: {}",
+        r.status,
+        r.text()
+    );
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/identities/rebuild?branch=dev",
+        &[
+            ("authorization", &devadmin),
+            ("content-type", "application/json"),
+        ],
+        &req_body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["committed"], true);
+
+    // Read-only server refuses rebuild with 403 even for an unrestricted admin.
+    let ro_dir = tempfile::tempdir().unwrap();
+    let mut ro_state = AppState::new(
+        ro_dir.path(),
+        sparkles::store::StoreOptions::default(),
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    ro_state.attach("ev", DbType::Persistent, None).unwrap();
+    let ro_ds = ro_state.get("ev").unwrap();
+    let ev_settings = sparkles::evidence::Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        decisions: vec!["urn:ev:decisions".into()],
+        identity: vec!["urn:ev:identity".into(), "urn:ev:maps".into()],
+        projections: vec!["urn:ev:map".into()],
+        matching_policies: [(
+            "people".to_string(),
+            sparkles::evidence::MatchingPolicy {
+                version: 1,
+                boundary: vec!["urn:ev:identity".into(), "urn:ev:claims".into()],
+                decisions: "urn:ev:decisions".into(),
+                maps: "urn:ev:maps".into(),
+                output: "urn:ev:map".into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    sparkles::evidence::configure(
+        &ro_ds.dataset,
+        &ev_settings,
+        &sparkles::task::Control::none(),
+    )
+    .unwrap();
+    ro_state.read_only = true;
+    let ro_app = crate::http::router(Arc::new(ro_state));
+    let r = call(
+        &ro_app,
+        "POST",
+        "/$/evidence/ev/identities/rebuild",
+        &[("content-type", "application/json")],
+        &req_body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+}

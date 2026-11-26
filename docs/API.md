@@ -13846,8 +13846,10 @@ it answers `422 incomplete-evidence`.
 A map follows the matches of the identity graphs it was built from. When one of them
 leaves the boundary, or is detached and protected again so that its proposals no longer
 authenticate, reviews and reads under the policy answer `503 projection-unavailable`
-until the boundary is restored or an administrator rebuilds the map. A graph added to
-the boundary keeps the map available.
+until the boundary is restored or an administrator rebuilds the map. A new graph added
+to the boundary with no current accepted proposals keeps the map available, while
+re-adding a boundary graph that holds current accepted proposals answers
+`503 projection-unavailable` until rebuilt.
 
 `POST /$/evidence/{ds}/identities/rebuild` rebuilds a matching policy's resolution map
 on `main` or on a selected `?branch=NAME`. It needs unrestricted `admin` on the dataset

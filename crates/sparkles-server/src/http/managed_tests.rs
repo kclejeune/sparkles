@@ -1438,6 +1438,50 @@ async fn identity_map_rebuild_over_http_restores_reviews_reads_and_persists() {
             "{conflict}"
         );
 
+        // Replay of rb-1 (policyVersion: 1) still returns the original receipt after bumping
+        // policy version to 2, while a fresh key with policyVersion: 1 gets policy-changed.
+        let mut bumped = settings_json(&["urn:ev:identity", "urn:ev:claims"]);
+        bumped["matchingPolicies"]["people"]["version"] = json!(2);
+        let (s, j) = call(
+            &app,
+            "PUT",
+            "/$/evidence/d/settings",
+            Some("application/json"),
+            &bumped.to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+        let (s, replay_after_bump) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "policyVersion": 1, "ifHead": head, "idempotencyKey": "rb-1"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{replay_after_bump}");
+        assert_eq!(replay_after_bump["replayed"], true);
+        assert_eq!(replay_after_bump["committed"], false);
+        assert_eq!(replay_after_bump["policyVersion"], 1);
+        assert_eq!(replay_after_bump["revision"], rev3_iri);
+        let (s, stale_v) = post(
+            "/$/evidence/d/identities/rebuild",
+            json!({"policy": "people", "policyVersion": 1, "idempotencyKey": "rb-fresh"}),
+        )
+        .await;
+        assert_eq!(
+            (s, stale_v["code"].as_str()),
+            (StatusCode::CONFLICT, Some("policy-changed")),
+            "{stale_v}"
+        );
+        // Restore version 1 for subsequent steps in this fixture.
+        let (s, j) = call(
+            &app,
+            "PUT",
+            "/$/evidence/d/settings",
+            Some("application/json"),
+            &settings_json(&["urn:ev:identity", "urn:ev:claims"]).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+
         // Reads and reviews succeed again on main.
         let (s, read) = post(
             "/d/claims/identities",
