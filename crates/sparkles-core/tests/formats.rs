@@ -672,6 +672,23 @@ fn damaged_reifier_payload_and_metadata_mismatch_fall_back_and_fail_check() {
     assert!(s.snapshot().generation.reifiers.missing.is_some());
     drop(s);
 
+    // 3b. Missing sidecar with contradictory format-zero metadata and nonzero counts:
+    // checker still warns and runtime still reports the missing file.
+    let mut zero_fmt: serde_json::Value = serde_json::from_slice(&orig_meta).unwrap();
+    zero_fmt["reifiers"] = serde_json::json!({"format": 0, "entries": 4, "bytes": 184});
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&zero_fmt).unwrap()).unwrap();
+    let r = check(&root, &CheckOptions { quick: true }).unwrap();
+    assert_eq!(
+        r.get("reifiers").unwrap().status,
+        Status::Warning,
+        "{}",
+        r.to_text()
+    );
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert!(!s.snapshot().generation.reifiers.is_indexed());
+    assert!(s.snapshot().generation.reifiers.missing.is_some());
+    drop(s);
+
     // 4. Legacy pre-index metadata (no `reifiers` field, no sidecar): opens with fallback and no warning.
     let mut legacy: serde_json::Value = serde_json::from_slice(&orig_meta).unwrap();
     legacy.as_object_mut().unwrap().remove("reifiers");

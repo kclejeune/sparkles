@@ -855,14 +855,7 @@ impl Loaded {
                 })
             }
             Ok(None) => {
-                if quads == 0
-                    || recorded
-                        .is_some_and(|r| r.format == VERSION && r.entries == 0 && r.bytes == 0)
-                {
-                    return Ok(Self::empty());
-                }
                 if let Some(info) = recorded
-                    && info.format > 0
                     && (info.entries > 0 || info.bytes > 0)
                 {
                     let msg = format!(
@@ -877,6 +870,12 @@ impl Loaded {
                         indexed: false,
                         missing: Some(msg),
                     });
+                }
+                if quads == 0
+                    || recorded
+                        .is_some_and(|r| r.format == VERSION && r.entries == 0 && r.bytes == 0)
+                {
+                    return Ok(Self::empty());
                 }
                 // Pre-index generation built before item 766: fall back to scan until compacted.
                 Ok(Self {
@@ -1244,10 +1243,51 @@ mod tests {
         let loaded = Loaded::open(dir.path(), Some(&bad_bytes), 2);
         assert!(loaded.file.is_none() && !loaded.is_indexed() && loaded.missing.is_some());
 
-        // Controlled open propagates cancellation during checksum verification.
-        let err = Loaded::open_controlled(dir.path(), Some(&info), 2, || Err(Error::Cancelled))
-            .unwrap_err();
+        // Controlled open polls cancellation between chunks during checksum verification,
+        // not only at the preflight before opening the file.
+        let big_dir = tempfile::tempdir().unwrap();
+        let big_rows: Vec<Key> = (0..4500u64).map(|i| [1, i, 100 + i, 1000 + i]).collect();
+        let big_info = write_sorted(big_dir.path(), big_rows.len() as u64, |emit| {
+            for &r in &big_rows {
+                emit(r)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            big_info.bytes as usize > HASH_CHECK_CHUNK * 2,
+            "fixture must span multiple 64 KiB checksum chunks"
+        );
+        let mut calls = 0usize;
+        let err = Loaded::open_controlled(
+            big_dir.path(),
+            Some(&big_info),
+            big_rows.len() as u64,
+            || {
+                calls += 1;
+                if calls >= 3 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::Cancelled));
+        assert!(
+            calls >= 3,
+            "expected cancellation after opening and hashing at least one chunk, got calls={calls}"
+        );
+
+        // Missing sidecar with contradictory format-zero metadata and nonzero counts is diagnosed.
+        let missing_dir = tempfile::tempdir().unwrap();
+        let zero_fmt = ReifierInfo {
+            format: 0,
+            entries: 4,
+            bytes: 184,
+        };
+        let loaded = Loaded::open(missing_dir.path(), Some(&zero_fmt), 10);
+        assert!(loaded.file.is_none() && !loaded.is_indexed() && loaded.missing.is_some());
 
         // Flipping one byte inside an entry payload keeps framing valid but fails checksum.
         let path = dir.path().join(FILE);

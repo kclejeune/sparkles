@@ -707,16 +707,11 @@ fn reifiers_partial_compaction_rebuilds_and_removes_index() {
 
 #[test]
 fn reifiers_dvocab_rollback_invalidates_cached_predicate_id() {
+    use crate::io::{RdfFormat, Source};
     use crate::store::{Store, StoreOptions};
 
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("db");
-    let s = Store::open(&root, StoreOptions::default()).unwrap();
     let reifies = crate::reifiers::RDF_REIFIES;
-
-    // 1. Dry-run interns rdf:reifies for the first time, then rolls back on Drop.
-    let mut txn = s.write();
-    let q = oxrdf::Quad::new(
+    let reifier_quad = oxrdf::Quad::new(
         iri("urn:c_dry"),
         iri(reifies),
         Term::Triple(Box::new(Triple::new(
@@ -726,75 +721,182 @@ fn reifiers_dvocab_rollback_invalidates_cached_predicate_id() {
         ))),
         GraphName::NamedNode(iri("urn:g")),
     );
-    let ids = txn.encode_quad(&q, &mut Default::default()).unwrap();
-    txn.insert(ids).unwrap();
-    let _preview = txn.preview(crate::preview::DryRun::default()).unwrap();
 
-    // 2. Also test explicit discard_terms rollback after interning rdf:reifies.
-    let mut txn = s.write();
-    let ids = txn.encode_quad(&q, &mut Default::default()).unwrap();
-    txn.insert(ids).unwrap();
-    txn.discard_terms().unwrap();
-    drop(txn);
+    // 1. Dry-run preview rollback alone (no second rollback before unrelated predicate reuse).
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Store::open(&tmp.path().join("dry"), StoreOptions::default()).unwrap();
+        let mut txn = s.write();
+        let ids = txn
+            .encode_quad(&reifier_quad, &mut Default::default())
+            .unwrap();
+        txn.insert(ids).unwrap();
+        let _preview = txn.preview(crate::preview::DryRun::default()).unwrap();
 
-    // 3. Commit an unrelated predicate (which reuses the rolled-back delta slot) with a triple term.
-    crate::sparql::update::update(
-        &s,
-        "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
-        &crate::sparql::QueryOptions::default(),
-    )
-    .unwrap();
-    assert!(
-        s.snapshot().delta.reifiers_ins.is_empty(),
-        "unrelated predicate reusing rolled-back slot must not populate reifiers_ins"
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            s.snapshot().delta.reifiers_ins.is_empty(),
+            "unrelated predicate reusing dry-run rolled-back slot must not populate reifiers_ins"
+        );
+    }
+
+    // 2. Explicit discard_terms rollback alone, followed by live vs reopened parity.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("discard");
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        {
+            let mut txn = s.write();
+            let ids = txn
+                .encode_quad(&reifier_quad, &mut Default::default())
+                .unwrap();
+            txn.insert(ids).unwrap();
+            txn.discard_terms().unwrap();
+        }
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            s.snapshot().delta.reifiers_ins.is_empty(),
+            "unrelated predicate reusing discard_terms slot must not populate reifiers_ins"
+        );
+
+        // Now write a real rdf:reifies quad on the persistent store and compare live vs reopened.
+        crate::sparql::update::update(
+            &s,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c_real> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> }} }}"
+            ),
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let live_keys: Vec<_> = s.snapshot().delta.reifiers_ins.iter().copied().collect();
+        assert_eq!(live_keys.len(), 2);
+        drop(s);
+
+        let reopened = Store::open(&root, StoreOptions::default()).unwrap();
+        let reopened_keys: Vec<_> = reopened
+            .snapshot()
+            .delta
+            .reifiers_ins
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(live_keys, reopened_keys);
+    }
+
+    // 3. Failed transactional load rollback alone (first quad interns rdf:reifies, second fails parse).
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        let bad_nq = format!(
+            "<urn:c_load> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> <urn:g> .\n\
+             not valid nquads\n"
+        );
+        assert!(
+            s.load(&[Source::from_bytes(
+                bad_nq.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .is_err()
+        );
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            s.snapshot().delta.reifiers_ins.is_empty(),
+            "unrelated predicate reusing failed-load rolled-back slot must not populate reifiers_ins"
+        );
+    }
+
+    // 4. Fork an in-memory branch after rollback and verify it did not inherit a stale predicate ID.
+    {
+        let mem_branch = Store::in_memory(StoreOptions::default());
+        {
+            let mut txn = mem_branch.write();
+            let ids = txn
+                .encode_quad(&reifier_quad, &mut Default::default())
+                .unwrap();
+            txn.insert(ids).unwrap();
+            txn.discard_terms().unwrap();
+        }
+        crate::sparql::update::update(
+            &mem_branch,
+            "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        mem_branch
+            .create_branch("dev", &Default::default())
+            .unwrap();
+        let dev = mem_branch.branch("dev").unwrap();
+        crate::sparql::update::update(
+            &dev,
+            "INSERT DATA { GRAPH <urn:g> { <urn:y> <urn:other_pred> <<( <urn:e2> <urn:p> <urn:o2> )>> } }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(dev.snapshot().delta.reifiers_ins.is_empty());
+    }
+}
+
+#[test]
+fn in_memory_early_write_admission_charges_proposed_reifier_keys() {
+    use crate::Error;
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{ReplaceTarget, Store, StoreOptions};
+
+    let reifies = crate::reifiers::RDF_REIFIES;
+    // One reifier quad with distinct IRI subject & object projects 448 + 128 = 576 bytes.
+    // A cap of 500 sits strictly between the quad-only projection (448) and the full
+    // reifier-aware projection (576), so early admission must refuse before interning terms.
+    let nq = format!("<urn:c1> <{reifies}> <<( <urn:s1> <urn:p> <urn:o1> )>> <urn:g> .\n");
+    let opts = StoreOptions {
+        max_memory_bytes: Some(500),
+        ..Default::default()
+    };
+
+    // 1. Transactional replace.
+    let mem_replace = Store::in_memory(opts.clone());
+    let err = mem_replace
+        .replace(
+            ReplaceTarget::Named(iri("urn:g")),
+            &[Source::from_bytes(
+                nq.as_bytes().to_vec(),
+                RdfFormat::NQuads,
+                None,
+            )],
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::StorageFull(_)), "got {err}");
+    assert!(mem_replace.snapshot().is_empty());
+    assert_eq!(
+        mem_replace.snapshot().generation.dvocab.with(|v| v.len()),
+        0,
+        "early refusal of replace must not leak newly interned terms"
     );
 
-    // 4. Fork an in-memory branch and verify it did not inherit a stale predicate ID.
-    let mem_branch = Store::in_memory(StoreOptions::default());
-    {
-        let mut txn = mem_branch.write();
-        let ids = txn.encode_quad(&q, &mut Default::default()).unwrap();
-        txn.insert(ids).unwrap();
-        txn.discard_terms().unwrap();
-    }
-    crate::sparql::update::update(
-        &mem_branch,
-        "INSERT DATA { GRAPH <urn:g> { <urn:x> <urn:other_pred> <<( <urn:e1> <urn:p> <urn:o1> )>> } }",
-        &crate::sparql::QueryOptions::default(),
-    )
-    .unwrap();
-    mem_branch
-        .create_branch("dev", &Default::default())
-        .unwrap();
-    let dev = mem_branch.branch("dev").unwrap();
-    crate::sparql::update::update(
-        &dev,
-        "INSERT DATA { GRAPH <urn:g> { <urn:y> <urn:other_pred> <<( <urn:e2> <urn:p> <urn:o2> )>> } }",
-        &crate::sparql::QueryOptions::default(),
-    )
-    .unwrap();
-    assert!(dev.snapshot().delta.reifiers_ins.is_empty());
-
-    // 5. Now write a real rdf:reifies quad on the persistent store and compare live vs reopened.
-    crate::sparql::update::update(
-        &s,
-        &format!(
-            "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c_real> <{reifies}> <<( <urn:e1> <urn:p> <urn:o1> )>> }} }}"
-        ),
-        &crate::sparql::QueryOptions::default(),
-    )
-    .unwrap();
-    let live_keys: Vec<_> = s.snapshot().delta.reifiers_ins.iter().copied().collect();
-    assert_eq!(live_keys.len(), 2);
-    drop(s);
-
-    let reopened = Store::open(&root, StoreOptions::default()).unwrap();
-    let reopened_keys: Vec<_> = reopened
-        .snapshot()
-        .delta
-        .reifiers_ins
-        .iter()
-        .copied()
-        .collect();
-    assert_eq!(live_keys, reopened_keys);
+    // 2. Transactional load.
+    let mem_load = Store::in_memory(opts);
+    let err = mem_load
+        .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+        .unwrap_err();
+    assert!(matches!(err, Error::StorageFull(_)), "got {err}");
+    assert!(mem_load.snapshot().is_empty());
+    assert_eq!(
+        mem_load.snapshot().generation.dvocab.with(|v| v.len()),
+        0,
+        "early refusal of load must not leak newly interned terms"
+    );
 }

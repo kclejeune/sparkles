@@ -326,6 +326,41 @@ impl Table {
         Ok(length)
     }
 
+    /// Measure the decoded length of `codes` up to `max_bytes`, stopping once at least
+    /// `max_bytes` decoded bytes are observed so a giant suffix is not scanned in full
+    /// for a short prefix lookup.
+    pub(super) fn measure_prefix_controlled<E: From<Error>>(
+        &self,
+        codes: &[u8],
+        max_bytes: usize,
+        mut admit: impl FnMut(usize) -> Result<(), E>,
+        checkpoint: &mut impl FnMut(&'static str) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let (mut at, mut length, mut since_check) = (0usize, 0usize, 0usize);
+        while at < codes.len() && length < max_bytes {
+            let code = codes[at];
+            let (bytes, consumed) = if code == ESCAPE {
+                (usize::from(at + 1 < codes.len()), 2)
+            } else {
+                (self.lens[code as usize] as usize, 1)
+            };
+            length = length
+                .checked_add(bytes)
+                .ok_or_else(|| Error::invalid("vocabulary suffix overflows"))?
+                .min(max_bytes);
+            at += consumed;
+            since_check += consumed;
+            if since_check >= 1024 {
+                admit(length)?;
+                checkpoint("measuring vocabulary suffix")?;
+                since_check = 0;
+            }
+        }
+        admit(length)?;
+        checkpoint("finishing vocabulary measurement")?;
+        Ok(length)
+    }
+
     pub(super) fn decode_controlled<E>(
         &self,
         codes: &[u8],

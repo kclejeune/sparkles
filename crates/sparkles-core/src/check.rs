@@ -1281,7 +1281,7 @@ impl Checker<'_> {
             Ok(None) => {
                 if recorded
                     .as_ref()
-                    .is_some_and(|r| r.format > 0 && (r.entries > 0 || r.bytes > 0))
+                    .is_some_and(|r| r.entries > 0 || r.bytes > 0)
                 {
                     run.add(
                         Issue::warning(

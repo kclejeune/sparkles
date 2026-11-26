@@ -957,10 +957,11 @@ mod tests {
     fn preparation_delta_and_mutation_bounds_cover_reifier_tree_splits() {
         let store = Store::in_memory(StoreOptions::default());
         let reifies = crate::reifiers::RDF_REIFIES;
-        // Insert 64 reifiers (128 keys -> >1 full leaf of 64 keys in reifiers_ins) so the
-        // next insert with a live cloned seed splits the reifier tree.
+        // Seed one completely full 64-key leaf (32 distinct two-key reifiers) so the next
+        // two-key insert with a live cloned seed deterministically splits the leaf and
+        // grows `reifiers_ins` from depth 1 to depth 2.
         let mut data = String::from("INSERT DATA { GRAPH <urn:g> {");
-        for i in 0..64u32 {
+        for i in 0..32u32 {
             data.push_str(&format!(
                 " <urn:c{i}> <{reifies}> <<( <urn:s{i}> <urn:p> <urn:o{i}> )>> ."
             ));
@@ -968,19 +969,25 @@ mod tests {
         data.push_str(" } }");
         crate::sparql::update::update(&store, &data, &Default::default()).unwrap();
         let seed = store.snapshot();
-        assert_eq!(seed.delta.reifiers_ins.len(), 128);
+        assert_eq!(seed.delta.reifiers_ins.len(), 64);
+        assert_eq!(seed.delta.reifiers_ins.depth(), 1);
 
         let before_mutation = preparation_mutation_bytes(&seed.delta);
         crate::sparql::update::update(
             &store,
             &format!(
-                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c64> <{reifies}> <<( <urn:s64> <urn:p> <urn:o64> )>> }} }}"
+                "INSERT DATA {{ GRAPH <urn:g> {{ <urn:c32> <{reifies}> <<( <urn:s32> <urn:p> <urn:o32> )>> }} }}"
             ),
             &Default::default(),
         )
         .unwrap();
         let after = store.snapshot();
-        assert_eq!(after.delta.reifiers_ins.len(), 130);
+        assert_eq!(after.delta.reifiers_ins.len(), 66);
+        assert_eq!(
+            after.delta.reifiers_ins.depth(),
+            2,
+            "65th key must split the full 64-key leaf into a depth-2 tree"
+        );
         // Keep `seed` live while measuring unshared nodes copied/split in `after.delta`.
         let (unshared, _) = after.delta.unshared_bytes(|| Ok(())).unwrap();
         assert!(
@@ -994,7 +1001,7 @@ mod tests {
         // Compare against an identical-quad-count delta with no reifiers.
         let plain = Store::in_memory(StoreOptions::default());
         let mut plain_data = String::from("INSERT DATA { GRAPH <urn:g> {");
-        for i in 0..65u32 {
+        for i in 0..33u32 {
             plain_data.push_str(&format!(" <urn:c{i}> <urn:plain> <urn:v{i}> ."));
         }
         plain_data.push_str(" } }");

@@ -311,8 +311,12 @@ fn cold_replay_with_giant_base_triple_term_respects_allowance() {
     let store = Store::open(root.path(), options.clone()).unwrap();
     let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
     let long_iri = format!("urn:long:{}", "a".repeat(350_000));
-    let base_data =
-        format!("<urn:c0> <{reifies}> <<( <{long_iri}> <urn:p> <urn:o> )>> <urn:g> .\n");
+    // All base terms fit in front-coded block 0: the 350 KiB triple term ('(') precedes
+    // both `<http://...#reifies>` and `<urn:other_pred>` ('<') in the same block.
+    let base_data = format!(
+        "<urn:c0> <{reifies}> <<( <{long_iri}> <urn:p> <urn:o> )>> <urn:g> .\n\
+         <urn:a0> <urn:other_pred> <urn:v0> <urn:g> .\n"
+    );
     store
         .load(&[Source::from_bytes(
             base_data.into_bytes(),
@@ -320,7 +324,20 @@ fn cold_replay_with_giant_base_triple_term_respects_allowance() {
             None,
         )])
         .unwrap();
-    // Small WAL transaction inserting a new reifier referencing the giant base triple term.
+    // Commit 1: small WAL insert with an UNRELATED predicate referencing the giant base triple term.
+    update(
+        &store,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{ <urn:a1> <urn:other_pred> <<( <{long_iri}> <urn:p> <urn:o> )>> }} }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let unrelated_target = store.head_commit().seq;
+    store
+        .create_snapshot("unrelated", &At::Commit(unrelated_target), None)
+        .unwrap();
+    // Commit 2: small WAL insert with `rdf:reifies` referencing the giant base triple term.
     update(
         &store,
         &format!(
@@ -329,9 +346,9 @@ fn cold_replay_with_giant_base_triple_term_respects_allowance() {
         &QueryOptions::default(),
     )
     .unwrap();
-    let target = store.head_commit().seq;
+    let reifies_target = store.head_commit().seq;
     store
-        .create_snapshot("retained", &At::Commit(target), None)
+        .create_snapshot("reifies", &At::Commit(reifies_target), None)
         .unwrap();
     update(
         &store,
@@ -343,17 +360,43 @@ fn cold_replay_with_giant_base_triple_term_respects_allowance() {
     store.flush_change_log().unwrap();
     drop(store);
 
-    let store = Store::open(root.path(), options).unwrap();
+    let store = Store::open(root.path(), options.clone()).unwrap();
     store.flush_change_log().unwrap();
     let before = bytes(root.path());
-    // 256 KiB is enough to open the generation metadata and WAL cursor, but smaller than
-    // reconstructing the 350 KiB base triple-term key during replay.
+    // 256 KiB admits generation metadata, WAL replay, and short-predicate sentinel
+    // resolution, but is smaller than reconstructing the 350 KiB base triple-term key.
+    // Replaying the unrelated predicate must SUCCEED without reconstructing the giant triple.
+    let (unrelated_res, unrelated_counts, _outside) = measure(|| {
+        store.snapshot_at_limited(
+            &At::Commit(unrelated_target),
+            &HistoryOptions::default(),
+            256 << 10,
+        )
+    });
+    let (unrelated_view, _) = unrelated_res.expect(
+        "cold replay of an unrelated predicate must not reconstruct a giant same-block triple term",
+    );
+    assert_eq!(unrelated_view.commit, unrelated_target);
+    assert!(unrelated_view.delta.reifiers_ins.is_empty());
+    assert!(
+        unrelated_counts.largest <= 256 << 10,
+        "sentinel resolution allocated beyond allowance: largest={}",
+        unrelated_counts.largest
+    );
+    drop(unrelated_view);
+
+    // Under the same 256 KiB allowance, replaying the actual `rdf:reifies` commit must
+    // refuse on the triple-term hash path (and still never reconstruct past the cap).
     let (result, counts, _outside) = measure(|| {
-        store.snapshot_at_limited(&At::Commit(target), &HistoryOptions::default(), 256 << 10)
+        store.snapshot_at_limited(
+            &At::Commit(reifies_target),
+            &HistoryOptions::default(),
+            256 << 10,
+        )
     });
     assert!(
         matches!(result, Err(Error::BudgetExceeded(_))),
-        "expected budget refusal when replaying giant base triple term, got {:?}",
+        "expected budget refusal when hashing giant base triple term, got {:?}",
         result.err()
     );
     assert!(
@@ -365,8 +408,71 @@ fn cold_replay_with_giant_base_triple_term_respects_allowance() {
 
     // With sufficient allowance, the cold replay succeeds and populates reifiers_ins.
     let (view, _) = store
-        .snapshot_at_limited(&At::Commit(target), &HistoryOptions::default(), 16 << 20)
+        .snapshot_at_limited(
+            &At::Commit(reifies_target),
+            &HistoryOptions::default(),
+            16 << 20,
+        )
         .unwrap();
-    assert_eq!(view.commit, target);
+    assert_eq!(view.commit, reifies_target);
     assert!(!view.delta.reifiers_ins.is_empty());
+    drop(view);
+    drop(store);
+
+    // Absence case: when `rdf:reifies` is not in the base vocabulary at all, proving its
+    // absence in the shared block must also avoid reconstructing the giant triple term.
+    let absent_root = tempfile::tempdir().unwrap();
+    let absent_store = Store::open(absent_root.path(), options.clone()).unwrap();
+    let absent_base = format!(
+        "<urn:a0> <urn:other_pred> <<( <{long_iri}> <urn:p> <urn:o> )>> <urn:g> .\n\
+         <urn:z0> <urn:z_later> <urn:v0> <urn:g> .\n"
+    );
+    absent_store
+        .load(&[Source::from_bytes(
+            absent_base.into_bytes(),
+            RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    update(
+        &absent_store,
+        &format!(
+            "INSERT DATA {{ GRAPH <urn:g> {{ <urn:a1> <urn:other_pred> <<( <{long_iri}> <urn:p> <urn:o> )>> }} }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let absent_target = absent_store.head_commit().seq;
+    absent_store
+        .create_snapshot("absent", &At::Commit(absent_target), None)
+        .unwrap();
+    update(
+        &absent_store,
+        "INSERT DATA { <urn:later> <urn:p> 2 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    absent_store.compact().unwrap();
+    absent_store.flush_change_log().unwrap();
+    drop(absent_store);
+
+    let absent_store = Store::open(absent_root.path(), options).unwrap();
+    absent_store.flush_change_log().unwrap();
+    let (absent_res, absent_counts, _outside) = measure(|| {
+        absent_store.snapshot_at_limited(
+            &At::Commit(absent_target),
+            &HistoryOptions::default(),
+            256 << 10,
+        )
+    });
+    let (absent_view, _) = absent_res.expect(
+        "proving rdf:reifies absent in a shared block must not reconstruct a giant triple term",
+    );
+    assert_eq!(absent_view.commit, absent_target);
+    assert!(absent_view.delta.reifiers_ins.is_empty());
+    assert!(
+        absent_counts.largest <= 256 << 10,
+        "absence resolution allocated beyond allowance: largest={}",
+        absent_counts.largest
+    );
 }

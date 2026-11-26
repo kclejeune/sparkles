@@ -5820,6 +5820,7 @@ impl Store {
     fn check_memory_before(
         &self,
         quads: usize,
+        reifier_keys: usize,
         o: &crate::guard::WriteOptions,
         stage: crate::preview::RefusalStage,
         early: &mut Option<crate::preview::StorageCheck>,
@@ -5831,7 +5832,9 @@ impl Store {
         let now = snap.generation.disk_bytes()
             + delta_bytes(&snap.delta)
             + snap.generation.dvocab.with(|v| v.bytes()) as u64;
-        let size = now.saturating_add((quads as u64).saturating_mul(DELTA_QUAD_BYTES));
+        let size = now
+            .saturating_add((quads as u64).saturating_mul(DELTA_QUAD_BYTES))
+            .saturating_add((reifier_keys as u64).saturating_mul(DELTA_REIFIER_KEY_BYTES));
         // one reading of the configuration's history serves the check and the preview
         let total = self.memory_with_configuration(size)?;
         match self.check_memory_total(total) {
@@ -6133,6 +6136,7 @@ impl Store {
                 .map_err(SparqlLoadError::Store)?;
             let mut prefixes = BTreeMap::new();
             let mut parsed = 0;
+            let mut parsed_reifier_keys = 0;
             let mut early = None;
             let prepared = (|| -> std::result::Result<(), SparqlLoadError> {
                 for s in sources {
@@ -6142,11 +6146,13 @@ impl Store {
                     let res = crate::io::parse_source_into(s, |q| {
                         let step = (|| -> Result<()> {
                             parsed += 1;
+                            parsed_reifier_keys += parsed_quad_reifier_keys(&q);
                             if parsed % 65_536 == 1 {
                                 o.check()?;
                             }
                             self.check_memory_before(
                                 parsed,
+                                parsed_reifier_keys,
                                 o,
                                 crate::preview::RefusalStage::Parse,
                                 &mut early,
@@ -6288,8 +6294,15 @@ impl Store {
         }
         // the transaction checks the precondition when it opens, after this check
         let mut early = None;
+        let total_quads: usize = parsed.iter().map(Vec::len).sum();
+        let total_reifier_keys: usize = parsed
+            .iter()
+            .flat_map(|qs| qs.iter())
+            .map(parsed_quad_reifier_keys)
+            .sum();
         self.check_memory_before(
-            parsed.iter().map(Vec::len).sum(),
+            total_quads,
+            total_reifier_keys,
             o,
             crate::preview::RefusalStage::Prepare,
             &mut early,
@@ -8629,6 +8642,30 @@ fn dump_snapshot(snap: &Snapshot, w: impl Write) -> Result<u64> {
 const DELTA_QUAD_BYTES: u64 = 7 * 64;
 /// Estimated memory of one reifier index key in a delta.
 const DELTA_REIFIER_KEY_BYTES: u64 = 64;
+
+/// Number of distinct `reifiers_ins` keys a parsed quad will insert (0, 1, or 2).
+fn parsed_quad_reifier_keys(q: &oxrdf::Quad) -> usize {
+    if q.predicate.as_str() != crate::reifiers::RDF_REIFIES {
+        return 0;
+    }
+    let oxrdf::Term::Triple(t) = &q.object else {
+        return 0;
+    };
+    let s = match &t.subject {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => Some(n.as_str()),
+        _ => None,
+    };
+    let o = match &t.object {
+        oxrdf::Term::NamedNode(n) => Some(n.as_str()),
+        _ => None,
+    };
+    match (s, o) {
+        (Some(s), Some(o)) if s == o => 1,
+        (Some(_), Some(_)) => 2,
+        (Some(_), None) | (None, Some(_)) => 1,
+        (None, None) => 0,
+    }
+}
 
 /// Estimated memory of a (replayed) delta.
 fn delta_bytes(d: &Delta) -> u64 {

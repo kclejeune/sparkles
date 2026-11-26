@@ -1250,6 +1250,9 @@ mod tests {
         let normal = super::super::Generation::open_sealed(dir.path(), "gen-0001").unwrap();
         assert!(normal.reifiers.file.is_some());
         assert!(normal.reifiers.is_indexed());
+        let normal_rdf_reifies = normal.rdf_reifies.load(Ordering::Acquire);
+        // Release the mmap held by `normal` before later steps rewrite `reifiers.bin` on disk.
+        drop(normal);
 
         let options = HistoryOptions::default();
         let mut budget = ColdBudget::new(ReadLimit {
@@ -1290,7 +1293,7 @@ mod tests {
         );
         assert_eq!(
             loaded.value.rdf_reifies.load(Ordering::Acquire),
-            normal.rdf_reifies.load(Ordering::Acquire),
+            normal_rdf_reifies,
             "cold generation should cache rdf:reifies on first triple-term encounter"
         );
         drop(loaded.value);
