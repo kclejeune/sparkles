@@ -2645,6 +2645,33 @@ fn run_whole_in_pool(
     })
 }
 
+fn run_whole_in_pool_observing_merge_fallback(
+    threads: usize,
+    ctx: &Ctx,
+    table: &Table,
+    keys: &[VarId],
+    aggs: &[(VarId, Agg)],
+    charged: bool,
+) -> crate::error::Result<(Table, super::exprcache::Report, bool)> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        let mut report = super::exprcache::Report::default();
+        let (out, merge_fallback) = super::group::op::whole_observing_range_merge_fallback(
+            ctx,
+            table,
+            keys,
+            aggs,
+            charged,
+            true,
+            &mut report,
+        )?;
+        Ok((out, report, merge_fallback))
+    })
+}
+
 #[test]
 fn parallel_whole_matches_sequential_ungrouped_edge_cases() {
     let ctx = ctx();
@@ -4401,13 +4428,19 @@ fn integer_subtotal_i64_promotion_admits_before_allocating_in_fold_and_merge() {
         };
         tight_table.push_row(&[int(&tight, g), int(&tight, v)]);
     }
-    let before_fallbacks = super::group::par::range_merge_memory_fallbacks();
-    let (fb_out, _) = run_whole_in_pool(2, &tight, &tight_table, &[0], &multi_aggs, true).unwrap();
-    let after_fallbacks = super::group::par::range_merge_memory_fallbacks();
+    let (fb_out, _, merge_fallback) = run_whole_in_pool_observing_merge_fallback(
+        2,
+        &tight,
+        &tight_table,
+        &[0],
+        &multi_aggs,
+        true,
+    )
+    .unwrap();
     assert!(
-        after_fallbacks > before_fallbacks,
+        merge_fallback,
         "expected tight budget to refuse inside acc.merge and trigger RangeOutcome::MemoryFallback \
-         (before={before_fallbacks}, after={after_fallbacks}, mem_peak={})",
+         (mem_peak={})",
         tight.mem_peak()
     );
     tight

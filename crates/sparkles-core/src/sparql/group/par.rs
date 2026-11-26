@@ -50,14 +50,6 @@ const HASH_PART_CHUNK_ROWS: usize = 4_096;
 const MIN_HASH_PARTS: usize = 4;
 const MAX_HASH_PARTS: usize = 64;
 
-#[cfg(test)]
-static RANGE_MERGE_MEMORY_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn range_merge_memory_fallbacks() -> usize {
-    RANGE_MERGE_MEMORY_FALLBACKS.load(Ordering::Relaxed)
-}
-
 #[inline]
 fn is_memory_budget_error(err: &Error) -> bool {
     matches!(
@@ -382,13 +374,13 @@ fn msd_radix_sort(
 enum RangeOutcome {
     Done(Table),
     TooManyGroups,
-    MemoryFallback,
+    MemoryFallback { during_merge: bool },
 }
 
 /// Parallel eager grouping entry point. Caller guarantees `eager && hashable &&
 /// !only_counts_rows && table.len >= PAR_GROUP_THRESHOLD && table.len <= u32::MAX &&
-/// rayon::current_num_threads() > 1`.
-pub(super) fn whole_parallel(
+/// rayon::current_num_threads() > 1`. Returns `(table, merge_memory_fallback)`.
+pub(super) fn whole_parallel_observing_merge_fallback(
     ctx: &Ctx,
     table: &Table,
     keys: &[VarId],
@@ -396,7 +388,7 @@ pub(super) fn whole_parallel(
     charged: bool,
     eager: bool,
     report: &mut ExprReport,
-) -> Result<Table> {
+) -> Result<(Table, bool)> {
     ctx.check()?;
     let mut vars = keys.to_vec();
     vars.extend(aggs.iter().map(|(v, _)| *v));
@@ -473,7 +465,7 @@ pub(super) fn whole_parallel(
     let workers = threads.min(table.len / PAR_MIN_LEN).max(1);
     if workers <= 1 {
         let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
-        return whole_sequential_with_computed(
+        let out = whole_sequential_with_computed(
             ctx,
             table,
             keys,
@@ -483,10 +475,12 @@ pub(super) fn whole_parallel(
             &vars,
             computed,
             expr_scratch,
-        );
+        )?;
+        return Ok((out, false));
     }
 
     if keys.is_empty() {
+        let mut merge_fallback = false;
         if all_mergeable {
             match run_range_split(
                 ctx,
@@ -502,12 +496,15 @@ pub(super) fn whole_parallel(
                 acc_group_bytes,
                 workers,
             )? {
-                RangeOutcome::Done(out) => return Ok(out),
-                RangeOutcome::TooManyGroups | RangeOutcome::MemoryFallback => {}
+                RangeOutcome::Done(out) => return Ok((out, false)),
+                RangeOutcome::TooManyGroups => {}
+                RangeOutcome::MemoryFallback { during_merge } => {
+                    merge_fallback = during_merge;
+                }
             }
         }
         let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
-        return whole_sequential_with_computed(
+        let out = whole_sequential_with_computed(
             ctx,
             table,
             keys,
@@ -517,7 +514,8 @@ pub(super) fn whole_parallel(
             &vars,
             computed,
             expr_scratch,
-        );
+        )?;
+        return Ok((out, merge_fallback));
     }
 
     let sample_distinct = sample_distinct_keys(table, &key_cols, RANGE_SPLIT_SAMPLE_DISTINCT);
@@ -536,10 +534,10 @@ pub(super) fn whole_parallel(
             acc_group_bytes,
             workers,
         )? {
-            RangeOutcome::Done(out) => return Ok(out),
-            RangeOutcome::MemoryFallback => {
+            RangeOutcome::Done(out) => return Ok((out, false)),
+            RangeOutcome::MemoryFallback { during_merge } => {
                 let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
-                return whole_sequential_with_computed(
+                let out = whole_sequential_with_computed(
                     ctx,
                     table,
                     keys,
@@ -549,7 +547,8 @@ pub(super) fn whole_parallel(
                     &vars,
                     computed,
                     expr_scratch,
-                );
+                )?;
+                return Ok((out, during_merge));
             }
             RangeOutcome::TooManyGroups => {
                 // Fall through to key-hash partitioning for high-cardinality keys.
@@ -558,7 +557,7 @@ pub(super) fn whole_parallel(
     } else if !all_mergeable && sample_distinct <= 1 {
         // Every sampled row shares one key and aggregates cannot merge across slices.
         let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
-        return whole_sequential_with_computed(
+        let out = whole_sequential_with_computed(
             ctx,
             table,
             keys,
@@ -568,7 +567,8 @@ pub(super) fn whole_parallel(
             &vars,
             computed,
             expr_scratch,
-        );
+        )?;
+        return Ok((out, false));
     }
 
     if let Some(out) = run_hash_partitioned(
@@ -585,11 +585,11 @@ pub(super) fn whole_parallel(
         acc_group_bytes,
         workers,
     )? {
-        return Ok(out);
+        return Ok((out, false));
     }
 
     let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
-    whole_sequential_with_computed(
+    let out = whole_sequential_with_computed(
         ctx,
         table,
         keys,
@@ -599,7 +599,8 @@ pub(super) fn whole_parallel(
         &vars,
         computed,
         expr_scratch,
-    )
+    )?;
+    Ok((out, false))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -788,7 +789,9 @@ fn run_range_split(
         }
     }
     if saw_memory {
-        return Ok(RangeOutcome::MemoryFallback);
+        return Ok(RangeOutcome::MemoryFallback {
+            during_merge: false,
+        });
     }
     if saw_too_many {
         return Ok(RangeOutcome::TooManyGroups);
@@ -799,7 +802,9 @@ fn run_range_split(
     ctx.check_rows(merged.groups)?;
     if eager && let Err(e) = ctx.check_output(merged.groups, width) {
         if is_memory_budget_error(&e) {
-            return Ok(RangeOutcome::MemoryFallback);
+            return Ok(RangeOutcome::MemoryFallback {
+                during_merge: false,
+            });
         }
         return Err(e);
     }
@@ -827,14 +832,18 @@ fn run_range_split(
                             && let Err(e) = ctx.check_output(merged.groups.saturating_add(1), width)
                         {
                             if is_memory_budget_error(&e) {
-                                return Ok(RangeOutcome::MemoryFallback);
+                                return Ok(RangeOutcome::MemoryFallback {
+                                    during_merge: false,
+                                });
                             }
                             return Err(e);
                         }
                         match merged.insert(key, part.first_row[g]) {
                             Ok(slot) => slot,
                             Err(e) if is_memory_budget_error(&e) => {
-                                return Ok(RangeOutcome::MemoryFallback);
+                                return Ok(RangeOutcome::MemoryFallback {
+                                    during_merge: false,
+                                });
                             }
                             Err(e) => return Err(e),
                         }
@@ -861,9 +870,7 @@ fn run_range_split(
                     *is_refused = true;
                 }
                 Err(e) if is_memory_budget_error(&e) => {
-                    #[cfg(test)]
-                    RANGE_MERGE_MEMORY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                    return Ok(RangeOutcome::MemoryFallback);
+                    return Ok(RangeOutcome::MemoryFallback { during_merge: true });
                 }
                 Err(e) => return Err(e),
             }
@@ -892,7 +899,9 @@ fn run_range_split(
             let _slot_charge = match ctx.charge(chunk_len as u64 * 4 + 64) {
                 Ok(c) => c,
                 Err(e) if is_memory_budget_error(&e) => {
-                    return Ok(RangeOutcome::MemoryFallback);
+                    return Ok(RangeOutcome::MemoryFallback {
+                        during_merge: false,
+                    });
                 }
                 Err(e) => return Err(e),
             };
@@ -958,7 +967,9 @@ fn run_range_split(
                 merged.accs[a] = acc;
                 if let Err(e) = add_res {
                     if is_memory_budget_error(&e) {
-                        return Ok(RangeOutcome::MemoryFallback);
+                        return Ok(RangeOutcome::MemoryFallback {
+                            during_merge: false,
+                        });
                     }
                     return Err(e);
                 }

@@ -291,6 +291,28 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub(crate) fn scratch_lease(&self) -> super::budget::ScratchLease {
+        super::budget::ScratchLease::new(self.budget.clone())
+    }
+
+    /// Atomically move `bytes` from `lease` into pass/state credit without releasing
+    /// or re-reserving against the upstream pool.
+    pub(crate) fn commit_scratch_to_state(
+        &self,
+        lease: &mut super::budget::ScratchLease,
+        bytes: u64,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(budget) = &self.budget {
+            let moved = budget.move_scratch_to_pass(lease, bytes);
+            debug_assert_eq!(moved, bytes);
+        } else {
+            lease.release(bytes);
+        }
+    }
+
     pub fn u64(&mut self) -> Result<u64> {
         let mut v = 0u64;
         let mut shift = 0;
@@ -347,6 +369,28 @@ impl<'a> Reader<'a> {
             ));
         }
         (0..n).map(|_| self.id()).collect()
+    }
+
+    /// Decode a row whose encoded width must equal `expected`, pre-admitting
+    /// `expected * size_of::<Id>()` bytes into `lease` before allocating the row buffer.
+    pub(crate) fn row_exact_leased(
+        &mut self,
+        expected: usize,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<Row> {
+        let n = self.u64()?;
+        if n != expected as u64 {
+            return Err(Error::Corrupt(format!(
+                "a view's state has a row of width {n}, expected {expected}"
+            )));
+        }
+        let row_bytes = (expected as u64).saturating_mul(std::mem::size_of::<Id>() as u64);
+        lease.try_reserve(row_bytes)?;
+        let mut out = Vec::with_capacity(expected);
+        for _ in 0..expected {
+            out.push(self.id()?);
+        }
+        Ok(out.into_boxed_slice())
     }
 
     pub fn zset(&mut self) -> Result<ZSet> {

@@ -163,42 +163,75 @@ fn bucket_capacity(buckets: usize) -> usize {
 }
 
 #[inline]
+fn hbmap_insert_growth_with_group(
+    len: usize,
+    cap: usize,
+    alloc: usize,
+    elem: usize,
+    align: usize,
+    key_extra: u64,
+    group_width: usize,
+) -> u64 {
+    let table_delta = if len < cap {
+        0
+    } else if alloc == 0 {
+        let first_buckets =
+            sparkles_budget::sizes::buckets(sparkles_budget::sizes::table_grown(0, 0, 1));
+        sparkles_budget::sizes::table_bytes_for_buckets_with_group(
+            first_buckets,
+            elem,
+            align,
+            group_width,
+        ) as u64
+    } else {
+        // `HashMap::capacity()` is `items + growth_left`, so tombstones can exhaust
+        // `growth_left` while `len() < full_capacity`. Derive the current bucket count
+        // from the live allocation so tombstone-triggered resizes are admitted before
+        // hashbrown doubles the table.
+        let mut buckets = sparkles_budget::sizes::buckets(cap).max(4);
+        while sparkles_budget::sizes::table_bytes_for_buckets_with_group(
+            buckets,
+            elem,
+            align,
+            group_width,
+        ) < alloc
+        {
+            let Some(doubled) = buckets.checked_mul(2) else {
+                break;
+            };
+            buckets = doubled;
+        }
+        let full_cap = bucket_capacity(buckets);
+        if len.saturating_add(1) <= full_cap / 2 {
+            0
+        } else {
+            let next_buckets = buckets.saturating_mul(2);
+            let next_bytes = sparkles_budget::sizes::table_bytes_for_buckets_with_group(
+                next_buckets,
+                elem,
+                align,
+                group_width,
+            ) as u64;
+            next_bytes.saturating_sub(alloc as u64)
+        }
+    };
+    table_delta.saturating_add(key_extra)
+}
+
+#[inline]
 pub(crate) fn hbmap_insert_growth<K: Eq + std::hash::Hash, V>(
     map: &HbMap<K, V>,
     key_extra: u64,
 ) -> u64 {
-    let table_delta = if map.len() < map.capacity() {
-        0
-    } else {
-        let elem = size_of::<(K, V)>();
-        let alloc = map.allocation_size();
-        if alloc == 0 {
-            let first_cap = sparkles_budget::sizes::table_grown(0, 0, 1);
-            sparkles_budget::sizes::table_bytes(first_cap, elem) as u64
-        } else {
-            // `HashMap::capacity()` is `items + growth_left`, so tombstones can exhaust
-            // `growth_left` while `len() < full_capacity`. Derive the current bucket count
-            // from the live allocation so tombstone-triggered resizes are admitted before
-            // hashbrown doubles the table.
-            let mut buckets = sparkles_budget::sizes::buckets(map.capacity()).max(4);
-            while sparkles_budget::sizes::table_bytes(bucket_capacity(buckets), elem) < alloc {
-                let Some(doubled) = buckets.checked_mul(2) else {
-                    break;
-                };
-                buckets = doubled;
-            }
-            let full_cap = bucket_capacity(buckets);
-            if map.len().saturating_add(1) <= full_cap / 2 {
-                0
-            } else {
-                let next_buckets = buckets.saturating_mul(2);
-                let next_bytes =
-                    sparkles_budget::sizes::table_bytes(bucket_capacity(next_buckets), elem) as u64;
-                next_bytes.saturating_sub(alloc as u64)
-            }
-        }
-    };
-    table_delta.saturating_add(key_extra)
+    hbmap_insert_growth_with_group(
+        map.len(),
+        map.capacity(),
+        map.allocation_size(),
+        size_of::<(K, V)>(),
+        align_of::<(K, V)>(),
+        key_extra,
+        sparkles_budget::sizes::table_control_group_width(),
+    )
 }
 
 #[inline]
@@ -219,19 +252,17 @@ fn hbmap_load_insert<K: Eq + std::hash::Hash, V>(
     map: &mut HbMap<K, V>,
     key: K,
     val: V,
-    key_extra: u64,
 ) -> Result<()> {
     if map.contains_key(&key) {
-        map.insert(key, val);
-        return Ok(());
+        return Err(Error::Corrupt(
+            "a view's state holds a duplicate accumulator key".into(),
+        ));
     }
     let before = map.allocation_size() as u64;
-    let est = hbmap_insert_growth(map, key_extra);
+    let est = hbmap_insert_growth(map, 0);
     r.charge_state(est)?;
     map.insert(key, val);
-    let actual = (map.allocation_size() as u64)
-        .saturating_sub(before)
-        .saturating_add(key_extra);
+    let actual = (map.allocation_size() as u64).saturating_sub(before);
     if est > actual {
         r.release_state(est - actual);
     } else if actual > est {
@@ -240,10 +271,39 @@ fn hbmap_load_insert<K: Eq + std::hash::Hash, V>(
     Ok(())
 }
 
+fn hbmap_load_insert_leased<K: Eq + std::hash::Hash, V>(
+    r: &Reader,
+    map: &mut HbMap<K, V>,
+    key: K,
+    val: V,
+    key_lease: &mut crate::incr::budget::ScratchLease,
+    key_bytes: u64,
+) -> Result<()> {
+    if map.contains_key(&key) {
+        return Err(Error::Corrupt(
+            "a view's state holds a duplicate accumulator key".into(),
+        ));
+    }
+    let before = map.allocation_size() as u64;
+    let table_est = hbmap_insert_growth(map, 0);
+    let leased_for_key = key_lease.bytes().min(key_bytes);
+    let key_topup = key_bytes.saturating_sub(leased_for_key);
+    r.charge_state(table_est.saturating_add(key_topup))?;
+    r.commit_scratch_to_state(key_lease, leased_for_key);
+    map.insert(key, val);
+    let table_actual = (map.allocation_size() as u64).saturating_sub(before);
+    if table_est > table_actual {
+        r.release_state(table_est - table_actual);
+    } else if table_actual > table_est {
+        r.charge_state(table_actual - table_est)?;
+    }
+    Ok(())
+}
+
 #[inline]
 fn boxed_hbmap_init_growth<K, V>(key_extra: u64) -> u64 {
     let first_cap = sparkles_budget::sizes::table_grown(0, 0, 1);
-    let table = sparkles_budget::sizes::table_bytes(first_cap, size_of::<(K, V)>()) as u64;
+    let table = sparkles_budget::sizes::table_bytes_for::<(K, V)>(first_cap) as u64;
     (size_of::<HbMap<K, V>>() as u64)
         .saturating_add(table)
         .saturating_add(key_extra)
@@ -1496,56 +1556,62 @@ impl SumState {
         for _ in 0..r.u64()? {
             let k = r.i128()?;
             let c = r.i64()?;
-            hbmap_load_insert(r, &mut s.decs, k, c, 0)?;
+            hbmap_load_insert(r, &mut s.decs, k, c)?;
         }
         for _ in 0..r.u64()? {
             let b = r.u64()? as u32;
             let c = r.i64()?;
-            hbmap_load_insert(r, &mut s.floats, b, c, 0)?;
+            hbmap_load_insert(r, &mut s.floats, b, c)?;
         }
         for _ in 0..r.u64()? {
             let b = r.u64()?;
             let c = r.i64()?;
-            hbmap_load_insert(r, &mut s.doubles, b, c, 0)?;
+            hbmap_load_insert(r, &mut s.doubles, b, c)?;
         }
         let n_bi = r.u64()?;
         if n_bi > 0 {
-            r.charge_state(size_of::<HbMap<crate::sparql::bignum::BigInt, i64>>() as u64)?;
+            let box_bytes = size_of::<HbMap<crate::sparql::bignum::BigInt, i64>>() as u64;
+            let mut box_lease = r.scratch_lease();
+            box_lease.try_reserve(box_bytes)?;
             let mut map = HbMap::default();
             for _ in 0..n_bi {
                 let text = std::str::from_utf8(r.bytes()?)
                     .map_err(|_| Error::Corrupt("view state holds non-UTF-8 big integer".into()))?;
+                let parse_scratch = crate::sparql::bignum::BigInt::parse_scratch_bytes(text);
+                let mut parse_lease = r.scratch_lease();
+                parse_lease.try_reserve(parse_scratch)?;
                 let bi = crate::sparql::bignum::BigInt::parse(text).ok_or_else(|| {
                     Error::Corrupt("view state holds malformed big integer".into())
                 })?;
                 let c = r.i64()?;
                 let key_bytes = bi.heap_bytes();
-                let is_new = !map.contains_key(&bi);
-                hbmap_load_insert(r, &mut map, bi, c, key_bytes)?;
-                if is_new {
-                    s.big_key_bytes = s.big_key_bytes.saturating_add(key_bytes);
-                }
+                hbmap_load_insert_leased(r, &mut map, bi, c, &mut parse_lease, key_bytes)?;
+                s.big_key_bytes = s.big_key_bytes.saturating_add(key_bytes);
             }
+            r.commit_scratch_to_state(&mut box_lease, box_bytes);
             s.big_ints = Some(Box::new(map));
         }
         let n_bd = r.u64()?;
         if n_bd > 0 {
-            r.charge_state(size_of::<HbMap<crate::sparql::bignum::BigDec, i64>>() as u64)?;
+            let box_bytes = size_of::<HbMap<crate::sparql::bignum::BigDec, i64>>() as u64;
+            let mut box_lease = r.scratch_lease();
+            box_lease.try_reserve(box_bytes)?;
             let mut map = HbMap::default();
             for _ in 0..n_bd {
                 let text = std::str::from_utf8(r.bytes()?)
                     .map_err(|_| Error::Corrupt("view state holds non-UTF-8 big decimal".into()))?;
+                let parse_scratch = crate::sparql::bignum::BigDec::parse_scratch_bytes(text);
+                let mut parse_lease = r.scratch_lease();
+                parse_lease.try_reserve(parse_scratch)?;
                 let bd = crate::sparql::bignum::BigDec::parse(text).ok_or_else(|| {
                     Error::Corrupt("view state holds malformed big decimal".into())
                 })?;
                 let c = r.i64()?;
                 let key_bytes = bd.heap_bytes();
-                let is_new = !map.contains_key(&bd);
-                hbmap_load_insert(r, &mut map, bd, c, key_bytes)?;
-                if is_new {
-                    s.big_key_bytes = s.big_key_bytes.saturating_add(key_bytes);
-                }
+                hbmap_load_insert_leased(r, &mut map, bd, c, &mut parse_lease, key_bytes)?;
+                s.big_key_bytes = s.big_key_bytes.saturating_add(key_bytes);
             }
+            r.commit_scratch_to_state(&mut box_lease, box_bytes);
             s.big_decs = Some(Box::new(map));
         }
         Ok(s)
@@ -2533,19 +2599,24 @@ impl Accumulator for RetractableDistinct {
         let load_res: Result<()> = match &mut self.groups[group] {
             DistinctGroup::Rows(m) => {
                 m.clear();
-                let row_extra = row_width as u64 * 8;
-                (0..r.u64()?).try_for_each(|_| {
-                    let row = r.row()?;
-                    let c = r.i64()?;
-                    hbmap_load_insert(r, m, row, c, row_extra)
+                let row_extra = row_width as u64 * size_of::<Id>() as u64;
+                r.u64().and_then(|n| {
+                    (0..n).try_for_each(|_| {
+                        let mut row_lease = r.scratch_lease();
+                        let row = r.row_exact_leased(row_width, &mut row_lease)?;
+                        let c = r.i64()?;
+                        hbmap_load_insert_leased(r, m, row, c, &mut row_lease, row_extra)
+                    })
                 })
             }
             DistinctGroup::Values(m) => {
                 m.clear();
-                (0..r.u64()?).try_for_each(|_| {
-                    let v = r.id()?;
-                    let c = r.i64()?;
-                    hbmap_load_insert(r, m, v, c, 0)
+                r.u64().and_then(|n| {
+                    (0..n).try_for_each(|_| {
+                        let v = r.id()?;
+                        let c = r.i64()?;
+                        hbmap_load_insert(r, m, v, c)
+                    })
                 })
             }
         };
@@ -3485,5 +3556,563 @@ mod tests {
         assert_eq!(distinct.retained_bytes(), exact_distinct_bytes(&distinct));
         distinct.clear();
         assert_eq!(distinct.retained_bytes(), 0);
+    }
+
+    /// Regression for round-3 P2-2: checkpoint hashbrown sizing uses the pinned layout's
+    /// actual control-group width (16 B on SSE2, 8 B on arm64 NEON) for first allocation
+    /// and non-empty resizes, so exact-ceiling loads never refuse due to an 8-byte excess.
+    #[test]
+    fn hbmap_control_width_matches_hashbrown_and_arm64_exact_ceilings() {
+        use crate::incr::budget::ViewBudget;
+        use crate::sparql::pool::QueryPool;
+
+        fn assert_exact_alloc<K: Eq + std::hash::Hash, V>() {
+            for &buckets in &[4usize, 8, 16, 32, 64, 128, 256] {
+                let cap = bucket_capacity(buckets);
+                let map: HbMap<K, V> = HbMap::with_capacity_and_hasher(cap, FxBuildHasher);
+                let expected = sparkles_budget::sizes::table_bytes_for::<(K, V)>(cap);
+                assert_eq!(
+                    map.allocation_size(),
+                    expected,
+                    "table_bytes_for must equal hashbrown allocation_size at {buckets} buckets"
+                );
+            }
+        }
+
+        assert_exact_alloc::<Id, i64>();
+        assert_exact_alloc::<Box<[Id]>, i64>();
+        assert_exact_alloc::<i128, i64>();
+        assert_exact_alloc::<u32, i64>();
+        assert_exact_alloc::<u64, i64>();
+        assert_exact_alloc::<BigInt, i64>();
+        assert_exact_alloc::<BigDec, i64>();
+
+        // Arm64 NEON (8 trailing control bytes): first allocation for `(Id, i64)` is 76 B
+        // (not 84 B), 4->8 resize delta is 68 B (144 - 76), and 8->16 resize delta is 136 B.
+        let id_elem = size_of::<(Id, i64)>();
+        let id_align = align_of::<(Id, i64)>();
+        assert_eq!(
+            hbmap_insert_growth_with_group(0, 0, 0, id_elem, id_align, 0, 8),
+            76
+        );
+        assert_eq!(
+            hbmap_insert_growth_with_group(3, 3, 76, id_elem, id_align, 0, 8),
+            68
+        );
+        assert_eq!(
+            hbmap_insert_growth_with_group(7, 7, 144, id_elem, id_align, 0, 8),
+            136
+        );
+        // Group index `(Box<[Id]>, u32)` on arm64 NEON: 4 * 24 + 4 + 8 = 108 B, 4->8 delta = 100 B.
+        let grp_elem = size_of::<(Box<[Id]>, u32)>();
+        let grp_align = align_of::<(Box<[Id]>, u32)>();
+        assert_eq!(
+            hbmap_insert_growth_with_group(0, 0, 0, grp_elem, grp_align, 0, 8),
+            108
+        );
+        assert_eq!(
+            hbmap_insert_growth_with_group(3, 3, 108, grp_elem, grp_align, 0, 8),
+            100
+        );
+
+        // Live exact-ceiling check on the host target for first allocation and 4->8 resize.
+        let (store, _ctx) = make_ctx();
+        let snap = store.snapshot();
+        let terms = Terms::default();
+        let empty_body = Writer::new(&snap, &terms).finish();
+        let alloc_4 = sparkles_budget::sizes::table_bytes_for::<(Id, i64)>(3) as u64;
+        let alloc_8 = sparkles_budget::sizes::table_bytes_for::<(Id, i64)>(7) as u64;
+        let ids: Vec<Id> = (1..=4).map(|i| Id::from_i64(i).unwrap()).collect();
+
+        // First allocation: exact `alloc_4` succeeds; `alloc_4 - 1` refuses without allocating.
+        {
+            let pool = QueryPool::new(alloc_4);
+            let budget = ViewBudget::new(Some(alloc_4), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let r = Reader::with_budget(&empty_body, &snap, &mut load_terms, Some(budget.handle()))
+                .unwrap();
+            let mut map: HbMap<Id, i64> = HbMap::default();
+            hbmap_load_insert(&r, &mut map, ids[0], 1).unwrap();
+            assert_eq!(map.allocation_size() as u64, alloc_4);
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+        {
+            let pool = QueryPool::new(alloc_4 - 1);
+            let budget = ViewBudget::new(Some(alloc_4 - 1), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let r = Reader::with_budget(&empty_body, &snap, &mut load_terms, Some(budget.handle()))
+                .unwrap();
+            let mut map: HbMap<Id, i64> = HbMap::default();
+            let err = hbmap_load_insert(&r, &mut map, ids[0], 1)
+                .expect_err("1 byte below first allocation must refuse");
+            assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+            assert_eq!(map.allocation_size(), 0);
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+
+        // 4->8 resize: exact `alloc_8` succeeds; `alloc_8 - 1` refuses leaving 4-bucket table intact.
+        {
+            let pool = QueryPool::new(alloc_8);
+            let budget = ViewBudget::new(Some(alloc_8), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let r = Reader::with_budget(&empty_body, &snap, &mut load_terms, Some(budget.handle()))
+                .unwrap();
+            let mut map: HbMap<Id, i64> = HbMap::default();
+            for &id in &ids {
+                hbmap_load_insert(&r, &mut map, id, 1).unwrap();
+            }
+            assert_eq!(map.allocation_size() as u64, alloc_8);
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+        {
+            let pool = QueryPool::new(alloc_8 - 1);
+            let budget = ViewBudget::new(Some(alloc_8 - 1), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let r = Reader::with_budget(&empty_body, &snap, &mut load_terms, Some(budget.handle()))
+                .unwrap();
+            let mut map: HbMap<Id, i64> = HbMap::default();
+            for &id in &ids[..3] {
+                hbmap_load_insert(&r, &mut map, id, 1).unwrap();
+            }
+            assert_eq!(map.allocation_size() as u64, alloc_4);
+            let err = hbmap_load_insert(&r, &mut map, ids[3], 1)
+                .expect_err("1 byte below 4->8 resize must refuse");
+            assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+            assert_eq!(map.allocation_size() as u64, alloc_4);
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+    }
+
+    /// Regression for round-3 P2-1: duplicate keys encoded immediately after a 4-bucket
+    /// checkpoint hash map fills must be rejected with `Error::Corrupt` before calling
+    /// `HashMap::insert` (so hashbrown never triggers `reserve(1)` and doubles the table
+    /// outside budget admission).
+    #[test]
+    fn checkpoint_load_rejects_duplicate_keys_without_growing_full_table() {
+        use crate::incr::budget::ViewBudget;
+        use crate::sparql::pool::QueryPool;
+
+        let (store, _ctx) = make_ctx();
+        let snap = store.snapshot();
+        let terms = Terms::default();
+
+        // 1. RetractableDistinct Values map (`HbMap<Id, i64>`): 3 unique + 1 duplicate.
+        {
+            let ids = [
+                Id::from_i64(10).unwrap(),
+                Id::from_i64(20).unwrap(),
+                Id::from_i64(30).unwrap(),
+            ];
+            let mut w = Writer::new(&snap, &terms);
+            w.u64(4);
+            for &id in &ids {
+                w.id(id).unwrap();
+                w.i64(1);
+            }
+            w.id(ids[0]).unwrap();
+            w.i64(2);
+            let body = w.finish();
+
+            let alloc_4 = sparkles_budget::sizes::table_bytes_for::<(Id, i64)>(3) as u64;
+            // Reader id table holds UNDEF + 3 ids = 4 slots * 8 B = 32 B.
+            let limit = 32 + alloc_4;
+            let pool = QueryPool::new(limit);
+            let budget = ViewBudget::new(Some(limit), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let mut distinct =
+                RetractableDistinct::new(Box::new(RetractableSum::new(&sum_agg())), false, 1);
+            distinct.init(1);
+            let err = distinct
+                .load_group(0, &mut r)
+                .expect_err("duplicate DISTINCT value key must fail with Corrupt");
+            assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+            match &distinct.groups[0] {
+                DistinctGroup::Values(m) => {
+                    assert_eq!(m.len(), 3);
+                    assert_eq!(m.allocation_size() as u64, alloc_4);
+                }
+                DistinctGroup::Rows(_) => unreachable!(),
+            }
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+
+        // 2. RetractableDistinct Rows map (`HbMap<Box<[Id]>, i64>`): 3 unique rows + 1 duplicate.
+        {
+            let rows = [
+                [Id::from_i64(1).unwrap(), Id::from_i64(2).unwrap()],
+                [Id::from_i64(3).unwrap(), Id::from_i64(4).unwrap()],
+                [Id::from_i64(5).unwrap(), Id::from_i64(6).unwrap()],
+            ];
+            let mut w = Writer::new(&snap, &terms);
+            w.u64(4);
+            for row in &rows {
+                w.row(row).unwrap();
+                w.i64(1);
+            }
+            w.row(&rows[0]).unwrap();
+            w.i64(2);
+            let body = w.finish();
+
+            let alloc_4 = sparkles_budget::sizes::table_bytes_for::<(Box<[Id]>, i64)>(3) as u64;
+            // Reader id table holds UNDEF + 6 ids = 7 -> Vec cap 8 * 8 = 64 B.
+            // 3 retained rows (3 * 16 B) + 1 decoded duplicate row (16 B) + 4-bucket table.
+            let limit = 64 + alloc_4 + 4 * 16;
+            let pool = QueryPool::new(limit);
+            let budget = ViewBudget::new(Some(limit), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let mut distinct =
+                RetractableDistinct::new(Box::new(RetractableSum::new(&sum_agg())), true, 2);
+            distinct.init(1);
+            let err = distinct
+                .load_group(0, &mut r)
+                .expect_err("duplicate DISTINCT* row key must fail with Corrupt");
+            assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+            match &distinct.groups[0] {
+                DistinctGroup::Rows(m) => {
+                    assert_eq!(m.len(), 3);
+                    assert_eq!(m.allocation_size() as u64, alloc_4);
+                }
+                DistinctGroup::Values(_) => unreachable!(),
+            }
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+
+        // 3. SumState decimal map (`HbMap<i128, i64>`): 3 unique + 1 duplicate.
+        {
+            let mut w = Writer::new(&snap, &terms);
+            w.i64(4); // rows
+            w.i64(0); // errs
+            w.i64(0); // undef
+            w.i128(0); // int
+            w.u64(4); // decs count
+            for k in [1i128, 2, 3, 1] {
+                w.i128(k);
+                w.i64(1);
+            }
+            let body = w.finish();
+
+            let alloc_4 = sparkles_budget::sizes::table_bytes_for::<(i128, i64)>(3) as u64;
+            let pool = QueryPool::new(alloc_4);
+            let budget = ViewBudget::new(Some(alloc_4), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let err = SumState::load(&mut r)
+                .expect_err("duplicate decimal key in SumState must fail with Corrupt");
+            assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+
+        // 4. SumState big_ints map (`HbMap<BigInt, i64>`): 3 unique + 1 duplicate.
+        {
+            let mut w = Writer::new(&snap, &terms);
+            w.i64(4);
+            w.i64(0);
+            w.i64(0);
+            w.i128(0);
+            w.u64(0); // decs
+            w.u64(0); // floats
+            w.u64(0); // doubles
+            let nums = [
+                "1000000000000000000000000000000000000001",
+                "1000000000000000000000000000000000000002",
+                "1000000000000000000000000000000000000003",
+            ];
+            w.u64(4); // big_ints
+            for num in nums {
+                w.bytes(num.as_bytes());
+                w.i64(1);
+            }
+            w.bytes(nums[0].as_bytes());
+            w.i64(2);
+            let body = w.finish();
+
+            let box_bytes = size_of::<HbMap<BigInt, i64>>() as u64;
+            let alloc_4 = sparkles_budget::sizes::table_bytes_for::<(BigInt, i64)>(3) as u64;
+            let key_bytes = BigInt::parse_scratch_bytes(nums[0]);
+            let limit = box_bytes + alloc_4 + 4 * key_bytes;
+            let pool = QueryPool::new(limit);
+            let budget = ViewBudget::new(Some(limit), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let err = SumState::load(&mut r)
+                .expect_err("duplicate BigInt key in SumState must fail with Corrupt");
+            assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+    }
+
+    /// Regression for round-3 P2-3: `COUNT(DISTINCT *)` row loading and `SumState` big-number
+    /// loading validate row widths and pre-admit row/parse scratch before allocating, and
+    /// release scratch cleanly on parse or read failures after admission.
+    #[test]
+    fn checkpoint_load_admits_distinct_rows_and_bignum_payloads_before_allocation() {
+        use crate::incr::budget::ViewBudget;
+        use crate::sparql::pool::QueryPool;
+
+        let (store, _ctx) = make_ctx();
+        let snap = store.snapshot();
+        let terms = Terms::default();
+
+        // 1. Valid COUNT(DISTINCT *) row under a budget refusing before row allocation.
+        {
+            let row = [
+                Id::from_i64(1).unwrap(),
+                Id::from_i64(2).unwrap(),
+                Id::from_i64(3).unwrap(),
+            ];
+            let mut w = Writer::new(&snap, &terms);
+            w.u64(1);
+            w.row(&row).unwrap();
+            w.i64(1);
+            let body = w.finish();
+
+            // Reader id table holds UNDEF + 3 ids = 4 slots = 32 B; allow 32 + 16 < 32 + 24.
+            let limit = 32 + 16;
+            let pool = QueryPool::new(limit);
+            let budget = ViewBudget::new(Some(limit), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let mut distinct =
+                RetractableDistinct::new(Box::new(RetractableSum::new(&sum_agg())), true, 3);
+            distinct.init(1);
+            let err = distinct
+                .load_group(0, &mut r)
+                .expect_err("budget below DISTINCT* row size must refuse before allocating");
+            assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+            assert_eq!(distinct.groups_own_bytes, 0);
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+
+        // 2. Wrong-width COUNT(DISTINCT *) rows (both oversized 65_536 and narrower width 1)
+        // must fail with Error::Corrupt before budget admission or allocation.
+        for bad_width in [65_536u64, 1u64] {
+            let mut w = Writer::new(&snap, &terms);
+            w.u64(1);
+            w.u64(bad_width);
+            if bad_width == 1 {
+                w.id(Id::from_i64(1).unwrap()).unwrap();
+                w.i64(1);
+            }
+            let body = w.finish();
+
+            // Leave 0 remaining bytes after Reader's id table so a missing width check would
+            // either allocate or hit BudgetExceeded instead of Corrupt.
+            let limit = if bad_width == 1 { 32 } else { 0 };
+            let pool = QueryPool::new(limit);
+            let budget = ViewBudget::new(Some(limit), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let mut distinct =
+                RetractableDistinct::new(Box::new(RetractableSum::new(&sum_agg())), true, 3);
+            distinct.init(1);
+            let err = distinct
+                .load_group(0, &mut r)
+                .expect_err("wrong-width DISTINCT* row must fail with Corrupt");
+            assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+        }
+
+        // 3. BigInt and BigDec: verify parse_scratch_bytes equals exact heap_bytes, pre-admits
+        // before parse, and releases scratch on malformed parse or truncated count read.
+        let big_int_lex = "9".repeat(120);
+        let big_dec_lex = format!("{}.{}", "8".repeat(80), "7".repeat(40));
+        let parsed_bi = BigInt::parse(&big_int_lex).unwrap();
+        let parsed_bd = BigDec::parse(&big_dec_lex).unwrap();
+        assert_eq!(
+            BigInt::parse_scratch_bytes(&big_int_lex),
+            parsed_bi.heap_bytes()
+        );
+        assert_eq!(
+            BigDec::parse_scratch_bytes(&big_dec_lex),
+            parsed_bd.heap_bytes()
+        );
+
+        let write_bignum_state = |bi_entry: Option<(&str, Option<i64>)>,
+                                  bd_entry: Option<(&str, Option<i64>)>|
+         -> Vec<u8> {
+            let mut w = Writer::new(&snap, &terms);
+            w.i64(1);
+            w.i64(0);
+            w.i64(0);
+            w.i128(0);
+            w.u64(0); // decs
+            w.u64(0); // floats
+            w.u64(0); // doubles
+            if let Some((text, count)) = bi_entry {
+                w.u64(1);
+                w.bytes(text.as_bytes());
+                if let Some(c) = count {
+                    w.i64(c);
+                }
+            } else {
+                w.u64(0);
+            }
+            if let Some((text, count)) = bd_entry {
+                w.u64(1);
+                w.bytes(text.as_bytes());
+                if let Some(c) = count {
+                    w.i64(c);
+                }
+            } else if bi_entry.is_none_or(|(_, c)| c.is_some()) {
+                w.u64(0);
+            }
+            w.finish()
+        };
+
+        // 3a. Refusal before BigInt/BigDec parse when budget covers Box<HbMap> but not parse scratch.
+        {
+            let body = write_bignum_state(Some((&big_int_lex, Some(1))), None);
+            let box_bytes = size_of::<HbMap<BigInt, i64>>() as u64;
+            let limit = box_bytes + parsed_bi.heap_bytes() - 1;
+            let pool = QueryPool::new(limit);
+            let budget = ViewBudget::new(Some(limit), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let err = SumState::load(&mut r)
+                .expect_err("budget below BigInt parse scratch must refuse before parsing");
+            assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+            drop(r);
+            drop(budget.drain_retired());
+            assert_eq!(pool.granted(), 0, "scratch leases must drop on refusal");
+        }
+        {
+            let body = write_bignum_state(None, Some((&big_dec_lex, Some(1))));
+            let box_bytes = size_of::<HbMap<BigDec, i64>>() as u64;
+            let limit = box_bytes + parsed_bd.heap_bytes() - 1;
+            let pool = QueryPool::new(limit);
+            let budget = ViewBudget::new(Some(limit), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let err = SumState::load(&mut r)
+                .expect_err("budget below BigDec parse scratch must refuse before parsing");
+            assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+            drop(r);
+            drop(budget.drain_retired());
+            assert_eq!(pool.granted(), 0, "scratch leases must drop on refusal");
+        }
+
+        // 3b. Malformed BigInt / BigDec after scratch admission returns Corrupt and releases credit.
+        for body in [
+            write_bignum_state(Some(("12345notanint", Some(1))), None),
+            write_bignum_state(None, Some(("12.34.56", Some(1)))),
+        ] {
+            let pool = QueryPool::new(4096);
+            let budget = ViewBudget::new(Some(4096), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let err = SumState::load(&mut r)
+                .expect_err("malformed big-number text must fail with Corrupt");
+            assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+            drop(r);
+            drop(budget.drain_retired());
+            assert_eq!(
+                pool.granted(),
+                0,
+                "malformed big-number parse must release scratch immediately"
+            );
+        }
+
+        // 3c. Truncated count read (`r.i64()` EOF) after valid BigInt/BigDec parse releases credit.
+        for body in [
+            write_bignum_state(Some((&big_int_lex, None)), None),
+            write_bignum_state(None, Some((&big_dec_lex, None))),
+        ] {
+            let pool = QueryPool::new(4096);
+            let budget = ViewBudget::new(Some(4096), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let err = SumState::load(&mut r)
+                .expect_err("truncated count after big-number parse must fail with Corrupt");
+            assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+            drop(r);
+            drop(budget.drain_retired());
+            assert_eq!(
+                pool.granted(),
+                0,
+                "truncated count after big-number parse must release scratch immediately"
+            );
+        }
+
+        // 3d. Exact-budget load of both BigInt and BigDec succeeds at exact retained bytes
+        // and refuses 1 byte below.
+        {
+            let body =
+                write_bignum_state(Some((&big_int_lex, Some(1))), Some((&big_dec_lex, Some(1))));
+            let exact = size_of::<HbMap<BigInt, i64>>() as u64
+                + sparkles_budget::sizes::table_bytes_for::<(BigInt, i64)>(3) as u64
+                + parsed_bi.heap_bytes()
+                + size_of::<HbMap<BigDec, i64>>() as u64
+                + sparkles_budget::sizes::table_bytes_for::<(BigDec, i64)>(3) as u64
+                + parsed_bd.heap_bytes();
+
+            let pool = QueryPool::new(exact);
+            let budget = ViewBudget::new(Some(exact), Some(pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+            let state = SumState::load(&mut r).expect("exact big-number budget must succeed");
+            assert_eq!(state.map_bytes(), exact);
+            assert_eq!(state.exact_map_bytes(), exact);
+            drop(r);
+            budget.clear_state();
+            drop(budget);
+            assert_eq!(pool.granted(), 0);
+
+            let tight_pool = QueryPool::new(exact - 1);
+            let tight_budget = ViewBudget::new(Some(exact - 1), Some(tight_pool.work_parent()));
+            let mut load_terms = Terms::default();
+            let mut r =
+                Reader::with_budget(&body, &snap, &mut load_terms, Some(tight_budget.handle()))
+                    .unwrap();
+            let err = SumState::load(&mut r)
+                .expect_err("1 byte below exact big-number budget must refuse");
+            assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+            drop(r);
+            tight_budget.clear_state();
+            drop(tight_budget);
+            assert_eq!(tight_pool.granted(), 0);
+        }
     }
 }

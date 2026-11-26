@@ -933,12 +933,7 @@ pub(super) fn whole_sequential_with_computed(
         .unwrap_or_else(|| Table::new(vars.to_vec())))
 }
 
-/// GROUP BY over a table that holds the whole input, for the eager executor and for
-/// the finished groups of an input ordered on the keys. Returns the keys and then the
-/// aggregates' values, one row per group in order of first appearance, and one row for
-/// an ungrouped aggregate over no rows. `eager` checks the output's size against the
-/// query's limits as the groups grow, as an eager table is checked.
-pub(crate) fn whole(
+fn whole_inner(
     ctx: &Ctx,
     table: &Table,
     keys: &[VarId],
@@ -946,7 +941,7 @@ pub(crate) fn whole(
     charged: bool,
     eager: bool,
     report: &mut ExprReport,
-) -> Result<Table> {
+) -> Result<(Table, bool)> {
     let only_counts = keys.is_empty()
         && hashable(ctx, aggs)
         && aggs.iter().all(|(_, a)| a.expr.is_none() && !a.distinct);
@@ -957,7 +952,9 @@ pub(crate) fn whole(
         && rayon::current_num_threads() > 1
         && hashable(ctx, aggs)
     {
-        return super::par::whole_parallel(ctx, table, keys, aggs, charged, eager, report);
+        return super::par::whole_parallel_observing_merge_fallback(
+            ctx, table, keys, aggs, charged, eager, report,
+        );
     }
     let mut vars = keys.to_vec();
     vars.extend(aggs.iter().map(|(v, _)| *v));
@@ -975,7 +972,40 @@ pub(crate) fn whole(
     } else {
         grouping.add(ctx, table, report)?;
     }
-    Ok(grouping
-        .output(ctx, &vars, usize::MAX)?
-        .unwrap_or_else(|| Table::new(vars)))
+    Ok((
+        grouping
+            .output(ctx, &vars, usize::MAX)?
+            .unwrap_or_else(|| Table::new(vars)),
+        false,
+    ))
+}
+
+/// GROUP BY over a table that holds the whole input, for the eager executor and for
+/// the finished groups of an input ordered on the keys. Returns the keys and then the
+/// aggregates' values, one row per group in order of first appearance, and one row for
+/// an ungrouped aggregate over no rows. `eager` checks the output's size against the
+/// query's limits as the groups grow, as an eager table is checked.
+pub(crate) fn whole(
+    ctx: &Ctx,
+    table: &Table,
+    keys: &[VarId],
+    aggs: &[(VarId, Agg)],
+    charged: bool,
+    eager: bool,
+    report: &mut ExprReport,
+) -> Result<Table> {
+    whole_inner(ctx, table, keys, aggs, charged, eager, report).map(|(out, _)| out)
+}
+
+#[cfg(test)]
+pub(crate) fn whole_observing_range_merge_fallback(
+    ctx: &Ctx,
+    table: &Table,
+    keys: &[VarId],
+    aggs: &[(VarId, Agg)],
+    charged: bool,
+    eager: bool,
+    report: &mut ExprReport,
+) -> Result<(Table, bool)> {
+    whole_inner(ctx, table, keys, aggs, charged, eager, report)
 }

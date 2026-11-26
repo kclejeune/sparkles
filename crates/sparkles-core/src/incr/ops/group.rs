@@ -742,29 +742,36 @@ impl Group {
             )));
         }
         self.clear_state();
-        let key_row_bytes = self.keys.len() as u64 * 8;
-        let out_row_bytes = (self.keys.len() + self.aggs.len()) as u64 * 8;
+        let key_width = self.keys.len();
+        let out_width = self.keys.len() + self.aggs.len();
+        let key_row_bytes = key_width as u64 * std::mem::size_of::<Id>() as u64;
+        let out_row_bytes = out_width as u64 * std::mem::size_of::<Id>() as u64;
         let live_per_group = key_row_bytes * 2 + out_row_bytes;
         let n = r.u64()?;
         for _ in 0..n {
-            let key = r.row()?;
+            let mut row_lease = r.scratch_lease();
+            let key = r.row_exact_leased(key_width, &mut row_lease)?;
+            if self.index.contains_key(&key) {
+                return Err(Error::Corrupt(
+                    "a view's state holds a duplicate group key".into(),
+                ));
+            }
             let rows = r.i64()?;
             let out = match r.u64()? {
                 0 => None,
-                _ => Some(r.row()?),
+                _ => Some(r.row_exact_leased(out_width, &mut row_lease)?),
             };
             let slots_delta = acc::vec_insert_growth(&self.slots);
-            let index_est = if self.index.contains_key(&key) {
-                0
-            } else {
-                acc::hbmap_insert_growth(&self.index, 0)
-            };
+            let index_est = acc::hbmap_insert_growth(&self.index, 0);
             let accs_delta: u64 = self.accs.iter().map(|a| a.init_growth(1)).sum();
-            let est = live_per_group
+            let leased = row_lease.bytes();
+            let remaining_live = live_per_group.saturating_sub(leased);
+            let remaining_est = remaining_live
                 .saturating_add(slots_delta)
                 .saturating_add(index_est)
                 .saturating_add(accs_delta);
-            r.charge_state(est)?;
+            r.charge_state(remaining_est)?;
+            r.commit_scratch_to_state(&mut row_lease, leased);
             let index_before = self.index.allocation_size() as u64;
             let slot = self.push_group(key) as usize;
             let index_actual = (self.index.allocation_size() as u64).saturating_sub(index_before);
@@ -1068,5 +1075,197 @@ mod tests {
                 group.bytes()
             );
         }
+    }
+
+    /// Regression for round-3 P2-1 and P2-3: `Group::load` must reject duplicate group
+    /// keys before `push_group` (preventing un-admitted 4->8 bucket growth and duplicate
+    /// slots), check encoded key/output row widths before allocating, and pre-admit valid
+    /// row buffers before decoding them.
+    #[test]
+    fn group_load_rejects_duplicate_keys_and_validates_admits_rows() {
+        use crate::incr::budget::ViewBudget;
+        use crate::sparql::pool::QueryPool;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let parsed = sparql::parse_query(
+            "PREFIX : <http://ex/> SELECT ?g (COUNT(*) AS ?c) WHERE { ?x :g ?g } GROUP BY ?g",
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let make_group = || {
+            let mut plan = compile(&parsed, None).unwrap();
+            find_group_mut(&mut plan.root)
+                .expect("Group operator")
+                .clone()
+        };
+
+        let g_ids = [
+            Id::from_i64(1).unwrap(),
+            Id::from_i64(2).unwrap(),
+            Id::from_i64(3).unwrap(),
+        ];
+        let c1 = Id::from_i64(1).unwrap();
+        let write_count_group = |w: &mut Writer, key: &[Id], out: Option<&[Id]>| {
+            w.row(key).unwrap();
+            w.i64(1);
+            match out {
+                Some(o) => {
+                    w.u64(1);
+                    w.row(o).unwrap();
+                }
+                None => w.u64(0),
+            }
+            // Running::save_group for COUNT(*) writes a single u64 count.
+            w.u64(1);
+        };
+
+        // 1. Measure exact bytes of 3 distinct groups (fills the 4-bucket index: len == 3, cap == 3).
+        let terms = Terms::default();
+        let mut w3 = Writer::new(&snap, &terms);
+        w3.u64(GROUP_STATE_VERSION);
+        w3.u64(3);
+        for &g in &g_ids {
+            write_count_group(&mut w3, &[g], Some(&[g, c1]));
+        }
+        let body3 = w3.finish();
+
+        let mut baseline = make_group();
+        let mut load_terms = Terms::default();
+        let mut r = Reader::new(&body3, &snap, &mut load_terms).unwrap();
+        baseline.load(&mut r).unwrap();
+        assert_eq!(baseline.slots.len(), 3);
+        assert_eq!(baseline.index.len(), 3);
+        assert_eq!(baseline.index.capacity(), 3);
+        let alloc_4 = baseline.index.allocation_size();
+        let bytes_3 = baseline.bytes();
+
+        // 2. Duplicate 4th group key immediately after the 4-bucket index fills, under a
+        // budget fitting only the 3-group allocation (plus Reader's id table + one key row).
+        let mut w_dup = Writer::new(&snap, &terms);
+        w_dup.u64(GROUP_STATE_VERSION);
+        w_dup.u64(4);
+        for &g in &g_ids {
+            write_count_group(&mut w_dup, &[g], Some(&[g, c1]));
+        }
+        write_count_group(&mut w_dup, &[g_ids[0]], Some(&[g_ids[0], c1]));
+        let body_dup = w_dup.finish();
+
+        // Reader id table holds 4 entries (UNDEF + 3 ints) -> Vec cap 4 = 32 B.
+        // Budget admits 3 groups + id table + the 8-byte decoded key row, well below an 8-bucket resize.
+        let dup_limit = bytes_3 + 32 + 8;
+        let pool = QueryPool::new(dup_limit);
+        let budget = ViewBudget::new(Some(dup_limit), Some(pool.work_parent()));
+        let mut dup_group = make_group();
+        let mut load_terms = Terms::default();
+        let mut r =
+            Reader::with_budget(&body_dup, &snap, &mut load_terms, Some(budget.handle())).unwrap();
+        let err = dup_group
+            .load(&mut r)
+            .expect_err("duplicate group key must be rejected");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(
+            dup_group.index.allocation_size(),
+            alloc_4,
+            "duplicate group key must not grow a full 4-bucket index"
+        );
+        assert_eq!(
+            dup_group.slots.len(),
+            3,
+            "duplicate group key must not append a fourth slot"
+        );
+        drop(r);
+        budget.clear_state();
+        drop(budget);
+        assert_eq!(pool.granted(), 0);
+
+        // 3. Valid group key row under a budget that refuses before allocating the key row.
+        let mut w_one = Writer::new(&snap, &terms);
+        w_one.u64(GROUP_STATE_VERSION);
+        w_one.u64(1);
+        write_count_group(&mut w_one, &[g_ids[0]], Some(&[g_ids[0], c1]));
+        let body_one = w_one.finish();
+
+        // Reader id table for 1 unique id needs 32 B; allow 35 B so the 8-byte key row refuses.
+        let tight_pool = QueryPool::new(35);
+        let tight_budget = ViewBudget::new(Some(35), Some(tight_pool.work_parent()));
+        let mut tight_group = make_group();
+        let mut load_terms = Terms::default();
+        let mut r = Reader::with_budget(
+            &body_one,
+            &snap,
+            &mut load_terms,
+            Some(tight_budget.handle()),
+        )
+        .unwrap();
+        let err = tight_group
+            .load(&mut r)
+            .expect_err("budget below key row size must refuse before allocating row");
+        assert!(matches!(err, Error::BudgetExceeded(_)), "got {err:?}");
+        assert_eq!(tight_group.slots.len(), 0);
+        drop(r);
+        tight_budget.clear_state();
+        drop(tight_budget);
+        assert_eq!(tight_pool.granted(), 0);
+
+        // 4. Wrong-width key row (oversized width 65_536) and wrong-width output row (width 3
+        // instead of 2) must fail with Error::Corrupt before budget admission or allocation.
+        let mut w_bad_key = Writer::new(&snap, &terms);
+        w_bad_key.u64(GROUP_STATE_VERSION);
+        w_bad_key.u64(1);
+        w_bad_key.u64(65_536);
+        let body_bad_key = w_bad_key.finish();
+
+        let tiny_pool = QueryPool::new(64);
+        let tiny_budget = ViewBudget::new(Some(64), Some(tiny_pool.work_parent()));
+        let mut bad_key_group = make_group();
+        let mut load_terms = Terms::default();
+        let mut r = Reader::with_budget(
+            &body_bad_key,
+            &snap,
+            &mut load_terms,
+            Some(tiny_budget.handle()),
+        )
+        .unwrap();
+        let err = bad_key_group
+            .load(&mut r)
+            .expect_err("oversized group key width must fail with Corrupt");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        drop(r);
+        tiny_budget.clear_state();
+        drop(tiny_budget);
+        assert_eq!(tiny_pool.granted(), 0);
+
+        let mut w_bad_out = Writer::new(&snap, &terms);
+        w_bad_out.u64(GROUP_STATE_VERSION);
+        w_bad_out.u64(1);
+        w_bad_out.row(&[g_ids[0]]).unwrap();
+        w_bad_out.i64(1);
+        w_bad_out.u64(1);
+        w_bad_out.row(&[g_ids[0], c1, c1]).unwrap();
+        let body_bad_out = w_bad_out.finish();
+
+        let out_pool = QueryPool::new(128);
+        let out_budget = ViewBudget::new(Some(128), Some(out_pool.work_parent()));
+        let mut bad_out_group = make_group();
+        let mut load_terms = Terms::default();
+        let mut r = Reader::with_budget(
+            &body_bad_out,
+            &snap,
+            &mut load_terms,
+            Some(out_budget.handle()),
+        )
+        .unwrap();
+        let err = bad_out_group
+            .load(&mut r)
+            .expect_err("wrong-width output row must fail with Corrupt");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(bad_out_group.slots.len(), 0);
+        drop(r);
+        out_budget.clear_state();
+        drop(out_budget);
+        assert_eq!(out_pool.granted(), 0);
     }
 }

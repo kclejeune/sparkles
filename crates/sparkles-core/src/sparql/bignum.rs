@@ -498,25 +498,36 @@ fn cmp_mag_scaled(a: &[u32], sa: u32, b: &[u32], sb: u32) -> Ordering {
     Ordering::Equal
 }
 
-fn parse_unsigned_digits(digits: &str) -> Vec<u32> {
-    let stripped = digits.trim_start_matches('0');
-    if stripped.is_empty() {
+fn parse_unsigned_digits_parts(hi: &[u8], lo: &[u8]) -> Vec<u32> {
+    let total = hi.len() + lo.len();
+    if total == 0 {
         return Vec::new();
     }
-    let bytes = stripped.as_bytes();
-    let mut limbs = Vec::with_capacity(bytes.len().div_ceil(BASE_DIGITS));
-    let mut end = bytes.len();
+    let byte_at = |idx: usize| -> u8 {
+        if idx < hi.len() {
+            hi[idx]
+        } else {
+            lo[idx - hi.len()]
+        }
+    };
+    let mut limbs = Vec::with_capacity(total.div_ceil(BASE_DIGITS));
+    let mut end = total;
     while end > 0 {
         let start = end.saturating_sub(BASE_DIGITS);
         let mut val: u32 = 0;
-        for &b in &bytes[start..end] {
-            val = val * 10 + u32::from(b - b'0');
+        for idx in start..end {
+            val = val * 10 + u32::from(byte_at(idx) - b'0');
         }
         limbs.push(val);
         end = start;
     }
     trim_limbs(&mut limbs);
     limbs
+}
+
+fn parse_unsigned_digits(digits: &str) -> Vec<u32> {
+    let stripped = digits.trim_start_matches('0');
+    parse_unsigned_digits_parts(&[], stripped.as_bytes())
 }
 
 fn write_limbs(limbs: &[u32], f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -583,6 +594,23 @@ impl BigInt {
             n /= BASE_U128;
         }
         Self { neg: false, limbs }
+    }
+
+    /// Heap allocation upper bound (and exact retained [`BigInt::heap_bytes`] for valid
+    /// inputs) for [`BigInt::parse`], computed without allocating.
+    pub(crate) fn parse_scratch_bytes(lex: &str) -> u64 {
+        let digits = lex
+            .strip_prefix(['+', '-'])
+            .unwrap_or(lex)
+            .trim_start_matches('0')
+            .len()
+            .min(MAX_DIGITS);
+        let limbs_bytes = if digits == 0 {
+            0
+        } else {
+            (digits.div_ceil(BASE_DIGITS) * std::mem::size_of::<u32>()) as u64
+        };
+        limbs_bytes + 32
     }
 
     /// Strict XSD `xsd:integer` lexical parse (`(\+|-)?[0-9]+`).
@@ -1015,6 +1043,31 @@ impl BigDec {
         Some(Decimal::from_be_bytes(raw.to_be_bytes()))
     }
 
+    /// Heap allocation upper bound (and exact retained [`BigDec::heap_bytes`] for valid
+    /// inputs) for [`BigDec::parse`], computed without allocating.
+    pub(crate) fn parse_scratch_bytes(lex: &str) -> u64 {
+        let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+        let digits = match body.split_once('.') {
+            Some((i, f)) => {
+                let i = i.trim_start_matches('0');
+                let f = f.trim_end_matches('0');
+                if i.is_empty() {
+                    f.trim_start_matches('0').len()
+                } else {
+                    i.len().saturating_add(f.len())
+                }
+            }
+            None => body.trim_start_matches('0').len(),
+        };
+        let capped = digits.min(MAX_DIGITS);
+        let limbs_bytes = if capped == 0 {
+            0
+        } else {
+            (capped.div_ceil(BASE_DIGITS) * std::mem::size_of::<u32>()) as u64
+        };
+        limbs_bytes + 40
+    }
+
     /// Strict XSD `xsd:decimal` lexical parse (`(\+|-)?([0-9]+(\.[0-9]*)?|\.[0-9]+)`).
     pub fn parse(lex: &str) -> Option<Self> {
         let (neg, body) = match lex.as_bytes().first() {
@@ -1058,14 +1111,11 @@ impl BigDec {
         if sig_len > MAX_DIGITS {
             return None;
         }
-        let mut combined = String::with_capacity(sig_len);
-        if int_trim.is_empty() {
-            combined.push_str(frac_trim.trim_start_matches('0'));
+        let limbs = if int_trim.is_empty() {
+            parse_unsigned_digits_parts(&[], frac_trim.trim_start_matches('0').as_bytes())
         } else {
-            combined.push_str(int_trim);
-            combined.push_str(frac_trim);
-        }
-        let limbs = parse_unsigned_digits(&combined);
+            parse_unsigned_digits_parts(int_trim.as_bytes(), frac_trim.as_bytes())
+        };
         Self::normalize(neg, limbs, scale)
     }
 
