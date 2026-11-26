@@ -1169,6 +1169,9 @@ pub enum ExistingRecord {
     Many,
 }
 
+/// A graph's stored quad with its physical `[Id; 4]` and decoded triple.
+pub type StoredQuad = ([Id; 4], Triple);
+
 /// Lookups in one unmasked snapshot under one preparation. The writer reads its head
 /// with them, which no caller policy limits: what they find decides only whether the
 /// operation repeats or conflicts with records of the caller's own identities.
@@ -1381,6 +1384,68 @@ impl<'a> Reads<'a> {
             Ok(false)
         })?;
         Ok(found)
+    }
+
+    /// Up to `limit` quads of graph `g`, returning each quad's physical `[Id; 4]` and
+    /// decoded triple, plus whether more quads exist in `g`. The scan buffer and every
+    /// retained triple are charged to the preparation before allocation.
+    pub fn graph_quads_up_to(
+        &mut self,
+        g: &str,
+        limit: usize,
+        held: &mut Reservation,
+    ) -> Result<(Vec<StoredQuad>, bool)> {
+        let Some(gid) = self.id(g)? else {
+            return Ok((Vec::new(), false));
+        };
+        const ROW: u64 = std::mem::size_of::<[Id; 4]>() as u64;
+        const CHUNK: usize = 4096;
+        let mut rows_held = self.preparation.reserve(0)?;
+        let mut rows: Vec<[Id; 4]> = Vec::new();
+        let mut more = false;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[gid.0], |q| {
+                if rows.len() == limit {
+                    more = true;
+                    return Ok(false);
+                }
+                if rows.len() == rows.capacity() {
+                    rows_held.grow_by(CHUNK as u64 * ROW)?;
+                    rows.reserve_exact(CHUNK);
+                }
+                rows.push(q);
+                Ok(true)
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for q in rows {
+            let subject = match self
+                .preparation
+                .with_term(self.snap, q[0], |t| Ok(t.cloned()))?
+            {
+                Some(Term::NamedNode(n)) => NamedOrBlankNode::NamedNode(n),
+                Some(Term::BlankNode(b)) => NamedOrBlankNode::BlankNode(b),
+                _ => continue,
+            };
+            let Some(Term::NamedNode(predicate)) =
+                self.preparation
+                    .with_term(self.snap, q[1], |t| Ok(t.cloned()))?
+            else {
+                continue;
+            };
+            let Some(object) = self
+                .preparation
+                .with_term(self.snap, q[2], |t| Ok(t.cloned()))?
+            else {
+                continue;
+            };
+            let triple = Triple::new(subject, predicate, object);
+            let bytes = (triple.to_string().len() as u64)
+                .saturating_mul(4)
+                .saturating_add(128);
+            held.grow_by(bytes)?;
+            out.push((q, triple));
+        }
+        Ok((out, more))
     }
 
     /// Whether the quad `s p o g` is in the snapshot. `o` is a ground term.

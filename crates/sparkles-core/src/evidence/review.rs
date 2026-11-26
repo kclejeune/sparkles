@@ -153,6 +153,20 @@ pub fn withdrawal_payload_digest(
     frame.finish()
 }
 
+/// The payload digest of a projection reconciliation request.
+pub fn reconcile_payload_digest(
+    policy: &str,
+    version: Option<u32>,
+    control: &Control,
+) -> Result<Sha256Digest> {
+    let mut frame = FrameHash::new(b"sparkles-evidence-reconcile-projection-v1", control)?;
+    frame.field(1, policy.as_bytes())?;
+    if let Some(v) = version {
+        frame.field(2, &v.to_be_bytes())?;
+    }
+    frame.finish()
+}
+
 fn planned(
     key: &str,
     kind: RecordKind,
@@ -385,6 +399,71 @@ pub fn projection_iri(
         &version.to_string(),
         control,
     )
+}
+
+/// The identity of a reconciled projection record of `policy` at `version` under the
+/// protection nonces `nonces`. Including the three nonces keeps it distinct from the
+/// initial projection record and from earlier protection epochs.
+pub fn reconciled_projection_iri(
+    dataset: Uuid,
+    policy: &str,
+    version: u32,
+    nonces: ProjectionNonces,
+    control: &Control,
+) -> Result<NamedNode> {
+    mint(
+        dataset,
+        &policy_iri(policy),
+        RecordKind::Projection,
+        policy,
+        &format!(
+            "{version} {} {} {}",
+            nonces.decisions, nonces.supports, nonces.output
+        ),
+        control,
+    )
+}
+
+/// A reconciled projection record of `policy` at `version` in its supports graph
+/// `graph`, carrying the current protection `nonces` and superseding `supersedes`
+/// through `prov:wasRevisionOf`.
+#[allow(clippy::too_many_arguments)]
+pub fn reconciled_projection_record(
+    dataset: Uuid,
+    policy: &str,
+    version: u32,
+    output: &NamedNode,
+    mode: ConflictMode,
+    nonces: ProjectionNonces,
+    supersedes: &[NamedNode],
+    graph: &NamedNode,
+    control: &Control,
+) -> Result<PlannedRecord> {
+    let iri = reconciled_projection_iri(dataset, policy, version, nonces, control)?;
+    let mut r = Record::new(&iri, RecordKind::Projection);
+    r.add(ev("reviewPolicy"), policy_iri(policy));
+    r.add(ev("policyVersion"), string(&version.to_string()));
+    r.add(ev("output"), output.clone());
+    r.add(
+        ev("conflictMode"),
+        ev(match mode {
+            ConflictMode::Refuse => "Refuse",
+            ConflictMode::AdmitLabelled => "AdmitLabelled",
+        }),
+    );
+    for (p, n) in NONCE_PREDICATES
+        .iter()
+        .zip([nonces.decisions, nonces.supports, nonces.output])
+    {
+        r.add(NamedNode::new_unchecked(*p), string(&n.to_string()));
+    }
+    let mut prior: Vec<&NamedNode> = supersedes.iter().collect();
+    prior.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    prior.dedup();
+    for p in prior {
+        r.add(prov("wasRevisionOf"), p.clone());
+    }
+    planned("projection", RecordKind::Projection, r, graph, control)
 }
 
 /// The protection nonces of a matching policy's decisions, maps and output graphs.

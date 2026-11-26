@@ -1085,3 +1085,544 @@ fn conflicts_are_answered_in_one_order_on_replay() {
     assert!(again.replayed);
     assert_eq!(again.decisions, first.decisions);
 }
+
+/// An occurrence asserting `<urn:release> <urn:affectedBy> <object>`.
+fn occurrence_with(source_key: &str, object: &str, polarity: Polarity) -> EvidenceInput {
+    let mut batch = occurrence(source_key, polarity);
+    batch.claims[0].proposition =
+        Triple::new(iri("urn:release"), iri("urn:affectedBy"), iri(object));
+    batch
+}
+
+fn reconcile(
+    ds: &Dataset,
+    policy: &str,
+    version: Option<u32>,
+    opts: &ReviewOptions,
+) -> sparkles::Result<evidence::ReconciledProjection> {
+    evidence::reconcile_projection(ds, ds, policy, version, opts, None, &Control::none())
+}
+
+/// Detaching and re-protecting the output graph leaves supports and decisions
+/// authenticated: reconciliation rebuilds the output graph strictly from live vouched
+/// supports (removing tampered ground and blank-node triples and restoring missing
+/// vouched triples), records a fresh projection record superseding the old one, and
+/// restores review, withdrawal and policy claim reads.
+#[test]
+fn reconciling_after_output_detach_rebuilds_from_vouched_supports() {
+    let ds = configured(ConflictMode::Refuse);
+    let prep = sparkles::access::Preparation::new(Control::none(), 16 << 20).unwrap();
+    ds.store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    let b = claim_of(&propose(
+        &ds,
+        &occurrence_with("s2", "urn:cve2", Polarity::Positive),
+    ));
+    let c = claim_of(&propose(
+        &ds,
+        &occurrence_with("s3", "urn:cve3", Polarity::Positive),
+    ));
+    let d = claim_of(&propose(
+        &ds,
+        &occurrence_with("s4", "urn:cve4", Polarity::Positive),
+    ));
+    let e = claim_of(&propose(
+        &ds,
+        &occurrence_with("s5", "urn:cve5", Polarity::Positive),
+    ));
+
+    let r1 = review(
+        &ds,
+        &[
+            decision("a", &a, Disposition::Accepted, None),
+            decision("b", &b, Disposition::Accepted, None),
+            decision("c", &c, Disposition::Accepted, None),
+            decision("d", &d, Disposition::Accepted, None),
+        ],
+    )
+    .unwrap();
+    let sup_a = r1.decisions[0].support.clone().unwrap();
+    let sup_b = r1.decisions[1].support.clone().unwrap();
+    let dec_d = r1.decisions[3].iri.clone();
+
+    // Withdraw C and supersede D with a rejection so only A and B remain live.
+    withdraw(&ds, &c);
+    review(
+        &ds,
+        &[decision("d2", &d, Disposition::Rejected, Some(&dec_d))],
+    )
+    .unwrap();
+
+    // Detach OUTPUT, delete A's triple, inject bogus ground + blank-node triples and
+    // re-insert withdrawn C's triple, then re-protect OUTPUT.
+    evidence::detach(&ds, OUTPUT).unwrap();
+    ds.update(&format!(
+        "DELETE DATA {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve1> }} }} ; \
+         INSERT DATA {{ GRAPH <{OUTPUT}> {{ \
+             <urn:bogus> <urn:p> \"tampered\" . \
+             _:b0 <urn:p> \"blank-tampered\" . \
+             <urn:release> <urn:affectedBy> <urn:cve3> \
+         }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+
+    // Reviews, withdrawals and policy reads all report projection-unavailable.
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("e", &e, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(
+        code(evidence::withdraw(
+            &ds,
+            &ds,
+            &[WithdrawalInput {
+                key: "w".into(),
+                target: a.0.clone(),
+                target_digest: a.1,
+            }],
+            &reviewer(),
+            &mut |_, _| all(),
+            &Control::none(),
+        )),
+        "projection-unavailable"
+    );
+    let view = ds
+        .store()
+        .evidence_view(&sparkles::history::At::Head, &prep)
+        .unwrap();
+    assert_eq!(
+        code(evidence::claim_states(
+            &view,
+            "main",
+            std::slice::from_ref(&a.0),
+            None,
+            &Control::none(),
+        )),
+        "projection-unavailable"
+    );
+
+    // Dry run previews exact rebuild without writing.
+    let head = ds.store().head_commit().seq;
+    let mut dry_opts = reviewer();
+    dry_opts.dry_run = true;
+    dry_opts.if_head = Some(head);
+    let preview = reconcile(&ds, "main", Some(1), &dry_opts).unwrap();
+    assert!(!preview.committed && !preview.replayed);
+    assert!(preview.preview.is_some());
+    assert_eq!(preview.changed.inserted.len(), 1);
+    assert_eq!(preview.changed.removed.len(), 3);
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Real reconciliation with idempotency key.
+    let mut opts = reviewer();
+    opts.idempotency_key = Some("rec-output-1".into());
+    opts.if_head = Some(head);
+    let rec = reconcile(&ds, "main", Some(1), &opts).unwrap();
+    assert!(rec.committed && !rec.replayed);
+    assert_eq!(rec.policy_version, 1);
+    let mut expected_supports = vec![sup_a, sup_b];
+    expected_supports.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+    assert_eq!(rec.vouched_supports, expected_supports);
+    assert_eq!(rec.changed.inserted.len(), 1);
+    assert_eq!(rec.changed.removed.len(), 3);
+    assert_eq!(
+        accepted(&ds),
+        vec![
+            "<urn:release> <urn:affectedBy> <urn:cve1>".to_string(),
+            "<urn:release> <urn:affectedBy> <urn:cve2>".to_string(),
+        ]
+    );
+    // Fresh projection record supersedes the earlier one through prov:wasRevisionOf.
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{SUPPORTS}> {{ <{}> a <{EV}Projection> ; <http://www.w3.org/ns/prov#wasRevisionOf> ?prior }} }}",
+            rec.projection.as_str()
+        ))
+        .unwrap()
+    );
+
+    // Replay returns the first receipt; different payload conflicts.
+    let replay = reconcile(&ds, "main", Some(1), &opts).unwrap();
+    assert!(!replay.committed && replay.replayed);
+    assert_eq!(replay.commit, rec.commit);
+    assert_eq!(replay.projection, rec.projection);
+    assert!(replay.changed.inserted.is_empty() && replay.changed.removed.is_empty());
+
+    assert_eq!(
+        code(reconcile(&ds, "main", None, &opts)),
+        "idempotency-conflict"
+    );
+
+    // Subsequent review (at same policy version 1), withdrawal and policy claim reads succeed.
+    review(&ds, &[decision("e", &e, Disposition::Accepted, None)]).unwrap();
+    assert_eq!(accepted(&ds).len(), 3);
+    withdraw(&ds, &a);
+    assert_eq!(
+        accepted(&ds),
+        vec![
+            "<urn:release> <urn:affectedBy> <urn:cve2>".to_string(),
+            "<urn:release> <urn:affectedBy> <urn:cve5>".to_string(),
+        ]
+    );
+    let view = ds
+        .store()
+        .evidence_view(&sparkles::history::At::Head, &prep)
+        .unwrap();
+    let states = evidence::claim_states(
+        &view,
+        "main",
+        &[a.0.clone(), b.0.clone()],
+        None,
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(
+        states[0].as_ref().unwrap().state,
+        evidence::ClaimState::Withdrawn
+    );
+    assert_eq!(
+        states[1].as_ref().unwrap().state,
+        evidence::ClaimState::Accepted
+    );
+}
+
+/// Detaching and re-protecting decisions or supports (untouched or cleared) stops
+/// prior supports from authenticating, so reconciliation empties the output graph,
+/// records the new protections, and restores normal reviews and withdrawals.
+#[test]
+fn reconciling_after_decisions_or_supports_detach_empties_output_and_restores_operations() {
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(
+        &ds,
+        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+    ));
+    let b = claim_of(&propose(
+        &ds,
+        &occurrence_with("s2", "urn:cve2", Polarity::Positive),
+    ));
+    let c = claim_of(&propose(
+        &ds,
+        &occurrence_with("s3", "urn:cve3", Polarity::Positive),
+    ));
+    let d = claim_of(&propose(
+        &ds,
+        &occurrence_with("s4", "urn:cve4", Polarity::Positive),
+    ));
+
+    // 1. Detach & re-protect DECISIONS.
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    evidence::detach(&ds, DECISIONS).unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("b", &b, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    let rec1 = reconcile(&ds, "main", None, &reviewer()).unwrap();
+    assert!(rec1.vouched_supports.is_empty());
+    assert_eq!(rec1.changed.removed.len(), 1);
+    assert!(accepted(&ds).is_empty());
+
+    // Normal review & withdrawal work again.
+    review(&ds, &[decision("b", &b, Disposition::Accepted, None)]).unwrap();
+    assert_eq!(
+        accepted(&ds),
+        vec!["<urn:release> <urn:affectedBy> <urn:cve2>".to_string()]
+    );
+
+    // 2. Detach & re-protect SUPPORTS (leaving old triples intact).
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("c", &c, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    let rec2 = reconcile(&ds, "main", None, &reviewer()).unwrap();
+    assert!(rec2.vouched_supports.is_empty());
+    assert_eq!(rec2.changed.removed.len(), 1);
+    assert!(accepted(&ds).is_empty());
+    review(&ds, &[decision("c", &c, Disposition::Accepted, None)]).unwrap();
+    assert_eq!(accepted(&ds).len(), 1);
+
+    // 3. Detach, CLEAR, and re-protect SUPPORTS.
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    ds.update(&format!(
+        "DELETE WHERE {{ GRAPH <{SUPPORTS}> {{ ?s ?p ?o }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("d", &d, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    let rec3 = reconcile(&ds, "main", None, &reviewer()).unwrap();
+    assert!(rec3.vouched_supports.is_empty());
+    assert_eq!(rec3.changed.removed.len(), 1);
+    assert!(accepted(&ds).is_empty());
+
+    // Reconciling an already-healthy projection reuses its active projection record.
+    let proj_count_before = count(&ds, "Projection", SUPPORTS);
+    let rec_noop = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert_eq!(rec_noop.projection, rec3.projection);
+    assert_eq!(count(&ds, "Projection", SUPPORTS), proj_count_before);
+    assert!(rec_noop.changed.inserted.is_empty() && rec_noop.changed.removed.is_empty());
+
+    // Subsequent review & withdrawal succeed.
+    review(&ds, &[decision("d", &d, Disposition::Accepted, None)]).unwrap();
+    assert_eq!(accepted(&ds).len(), 1);
+    withdraw(&ds, &d);
+    assert!(accepted(&ds).is_empty());
+
+    // Written reconciled projection records conform to profile shapes.
+    #[cfg(feature = "shacl")]
+    {
+        use oxrdfio::RdfFormat;
+        let copy = Dataset::memory();
+        let mut nt = String::new();
+        for g in [SOURCES, CLAIMS, DECISIONS, SUPPORTS] {
+            for t in ds
+                .construct(&format!(
+                    "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}"
+                ))
+                .unwrap()
+                .iter()
+            {
+                nt.push_str(&format!("{t} .\n"));
+            }
+        }
+        copy.load_str(&nt, RdfFormat::NTriples).unwrap();
+        let shapes = sparkles_shacl::Shapes::parse(
+            evidence::profile(1).unwrap().shapes,
+            RdfFormat::Turtle,
+            None,
+        )
+        .unwrap();
+        let report = copy
+            .validation()
+            .shacl(&shapes, &Default::default())
+            .unwrap();
+        assert!(report.conforms, "{report:?}");
+    }
+}
+
+/// Reconciliation persists across persistent dataset reopen, isolates branches and
+/// sibling policies sharing a supports graph, and enforces preconditions and grants.
+#[test]
+fn reconciliation_refusals_branches_and_restart_durability() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = {
+        let ds = Dataset::open(dir.path()).unwrap();
+        evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+        let a = claim_of(&propose(&ds, &occurrence("advisory", Polarity::Positive)));
+        review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+        evidence::detach(&ds, OUTPUT).unwrap();
+        ds.update(&format!(
+            "INSERT DATA {{ GRAPH <{OUTPUT}> {{ <urn:stray> <urn:p> 1 }} }}"
+        ))
+        .unwrap();
+        // While still detached, reconciliation refuses with unsupported-profile.
+        assert_eq!(
+            code(reconcile(&ds, "main", None, &reviewer())),
+            "unsupported-profile"
+        );
+        evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+        let rec = reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+        assert_eq!(rec.vouched_supports.len(), 1);
+        assert_eq!(rec.changed.removed.len(), 1);
+        a
+    };
+    // Reopen from disk and verify durability and subsequent operations.
+    {
+        let ds = Dataset::open(dir.path()).unwrap();
+        assert_eq!(accepted(&ds), affected_line());
+        let b = claim_of(&propose(
+            &ds,
+            &occurrence_with("mirror", "urn:cve2", Polarity::Positive),
+        ));
+        review(&ds, &[decision("b", &b, Disposition::Accepted, None)]).unwrap();
+        assert_eq!(accepted(&ds).len(), 2);
+        withdraw(&ds, &a);
+        assert_eq!(
+            accepted(&ds),
+            vec!["<urn:release> <urn:affectedBy> <urn:cve2>".to_string()]
+        );
+    }
+
+    // Shared SUPPORTS graph across two policies: reconciling one leaves the other unavailable.
+    let ds = Dataset::memory();
+    let mut s = settings(ConflictMode::Refuse);
+    let output2 = "urn:ev:accepted2";
+    s.projections.push(output2.into());
+    s.policies.insert(
+        "second".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::Refuse,
+            boundary: vec![SOURCES.into(), CLAIMS.into()],
+            decisions: DECISIONS.into(),
+            supports: SUPPORTS.into(),
+            output: output2.into(),
+        },
+    );
+    s.identity.push("urn:ev:id".into());
+    s.identity.push("urn:ev:maps".into());
+    s.projections.push("urn:ev:map".into());
+    s.matching_policies.insert(
+        "people".into(),
+        evidence::MatchingPolicy {
+            version: 1,
+            boundary: vec!["urn:ev:id".into()],
+            decisions: DECISIONS.into(),
+            maps: "urn:ev:maps".into(),
+            output: "urn:ev:map".into(),
+        },
+    );
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let a = claim_of(&propose(&ds, &occurrence("advisory", Polarity::Positive)));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    let mut o = reviewer();
+    o.if_head = Some(ds.store().head_commit().seq);
+    evidence::review(
+        None,
+        &ds,
+        &ds,
+        "second",
+        1,
+        &[decision("a2", &a, Disposition::Accepted, None)],
+        &o,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    // Create branch before detaching SUPPORTS.
+    ds.store()
+        .create_branch("dev", &Default::default())
+        .unwrap();
+    let dev = ds.branch("dev").unwrap();
+
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+
+    // Refusals: unknown policy, matching policy, wrong version, stale ifHead, missing grants, masked access.
+    assert!(matches!(
+        reconcile(&ds, "missing", None, &reviewer()),
+        Err(sparkles::Error::Invalid(_))
+    ));
+    assert!(matches!(
+        reconcile(&ds, "people", None, &reviewer()),
+        Err(sparkles::Error::Invalid(_))
+    ));
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(2), &reviewer())),
+        "policy-changed"
+    );
+    let mut stale = reviewer();
+    stale.if_head = Some(0);
+    assert_eq!(code(reconcile(&ds, "main", None, &stale)), "head-changed");
+    let mut no_write = reviewer();
+    no_write.write = Some(Arc::new(GraphAccess::graphs(
+        Graphs::All,
+        Graphs::Only(GraphRule::new([SUPPORTS], &[])),
+    )));
+    assert!(matches!(
+        reconcile(&ds, "main", None, &no_write),
+        Err(sparkles::Error::NotPermitted(_))
+    ));
+    let no_read = Some(Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new([SUPPORTS, OUTPUT], &[])),
+        Graphs::All,
+    )));
+    assert!(matches!(
+        evidence::reconcile_projection(
+            &ds,
+            &ds,
+            "main",
+            None,
+            &reviewer(),
+            no_read,
+            &Control::none()
+        ),
+        Err(sparkles::Error::NotPermitted(_))
+    ));
+
+    // Reconciling "main" on main restores "main" while "second" and branch "dev" stay unavailable.
+    reconcile(&ds, "main", Some(1), &reviewer()).unwrap();
+    assert!(accepted(&ds).is_empty());
+    let b = claim_of(&propose(
+        &ds,
+        &occurrence_with("m", "urn:cve2", Polarity::Positive),
+    ));
+    review(&ds, &[decision("b", &b, Disposition::Accepted, None)]).unwrap();
+    let mut o2 = reviewer();
+    o2.if_head = Some(ds.store().head_commit().seq);
+    assert_eq!(
+        code(evidence::review(
+            None,
+            &ds,
+            &ds,
+            "second",
+            1,
+            &[decision("b2", &b, Disposition::Accepted, None)],
+            &o2,
+            &mut |_, _| all(),
+            &Control::none(),
+        )),
+        "projection-unavailable"
+    );
+    // Branch dev still unavailable until reconciled on dev.
+    let mut odev = reviewer();
+    odev.if_head = Some(dev.store().head_commit().seq);
+    assert_eq!(
+        code(evidence::review(
+            None,
+            &ds,
+            &dev,
+            "main",
+            1,
+            &[decision("a3", &a, Disposition::Rejected, None)],
+            &odev,
+            &mut |_, _| all(),
+            &Control::none(),
+        )),
+        "projection-unavailable"
+    );
+    evidence::reconcile_projection(
+        &ds,
+        &dev,
+        "main",
+        Some(1),
+        &reviewer(),
+        None,
+        &Control::none(),
+    )
+    .unwrap();
+    assert!(accepted(&dev).is_empty());
+    // Changing conflict mode without bumping version under unchanged protections refuses.
+    let mut changed = s.clone();
+    changed.policies.get_mut("main").unwrap().conflicts = ConflictMode::AdmitLabelled;
+    evidence::configure(&ds, &changed, &Control::none()).unwrap();
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "projection-unavailable"
+    );
+}

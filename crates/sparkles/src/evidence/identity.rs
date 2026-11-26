@@ -1018,7 +1018,16 @@ pub(super) fn review(
     check_identities(&mut state, &batch, &records, &skip)?;
     drop(state);
     let committed = publish(
-        main, logical, capability, r.if_head, &batch, &skip, &changes, options, control,
+        main,
+        logical,
+        capability,
+        r.if_head,
+        &batch,
+        &skip,
+        &changes,
+        &[],
+        options,
+        control,
     )?;
     Ok(Reviewed {
         operation: batch.operation_iri.clone(),
