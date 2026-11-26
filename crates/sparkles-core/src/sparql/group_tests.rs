@@ -65,6 +65,40 @@ fn results(ctx: &Ctx, acc: &mut dyn Accumulator, groups: usize) -> Vec<String> {
 }
 
 #[test]
+fn decimal_avg_rounds_after_merging_partial_sums() {
+    use oxrdf::vocab::xsd;
+
+    let ctx = ctx();
+    let agg = agg(AggregateFunction::Avg, true, false);
+    let decimal = |s| ctx.intern_value(&Value::from_typed(s, xsd::DECIMAL.as_str()));
+    let zero = int(&ctx, 0);
+    let cases = [
+        ([decimal("1"), zero, zero], "0.333333333333333333333333"),
+        ([decimal("-2"), zero, zero], "-0.666666666666666666666667"),
+        (
+            [
+                decimal("80000000000000000000"),
+                decimal("80000000000000000000"),
+                zero,
+            ],
+            "53333333333333333333.333333333333333333333333",
+        ),
+    ];
+    for (values, expected) in cases {
+        for split in 0..=values.len() {
+            let (mut left, mut right) = (Running::new(&agg, true), Running::new(&agg, true));
+            left.init(1);
+            right.init(1);
+            let (l, r) = values.split_at(split);
+            fold(&ctx, &mut left, l, &[0; 3][..l.len()]);
+            fold(&ctx, &mut right, r, &[0; 3][..r.len()]);
+            left.merge(&ctx, &mut right, &[0], &mut |_| Ok(())).unwrap();
+            assert_eq!(results(&ctx, &mut left, 1), [expected], "split {split}");
+        }
+    }
+}
+
+#[test]
 fn merging_two_passes_gives_one_pass() {
     let ctx = ctx();
     let values: Vec<Id> = [5, 3, 9, 3, 7, 1, 8, 2, 6, 4]
@@ -351,7 +385,7 @@ fn running_decimal_avg_uses_the_final_subtotal_precision() {
         let mut acc = Running::new(&avg, false);
         acc.init(1);
         fold(&ctx, &mut acc, &inputs, &[0; 6]);
-        assert_eq!(results(&ctx, &mut acc, 1), ["0"]);
+        assert_eq!(results(&ctx, &mut acc, 1), ["0.000000000000000000166667"]);
     }
 }
 
@@ -666,8 +700,8 @@ fn big_avg_finalization_charges_division_scratch_deferred_and_direct() {
 
     let big_str = format!("1{}1", "0".repeat(3_998));
 
-    // Direct (non-deferred) AVG finalization of a 4,000-digit integer over 3 rows takes
-    // the non-terminating BigDec::checked_div path and must charge division scratch.
+    // Finalizing a 4,000-digit AVG charges arbitrary-precision division scratch,
+    // including when the quotient terminates.
     let mut ctx_direct = ctx();
     ctx_direct.mem_limit = 512 << 10;
     let big = ctx_direct.intern_value(&Value::from_typed(

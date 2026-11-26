@@ -12,7 +12,7 @@ use super::plan::{
 };
 use super::sortkey::{Entry, Screen, SortKey, TopK};
 use super::table::{InputCredit, Materialized, Table, VarId};
-use super::value::{NumOp, Value, arith, order_cmp};
+use super::value::{Value, order_cmp};
 use crate::access::Reservation;
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -8751,12 +8751,12 @@ impl AggState {
                             if *rows == 0 {
                                 0
                             } else {
-                                let needs_big = match (i64::try_from(sum), i64::try_from(*rows)) {
-                                    (Ok(i), Ok(r)) => super::value::int_div_needs_big(i, r),
-                                    _ => true,
-                                };
+                                let needs_big = sum
+                                    .checked_mul(super::value::DECIMAL_SCALE)
+                                    .and_then(|raw| super::value::avg_fixed_raw(raw, *rows))
+                                    .is_none();
                                 if needs_big {
-                                    super::bignum::AGG_SUM_SCRATCH_BYTES + 4500
+                                    super::bignum::FIXED_AVG_SCRATCH_BYTES + 256
                                 } else {
                                     256
                                 }
@@ -8775,19 +8775,8 @@ impl AggState {
                             if *rows == 0 {
                                 0
                             } else {
-                                let d = super::value::decimal_from_raw(ds.val);
-                                let needs_big = match i64::try_from(*rows)
-                                    .ok()
-                                    .map(oxsdatatypes::Decimal::from)
-                                {
-                                    Some(rd) => {
-                                        super::value::decimal_div_needs_big(d, rd)
-                                            || d.checked_div(rd).is_none()
-                                    }
-                                    None => true,
-                                };
-                                if needs_big {
-                                    super::bignum::AGG_SUM_SCRATCH_BYTES + 4500
+                                if super::value::avg_fixed_raw(ds.val, *rows).is_none() {
+                                    super::bignum::FIXED_AVG_SCRATCH_BYTES + 256
                                 } else {
                                     256
                                 }
@@ -9833,61 +9822,38 @@ impl AggState {
                 if is_avg && rows == 0 {
                     return ctx.try_intern_value(&Value::Integer(0.into()));
                 }
-                let denom_value = || match i64::try_from(rows) {
-                    Ok(r) => Value::Integer(r.into()),
-                    Err(_) => Value::from_bigint(super::bignum::BigInt::from_u64(rows)),
+                use super::bignum::{BigDec, BigInt, FIXED_AVG_SCRATCH_BYTES};
+                use super::value::{
+                    DECIMAL_SCALE, avg_big_decimal, avg_fixed_raw, decimal_from_raw,
                 };
                 let (v, scratch) = match acc {
                     SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_) => {
                         let int = acc.int_sum().expect("int variant");
-                        let needs_big = is_avg
-                            && match (i64::try_from(int), i64::try_from(rows)) {
-                                (Ok(i), Ok(r)) => super::value::int_div_needs_big(i, r),
-                                _ => true,
-                            };
-                        let scratch = if needs_big {
-                            Some(
-                                scratch_admit
-                                    .charge_scratch(ctx, super::bignum::AGG_SUM_SCRATCH_BYTES)?,
-                            )
+                        if !is_avg {
+                            (Some(super::value::exact_sum(int)), None)
+                        } else if let Some(avg) = int
+                            .checked_mul(DECIMAL_SCALE)
+                            .and_then(|raw| avg_fixed_raw(raw, rows))
+                        {
+                            (Some(Value::Decimal(avg)), None)
                         } else {
-                            None
-                        };
-                        let sum = super::value::exact_sum(int);
-                        let v = if is_avg {
-                            let denom = denom_value();
-                            arith(NumOp::Div, &sum, &denom).ok()
-                        } else {
-                            Some(sum)
-                        };
-                        (v, scratch)
+                            let scratch =
+                                scratch_admit.charge_scratch(ctx, FIXED_AVG_SCRATCH_BYTES)?;
+                            let sum = BigDec::from_bigint(BigInt::from_i128(int));
+                            (avg_big_decimal(&sum, rows), Some(scratch))
+                        }
                     }
                     SumAcc::Decimal(ds) => {
-                        let d = super::value::decimal_from_raw(ds.val);
-                        let needs_big = is_avg
-                            && match i64::try_from(rows).ok().map(oxsdatatypes::Decimal::from) {
-                                Some(rd) => {
-                                    super::value::decimal_div_needs_big(d, rd)
-                                        || d.checked_div(rd).is_none()
-                                }
-                                None => true,
-                            };
-                        let scratch = if needs_big {
-                            Some(
-                                scratch_admit
-                                    .charge_scratch(ctx, super::bignum::AGG_SUM_SCRATCH_BYTES)?,
-                            )
+                        if !is_avg {
+                            (Some(Value::Decimal(decimal_from_raw(ds.val))), None)
+                        } else if let Some(avg) = avg_fixed_raw(ds.val, rows) {
+                            (Some(Value::Decimal(avg)), None)
                         } else {
-                            None
-                        };
-                        let sum = Value::Decimal(d);
-                        let v = if is_avg {
-                            let denom = denom_value();
-                            arith(NumOp::Div, &sum, &denom).ok()
-                        } else {
-                            Some(sum)
-                        };
-                        (v, scratch)
+                            let scratch =
+                                scratch_admit.charge_scratch(ctx, FIXED_AVG_SCRATCH_BYTES)?;
+                            let sum = BigDec::from_oxs_decimal(decimal_from_raw(ds.val));
+                            (avg_big_decimal(&sum, rows), Some(scratch))
+                        }
                     }
                     SumAcc::Float(f) => {
                         let v = if is_avg {
@@ -9909,7 +9875,7 @@ impl AggState {
                         if is_avg {
                             let scratch = scratch_admit
                                 .charge_scratch(ctx, super::bignum::AGG_SUM_SCRATCH_BYTES)?;
-                            let v = super::value::avg_big_int(*bi, rows);
+                            let v = avg_big_decimal(&BigDec::from_bigint(*bi), rows);
                             (v, Some(scratch))
                         } else {
                             (bi.fits_limits().then(|| Value::from_bigint(*bi)), None)

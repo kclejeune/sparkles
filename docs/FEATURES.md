@@ -34,6 +34,8 @@ evaluator and its differential comparisons. The guide also covers the
 [formatting and editor support](querying/README.md#formatter-and-editor-support).
 How MIN, MAX, AVG and GROUP_CONCAT treat errors is a setting with Jena's answers as its
 default, described under [aggregate errors](querying/README.md#aggregate-errors).
+AVG of integer and decimal inputs follows ARQ's division precision in queries and
+maintained views.
 Eager and streaming query operators apply memory limits to vocabulary decoding and
 preserve a refused decode's original error.
 

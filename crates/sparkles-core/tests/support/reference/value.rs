@@ -445,6 +445,59 @@ impl Num {
         }
     }
 
+    /// Average an exact subtotal by long division on its integer coefficient.
+    /// ARQ keeps terminating quotients exact and otherwise rounds at scale 24.
+    pub fn average_term(self, rows: usize) -> Option<Term> {
+        let (raw, unit) = match self {
+            Num::Int(i) => (i, 1),
+            Num::Dec(d) => (i128::from_be_bytes(d.to_be_bytes()), 10_u128.pow(18)),
+            Num::Flt(_) | Num::Dbl(_) => {
+                return self
+                    .arith(Arith::Div, Num::Int(rows as i128))
+                    .map(Num::to_term);
+            }
+        };
+        let denominator = u128::from(u64::try_from(rows).ok()?) * unit;
+        if denominator == 0 {
+            return None;
+        }
+        let magnitude = raw.unsigned_abs();
+        let mut whole = magnitude / denominator;
+        let mut remainder = magnitude % denominator;
+        let mut other_factors = denominator >> denominator.trailing_zeros();
+        while other_factors.is_multiple_of(5) {
+            other_factors /= 5;
+        }
+        let exact = magnitude.is_multiple_of(other_factors);
+        let mut fraction = String::new();
+        while remainder != 0 && (exact || fraction.len() < 24) {
+            remainder *= 10;
+            fraction.push(char::from(b'0' + (remainder / denominator) as u8));
+            remainder %= denominator;
+        }
+        if !exact {
+            let coefficient = fraction.parse::<u128>().ok()?;
+            let half = (remainder * 2).cmp(&denominator);
+            if half.is_gt() || (half.is_eq() && !coefficient.is_multiple_of(2)) {
+                let rounded = coefficient + 1;
+                whole += rounded / 10_u128.pow(24);
+                fraction = format!("{:024}", rounded % 10_u128.pow(24));
+            }
+        }
+        let fraction = fraction.trim_end_matches('0');
+        let sign = if raw < 0 && (whole != 0 || !fraction.is_empty()) {
+            "-"
+        } else {
+            ""
+        };
+        let lexical = if fraction.is_empty() {
+            format!("{sign}{whole}")
+        } else {
+            format!("{sign}{whole}.{fraction}")
+        };
+        Some(Literal::new_typed_literal(lexical, xsd::DECIMAL).into())
+    }
+
     pub fn neg(self) -> Option<Num> {
         match self {
             Num::Int(i) => i.checked_neg().map(Num::Int),

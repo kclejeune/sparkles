@@ -2291,8 +2291,7 @@ impl<'a> Evaluator<'a> {
                 if matches!(name, AggregateFunction::Sum) {
                     Some(Binding::number(sum.to_term()))
                 } else {
-                    sum.arith(Arith::Div, value::Num::Int(terms.len() as i128))
-                        .map(|n| Binding::number(n.to_term()))
+                    sum.average_term(terms.len()).map(Binding::number)
                 }
             }
             AggregateFunction::Min | AggregateFunction::Max => {

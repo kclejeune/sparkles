@@ -526,6 +526,46 @@ fn arithmetic_unary_rounding_casts_and_ebv() {
 }
 
 #[test]
+fn decimal_avg_matches_arq_in_eager_and_streaming_groups() {
+    let store = Store::in_memory(StoreOptions::default());
+    for (values, expected) in [
+        ("1.0 0 0", "0.333333333333333333333333"),
+        ("-1.0 -1 0", "-0.666666666666666666666667"),
+        ("1 0 0", "0.333333333333333333333333"),
+        (
+            "0.000000000000000000000000001 0",
+            "0.0000000000000000000000000005",
+        ),
+        ("0.000000000000000000000000001 0 0", "0"),
+        (
+            "100000000000000000000.0 100000000000000000000.0 0",
+            "66666666666666666666.666666666666666666666667",
+        ),
+    ] {
+        let query = format!("SELECT (AVG(?v) AS ?avg) {{ VALUES ?v {{ {values} }} }}");
+        let answer = run_both(&store, &query);
+        assert_eq!(answer.len(), 1, "{values}");
+        assert_eq!(
+            lit_val(&answer[0], 0),
+            Some((expected.into(), xsd::DECIMAL.as_str().into())),
+            "{values}"
+        );
+    }
+
+    let answer = run_both(
+        &store,
+        "SELECT (AVG(DISTINCT ?v) AS ?avg) { VALUES ?v { 0 0 2 -1.0 } }",
+    );
+    assert_eq!(
+        lit_val(&answer[0], 0),
+        Some((
+            "0.333333333333333333333333".into(),
+            xsd::DECIMAL.as_str().into(),
+        ))
+    );
+}
+
+#[test]
 fn aggregates_sum_avg_min_max_on_big_numbers() {
     let s = store_from_ttl(
         r#"

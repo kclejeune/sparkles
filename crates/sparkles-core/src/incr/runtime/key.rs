@@ -5,7 +5,7 @@ use super::*;
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-pub(crate) const COMPILER: &str = "f13-phase2-6";
+pub(crate) const COMPILER: &str = "f13-phase2-7";
 
 /// Whether `access` has protections that depend on the data, with the reason the
 /// whole query is then evaluated again (spec F13 §6.2).
@@ -155,6 +155,8 @@ mod compiler_tests {
         // the group operator runs over the shared Accumulator trait with versioned
         // per-accumulator checkpoint state (item 1073)
         ("f13-phase2-6", "33695b11351c501e"),
+        // emitted GROUP rows use ARQ's AVG precision (item 1084)
+        ("f13-phase2-7", "33695b11351c501e"),
     ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or

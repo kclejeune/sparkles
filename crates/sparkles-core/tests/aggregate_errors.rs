@@ -101,8 +101,7 @@ fn executors() -> [Option<Optimizations>; 3] {
     [None, Some(rows), Some(Optimizations::NONE)]
 }
 
-/// Whether two TSV cells hold the same answer: equal, or the same decimal to 1e-15,
-/// since Jena divides decimals to more digits than the engine.
+/// Allow rounding differences in statistics computed with floating-point arithmetic.
 fn same(got: &str, want: &str) -> bool {
     got == want
         || matches!((got.parse::<f64>(), want.parse::<f64>()),
@@ -126,6 +125,8 @@ fn the_jena_reading_answers_as_arq() {
                 // SAMPLE may pick any value, so only whether it is bound is compared
                 if a.starts_with("SAMPLE") {
                     assert_eq!(v.is_empty(), w.is_empty(), "{a} {g}: {v} against {w}");
+                } else if a.starts_with("AVG") {
+                    assert_eq!(&v, w, "{a} {g} {opt:?}");
                 } else {
                     assert!(same(&v, w), "{a} {g} {opt:?}: {v} against Jena's {w}");
                 }

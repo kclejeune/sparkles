@@ -799,17 +799,6 @@ fn u128_terminates_base10(num: u128, mut den: u128) -> bool {
     num.is_multiple_of(den)
 }
 
-/// Whether `i / j` (`j != 0`) is a terminating decimal quotient whose exact fractional
-/// scale exceeds 18 digits (so [`exact_decimal`] delegates to `BigDec::checked_div`).
-pub(crate) fn int_div_needs_big(i: i64, j: i64) -> bool {
-    if j == 0 {
-        return false;
-    }
-    let num = i128::from(i) * DECIMAL_SCALE;
-    let den = i128::from(j);
-    num % den != 0 && u128_terminates_base10(i.unsigned_abs() as u128, j.unsigned_abs() as u128)
-}
-
 /// Whether `x / y` (`y != 0`) is a terminating decimal quotient whose exact fractional
 /// scale exceeds 18 digits (so the fixed-width `Decimal` path would truncate it).
 pub(crate) fn decimal_div_needs_big(x: Decimal, y: Decimal) -> bool {
@@ -848,33 +837,17 @@ pub(crate) fn exact_sum(sum: i128) -> Value {
     }
 }
 
-/// Divide an aggregate's normalized integer subtotal, including subtotals whose
-/// final quotient can fit even when the subtotal itself exceeds the digit cap.
-pub(crate) fn avg_big_int(sum: BigInt, rows: u64) -> Option<Value> {
-    if let Some(i) = sum.to_i64() {
-        let denom = match i64::try_from(rows) {
-            Ok(r) => Value::Integer(r.into()),
-            Err(_) => Value::from_bigint(BigInt::from_u64(rows)),
-        };
-        return arith(NumOp::Div, &Value::Integer(i.into()), &denom).ok();
-    }
-    BigDec::from_bigint(sum)
-        .checked_div(&BigDec::from_u64(rows))
-        .map(Value::from_bigdec)
+/// An AVG of a fixed-point subtotal can stay in the fixed-width decimal type
+/// exactly when the raw scaled subtotal is divisible by the row count.
+pub(crate) fn avg_fixed_raw(raw: i128, rows: u64) -> Option<Decimal> {
+    let rows = i128::from(rows);
+    (raw.checked_rem(rows)? == 0).then(|| decimal_from_raw(raw / rows))
 }
 
-/// Choose the precision from the final subtotal so intermediate promotion and
-/// cancellation cannot change AVG.
+/// Use the same division for every exact subtotal, even one which grew past the
+/// digit cap before division but whose final quotient fits.
 pub(crate) fn avg_big_decimal(sum: &BigDec, rows: u64) -> Option<Value> {
-    if let Some(d) = sum.to_oxs_decimal() {
-        let denom = match i64::try_from(rows) {
-            Ok(r) => Value::Integer(r.into()),
-            Err(_) => Value::from_bigint(BigInt::from_u64(rows)),
-        };
-        return arith(NumOp::Div, &Value::Decimal(d), &denom).ok();
-    }
-    sum.checked_div(&BigDec::from_u64(rows))
-        .map(Value::from_bigdec)
+    sum.checked_avg(rows).map(Value::from_bigdec)
 }
 
 /// The decimal product or quotient of `a` and `b` in one `i128` operation, for the

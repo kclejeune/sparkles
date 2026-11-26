@@ -16,12 +16,16 @@ use super::op::BatchBudget;
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::incr::persist::{Reader, Writer};
+use crate::sparql::bignum::{AGG_SUM_SCRATCH_BYTES, BigDec, BigInt, FIXED_AVG_SCRATCH_BYTES};
 use crate::sparql::ctx::{Charge, Ctx};
 use crate::sparql::exec::{AggState, ScratchAdmit, SumAdmit};
 use crate::sparql::expr::Expr;
 use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
-use crate::sparql::value::{NumOp, Value, arith, exact_sum, order_cmp};
+use crate::sparql::value::{
+    DECIMAL_SCALE, NumOp, Value, arith, avg_big_decimal, avg_fixed_raw, decimal_from_raw,
+    decimal_raw, exact_sum, order_cmp,
+};
 use oxsdatatypes::{Decimal, Double, Float};
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use spargebra::algebra::AggregateFunction;
@@ -1137,6 +1141,12 @@ impl Wide {
     }
 }
 
+enum NumericSubtotal {
+    Int(BigInt),
+    Dec(BigDec),
+    Fixed(Value),
+}
+
 #[derive(Debug, Default)]
 struct SumState {
     rows: i64,
@@ -1338,12 +1348,9 @@ impl SumState {
         Ok(())
     }
 
-    fn sum_or_avg(&self, avg: bool) -> Option<Value> {
+    fn subtotal(&self) -> Option<NumericSubtotal> {
         if self.errs != 0 {
             return None;
-        }
-        if avg && self.rows == 0 {
-            return Some(Value::Integer(0.into()));
         }
         let has_big_int = self.big_ints.as_ref().is_some_and(|m| !m.is_empty());
         let has_big_dec = self.big_decs.as_ref().is_some_and(|m| !m.is_empty());
@@ -1351,14 +1358,8 @@ impl SumState {
 
         // Accumulate exact subtotals with bounded headroom so cancellation and averaging at
         // the digit cap are evaluated on the final result rather than intermediate terms.
-        enum ExactAcc {
-            Int(crate::sparql::bignum::BigInt),
-            Dec(crate::sparql::bignum::BigDec),
-            Fixed(Value),
-        }
-
         let exact = if has_big_dec || (has_big_int && !self.decs.is_empty()) {
-            use crate::sparql::bignum::{AGG_MAX_DEC_DIGITS, BigDec, BigInt};
+            use crate::sparql::bignum::AGG_MAX_DEC_DIGITS;
             let mut total = BigDec::from_bigint(BigInt::from_i128(self.int));
             if let Some(map) = &self.big_ints {
                 for (bi, &n) in map.iter() {
@@ -1378,7 +1379,7 @@ impl SumState {
                     total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
                 }
             }
-            ExactAcc::Dec(total)
+            NumericSubtotal::Dec(total)
         } else if !self.decs.is_empty() {
             // Summed exactly in 256 bits so values that cancel out do not overflow on
             // the way; the integers join the decimals as a one-off evaluation promotes
@@ -1389,19 +1390,19 @@ impl SumState {
             }
             acc.add_product(self.int, 1_000_000_000_000_000_000);
             if let Some(raw) = acc.to_i128() {
-                ExactAcc::Fixed(Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes())))
+                NumericSubtotal::Fixed(Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes())))
             } else {
-                use crate::sparql::bignum::{AGG_MAX_DEC_DIGITS, BigDec, BigInt};
+                use crate::sparql::bignum::AGG_MAX_DEC_DIGITS;
                 let mut total = BigDec::from_bigint(BigInt::from_i128(self.int));
                 for (&k, &n) in &self.decs {
                     let d = BigDec::from_oxs_decimal(Decimal::from_be_bytes(k.to_be_bytes()));
                     let term = d.checked_mul_i64_with_limit(n, AGG_MAX_DEC_DIGITS)?;
                     total = total.checked_add_with_limit(&term, AGG_MAX_DEC_DIGITS)?;
                 }
-                ExactAcc::Dec(total)
+                NumericSubtotal::Dec(total)
             }
         } else if has_big_int {
-            use crate::sparql::bignum::{AGG_MAX_INT_DIGITS, BigInt};
+            use crate::sparql::bignum::AGG_MAX_INT_DIGITS;
             let mut total = BigInt::from_i128(self.int);
             if let Some(map) = &self.big_ints {
                 for (bi, &n) in map.iter() {
@@ -1409,47 +1410,27 @@ impl SumState {
                     total = total.checked_add_with_limit(&term, AGG_MAX_INT_DIGITS)?;
                 }
             }
-            ExactAcc::Int(total)
+            NumericSubtotal::Int(total)
         } else {
-            ExactAcc::Fixed(exact_sum(self.int))
+            NumericSubtotal::Fixed(exact_sum(self.int))
         };
 
         if !has_approx {
-            return match exact {
-                ExactAcc::Fixed(v) => {
-                    if avg {
-                        arith(NumOp::Div, &v, &Value::Integer(self.rows.into())).ok()
-                    } else {
-                        Some(v)
-                    }
-                }
-                ExactAcc::Int(bi) => {
-                    if avg {
-                        crate::sparql::value::avg_big_int(bi, self.rows.try_into().ok()?)
-                    } else {
-                        bi.fits_limits().then(|| Value::from_bigint(bi))
-                    }
-                }
-                ExactAcc::Dec(bd) => {
-                    if avg {
-                        crate::sparql::value::avg_big_decimal(&bd, self.rows.try_into().ok()?)
-                    } else {
-                        bd.fits_limits().then(|| Value::from_bigdec(bd))
-                    }
-                }
-            };
+            return Some(exact);
         }
 
         // Fold floats at float precision before the first double promotes the subtotal.
         let mut acc = match exact {
-            ExactAcc::Fixed(v) => v,
-            ExactAcc::Dec(bd) => match bd.to_oxs_decimal() {
+            NumericSubtotal::Fixed(v) => v,
+            NumericSubtotal::Dec(bd) => match bd.to_oxs_decimal() {
                 Some(decimal) => Value::Decimal(decimal),
                 None if self.floats.is_empty() => Value::Double(Double::from(bd.to_f64())),
                 None => Value::Float(Float::from(bd.to_f32())),
             },
-            ExactAcc::Int(bi) if self.floats.is_empty() => Value::Double(Double::from(bi.to_f64())),
-            ExactAcc::Int(bi) => Value::Float(Float::from(bi.to_f32())),
+            NumericSubtotal::Int(bi) if self.floats.is_empty() => {
+                Value::Double(Double::from(bi.to_f64()))
+            }
+            NumericSubtotal::Int(bi) => Value::Float(Float::from(bi.to_f32())),
         };
         let mut floats: Vec<(f32, i64)> = self
             .floats
@@ -1469,11 +1450,7 @@ impl SumState {
         for (d, n) in doubles {
             acc = arith(NumOp::Add, &acc, &Value::Double(Double::from(d * n as f64))).ok()?;
         }
-        if avg {
-            arith(NumOp::Div, &acc, &Value::Integer(self.rows.into())).ok()
-        } else {
-            Some(acc)
-        }
+        Some(NumericSubtotal::Fixed(acc))
     }
 
     fn map_bytes(&self) -> u64 {
@@ -1729,13 +1706,62 @@ impl Accumulator for RetractableSum {
 
     fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         let s = &self.groups[group];
-        finish_sum_avg(
-            ctx,
-            self.is_avg,
-            s.rows.max(0) as u64,
-            s.undef.max(0) as u64,
-            s.sum_or_avg(self.is_avg),
-        )
+        let rows = s.rows.max(0) as u64;
+        let undef = s.undef.max(0) as u64;
+        let value = if self.is_avg && s.rows == 0 && s.errs == 0 {
+            Some(Value::Integer(0.into()))
+        } else {
+            let subtotal = match s.subtotal() {
+                Some(subtotal) => subtotal,
+                None => return finish_sum_avg(ctx, self.is_avg, rows, undef, None),
+            };
+            if self.is_avg {
+                let fixed_raw = match &subtotal {
+                    NumericSubtotal::Fixed(Value::Integer(i)) => {
+                        Some(i128::from(i64::from(*i)) * DECIMAL_SCALE)
+                    }
+                    NumericSubtotal::Fixed(Value::Decimal(d)) => Some(decimal_raw(*d)),
+                    _ => None,
+                };
+                if let Some(avg) = fixed_raw.and_then(|raw| avg_fixed_raw(raw, rows)) {
+                    Some(Value::Decimal(avg))
+                } else if let NumericSubtotal::Fixed(v @ (Value::Float(_) | Value::Double(_))) =
+                    subtotal
+                {
+                    arith(NumOp::Div, &v, &Value::Integer(s.rows.into())).ok()
+                } else {
+                    let scratch = ctx.charge(if fixed_raw.is_some() {
+                        FIXED_AVG_SCRATCH_BYTES
+                    } else {
+                        AGG_SUM_SCRATCH_BYTES
+                    })?;
+                    let sum = match subtotal {
+                        NumericSubtotal::Int(i) => BigDec::from_bigint(i),
+                        NumericSubtotal::Dec(d) => d,
+                        NumericSubtotal::Fixed(Value::BigInteger(i)) => {
+                            BigDec::from_bigint(i.as_ref().clone())
+                        }
+                        NumericSubtotal::Fixed(Value::Integer(_) | Value::Decimal(_)) => {
+                            BigDec::from_oxs_decimal(decimal_from_raw(
+                                fixed_raw.expect("fixed subtotal"),
+                            ))
+                        }
+                        NumericSubtotal::Fixed(_) => unreachable!("numeric subtotal"),
+                    };
+                    let id = finish_sum_avg(ctx, true, rows, undef, avg_big_decimal(&sum, rows))?;
+                    drop(sum);
+                    drop(scratch);
+                    return Ok(id);
+                }
+            } else {
+                match subtotal {
+                    NumericSubtotal::Fixed(v) => Some(v),
+                    NumericSubtotal::Int(i) => i.fits_limits().then(|| Value::from_bigint(i)),
+                    NumericSubtotal::Dec(d) => d.fits_limits().then(|| Value::from_bigdec(d)),
+                }
+            }
+        };
+        finish_sum_avg(ctx, self.is_avg, rows, undef, value)
     }
 
     fn retractable(&self) -> bool {
