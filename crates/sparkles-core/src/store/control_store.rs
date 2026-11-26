@@ -703,21 +703,37 @@ impl WriteTxn<'_> {
             && state.get(control::ORIGIN_KEY).is_none();
         let staged_prefixes = std::mem::take(&mut self.staged_prefixes);
         let store = self.store;
-        let mut prep =
-            (!staged_prefixes.is_empty()).then(|| store.prepare_added_prefixes(&staged_prefixes));
+        let mut prep = if !staged_prefixes.is_empty() {
+            Some(store.prepare_added_prefixes(&staged_prefixes)?)
+        } else {
+            None
+        };
         let pending_next = prep.as_mut().and_then(|p| p.next.take());
-        if let Some(ref next) = pending_next
-            && let Err(e) = store.stage_prefixes_for_commit(head.seq, Some(frame.seq), next)
-        {
-            if store.clear_staged_prefixes().is_err() {
-                self.guard.poisoned = true;
+        if let Some(ref next) = pending_next {
+            if let Some(prep) = prep.as_mut() {
+                prep.arm_staged_fence(store);
             }
-            return Err(e);
+            if let Err(e) = store.stage_prefixes_for_commit(head.seq, Some(frame.seq), next) {
+                if store.clear_staged_prefixes().is_ok() {
+                    if let Some(prep) = prep.as_mut() {
+                        prep.disarm_staged_fence();
+                    }
+                } else {
+                    self.guard.poisoned = true;
+                }
+                return Err(e);
+            }
         }
         let w = &mut **self.guard;
         if let Err(e) = store.append_control(w, &frame, state) {
-            if pending_next.is_some() && !w.poisoned && store.clear_staged_prefixes().is_err() {
-                w.poisoned = true;
+            if pending_next.is_some() && !w.poisoned {
+                if store.clear_staged_prefixes().is_ok() {
+                    if let Some(prep) = prep.as_mut() {
+                        prep.disarm_staged_fence();
+                    }
+                } else {
+                    w.poisoned = true;
+                }
             }
             return Err(e);
         }
@@ -734,6 +750,7 @@ impl WriteTxn<'_> {
                     w.poisoned = true;
                     return Err(e);
                 }
+                prep.disarm_staged_fence();
                 *prep.cur = next;
             }
             let skipped = prep.skipped;

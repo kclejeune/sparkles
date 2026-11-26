@@ -37,14 +37,18 @@ pub(crate) fn activation_recorded(root: &Path) -> Result<bool> {
 /// [`READER`] or more that nothing else explains. Reader 9 belongs to the durable job
 /// ledger ([`crate::jobs::READER`]), and an interrupted enablement of jobs leaves that
 /// reader with no `jobs.json`, which C26 §7 says is safe to resume, so reader 9 never
-/// records an activation by itself and only the history directory does. A reader this
-/// build does not know still refuses as activated.
+/// records an activation by itself and only the history directory does. Reader 10
+/// ([`crate::store::STAGED_PREFIXES_V2_READER`]) similarly belongs to control-only staged
+/// prefix recovery v2, which can run on a control-enabled store without configuration
+/// history. A reader this build does not know still refuses as activated.
 fn reader_records_activation(root: &Path) -> Result<bool> {
     let Some(versions) = crate::commit::read_dataset_versions(root)? else {
         return Ok(false);
     };
     let reader = versions.minimum_reader;
-    Ok(reader >= READER && reader != crate::jobs::READER)
+    Ok(reader >= READER
+        && reader != crate::jobs::READER
+        && reader != crate::store::STAGED_PREFIXES_V2_READER)
 }
 
 /// Refuse an activated root whose registry no longer names its history root.

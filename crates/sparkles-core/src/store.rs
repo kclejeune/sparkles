@@ -1827,8 +1827,22 @@ pub const REMOVED_PREFIXES_FILE: &str = "prefixes-removed.json";
 const STAGED_PREFIXES_FILE: &str = "prefixes.staged.tmp";
 /// Temporary write path renamed into [`STAGED_PREFIXES_FILE`].
 const STAGED_PREFIXES_WRITE_TMP: &str = "prefixes.staged.write.tmp";
-/// Supported on-disk format version of [`STAGED_PREFIXES_FILE`].
-const STAGED_PREFIXES_FORMAT_VERSION: u32 = 1;
+/// Legacy v1 format version of [`STAGED_PREFIXES_FILE`] (quad commits without `control_seq`).
+const STAGED_PREFIXES_FORMAT_VERSION_V1: u32 = 1;
+/// Current format version of [`STAGED_PREFIXES_FILE`] (adds `control_seq` for control-only
+/// transactions).
+const STAGED_PREFIXES_FORMAT_VERSION: u32 = 2;
+/// Minimum dataset reader required before writing a v2 [`STAGED_PREFIXES_FILE`], so older
+/// binaries refuse in `check_dataset_compatibility` before WAL repair or catalog open.
+pub(crate) const STAGED_PREFIXES_V2_READER: u32 = 10;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedPrefixesFileV1 {
+    format_version: u32,
+    commit_seq: u64,
+    prefixes: BTreeMap<String, String>,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2121,6 +2135,9 @@ pub struct Store {
     cache: Arc<BlockCache>,
     results: Arc<crate::sparql::cache::ResultCache>,
     prefixes: Mutex<BTreeMap<String, String>>,
+    /// an unresolved staged-prefix sidecar may remain on disk after a failed cleanup or
+    /// uncertain commit: refuse standalone prefix mutations so reopen cannot overwrite them
+    prefixes_poisoned: AtomicBool,
     /// the prefix names the runtime layer removes (spec C20 §3.2), kept in
     /// `prefixes-removed.json`; a name is never both bound and removed
     removed_prefixes: Mutex<BTreeSet<String>>,
@@ -2506,6 +2523,7 @@ impl Store {
             cache,
             results,
             prefixes: Mutex::new(prefixes),
+            prefixes_poisoned: AtomicBool::new(false),
             removed_prefixes: Mutex::new(BTreeSet::new()),
             prefix_filter: Mutex::new(None),
             _lock: None,
@@ -3065,6 +3083,7 @@ impl Store {
             cache,
             results,
             prefixes: Mutex::new(prefixes),
+            prefixes_poisoned: AtomicBool::new(false),
             removed_prefixes: Mutex::new(removed_prefixes),
             prefix_filter: Mutex::new(None),
             _lock: Some(lock.clone()),
@@ -5057,14 +5076,18 @@ impl Store {
     pub fn add_prefixes(&self, p: BTreeMap<String, String>) -> Result<()> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         if p.is_empty() {
+            if self.prefixes_poisoned.load(Ordering::Acquire) {
+                return Err(Error::Poisoned);
+            }
             return Ok(());
         }
         let PreparedPrefixes {
+            staged_fence: _,
             _removed,
             mut cur,
             next,
             skipped,
-        } = self.prepare_added_prefixes(&p);
+        } = self.prepare_added_prefixes(&p)?;
         if let Some(next) = next {
             self.save_prefixes(&next)?;
             *cur = next;
@@ -5075,12 +5098,18 @@ impl Store {
         Ok(())
     }
 
-    fn prepare_added_prefixes(&self, p: &BTreeMap<String, String>) -> PreparedPrefixes<'_> {
+    pub(super) fn prepare_added_prefixes(
+        &self,
+        p: &BTreeMap<String, String>,
+    ) -> Result<PreparedPrefixes<'_>> {
         let filter = self.prefix_filter.lock().clone();
         // Acquire `removed_prefixes` before `prefixes` (matching `set_prefix` and
         // `set_prefix_layer`) and retain both guards through admission and publication.
         let removed = self.removed_prefixes.lock();
         let cur = self.prefixes.lock();
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
         let mut next: Option<BTreeMap<String, String>> = None;
         let mut skipped = 0usize;
         for (k, v) in p {
@@ -5099,12 +5128,13 @@ impl Store {
             next.get_or_insert_with(|| cur.clone())
                 .insert(k.clone(), v.clone());
         }
-        PreparedPrefixes {
+        Ok(PreparedPrefixes {
+            staged_fence: None,
             _removed: removed,
             cur,
             next,
             skipped,
-        }
+        })
     }
 
     fn preflight_prefixes_target(&self) -> Result<()> {
@@ -5134,13 +5164,26 @@ impl Store {
     ) -> Result<()> {
         self.preflight_prefixes_target()?;
         if let Some(root) = &self.root {
-            let staged = StagedPrefixesFile {
-                format_version: STAGED_PREFIXES_FORMAT_VERSION,
-                commit_seq,
-                control_seq,
-                prefixes: next.clone(),
+            let bytes = if let Some(cseq) = control_seq {
+                // Raise `dataset.json`'s `minimumReader` BEFORE writing a v2 staged sidecar
+                // so older binaries encounter the compatibility fence before WAL repair or
+                // catalog open.
+                commit::require_reader(root, STAGED_PREFIXES_V2_READER)?;
+                let staged = StagedPrefixesFile {
+                    format_version: STAGED_PREFIXES_FORMAT_VERSION,
+                    commit_seq,
+                    control_seq: Some(cseq),
+                    prefixes: next.clone(),
+                };
+                serde_json::to_vec_pretty(&staged).unwrap()
+            } else {
+                let staged = StagedPrefixesFileV1 {
+                    format_version: STAGED_PREFIXES_FORMAT_VERSION_V1,
+                    commit_seq,
+                    prefixes: next.clone(),
+                };
+                serde_json::to_vec_pretty(&staged).unwrap()
             };
-            let bytes = serde_json::to_vec_pretty(&staged).unwrap();
             crate::fsutil::write_atomic_via(
                 &root.join(STAGED_PREFIXES_FILE),
                 &root.join(STAGED_PREFIXES_WRITE_TMP),
@@ -5194,6 +5237,9 @@ impl Store {
         check_prefix(prefix, iri)?;
         let mut removed = self.removed_prefixes.lock();
         let mut cur = self.prefixes.lock();
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
         if cur.get(prefix).map(String::as_str) == Some(iri) && !removed.contains(prefix) {
             return Ok(());
         }
@@ -5222,6 +5268,9 @@ impl Store {
     pub fn remove_prefix(&self, prefix: &str) -> Result<bool> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         let mut cur = self.prefixes.lock();
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
         if !cur.contains_key(prefix) {
             return Ok(false);
         }
@@ -5269,6 +5318,9 @@ impl Store {
         }
         let mut cur_removed = self.removed_prefixes.lock();
         let mut cur = self.prefixes.lock();
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
         if *cur_removed != removed {
             self.save_removed_prefixes(&removed)?;
             *cur_removed = removed;
@@ -6588,21 +6640,37 @@ impl Store {
         // have succeeded, and stage them durably before `switch_generation`.
         let mut combined_prefixes = meta.prefixes.clone();
         combined_prefixes.extend(bulk.staged_prefixes);
-        let mut prepared_prefixes = (!combined_prefixes.is_empty())
-            .then(|| self.prepare_added_prefixes(&combined_prefixes));
-        if let Some(prep) = prepared_prefixes.as_ref()
-            && let Some(next) = prep.next.as_ref()
-            && let Err(e) = self.stage_prefixes_for_commit(head.seq, None, next)
+        let mut prepared_prefixes = if !combined_prefixes.is_empty() {
+            match self.prepare_added_prefixes(&combined_prefixes) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    drop(gen_);
+                    if self.root.is_some() {
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+                    return Err(SparqlLoadError::Store(e));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(prep) = prepared_prefixes.as_mut()
+            && let Some(next) = prep.next.clone()
         {
-            if self.clear_staged_prefixes().is_err() {
-                w.poisoned = true;
+            prep.arm_staged_fence(self);
+            if let Err(e) = self.stage_prefixes_for_commit(head.seq, None, &next) {
+                if self.clear_staged_prefixes().is_ok() {
+                    prep.disarm_staged_fence();
+                } else {
+                    w.poisoned = true;
+                }
+                drop(prepared_prefixes);
+                drop(gen_);
+                if self.root.is_some() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                return Err(SparqlLoadError::Store(e));
             }
-            drop(prepared_prefixes);
-            drop(gen_);
-            if self.root.is_some() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-            return Err(SparqlLoadError::Store(e));
         }
         if bulk.skip_if_unchanged {
             w.tap = None;
@@ -6645,7 +6713,11 @@ impl Store {
             let (wal, wal_size, ann) = match pre_switch {
                 Ok(v) => v,
                 Err(e) => {
-                    if self.clear_staged_prefixes().is_err() {
+                    if self.clear_staged_prefixes().is_ok() {
+                        if let Some(prep) = prepared_prefixes.as_mut() {
+                            prep.disarm_staged_fence();
+                        }
+                    } else {
                         w.poisoned = true;
                     }
                     return Err(e);
@@ -6657,7 +6729,11 @@ impl Store {
                 // may bring the bulk commit back with its annotation and staged prefixes,
                 // both go.
                 if !f.maybe_switched {
-                    if self.clear_staged_prefixes().is_err() {
+                    if self.clear_staged_prefixes().is_ok() {
+                        if let Some(prep) = prepared_prefixes.as_mut() {
+                            prep.disarm_staged_fence();
+                        }
+                    } else {
                         w.poisoned = true;
                     }
                     if !annotation.is_empty() && self.undo_annotation(head.seq).is_err() {
@@ -6682,7 +6758,11 @@ impl Store {
             annotation = match self.annotate(&head, message.clone(), || None) {
                 Ok(a) => a,
                 Err(e) => {
-                    if self.clear_staged_prefixes().is_err() {
+                    if self.clear_staged_prefixes().is_ok() {
+                        if let Some(prep) = prepared_prefixes.as_mut() {
+                            prep.disarm_staged_fence();
+                        }
+                    } else {
                         w.poisoned = true;
                     }
                     return Err(SparqlLoadError::Store(e));
@@ -6698,6 +6778,7 @@ impl Store {
                     w.poisoned = true;
                     return Err(SparqlLoadError::Store(e));
                 }
+                prep.disarm_staged_fence();
                 *prep.cur = next;
             }
             let skipped = prep.skipped;
@@ -7325,11 +7406,45 @@ impl std::ops::DerefMut for TxnGuard<'_> {
     }
 }
 
-struct PreparedPrefixes<'a> {
+struct StagedPrefixFence<'a> {
+    store: &'a Store,
+    armed: bool,
+}
+
+impl StagedPrefixFence<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedPrefixFence<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.store.prefixes_poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+pub(super) struct PreparedPrefixes<'a> {
+    // Dropped first (before `cur` and `_removed` unlock) so any unresolved staged sidecar
+    // poisons standalone prefix mutators before they can acquire `prefixes`.
+    staged_fence: Option<StagedPrefixFence<'a>>,
     _removed: parking_lot::MutexGuard<'a, BTreeSet<String>>,
-    cur: parking_lot::MutexGuard<'a, BTreeMap<String, String>>,
-    next: Option<BTreeMap<String, String>>,
-    skipped: usize,
+    pub(super) cur: parking_lot::MutexGuard<'a, BTreeMap<String, String>>,
+    pub(super) next: Option<BTreeMap<String, String>>,
+    pub(super) skipped: usize,
+}
+
+impl<'a> PreparedPrefixes<'a> {
+    pub(super) fn arm_staged_fence(&mut self, store: &'a Store) {
+        self.staged_fence = Some(StagedPrefixFence { store, armed: true });
+    }
+
+    pub(super) fn disarm_staged_fence(&mut self) {
+        if let Some(f) = self.staged_fence.as_mut() {
+            f.disarm();
+        }
+    }
 }
 
 /// The single write transaction. Changes are invisible until [`commit`](Self::commit).
@@ -8121,10 +8236,13 @@ impl WriteTxn<'_> {
             }
             let store = self.store;
             let target_seq = self.guard.head.seq + 1;
-            let mut prep = store.prepare_added_prefixes(&staged_prefixes);
+            let mut prep = store.prepare_added_prefixes(&staged_prefixes)?;
             if let Some(next) = prep.next.take() {
+                prep.arm_staged_fence(store);
                 if let Err(e) = store.stage_prefixes_for_commit(target_seq, None, &next) {
-                    if store.clear_staged_prefixes().is_err() {
+                    if store.clear_staged_prefixes().is_ok() {
+                        prep.disarm_staged_fence();
+                    } else {
                         self.guard.poisoned = true;
                     }
                     return Err(e);
@@ -8140,6 +8258,7 @@ impl WriteTxn<'_> {
                             self.guard.poisoned = true;
                             return Err(e);
                         }
+                        prep.disarm_staged_fence();
                         *prep.cur = next;
                         let skipped = prep.skipped;
                         drop(prep);
@@ -8147,8 +8266,12 @@ impl WriteTxn<'_> {
                         return Ok(receipt);
                     }
                     Err(e) => {
-                        if !self.guard.poisoned && store.clear_staged_prefixes().is_err() {
-                            self.guard.poisoned = true;
+                        if !self.guard.poisoned {
+                            if store.clear_staged_prefixes().is_ok() {
+                                prep.disarm_staged_fence();
+                            } else {
+                                self.guard.poisoned = true;
+                            }
                         }
                         return Err(e);
                     }
@@ -8466,22 +8589,38 @@ fn parse_staged_prefixes_file(root: &Path) -> Result<Option<StagedPrefixesFile>>
             ))
         })?;
     let found = u32::try_from(found_u64).unwrap_or(u32::MAX);
-    if found != STAGED_PREFIXES_FORMAT_VERSION {
-        return Err(Error::Unsupported(format!(
-            "{}: unsupported staged prefixes format_version {found}; supported version is {STAGED_PREFIXES_FORMAT_VERSION}",
+    match found {
+        STAGED_PREFIXES_FORMAT_VERSION_V1 => {
+            let v1: StagedPrefixesFileV1 = serde_json::from_value(raw).map_err(|e| {
+                Error::Corrupt(format!(
+                    "{}: invalid v1 staged prefixes payload: {e}",
+                    staged_path.display()
+                ))
+            })?;
+            Ok(Some(StagedPrefixesFile {
+                format_version: v1.format_version,
+                commit_seq: v1.commit_seq,
+                control_seq: None,
+                prefixes: v1.prefixes,
+            }))
+        }
+        STAGED_PREFIXES_FORMAT_VERSION => {
+            let staged: StagedPrefixesFile = serde_json::from_value(raw).map_err(|e| {
+                Error::Corrupt(format!(
+                    "{}: invalid v2 staged prefixes payload: {e}",
+                    staged_path.display()
+                ))
+            })?;
+            Ok(Some(staged))
+        }
+        _ => Err(Error::Unsupported(format!(
+            "{}: unsupported staged prefixes format_version {found}; supported versions are {STAGED_PREFIXES_FORMAT_VERSION_V1} and {STAGED_PREFIXES_FORMAT_VERSION}",
             staged_path.display()
-        )));
+        ))),
     }
-    let staged: StagedPrefixesFile = serde_json::from_value(raw).map_err(|e| {
-        Error::Corrupt(format!(
-            "{}: invalid staged prefixes payload: {e}",
-            staged_path.display()
-        ))
-    })?;
-    Ok(Some(staged))
 }
 
-fn preflight_staged_prefixes(root: &Path) -> Result<()> {
+pub(crate) fn preflight_staged_prefixes(root: &Path) -> Result<()> {
     let _ = parse_staged_prefixes_file(root)?;
     Ok(())
 }
@@ -12116,5 +12255,274 @@ mod ordinary_sync_tests {
             wal_bytes_after, wal_bytes_before,
             "unknown staged prefixes version must refuse open before modifying wal.log"
         );
+    }
+
+    #[test]
+    fn staged_prefix_cleanup_failure_fences_standalone_mutators_until_reopen() {
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+
+        let insert_quad = |tx: &mut WriteTxn<'_>, n: i64| {
+            let mut labels = std::collections::HashMap::new();
+            let q = Quad::new(
+                NamedNode::new_unchecked(format!("http://example.org/r54s{n}")),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(n),
+                GraphName::DefaultGraph,
+            );
+            let id = tx.encode_quad(&q, &mut labels).unwrap();
+            tx.insert(id).unwrap();
+        };
+
+        // 1. Durable quad commit whose post-install sidecar cleanup fails: standalone prefix
+        //    mutators must refuse with Poisoned so reopen cannot overwrite an acknowledged edit.
+        let dir1 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir1.path(), Default::default()).unwrap();
+            store
+                .set_prefix("keep", "http://example.org/keep/")
+                .unwrap();
+            {
+                let _g = staged_prefix_test_hooks::install(staged_prefix_test_hooks::Faults {
+                    fail_clear_staged: true,
+                    ..Default::default()
+                });
+                let mut tx = store.write();
+                insert_quad(&mut tx, 1);
+                tx.stage_prefixes(BTreeMap::from([(
+                    "txp".into(),
+                    "http://example.org/txp/".into(),
+                )]));
+                assert!(tx.commit().is_err());
+            }
+            assert!(dir1.path().join(STAGED_PREFIXES_FILE).is_file());
+            assert!(matches!(
+                store.set_prefix("later", "http://example.org/later/"),
+                Err(Error::Poisoned)
+            ));
+            assert!(matches!(store.remove_prefix("keep"), Err(Error::Poisoned)));
+            assert!(matches!(
+                store.add_prefixes(BTreeMap::from([(
+                    "addp".into(),
+                    "http://example.org/add/".into(),
+                )])),
+                Err(Error::Poisoned)
+            ));
+            assert!(matches!(
+                store.set_prefix_layer(BTreeMap::new(), BTreeSet::new()),
+                Err(Error::Poisoned)
+            ));
+        }
+        let reopened1 = Store::open(dir1.path(), Default::default()).unwrap();
+        assert_eq!(reopened1.snapshot().len(), 1);
+        assert_eq!(
+            reopened1.prefixes().get("txp").map(String::as_str),
+            Some("http://example.org/txp/")
+        );
+        assert_eq!(
+            reopened1.prefixes().get("keep").map(String::as_str),
+            Some("http://example.org/keep/")
+        );
+        assert!(!reopened1.prefixes().contains_key("later"));
+        assert!(!dir1.path().join(STAGED_PREFIXES_FILE).exists());
+
+        // 2. Durable control-only commit whose post-install sidecar cleanup fails: standalone
+        //    prefix mutators must likewise refuse with Poisoned, and reopen reconciles cleanly.
+        let dir2 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir2.path(), Default::default()).unwrap();
+            store.enable_control().unwrap();
+            {
+                let _g = staged_prefix_test_hooks::install(staged_prefix_test_hooks::Faults {
+                    fail_clear_staged: true,
+                    ..Default::default()
+                });
+                let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+                let mut tx = store.write();
+                tx.set_control(cap).unwrap();
+                tx.control_put(b"jobs/cleanup-fail", Arc::from(&b"ok"[..]))
+                    .unwrap();
+                tx.stage_prefixes(BTreeMap::from([(
+                    "ctrltx".into(),
+                    "http://example.org/ctrltx/".into(),
+                )]));
+                assert!(tx.commit().is_err());
+            }
+            assert!(dir2.path().join(STAGED_PREFIXES_FILE).is_file());
+            assert!(matches!(
+                store.set_prefix("later", "http://example.org/later/"),
+                Err(Error::Poisoned)
+            ));
+        }
+        let reopened2 = Store::open(dir2.path(), Default::default()).unwrap();
+        assert_eq!(
+            reopened2.prefixes().get("ctrltx").map(String::as_str),
+            Some("http://example.org/ctrltx/")
+        );
+        assert!(!reopened2.prefixes().contains_key("later"));
+        assert!(!dir2.path().join(STAGED_PREFIXES_FILE).exists());
+    }
+
+    #[test]
+    fn staged_prefixes_v1_and_v2_version_contract_and_reader_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        store.enable_control().unwrap();
+
+        // Trigger crash after staging a control-only v2 sidecar so it stays on disk.
+        store.set_failpoint(
+            "prefixes-before-install",
+            Some(Arc::new(|_| panic!("simulated crash before install"))),
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/v2", Arc::from(&b"ok"[..])).unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "v2p".into(),
+                "http://example.org/v2p/".into(),
+            )]));
+            let _ = tx.commit();
+        }));
+        assert!(panicked.is_err());
+        drop(store);
+
+        // Sidecar must carry format_version 2 and `dataset.json` must require reader 10,
+        // fencing older binaries (reader <= 9) before WAL repair or catalog open.
+        let staged_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(STAGED_PREFIXES_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            staged_json["format_version"],
+            STAGED_PREFIXES_FORMAT_VERSION
+        );
+        assert!(staged_json["control_seq"].as_u64().is_some());
+
+        let ds_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("dataset.json")).unwrap())
+                .unwrap();
+        assert!(
+            ds_json["minimumReader"].as_u64().unwrap() >= u64::from(STAGED_PREFIXES_V2_READER),
+            "dataset.json must raise minimumReader before writing v2 staged prefixes: {ds_json}"
+        );
+        assert!(
+            matches!(
+                commit::check_dataset_value_as(&ds_json, STAGED_PREFIXES_V2_READER - 1),
+                Err(Error::Unsupported(_))
+            ),
+            "older reader (<= 9) must refuse dataset with v2 staged prefixes before startup writes"
+        );
+
+        // Current build recovers v2 cleanly.
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(
+            reopened.prefixes().get("v2p").map(String::as_str),
+            Some("http://example.org/v2p/")
+        );
+        drop(reopened);
+
+        // A v1 sidecar illegally carrying `control_seq` must be rejected as corrupt.
+        std::fs::write(
+            dir.path().join(STAGED_PREFIXES_FILE),
+            br#"{"format_version":1,"commit_seq":0,"control_seq":1,"prefixes":{}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            Store::open(dir.path(), Default::default()),
+            Err(Error::Corrupt(_))
+        ));
+
+        // A valid v1 sidecar (without `control_seq`) remains readable and reconciles cleanly.
+        std::fs::write(
+            dir.path().join(STAGED_PREFIXES_FILE),
+            br#"{"format_version":1,"commit_seq":0,"prefixes":{"v1p":"http://example.org/v1p/"}}"#,
+        )
+        .unwrap();
+        let reopened_v1 = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(
+            reopened_v1.prefixes().get("v1p").map(String::as_str),
+            Some("http://example.org/v1p/")
+        );
+        assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+    }
+
+    #[test]
+    fn unknown_staged_prefixes_version_in_branch_refuses_main_open_before_wal_repair() {
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+
+        for retained in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let branch_id = {
+                let store = Store::open(&root, Default::default()).unwrap();
+                let mut tx = store.write();
+                let mut labels = std::collections::HashMap::new();
+                let q = Quad::new(
+                    NamedNode::new_unchecked("http://example.org/s"),
+                    NamedNode::new_unchecked("http://example.org/p"),
+                    Literal::from(1i64),
+                    GraphName::DefaultGraph,
+                );
+                let id = tx.encode_quad(&q, &mut labels).unwrap();
+                tx.insert(id).unwrap();
+                tx.commit().unwrap();
+                let b = store.create_branch("bad", &Default::default()).unwrap();
+                if retained {
+                    store
+                        .create_branch(
+                            "child",
+                            &crate::branch::BranchOptions {
+                                from: "bad".into(),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    store
+                        .delete_branch_with(
+                            "bad",
+                            &crate::branch::DeleteOptions {
+                                force: true,
+                                reparent: true,
+                                release_holds: false,
+                            },
+                        )
+                        .unwrap();
+                }
+                b.id
+            };
+
+            let gen_name = std::fs::read_to_string(root.join("CURRENT"))
+                .unwrap()
+                .trim()
+                .to_string();
+            let wal_path = root.join(&gen_name).join("wal.log");
+            {
+                let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+                std::io::Write::write_all(&mut f, &[0xDE, 0xAD, 0xBE]).unwrap();
+            }
+            let wal_bytes_before = std::fs::read(&wal_path).unwrap();
+
+            let branch_dir = root.join("branches").join(branch_id.to_string());
+            assert!(branch_dir.is_dir());
+            std::fs::write(
+                branch_dir.join(STAGED_PREFIXES_FILE),
+                br#"{"format_version":99,"commit_seq":1,"prefixes":{}}"#,
+            )
+            .unwrap();
+
+            let err = match Store::open(&root, Default::default()) {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "expected Unsupported error for unsupported staged prefixes in branch (retained={retained})"
+                ),
+            };
+            assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+            assert!(err.to_string().contains(&branch_id.to_string()), "{err}");
+            assert_eq!(
+                std::fs::read(&wal_path).unwrap(),
+                wal_bytes_before,
+                "branch staged-prefix preflight must refuse before modifying main wal.log (retained={retained})"
+            );
+        }
     }
 }
