@@ -2579,7 +2579,7 @@ fn big_numeric_sum_avg_view_checkpoints_and_recovers() {
 }
 
 #[test]
-fn sum_view_rebuilds_a_version_three_checkpoint() {
+fn sum_view_rebuilds_a_phase2_4_checkpoint() {
     use super::persist::{self, Writer};
     use super::terms::Terms;
     use super::zset::ZSet;
@@ -2607,7 +2607,7 @@ fn sum_view_rebuilds_a_version_three_checkpoint() {
     saved.add(vec![group, Id::UNDEF].into(), 1);
     let mut legacy = Writer::new(&snap, &terms);
     legacy.zset(&saved).unwrap();
-    // Version 3 wrote the group and its last output before the SUM state.
+    // Compiler f13-phase2-4 wrote the group and its last output before the SUM state.
     // Project, extend and the single triple-pattern child held no checkpoint state.
     legacy.u64(1);
     legacy.row(&[group]).unwrap();
@@ -2624,7 +2624,7 @@ fn sum_view_rebuilds_a_version_three_checkpoint() {
 
     let parsed = spargebra::SparqlParser::new().parse_query(&query).unwrap();
     let mut key = Sha256::new();
-    key.update(b"f13-phase2-3\0");
+    key.update(b"f13-phase2-4\0");
     key.update(super::runtime::key::normalized(&parsed, &query));
     key.update([0]);
     key.update(0u64.to_le_bytes()); // unrestricted access
@@ -2641,7 +2641,7 @@ fn sum_view_rebuilds_a_version_three_checkpoint() {
     let (mut header, _) = persist::decode(&bytes).unwrap();
     assert_ne!(
         fingerprint, header.fingerprint,
-        "version 3 must have a distinct key"
+        "f13-phase2-4 must have a distinct key"
     );
     header.fingerprint = fingerprint;
     std::fs::write(latest, persist::encode(&header, &legacy.finish())).unwrap();

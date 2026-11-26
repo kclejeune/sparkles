@@ -9106,7 +9106,7 @@ ex:r_lines ex:txt "first\rline\nsecond" .
 /// `SPKVNUM2` numeric column written under pre-1077 rules (which classified `"inf"^^xsd:double`
 /// and `"-inf"^^xsd:float` as IEEE infinities): reopening ignores `SPKVNUM2` cleanly,
 /// `sparkles check --full` warns rather than failing, both query modes decode from keys with
-/// strict XSD 1.1 semantics, and `add_numeric_column` upgrades the file to `SPKVNUM3`.
+/// strict XSD 1.1 semantics, and `add_numeric_column` upgrades the file to `SPKVNUM4`.
 #[test]
 fn legacy_spkvnum2_column_falls_back_cleanly_on_reopen() {
     use sparkles_core::check::{CheckOptions, Status, check};
@@ -9304,7 +9304,7 @@ ex:d_num ex:v "1.50"^^xsd:double .
 
     verify_queries(&store);
 
-    // Rebuilding upgrades vocab.num to SPKVNUM3 (holding only the 2 valid numbers),
+    // Rebuilding upgrades vocab.num to SPKVNUM4 (holding only the 2 valid numbers),
     // and a second call on the same handle returns None without rewriting the file.
     assert_eq!(store.add_numeric_column().unwrap(), Some(2));
     assert_eq!(store.add_numeric_column().unwrap(), None);

@@ -938,7 +938,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     fn numeric_expected_page(at: usize, len: usize) -> std::collections::BTreeSet<usize> {
-        // Independent SPKVNUM3 byte layout and system page size, not locate().
+        // Independent SPKVNUM4 byte layout and system page size, not locate().
         // SAFETY: sysconf has no pointer arguments or other preconditions.
         let ps = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
         (at / ps..(at + len).div_ceil(ps)).collect()
@@ -1151,7 +1151,7 @@ pub(crate) mod tests {
             i if i == tail => Numeric::Integer(777),
             _ => Numeric::NotNumeric,
         };
-        // Derive load ranges from the fixture's documented two segments and SPKVNUM3
+        // Derive load ranges from the fixture's documented two segments and SPKVNUM4
         // layout, without calling locate(), kind_word(), rank_at() or layout().
         let expected_pages = |ids: &[u64], mapped: bool| {
             let positions = PROFILE_NUMBERS + 1;

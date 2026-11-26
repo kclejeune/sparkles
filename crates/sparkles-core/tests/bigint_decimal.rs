@@ -112,7 +112,7 @@ fn range_filters_and_compacted_vocab_keep_large_integers_and_decimals() {
         None,
     )])
     .unwrap();
-    // Compact so `vocab.num` (SPKVNUM3) is built and tested alongside RangeScan.
+    // Compact so `vocab.num` (SPKVNUM4) is built and tested alongside RangeScan.
     s.compact().unwrap();
     assert!(s.snapshot().generation.vocab.numeric().is_some());
 
@@ -623,7 +623,7 @@ fn dos_bounds_reject_pathological_digit_counts_cleanly() {
 }
 
 #[test]
-fn legacy_spkvnum2_file_is_ignored_so_big_integers_are_not_dropped() {
+fn legacy_spkvnum3_file_is_ignored_so_big_integers_are_not_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
     let ttl = r#"

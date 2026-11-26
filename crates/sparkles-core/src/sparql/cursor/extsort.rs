@@ -1060,7 +1060,19 @@ fn assert_spill_merge_keeps_geometry_key(column_key: bool) {
     };
     let expr = Expr::If(is_row(geometry_row), Box::new(length), Box::new(other_rows));
     keys.push((Key::expression(expr), true));
-    let frame_bytes = 2 * 256 + 3 * (2 * 8 + (keys.len() * size_of::<SortKey>()) as u64);
+    let reader_bytes: u64 = runs
+        .iter()
+        .map(|run| {
+            let mut reader = run.reader().unwrap();
+            assert!(reader.next_frame().unwrap().is_some());
+            reader.buffer_capacity()
+        })
+        .sum();
+    let vec_meta = 2 * (2 * size_of::<Vec<Id>>() + keys.len() * size_of::<Vec<SortKey>>()) as u64;
+    let frame_bytes = reader_bytes
+        + vec_meta
+        + 2 * 256
+        + 3 * (2 * 8 + (keys.len() * size_of::<SortKey>()) as u64);
     let keys = Keys::Values {
         keys,
         vars: vec![row, column],
