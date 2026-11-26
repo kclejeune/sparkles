@@ -569,9 +569,9 @@ async fn client_disconnect_cancels_explicit_streaming_and_releases_resources() {
     assert!(ok, "client disconnect did not release concurrency slot");
 }
 
-/// Graph formats (Turtle, N-Triples, N-Quads, TriG, RDF/XML, RDF Thrift, RDF Protobuf,
-/// RDF/JSON, TriX, native JSON) keep exact parity between `execution=auto` and explicit
-/// `execution=streaming` below the streaming threshold.
+/// Graph formats (Turtle, N-Triples, JSON-LD, N-Quads, TriG, RDF/XML, RDF Thrift, RDF
+/// Protobuf, RDF/JSON, TriX, native JSON) keep parity between `execution=auto` and
+/// explicit `execution=streaming` below the streaming threshold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graph_formats_exact_parity_across_auto_and_streaming() {
     let s = pool_server(None, None);
@@ -586,6 +586,7 @@ async fn graph_formats_exact_parity_across_auto_and_streaming() {
     let formats = [
         ("ttl", "text/turtle"),
         ("nt", "application/n-triples"),
+        ("jsonld", "application/ld+json"),
         ("nq", "application/n-quads"),
         ("trig", "application/trig"),
         ("rdfxml", "application/rdf+xml"),
@@ -616,18 +617,48 @@ async fn graph_formats_exact_parity_across_auto_and_streaming() {
             assert_eq!(a["queryType"], "CONSTRUCT");
             assert_eq!(b["queryType"], "CONSTRUCT");
             // Eager native graph puts triples in `triples`, streaming cursor puts quads in `quads`;
-            // verify both return all 300 statements.
-            let a_count = a["triples"].as_array().map_or(0, Vec::len)
-                + a["quads"].as_array().map_or(0, Vec::len);
-            let b_count = b["triples"].as_array().map_or(0, Vec::len)
-                + b["quads"].as_array().map_or(0, Vec::len);
-            assert_eq!(a_count, 300);
-            assert_eq!(b_count, 300);
+            // verify both return the exact same 300 statements.
+            let stmts = |v: &J| -> Vec<(J, J, J)> {
+                let mut out = Vec::new();
+                for field in ["triples", "quads"] {
+                    if let Some(arr) = v[field].as_array() {
+                        out.extend(
+                            arr.iter()
+                                .map(|row| (row["s"].clone(), row["p"].clone(), row["o"].clone())),
+                        );
+                    }
+                }
+                out
+            };
+            let a_stmts = stmts(&a);
+            let b_stmts = stmts(&b);
+            assert_eq!(a_stmts.len(), 300);
+            assert_eq!(a_stmts, b_stmts, "native statement parity");
         } else if *fname == "rt" || *fname == "pb" {
             // Jena binary formats write triple messages on eager and quad messages on cursor;
-            // verify both are non-empty valid payloads.
-            assert!(!body_auto.is_empty(), "graph auto {fname}");
-            assert!(!body_stream.is_empty(), "graph streaming {fname}");
+            // decode both payloads and verify they contain the exact same 300 statements.
+            let jena_fmt = if *fname == "rt" {
+                sparkles::jena_formats::JenaFormat::Thrift
+            } else {
+                sparkles::jena_formats::JenaFormat::Protobuf
+            };
+            let mut quads_auto = Vec::new();
+            sparkles::jena_formats::read(jena_fmt, &body_auto[..], None, &mut |q| {
+                quads_auto.push(q);
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("decode auto {fname}: {e}"));
+            let mut quads_stream = Vec::new();
+            sparkles::jena_formats::read(jena_fmt, &body_stream[..], None, &mut |q| {
+                quads_stream.push(q);
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("decode streaming {fname}: {e}"));
+            assert_eq!(quads_auto.len(), 300, "graph auto {fname} count");
+            assert_eq!(
+                quads_auto, quads_stream,
+                "graph decoded statement parity {fname}"
+            );
         } else {
             assert_eq!(body_auto, body_stream, "graph parity {fname}");
         }
@@ -1196,6 +1227,11 @@ async fn algorithm_ask_is_never_remembered_as_quick_or_run_in_place() {
         let parsed: J = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["boolean"], true);
     }
+    assert_eq!(
+        route_stats::pool_auto(key),
+        3,
+        "algorithm ASK must execute through the pool_auto cursor route on every run"
+    );
     assert!(
         !crate::http::QUICK.is_quick(key),
         "algorithm ASK must never be remembered as quick"
@@ -1206,6 +1242,143 @@ async fn algorithm_ask_is_never_remembered_as_quick_or_run_in_place() {
         "algorithm ASK must never run in place"
     );
     assert_eq!(route_stats::in_place_whole(key), 0);
+    assert!(wait_pool_zero(&s.state, Duration::from_secs(2)).await);
+}
+
+/// `QueryCursor::uses_algorithms`, `GraphCursor::uses_algorithms`, and the
+/// `InPlaceWork::CursorWhole` algorithmic guard record algorithm-calling cursors as `Slow`
+/// rather than quick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn algorithm_select_and_construct_cursors_report_uses_algorithms_and_never_mark_quick() {
+    use crate::http::cursor::{AutoOutcome, AutoRequest, run_in_place_with_mode};
+    use crate::http::{OutFormat, Params, stream};
+    use sparkles::sparql::results::SolutionsFormat;
+    use sparkles::sparql::{
+        CursorOptions, ExecutionMode, QueryExecution, QueryOptions, query_cursor,
+    };
+
+    let s = pool_server(None, None);
+    load_turtle(
+        &s.state,
+        "algo_cur",
+        "<urn:a> <urn:e> <urn:b> .\n<urn:b> <urn:e> <urn:c> .\n".into(),
+    );
+    let ds = s.state.get("algo_cur").unwrap();
+    let snap = ds.store.snapshot();
+
+    let algo_select = "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:node ?n ; algo:component ?c } }";
+    let plain_select = "SELECT ?s ?o WHERE { ?s <urn:e> ?o }";
+    let algo_construct = "PREFIX algo: <urn:x-sparkles:algo#> CONSTRUCT { ?n <urn:comp> ?c } WHERE { SERVICE algo:wcc { [] algo:node ?n ; algo:component ?c } }";
+    let plain_construct = "CONSTRUCT { ?s <urn:e> ?o } WHERE { ?s <urn:e> ?o }";
+
+    // Direct core accessor checks on QueryCursor, GraphCursor, and QueryExecution.
+    let exec = query_cursor(
+        snap.clone(),
+        algo_select,
+        &QueryOptions::default(),
+        &CursorOptions::default(),
+    )
+    .unwrap();
+    assert!(exec.uses_algorithms());
+    match exec {
+        QueryExecution::Select(c) => assert!(c.uses_algorithms()),
+        _ => panic!("expected QueryExecution::Select"),
+    }
+
+    let exec = query_cursor(
+        snap.clone(),
+        plain_select,
+        &QueryOptions::default(),
+        &CursorOptions::default(),
+    )
+    .unwrap();
+    assert!(!exec.uses_algorithms());
+    match exec {
+        QueryExecution::Select(c) => assert!(!c.uses_algorithms()),
+        _ => panic!("expected QueryExecution::Select"),
+    }
+
+    let exec = query_cursor(
+        snap.clone(),
+        algo_construct,
+        &QueryOptions::default(),
+        &CursorOptions::default(),
+    )
+    .unwrap();
+    assert!(exec.uses_algorithms());
+    match exec {
+        QueryExecution::Graph(c) => assert!(c.uses_algorithms()),
+        _ => panic!("expected QueryExecution::Graph"),
+    }
+
+    let exec = query_cursor(
+        snap,
+        plain_construct,
+        &QueryOptions::default(),
+        &CursorOptions::default(),
+    )
+    .unwrap();
+    assert!(!exec.uses_algorithms());
+    match exec {
+        QueryExecution::Graph(c) => assert!(!c.uses_algorithms()),
+        _ => panic!("expected QueryExecution::Graph"),
+    }
+
+    // Direct `InPlaceWork::CursorWhole` guard check for algorithmic SELECT and CONSTRUCT.
+    let params = Params(Default::default());
+    let uri: axum::http::Uri = "/algo_cur/sparql?execution=auto".parse().unwrap();
+    for (label, query) in [("select", algo_select), ("construct", algo_construct)] {
+        let key = QuickQueries::key("algo_cur", query);
+        crate::http::QUICK.ignore_time(key);
+        let (options, guard) = crate::http::query_options_for_test(&s.state, &ds);
+        let AutoOutcome::Responded(resp) = run_in_place_with_mode(
+            ds.clone(),
+            AutoRequest {
+                timeouts: stream::Timeouts::default(),
+                query: query.into(),
+                options,
+                at: None,
+                params: &params,
+                uri: &uri,
+                guard,
+                limit: None,
+                format: SolutionsFormat::Json,
+                thrift: false,
+                rdf_format: OutFormat::Rdf(oxrdfio::RdfFormat::NTriples),
+                native_graph: false,
+                prefixes: Default::default(),
+                io: None,
+                quick_key: key,
+                auto: true,
+                trial: false,
+                claim: None,
+            },
+            ExecutionMode::Streaming,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("algo in-place {label} failed: {} {}", e.0, e.1)) else {
+            panic!("expected CursorWhole response for algo {label}");
+        };
+        assert_eq!(resp.status(), StatusCode::OK, "algo {label}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!body.is_empty(), "algo {label} body");
+        assert_eq!(
+            route_stats::in_place_whole(key),
+            1,
+            "algo {label} should finish through InPlaceWork::CursorWhole"
+        );
+        assert_eq!(
+            crate::http::QUICK.history(key),
+            History::Slow,
+            "InPlaceWork::CursorWhole must record algorithmic {label} as Slow"
+        );
+        assert!(
+            !crate::http::QUICK.is_quick(key),
+            "algorithmic {label} must never be remembered as quick"
+        );
+    }
     assert!(wait_pool_zero(&s.state, Duration::from_secs(2)).await);
 }
 
@@ -1270,6 +1443,16 @@ async fn settled_quick_cursor_stays_in_place_on_subsequent_runs() {
     .await;
     assert_eq!(st_eager, StatusCode::OK);
     assert_eq!(body1, body_eager);
+
+    let (st_stream, _, body_stream) = post_query(
+        &s.app,
+        "/settled_cur/sparql?execution=streaming",
+        q,
+        "text/tab-separated-values",
+    )
+    .await;
+    assert_eq!(st_stream, StatusCode::OK);
+    assert_eq!(body1, body_stream);
     assert!(wait_pool_zero(&s.state, Duration::from_secs(2)).await);
 }
 
@@ -1280,6 +1463,8 @@ async fn settled_quick_cursor_stays_in_place_on_subsequent_runs() {
 async fn row_budget_enforced_pre_commit_and_post_handoff() {
     use crate::http::cursor::{AutoOutcome, AutoRequest, run_in_place_with_mode};
     use crate::http::{OutFormat, Params, stream};
+    use crate::obs::{DeferredReport, Outcome};
+    use sparkles::BudgetKind;
     use sparkles::sparql::ExecutionMode;
     use sparkles::sparql::results::SolutionsFormat;
 
@@ -1378,7 +1563,8 @@ async fn row_budget_enforced_pre_commit_and_post_handoff() {
 
     // Case 4: Post-handoff `max-rows=4500` lets batch 1 (4,096 rows ≈ 1.76 MiB) cross
     // STREAM_AFTER and commit 200 OK before batch 2 trips the row limit and aborts mid-stream
-    // on both in-place hand-off and explicit `execution=streaming`.
+    // with the exact row-budget error and deferred budget outcome on both in-place hand-off
+    // and explicit `execution=streaming`.
     let q_mid = "# rb-mid\nSELECT ?s ?o WHERE { ?s <urn:rb:p> ?o }";
     let key_mid = QuickQueries::key("rb_ds", q_mid);
     let (mut options, guard) = crate::http::query_options_for_test(&s.state, &ds);
@@ -1417,14 +1603,19 @@ async fn row_budget_enforced_pre_commit_and_post_handoff() {
         "in-place hand-off must commit headers before hitting row 4500"
     );
     assert_eq!(route_stats::in_place_handoff(key_mid), 1);
+    let deferred = resp
+        .extensions()
+        .get::<DeferredReport>()
+        .cloned()
+        .expect("in-place handoff deferred report");
     let mut stream = resp.into_body().into_data_stream();
     let mut received = 0usize;
-    let mut saw_err = false;
+    let mut err_msg = None;
     while let Some(item) = stream.next().await {
         match item {
             Ok(chunk) => received += chunk.len(),
-            Err(_) => {
-                saw_err = true;
+            Err(err) => {
+                err_msg = Some(err.to_string());
                 break;
             }
         }
@@ -1433,9 +1624,15 @@ async fn row_budget_enforced_pre_commit_and_post_handoff() {
         received > 0,
         "handoff must deliver prefix bytes before abort"
     );
+    let err_msg = err_msg.expect("handoff must abort stream on post-commit row budget");
     assert!(
-        saw_err,
-        "handoff must abort stream on post-commit row budget"
+        err_msg.contains("exceeds the limit of 4500"),
+        "expected post-handoff max-rows error, got: {err_msg}"
+    );
+    assert_eq!(
+        deferred.snapshot_outcome(),
+        Some((Some(Outcome::Budget), Some(BudgetKind::Rows))),
+        "in-place hand-off deferred report must record Budget(Rows)"
     );
 
     let req = Request::post("/rb_ds/sparql?execution=streaming&max-rows=4500")
@@ -1451,12 +1648,12 @@ async fn row_budget_enforced_pre_commit_and_post_handoff() {
     );
     let mut stream = resp.into_body().into_data_stream();
     let mut received = 0usize;
-    let mut saw_err = false;
+    let mut err_msg = None;
     while let Some(item) = stream.next().await {
         match item {
             Ok(chunk) => received += chunk.len(),
-            Err(_) => {
-                saw_err = true;
+            Err(err) => {
+                err_msg = Some(err.to_string());
                 break;
             }
         }
@@ -1465,28 +1662,162 @@ async fn row_budget_enforced_pre_commit_and_post_handoff() {
         received > 0,
         "streaming must deliver prefix bytes before abort"
     );
+    let err_msg = err_msg.expect("streaming must abort stream on post-commit row budget");
     assert!(
-        saw_err,
-        "streaming must abort stream on post-commit row budget"
+        err_msg.contains("exceeds the limit of 4500"),
+        "expected streaming max-rows error, got: {err_msg}"
     );
 
-    let _ = wait_metric(
+    // Case 5: Post-handoff `max-rows-produced=9000` allows batch 1 (Scan + Project = 8,192
+    // rows produced, ~1.76 MiB > STREAM_AFTER) to commit 200 OK before batch 2 (total 9,096+
+    // rows produced) trips `BudgetKind::RowsProduced` on both in-place hand-off and explicit
+    // `execution=streaming`.
+    let q_mid_prod = "# rb-mid-prod\nSELECT ?s ?o WHERE { ?s <urn:rb:p> ?o }";
+    let key_mid_prod = QuickQueries::key("rb_ds", q_mid_prod);
+    let (mut options, guard) = crate::http::query_options_for_test(&s.state, &ds);
+    options.max_rows_produced = Some(9000);
+    let AutoOutcome::Responded(resp) = run_in_place_with_mode(
+        ds.clone(),
+        AutoRequest {
+            timeouts: stream::Timeouts::default(),
+            query: q_mid_prod.into(),
+            options,
+            at: None,
+            params: &params,
+            uri: &uri,
+            guard,
+            limit: None,
+            format: SolutionsFormat::Tsv,
+            thrift: false,
+            rdf_format: OutFormat::Rdf(oxrdfio::RdfFormat::NTriples),
+            native_graph: false,
+            prefixes: Default::default(),
+            io: None,
+            quick_key: key_mid_prod,
+            auto: true,
+            trial: false,
+            claim: None,
+        },
+        ExecutionMode::Streaming,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "in-place post-handoff rows-produced budget failed: {} {}",
+            e.0, e.1
+        )
+    }) else {
+        panic!("expected CursorHandoff response for max-rows-produced");
+    };
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "in-place hand-off must commit headers before hitting 9000 rows produced"
+    );
+    assert_eq!(route_stats::in_place_handoff(key_mid_prod), 1);
+    let deferred_prod = resp
+        .extensions()
+        .get::<DeferredReport>()
+        .cloned()
+        .expect("in-place handoff deferred report for max-rows-produced");
+    let mut stream = resp.into_body().into_data_stream();
+    let mut received = 0usize;
+    let mut err_msg = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(chunk) => received += chunk.len(),
+            Err(err) => {
+                err_msg = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    assert!(
+        received > 0,
+        "handoff must deliver prefix bytes before rows-produced abort"
+    );
+    let err_msg = err_msg.expect("handoff must abort stream on post-commit rows-produced budget");
+    assert!(
+        err_msg.contains("operators produced") && err_msg.contains("limit 9000"),
+        "expected post-handoff rows-produced error, got: {err_msg}"
+    );
+    assert_eq!(
+        deferred_prod.snapshot_outcome(),
+        Some((Some(Outcome::Budget), Some(BudgetKind::RowsProduced))),
+        "in-place hand-off deferred report must record Budget(RowsProduced)"
+    );
+
+    let req = Request::post("/rb_ds/sparql?execution=streaming&max-rows-produced=9000")
+        .header(header::CONTENT_TYPE, "application/sparql-query")
+        .header(header::ACCEPT, "text/tab-separated-values")
+        .body(Body::from(q_mid_prod))
+        .unwrap();
+    let resp = s.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "streaming must commit headers before hitting 9000 rows produced"
+    );
+    let mut stream = resp.into_body().into_data_stream();
+    let mut received = 0usize;
+    let mut err_msg = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(chunk) => received += chunk.len(),
+            Err(err) => {
+                err_msg = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    assert!(
+        received > 0,
+        "streaming must deliver prefix bytes before rows-produced abort"
+    );
+    let err_msg = err_msg.expect("streaming must abort stream on post-commit rows-produced budget");
+    assert!(
+        err_msg.contains("operators produced") && err_msg.contains("limit 9000"),
+        "expected streaming rows-produced error, got: {err_msg}"
+    );
+
+    let m = wait_metric(
         &s.app,
         r#"sparkles_requests_total{dataset="rb_ds",operation="query",outcome="budget"}"#,
-        3.0,
+        4.0,
     )
     .await;
+    assert_eq!(
+        metric_sample(
+            &m,
+            r#"sparkles_budget_exceeded_total{dataset="rb_ds",budget="rows"}"#
+        ),
+        Some(2.0),
+        "expected 2 routed rows-budget failures:\n{m}"
+    );
+    assert_eq!(
+        metric_sample(
+            &m,
+            r#"sparkles_budget_exceeded_total{dataset="rb_ds",budget="rows-produced"}"#
+        ),
+        Some(2.0),
+        "expected 2 routed rows-produced-budget failures:\n{m}"
+    );
     assert!(wait_pool_zero(&s.state, Duration::from_secs(2)).await);
 }
 
 /// Dropping a client connection mid-stream after an in-place `execution=auto` cursor hands
-/// off to the blocking pool cancels the producer and releases both memory and concurrency.
+/// off to the blocking pool cancels the live producer, records `outcome="cancelled"`, and
+/// releases both memory and concurrency.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_disconnect_after_in_place_handoff_releases_resources() {
+    use crate::http::algo::probe::{CURRENT, Gate, Probe, Release};
+
     let s = pool_server(None, Some("query=concurrency=1"));
     let payload = "d".repeat(800);
     let mut data = String::new();
-    for i in 0..2500 {
+    // 5,000 rows (~4.1 MiB, spanning two cursor batches) so substantial cursor work remains
+    // un-pulled after hand-off.
+    for i in 0..5000 {
         data.push_str(&format!(
             "<urn:dch:s{i:04}> <urn:dch:p> \"{payload}-{i}\" .\n"
         ));
@@ -1495,73 +1826,13 @@ async fn client_disconnect_after_in_place_handoff_releases_resources() {
 
     let q = "SELECT ?s ?o WHERE { ?s <urn:dch:p> ?o }";
     let key = QuickQueries::key("dch_ds", q);
-    let req = Request::post("/dch_ds/sparql?execution=auto")
-        .header(header::CONTENT_TYPE, "application/sparql-query")
-        .header(header::ACCEPT, "text/tab-separated-values")
-        .body(Body::from(q))
-        .unwrap();
-    let resp = s.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(route_stats::in_place_handoff(key), 1);
-
-    let mut stream = resp.into_body().into_data_stream();
-    let first = stream.next().await.expect("first chunk").expect("ok chunk");
-    assert!(!first.is_empty());
-    drop(stream);
-
-    assert!(
-        wait_pool_zero(&s.state, Duration::from_secs(5)).await,
-        "disconnect after in-place hand-off leaked memory grant"
-    );
-    let ok = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let (st, _, _) = post_query(
-                &s.app,
-                "/dch_ds/sparql?execution=auto",
-                "ASK { ?s <urn:dch:p> ?o }",
-                "application/sparql-results+json",
-            )
-            .await;
-            if st == StatusCode::OK {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or(false);
-    assert!(
-        ok,
-        "disconnect after in-place hand-off did not release concurrency slot"
-    );
-}
-
-/// A query timeout that expires after an in-place cursor hands off to the blocking pool
-/// aborts the committed stream, records `outcome="timeout"`, and releases both memory and
-/// the HTTP concurrency permit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mid_stream_timeout_after_handoff_aborts_and_releases_resources() {
-    use crate::http::algo::probe::{CURRENT, Gate, Probe, Release};
-
-    let s = pool_server(None, Some("query=concurrency=1"));
-    let payload = "t".repeat(400);
-    let mut data = String::new();
-    for i in 0..2000 {
-        data.push_str(&format!(
-            "<urn:to:s{i:04}> <urn:to:p> \"{payload}-{i}\" .\n"
-        ));
-    }
-    load_turtle(&s.state, "to_ds", data);
-
-    let q = "SELECT ?s ?o WHERE { ?s <urn:to:p> ?o }";
-    let key = QuickQueries::key("to_ds", q);
     let gate = Arc::new(Gate::default());
     let _release = Release(gate.clone());
     let probe = Probe {
         queued_producer: Some(gate.clone()),
         ..Default::default()
     };
-    let req = Request::post("/to_ds/sparql?execution=auto&timeout=0.2")
+    let req = Request::post("/dch_ds/sparql?execution=auto")
         .header(header::CONTENT_TYPE, "application/sparql-query")
         .header(header::ACCEPT, "text/tab-separated-values")
         .body(Body::from(q))
@@ -1584,21 +1855,149 @@ async fn mid_stream_timeout_after_handoff_aborts_and_releases_resources() {
     let first = stream.next().await.expect("first chunk").expect("ok chunk");
     assert!(!first.is_empty());
 
-    // Wait past the 200 ms query deadline while the producer is paused after its initial send.
-    tokio::time::sleep(Duration::from_millis(260)).await;
+    // Prove the producer is still live mid-stream and holding both its cursor memory grant
+    // and the HTTP concurrency permit before simulating client disconnect.
+    assert!(
+        !gate.finished(),
+        "producer must still be paused mid-stream before disconnect"
+    );
+    assert!(
+        s.state.catalog.pool().unwrap().granted() > 0,
+        "cursor memory grant must be held while producer is paused mid-stream"
+    );
+    let (busy_status, _, _) = post_query(
+        &s.app,
+        "/dch_ds/sparql?execution=auto",
+        "ASK { ?s <urn:dch:p> ?o }",
+        "application/sparql-results+json",
+    )
+    .await;
+    assert_eq!(
+        busy_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "HTTP concurrency permit must be held while producer is paused mid-stream"
+    );
+
+    let done = gate.done.notified();
+    tokio::pin!(done);
+    done.as_mut().enable();
+    drop(stream);
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), done)
+        .await
+        .unwrap();
+
+    let m = wait_metric(
+        &s.app,
+        r#"sparkles_requests_total{dataset="dch_ds",operation="query",outcome="cancelled"}"#,
+        1.0,
+    )
+    .await;
+    assert_eq!(
+        metric_sample(
+            &m,
+            r#"sparkles_requests_total{dataset="dch_ds",operation="query",outcome="ok"}"#
+        )
+        .unwrap_or(0.0),
+        0.0,
+        "cancelled hand-off stream must not record ok:\n{m}"
+    );
+    assert!(
+        wait_pool_zero(&s.state, Duration::from_secs(5)).await,
+        "disconnect after in-place hand-off leaked memory grant"
+    );
+    let (st, _, _) = post_query(
+        &s.app,
+        "/dch_ds/sparql?execution=auto",
+        "ASK { ?s <urn:dch:p> ?o }",
+        "application/sparql-results+json",
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "disconnect after in-place hand-off did not release concurrency slot"
+    );
+}
+
+/// A query timeout that expires after an in-place cursor hands off to the blocking pool
+/// aborts the committed stream, records `outcome="timeout"`, and releases both memory and
+/// the HTTP concurrency permit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_stream_timeout_after_handoff_aborts_and_releases_resources() {
+    use crate::http::algo::probe::{CURRENT, Gate, Probe, Release};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let s = pool_server(None, Some("query=concurrency=1"));
+    let payload = "t".repeat(400);
+    let mut data = String::new();
+    for i in 0..2000 {
+        data.push_str(&format!(
+            "<urn:to:s{i:04}> <urn:to:p> \"{payload}-{i}\" .\n"
+        ));
+    }
+    load_turtle(&s.state, "to_ds", data);
+
+    let q = "SELECT ?s ?o WHERE { ?s <urn:to:p> ?o }";
+    let key = QuickQueries::key("to_ds", q);
+    let gate = Arc::new(Gate::default());
+    let _release = Release(gate.clone());
+    let clock_advance_ns = Arc::new(AtomicU64::new(0));
+    let probe = Probe {
+        queued_producer: Some(gate.clone()),
+        clock_advance_ns: Some(clock_advance_ns.clone()),
+        ..Default::default()
+    };
+    // Give the pre-commit phase a 30 s deadline so it can never expire before hand-off,
+    // then advance the producer's deadline clock deterministically once paused mid-stream.
+    let req = Request::post("/to_ds/sparql?execution=auto&timeout=30")
+        .header(header::CONTENT_TYPE, "application/sparql-query")
+        .header(header::ACCEPT, "text/tab-separated-values")
+        .body(Body::from(q))
+        .unwrap();
+
+    let entered = gate.entered.notified();
+    tokio::pin!(entered);
+    entered.as_mut().enable();
+    let resp = CURRENT
+        .scope(probe, s.app.clone().oneshot(req))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(route_stats::in_place_handoff(key), 1);
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .unwrap();
+
+    let mut stream = resp.into_body().into_data_stream();
+    let first = stream.next().await.expect("first chunk").expect("ok chunk");
+    assert!(!first.is_empty());
+    assert!(!gate.finished());
+    assert!(s.state.catalog.pool().unwrap().granted() > 0);
+
+    // Advance the test clock past the 30 s deadline while the producer is paused after its
+    // initial send, then release it so the next post-handoff check trips the timeout.
+    let done = gate.done.notified();
+    tokio::pin!(done);
+    done.as_mut().enable();
+    clock_advance_ns.store(Duration::from_secs(60).as_nanos() as u64, Ordering::Relaxed);
     gate.release();
 
-    let mut saw_err = false;
+    let mut err_msg = None;
     while let Some(item) = stream.next().await {
-        if item.is_err() {
-            saw_err = true;
+        if let Err(err) = item {
+            err_msg = Some(err.to_string());
             break;
         }
     }
+    let err_msg = err_msg.expect("mid-stream timeout after hand-off must abort stream");
     assert!(
-        saw_err,
-        "mid-stream timeout after hand-off must abort stream"
+        err_msg.contains("timed out"),
+        "expected mid-stream timeout error, got: {err_msg}"
     );
+    tokio::time::timeout(Duration::from_secs(5), done)
+        .await
+        .unwrap();
 
     let _ = wait_metric(
         &s.app,

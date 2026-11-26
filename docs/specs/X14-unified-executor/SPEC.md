@@ -1883,21 +1883,24 @@ writers. Pool-routed cursors, both explicit `execution=streaming` and pool-route
 through `stream::open_and_serialize_controlled`, removing the return wake to the handler
 and the second pool wake while keeping open-phase error responses, concurrency permit
 lifetimes, `StreamControl`, and the execution-to-serialization timing split unchanged.
-Eligible `execution=auto` requests, namely unseen first runs and texts whose quick history
-retains automatic execution, open and drain cursors in place through resumable `Send`
-`CursorWriter` sessions in `sparkles-core`. A cursor whose encoded output finishes within
-`STREAM_AFTER` returns a whole response with `Content-Length` and zero thread hops, and a
-cursor that would cross `STREAM_AFTER` pauses before buffering an oversized row, quad or
-footer and hands off the cursor, encoder state and buffered `SwitchWriter` prefix to a
-blocking streaming task whose initial chunk stays within `STREAM_AFTER + 1` bytes and
-whose subsequent chunks drain in `CHUNK`-sized backpressured frames. Explicit
-`execution=streaming` keeps the blocking-pool route with early first-batch or 64 KiB
-commit and immediate cancellation on client disconnect, and queries that call graph
-algorithms are never recorded as quick on either route. Core session parity tests and HTTP
-router integration tests cover route selection, format parity across all SELECT, ASK and
-graph formats, open errors, memory, result-byte and row budgets, mid-stream timeouts, and
-client-disconnect cancellation. The quiet `atlas` timing comparison against pre-handoff
-`5369883f` is pending.
+Eligible `execution=auto` requests, namely unseen first runs that carry a timeout, arrive
+after a server-idle interval (`FIRST_RUN_QUIET`) and contain no `SERVICE` keyword or
+Unicode escape, along with texts whose quick history retains automatic execution, open and
+drain cursors in place through resumable `Send` `CursorWriter` sessions in `sparkles-core`.
+A cursor whose encoded output finishes within `STREAM_AFTER` returns a whole response with
+`Content-Length` and zero thread hops, and a cursor that would cross `STREAM_AFTER` pauses
+before buffering an oversized row, quad or footer and hands off the cursor, encoder state
+and buffered `SwitchWriter` prefix to a blocking streaming task whose initial chunk stays
+within `STREAM_AFTER + 1` bytes and whose subsequent chunks drain in `CHUNK`-sized
+backpressured frames. Explicit `execution=streaming` keeps the blocking-pool route with
+early first-batch or 64 KiB commit and immediate cancellation on client disconnect, and
+queries that call graph algorithms are never recorded as quick on either route. Core
+session parity tests and HTTP router integration tests cover route selection, format parity
+across all SELECT, ASK and graph formats (including JSON-LD, with decoded statement
+equality for Jena binary formats and native JSON), open errors, memory, result-byte and
+row budgets on both sides of commit, mid-stream timeouts, and client-disconnect
+cancellation. The quiet `atlas` timing comparison against pre-handoff `5369883f` is
+pending.
 
 ### One writer per format and exact row accounting (items 828 and 243)
 
