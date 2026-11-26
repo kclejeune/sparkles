@@ -295,30 +295,35 @@ pub fn write_axioms<'a>(
 /// Resolve `path` to the final target path for atomic replacement: follows existing
 /// symlinks (including dangling symlink chains, bounded to 40 hops) so an output symlink
 /// stays intact and points at the atomically replaced target, matching `File::create`.
-fn resolve_atomic_target(path: &Path) -> std::path::PathBuf {
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        return canon;
+/// Returns an error if resolution fails or exhausts the hop bound.
+fn resolve_atomic_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(canon) => return Ok(canon),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     let mut cur = path.to_path_buf();
-    for _ in 0..40 {
-        let Ok(meta) = std::fs::symlink_metadata(&cur) else {
-            break;
-        };
-        if !meta.file_type().is_symlink() {
-            break;
+    for _ in 0..=40 {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = std::fs::read_link(&cur)?;
+                cur = if link.is_absolute() {
+                    link
+                } else {
+                    cur.parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map_or_else(|| link.clone(), |p| p.join(&link))
+                };
+            }
+            Ok(_) => return Ok(cur),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(cur),
+            Err(e) => return Err(e),
         }
-        let Ok(link) = std::fs::read_link(&cur) else {
-            break;
-        };
-        cur = if link.is_absolute() {
-            link
-        } else {
-            cur.parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .map_or_else(|| link.clone(), |p| p.join(&link))
-        };
     }
-    cur
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "too many levels of symbolic links",
+    ))
 }
 
 /// Write a header and axioms to `path` in `format`, returning the writer's report of
@@ -335,25 +340,43 @@ pub fn write_axioms_reported<'a>(
     let werr = |e: sparkles_owl::WriteError| {
         Error::invalid(format!("cannot write {}: {e}", path.display()))
     };
-    let target = resolve_atomic_target(path);
+    let target = resolve_atomic_target(path).map_err(io)?;
     let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let existing_perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    let existing_perms = match std::fs::symlink_metadata(&target) {
+        Ok(meta) => {
+            if !meta.file_type().is_file() {
+                return Err(io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "output destination must be a regular file",
+                )));
+            }
+            Some(meta.permissions())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io(e)),
+    };
+    // Stage inside a private (0o700 on Unix) temporary directory in `parent` (same
+    // filesystem as `target`) so neither partial writes nor final permissions are
+    // exposed to other users or group members before atomic publication.
+    let stage_dir = tempfile::Builder::new()
+        .prefix(".sparkles-owl-stage-")
+        .tempdir_in(parent)
+        .map_err(io)?;
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".sparkles-owl-").suffix(".tmp");
-    // New files get the standard 0o666 mode masked by the process umask (matching
-    // File::create); existing files keep their own mode after staging.
+    builder.prefix("out-").suffix(".tmp");
+    // New files derive the standard 0o666 mode masked by the process umask (matching
+    // File::create) while isolated inside the private staging directory; existing files
+    // stay private (0o600) during serialization and receive their preserved mode only
+    // after serialization and gzip completion.
     #[cfg(unix)]
     if existing_perms.is_none() {
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-    let mut tmp = builder.tempfile_in(parent).map_err(io)?;
-    if let Some(perms) = existing_perms {
-        tmp.as_file().set_permissions(perms).map_err(io)?;
-    }
+    let mut tmp = builder.tempfile_in(stage_dir.path()).map_err(io)?;
     // Stage output beside the resolved destination so a writer or gzip error never
     // truncates or overwrites an existing file. Each layer is finished and flushed by
     // hand so an error writing the gzip trailer or final buffer fails the command.
@@ -371,8 +394,12 @@ pub fn write_axioms_reported<'a>(
             report
         }
     };
+    if let Some(perms) = existing_perms {
+        tmp.as_file().set_permissions(perms).map_err(io)?;
+    }
     tmp.as_file().sync_all().map_err(io)?;
     tmp.persist(&target).map_err(|e| io(e.error))?;
+    drop(stage_dir);
     #[cfg(unix)]
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
@@ -766,5 +793,84 @@ EquivalentClasses(:D ObjectIntersectionOf(:C ObjectSomeValuesFrom(:p :B)))
         assert!(
             sparkles_owl::owx::parse(&std::fs::read_to_string(&dangling_target).unwrap()).is_ok()
         );
+
+        // 5. Overwriting a read-only regular file (0o444) succeeds (mode applied after
+        // serialization) and preserves 0o444.
+        let readonly = d.path().join("readonly.owx");
+        std::fs::write(&readonly, "old").unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o444)).unwrap();
+        w.write(&readonly).unwrap();
+        assert_eq!(
+            std::fs::metadata(&readonly).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert!(sparkles_owl::owx::parse(&std::fs::read_to_string(&readonly).unwrap()).is_ok());
+
+        // 6. Cyclic symlink loops (self-loop and mutual loop) fail and preserve the links.
+        let self_loop = d.path().join("self_loop.owx");
+        std::os::unix::fs::symlink(&self_loop, &self_loop).unwrap();
+        assert!(w.write(&self_loop).is_err());
+        assert!(
+            std::fs::symlink_metadata(&self_loop)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&self_loop).unwrap(), self_loop);
+
+        let loop_a = d.path().join("loop_a.owx");
+        let loop_b = d.path().join("loop_b.owx");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        assert!(w.write(&loop_a).is_err());
+        assert!(
+            std::fs::symlink_metadata(&loop_a)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&loop_a).unwrap(), loop_b);
+
+        // 7. Non-regular destinations (directory, FIFO directly, symlink to FIFO) are refused
+        // before staging and remain untouched.
+        let dir_dest = d.path().join("dir.owx");
+        std::fs::create_dir(&dir_dest).unwrap();
+        assert!(w.write(&dir_dest).is_err());
+        assert!(dir_dest.is_dir());
+
+        let fifo = d.path().join("pipe.owx");
+        let mkfifo_status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(mkfifo_status.success());
+        let fifo_link = d.path().join("pipe_link.owx");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+        assert!(w.write(&fifo).is_err());
+        assert!(w.write(&fifo_link).is_err());
+        assert!(
+            !std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert!(
+            std::fs::symlink_metadata(&fifo_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // 8. No staging directories are left behind in `d`.
+        let leftover: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".sparkles-owl-stage-")
+            })
+            .collect();
+        assert!(leftover.is_empty(), "leftover staging dirs: {leftover:?}");
     }
 }

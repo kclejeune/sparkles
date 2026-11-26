@@ -1544,6 +1544,13 @@ fn ontology_writers_remote_server_stdout_formats() {
     );
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
 
+    let go1 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000001");
+    let go2 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000002");
+    let go3 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000003");
+    let go4 = sparkles::owl::Class::new("http://purl.obolibrary.org/obo/GO_0000004");
+    let expected_sub_1_3 = sparkles::owl::AxiomKind::SubClassOf(go1.into(), go3.into());
+    let expected_sub_4_2 = sparkles::owl::AxiomKind::SubClassOf(go4.into(), go2.into());
+
     for cmd in ["axioms", "classify"] {
         for fmt in ["owx", "omn", "obo", "obographs"] {
             let o = sparkles(
@@ -1561,19 +1568,25 @@ fn ontology_writers_remote_server_stdout_formats() {
             );
             assert_eq!(o.status.code(), Some(0), "{cmd} {fmt}: {}", err(&o));
             let body = out(&o);
-            match fmt {
-                "owx" => assert!(sparkles::owl::owx::parse(&body).is_ok(), "{cmd}: {body}"),
-                "omn" => assert!(
-                    sparkles::owl::manchester::parse_document(&body).is_ok(),
-                    "{cmd}: {body}"
-                ),
-                "obo" => assert!(sparkles::owl::obo::parse(&body).is_ok(), "{cmd}: {body}"),
-                "obographs" => assert!(
-                    sparkles::owl::obographs::parse(&body).is_ok(),
-                    "{cmd}: {body}"
-                ),
+            let doc = match fmt {
+                "owx" => sparkles::owl::owx::parse(&body)
+                    .unwrap_or_else(|e| panic!("{cmd} owx: {e}\n{body}")),
+                "omn" => sparkles::owl::manchester::parse_document(&body)
+                    .unwrap_or_else(|e| panic!("{cmd} omn: {e}\n{body}")),
+                "obo" => sparkles::owl::obo::parse(&body)
+                    .unwrap_or_else(|e| panic!("{cmd} obo: {e}\n{body}")),
+                "obographs" => sparkles::owl::obographs::parse(&body)
+                    .unwrap_or_else(|e| panic!("{cmd} obographs: {e}\n{body}")),
                 _ => unreachable!(),
-            }
+            };
+            assert!(
+                doc.axioms.iter().any(|a| a.kind == expected_sub_1_3),
+                "{cmd} {fmt} missing expected SubClassOf(GO_0000001, GO_0000003):\n{body}"
+            );
+            assert!(
+                doc.axioms.iter().any(|a| a.kind == expected_sub_4_2),
+                "{cmd} {fmt} missing expected SubClassOf(GO_0000004, GO_0000002):\n{body}"
+            );
         }
     }
 }
