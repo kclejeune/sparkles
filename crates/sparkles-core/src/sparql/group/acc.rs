@@ -3603,9 +3603,9 @@ mod tests {
             hbmap_insert_growth_with_group(7, 7, 144, id_elem, id_align, 0, 8),
             136
         );
-        // Group index `(Box<[Id]>, u32)` on arm64 NEON: 4 * 24 + 4 + 8 = 108 B, 4->8 delta = 100 B.
-        let grp_elem = size_of::<(Box<[Id]>, u32)>();
-        let grp_align = align_of::<(Box<[Id]>, u32)>();
+        // Group index `(Box<[Id]>, u32)` on arm64 NEON (24 B, align 8): 4 * 24 + 4 + 8 = 108 B,
+        // 4->8 delta = 100 B.
+        let (grp_elem, grp_align) = (24, 8);
         assert_eq!(
             hbmap_insert_growth_with_group(0, 0, 0, grp_elem, grp_align, 0, 8),
             108
