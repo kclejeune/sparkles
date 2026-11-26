@@ -5823,6 +5823,7 @@ dependencies = [
  "rayon",
  "regex",
  "rustc-hash 2.1.3",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

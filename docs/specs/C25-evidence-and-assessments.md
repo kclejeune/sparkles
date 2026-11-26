@@ -550,8 +550,43 @@ closed links. Recovery checks a known original UUID before and under process exc
 and cannot create a missing root or empty generation. A failed delete move is synchronized
 back before reopen, or remains unavailable with its original bytes and reported path.
 Uncertain moved data uses the existing retained `.kept-<name>-<token>` convention.
-Catalog startup refuses only a registered root that lacks its directory or CURRENT,
-names the expected path and serves the other datasets. Restore publication
+Managed persistent deletes record an intent, stage the source and synchronize its new
+name before removing the registry row. Format 2 of `config.json` stores persistent
+dataset UUIDs, and format 3 adds swap revisions. Format 4 of `delete.json` records the
+prepared stage and can record a committed decision before a later registration reuses the
+alias and UUID. Startup validates the journal and registry before recovering any
+operation, and checks registered UUIDs when opening persistent datasets. For a prepared
+delete, it restores a verified staged copy when the original UUID remains registered and
+reclaims the copy when the registry records the deletion or a replacement. It takes the
+store process lock before moving or removing a copy and synchronizes the database
+directory before retiring the intent. Live deletion and startup recovery hold the process
+lock while removing store contents. Format 3 prepared records retain their provenance on
+rewrite; a sole verified `.deleted-<token>` trash copy is classified as committed before
+conflict and duplicate-root checks, allowing a same-UUID replacement or verified legacy
+predecessor to recover while reclaiming only the trash copies, while an ambiguous kept
+copy or conflicting path keeps the registration closed and retains the staged copy.
+Restore publication synchronizes the journal before replacing the registry and preserves
+dataset bytes after an indeterminate registry replacement. In-place restores persist the
+predecessor revision in format 3 of `config.json` and write a versioned swap marker in
+`.replaced-<name>-<task>` after synchronizing rename 1 so all catalog builds reconcile
+both copies against the durable registry before removing either one, synchronizing the
+database directory before removing the marker during live and startup rollbacks. Unmarked
+format 2 pairs reconcile against the registered UUID and fail closed on ambiguous
+identities, while unmarked format 1 rows retain roll-forward recovery. Unmarked
+roll-forward synchronizes the database directory under the live store lock before
+removing a predecessor, and obsolete unmarked copies with no persistent registry row
+are retired without populating the live path. Startup refuses to open when `config.json`
+is absent beside any `.replaced-` directory while still reporting newer swap marker
+formats as unsupported. A `.replaced-` copy carrying a validated `.keep-replaced-v1`
+marker is moved to `.kept-<name>-<task>` under the store lock when free, or retained
+and warned when occupied, keeping the live alias untouched. Ambiguous legacy
+journal records and competing staged restore copies remain available for recovery.
+Startup preserves
+unknown kept copies and reports retained paths, byte counts and incomplete counts.
+Restores mark intentional `keepReplaced` copies so their warnings do not depend on the
+active name.
+A registered root with a missing directory or CURRENT stays closed. Startup names the
+expected path and serves the other datasets. Restore publication
 checks the restored identity separately from original-identity rollback. Existing roots
 without a known expected UUID retain the supported legacy metadata upgrade only when
 CURRENT already exists.

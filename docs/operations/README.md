@@ -10,6 +10,7 @@ Sparkles runs as a single binary packaged for NixOS, Home Manager, Docker, and K
 | [Observability](#observability) | Audit events, structured access logs, Prometheus metrics, and OpenTelemetry traces/metrics/logs. |
 | [Backups](#backups) | Deduplicated file-system and S3 backup repositories, encryption, verification, and lifecycle policies. |
 | [Upgrades and on-disk formats](#upgrades-and-on-disk-formats) | Format registry, `sparkles migrate`, parallel degraded startup, health probes, and graceful shutdown. |
+| [Interrupted dataset deletes](#interrupted-dataset-deletes) | Recovery decisions, retained copies and startup warnings. |
 | [API compatibility](#api-compatibility) | Compatibility policy and current development-baseline checks. |
 
 ## Operations
@@ -56,6 +57,58 @@ Sparkles runs as a single binary packaged for NixOS, Home Manager, Docker, and K
 * **Format registry and migration.** A central registry in `sparkles-core` tracks read and write versions for every file kind, exposed at `GET /$/server` ([X12](../specs/X12-release-engineering.md), [USAGE.md](../USAGE.md#upgrading-databases)). Unreadable newer formats fail cleanly with upgrade instructions while healthy datasets keep serving. Generation indexes support multi-version reading so format upgrades take effect on compaction and older backups remain restorable. `sparkles migrate` inspects stopped-server file versions and upgrades on a verified copy before swapping in while preserving dataset UUIDs and history. Fixtures in `testsuite/formats/` test backward compatibility across open, query, write, compact, and restore.
 * **Parallel startup and health probes.** The server opens its listening socket first and opens datasets in parallel ([API.md](../API.md#startup)). `/$/ready` reports each dataset as `open`, `opening` (returning `503` with `Retry-After` on access), or `failed`. Failed datasets stay closed while others serve, marking the server `degraded` and unready unless `--ready-ignore-failed` is set (`--require-all-datasets` exits instead). Use `/$/ping` for startup and liveness probes and `/$/ready` (or `/$/ready/{ds}`) for readiness checks ([USAGE.md](../USAGE.md#endpoints-and-operations)). Degraded derived-index reporting and WAL replay progress remain planned (roadmap [item 402](../ROADMAP.md)).
 * **Graceful shutdown.** On `SIGTERM` or `SIGINT`, the server stops accepting new connections, allows in-flight requests up to `--shutdown-grace` seconds to finish, and cancels remaining work without committing aborted writes.
+
+### Interrupted dataset deletes
+
+Managed persistent deletes use the catalog's `delete.json` journal. Startup checks the
+journal and registry before recovering any pending rename, restore or delete. An
+unsupported format, invalid journal or registry, or symlink in place of `delete.json`,
+`config.json`, or the `databases` directory prevents the catalog from opening. A prepared
+delete or any staged `databases/.replaced-<name>-<task>` directory requires a valid
+registry, even when the registry contains no datasets.
+
+Before committing a delete, the catalog moves the dataset to
+`databases/.kept-<name>-<token>` and synchronizes the database directory. The persistent
+dataset UUID in `config.json` helps startup identify the original registration. Startup
+takes the store's process lock and verifies the staged copy. For a prepared delete, it
+restores the original path when the same UUID remains registered, or removes the staged
+copy when the registry records the deletion or a replacement. If a later registration
+reuses the name and UUID, the catalog durably records the old delete's commit in journal
+format 4 before publishing that registration. Recovery only reclaims that committed copy.
+A busy or unverifiable copy keeps its journal entry for the next startup. Format 3
+journals treat a sole verified `.deleted-<token>` trash copy as proof that the older
+delete committed, allowing a same-UUID replacement to open while reclaiming only the
+trash copy. When format 3 leaves an ambiguous kept copy or conflicting paths next to a
+matching registration, startup leaves the dataset closed and retains its files for
+inspection. Ambiguous earlier journals and competing staged restore copies also remain
+on disk.
+
+An indeterminate registry commit keeps the name unavailable until the catalog reopens.
+A restore with that outcome preserves its published root. An in-place restore records a
+swap revision in format 3 of `config.json` and writes a versioned swap marker in its
+`.replaced-` predecessor directory before moving the restored copy into place. All
+catalog builds synchronize the registry and reconcile marked swaps on startup, restoring
+the predecessor when the predecessor revision survived or a live rollback failed and
+removing the predecessor when the restored revision committed. Live and startup rollbacks
+synchronize the database directory after moving the live path aside and before clearing
+the swap marker. Unmarked format 2 pairs reconcile against the registered UUID before
+deleting either copy and refuse ambiguous identity combinations. Unmarked format 1
+rows retain roll-forward recovery, unmarked roll-forward synchronizes the database
+directory under the live store lock before removing a predecessor, and obsolete
+unmarked copies without a persistent registry row are retired without populating the
+live path. A staged `.replaced-` copy carrying a validated `keepReplaced` marker is
+moved to its `.kept-` name under the store lock when that destination is free, or
+retained and reported when the destination is occupied, leaving the live alias untouched.
+Publication synchronizes the journal
+namespace before replacing the registry, and startup synchronizes the registry before
+acting on the delete outcome it observes. Power-loss recovery requires a filesystem and
+platform that support durable directory synchronization.
+
+Warnings report `path`, `retained_bytes`, and whether the byte count is complete.
+Startup leaves unrecognized kept entries in place. Copies marked by a `keepReplaced`
+restore are recognized even after the active dataset is renamed or deleted. Older copies
+without a marker may appear in the warnings. Stop the catalog and all standalone users
+of a dataset before moving or editing files inside the managed catalog directory.
 
 ### API compatibility
 

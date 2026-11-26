@@ -749,7 +749,6 @@ impl AppState {
         default_timeout: std::time::Duration,
         pool_bytes: Option<u64>,
     ) -> Result<(AppState, Vec<String>)> {
-        std::fs::create_dir_all(data_dir.join("databases"))?;
         let mut options: sparkles::CatalogOptions = store_opts.clone().into();
         options.memory.pool_bytes = pool_bytes;
         let (catalog, pending) = sparkles::Catalog::open_deferred(data_dir, options)?;
