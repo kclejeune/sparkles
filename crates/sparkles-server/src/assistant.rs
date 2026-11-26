@@ -1119,6 +1119,13 @@ pub fn stored_answer(out: &Value, ground: &Value) -> Option<Value> {
         if let Some(u) = cut_list(&s["uncitedSentences"], cut) {
             gl["uncitedSentences"] = u;
         }
+        if let Some(p) = out["global"].get("reviewPolicy").filter(|v| v.is_object()) {
+            gl["reviewPolicy"] = json!({
+                "name": cut(&p["name"]),
+                "iri": cut(&p["iri"]),
+                "version": p["version"].as_u64(),
+            });
+        }
         put("global", Some(gl));
     }
     put("claims", claims_kept.take());

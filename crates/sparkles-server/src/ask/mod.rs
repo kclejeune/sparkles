@@ -387,9 +387,10 @@ pub fn ask(
         fenced: false,
     };
     let mut out = a.run();
-    // without a summary, the answer still carries the claims, read for the caller now
+    // without a summary, a local answer still carries the claims, read for the caller now
     if (o.review_policy.is_some() || o.matching_policy.is_some())
         && out["outcome"] == "answered"
+        && out["mode"] != "global"
         && a.claims.is_none()
         && !a.withheld
     {
@@ -884,12 +885,6 @@ impl Asking<'_, '_> {
             return self.error(&e.code, e.message);
         }
         if self.o.review_policy.is_some() || self.o.matching_policy.is_some() {
-            if self.o.mode == AskMode::Global {
-                return self.error(
-                    "bad-argument",
-                    "reviewPolicy and matchingPolicy apply to answers from the data, not to mode global",
-                );
-            }
             // the policies and the store's configuration history are checked before
             // any model call, so a refused policy costs nothing
             if let Err(e) = self.claims_recall(&[]) {
@@ -899,13 +894,14 @@ impl Asking<'_, '_> {
         if let Some(q) = self.o.query.clone() {
             return self.given(&q);
         }
-        // C22 §7: the reports a global answer may use, and the explicit global mode.
-        // An ask that cites claims answers from the data.
-        if self.o.mode != AskMode::Local
-            && self.o.review_policy.is_none()
-            && self.o.matching_policy.is_none()
-        {
-            self.reports = self.report_selection();
+        // C22 §7 / C25 item 811: the reports a global answer may use, and the explicit
+        // global mode. With reviewPolicy only reports read under that policy are used,
+        // and with matchingPolicy report identities are resolved through its map.
+        if self.o.mode != AskMode::Local {
+            match self.report_selection() {
+                Ok(reports) => self.reports = reports,
+                Err(e) => return self.error(&e.code, e.message),
+            }
             if self.o.mode == AskMode::Global
                 && let Some(sel) = self.reports.take()
             {

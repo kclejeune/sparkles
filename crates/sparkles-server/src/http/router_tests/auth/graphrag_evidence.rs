@@ -1498,3 +1498,322 @@ async fn declared_drift_refuses_policy_build_and_refresh_before_model_calls() {
     .unwrap();
     assert!(e.mock.requests().is_empty());
 }
+
+/// Item 811: authenticated `POST /ev/ask` (global mode) and `community_reports` enforce
+/// `reviewPolicy` grants, `matchingPolicy` grants, configuration history activation, and
+/// the C22 disclosure footprint without leaking hidden reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn global_ask_and_community_reports_enforce_policy_and_footprint_authorization() {
+    use sparkles::evidence::{IdentityInput, IdentityRelation, MethodRef};
+
+    let models_all = |url: &str| {
+        let pair = serde_json::json!({ "provider": "p", "model": "m" });
+        let cfg = serde_json::json!({
+            "providers": { "p": { "kind": "openai", "endpoint": url, "requestTimeoutSecs": 5, "allowedModels": ["m"], "structuredOutput": "json-schema" } },
+            "roles": { "draft": [pair], "summarize": [pair], "community": [pair] }
+        });
+        Arc::new(crate::models::Models::new(
+            crate::models::ModelsConfig::parse(&cfg.to_string()).unwrap(),
+            Default::default(),
+            sparkles::outbound::OutboundPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        ))
+    };
+
+    // Unactivated store refuses global Ask with reviewPolicy before any model call.
+    let unact = Arc::new(env(false));
+    unact
+        .s
+        .state
+        .models
+        .store(Some(models_all(&unact.mock.url())));
+    crate::settings::store_runtime(
+        &unact.s.state,
+        &unact.ds(),
+        &crate::settings::ASSISTANT,
+        &serde_json::json!({ "enabled": true, "send": "rows" }),
+    )
+    .unwrap();
+    let res = call(
+        &unact.s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({
+            "question": "Summarize the dataset.",
+            "mode": "global",
+            "reviewPolicy": "main",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.text());
+    assert_eq!(
+        res.json()["error"]["code"],
+        "configuration-history-inactive"
+    );
+    assert!(unact.mock.requests().is_empty());
+
+    // Build real community reports under `reviewPolicy: "main"` with an accepted claim
+    // and an accepted identity match merging http://ex/x0 and http://ex/y0 under "people".
+    let e = Arc::new(env(true));
+    // Replace mock with one that serves community builds, global map/reduce, and fallback drafts.
+    let ask_mock = MockModel::start(|r, _| {
+        let body = r.body.to_string();
+        if body.contains("\"Points\"") || body.contains("pick out what bears") {
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "points": [{
+                            "text": "People collaborate in cluster X.",
+                            "score": 85,
+                            "reports": ["R1"],
+                            "findings": ["F1.1"]
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if body.contains("\"GlobalAnswer\"") || body.contains("Points from the community reports") {
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "text": "Cluster X collaborates under main policy [1].",
+                        "citations": [1]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if body.contains("translate a person's question") {
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "query": "SELECT ?s WHERE { ?s <http://ex/owns> ?o }",
+                        "explanation": "Owned resources.",
+                        "assumptions": [],
+                        "clarify": { "question": "", "choices": [] },
+                        "graph": { "subject": "", "predicate": "", "object": "" }
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if body.contains("rows of a query result") {
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "text": "Local fallback [1].",
+                        "citations": [1],
+                        "claimCitations": []
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        (200, mock::openai(&answer_all(r)))
+    });
+    e.s.state.models.store(Some(models_all(&ask_mock.url())));
+    crate::settings::store_runtime(
+        &e.s.state,
+        &e.ds(),
+        &crate::settings::ASSISTANT,
+        &serde_json::json!({ "enabled": true, "send": "rows" }),
+    )
+    .unwrap();
+
+    let ds = e.dataset();
+    let a = propose(&ds, "advisory", leads());
+    decide(&ds, &a, Disposition::Accepted, 1);
+
+    // Accept an identity match between x0 and y0 under matching policy "people".
+    let mut po = ProposeOptions::new(iri("urn:principal:matcher"));
+    po.identity_graph = Some(iri(IDENTITIES));
+    let prop = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &EvidenceInput {
+            identities: vec![IdentityInput {
+                version: RecordVersion::V1,
+                key: RecordKey::new("id1").unwrap(),
+                occurrence_key: RecordKey::new("occ-id1").unwrap(),
+                entities: vec![ex("x0"), ex("y0")],
+                relation: IdentityRelation::PossibleMatch,
+                preferred: Some(ex("x0")),
+                attributed_author: iri("urn:matcher"),
+                method: Some(MethodRef {
+                    method: iri("urn:method"),
+                    version: RecordKey::new("1").unwrap(),
+                }),
+            }],
+            ..Default::default()
+        },
+        &po,
+        &mut |_, _| Some(Arc::new(sparkles::access::GraphAccess::all())),
+        &Control::none(),
+    )
+    .unwrap();
+    let mut ro = ReviewOptions::new(iri("urn:principal:reviewer"));
+    ro.if_head = Some(ds.store().head_commit().seq);
+    evidence::review(
+        None,
+        &ds,
+        &ds,
+        "people",
+        1,
+        &[DecisionInput {
+            key: "did1".into(),
+            target: prop.records[0].iri.clone(),
+            target_digest: prop.records[0].digest,
+            disposition: Disposition::Accepted,
+            supersedes: None,
+        }],
+        &ro,
+        &mut |_, _| Some(Arc::new(sparkles::access::GraphAccess::all())),
+        &Control::none(),
+    )
+    .unwrap();
+
+    let e2 = e.clone();
+    let o =
+        tokio::task::spawn_blocking(move || e2.run(settings(serde_json::json!({})), Mode::Build))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(o.stopped, None, "{o:?}");
+    assert!(o.written >= 2, "{o:?}");
+
+    // 1) `community_reports` with both policies as `rad` returns filtered reports and
+    //    resolved identities.
+    let e3 = e.clone();
+    let tool_out = tokio::task::spawn_blocking(move || {
+        tool_as(
+            &e3.s,
+            "rad",
+            "community_reports",
+            serde_json::json!({ "reviewPolicy": "main", "matchingPolicy": "people" }),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(tool_out["available"], true, "{tool_out}");
+    assert_eq!(tool_out["reviewPolicy"]["name"], "main", "{tool_out}");
+    assert_eq!(tool_out["resolution"]["policy"], "people", "{tool_out}");
+    assert_eq!(tool_out["resolution"]["number"], 1, "{tool_out}");
+    let resolved_ents = tool_out["resolution"]["entities"].as_array().unwrap();
+    assert!(!resolved_ents.is_empty(), "{tool_out}");
+
+    // 2) `POST /ev/ask` in global mode as `rad` succeeds with policy-filtered reports
+    //    and resolved identities.
+    let res = call(
+        &e.s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    let j = res.json();
+    assert_eq!(j["outcome"], "answered", "{j}");
+    assert_eq!(j["mode"], "global", "{j}");
+    assert_eq!(j["global"]["reviewPolicy"]["name"], "main", "{j}");
+    assert_eq!(j["resolution"]["policy"], "people", "{j}");
+    assert_eq!(j["resolution"]["number"], 1, "{j}");
+    assert!(!j["reports"].as_array().unwrap().is_empty(), "{j}");
+
+    // 3) Unauthorized caller `rnodec` (lacks DECISIONS grant) is refused with 400
+    //    bad-argument for both reviewPolicy and matchingPolicy, with 0 model calls.
+    let before = ask_mock.requests().len();
+    for body in [
+        serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "reviewPolicy": "main",
+        }),
+        serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "matchingPolicy": "people",
+        }),
+    ] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/ask",
+            &[
+                ("authorization", &b("rnodec")),
+                ("content-type", "application/json"),
+                ("accept", "application/json"),
+            ],
+            &body.to_string(),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.text());
+        assert_eq!(res.json()["error"]["code"], "bad-argument");
+        assert!(
+            !res.text().contains("urn:ev:") && !res.text().contains("People who work together"),
+            "{}",
+            res.text()
+        );
+    }
+    assert_eq!(ask_mock.requests().len(), before);
+
+    // 4) `rnoclaims` has grants on DECISIONS, SUPPORTS, ACCEPTED (so reviewPolicy "main"
+    //    is authorized), but lacks CLAIMS (which is in the report build's footprint!).
+    //    The disclosure guard must hide the reports graph so no report leaks.
+    let before = ask_mock.requests().len();
+    let res = call(
+        &e.s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("rnoclaims")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "reviewPolicy": "main",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    let j = res.json();
+    assert_eq!(j["mode"], "local", "{j}");
+    assert!(j.get("reports").is_none(), "{j}");
+    assert!(
+        j["notes"]
+            .to_string()
+            .contains("summaries are unavailable to you"),
+        "{j}"
+    );
+    for req in &ask_mock.requests()[before..] {
+        let s = req.body.to_string();
+        assert!(!s.contains("People who work together"), "{s}");
+    }
+}

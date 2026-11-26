@@ -8,9 +8,13 @@
 //! and says why.
 
 use super::{AskMode, Asking, prompts};
+use crate::mcp::errors::ToolError;
 use crate::models::{OutputSchema, Pair, Prompt, Role};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// The most cluster members listed inline per identity line in the map prompt.
+const PROMPT_IDENTITY_MEMBERS: usize = 8;
 
 /// The most reports a global answer reads (§7.2).
 pub const MAX_REPORTS: usize = crate::graphrag::read::DEFAULT_MAX_REPORTS;
@@ -119,6 +123,44 @@ pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize
             Some(i),
             format!("F{n}.{} {}", i + 1, f["text"].as_str().unwrap_or("")),
         ));
+    }
+    if let Some(ids) = r["identities"].as_array()
+        && !ids.is_empty()
+    {
+        let clean = |s: &str| s.replace(['\r', '\n'], " ");
+        for id in ids {
+            let Some(entity) = id["entity"].as_str() else {
+                continue;
+            };
+            let Some(rep) = id["representative"].as_str() else {
+                continue;
+            };
+            let members: Vec<String> = id["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|m| format!("<{}>", clean(m)))
+                .collect();
+            let line = if members.len() > 1 {
+                let shown = members.len().min(PROMPT_IDENTITY_MEMBERS);
+                let mut detail = members[..shown].join(", ");
+                if members.len() > shown {
+                    detail.push_str(&format!(", +{} more", members.len() - shown));
+                }
+                if id["membersComplete"] == false {
+                    detail.push_str(", truncated");
+                }
+                format!(
+                    "Identity: <{}> resolvesTo <{}> (cluster: {detail})",
+                    clean(entity),
+                    clean(rep),
+                )
+            } else {
+                format!("Identity: <{}> resolvesTo <{}>", clean(entity), clean(rep))
+            };
+            lines.push((None, line));
+        }
     }
     let mut out: Vec<(String, Vec<usize>)> = Vec::new();
     let mut cur = format!("R{n} {title}\n");
@@ -281,10 +323,29 @@ pub fn uncited_sentences(t: &str) -> Vec<String> {
 }
 
 impl Asking<'_, '_> {
-    /// The reports this ask may answer from, or `None` with a note when there are none
-    /// it may use.
-    pub(super) fn report_selection(&mut self) -> Option<Value> {
+    /// Arguments passed to `community_reports` for this ask.
+    fn report_query_args(&self) -> Value {
+        let mut args = json!({
+            "query": self.o.question,
+            "reviewedOnly": self.o.reviewed_only,
+            "limit": MAX_REPORTS,
+            "findings": true,
+        });
+        if let Some(p) = &self.o.review_policy {
+            args["reviewPolicy"] = p.clone().into();
+        }
+        if let Some(p) = &self.o.matching_policy {
+            args["matchingPolicy"] = p.clone().into();
+        }
+        args
+    }
+
+    /// The reports this ask may answer from, or `Ok(None)` with a note when there are
+    /// none it may use. Policy or evidence refusals propagate as `Err` so they are
+    /// reported directly rather than hidden by a fallback.
+    pub(super) fn report_selection(&mut self) -> Result<Option<Value>, ToolError> {
         let global = self.o.mode == AskMode::Global;
+        let has_policies = self.o.review_policy.is_some() || self.o.matching_policy.is_some();
         if self.o.at.is_some() || self.o.branch.is_some() {
             if global {
                 self.notes.push(
@@ -292,7 +353,7 @@ impl Asking<'_, '_> {
                         .into(),
                 );
             }
-            return None;
+            return Ok(None);
         }
         if self.pair(Role::Summarize).is_none() {
             if global {
@@ -301,27 +362,21 @@ impl Asking<'_, '_> {
                         .into(),
                 );
             }
-            return None;
+            return Ok(None);
         }
-        let v = match self.tool(
-            "community_reports",
-            json!({
-                "query": self.o.question,
-                "reviewedOnly": self.o.reviewed_only,
-                "limit": MAX_REPORTS,
-                "findings": true,
-            }),
-            true,
-        ) {
+        let v = match self.tool("community_reports", self.report_query_args(), true) {
             Ok(v) => v,
             Err(e) => {
+                if has_policies {
+                    return Err(e);
+                }
                 if global {
                     self.notes.push(format!(
                         "the community reports could not be read ({}), so the question is answered from the data",
                         e.message
                     ));
                 }
-                return None;
+                return Ok(None);
             }
         };
         if v["available"] != true {
@@ -340,7 +395,7 @@ impl Asking<'_, '_> {
                         .unwrap_or("no community report can be used")
                 ));
             }
-            return None;
+            return Ok(None);
         }
         let n = v["reports"].as_array().map_or(0, Vec::len);
         if n == 0 {
@@ -350,7 +405,7 @@ impl Asking<'_, '_> {
                         .into(),
                 );
             }
-            return None;
+            return Ok(None);
         }
         let stale = v["stale"].as_u64().unwrap_or(0) as f64;
         if stale / n as f64 > MAX_STALE {
@@ -358,25 +413,61 @@ impl Asking<'_, '_> {
                 "more than {}% of the community reports are stale, so the question is answered from the data",
                 (MAX_STALE * 100.0) as u32
             ));
-            return None;
+            return Ok(None);
         }
-        Some(v)
+        Ok(Some(v))
+    }
+
+    /// Re-read the selected reports under the caller's current authority before
+    /// publishing a policy-bound global answer (C25).
+    fn verify_global_evidence(&self, sel: &Value) -> bool {
+        if !self.authority_current() {
+            return false;
+        }
+        let Ok(again) = self.tool("community_reports", self.report_query_args(), true) else {
+            return false;
+        };
+        again["available"] == true
+            && again["reports"] == sel["reports"]
+            && again.get("reviewPolicy") == sel.get("reviewPolicy")
+            && again.get("resolution") == sel.get("resolution")
+            && self.authority_current()
     }
 
     /// Steps 2 to 4 of §7.2 over the selected reports.
     pub(super) fn global(&mut self, sel: Value) -> Value {
+        let fenced = self.o.review_policy.is_some() || self.o.matching_policy.is_some();
+        if fenced && !self.authority_current() {
+            self.withheld = true;
+            return json!({});
+        }
         let reports: Vec<Value> = sel["reports"].as_array().cloned().unwrap_or_default();
-        self.emit(
-            "reports",
-            &json!({
-                "level": sel["level"],
-                "ranking": sel["ranking"],
-                "reports": reports.iter().map(|r| json!({
+        let mut reports_event = json!({
+            "level": sel["level"],
+            "ranking": sel["ranking"],
+            "reports": reports.iter().map(|r| {
+                let mut item = json!({
                     "iri": r["iri"], "title": r["title"], "level": r["level"],
                     "status": r["status"], "rating": r["rating"],
-                })).collect::<Vec<_>>(),
-            }),
-        );
+                });
+                if let Some(p) = r.get("reviewPolicy") {
+                    item["reviewPolicy"] = p.clone();
+                }
+                item
+            }).collect::<Vec<_>>(),
+        });
+        if let Some(p) = sel.get("reviewPolicy") {
+            reports_event["reviewPolicy"] = p.clone();
+        }
+        if let Some(res) = sel.get("resolution") {
+            reports_event["resolution"] = json!({
+                "policy": res["policy"],
+                "version": res["version"],
+                "revision": res["revision"],
+                "number": res["number"],
+            });
+        }
+        self.emit("reports", &reports_event);
         let Some(pair) = self.pair(Role::Summarize) else {
             return self.error(
                 "no-model",
@@ -471,6 +562,8 @@ impl Asking<'_, '_> {
             };
             let deadline = self.deadline;
             let models = self.models;
+            let state = &self.server.state;
+            let principal = self.principal;
             let results: Vec<_> = std::thread::scope(|s| {
                 let hs: Vec<_> = chunk
                     .iter()
@@ -479,15 +572,18 @@ impl Asking<'_, '_> {
                         let pair = pair.clone();
                         let schema = &schema;
                         s.spawn(move || {
+                            let fence = super::AuthorityFence { state, principal };
+                            let admission: Option<&dyn crate::models::admission::Admission> =
+                                if fenced { Some(&fence) } else { None };
                             (
                                 gi,
-                                models.call(
+                                models.call_prompt(
                                     Some(Role::Summarize),
                                     &pair,
-                                    MAP_SYSTEM,
-                                    &user,
+                                    &Prompt::plain(MAP_SYSTEM, &user),
                                     schema,
                                     deadline,
+                                    admission,
                                 ),
                             )
                         })
@@ -500,6 +596,7 @@ impl Asking<'_, '_> {
             // every answer of the chunk is recorded before a terminal error returns, so
             // its tokens are charged (round 2, finding 3)
             let mut terminal: Option<(&'static str, String)> = None;
+            let mut authority_changed = false;
             for (gi, r) in results {
                 match r {
                     Ok(a) => {
@@ -513,6 +610,12 @@ impl Asking<'_, '_> {
                                 terminal.get_or_insert(("budget-exceeded", f.error.message()));
                                 continue;
                             }
+                            crate::models::StepError::Call(
+                                crate::models::CallError::Admission(super::AUTHORITY_CHANGED, ..),
+                            ) => {
+                                authority_changed = true;
+                                continue;
+                            }
                             crate::models::StepError::Deadline => {
                                 terminal.get_or_insert(("timeout", f.error.message()));
                                 continue;
@@ -524,6 +627,10 @@ impl Asking<'_, '_> {
                         failed.push(gi);
                     }
                 }
+            }
+            if authority_changed {
+                self.withheld = true;
+                return json!({});
             }
             if let Some((code, message)) = terminal {
                 return self.error(code, message);
@@ -548,13 +655,21 @@ impl Asking<'_, '_> {
                     format!("the ask used its {} tokens", self.o.max_tokens),
                 );
             }
-            match self.call(
+            self.fenced = fenced;
+            let called = self.call(
                 Role::Summarize,
                 &Prompt::plain(MAP_SYSTEM, &prompt(&groups[gi])),
                 &schema,
-            ) {
+            );
+            self.fenced = false;
+            match called {
                 Ok((v, _, _)) => answers[gi] = Some(v),
-                Err((code, message)) => return self.error(code, message),
+                Err((code, message)) => {
+                    if self.withheld {
+                        return json!({});
+                    }
+                    return self.error(code, message);
+                }
             }
         }
         for (gi, a) in answers.iter().enumerate() {
@@ -588,6 +703,7 @@ impl Asking<'_, '_> {
                 format!("a global answer makes at most {limit} model answers"),
             );
         }
+        let has_resolution = sel.get("resolution").is_some();
         let reports_out = |kept: &[Point]| -> Vec<Value> {
             // the reports used, with the findings the points use
             let mut used: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -606,20 +722,57 @@ impl Asking<'_, '_> {
                 .map(|(r, mut fs)| {
                     fs.sort_unstable();
                     let rep = &reports[r];
+                    let kept_findings: Vec<Value> = fs
+                        .iter()
+                        .filter_map(|f| rep["findings"].get(*f).cloned())
+                        .collect();
                     let mut v = json!({
                         "iri": rep["iri"],
                         "title": rep["title"],
                         "level": rep["level"],
                         "status": rep["status"],
                         "rating": rep["rating"],
-                        "findings": fs.iter().filter_map(|f| rep["findings"].get(*f).cloned()).collect::<Vec<_>>(),
+                        "findings": kept_findings,
                     });
                     if let Some(p) = rep.get("reviewPolicy") {
                         v["reviewPolicy"] = p.clone();
                     }
+                    if has_resolution {
+                        let referenced = referenced_entities(&v["findings"]);
+                        let ids: Vec<Value> = rep["identities"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|id| {
+                                id["entity"]
+                                    .as_str()
+                                    .is_some_and(|e| referenced.contains(e))
+                            })
+                            .cloned()
+                            .collect();
+                        v["identities"] = Value::Array(ids);
+                    }
                     v
                 })
                 .collect()
+        };
+        let resolution_out = |out_reports: &[Value]| -> Option<Value> {
+            let res = sel.get("resolution")?;
+            let mut by_entity: BTreeMap<String, Value> = BTreeMap::new();
+            for rep in out_reports {
+                for id in rep["identities"].as_array().into_iter().flatten() {
+                    if let Some(e) = id["entity"].as_str() {
+                        by_entity.entry(e.to_string()).or_insert_with(|| id.clone());
+                    }
+                }
+            }
+            Some(json!({
+                "policy": res["policy"],
+                "version": res["version"],
+                "revision": res["revision"],
+                "number": res["number"],
+                "entities": by_entity.into_values().collect::<Vec<_>>(),
+            }))
         };
         let point_json = |n: usize, p: &Point| {
             json!({
@@ -630,14 +783,21 @@ impl Asking<'_, '_> {
                 "findings": p.findings.iter().filter_map(|(r, f)| reports[*r]["findings"].get(*f).map(|x| x["iri"].clone())).collect::<Vec<_>>(),
             })
         };
-        let global = json!({
+        let mut global = json!({
             "level": sel["level"],
             "ranking": sel["ranking"],
             "reportsGraph": sel["reportsGraph"],
             "selected": reports.len(),
             "batches": groups.len(),
         });
+        if let Some(p) = sel.get("reviewPolicy") {
+            global["reviewPolicy"] = p.clone();
+        }
         if kept.is_empty() {
+            if fenced && !self.verify_global_evidence(&sel) {
+                self.withheld = true;
+                return json!({});
+            }
             let s = json!({
                 "text": "The community reports do not cover this question.",
                 "citations": [],
@@ -645,12 +805,8 @@ impl Asking<'_, '_> {
             });
             self.notes
                 .push("no community report bears on the question".into());
-            self.emit(
-                "global",
-                &json!({ "points": [], "reports": [], "global": global.clone() }),
-            );
-            self.emit("summary", &s);
-            return json!({
+            let mut ev = json!({ "points": [], "reports": [], "global": global.clone() });
+            let mut out = json!({
                 "outcome": "answered",
                 "mode": "global",
                 "summary": s,
@@ -658,6 +814,13 @@ impl Asking<'_, '_> {
                 "reports": [],
                 "global": global,
             });
+            if let Some(res) = resolution_out(&[]) {
+                ev["resolution"] = res.clone();
+                out["resolution"] = res;
+            }
+            self.emit("global", &ev);
+            self.emit("summary", &s);
+            return out;
         }
         let mut lines = String::new();
         for (i, p) in kept.iter().enumerate() {
@@ -668,14 +831,26 @@ impl Asking<'_, '_> {
             prompts::data_block(&question),
             prompts::data_block(&lines)
         );
-        let (value, pair) = match self.call(
+        self.fenced = fenced;
+        let called = self.call(
             Role::Summarize,
             &Prompt::plain(REDUCE_SYSTEM, &user),
             &reduce_schema(),
-        ) {
+        );
+        self.fenced = false;
+        let (value, pair) = match called {
             Ok((v, _, p)) => (v, p),
-            Err((code, message)) => return self.error(code, message),
+            Err((code, message)) => {
+                if self.withheld {
+                    return json!({});
+                }
+                return self.error(code, message);
+            }
         };
+        if fenced && !self.verify_global_evidence(&sel) {
+            self.withheld = true;
+            return json!({});
+        }
         self.answered_by = Some((Role::Summarize, pair.clone()));
         // §7.2 step 4: every citation resolves through a point
         let n = kept.len() as u64;
@@ -707,23 +882,57 @@ impl Asking<'_, '_> {
         } else if !uncited.is_empty() {
             s["uncitedSentences"] = json!(uncited);
         }
-        let answer = json!({
+        let out_reports = reports_out(if cited.is_empty() { &kept } else { &cited });
+        let out_resolution = resolution_out(&out_reports);
+        let mut answer = json!({
             "points": kept.iter().enumerate().map(|(i, p)| point_json(i, p)).collect::<Vec<_>>(),
-            "reports": reports_out(if cited.is_empty() { &kept } else { &cited }),
+            "reports": out_reports,
             "global": global,
         });
+        if let Some(res) = &out_resolution {
+            answer["resolution"] = res.clone();
+        }
         // the points and reports first, so that a client can link the summary's markers
         self.emit("global", &answer);
         self.emit("summary", &s);
-        json!({
+        let mut out = json!({
             "outcome": "answered",
             "mode": "global",
             "summary": s,
             "points": answer["points"],
             "reports": answer["reports"],
             "global": answer["global"],
-        })
+        });
+        if let Some(res) = out_resolution {
+            out["resolution"] = res;
+        }
+        out
     }
+}
+
+/// The distinct entity IRIs referenced by JSON findings' `about` and `cites` lists.
+fn referenced_entities(findings: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for f in findings.as_array().into_iter().flatten() {
+        let about: Vec<String> = f["about"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        let cites: Vec<String> = f["cites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        for n in crate::graphrag::read::finding_entity_iris(&about, &cites) {
+            out.insert(n.as_str().to_string());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -848,5 +1057,51 @@ mod tests {
             vec!["Nobody knows why.".to_string()]
         );
         assert!(uncited_sentences("All cited [1].").is_empty());
+    }
+
+    #[test]
+    fn report_blocks_includes_identity_lines_and_keeps_finding_labels() {
+        let members: Vec<String> = (0..10).map(|i| format!("http://ex/m{i}")).collect();
+        let r = json!({
+            "title": "Payments",
+            "summary": "Summary text",
+            "findings": [
+                { "text": "Alice owns ledger" },
+                { "text": "Bob reviews PRs" },
+            ],
+            "identities": [{
+                "entity": "http://ex/m1",
+                "representative": "http://ex/m0",
+                "members": members,
+                "membersComplete": false,
+            }],
+        });
+        let parts = report_blocks(2, &r, 500);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].1, vec![0, 1]);
+        let text = &parts[0].0;
+        assert!(text.contains("F2.1 Alice owns ledger"), "{text}");
+        assert!(text.contains("F2.2 Bob reviews PRs"), "{text}");
+        assert!(
+            text.contains("Identity: <http://ex/m1> resolvesTo <http://ex/m0>"),
+            "{text}"
+        );
+        assert!(text.contains("+2 more, truncated"), "{text}");
+    }
+
+    #[test]
+    fn referenced_entities_collects_about_and_cited_triple_terms() {
+        let findings = json!([
+            {
+                "about": ["http://ex/a"],
+                "cites": [
+                    "<<( <http://ex/a> <http://ex/knows> <http://ex/b> )>>",
+                    "<urn:uuid:11111111-1111-4111-8111-111111111111>",
+                    "<urn:x-sparkles:graphrag:r1#f1>"
+                ]
+            }
+        ]);
+        let got: Vec<String> = referenced_entities(&findings).into_iter().collect();
+        assert_eq!(got, vec!["http://ex/a", "http://ex/b"]);
     }
 }

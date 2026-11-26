@@ -285,26 +285,22 @@ async fn the_summary_reads_and_cites_claims() {
     assert!(plain.get("claims").is_none() && plain["summary"].get("claimCitations").is_none());
 }
 
-/// An unknown policy and the global mode are refused before any model call.
+/// An unknown or wrong-kind policy is refused before any model call, in both local and
+/// global modes.
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_policies_cost_no_model_call() {
     let m = mock(Arc::new(OnceLock::new()));
     let (_, app) = app(&m.url()).await;
-    let out = ask_with(
-        &app,
+    for body in [
         json!({ "question": "Which teams does Acme have?", "reviewPolicy": "nothing" }),
-        StatusCode::BAD_REQUEST,
-    )
-    .await;
-    assert_eq!(out["outcome"], "error", "{out}");
-    assert_eq!(out["error"]["code"], "bad-argument");
-    let out = ask_with(
-        &app,
-        json!({ "question": "Which teams does Acme have?", "reviewPolicy": "main", "mode": "global" }),
-        StatusCode::BAD_REQUEST,
-    )
-    .await;
-    assert_eq!(out["error"]["code"], "bad-argument", "{out}");
+        json!({ "question": "Which teams does Acme have?", "reviewPolicy": "nothing", "mode": "global" }),
+        json!({ "question": "Which teams does Acme have?", "matchingPolicy": "nothing", "mode": "global" }),
+        json!({ "question": "Which teams does Acme have?", "matchingPolicy": "main", "mode": "global" }),
+    ] {
+        let out = ask_with(&app, body, StatusCode::BAD_REQUEST).await;
+        assert_eq!(out["outcome"], "error", "{out}");
+        assert_eq!(out["error"]["code"], "bad-argument", "{out}");
+    }
     assert!(m.requests().is_empty());
 }
 
@@ -462,4 +458,443 @@ fn evidence_refusals_keep_their_status() {
     assert_eq!(status("configuration-history-inactive"), S::CONFLICT);
     assert_eq!(status("forbidden"), S::FORBIDDEN);
     assert_eq!(status("something-else"), S::INTERNAL_SERVER_ERROR);
+}
+
+/// Global Ask with `reviewPolicy` and `matchingPolicy` (spec C25, item 811):
+/// - `reviewPolicy` selects only reports built under that policy, excluding reports built
+///   under another policy or no policy;
+/// - requesting a policy with no reports excludes other policies' reports and falls back;
+/// - `matchingPolicy` resolves identities referenced by the reports (and handles an empty
+///   map revision cleanly);
+/// - changing the matching map mid-flight withholds the global answer (`403 forbidden`).
+#[tokio::test(flavor = "multi_thread")]
+async fn global_answer_filters_by_review_policy_and_resolves_report_identities() {
+    use sparkles::evidence::{IdentityInput, IdentityRelation, MatchingPolicy, MethodRef};
+
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+    const IDENTITIES: &str = "urn:ev:identities";
+    const MAPS: &str = "urn:ev:maps";
+    const MAP: &str = "urn:ev:map";
+    const EMPTY_MAPS: &str = "urn:ev:empty-maps";
+    const EMPTY_MAP: &str = "urn:ev:empty-map";
+    const OTHER_DEC: &str = "urn:ev:other-decisions";
+    const OTHER_SUP: &str = "urn:ev:other-supports";
+    const OTHER_OUT: &str = "urn:ev:other-accepted";
+    const UNUSED_DEC: &str = "urn:ev:unused-decisions";
+    const UNUSED_SUP: &str = "urn:ev:unused-supports";
+    const UNUSED_OUT: &str = "urn:ev:unused-accepted";
+
+    let hook: Arc<Hook> = Arc::new(OnceLock::new());
+    let hook_c = hook.clone();
+    let m = MockModel::start(move |r, _| {
+        let body = r.body.to_string();
+        if body.contains("\"Points\"") || body.contains("pick out what bears") {
+            return (
+                200,
+                mock::openai(
+                    &json!({
+                        "points": [{
+                            "text": "Acme payments community under main policy.",
+                            "score": 90,
+                            "reports": ["R1"],
+                            "findings": ["F1.1"]
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if body.contains("\"GlobalAnswer\"") || body.contains("Points from the community reports") {
+            if let Some(h) = hook_c.get() {
+                h();
+            }
+            return (
+                200,
+                mock::openai(
+                    &json!({
+                        "text": "The main policy reports describe Acme payments [1].",
+                        "citations": [1]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if is_summary(r) {
+            return (
+                200,
+                mock::openai(
+                    &json!({ "text": "Fallback local answer [1].", "citations": [1] }).to_string(),
+                ),
+            );
+        }
+        (200, mock::openai(&draft(EASY)))
+    });
+
+    let (st, app) = app(&m.url()).await;
+    let ds = dataset(&st);
+
+    // Configure three review policies ("main", "other", "unused") and two matching
+    // policies ("people" with a merged cluster, "empty" with no map revision).
+    let mut cfg = settings();
+    cfg.decisions.extend([OTHER_DEC.into(), UNUSED_DEC.into()]);
+    cfg.supports.extend([OTHER_SUP.into(), UNUSED_SUP.into()]);
+    cfg.projections.extend([
+        OTHER_OUT.into(),
+        UNUSED_OUT.into(),
+        MAP.into(),
+        EMPTY_MAP.into(),
+    ]);
+    cfg.identity
+        .extend([IDENTITIES.into(), MAPS.into(), EMPTY_MAPS.into()]);
+    cfg.policies.insert(
+        "other".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: vec![],
+            conflicts: ConflictMode::AdmitLabelled,
+            boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+            decisions: OTHER_DEC.into(),
+            supports: OTHER_SUP.into(),
+            output: OTHER_OUT.into(),
+        },
+    );
+    cfg.policies.insert(
+        "unused".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported],
+            required_scope: vec![],
+            conflicts: ConflictMode::AdmitLabelled,
+            boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+            decisions: UNUSED_DEC.into(),
+            supports: UNUSED_SUP.into(),
+            output: UNUSED_OUT.into(),
+        },
+    );
+    cfg.matching_policies.insert(
+        "people".into(),
+        MatchingPolicy {
+            version: 1,
+            boundary: vec![IDENTITIES.into()],
+            decisions: "urn:ev:decisions".into(),
+            maps: MAPS.into(),
+            output: MAP.into(),
+        },
+    );
+    cfg.matching_policies.insert(
+        "empty".into(),
+        MatchingPolicy {
+            version: 1,
+            boundary: vec![IDENTITIES.into()],
+            decisions: "urn:ev:decisions".into(),
+            maps: EMPTY_MAPS.into(),
+            output: EMPTY_MAP.into(),
+        },
+    );
+    evidence::configure(&ds, &cfg, &Control::none()).unwrap();
+
+    // Propose and accept a PossibleMatch merging alice_dup into alice under "people".
+    let mut po = ProposeOptions::new(iri("urn:principal:matcher"));
+    po.identity_graph = Some(iri(IDENTITIES));
+    let id_prop = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &EvidenceInput {
+            identities: vec![IdentityInput {
+                version: RecordVersion::V1,
+                key: RecordKey::new("m1").unwrap(),
+                occurrence_key: RecordKey::new("occ-m1").unwrap(),
+                entities: vec![
+                    iri("http://example.org/resource/alice"),
+                    iri("http://example.org/resource/alice_dup"),
+                ],
+                relation: IdentityRelation::PossibleMatch,
+                preferred: Some(iri("http://example.org/resource/alice")),
+                attributed_author: iri("urn:matcher"),
+                method: Some(MethodRef {
+                    method: iri("urn:method"),
+                    version: RecordKey::new("1").unwrap(),
+                }),
+            }],
+            ..Default::default()
+        },
+        &po,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let match_rec = &id_prop.records[0];
+    let mut ro = ReviewOptions::new(iri("urn:principal:reviewer"));
+    ro.if_head = Some(ds.store().head_commit().seq);
+    let rev = evidence::review(
+        None,
+        &ds,
+        &ds,
+        "people",
+        1,
+        &[DecisionInput {
+            key: "dm1".into(),
+            target: match_rec.iri.clone(),
+            target_digest: match_rec.digest,
+            disposition: Disposition::Accepted,
+            supersedes: None,
+        }],
+        &ro,
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let first_decision = rev.decisions[0].iri.clone();
+
+    // Populate mixed community reports in the reports graph:
+    // - r-main: built under reviewPolicy "main" (references alice_dup)
+    // - r-other: built under reviewPolicy "other" (secret marker OTHER_ONLY_TEXT)
+    // - r-plain: built with no reviewPolicy (secret marker PLAIN_ONLY_TEXT)
+    let gr = crate::graphrag::guard::gr;
+    let main_policy_iri = sparkles::evidence::review::policy_iri("main");
+    let other_policy_iri = sparkles::evidence::review::policy_iri("other");
+    let trig = format!(
+        r#"
+<{REPORTS}> {{
+  <urn:c:main> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:main> .
+  <urn:r:main> a <{report_cls}> ;
+    <http://www.w3.org/2000/01/rdf-schema#label> "Main Policy Community" ;
+    <{summary}> "Summary under main policy." ;
+    <{status}> "reviewed" ;
+    <{rating}> 8 ;
+    <{rp}> <{main_iri}> ;
+    <{pv}> 1 ;
+    <{ec}> "lin/cfg" ;
+    <{finding}> <urn:r:main#f1> .
+  <urn:r:main#f1> <{order}> 1 ;
+    <{text}> "MAIN_POLICY_FINDING for alice_dup." ;
+    <{about}> <http://example.org/resource/alice_dup> ;
+    <{cites}> <<( <http://example.org/resource/alice_dup> <http://example.org/ontology#leads> <http://example.org/resource/payments> )>> ;
+    <{cc}> <urn:claim:main-1> ;
+    <{cd}> <urn:decision:main-1> .
+
+  <urn:c:other> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:other> .
+  <urn:r:other> a <{report_cls}> ;
+    <http://www.w3.org/2000/01/rdf-schema#label> "Other Policy Community" ;
+    <{summary}> "OTHER_ONLY_TEXT summary." ;
+    <{status}> "reviewed" ;
+    <{rating}> 10 ;
+    <{rp}> <{other_iri}> ;
+    <{pv}> 1 ;
+    <{ec}> "lin/cfg" ;
+    <{finding}> <urn:r:other#f1> .
+  <urn:r:other#f1> <{order}> 1 ;
+    <{text}> "OTHER_ONLY_TEXT finding." ;
+    <{about}> <http://example.org/resource/bob> ;
+    <{cites}> <<( <http://example.org/resource/bob> <http://example.org/ontology#leads> <http://example.org/resource/ops> )>> .
+
+  <urn:c:plain> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{report}> <urn:r:plain> .
+  <urn:r:plain> a <{report_cls}> ;
+    <http://www.w3.org/2000/01/rdf-schema#label> "Unpolicied Community" ;
+    <{summary}> "PLAIN_ONLY_TEXT summary." ;
+    <{status}> "reviewed" ;
+    <{rating}> 9 ;
+    <{finding}> <urn:r:plain#f1> .
+  <urn:r:plain#f1> <{order}> 1 ;
+    <{text}> "PLAIN_ONLY_TEXT finding." ;
+    <{about}> <http://example.org/resource/carol> ;
+    <{cites}> <<( <http://example.org/resource/carol> <http://example.org/ontology#leads> <http://example.org/resource/sec> )>> .
+}}
+"#,
+        community = gr("Community"),
+        level = gr("level"),
+        count = gr("memberCount"),
+        report = gr("report"),
+        report_cls = gr("Report"),
+        summary = gr("summary"),
+        status = gr("status"),
+        rating = gr("rating"),
+        rp = gr("reviewPolicy"),
+        pv = gr("policyVersion"),
+        ec = gr("evidenceConfiguration"),
+        finding = gr("finding"),
+        order = gr("order"),
+        text = gr("text"),
+        about = gr("about"),
+        cites = gr("cites"),
+        cc = gr("citesClaim"),
+        cd = gr("citesDecision"),
+        main_iri = main_policy_iri.as_str(),
+        other_iri = other_policy_iri.as_str(),
+    );
+    ds.store()
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    // Enable GraphRAG on `org`.
+    let state_ds = st.get("org").unwrap();
+    crate::settings::store_runtime(
+        &st,
+        &state_ds,
+        &crate::settings::GRAPHRAG,
+        &json!({ "enabled": true, "principal": "local", "projection": { "graphs": ["urn:g:org"] } }),
+    )
+    .unwrap();
+
+    // 1) Global answer with reviewPolicy="main" AND matchingPolicy="people":
+    //    - selects ONLY urn:r:main (excludes urn:r:other and urn:r:plain)
+    //    - resolves alice_dup -> alice and passes the identity link to the map prompt
+    let before = m.requests().len();
+    let out = ask(
+        &app,
+        json!({
+            "question": "What are the main themes across the organisation?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        }),
+    )
+    .await;
+    assert_eq!(out["outcome"], "answered", "{out}");
+    assert_eq!(out["mode"], "global", "{out}");
+    assert_eq!(out["global"]["selected"], 1, "{out}");
+    assert_eq!(out["global"]["reviewPolicy"]["name"], "main", "{out}");
+    assert_eq!(out["global"]["reviewPolicy"]["version"], 1, "{out}");
+    let reps = out["reports"].as_array().unwrap();
+    assert_eq!(reps.len(), 1, "{out}");
+    assert_eq!(reps[0]["iri"], "urn:r:main", "{out}");
+    assert_eq!(reps[0]["reviewPolicy"]["iri"], main_policy_iri.as_str());
+    assert_eq!(
+        reps[0]["findings"][0]["about"],
+        json!(["http://example.org/resource/alice_dup"])
+    );
+    assert_eq!(
+        reps[0]["identities"],
+        json!([{
+            "entity": "http://example.org/resource/alice_dup",
+            "representative": "http://example.org/resource/alice",
+            "members": [
+                "http://example.org/resource/alice",
+                "http://example.org/resource/alice_dup"
+            ],
+            "membersComplete": true,
+        }]),
+        "{out}"
+    );
+    assert_eq!(out["resolution"]["policy"], "people", "{out}");
+    assert_eq!(out["resolution"]["version"], 1, "{out}");
+    assert_eq!(out["resolution"]["number"], 1, "{out}");
+    assert!(out["resolution"]["revision"].is_string(), "{out}");
+    assert_eq!(
+        out["resolution"]["entities"], reps[0]["identities"],
+        "{out}"
+    );
+    // No other-policy or unpolicied report reached any LLM request, and the map prompt saw
+    // the resolved identity link without rewriting source IRIs.
+    let sent = &m.requests()[before..];
+    assert_eq!(sent.len(), 2, "map + reduce only: {}", sent.len());
+    let map_body = sent[0].body.to_string();
+    assert!(map_body.contains("MAIN_POLICY_FINDING"), "{map_body}");
+    assert!(!map_body.contains("OTHER_ONLY_TEXT"), "{map_body}");
+    assert!(!map_body.contains("PLAIN_ONLY_TEXT"), "{map_body}");
+    assert!(
+        map_body.contains("resolvesTo <http://example.org/resource/alice>"),
+        "{map_body}"
+    );
+
+    // 2) Global answer with an empty matching policy map reports revision: null, number: 0.
+    let empty_map_out = ask(
+        &app,
+        json!({
+            "question": "What are the main themes across the organisation?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "empty",
+        }),
+    )
+    .await;
+    assert_eq!(empty_map_out["outcome"], "answered", "{empty_map_out}");
+    assert_eq!(empty_map_out["mode"], "global", "{empty_map_out}");
+    assert_eq!(empty_map_out["resolution"]["policy"], "empty");
+    assert_eq!(empty_map_out["resolution"]["revision"], Value::Null);
+    assert_eq!(empty_map_out["resolution"]["number"], 0);
+    assert_eq!(empty_map_out["resolution"]["entities"], json!([]));
+    assert_eq!(empty_map_out["reports"][0]["identities"], json!([]));
+
+    // 3) Requesting reviewPolicy="unused" (no reports built under it) excludes main/other/plain
+    //    reports and falls back to answering from the data with a note explaining why.
+    let before = m.requests().len();
+    let unused_out = ask(
+        &app,
+        json!({
+            "question": "Which teams does Acme have?",
+            "mode": "global",
+            "reviewPolicy": "unused",
+        }),
+    )
+    .await;
+    assert_eq!(unused_out["outcome"], "answered", "{unused_out}");
+    assert_eq!(unused_out["mode"], "local", "{unused_out}");
+    assert!(unused_out.get("reports").is_none(), "{unused_out}");
+    let notes = unused_out["notes"].to_string();
+    assert!(
+        notes.contains("no community report exists under reviewPolicy \\\"unused\\\""),
+        "{notes}"
+    );
+    for req in &m.requests()[before..] {
+        let s = req.body.to_string();
+        assert!(
+            !s.contains("MAIN_POLICY_FINDING")
+                && !s.contains("OTHER_ONLY_TEXT")
+                && !s.contains("PLAIN_ONLY_TEXT"),
+            "{s}"
+        );
+    }
+
+    // 4) Splitting the identity match while the reduce call runs withholds the global answer
+    //    with 403 forbidden.
+    let ds_hook = ds.clone();
+    let match_iri = match_rec.iri.clone();
+    let match_digest = match_rec.digest;
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let _ = hook.set(Box::new(move || {
+        if !done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let mut ro = ReviewOptions::new(iri("urn:principal:reviewer"));
+            ro.if_head = Some(ds_hook.store().head_commit().seq);
+            evidence::review(
+                None,
+                &ds_hook,
+                &ds_hook,
+                "people",
+                1,
+                &[DecisionInput {
+                    key: "dm2".into(),
+                    target: match_iri.clone(),
+                    target_digest: match_digest,
+                    disposition: Disposition::Rejected,
+                    supersedes: Some(first_decision.clone()),
+                }],
+                &ro,
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+            .unwrap();
+        }
+    }));
+    let withheld = ask_with(
+        &app,
+        json!({
+            "question": "What are the main themes across the organisation?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        }),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    assert_eq!(withheld["outcome"], "error", "{withheld}");
+    assert_eq!(withheld["error"]["code"], "forbidden", "{withheld}");
+    assert!(
+        withheld.get("summary").is_none()
+            && withheld.get("reports").is_none()
+            && withheld.get("resolution").is_none(),
+        "{withheld}"
+    );
 }
