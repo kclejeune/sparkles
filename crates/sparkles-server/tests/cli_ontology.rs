@@ -1059,3 +1059,242 @@ fn dl663_cli_materialize_defaults_to_elk() {
     assert_eq!(default, explicit);
     println!("dl663 ok: CLI omitted materialize reasoner is ELK");
 }
+
+const WRITER_ONTO: &str = r#"Prefix(:=<http://ex.org/>)
+Prefix(obo:=<http://purl.obolibrary.org/obo/>)
+Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)
+Ontology(<http://purl.obolibrary.org/obo/demo.owl>
+Declaration(Class(obo:GO_0000001))
+Declaration(Class(obo:GO_0000002))
+Declaration(Class(obo:GO_0000003))
+Declaration(Class(obo:GO_0000004))
+Declaration(ObjectProperty(obo:BFO_0000050))
+AnnotationAssertion(rdfs:label obo:GO_0000001 "cerebellar neuron")
+AnnotationAssertion(rdfs:label obo:GO_0000002 "hindbrain neuron")
+AnnotationAssertion(rdfs:label obo:GO_0000003 "neuron")
+AnnotationAssertion(rdfs:label obo:GO_0000004 "cerebellum")
+EquivalentClasses(obo:GO_0000001 ObjectIntersectionOf(obo:GO_0000003 ObjectSomeValuesFrom(obo:BFO_0000050 obo:GO_0000004)))
+SubClassOf(obo:GO_0000004 obo:GO_0000002)
+SubClassOf(obo:GO_0000001 obo:GO_0000003)
+TransitiveObjectProperty(obo:BFO_0000050)
+)
+"#;
+
+#[test]
+fn ontology_writers_owx_omn_obo_and_obographs_cli() {
+    use sparkles::owl::{
+        Annotation, AnnotationProperty, AnnotationValue, Axiom, Class, ClassExpression, Literal,
+        ObjectProperty,
+    };
+    use std::collections::BTreeSet;
+    use std::io::Read as _;
+
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("demo.ofn"), WRITER_ONTO).unwrap();
+
+    // Write all four new formats (plus .gz) in a single reason/relax/reduce chain
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "--input",
+            "demo.ofn",
+            "-a",
+            "true",
+            "-o",
+            "reasoned.ofn",
+            "-o",
+            "reasoned.owx",
+            "-o",
+            "reasoned.omn",
+            "-o",
+            "reasoned.obo",
+            "-o",
+            "reasoned.json",
+            "-o",
+            "reasoned.owx.gz",
+            "-o",
+            "reasoned.obo.gz",
+            "-o",
+            "reasoned.json.gz",
+            "relax",
+            "-o",
+            "relaxed.owx",
+            "reduce",
+            "-o",
+            "reduced.omn",
+            "-o",
+            "reduced.obo",
+            "-o",
+            "reduced.json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+
+    // Reference axioms from .ofn
+    let ofn_doc =
+        sparkles::owl::ofn_read::parse(&std::fs::read_to_string(dir.join("reasoned.ofn")).unwrap())
+            .unwrap();
+    let ofn_set: BTreeSet<Axiom> = ofn_doc.axioms.into_iter().collect();
+
+    // OWL/XML round-trips identically to .ofn
+    let owx_text = std::fs::read_to_string(dir.join("reasoned.owx")).unwrap();
+    let owx_doc = sparkles::owl::owx::parse(&owx_text).unwrap();
+    assert_eq!(owx_doc.header, ofn_doc.header);
+    assert_eq!(owx_doc.axioms.into_iter().collect::<BTreeSet<_>>(), ofn_set);
+
+    // Gzipped OWL/XML matches plain OWL/XML byte-for-byte
+    let mut gz_buf = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(dir.join("reasoned.owx.gz")).unwrap())
+        .read_to_string(&mut gz_buf)
+        .unwrap();
+    assert_eq!(gz_buf, owx_text);
+
+    // Manchester round-trips identically to .ofn
+    let omn_text = std::fs::read_to_string(dir.join("reasoned.omn")).unwrap();
+    let omn_doc = sparkles::owl::manchester::parse_document(&omn_text).unwrap();
+    assert_eq!(omn_doc.header, ofn_doc.header);
+    assert_eq!(omn_doc.axioms.into_iter().collect::<BTreeSet<_>>(), ofn_set);
+
+    // OBO 1.4 contains OBO PURL IDs, trailing is_inferred qualifier, and parses back with expected axioms
+    let obo_text = std::fs::read_to_string(dir.join("reasoned.obo")).unwrap();
+    assert!(obo_text.contains("format-version: 1.4\n"), "{obo_text}");
+    assert!(obo_text.contains("id: GO:0000001\n"), "{obo_text}");
+    assert!(obo_text.contains("id: BFO:0000050\n"), "{obo_text}");
+    assert!(
+        obo_text.contains("is_a: GO:0000003 {is_inferred=\"true\"}\n"),
+        "{obo_text}"
+    );
+    let obo_doc = sparkles::owl::obo::parse(&obo_text).unwrap();
+    let go1 = Class::new("http://purl.obolibrary.org/obo/GO_0000001");
+    let go3 = Class::new("http://purl.obolibrary.org/obo/GO_0000003");
+    let go4 = Class::new("http://purl.obolibrary.org/obo/GO_0000004");
+    let bfo50 = ObjectProperty::new("http://purl.obolibrary.org/obo/BFO_0000050");
+    let inferred_sub = Axiom::sub_class_of(go1.clone(), go3.clone()).annotated(Annotation::new(
+        AnnotationProperty::new(sparkles::owl::obo::OIO_IS_INFERRED),
+        AnnotationValue::Literal(Literal::simple("true")),
+    ));
+    assert!(obo_doc.axioms.contains(&inferred_sub));
+
+    // Gzipped OBO matches plain OBO
+    let mut obo_gz = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(dir.join("reasoned.obo.gz")).unwrap())
+        .read_to_string(&mut obo_gz)
+        .unwrap();
+    assert_eq!(obo_gz, obo_text);
+
+    // OBO Graphs JSON is valid JSON, reports skipped TransitiveObjectProperty warning, and
+    // preserves classes, edges and logical definitions
+    assert!(
+        err(&o).contains("reasoned.json") && err(&o).contains("omitted"),
+        "lossy OBO Graphs JSON write must warn on stderr: {}",
+        err(&o)
+    );
+    let json_text = std::fs::read_to_string(dir.join("reasoned.json")).unwrap();
+    let json_doc = sparkles::owl::obographs::parse(&json_text).unwrap();
+    assert!(json_doc.axioms.contains(&inferred_sub));
+    let mut json_gz = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(dir.join("reasoned.json.gz")).unwrap())
+        .read_to_string(&mut json_gz)
+        .unwrap();
+    assert_eq!(json_gz, json_text);
+
+    // Relax output in .owx and reduce output in .obo/.json carry the relaxed existential
+    let relaxed_owx =
+        sparkles::owl::owx::parse(&std::fs::read_to_string(dir.join("relaxed.owx")).unwrap())
+            .unwrap();
+    let ex_ax = Axiom::sub_class_of(
+        go1.clone(),
+        ClassExpression::some(bfo50.clone(), go4.clone()),
+    );
+    assert!(relaxed_owx.axioms.contains(&ex_ax));
+    let reduced_obo =
+        sparkles::owl::obo::parse(&std::fs::read_to_string(dir.join("reduced.obo")).unwrap())
+            .unwrap();
+    assert!(reduced_obo.axioms.contains(&ex_ax));
+    let reduced_json = sparkles::owl::obographs::parse(
+        &std::fs::read_to_string(dir.join("reduced.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(reduced_json.axioms.contains(&ex_ax));
+
+    // Materialize also writes all four formats
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "materialize",
+            "-i",
+            "demo.ofn",
+            "--term",
+            "BFO:0000050",
+            "-o",
+            "mat.owx",
+            "-o",
+            "mat.omn",
+            "-o",
+            "mat.obo",
+            "-o",
+            "mat.json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    for f in ["mat.owx", "mat.omn", "mat.obo", "mat.json"] {
+        assert!(dir.join(f).exists(), "{f}");
+    }
+    let mat_owx =
+        sparkles::owl::owx::parse(&std::fs::read_to_string(dir.join("mat.owx")).unwrap()).unwrap();
+    assert!(mat_owx.axioms.contains(&ex_ax));
+
+    // Explicit --format flags on `classify` and `axioms`
+    for fmt in ["owx", "omn", "obo", "obographs"] {
+        let o = sparkles(dir, &["ontology", "classify", "demo.ofn", "--format", fmt]);
+        assert_eq!(o.status.code(), Some(0), "{fmt}: {}", err(&o));
+        let body = out(&o);
+        match fmt {
+            "owx" => assert!(sparkles::owl::owx::parse(&body).is_ok(), "{body}"),
+            "omn" => assert!(
+                sparkles::owl::manchester::parse_document(&body).is_ok(),
+                "{body}"
+            ),
+            "obo" => assert!(sparkles::owl::obo::parse(&body).is_ok(), "{body}"),
+            "obographs" => assert!(sparkles::owl::obographs::parse(&body).is_ok(), "{body}"),
+            _ => unreachable!(),
+        }
+        // --partial refuses every document syntax format
+        let p = sparkles(
+            dir,
+            &[
+                "ontology",
+                "classify",
+                "demo.ofn",
+                "--partial",
+                "--format",
+                fmt,
+            ],
+        );
+        assert_ne!(p.status.code(), Some(0), "{fmt}");
+        assert!(err(&p).contains("partial"), "{fmt}: {}", err(&p));
+    }
+
+    // Load into a local database and test `sparkles ontology axioms --format owx|omn|obo|obographs`
+    let o = sparkles(dir, &["load", "--loc", "db", "demo.ofn"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    for fmt in ["owx", "omn", "obo", "obographs"] {
+        let o = sparkles(dir, &["ontology", "axioms", "--loc", "db", "--format", fmt]);
+        assert_eq!(o.status.code(), Some(0), "{fmt}: {}", err(&o));
+        let body = out(&o);
+        match fmt {
+            "owx" => assert!(sparkles::owl::owx::parse(&body).is_ok(), "{body}"),
+            "omn" => assert!(
+                sparkles::owl::manchester::parse_document(&body).is_ok(),
+                "{body}"
+            ),
+            "obo" => assert!(sparkles::owl::obo::parse(&body).is_ok(), "{body}"),
+            "obographs" => assert!(sparkles::owl::obographs::parse(&body).is_ok(), "{body}"),
+            _ => unreachable!(),
+        }
+    }
+}

@@ -166,8 +166,15 @@ impl WorkingOntology {
 
     /// Write the ontology to `path` in the syntax its extension names.
     pub fn write(&self, path: &Path) -> Result<()> {
+        let _ = self.write_reported(path)?;
+        Ok(())
+    }
+
+    /// Write the ontology to `path` in the syntax its extension names, returning the
+    /// writer's report of written and any lossy/skipped axioms.
+    pub fn write_reported(&self, path: &Path) -> Result<sparkles_owl::WriteReport> {
         let (format, gz) = OutputFormat::of(path)?;
-        write_axioms(
+        write_axioms_reported(
             path,
             format,
             gz,
@@ -216,12 +223,19 @@ pub enum OutputFormat {
     Turtle,
     /// `.nt`
     NTriples,
+    /// `.owx` (OWL/XML)
+    OwlXml,
+    /// `.omn` (Manchester OWL Syntax)
+    Manchester,
+    /// `.obo` (OBO 1.4)
+    Obo,
+    /// `.json` (OBO Graphs JSON)
+    OboGraphsJson,
 }
 
 impl OutputFormat {
     /// The syntax of an output path by its extension, after a `.gz` that compresses
-    /// it, and whether it is compressed. ROBOT's other syntaxes are refused, since no
-    /// writer exists here.
+    /// it, and whether it is compressed.
     pub fn of(path: &Path) -> Result<(OutputFormat, bool)> {
         let name = path
             .file_name()
@@ -237,17 +251,10 @@ impl OutputFormat {
             "owl" | "rdf" => OutputFormat::RdfXml,
             "ttl" => OutputFormat::Turtle,
             "nt" => OutputFormat::NTriples,
-            "owx" | "omn" | "obo" | "json" => {
-                return Err(Error::invalid(format!(
-                    "no writer for .{ext} output (ROBOT's {}): write .ofn, .owl, .ttl or .nt",
-                    match ext.as_str() {
-                        "owx" => "OWL/XML",
-                        "omn" => "Manchester syntax",
-                        "obo" => "OBO format",
-                        _ => "OBO Graphs JSON",
-                    }
-                )));
-            }
+            "owx" => OutputFormat::OwlXml,
+            "omn" => OutputFormat::Manchester,
+            "obo" => OutputFormat::Obo,
+            "json" => OutputFormat::OboGraphsJson,
             _ => {
                 return Err(Error::invalid(format!(
                     "io#INVALID FORMAT ERROR unknown format: {ext}"
@@ -256,10 +263,23 @@ impl OutputFormat {
         };
         Ok((f, gz))
     }
+
+    /// Human-readable syntax name for diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            OutputFormat::Functional => "OWL functional-style syntax (.ofn)",
+            OutputFormat::RdfXml => "RDF/XML (.owl)",
+            OutputFormat::Turtle => "Turtle (.ttl)",
+            OutputFormat::NTriples => "N-Triples (.nt)",
+            OutputFormat::OwlXml => "OWL/XML (.owx)",
+            OutputFormat::Manchester => "Manchester OWL syntax (.omn)",
+            OutputFormat::Obo => "OBO 1.4 (.obo)",
+            OutputFormat::OboGraphsJson => "OBO Graphs JSON (.json)",
+        }
+    }
 }
 
-/// Write a header and axioms to `path`: a functional-style document whose axioms are
-/// one to a line, or their triples by the mapping to RDF graphs.
+/// Write a header and axioms to `path` in `format`.
 pub fn write_axioms<'a>(
     path: &Path,
     format: OutputFormat,
@@ -268,24 +288,41 @@ pub fn write_axioms<'a>(
     header: &sparkles_owl::Header,
     axioms: impl IntoIterator<Item = &'a Axiom>,
 ) -> Result<()> {
+    let _ = write_axioms_reported(path, format, gz, prefixes, header, axioms)?;
+    Ok(())
+}
+
+/// Write a header and axioms to `path` in `format`, returning the writer's report of
+/// written and any skipped axioms.
+pub fn write_axioms_reported<'a>(
+    path: &Path,
+    format: OutputFormat,
+    gz: bool,
+    prefixes: &BTreeMap<String, String>,
+    header: &sparkles_owl::Header,
+    axioms: impl IntoIterator<Item = &'a Axiom>,
+) -> Result<sparkles_owl::WriteReport> {
     let file = std::fs::File::create(path)
         .map_err(|e| Error::invalid(format!("cannot write {}: {e}", path.display())))?;
     let io = |e: std::io::Error| Error::invalid(format!("cannot write {}: {e}", path.display()));
+    let werr = |e: sparkles_owl::WriteError| {
+        Error::invalid(format!("cannot write {}: {e}", path.display()))
+    };
     let buf = std::io::BufWriter::with_capacity(1 << 20, file);
     // each layer is finished and flushed by hand, so that an error writing the gzip
     // trailer or the last buffer fails the command
-    let buf = if gz {
+    let (buf, report) = if gz {
         let mut enc = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
-        write_body(&mut enc, format, prefixes, header, axioms).map_err(io)?;
-        enc.finish().map_err(io)?
+        let report = write_body(&mut enc, format, prefixes, header, axioms).map_err(werr)?;
+        (enc.finish().map_err(io)?, report)
     } else {
         let mut buf = buf;
-        write_body(&mut buf, format, prefixes, header, axioms).map_err(io)?;
-        buf
+        let report = write_body(&mut buf, format, prefixes, header, axioms).map_err(werr)?;
+        (buf, report)
     };
     let file = buf.into_inner().map_err(|e| io(e.into_error()))?;
     file.sync_all().map_err(io)?;
-    Ok(())
+    Ok(report)
 }
 
 /// The document in the syntax `format` names.
@@ -295,31 +332,60 @@ fn write_body<'a>(
     prefixes: &BTreeMap<String, String>,
     header: &sparkles_owl::Header,
     axioms: impl IntoIterator<Item = &'a Axiom>,
-) -> std::io::Result<()> {
+) -> std::result::Result<sparkles_owl::WriteReport, sparkles_owl::WriteError> {
     let r = Renderer::new(prefixes.clone());
-    if format == OutputFormat::Functional {
-        return write_functional(out, &r, header, axioms);
+    match format {
+        OutputFormat::Functional => write_functional(out, &r, header, axioms).map_err(Into::into),
+        OutputFormat::OwlXml => sparkles_owl::owx::write_document(out, &r, header, axioms),
+        OutputFormat::Manchester => sparkles_owl::manchester::write_document(
+            out,
+            &r,
+            header,
+            axioms,
+            sparkles_owl::WriteOptions::default(),
+        ),
+        OutputFormat::Obo => sparkles_owl::obo::write_document(
+            out,
+            &r,
+            header,
+            axioms,
+            sparkles_owl::WriteOptions::default(),
+        ),
+        OutputFormat::OboGraphsJson => sparkles_owl::obographs::write_document(
+            out,
+            &r,
+            header,
+            axioms,
+            sparkles_owl::WriteOptions::default(),
+        ),
+        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
+            let rdf = match format {
+                OutputFormat::RdfXml => oxrdfio::RdfFormat::RdfXml,
+                OutputFormat::Turtle => oxrdfio::RdfFormat::Turtle,
+                _ => oxrdfio::RdfFormat::NTriples,
+            };
+            let mut fresh = sparkles_owl::write::counter("genid");
+            let axioms: Vec<&'a Axiom> = axioms.into_iter().collect();
+            let written_axioms = axioms.len();
+            let triples = sparkles_owl::write::ontology_triples(header, axioms, &mut fresh);
+            // the input's prefixes and the standard ones, as the renderer has them
+            let ser = crate::io::with_prefixes(
+                oxrdfio::RdfSerializer::from_format(rdf),
+                r.prefixes()
+                    .into_iter()
+                    .map(|(p, n)| (p.to_string(), n.to_string())),
+            );
+            let mut w = ser.for_writer(out);
+            for t in &triples {
+                w.serialize_triple(t)?;
+            }
+            w.finish()?;
+            Ok(sparkles_owl::WriteReport {
+                written_axioms,
+                ..Default::default()
+            })
+        }
     }
-    let rdf = match format {
-        OutputFormat::RdfXml => oxrdfio::RdfFormat::RdfXml,
-        OutputFormat::Turtle => oxrdfio::RdfFormat::Turtle,
-        _ => oxrdfio::RdfFormat::NTriples,
-    };
-    let mut fresh = sparkles_owl::write::counter("genid");
-    let triples = sparkles_owl::write::ontology_triples(header, axioms, &mut fresh);
-    // the input's prefixes and the standard ones, as the renderer has them
-    let ser = crate::io::with_prefixes(
-        oxrdfio::RdfSerializer::from_format(rdf),
-        r.prefixes()
-            .into_iter()
-            .map(|(p, n)| (p.to_string(), n.to_string())),
-    );
-    let mut w = ser.for_writer(out);
-    for t in &triples {
-        w.serialize_triple(t)?;
-    }
-    w.finish()?;
-    Ok(())
 }
 
 /// [`sparkles_owl::ofn::document`], written as it goes.
@@ -328,7 +394,7 @@ fn write_functional<'a>(
     r: &Renderer,
     header: &sparkles_owl::Header,
     axioms: impl IntoIterator<Item = &'a Axiom>,
-) -> std::io::Result<()> {
+) -> std::io::Result<sparkles_owl::WriteReport> {
     for (p, n) in r.prefixes() {
         writeln!(w, "Prefix({p}:=<{n}>)")?;
     }
@@ -347,10 +413,16 @@ fn write_functional<'a>(
         writeln!(w, "{}", r.annotation(a))?;
     }
     w.write_all(b"\n")?;
+    let mut written_axioms = 0usize;
     for ax in axioms {
         writeln!(w, "{}", r.axiom(ax))?;
+        written_axioms += 1;
     }
-    w.write_all(b")\n")
+    w.write_all(b")\n")?;
+    Ok(sparkles_owl::WriteReport {
+        written_axioms,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -411,9 +483,65 @@ EquivalentClasses(:D ObjectIntersectionOf(:C ObjectSomeValuesFrom(:p :B)))
             let back = read(&p);
             assert_eq!(back.doc, w.doc, "{name}");
         }
-        assert!(OutputFormat::of(Path::new("x.owx")).is_err());
-        assert!(OutputFormat::of(Path::new("x.json")).is_err());
+        assert_eq!(
+            OutputFormat::of(Path::new("x.owx")).unwrap(),
+            (OutputFormat::OwlXml, false)
+        );
+        assert_eq!(
+            OutputFormat::of(Path::new("x.omn")).unwrap(),
+            (OutputFormat::Manchester, false)
+        );
+        assert_eq!(
+            OutputFormat::of(Path::new("x.obo")).unwrap(),
+            (OutputFormat::Obo, false)
+        );
+        assert_eq!(
+            OutputFormat::of(Path::new("x.json")).unwrap(),
+            (OutputFormat::OboGraphsJson, false)
+        );
+        assert_eq!(
+            OutputFormat::of(Path::new("x.owx.gz")).unwrap(),
+            (OutputFormat::OwlXml, true)
+        );
         assert!(OutputFormat::of(Path::new("x")).is_err());
+        // OWL/XML and Manchester round-trip losslessly on the reasoned ontology
+        let owx_path = d.path().join("r.owx");
+        w.write(&owx_path).unwrap();
+        let owx_doc =
+            sparkles_owl::owx::parse(&std::fs::read_to_string(&owx_path).unwrap()).unwrap();
+        assert_eq!(
+            Document::new(owx_doc.header, owx_doc.axioms),
+            w.doc,
+            "r.owx"
+        );
+        let omn_path = d.path().join("r.omn");
+        let omn_rep = w.write_reported(&omn_path).unwrap();
+        assert!(omn_rep.is_lossless(), "{omn_rep:?}");
+        let omn_doc =
+            sparkles_owl::manchester::parse_document(&std::fs::read_to_string(&omn_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            Document::new(omn_doc.header, omn_doc.axioms),
+            w.doc,
+            "r.omn"
+        );
+        // OBO 1.4 and OBO Graphs JSON write cleanly and parse back
+        let obo_path = d.path().join("r.obo");
+        let _ = w.write_reported(&obo_path).unwrap();
+        let obo_doc =
+            sparkles_owl::obo::parse(&std::fs::read_to_string(&obo_path).unwrap()).unwrap();
+        assert!(obo_doc.axioms.contains(&Axiom::sub_class_of(
+            sparkles_owl::Class::new("http://ex.org/A"),
+            sparkles_owl::Class::new("http://ex.org/B"),
+        )));
+        let json_path = d.path().join("r.json");
+        let _ = w.write_reported(&json_path).unwrap();
+        let json_doc =
+            sparkles_owl::obographs::parse(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert!(json_doc.axioms.contains(&Axiom::sub_class_of(
+            sparkles_owl::Class::new("http://ex.org/A"),
+            sparkles_owl::Class::new("http://ex.org/B"),
+        )));
         // a file of the document classifies as the document
         let file = w.to_file().unwrap();
         let out = file.classify(&c, &QueryOptions::default()).unwrap();

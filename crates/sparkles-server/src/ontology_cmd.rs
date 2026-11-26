@@ -55,7 +55,7 @@ pub enum OntologyCmd {
         limit: usize,
         #[arg(long, default_value_t = 0)]
         offset: usize,
-        /// ofn (a functional-style document) or json
+        /// ofn, owx, omn, obo, obographs or json
         #[arg(long, default_value = "ofn")]
         format: String,
     },
@@ -141,7 +141,7 @@ pub enum OntologyCmd {
         /// The expansion strategy of the disjunctive rules: cautious or eager
         #[arg(long, default_value = "cautious")]
         expansion: String,
-        /// ofn (the taxonomy as a functional-style document), json or text
+        /// ofn, owx, omn, obo, obographs, json or text
         #[arg(long, default_value = "ofn")]
         format: String,
         /// The commands that follow in a chain
@@ -291,8 +291,8 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             offset,
             format,
         } => {
-            if format != "ofn" && format != "json" {
-                bail!("unknown --format {format}: ofn or json");
+            if !["ofn", "owx", "omn", "obo", "obographs", "json"].contains(&format.as_str()) {
+                bail!("unknown --format {format}: ofn, owx, omn, obo, obographs or json");
             }
             match local(&at)? {
                 Some(loc) => {
@@ -314,16 +314,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                         bail!("the ontology neither declares nor uses <{a}>");
                     }
                     let r = renderer(&ds);
-                    if format == "ofn" {
-                        print!(
-                            "{}",
-                            owl::ofn::document(
-                                &r,
-                                &o.ontology.header,
-                                page.items.iter().map(|(a, _)| a)
-                            )
-                        );
-                    } else {
+                    if format == "json" {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&page_body(
@@ -334,6 +325,14 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                                 &page
                             ))?
                         );
+                    } else {
+                        let doc = render_ontology_doc(
+                            &format,
+                            &r,
+                            &o.ontology.header,
+                            page.items.iter().map(|(a, _)| a),
+                        )?;
+                        print!("{doc}");
                     }
                 }
                 None => {
@@ -349,13 +348,20 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     }
                     q.push(("limit".into(), limit.to_string()));
                     q.push(("offset".into(), offset.to_string()));
-                    q.push(("format".into(), format.clone()));
+                    let wire_fmt = if format == "json" { "json" } else { "ofn" };
+                    q.push(("format".into(), wire_fmt.to_string()));
                     let text = remote_text(&at, "/axioms", &q)?;
                     if format == "json" {
                         let j: J = serde_json::from_str(&text)?;
                         println!("{}", serde_json::to_string_pretty(&j)?);
-                    } else {
+                    } else if format == "ofn" {
                         print!("{text}");
+                    } else {
+                        let parsed = owl::ofn_read::parse(&text)?;
+                        let r = Renderer::new(parsed.prefixes);
+                        let doc =
+                            render_ontology_doc(&format, &r, &parsed.header, parsed.axioms.iter())?;
+                        print!("{doc}");
                     }
                 }
             }
@@ -444,8 +450,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             format,
             rest,
         } => {
-            if !["ofn", "json", "text"].contains(&format.as_str()) {
-                bail!("unknown --format {format}: ofn, json or text");
+            if !["ofn", "owx", "omn", "obo", "obographs", "json", "text"].contains(&format.as_str())
+            {
+                bail!("unknown --format {format}: ofn, owx, omn, obo, obographs, json or text");
             }
             let chain = chain_head(&file, &at, &rest, &output)?;
             if chain.is_some() && target.is_some() {
@@ -456,9 +463,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     "--partial answers in part, which a chain does not transform: leave out --partial"
                 );
             }
-            if partial && format == "ofn" {
+            if partial && is_doc_format(&format) {
                 bail!(
-                    "--format ofn has no place to say that an answer is partial: name --format json or text"
+                    "--format {format} has no place to say that an answer is partial: name --format json or text"
                 );
             }
             if partial && target.is_some() {
@@ -514,11 +521,16 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 let out = ds.ontology().classify(&req, &c, &qopts)?;
                 let r = renderer(ds);
                 let j = classify_body(name, &out, &req, &r, &q)?;
-                let doc = owl::ofn::document(
-                    &r,
-                    &owl::Header::default(),
-                    out.classification.taxonomy.axioms().iter(),
-                );
+                let doc = if is_doc_format(&format) {
+                    render_ontology_doc(
+                        &format,
+                        &r,
+                        &owl::Header::default(),
+                        out.classification.taxonomy.axioms().iter(),
+                    )?
+                } else {
+                    String::new()
+                };
                 Ok((j, doc))
             };
             let (j, doc) = match (file, loc) {
@@ -537,7 +549,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     match OntologyFile::read(&f, &req, 0)? {
                         // the file's axioms, read without a database
                         Some(file) => {
-                            classify_body_of_file(&file, &c, &read, about.clone(), &qopts)?
+                            classify_body_of_file(&file, &c, &read, about.clone(), &format, &qopts)?
                         }
                         None => {
                             let ds = sparkles::Dataset::memory();
@@ -582,7 +594,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                         None => "/classify".to_string(),
                     };
                     let j = remote_post(&at, &path, &body)?;
-                    let doc = if format == "ofn" {
+                    let doc = if is_doc_format(&format) {
                         // the kept classification answers the second request
                         if let Some(o) = body.as_object_mut() {
                             o.remove("target");
@@ -590,7 +602,15 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                             o.remove("about");
                         }
                         let sep = if path.contains('?') { '&' } else { '?' };
-                        remote_post_text(&at, &format!("{path}{sep}format=ofn"), &body)?
+                        let ofn_text =
+                            remote_post_text(&at, &format!("{path}{sep}format=ofn"), &body)?;
+                        if format == "ofn" {
+                            ofn_text
+                        } else {
+                            let parsed = owl::ofn_read::parse(&ofn_text)?;
+                            let r = Renderer::new(parsed.prefixes);
+                            render_ontology_doc(&format, &r, &parsed.header, parsed.axioms.iter())?
+                        }
                     } else {
                         String::new()
                     };
@@ -716,13 +736,63 @@ fn not_a_chain(f: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_doc_format(format: &str) -> bool {
+    matches!(format, "ofn" | "owx" | "omn" | "obo" | "obographs")
+}
+
+fn render_ontology_doc<'a>(
+    format: &str,
+    r: &Renderer,
+    header: &owl::Header,
+    axioms: impl IntoIterator<Item = &'a Axiom>,
+) -> Result<String> {
+    match format {
+        "ofn" => Ok(owl::ofn::document(r, header, axioms)),
+        "owx" => Ok(owl::owx::document(r, header, axioms)?),
+        "omn" => {
+            let (s, rep) =
+                owl::manchester::document(r, header, axioms, owl::WriteOptions::default())?;
+            if rep.skipped_count > 0 {
+                eprintln!(
+                    "WARN --format omn omitted {} axioms that Manchester syntax cannot represent",
+                    rep.skipped_count
+                );
+            }
+            Ok(s)
+        }
+        "obo" => {
+            let (s, rep) = owl::obo::document(r, header, axioms, owl::WriteOptions::default())?;
+            if rep.skipped_count > 0 {
+                eprintln!(
+                    "WARN --format obo omitted {} axioms that OBO 1.4 cannot represent",
+                    rep.skipped_count
+                );
+            }
+            Ok(s)
+        }
+        "obographs" => {
+            let (s, rep) =
+                owl::obographs::document(r, header, axioms, owl::WriteOptions::default())?;
+            if rep.skipped_count > 0 {
+                eprintln!(
+                    "WARN --format obographs omitted {} axioms that OBO Graphs JSON cannot represent",
+                    rep.skipped_count
+                );
+            }
+            Ok(s)
+        }
+        f => bail!("unknown --format {f}: ofn, owx, omn, obo, obographs, json or text"),
+    }
+}
+
 /// The classification of an ontology file read without a database, as the answer's
-/// JSON body and the taxonomy as a functional-style document.
+/// JSON body and the taxonomy in the requested ontology document syntax.
 pub(crate) fn classify_body_of_file(
     file: &OntologyFile,
     c: &ClassifyRequest,
     read: &Read,
     about: Option<String>,
+    format: &str,
     opts: &sparkles::sparql::QueryOptions,
 ) -> Result<(J, String)> {
     let req = read.request()?;
@@ -750,11 +820,16 @@ pub(crate) fn classify_body_of_file(
         &r,
         &q,
     )?;
-    let doc = owl::ofn::document(
-        &r,
-        &owl::Header::default(),
-        out.classification.taxonomy.axioms().iter(),
-    );
+    let doc = if is_doc_format(format) {
+        render_ontology_doc(
+            format,
+            &r,
+            &owl::Header::default(),
+            out.classification.taxonomy.axioms().iter(),
+        )?
+    } else {
+        String::new()
+    };
     Ok((j, doc))
 }
 
@@ -768,10 +843,10 @@ pub(crate) fn finish_classify(
     allow_unsatisfiable: bool,
 ) -> Result<bool> {
     match format {
-        "ofn" => print!("{doc}"),
+        "ofn" | "owx" | "omn" | "obo" | "obographs" => print!("{doc}"),
         "json" => println!("{}", serde_json::to_string_pretty(j)?),
         "text" => print_classify(j),
-        f => bail!("unknown --format {f}: ofn, json or text"),
+        f => bail!("unknown --format {f}: ofn, owx, omn, obo, obographs, json or text"),
     }
     if j["partial"].as_bool() == Some(true) {
         eprintln!(

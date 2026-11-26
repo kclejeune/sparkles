@@ -357,10 +357,6 @@ fn robot_errors_and_exit_statuses() {
             "CREATE ONTOLOGY ERROR",
         ),
         (
-            &["reason", "-i", "o.ofn", "-o", "y.owx"],
-            "no writer for .owx",
-        ),
-        (
             &["reason", "-i", "o.ofn", "-o", "y.xyz"],
             "INVALID FORMAT ERROR",
         ),
