@@ -13674,7 +13674,7 @@ deleted, error}`, and holds nothing.
 | `409 immutable-record-conflict` | A record identity already holds other content, or content that is not an authenticated record. |
 | `409 hold-conflict` | An earlier attempt of the operation holds other commits. |
 | `409 unsupported-profile` | The profile is not enabled, or a written graph is detached. |
-| `422` | A reference does not verify, with the codes of evidence resolution. A passage of an existing rendition and a structured value outside a retained JSON revision of the batch are `incomplete-evidence`. |
+| `422` | A reference or selection does not verify, with the codes of evidence resolution. Unsupported structured normalization methods and exhausted resolution budgets answer `incomplete-evidence`. |
 | `503 authority-changed` | The caller's credential was revoked, expired or the access policy changed before the commit published. |
 
 A refusal writes nothing. A failure after the hold was acquired leaves the hold without
