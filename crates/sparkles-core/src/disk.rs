@@ -77,12 +77,22 @@ pub fn in_memory_file_system(name: &str) -> bool {
 
 type FreeSpaceSamples = HashMap<PathBuf, (Instant, u64)>;
 
-static FREE_SPACE: parking_lot::Mutex<Option<FreeSpaceSamples>> = parking_lot::Mutex::new(None);
+struct FreeSpaceCache {
+    epoch: u64,
+    samples: Option<FreeSpaceSamples>,
+}
+
+static FREE_SPACE: parking_lot::Mutex<FreeSpaceCache> = parking_lot::Mutex::new(FreeSpaceCache {
+    epoch: 0,
+    samples: None,
+});
 
 /// Discard the observation made before a replay step allocated disk space.
 pub(crate) fn invalidate_free_bytes(dir: &Path) {
-    if let Some(cache) = FREE_SPACE.lock().as_mut() {
-        cache.remove(dir);
+    let mut cache = FREE_SPACE.lock();
+    cache.epoch = cache.epoch.wrapping_add(1);
+    if let Some(samples) = &mut cache.samples {
+        samples.remove(dir);
     }
 }
 
@@ -95,19 +105,34 @@ pub fn free_bytes_cached(dir: &Path, max_age: Duration) -> std::io::Result<u64> 
         Some(disk) => return Ok(disk.free()),
         None => max_age,
     };
+    free_bytes_cached_with(dir, max_age, free_bytes)
+}
+
+fn free_bytes_cached_with(
+    dir: &Path,
+    max_age: Duration,
+    measure: impl FnOnce(&Path) -> std::io::Result<u64>,
+) -> std::io::Result<u64> {
     let now = Instant::now();
-    if let Some((at, free)) = FREE_SPACE.lock().as_ref().and_then(|c| c.get(dir).copied())
-        && now.duration_since(at) < max_age
+    let cache = FREE_SPACE.lock();
+    if let Some((at, free)) = cache.samples.as_ref().and_then(|samples| samples.get(dir))
+        && now.duration_since(*at) < max_age
     {
-        return Ok(free);
+        return Ok(*free);
     }
-    let free = free_bytes(dir)?;
+    let epoch = cache.epoch;
+    drop(cache);
+
+    let free = measure(dir)?;
     let mut cache = FREE_SPACE.lock();
-    let cache = cache.get_or_insert_with(HashMap::new);
-    if cache.len() > 1024 {
-        cache.clear();
+    // An invalidation fences off measurements already in flight.
+    if cache.epoch == epoch {
+        let samples = cache.samples.get_or_insert_with(HashMap::new);
+        if samples.len() > 1024 {
+            samples.clear();
+        }
+        samples.insert(dir.to_path_buf(), (now, free));
     }
-    cache.insert(dir.to_path_buf(), (now, free));
     Ok(free)
 }
 
@@ -287,6 +312,42 @@ impl std::io::Write for WritebackFile {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.f.flush()
+    }
+}
+
+#[cfg(test)]
+mod free_space_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn invalidation_prevents_an_in_flight_sample_from_being_cached() {
+        const CAPACITY: u64 = 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let _disk = fake::install_cached(dir, CAPACITY);
+        let measured = Barrier::new(2);
+        let invalidated = Barrier::new(2);
+
+        let (old_free, write) = std::thread::scope(|scope| {
+            let check = scope.spawn(|| {
+                free_bytes_cached_with(dir, Duration::MAX, |dir| {
+                    let free = free_bytes(dir);
+                    measured.wait();
+                    invalidated.wait();
+                    free
+                })
+            });
+            measured.wait();
+            let write = std::fs::write(dir.join("growth"), b"x");
+            invalidate_free_bytes(dir);
+            invalidated.wait();
+            (check.join().unwrap().unwrap(), write)
+        });
+
+        write.unwrap();
+        assert_eq!(old_free, CAPACITY);
+        assert_eq!(free_bytes_cached(dir, Duration::MAX).unwrap(), CAPACITY - 1);
     }
 }
 
