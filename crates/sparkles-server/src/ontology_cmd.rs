@@ -758,6 +758,12 @@ fn render_ontology_doc<'a>(
                     rep.skipped_count
                 );
             }
+            if rep.skipped_header_count > 0 {
+                eprintln!(
+                    "WARN --format omn omitted {} header annotations that Manchester syntax cannot represent",
+                    rep.skipped_header_count
+                );
+            }
             Ok(s)
         }
         "obo" => {
@@ -766,6 +772,12 @@ fn render_ontology_doc<'a>(
                 eprintln!(
                     "WARN --format obo omitted {} axioms that OBO 1.4 cannot represent",
                     rep.skipped_count
+                );
+            }
+            if rep.skipped_header_count > 0 {
+                eprintln!(
+                    "WARN --format obo omitted {} header annotations that OBO 1.4 cannot represent",
+                    rep.skipped_header_count
                 );
             }
             Ok(s)
@@ -777,6 +789,12 @@ fn render_ontology_doc<'a>(
                 eprintln!(
                     "WARN --format obographs omitted {} axioms that OBO Graphs JSON cannot represent",
                     rep.skipped_count
+                );
+            }
+            if rep.skipped_header_count > 0 {
+                eprintln!(
+                    "WARN --format obographs omitted {} header annotations that OBO Graphs JSON cannot represent",
+                    rep.skipped_header_count
                 );
             }
             Ok(s)

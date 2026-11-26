@@ -319,6 +319,21 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
     for o in &io.output {
         OutputFormat::of(o)?;
     }
+    match &step {
+        Step::Classify(a)
+            if !["ofn", "owx", "omn", "obo", "obographs", "json", "text"]
+                .contains(&a.format.as_str()) =>
+        {
+            bail!(
+                "unknown --format {}: ofn, owx, omn, obo, obographs, json or text",
+                a.format
+            );
+        }
+        Step::Check(a) if !["json", "text"].contains(&a.format.as_str()) => {
+            bail!("unknown --format {}: json or text", a.format);
+        }
+        _ => {}
+    }
     let q = QueryOptions::default();
     let mut w = match state.take() {
         Some(w) => {
@@ -454,26 +469,41 @@ fn log_write_report(
     renderer: &sparkles::owl::ofn::Renderer,
     report: &sparkles::owl::WriteReport,
 ) {
-    if report.skipped_count == 0 {
-        return;
-    }
-    eprintln!(
-        "WARN {}: {} axioms could not be represented in the target syntax and were omitted",
-        path.display(),
-        report.skipped_count
-    );
-    for s in report.skipped.iter().take(UNMAPPED_LOGGED) {
+    if report.skipped_count > 0 {
         eprintln!(
-            "WARN   omitted ({}): {}",
-            s.reason,
-            renderer.axiom(&s.axiom)
+            "WARN {}: {} axioms could not be represented in the target syntax and were omitted",
+            path.display(),
+            report.skipped_count
         );
+        for s in report.skipped.iter().take(UNMAPPED_LOGGED) {
+            eprintln!(
+                "WARN   omitted ({}): {}",
+                s.reason,
+                renderer.axiom(&s.axiom)
+            );
+        }
+        if report.skipped_count > UNMAPPED_LOGGED {
+            eprintln!(
+                "WARN   and {} more",
+                report.skipped_count - UNMAPPED_LOGGED.min(report.skipped.len())
+            );
+        }
     }
-    if report.skipped_count > UNMAPPED_LOGGED {
+    if report.skipped_header_count > 0 {
         eprintln!(
-            "WARN   and {} more",
-            report.skipped_count - UNMAPPED_LOGGED.min(report.skipped.len())
+            "WARN {}: {} header annotations could not be represented in the target syntax and were omitted",
+            path.display(),
+            report.skipped_header_count
         );
+        for reason in report.skipped_header.iter().take(UNMAPPED_LOGGED) {
+            eprintln!("WARN   omitted header: {reason}");
+        }
+        if report.skipped_header_count > UNMAPPED_LOGGED {
+            eprintln!(
+                "WARN   and {} more header annotations",
+                report.skipped_header_count - UNMAPPED_LOGGED.min(report.skipped_header.len())
+            );
+        }
     }
 }
 

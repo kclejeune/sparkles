@@ -1298,3 +1298,120 @@ fn ontology_writers_owx_omn_obo_and_obographs_cli() {
         }
     }
 }
+
+#[test]
+fn ontology_writers_atomic_error_omn_gz_chained_classify_and_header_loss_cli() {
+    use std::io::Read as _;
+
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("demo.ofn"), WRITER_ONTO).unwrap();
+
+    // 1. .omn.gz matches plain .omn byte-for-byte
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "-i",
+            "demo.ofn",
+            "-o",
+            "out.omn",
+            "-o",
+            "out.omn.gz",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let plain_omn = std::fs::read_to_string(dir.join("out.omn")).unwrap();
+    let mut gz_omn = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(dir.join("out.omn.gz")).unwrap())
+        .read_to_string(&mut gz_omn)
+        .unwrap();
+    assert_eq!(gz_omn, plain_omn);
+
+    // 2. Chained `reason ... classify --format owx|omn|obo|obographs`
+    for fmt in ["owx", "omn", "obo", "obographs"] {
+        let o = sparkles(
+            dir,
+            &[
+                "ontology", "reason", "-i", "demo.ofn", "classify", "--format", fmt,
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{fmt}: {}", err(&o));
+        let body = out(&o);
+        match fmt {
+            "owx" => assert!(sparkles::owl::owx::parse(&body).is_ok(), "{body}"),
+            "omn" => assert!(
+                sparkles::owl::manchester::parse_document(&body).is_ok(),
+                "{body}"
+            ),
+            "obo" => assert!(sparkles::owl::obo::parse(&body).is_ok(), "{body}"),
+            "obographs" => assert!(sparkles::owl::obographs::parse(&body).is_ok(), "{body}"),
+            _ => unreachable!(),
+        }
+    }
+
+    // 3. Chained `classify --format bogus` fails fast before writing `-o`
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "-i",
+            "demo.ofn",
+            "classify",
+            "--format",
+            "bogus",
+            "-o",
+            "should_not_exist.owx",
+        ],
+    );
+    assert_ne!(o.status.code(), Some(0));
+    assert!(
+        !dir.join("should_not_exist.owx").exists(),
+        "invalid --format must fail before writing -o"
+    );
+
+    // 4. Atomic write: writer error (XML 1.0 illegal NUL in literal) must not truncate pre-existing file
+    let bad_ofn = "Prefix(:=<http://ex.org/>)\nPrefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)\nOntology(<http://ex.org/bad>\nDeclaration(Class(:A))\nAnnotationAssertion(rdfs:label :A \"bad\0nul\")\n)\n";
+    std::fs::write(dir.join("bad.ofn"), bad_ofn).unwrap();
+    let existing = dir.join("existing.owx");
+    std::fs::write(&existing, "SENTINEL_KEEP_ME").unwrap();
+    let o = sparkles(
+        dir,
+        &["ontology", "relax", "-i", "bad.ofn", "-o", "existing.owx"],
+    );
+    assert_ne!(o.status.code(), Some(0), "NUL in OWL/XML must fail");
+    assert_eq!(
+        std::fs::read_to_string(&existing).unwrap(),
+        "SENTINEL_KEEP_ME",
+        "writer error must not truncate or corrupt existing destination file"
+    );
+
+    // 5. Header-only loss logs stderr warning on lossy format
+    let hdr_loss_ofn = "Prefix(:=<http://ex.org/>)\nPrefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)\nOntology(<http://ex.org/hdr>\nAnnotation(rdfs:label \"bonjour\"@fr)\nDeclaration(Class(:A))\n)\n";
+    std::fs::write(dir.join("hdr_loss.ofn"), hdr_loss_ofn).unwrap();
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "relax",
+            "-i",
+            "hdr_loss.ofn",
+            "-o",
+            "hdr_loss.json",
+            "-o",
+            "hdr_loss.obo",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let stderr = err(&o);
+    assert!(
+        stderr.contains("hdr_loss.json") && stderr.contains("header annotations"),
+        "expected header-loss warning for .json: {stderr}"
+    );
+    assert!(
+        stderr.contains("hdr_loss.obo") && stderr.contains("header annotations"),
+        "expected header-loss warning for .obo: {stderr}"
+    );
+}

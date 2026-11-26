@@ -302,26 +302,34 @@ pub fn write_axioms_reported<'a>(
     header: &sparkles_owl::Header,
     axioms: impl IntoIterator<Item = &'a Axiom>,
 ) -> Result<sparkles_owl::WriteReport> {
-    let file = std::fs::File::create(path)
-        .map_err(|e| Error::invalid(format!("cannot write {}: {e}", path.display())))?;
     let io = |e: std::io::Error| Error::invalid(format!("cannot write {}: {e}", path.display()));
     let werr = |e: sparkles_owl::WriteError| {
         Error::invalid(format!("cannot write {}: {e}", path.display()))
     };
-    let buf = std::io::BufWriter::with_capacity(1 << 20, file);
-    // each layer is finished and flushed by hand, so that an error writing the gzip
-    // trailer or the last buffer fails the command
-    let (buf, report) = if gz {
-        let mut enc = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
-        let report = write_body(&mut enc, format, prefixes, header, axioms).map_err(werr)?;
-        (enc.finish().map_err(io)?, report)
-    } else {
-        let mut buf = buf;
-        let report = write_body(&mut buf, format, prefixes, header, axioms).map_err(werr)?;
-        (buf, report)
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io)?;
+    // Stage output beside the destination so a writer or gzip error never truncates or
+    // overwrites an existing file. Each layer is finished and flushed by hand so an error
+    // writing the gzip trailer or final buffer fails the command.
+    let report = {
+        let mut buf = std::io::BufWriter::with_capacity(1 << 20, tmp.as_file_mut());
+        if gz {
+            let mut enc = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
+            let report = write_body(&mut enc, format, prefixes, header, axioms).map_err(werr)?;
+            let mut buf = enc.finish().map_err(io)?;
+            buf.flush().map_err(io)?;
+            report
+        } else {
+            let report = write_body(&mut buf, format, prefixes, header, axioms).map_err(werr)?;
+            buf.flush().map_err(io)?;
+            report
+        }
     };
-    let file = buf.into_inner().map_err(|e| io(e.into_error()))?;
-    file.sync_all().map_err(io)?;
+    tmp.as_file().sync_all().map_err(io)?;
+    tmp.persist(path).map_err(|e| io(e.error))?;
     Ok(report)
 }
 
