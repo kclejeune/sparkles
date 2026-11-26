@@ -1987,7 +1987,11 @@ export class Administration {
       configure: (settings: Configuration | string, o?: OperationOptions) =>
         call<EvidenceSettingsStatus>(
           'evidence.configure',
-          typeof settings === 'string' ? { raw: settings } : { settings },
+          (typeof settings === 'string'
+            ? settings
+            : settings === undefined
+              ? 'null'
+              : settings) as unknown as Configuration,
           evidenceWriteOpts(o),
           true,
         ),
@@ -2078,7 +2082,7 @@ export class Administration {
           'evidence.claimStates',
           {
             branch: options.branch,
-            at: options.at === undefined ? undefined : at(options.at),
+            at: options.at === undefined ? undefined : evAt(options.at),
             policy,
             claims,
           },
@@ -2171,6 +2175,10 @@ const numbers = new Set([
 ]);
 const evidenceCounts = new Set([...counts, 'revision', 'number', 'start', 'end']);
 
+function evAt(value: unknown): string {
+  if (typeof value === 'string') return value;
+  return 'commit:' + evU64(value, 'at');
+}
 function evU64(value: unknown, name: string): string {
   if (typeof value !== 'number' && typeof value !== 'bigint')
     throw new InvalidInputError(`${name} must be a safe integer or bigint`);

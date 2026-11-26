@@ -2363,7 +2363,10 @@ proposal, review or withdrawal omits a principal, the bindings record
 arguments override values in the JSON body. Single-dataset binding resolution passes
 no catalog, so a stored-fact reference naming another dataset returns
 `evidence-unavailable`. Hold acquisition returns `{ created, hold }` and hold release
-returns a boolean, replacing the HTTP status distinctions.
+returns a boolean, replacing the HTTP status distinctions. Policy claim-state reads
+require activated configuration history when an explicit `at` selector is given and fall
+back to a coherent live-head read under the current managed settings when `at` is
+omitted on a store without configuration history.
 
 Managed-boundary and branch refusals map globally to the bindings' typed exception
 classes and carry the stable machine code (`e.code` in Python and the JVM,

@@ -95,26 +95,37 @@ fn holds_does_not_deadlock_during_open_write_transaction() {
     .unwrap();
 }
 
-/// Regression for F2 (Sol P1 #2): acquiring a hold succeeds and returns its generated hold ID
-/// and branch name even when an unrelated branch's on-disk descriptor is corrupt.
+/// Regression for F2 (Sol P1 #2) and R2-7: acquiring a hold succeeds and returns its generated
+/// hold ID and branch name even when an unrelated branch's on-disk descriptor is corrupt and
+/// the main dataset is reopened so the bad branch is not cached open.
 #[test]
 fn acquire_hold_ignores_unrelated_unreadable_branch_descriptor() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
-    let ds = Dataset::open(&root).unwrap();
-    ds.update("INSERT DATA { <urn:s> <urn:p> '1' }").unwrap();
-    let good = ds.create_branch("good", &Default::default()).unwrap();
-    let bad = ds.create_branch("bad", &Default::default()).unwrap();
+    let (good_id, good_seq, bad_id) = {
+        let ds = Dataset::open(&root).unwrap();
+        ds.update("INSERT DATA { <urn:s> <urn:p> '1' }").unwrap();
+        let good = ds.create_branch("good", &Default::default()).unwrap();
+        let bad = ds.create_branch("bad", &Default::default()).unwrap();
+        (good.id, good.head.unwrap().seq, bad.id)
+    };
 
-    // Corrupt the unrelated branch's branch.json descriptor on disk so opening it would fail.
+    // Corrupt the unrelated branch's branch.json descriptor on disk while the dataset is closed
+    // so reopening cannot hit a cached live store for "bad".
     let bad_file = root
         .join("branches")
-        .join(bad.id.to_string())
+        .join(bad_id.to_string())
         .join("branch.json");
     std::fs::write(&bad_file, b"{not valid json").unwrap();
 
+    let ds = Dataset::open(&root).unwrap();
+    assert!(
+        ds.branch("bad").is_err(),
+        "corrupt branch descriptor must prevent opening branch 'bad'"
+    );
+
     let req = serde_json::to_vec(&json!({
-        "commits": [{ "branch": "good", "commit": good.head.unwrap().seq }]
+        "commits": [{ "branch": "good", "commit": good_seq }]
     }))
     .unwrap();
     let acquired = binding::acquire_hold_bytes(&ds, &req).unwrap();
@@ -123,8 +134,12 @@ fn acquire_hold_ignores_unrelated_unreadable_branch_descriptor() {
     assert_eq!(acquired["hold"]["commits"][0]["branch"], "good");
     assert_eq!(
         acquired["hold"]["commits"][0]["branchId"],
-        good.id.to_string()
+        good_id.to_string()
     );
+
+    let listed = binding::holds(&ds, Some("good"), None, Some(10)).unwrap();
+    assert_eq!(listed["holds"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["holds"][0]["commits"][0]["branch"], "good");
 }
 
 /// Regression for F3 (Sol P2 #3): configure honors cancellation/deadline while waiting for
@@ -532,4 +547,296 @@ fn binding_claim_states_covers_live_and_historical_views() {
     )
     .unwrap();
     assert_eq!(at_head["claims"][0]["state"], "accepted");
+}
+
+/// Regression for R2-1 (Sol P1 #1): with configuration history enabled on both main and a
+/// named branch (in-memory and persistent), claim_states reads the caller's committed
+/// snapshot immediately without waiting on the caller's own open write transaction.
+#[test]
+fn claim_states_does_not_wait_on_open_writer_with_configuration_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    {
+        let ds = Dataset::open(&root).unwrap();
+        binding::configure(&ds, &settings_bytes(), &Control::none()).unwrap();
+    }
+    let prep = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    sparkles_core::migrate::activate_configuration_history(&root, false, &prep).unwrap();
+
+    let ds = Dataset::open(&root).unwrap();
+    let ctl = Control::none();
+    let p_main = binding::propose_bytes(
+        &ds,
+        None,
+        None,
+        None,
+        &claim_proposal_bytes("https://example.org/src/main", "occ-main"),
+        &ctl,
+    )
+    .unwrap();
+    let main_claim = p_main["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "c1")
+        .unwrap()["iri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let main_seq = ds.head_commit().seq;
+
+    ds.create_branch("feat", &Default::default()).unwrap();
+    let p_feat = binding::propose_bytes(
+        &ds,
+        Some("feat"),
+        None,
+        None,
+        &claim_proposal_bytes("https://example.org/src/feat", "occ-feat"),
+        &ctl,
+    )
+    .unwrap();
+    let feat_claim = p_feat["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "c1")
+        .unwrap()["iri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let br = ds.branch("feat").unwrap();
+    let feat_seq = br.head_commit().seq;
+
+    // 1. Open write transaction on main: omitted `at`, explicit `"head"`, and explicit commit
+    // all read the committed snapshot immediately under a tight deadline (no writer wait).
+    ds.transaction(|_tx| {
+        let tight = Control {
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+            ..Control::with_cancel(Arc::new(AtomicBool::new(false)))
+        };
+        let omitted = binding::claim_states(
+            &ds,
+            None,
+            None,
+            "review-v1",
+            std::slice::from_ref(&main_claim),
+            &tight,
+        )?;
+        assert_eq!(omitted["commit"], main_seq);
+        assert_eq!(omitted["claims"][0]["state"], "unreviewed");
+
+        let explicit_head = binding::claim_states(
+            &ds,
+            None,
+            Some("head"),
+            "review-v1",
+            std::slice::from_ref(&main_claim),
+            &tight,
+        )?;
+        assert_eq!(explicit_head["commit"], main_seq);
+        assert_eq!(explicit_head["claims"][0]["state"], "unreviewed");
+
+        let explicit_seq = binding::claim_states(
+            &ds,
+            None,
+            Some(&main_seq.to_string()),
+            "review-v1",
+            std::slice::from_ref(&main_claim),
+            &tight,
+        )?;
+        assert_eq!(explicit_seq["commit"], main_seq);
+        assert_eq!(explicit_seq["claims"][0]["state"], "unreviewed");
+        Ok(())
+    })
+    .unwrap();
+
+    // 2. Open write transaction on named branch "feat": main handle reading branch "feat"
+    // succeeds immediately under a tight deadline for both omitted and explicit selectors.
+    br.transaction(|_tx| {
+        let tight = Control {
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+            ..Control::with_cancel(Arc::new(AtomicBool::new(false)))
+        };
+        let omitted = binding::claim_states(
+            &ds,
+            Some("feat"),
+            None,
+            "review-v1",
+            std::slice::from_ref(&feat_claim),
+            &tight,
+        )?;
+        assert_eq!(omitted["commit"], feat_seq);
+        assert_eq!(omitted["claims"][0]["state"], "unreviewed");
+
+        let explicit = binding::claim_states(
+            &ds,
+            Some("feat"),
+            Some(&feat_seq.to_string()),
+            "review-v1",
+            std::slice::from_ref(&feat_claim),
+            &tight,
+        )?;
+        assert_eq!(explicit["commit"], feat_seq);
+        assert_eq!(explicit["claims"][0]["state"], "unreviewed");
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Regression for R2-3 (Sol P2 #3): decoded-input preflight metering covers RDF triples,
+/// propositions, assessment conclusions, and scope literals before RDF parsing, and
+/// nested conversion loops honor cancellation.
+#[test]
+fn propose_preflight_meters_decoded_rdf_and_checks_nested_cancellation() {
+    let ds = Dataset::memory();
+    let ctl = Control::none();
+
+    // 12 MiB of decoded base64 (16 MiB base64 text) + 5 MiB of syntactically invalid N-Triples
+    // stays under the 24 MiB wire limit; preflight metering must reject with BudgetExceeded
+    // before calling oxrdfio (which would otherwise fail with Error::Invalid).
+    let b64_12m = "A".repeat(16 * 1024 * 1024);
+    let invalid_5m = format!("\"unterminated-{}", "x".repeat(5 * 1024 * 1024));
+
+    // (a) Mixed base64 + proposition literal.
+    let prop_req = serde_json::to_vec(&json!({
+        "revisions": [{
+            "key": "r1",
+            "source": "https://example.org/s",
+            "sourceKey": "k",
+            "content": { "base64": b64_12m },
+        }],
+        "claims": [{
+            "key": "c1",
+            "occurrenceKey": "o1",
+            "revision": { "key": "r1" },
+            "proposition": invalid_5m,
+            "kind": "reported",
+            "polarity": "positive",
+            "author": "https://example.org/org/a",
+        }],
+    }))
+    .unwrap();
+    assert!(prop_req.len() < binding::MAX_CLAIMS_BYTES);
+    let err = binding::propose_bytes(&ds, None, None, None, &prop_req, &ctl).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded before proposition RDF parse, got {err:?}"
+    );
+
+    // (b) Mixed base64 + storedFact triple.
+    let sf_req = serde_json::to_vec(&json!({
+        "revisions": [{
+            "key": "r1",
+            "source": "https://example.org/s",
+            "sourceKey": "k",
+            "content": { "base64": b64_12m },
+        }],
+        "references": [{
+            "key": "ref1",
+            "occurrenceKey": "o1",
+            "storedFact": {
+                "datasetId": uuid::Uuid::new_v4(),
+                "branchId": uuid::Uuid::new_v4(),
+                "commit": 1,
+                "triple": invalid_5m,
+            },
+        }],
+    }))
+    .unwrap();
+    assert!(sf_req.len() < binding::MAX_CLAIMS_BYTES);
+    let err = binding::propose_bytes(&ds, None, None, None, &sf_req, &ctl).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded before storedFact RDF parse, got {err:?}"
+    );
+
+    // (c) Mixed base64 + assessment conclusion literal.
+    let assess_req = serde_json::to_vec(&json!({
+        "revisions": [{
+            "key": "r1",
+            "source": "https://example.org/s",
+            "sourceKey": "k",
+            "content": { "base64": b64_12m },
+        }],
+        "assessments": [{
+            "key": "a1",
+            "occurrenceKey": "o1",
+            "target": { "key": "r1" },
+            "conclusion": invalid_5m,
+            "method": { "method": "https://example.org/m", "version": "1" },
+            "configurationDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "evaluatedAt": "2026-01-01T00:00:00Z",
+            "evaluator": "https://example.org/org/a",
+        }],
+    }))
+    .unwrap();
+    assert!(assess_req.len() < binding::MAX_CLAIMS_BYTES);
+    let err = binding::propose_bytes(&ds, None, None, None, &assess_req, &ctl).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded before assessment conclusion RDF parse, got {err:?}"
+    );
+
+    // (d) Mixed base64 + scope literal.
+    let scope_req = serde_json::to_vec(&json!({
+        "revisions": [{
+            "key": "r1",
+            "source": "https://example.org/s",
+            "sourceKey": "k",
+            "content": { "base64": b64_12m },
+        }],
+        "claims": [{
+            "key": "c1",
+            "occurrenceKey": "o1",
+            "revision": { "key": "r1" },
+            "proposition": "<https://example.org/a> <https://example.org/b> <https://example.org/c>",
+            "kind": "reported",
+            "polarity": "positive",
+            "author": "https://example.org/org/a",
+            "scope": {
+                "https://example.org/p": [invalid_5m],
+            },
+        }],
+    }))
+    .unwrap();
+    assert!(scope_req.len() < binding::MAX_CLAIMS_BYTES);
+    let err = binding::propose_bytes(&ds, None, None, None, &scope_req, &ctl).unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded before scope RDF parse, got {err:?}"
+    );
+
+    // (e) Cancellation reaching nested conversion loops (scope and resolve kinds).
+    let mut big_scope: Vec<String> = (0..120_000).map(|i| format!("\"v{i}\"")).collect();
+    big_scope.push("not-valid-rdf".into());
+    let nested_scope_req = serde_json::to_vec(&json!({
+        "revisions": [{
+            "key": "r1",
+            "source": "https://example.org/s",
+            "sourceKey": "k",
+            "content": { "text": "x" },
+        }],
+        "claims": [{
+            "key": "c1",
+            "occurrenceKey": "o1",
+            "revision": { "key": "r1" },
+            "proposition": "<https://example.org/a> <https://example.org/b> <https://example.org/c>",
+            "kind": "reported",
+            "polarity": "positive",
+            "author": "https://example.org/org/a",
+            "scope": {
+                "https://example.org/p": big_scope,
+            },
+        }],
+    }))
+    .unwrap();
+    let short = Control {
+        deadline: Some(Instant::now() + Duration::from_millis(20)),
+        ..Control::with_cancel(Arc::new(AtomicBool::new(false)))
+    };
+    let err = binding::propose_bytes(&ds, None, None, None, &nested_scope_req, &short).unwrap_err();
+    assert!(
+        matches!(err, Error::Timeout),
+        "expected Timeout inside nested scope conversion, got {err:?}"
+    );
 }

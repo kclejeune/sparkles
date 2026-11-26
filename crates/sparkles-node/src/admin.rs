@@ -158,13 +158,18 @@ fn evidence_meta(v: Value) -> Value {
 }
 fn evidence_raw_limit(op: &str) -> Option<usize> {
     use sparkles::evidence::binding;
-    const ENVELOPE_SLACK: usize = 4096;
+    const ENVELOPE_MAX: usize = 64 << 10;
     match op {
-        "evidence.configure" => Some(binding::MAX_SETTINGS_BYTES + ENVELOPE_SLACK),
+        "evidence.configure" => Some(binding::MAX_SETTINGS_BYTES),
         "evidence.acquireHold" => Some(binding::MAX_HOLD_BYTES),
-        "evidence.resolve" => Some(binding::MAX_RESOLVE_BYTES + ENVELOPE_SLACK),
-        "evidence.propose" => Some(binding::MAX_CLAIMS_BYTES + ENVELOPE_SLACK),
-        "evidence.review" | "evidence.withdraw" => Some(binding::MAX_REVIEW_BYTES + ENVELOPE_SLACK),
+        "evidence.resolve" => Some(binding::MAX_RESOLVE_BYTES + ENVELOPE_MAX),
+        "evidence.propose" => Some(binding::MAX_CLAIMS_BYTES + ENVELOPE_MAX),
+        "evidence.review" | "evidence.withdraw" => Some(binding::MAX_REVIEW_BYTES + ENVELOPE_MAX),
+        "evidence.claimStates" => Some(binding::MAX_RESOLVE_BYTES),
+        "evidence.resolveEntities" | "evidence.findDependents" => Some(binding::MAX_REVIEW_BYTES),
+        "evidence.settings" | "evidence.detach" | "evidence.holds" | "evidence.releaseHold" => {
+            Some(ENVELOPE_MAX)
+        }
         _ => None,
     }
 }
@@ -561,15 +566,22 @@ impl NativeDataset {
         if let Some(limit) = evidence_raw_limit(&op) {
             sparkles::evidence::binding::check_raw_bytes(args.as_bytes(), limit).map_err(err)?;
         }
+        let is_evidence = op.starts_with("evidence.");
         #[cfg(feature = "ontology")]
-        let a = if let Some(ontology_op) = op.strip_prefix("ontology.") {
+        let a = if is_evidence {
+            Value::Null
+        } else if let Some(ontology_op) = op.strip_prefix("ontology.") {
             sparkles::handles::ontology::wire::decode_arguments(ontology_op, args.as_bytes())
                 .map_err(err)?
         } else {
             parse(&args)?
         };
         #[cfg(not(feature = "ontology"))]
-        let a = parse(&args)?;
+        let a = if is_evidence {
+            Value::Null
+        } else {
+            parse(&args)?
+        };
         // a classification writes only when it names a target graph
         let write = writes(&op)
             || (op == "ontology.classify" && a.get("target").is_some_and(|t| !t.is_null()));
@@ -593,8 +605,8 @@ impl NativeDataset {
                 ..sparkles::task::Control::with_cancel(flag.clone())
             };
             ctl.check()?;
-            let result = if op.starts_with("evidence.") {
-                run_evidence(&shared.ds, &op, a, &ctl)?
+            let result = if is_evidence {
+                run_evidence(&shared.ds, &op, &args, &ctl)?
             } else {
                 run_admin(&shared.ds, &op, &a, &v, flag, &ctl)?
             };
@@ -1557,113 +1569,257 @@ fn run_admin(
     })
 }
 
-/// Evidence administration operations, taking ownership of `a` to avoid cloning request trees.
+fn parse_evidence_json<'a, T: serde::Deserialize<'a>>(args: &'a str) -> sparkles::Result<T> {
+    serde_json::from_str(args).map_err(|e| EngineError::invalid(e.to_string()))
+}
+
+fn de_bounded_strings<'de, const MAX: usize, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    struct Visitor<const M: usize>;
+    impl<'de, const M: usize> serde::de::Visitor<'de> for Visitor<M> {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "an array of at most {M} strings")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(M));
+            loop {
+                if out.len() == M {
+                    if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "array exceeds the maximum of {M} entries"
+                        )));
+                    }
+                    break;
+                }
+                match seq.next_element::<String>()? {
+                    Some(item) => out.push(item),
+                    None => break,
+                }
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_seq(Visitor::<MAX>)
+}
+
+fn de_opt_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error> {
+    struct Visitor;
+    impl serde::de::Visitor<'_> for Visitor {
+        type Value = Option<usize>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an optional unsigned integer")
+        }
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            usize::try_from(v)
+                .map(Some)
+                .map_err(|_| E::custom("limit is too large"))
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            let n: u64 = v
+                .parse()
+                .map_err(|_| E::custom("limit must be an unsigned integer"))?;
+            usize::try_from(n)
+                .map(Some)
+                .map_err(|_| E::custom("limit is too large"))
+        }
+    }
+    deserializer.deserialize_any(Visitor)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceDetachArgs {
+    graph: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceHoldsArgs {
+    on_branch: Option<String>,
+    after: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_limit")]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceReleaseHoldArgs {
+    id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceResolveEnvelope<'a> {
+    branch: Option<String>,
+    #[serde(borrow)]
+    request: Option<&'a serde_json::value::RawValue>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceWriteEnvelope<'a> {
+    branch: Option<String>,
+    principal: Option<String>,
+    author: Option<String>,
+    #[serde(borrow)]
+    request: Option<&'a serde_json::value::RawValue>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceClaimStatesArgs {
+    branch: Option<String>,
+    at: Option<String>,
+    policy: String,
+    #[serde(deserialize_with = "de_bounded_strings::<{ sparkles::evidence::MAX_CLAIMS }, _>")]
+    claims: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceResolveEntitiesArgs {
+    branch: Option<String>,
+    policy: String,
+    #[serde(deserialize_with = "de_bounded_strings::<{ sparkles::evidence::MAX_RESOLVE }, _>")]
+    entities: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceFindDependentsArgs {
+    branch: Option<String>,
+    #[serde(deserialize_with = "de_bounded_strings::<{ sparkles::evidence::MAX_CHANGED }, _>")]
+    changed: Vec<String>,
+    #[serde(default)]
+    transitive: bool,
+}
+
+/// Evidence administration operations, reading raw JSON slices and bounded lists directly
+/// without building intermediate `serde_json::Value` trees.
 fn run_evidence(
     ds: &Dataset,
     op: &str,
-    mut a: Value,
+    args: &str,
     ctl: &sparkles::task::Control,
 ) -> sparkles::Result<Value> {
     Ok(match op {
         "evidence.settings" => sparkles::evidence::binding::settings(ds)?,
-        "evidence.configure" => {
-            let bytes = if let Some(raw) = a["raw"].as_str() {
-                raw.as_bytes().to_vec()
-            } else {
-                serde_json::to_vec(&a["settings"])
-                    .map_err(|e| EngineError::invalid(e.to_string()))?
-            };
-            sparkles::evidence::binding::configure(ds, &bytes, ctl)?
+        "evidence.configure" => sparkles::evidence::binding::configure(ds, args.as_bytes(), ctl)?,
+        "evidence.detach" => {
+            let req: EvidenceDetachArgs = parse_evidence_json(args)?;
+            sparkles::evidence::binding::detach(ds, &req.graph)?
         }
-        "evidence.detach" => sparkles::evidence::binding::detach(ds, text(&a, "graph")?)?,
-        "evidence.holds" => sparkles::evidence::binding::holds(
-            ds,
-            a["onBranch"].as_str(),
-            a["after"].as_str(),
-            optional_number(&a, "limit")?
-                .map(|n| usize::try_from(n).map_err(|_| EngineError::invalid("limit is too large")))
-                .transpose()?,
-        )?,
-        "evidence.acquireHold" => sparkles::evidence::binding::acquire_hold_value(ds, a)?,
-        "evidence.releaseHold" => Value::Bool(sparkles::evidence::binding::release_hold(
-            ds,
-            text(&a, "id")?,
-        )?),
+        "evidence.holds" => {
+            let req: EvidenceHoldsArgs = parse_evidence_json(args)?;
+            sparkles::evidence::binding::holds(
+                ds,
+                req.on_branch.as_deref(),
+                req.after.as_deref(),
+                req.limit,
+            )?
+        }
+        "evidence.acquireHold" => {
+            sparkles::evidence::binding::acquire_hold_bytes(ds, args.as_bytes())?
+        }
+        "evidence.releaseHold" => {
+            let req: EvidenceReleaseHoldArgs = parse_evidence_json(args)?;
+            Value::Bool(sparkles::evidence::binding::release_hold(ds, &req.id)?)
+        }
         "evidence.resolve" => {
-            let branch = a["branch"].as_str().map(str::to_owned);
-            let req = a["request"].take();
-            sparkles::evidence::binding::resolve_value(ds, branch.as_deref(), req, ctl)?
+            let env: EvidenceResolveEnvelope<'_> = parse_evidence_json(args)?;
+            let req = env
+                .request
+                .ok_or_else(|| EngineError::invalid("request is required"))?;
+            sparkles::evidence::binding::resolve_bytes(
+                ds,
+                env.branch.as_deref(),
+                req.get().as_bytes(),
+                ctl,
+            )?
         }
         "evidence.propose" => {
-            let branch = a["branch"].as_str().map(str::to_owned);
-            let principal = a["principal"].as_str().map(str::to_owned);
-            let author = a["author"].as_str().map(str::to_owned);
-            let req = a["request"].take();
-            sparkles::evidence::binding::propose_value(
+            let env: EvidenceWriteEnvelope<'_> = parse_evidence_json(args)?;
+            let req = env
+                .request
+                .ok_or_else(|| EngineError::invalid("request is required"))?;
+            sparkles::evidence::binding::propose_bytes(
                 ds,
-                branch.as_deref(),
-                principal.as_deref(),
-                author.as_deref(),
-                req,
+                env.branch.as_deref(),
+                env.principal.as_deref(),
+                env.author.as_deref(),
+                req.get().as_bytes(),
                 ctl,
             )?
         }
         "evidence.review" => {
-            let branch = a["branch"].as_str().map(str::to_owned);
-            let principal = a["principal"].as_str().map(str::to_owned);
-            let author = a["author"].as_str().map(str::to_owned);
-            let req = a["request"].take();
-            sparkles::evidence::binding::review_value(
+            let env: EvidenceWriteEnvelope<'_> = parse_evidence_json(args)?;
+            let req = env
+                .request
+                .ok_or_else(|| EngineError::invalid("request is required"))?;
+            sparkles::evidence::binding::review_bytes(
                 ds,
-                branch.as_deref(),
-                principal.as_deref(),
-                author.as_deref(),
-                req,
+                env.branch.as_deref(),
+                env.principal.as_deref(),
+                env.author.as_deref(),
+                req.get().as_bytes(),
                 ctl,
             )?
         }
         "evidence.withdraw" => {
-            let branch = a["branch"].as_str().map(str::to_owned);
-            let principal = a["principal"].as_str().map(str::to_owned);
-            let author = a["author"].as_str().map(str::to_owned);
-            let req = a["request"].take();
-            sparkles::evidence::binding::withdraw_value(
+            let env: EvidenceWriteEnvelope<'_> = parse_evidence_json(args)?;
+            let req = env
+                .request
+                .ok_or_else(|| EngineError::invalid("request is required"))?;
+            sparkles::evidence::binding::withdraw_bytes(
                 ds,
-                branch.as_deref(),
-                principal.as_deref(),
-                author.as_deref(),
-                req,
+                env.branch.as_deref(),
+                env.principal.as_deref(),
+                env.author.as_deref(),
+                req.get().as_bytes(),
                 ctl,
             )?
         }
         "evidence.claimStates" => {
-            let claims: Vec<String> = decode(&a["claims"])?;
+            let req: EvidenceClaimStatesArgs = parse_evidence_json(args)?;
             sparkles::evidence::binding::claim_states(
                 ds,
-                a["branch"].as_str(),
-                a["at"].as_str(),
-                text(&a, "policy")?,
-                &claims,
+                req.branch.as_deref(),
+                req.at.as_deref(),
+                &req.policy,
+                &req.claims,
                 ctl,
             )?
         }
         "evidence.resolveEntities" => {
-            let entities: Vec<String> = decode(&a["entities"])?;
+            let req: EvidenceResolveEntitiesArgs = parse_evidence_json(args)?;
             sparkles::evidence::binding::resolve_entities(
                 ds,
-                a["branch"].as_str(),
-                text(&a, "policy")?,
-                &entities,
+                req.branch.as_deref(),
+                &req.policy,
+                &req.entities,
                 ctl,
             )?
         }
         "evidence.findDependents" => {
-            let changed: Vec<String> = decode(&a["changed"])?;
+            let req: EvidenceFindDependentsArgs = parse_evidence_json(args)?;
             sparkles::evidence::binding::find_dependents(
                 ds,
-                a["branch"].as_str(),
-                &changed,
-                a["transitive"].as_bool().unwrap_or(false),
+                req.branch.as_deref(),
+                &req.changed,
+                req.transitive,
                 ctl,
             )?
         }

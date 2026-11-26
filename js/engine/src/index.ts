@@ -578,7 +578,9 @@ export class Dataset extends Queryable {
         (cancel) =>
           this.handle.admin(
             op,
-            JSON.stringify(args, (_, v) => (typeof v === 'bigint' ? v.toString() : v)),
+            typeof args === 'string'
+              ? args
+              : JSON.stringify(args, (_, v) => (typeof v === 'bigint' ? v.toString() : v)),
             wireOptions(options),
             cancel,
           ),

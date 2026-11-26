@@ -20,7 +20,7 @@ oxrdfio = { version = "0.2", features = ["rdf-12"] }
 parking_lot = "0.12"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 sparkles-shacl = { path = "../sparkles-shacl", optional = true }
 sparkles-shex = { path = "../sparkles-shex", optional = true }
 sparkles-alloc = { path = "../sparkles-alloc", optional = true, features = ["local-dynamic-tls"] }

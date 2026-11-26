@@ -35,6 +35,10 @@ class SparklesError(Exception):
 
     code: str | None
 
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+        self.code = None
+
 
 class ParseError(SparklesError, SyntaxError):
     """Text that does not parse: SPARQL, RDF, rules, shapes or a ShEx schema."""

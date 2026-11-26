@@ -416,8 +416,15 @@ class EvidenceTest {
 
         ds.begin(TxnType.WRITE)
         try {
-            // Table-only hold listing succeeds inside an open write transaction without deadlocking.
+            // Table-only hold listing and committed claim-state reads succeed inside an open
+            // write transaction without deadlocking.
             assertEquals(0L, ds.evidence().holds().get("heldCommits").asNumber.value().toLong())
+            SparklesOperation(200L).use { op ->
+                assertEquals(
+                    0,
+                    ds.evidence().claimStates("review-v1", emptyList(), null, null, op).arr("claims").size,
+                )
+            }
             assertThrows(JenaTransactionException::class.java) { ds.evidence().configure(settingsJson()) }
             assertThrows(JenaTransactionException::class.java) { ds.evidence().detach(acceptedG) }
             assertThrows(JenaTransactionException::class.java) {
@@ -440,11 +447,18 @@ class EvidenceTest {
             ds.end()
         }
 
-        // Open transaction on a live branch refuses main-handle evidence writes with accurate message.
+        // Open transaction on a live branch refuses main-handle evidence writes with accurate message,
+        // while committed claim-state reads on that branch still succeed immediately.
         ds.branches().create("work")
         ds.branch("work").use { br ->
             br.begin(TxnType.WRITE)
             try {
+                SparklesOperation(200L).use { op ->
+                    assertEquals(
+                        0,
+                        ds.evidence().claimStates("review-v1", emptyList(), "work", null, op).arr("claims").size,
+                    )
+                }
                 val txErr = assertThrows(JenaTransactionException::class.java) {
                     ds.evidence().configure(settingsJson())
                 }

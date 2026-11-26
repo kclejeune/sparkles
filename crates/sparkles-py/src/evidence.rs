@@ -79,8 +79,9 @@ impl PyEvidence {
         progress: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.write_family(py)?;
+        let _ = self.write_family(py)?;
         let bytes = settings_bytes(py, settings)?;
+        let ds = self.write_family(py)?;
         let v = interrupt::controlled_write(py, cancel, progress, timeout, move |ctl| {
             let v = binding::configure(&ds, &bytes, &ctl)?;
             ctl.progress.report(1.0, "configured evidence settings");
@@ -117,7 +118,7 @@ impl PyEvidence {
         commits: &Bound<'py, PyAny>,
         id: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.write_family(py)?;
+        let _ = self.write_family(py)?;
         let commits_json = admin::dumps_py(commits)?;
         let payload = match id {
             Some(id) => {
@@ -128,6 +129,7 @@ impl PyEvidence {
             None => format!("{{\"commits\":{commits_json}}}"),
         };
         binding::check_raw_bytes(payload.as_bytes(), binding::MAX_HOLD_BYTES).py(py)?;
+        let ds = self.write_family(py)?;
         let v = py
             .detach(|| binding::acquire_hold_bytes(&ds, payload.as_bytes()))
             .py(py)?;
@@ -150,8 +152,9 @@ impl PyEvidence {
         progress: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.ds(py)?;
+        let _ = self.ds(py)?;
         let bytes = json_bytes(py, references, binding::MAX_RESOLVE_BYTES)?;
+        let ds = self.ds(py)?;
         let v = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
             let v = binding::resolve_bytes(&ds, branch.as_deref(), &bytes, &ctl)?;
             ctl.progress.report(1.0, "resolved evidence references");
@@ -173,8 +176,9 @@ impl PyEvidence {
         progress: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.write_family(py)?;
+        let _ = self.write_family(py)?;
         let bytes = json_bytes(py, proposal, binding::MAX_CLAIMS_BYTES)?;
+        let ds = self.write_family(py)?;
         let v = interrupt::controlled_write(py, cancel, progress, timeout, move |ctl| {
             let v = binding::propose_bytes(
                 &ds,
@@ -203,8 +207,9 @@ impl PyEvidence {
         progress: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.write_family(py)?;
+        let _ = self.write_family(py)?;
         let bytes = json_bytes(py, review, binding::MAX_REVIEW_BYTES)?;
+        let ds = self.write_family(py)?;
         let v = interrupt::controlled_write(py, cancel, progress, timeout, move |ctl| {
             let v = binding::review_bytes(
                 &ds,
@@ -233,8 +238,9 @@ impl PyEvidence {
         progress: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.write_family(py)?;
+        let _ = self.write_family(py)?;
         let bytes = json_bytes(py, withdrawal, binding::MAX_REVIEW_BYTES)?;
+        let ds = self.write_family(py)?;
         let v = interrupt::controlled_write(py, cancel, progress, timeout, move |ctl| {
             let v = binding::withdraw_bytes(
                 &ds,
@@ -263,8 +269,9 @@ impl PyEvidence {
         progress: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.ds(py)?;
+        let _ = self.ds(py)?;
         let at = at_selector(at)?;
+        let ds = self.ds(py)?;
         let v = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
             let v = binding::claim_states(
                 &ds,

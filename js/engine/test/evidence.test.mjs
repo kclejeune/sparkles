@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   Dataset,
+  BudgetExceededError,
   ConflictError,
   InvalidInputError,
   NotFoundError,
@@ -409,11 +410,13 @@ test('evidence transaction-owner, in-txn holds, branch errors, integer precision
   await ds.evidence.configure(makeSettings());
   await ds.branches.create('feat');
 
-  // In-transaction holds() succeeds on a persistent store without deadlocking,
+  // In-transaction holds() and claimStates() succeed on a persistent store without deadlocking,
   // while mutating evidence operations are refused with ConflictError.
   await ds.transaction(async () => {
     const page = await ds.evidence.holds();
     assert.equal(page.heldCommits, 0);
+    const states = await ds.evidence.claimStates('review-v1', [], { timeout: 200 });
+    assert.deepEqual(states.claims, []);
     await assert.rejects(ds.evidence.configure(makeSettings()), ConflictError);
     await assert.rejects(ds.evidence.detach(ACCEPTED_G), ConflictError);
     await assert.rejects(ds.evidence.acquireHold([{ commit: 0 }]), ConflictError);
@@ -437,8 +440,16 @@ test('evidence transaction-owner, in-txn holds, branch errors, integer precision
     (e) => e instanceof NotFoundError && e.details.code === 'history-gone',
   );
 
-  // Branch handles refuse evidence operations uniformly with InvalidInputError.
+  // Branch handles refuse evidence operations uniformly with InvalidInputError, and an open
+  // branch transaction still allows main-handle claimStates() to read committed state.
   const br = await ds.branch('feat');
+  await br.transaction(async () => {
+    const states = await ds.evidence.claimStates('review-v1', [], {
+      branch: 'feat',
+      timeout: 200,
+    });
+    assert.deepEqual(states.claims, []);
+  });
   await assert.rejects(br.evidence.settings(), InvalidInputError);
   await assert.rejects(br.evidence.holds(), InvalidInputError);
   await assert.rejects(
@@ -448,7 +459,8 @@ test('evidence transaction-owner, in-txn holds, branch errors, integer precision
   await assert.rejects(br.evidence.claimStates('review-v1', []), InvalidInputError);
   await br.close();
 
-  // Integer precision guards: unsafe JS numbers and u64 overflow reject with InvalidInputError.
+  // Integer precision and runtime-type guards: unsafe JS numbers, u64 overflow, and
+  // non-integer `at` values (including booleans) reject with InvalidInputError.
   const unsafeInt = Number.MAX_SAFE_INTEGER + 2;
   const overU64 = 18446744073709551616n;
   await assert.rejects(ds.evidence.acquireHold([{ commit: unsafeInt }]), InvalidInputError);
@@ -466,6 +478,55 @@ test('evidence transaction-owner, in-txn holds, branch errors, integer precision
     InvalidInputError,
   );
   await assert.rejects(ds.evidence.holds({ limit: 1.5 }), InvalidInputError);
+  await assert.rejects(ds.evidence.claimStates('review-v1', [], { at: true }), InvalidInputError);
+  await assert.rejects(ds.evidence.claimStates('review-v1', [], { at: false }), InvalidInputError);
+  await assert.rejects(ds.evidence.claimStates('review-v1', [], { at: null }), InvalidInputError);
+
+  // Exact payload byte bounds (R2-4): raw settings text is measured by UTF-8 bytes without
+  // JSON string escaping inflation, nested requests are bounded at the payload boundary
+  // without 4 KiB slack, and list endpoints bound admission before cloning.
+  const newlinePaddedSettings = '\n'.repeat(9 * 1024 * 1024) + JSON.stringify(makeSettings());
+  const paddedResult = await ds.evidence.configure(newlinePaddedSettings);
+  assert.equal(paddedResult.settings.enabled, true);
+
+  const overSettings = ' '.repeat(16 * 1024 * 1024) + '{}';
+  await assert.rejects(ds.evidence.configure(overSettings), BudgetExceededError);
+
+  const overReview = {
+    policy: 'review-v1',
+    policyVersion: 1,
+    ifHead: 0,
+    message: 'a'.repeat(4 * 1024 * 1024 + 64),
+    decisions: [],
+  };
+  await assert.rejects(ds.evidence.review(overReview), BudgetExceededError);
+
+  const overWithdraw = {
+    message: 'a'.repeat(4 * 1024 * 1024 + 64),
+    withdrawals: [],
+  };
+  await assert.rejects(ds.evidence.withdraw(overWithdraw), BudgetExceededError);
+
+  await assert.rejects(
+    ds.evidence.claimStates(
+      'review-v1',
+      Array.from({ length: 10_001 }, () => 'https://example.org/c/1'),
+    ),
+    InvalidInputError,
+  );
+  await assert.rejects(
+    ds.evidence.resolveEntities(
+      'match-v1',
+      Array.from({ length: 101 }, () => 'https://example.org/e/1'),
+    ),
+    InvalidInputError,
+  );
+  await assert.rejects(
+    ds.evidence.findDependents(
+      Array.from({ length: 1_001 }, () => 'https://example.org/c/1'),
+    ),
+    InvalidInputError,
+  );
 
   // Synthetic response above JS safe integer range decodes losslessly to BigInt
   // while leaving settings numbers and IRI revision strings unchanged.

@@ -340,14 +340,6 @@ pub fn acquire_hold_bytes(dataset: &Dataset, bytes: &[u8]) -> Result<J> {
     acquire_hold_req(dataset, req)
 }
 
-/// Acquire a durable evidence hold from an owned JSON value (no tree clone).
-pub fn acquire_hold_value(dataset: &Dataset, request: J) -> Result<J> {
-    require_main(dataset)?;
-    let req: AcquireHoldJson = serde_json::from_value(request)
-        .map_err(|e| Error::invalid(format!("invalid hold request: {e}")))?;
-    acquire_hold_req(dataset, req)
-}
-
 /// Release an evidence hold by UUID, returning whether it existed.
 pub fn release_hold(dataset: &Dataset, id: &str) -> Result<bool> {
     require_main(dataset)?;
@@ -439,28 +431,53 @@ fn parse_triple(field: &str, text: &str) -> Result<Triple> {
     Ok(Triple::new(quad.subject, quad.predicate, quad.object))
 }
 
-fn stored_fact_ref(at: &str, f: StoredFactJson) -> Result<StoredFactRef> {
+fn stored_fact_ref_with(
+    at: &str,
+    f: StoredFactJson,
+    mut decoded_bytes: Option<&mut usize>,
+    control: &Control,
+) -> Result<StoredFactRef> {
+    control.check()?;
     let graph = match &f.graph {
         None => GraphIdentity::Default,
-        Some(g) => GraphIdentity::Named(named(&format!("{at}.graph"), g)?),
+        Some(g) => {
+            if let Some(bytes) = decoded_bytes.as_deref_mut() {
+                charge_decoded(bytes, g.len())?;
+            }
+            GraphIdentity::Named(named(&format!("{at}.graph"), g)?)
+        }
     };
     let anchor = match (&f.reifier, &f.import_map) {
         (Some(_), Some(_)) => {
             return Err(bad(at, "name a reifier or an import mapping, not both"));
         }
-        (Some(r), None) => Some(BlankAnchor::Reifier(named(&format!("{at}.reifier"), r)?)),
-        (None, Some(m)) => Some(BlankAnchor::ImportMap(named(
-            &format!("{at}.importMap"),
-            m,
-        )?)),
+        (Some(r), None) => {
+            if let Some(bytes) = decoded_bytes.as_deref_mut() {
+                charge_decoded(bytes, r.len())?;
+            }
+            Some(BlankAnchor::Reifier(named(&format!("{at}.reifier"), r)?))
+        }
+        (None, Some(m)) => {
+            if let Some(bytes) = decoded_bytes.as_deref_mut() {
+                charge_decoded(bytes, m.len())?;
+            }
+            Some(BlankAnchor::ImportMap(named(
+                &format!("{at}.importMap"),
+                m,
+            )?))
+        }
         (None, None) => None,
+    };
+    let expected = match decoded_bytes {
+        Some(bytes) => parse_triple_metered(&format!("{at}.triple"), &f.triple, bytes, control)?,
+        None => parse_triple(&format!("{at}.triple"), &f.triple)?,
     };
     Ok(StoredFactRef {
         dataset: f.dataset_id,
         branch: f.branch_id,
         commit: f.commit,
         graph,
-        expected: parse_triple(&format!("{at}.triple"), &f.triple)?,
+        expected,
         anchor,
     })
 }
@@ -533,13 +550,17 @@ fn resolve_req(
             return Err(bad(format!("{at}.key"), "keys are unique"));
         }
         let reference = match (r.stored_fact, r.record) {
-            (Some(f), None) => {
-                Reference::StoredFact(stored_fact_ref(&format!("{at}.storedFact"), f)?)
-            }
+            (Some(f), None) => Reference::StoredFact(stored_fact_ref_with(
+                &format!("{at}.storedFact"),
+                f,
+                None,
+                control,
+            )?),
             (None, Some(rec)) => {
                 let at = format!("{at}.record");
                 let mut kinds = Vec::new();
                 for (j, k) in rec.kinds.iter().enumerate() {
+                    control.check()?;
                     let kind = record_kind(k).ok_or_else(|| {
                         bad(
                             format!("{at}.kinds[{j}]"),
@@ -604,30 +625,6 @@ pub fn resolve_bytes(
     } else {
         serde_json::from_slice(bytes)
             .map_err(|e| Error::invalid(format!("invalid resolution request: {e}")))?
-    };
-    resolve_req(main, branch, req, control)
-}
-
-/// Resolve stored-fact and record references from an owned JSON value (no tree clone).
-pub fn resolve_value(
-    main: &Dataset,
-    branch: Option<&str>,
-    request: J,
-    control: &Control,
-) -> Result<J> {
-    control.check()?;
-    require_main(main)?;
-    let req: ResolveRequestJson = match request {
-        J::Array(_) => {
-            let references: Vec<ResolveReferenceJson> = serde_json::from_value(request)
-                .map_err(|e| Error::invalid(format!("invalid resolution request: {e}")))?;
-            ResolveRequestJson {
-                branch: None,
-                references,
-            }
-        }
-        other => serde_json::from_value(other)
-            .map_err(|e| Error::invalid(format!("invalid resolution request: {e}")))?,
     };
     resolve_req(main, branch, req, control)
 }
@@ -938,22 +935,126 @@ fn content_of(field: &str, c: ContentJson, decoded_bytes: &mut usize) -> Result<
     }
 }
 
-fn parse_scope(field: &str, s: &BTreeMap<String, Vec<String>>) -> Result<Scope> {
+fn term_decoded_bytes(term: &Term) -> usize {
+    match term {
+        Term::NamedNode(n) => n.as_str().len(),
+        Term::BlankNode(b) => b.as_str().len(),
+        Term::Literal(l) => l
+            .value()
+            .len()
+            .saturating_add(l.datatype().as_str().len())
+            .saturating_add(l.language().map_or(0, str::len)),
+        Term::Triple(t) => triple_decoded_bytes(t),
+    }
+}
+
+fn triple_decoded_bytes(triple: &Triple) -> usize {
+    let mut total = 0usize;
+    let mut current = triple;
+    loop {
+        let subj = match &current.subject {
+            oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+            oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+        };
+        total = total
+            .saturating_add(subj)
+            .saturating_add(current.predicate.as_str().len());
+        match &current.object {
+            Term::Triple(nested) => current = nested,
+            other => return total.saturating_add(term_decoded_bytes(other)),
+        }
+    }
+}
+
+fn parse_triple_metered(
+    field: &str,
+    text: &str,
+    decoded_bytes: &mut usize,
+    control: &Control,
+) -> Result<Triple> {
+    control.check()?;
+    let prospective = decoded_bytes.saturating_add(text.len());
+    if prospective > RecordKey::MAX_BYTES {
+        return Err(budget_exceeded(RecordKey::MAX_BYTES, prospective));
+    }
+    let triple = parse_triple(field, text)?;
+    charge_decoded(decoded_bytes, triple_decoded_bytes(&triple))?;
+    Ok(triple)
+}
+
+fn parse_term_metered(
+    field: &str,
+    text: &str,
+    decoded_bytes: &mut usize,
+    control: &Control,
+) -> Result<Term> {
+    control.check()?;
+    let prospective = decoded_bytes.saturating_add(text.len());
+    if prospective > RecordKey::MAX_BYTES {
+        return Err(budget_exceeded(RecordKey::MAX_BYTES, prospective));
+    }
+    let term = parse_term(field, text)?;
+    charge_decoded(decoded_bytes, term_decoded_bytes(&term))?;
+    Ok(term)
+}
+
+fn charge_opt_str(decoded_bytes: &mut usize, s: Option<&str>) -> Result<()> {
+    if let Some(v) = s {
+        charge_decoded(decoded_bytes, v.len())?;
+    }
+    Ok(())
+}
+
+fn charge_ref(decoded_bytes: &mut usize, r: &RefJson) -> Result<()> {
+    charge_opt_str(decoded_bytes, r.key.as_deref())?;
+    charge_opt_str(decoded_bytes, r.iri.as_deref())
+}
+
+fn charge_method(decoded_bytes: &mut usize, m: &MethodJson) -> Result<()> {
+    charge_decoded(decoded_bytes, m.method.len())?;
+    charge_decoded(decoded_bytes, m.version.len())
+}
+
+fn parse_scope(
+    field: &str,
+    s: &BTreeMap<String, Vec<String>>,
+    decoded_bytes: &mut usize,
+    control: &Control,
+) -> Result<Scope> {
     let mut out = Scope::new();
     for (p, values) in s {
+        control.check()?;
+        charge_decoded(decoded_bytes, p.len())?;
         named(&format!("{field}.scope"), p)?;
         let mut terms = Vec::with_capacity(values.len());
         for (i, v) in values.iter().enumerate() {
-            terms.push(parse_term(&format!("{field}.scope[{p}][{i}]"), v)?);
+            control.check()?;
+            terms.push(parse_term_metered(
+                &format!("{field}.scope[{p}][{i}]"),
+                v,
+                decoded_bytes,
+                control,
+            )?);
         }
         out.insert(p.clone(), terms);
     }
     Ok(out)
 }
 
-fn parse_confidence(field: &str, c: &ConfidenceJson) -> Result<Confidence> {
+fn parse_confidence(
+    field: &str,
+    c: &ConfidenceJson,
+    decoded_bytes: &mut usize,
+    control: &Control,
+) -> Result<Confidence> {
+    control.check()?;
+    charge_decoded(decoded_bytes, c.scale.len())?;
+    charge_decoded(decoded_bytes, c.evaluator.len())?;
+    if let Some(m) = &c.method {
+        charge_method(decoded_bytes, m)?;
+    }
     let value = if c.value.starts_with('"') {
-        match parse_term(&format!("{field}.value"), &c.value)? {
+        match parse_term_metered(&format!("{field}.value"), &c.value, decoded_bytes, control)? {
             Term::Literal(l) => l,
             _ => {
                 return Err(bad(
@@ -963,6 +1064,7 @@ fn parse_confidence(field: &str, c: &ConfidenceJson) -> Result<Confidence> {
             }
         }
     } else {
+        charge_decoded(decoded_bytes, c.value.len())?;
         Literal::new_typed_literal(
             c.value.as_str(),
             NamedNode::new_unchecked(format!("{XSD}decimal")),
@@ -980,7 +1082,17 @@ fn parse_confidence(field: &str, c: &ConfidenceJson) -> Result<Confidence> {
     })
 }
 
-fn parse_boundary(at: &str, b: &BoundaryJson) -> Result<BoundaryInput> {
+fn parse_boundary(
+    at: &str,
+    b: &BoundaryJson,
+    decoded_bytes: &mut usize,
+    control: &Control,
+) -> Result<BoundaryInput> {
+    control.check()?;
+    charge_opt_str(decoded_bytes, b.earliest.as_deref())?;
+    charge_opt_str(decoded_bytes, b.latest.as_deref())?;
+    charge_opt_str(decoded_bytes, b.precision.as_deref())?;
+    charge_opt_str(decoded_bytes, b.source_value.as_deref())?;
     let finite = b.earliest.is_some() || b.latest.is_some() || b.precision.is_some();
     Ok(match b.kind.as_str() {
         "known" => {
@@ -1020,9 +1132,20 @@ fn parse_boundary(at: &str, b: &BoundaryJson) -> Result<BoundaryInput> {
     })
 }
 
-fn parse_validity(at: &str, v: &ValidityJson) -> Result<ValidityInput> {
+fn parse_validity(
+    at: &str,
+    v: &ValidityJson,
+    decoded_bytes: &mut usize,
+    control: &Control,
+) -> Result<ValidityInput> {
+    control.check()?;
     let n = &v.normalization;
     let at_n = format!("{at}.normalization");
+    charge_decoded(decoded_bytes, n.method.len())?;
+    charge_decoded(decoded_bytes, n.method_version.len())?;
+    charge_decoded(decoded_bytes, n.calendar.len())?;
+    charge_opt_str(decoded_bytes, n.timezone_policy.as_deref())?;
+    charge_opt_str(decoded_bytes, n.tzdb_version.as_deref())?;
     let status = match n.status.as_str() {
         "normalized" => NormalizationStatus::Normalized,
         "unresolved" => NormalizationStatus::Unresolved,
@@ -1049,8 +1172,8 @@ fn parse_validity(at: &str, v: &ValidityJson) -> Result<ValidityInput> {
         }
     };
     Ok(ValidityInput {
-        start: parse_boundary(&format!("{at}.start"), &v.start)?,
-        end: parse_boundary(&format!("{at}.end"), &v.end)?,
+        start: parse_boundary(&format!("{at}.start"), &v.start, decoded_bytes, control)?,
+        end: parse_boundary(&format!("{at}.end"), &v.end, decoded_bytes, control)?,
         normalization: NormalizationInput {
             status,
             method: named(&format!("{at_n}.method"), &n.method)?,
@@ -1143,6 +1266,12 @@ fn propose_req(
     for (i, v) in r.revisions.into_iter().enumerate() {
         control.check()?;
         let at = format!("revisions[{i}]");
+        charge_decoded(&mut decoded_bytes, v.key.len())?;
+        charge_decoded(&mut decoded_bytes, v.source.len())?;
+        charge_decoded(&mut decoded_bytes, v.source_key.len())?;
+        charge_opt_str(&mut decoded_bytes, v.upstream_version.as_deref())?;
+        charge_opt_str(&mut decoded_bytes, v.published_at.as_deref())?;
+        charge_opt_str(&mut decoded_bytes, v.reported_available_at.as_deref())?;
         let (bytes, text, metadata) =
             content_of(&format!("{at}.content"), v.content, &mut decoded_bytes)?;
         let expected = v
@@ -1173,18 +1302,29 @@ fn propose_req(
         let mut rights = Vec::new();
         for (j, t) in v.reported_rights.iter().enumerate() {
             control.check()?;
-            rights.push(parse_term(&format!("{at}.reportedRights[{j}]"), t)?);
+            rights.push(parse_term_metered(
+                &format!("{at}.reportedRights[{j}]"),
+                t,
+                &mut decoded_bytes,
+                control,
+            )?);
         }
         let mut locators = Vec::new();
         for (j, l) in v.locators.iter().enumerate() {
+            control.check()?;
+            charge_decoded(&mut decoded_bytes, l.len())?;
             locators.push(named(&format!("{at}.locators[{j}]"), l)?);
         }
         let mut upstream = Vec::new();
         for (j, u) in v.upstream_revisions.iter().enumerate() {
+            control.check()?;
+            charge_ref(&mut decoded_bytes, u)?;
             upstream.push(reference(&format!("{at}.upstreamRevisions[{j}]"), u)?);
         }
         let mut families = Vec::new();
         for (j, f) in v.families.iter().enumerate() {
+            control.check()?;
+            charge_decoded(&mut decoded_bytes, f.len())?;
             families.push(named(&format!("{at}.families[{j}]"), f)?);
         }
         input.revisions.push(SourceRevisionInput {
@@ -1215,6 +1355,12 @@ fn propose_req(
     for (i, v) in r.renditions.into_iter().enumerate() {
         control.check()?;
         let at = format!("renditions[{i}]");
+        charge_decoded(&mut decoded_bytes, v.key.len())?;
+        charge_ref(&mut decoded_bytes, &v.revision)?;
+        charge_decoded(&mut decoded_bytes, v.occurrence_key.len())?;
+        charge_method(&mut decoded_bytes, &v.conversion)?;
+        charge_decoded(&mut decoded_bytes, v.media_type.len())?;
+        charge_opt_str(&mut decoded_bytes, v.language.as_deref())?;
         let (bytes, text, metadata) =
             content_of(&format!("{at}.content"), v.content, &mut decoded_bytes)?;
         let content = match (bytes, text, metadata) {
@@ -1242,6 +1388,10 @@ fn propose_req(
     for (i, v) in r.passages.into_iter().enumerate() {
         control.check()?;
         let at = format!("passages[{i}]");
+        charge_decoded(&mut decoded_bytes, v.key.len())?;
+        charge_ref(&mut decoded_bytes, &v.revision)?;
+        charge_ref(&mut decoded_bytes, &v.rendition)?;
+        charge_decoded(&mut decoded_bytes, v.occurrence_key.len())?;
         if let Some(q) = &v.quote {
             charge_decoded(&mut decoded_bytes, q.len())?;
         }
@@ -1260,21 +1410,36 @@ fn propose_req(
     for (i, v) in r.references.into_iter().enumerate() {
         control.check()?;
         let at = format!("references[{i}]");
+        charge_decoded(&mut decoded_bytes, v.key.len())?;
+        charge_decoded(&mut decoded_bytes, v.occurrence_key.len())?;
         let target = match (v.stored_fact, v.passage, v.structured) {
-            (Some(f), None, None) => {
-                EvidenceRefTarget::StoredFact(stored_fact_ref(&format!("{at}.storedFact"), f)?)
+            (Some(f), None, None) => EvidenceRefTarget::StoredFact(stored_fact_ref_with(
+                &format!("{at}.storedFact"),
+                f,
+                Some(&mut decoded_bytes),
+                control,
+            )?),
+            (None, Some(p), None) => {
+                charge_ref(&mut decoded_bytes, &p.revision)?;
+                charge_ref(&mut decoded_bytes, &p.rendition)?;
+                charge_ref(&mut decoded_bytes, &p.passage)?;
+                EvidenceRefTarget::Passage {
+                    revision: reference(&format!("{at}.passage.revision"), &p.revision)?,
+                    rendition: reference(&format!("{at}.passage.rendition"), &p.rendition)?,
+                    passage: reference(&format!("{at}.passage.passage"), &p.passage)?,
+                }
             }
-            (None, Some(p), None) => EvidenceRefTarget::Passage {
-                revision: reference(&format!("{at}.passage.revision"), &p.revision)?,
-                rendition: reference(&format!("{at}.passage.rendition"), &p.rendition)?,
-                passage: reference(&format!("{at}.passage.passage"), &p.passage)?,
-            },
-            (None, None, Some(s)) => EvidenceRefTarget::Structured {
-                revision: reference(&format!("{at}.structured.revision"), &s.revision)?,
-                pointer: s.pointer,
-                method: method_ref(&format!("{at}.structured.method"), &s.method)?,
-                value_digest: digest(&format!("{at}.structured.valueDigest"), &s.value_digest)?,
-            },
+            (None, None, Some(s)) => {
+                charge_ref(&mut decoded_bytes, &s.revision)?;
+                charge_decoded(&mut decoded_bytes, s.pointer.len())?;
+                charge_method(&mut decoded_bytes, &s.method)?;
+                EvidenceRefTarget::Structured {
+                    revision: reference(&format!("{at}.structured.revision"), &s.revision)?,
+                    pointer: s.pointer,
+                    method: method_ref(&format!("{at}.structured.method"), &s.method)?,
+                    value_digest: digest(&format!("{at}.structured.valueDigest"), &s.value_digest)?,
+                }
+            }
             _ => {
                 return Err(bad(
                     at,
@@ -1292,36 +1457,87 @@ fn propose_req(
     for (i, v) in r.claims.iter().enumerate() {
         control.check()?;
         let at = format!("claims[{i}]");
-        let facet = |name: &str, c: &Option<ConfidenceJson>| {
-            c.as_ref()
-                .map(|c| parse_confidence(&format!("{at}.confidence.{name}"), c))
-                .transpose()
-        };
+        charge_decoded(&mut decoded_bytes, v.key.len())?;
+        charge_decoded(&mut decoded_bytes, v.occurrence_key.len())?;
+        charge_ref(&mut decoded_bytes, &v.revision)?;
+        charge_decoded(&mut decoded_bytes, v.author.len())?;
+        let proposition = parse_triple_metered(
+            &format!("{at}.proposition"),
+            &v.proposition,
+            &mut decoded_bytes,
+            control,
+        )?;
+        let scope = parse_scope(&at, &v.scope, &mut decoded_bytes, control)?;
+        let source_conf = v
+            .confidence
+            .source
+            .as_ref()
+            .map(|c| {
+                parse_confidence(
+                    &format!("{at}.confidence.source"),
+                    c,
+                    &mut decoded_bytes,
+                    control,
+                )
+            })
+            .transpose()?;
+        let extraction_conf = v
+            .confidence
+            .extraction
+            .as_ref()
+            .map(|c| {
+                parse_confidence(
+                    &format!("{at}.confidence.extraction"),
+                    c,
+                    &mut decoded_bytes,
+                    control,
+                )
+            })
+            .transpose()?;
+        let analyst_conf = v
+            .confidence
+            .analyst
+            .as_ref()
+            .map(|c| {
+                parse_confidence(
+                    &format!("{at}.confidence.analyst"),
+                    c,
+                    &mut decoded_bytes,
+                    control,
+                )
+            })
+            .transpose()?;
+        let validity = v
+            .validity
+            .as_ref()
+            .map(|val| parse_validity(&format!("{at}.validity"), val, &mut decoded_bytes, control))
+            .transpose()?;
         input.claims.push(ClaimInput {
             version: RecordVersion::V1,
             key: record_key(&format!("{at}.key"), &v.key)?,
             occurrence_key: record_key(&format!("{at}.occurrenceKey"), &v.occurrence_key)?,
             revision: reference(&format!("{at}.revision"), &v.revision)?,
-            proposition: parse_triple(&format!("{at}.proposition"), &v.proposition)?,
+            proposition,
             kind: parse_claim_kind(&format!("{at}.kind"), &v.kind)?,
             polarity: parse_polarity(&format!("{at}.polarity"), &v.polarity)?,
             attributed_author: named(&format!("{at}.author"), &v.author)?,
-            scope: parse_scope(&at, &v.scope)?,
+            scope,
             confidence: ConfidenceFacets {
-                source: facet("source", &v.confidence.source)?,
-                extraction: facet("extraction", &v.confidence.extraction)?,
-                analyst: facet("analyst", &v.confidence.analyst)?,
+                source: source_conf,
+                extraction: extraction_conf,
+                analyst: analyst_conf,
             },
-            validity: v
-                .validity
-                .as_ref()
-                .map(|val| parse_validity(&format!("{at}.validity"), val))
-                .transpose()?,
+            validity,
         });
     }
     for (i, v) in r.links.iter().enumerate() {
         control.check()?;
         let at = format!("links[{i}]");
+        charge_decoded(&mut decoded_bytes, v.key.len())?;
+        charge_decoded(&mut decoded_bytes, v.occurrence_key.len())?;
+        charge_ref(&mut decoded_bytes, &v.target)?;
+        charge_ref(&mut decoded_bytes, &v.evidence)?;
+        charge_decoded(&mut decoded_bytes, v.author.len())?;
         input.links.push(EvidenceLinkInput {
             version: RecordVersion::V1,
             key: record_key(&format!("{at}.key"), &v.key)?,
@@ -1341,12 +1557,36 @@ fn propose_req(
                 format!("an assessment names at most {MAX_ASSESSMENT_INPUTS} inputs"),
             ));
         }
+        charge_decoded(&mut decoded_bytes, v.key.len())?;
+        charge_decoded(&mut decoded_bytes, v.occurrence_key.len())?;
+        charge_ref(&mut decoded_bytes, &v.target)?;
+        charge_method(&mut decoded_bytes, &v.method)?;
+        charge_decoded(&mut decoded_bytes, v.evaluated_at.len())?;
+        charge_decoded(&mut decoded_bytes, v.evaluator.len())?;
+        let conclusion = parse_term_metered(
+            &format!("{at}.conclusion"),
+            &v.conclusion,
+            &mut decoded_bytes,
+            control,
+        )?;
+        let confidence = v
+            .confidence
+            .as_ref()
+            .map(|c| parse_confidence(&format!("{at}.confidence"), c, &mut decoded_bytes, control))
+            .transpose()?;
+        let scope = parse_scope(&at, &v.scope, &mut decoded_bytes, control)?;
+        let mut inputs = Vec::with_capacity(v.inputs.len());
+        for (j, x) in v.inputs.iter().enumerate() {
+            control.check()?;
+            charge_ref(&mut decoded_bytes, x)?;
+            inputs.push(reference(&format!("{at}.inputs[{j}]"), x)?);
+        }
         input.assessments.push(AssessmentInput {
             version: RecordVersion::V1,
             key: record_key(&format!("{at}.key"), &v.key)?,
             occurrence_key: record_key(&format!("{at}.occurrenceKey"), &v.occurrence_key)?,
             target: reference(&format!("{at}.target"), &v.target)?,
-            conclusion: parse_term(&format!("{at}.conclusion"), &v.conclusion)?,
+            conclusion,
             method: method_ref(&format!("{at}.method"), &v.method)?,
             configuration_digest: digest(
                 &format!("{at}.configurationDigest"),
@@ -1354,18 +1594,9 @@ fn propose_req(
             )?,
             evaluated_at: date_time(&v.evaluated_at),
             attributed_evaluator: named(&format!("{at}.evaluator"), &v.evaluator)?,
-            confidence: v
-                .confidence
-                .as_ref()
-                .map(|c| parse_confidence(&format!("{at}.confidence"), c))
-                .transpose()?,
-            scope: parse_scope(&at, &v.scope)?,
-            inputs: v
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(j, x)| reference(&format!("{at}.inputs[{j}]"), x))
-                .collect::<Result<Vec<_>>>()?,
+            confidence,
+            scope,
+            inputs,
         });
     }
     for (i, v) in r.identities.iter().enumerate() {
@@ -1377,16 +1608,24 @@ fn propose_req(
                 "a proposal names 2 to 64 entities",
             ));
         }
+        charge_decoded(&mut decoded_bytes, v.key.len())?;
+        charge_decoded(&mut decoded_bytes, v.occurrence_key.len())?;
+        charge_decoded(&mut decoded_bytes, v.author.len())?;
+        charge_opt_str(&mut decoded_bytes, v.preferred_entity.as_deref())?;
+        if let Some(m) = &v.method {
+            charge_method(&mut decoded_bytes, m)?;
+        }
+        let mut entities = Vec::with_capacity(v.entities.len());
+        for (j, e) in v.entities.iter().enumerate() {
+            control.check()?;
+            charge_decoded(&mut decoded_bytes, e.len())?;
+            entities.push(named(&format!("{at}.entities[{j}]"), e)?);
+        }
         input.identities.push(IdentityInput {
             version: RecordVersion::V1,
             key: record_key(&format!("{at}.key"), &v.key)?,
             occurrence_key: record_key(&format!("{at}.occurrenceKey"), &v.occurrence_key)?,
-            entities: v
-                .entities
-                .iter()
-                .enumerate()
-                .map(|(j, e)| named(&format!("{at}.entities[{j}]"), e))
-                .collect::<Result<_>>()?,
+            entities,
             relation: IdentityRelation::from_name(&v.relation).ok_or_else(|| {
                 bad(
                     format!("{at}.relation"),
@@ -1472,22 +1711,6 @@ pub fn propose_bytes(
     require_main(main)?;
     check_raw_bytes(bytes, MAX_CLAIMS_BYTES)?;
     let r: ClaimsRequestJson = serde_json::from_slice(bytes)
-        .map_err(|e| Error::invalid(format!("invalid proposal: {e}")))?;
-    propose_req(main, branch, principal, author, r, control)
-}
-
-/// Publish an authenticated claim/evidence proposal batch from an owned JSON value.
-pub fn propose_value(
-    main: &Dataset,
-    branch: Option<&str>,
-    principal: Option<&str>,
-    author: Option<&str>,
-    request: J,
-    control: &Control,
-) -> Result<J> {
-    control.check()?;
-    require_main(main)?;
-    let r: ClaimsRequestJson = serde_json::from_value(request)
         .map_err(|e| Error::invalid(format!("invalid proposal: {e}")))?;
     propose_req(main, branch, principal, author, r, control)
 }
@@ -1688,22 +1911,6 @@ pub fn review_bytes(
     review_req(main, branch, principal, author, r, control)
 }
 
-/// Append review decisions from an owned JSON value (no tree clone).
-pub fn review_value(
-    main: &Dataset,
-    branch: Option<&str>,
-    principal: Option<&str>,
-    author: Option<&str>,
-    request: J,
-    control: &Control,
-) -> Result<J> {
-    control.check()?;
-    require_main(main)?;
-    let r: ReviewRequestJson = serde_json::from_value(request)
-        .map_err(|e| Error::invalid(format!("invalid review: {e}")))?;
-    review_req(main, branch, principal, author, r, control)
-}
-
 fn withdraw_req(
     main: &Dataset,
     branch: Option<&str>,
@@ -1788,22 +1995,6 @@ pub fn withdraw_bytes(
     withdraw_req(main, branch, principal, author, r, control)
 }
 
-/// Withdraw one or more claim occurrences from an owned JSON value (no tree clone).
-pub fn withdraw_value(
-    main: &Dataset,
-    branch: Option<&str>,
-    principal: Option<&str>,
-    author: Option<&str>,
-    request: J,
-    control: &Control,
-) -> Result<J> {
-    control.check()?;
-    require_main(main)?;
-    let r: WithdrawRequestJson = serde_json::from_value(request)
-        .map_err(|e| Error::invalid(format!("invalid withdrawal: {e}")))?;
-    withdraw_req(main, branch, principal, author, r, control)
-}
-
 // -------------------------------------------------- identities & dependents ----
 
 fn claim_kind_name(kind: ClaimKind) -> &'static str {
@@ -1856,9 +2047,11 @@ pub fn claim_states(
             let selector = raw.parse::<crate::history::At>()?;
             let preparation =
                 crate::access::Preparation::new(control.clone(), super::propose::READS_BYTES)?;
-            let view =
-                main.store()
-                    .evidence_view_with_branch(logical.store(), &selector, &preparation)?;
+            let view = main.store().evidence_view_committed_with_branch(
+                logical.store(),
+                &selector,
+                &preparation,
+            )?;
             let commit = view.commit().seq;
             let occurrences = super::claim_states(&view, policy, &nodes, None, control)?;
             (commit, occurrences)
@@ -1866,7 +2059,7 @@ pub fn claim_states(
         None => {
             let preparation =
                 crate::access::Preparation::new(control.clone(), super::propose::READS_BYTES)?;
-            match main.store().evidence_view_with_branch(
+            match main.store().evidence_view_committed_with_branch(
                 logical.store(),
                 &crate::history::At::Head,
                 &preparation,

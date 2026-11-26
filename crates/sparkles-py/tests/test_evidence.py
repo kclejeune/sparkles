@@ -417,8 +417,9 @@ def test_evidence_closed_dataset_and_transaction_guards(tmp_path: Path) -> None:
             ds.evidence.configure(_settings())
         with pytest.raises(ConflictError, match="open transaction"):
             ds.evidence.detach(ACCEPTED_G)
-        with pytest.raises(ConflictError, match="open transaction"):
+        with pytest.raises(ConflictError, match="open transaction") as cexc:
             ds.evidence.acquire_hold([{"commit": 1}])
+        assert cexc.value.code is None
         with pytest.raises(ConflictError, match="open transaction"):
             ds.evidence.release_hold(str(uuid.uuid4()))
         with pytest.raises(ConflictError, match="open transaction"):
@@ -434,12 +435,16 @@ def test_evidence_closed_dataset_and_transaction_guards(tmp_path: Path) -> None:
             )
         with pytest.raises(ConflictError, match="open transaction"):
             ds.evidence.withdraw({"withdrawals": []})
+        # Claim-state reads inside an open write transaction read the committed snapshot
+        # without waiting on the caller's writer.
+        assert ds.evidence.claim_states("review-v1", [], timeout=0.2)["claims"] == []
 
     # Active transaction on a live branch refuses main-handle evidence writes without deadlocking.
     ds.branches.create("work")
     work = ds.branch("work")
     with work.transaction():
         assert ds.evidence.holds(on_branch="work")["holds"] == []
+        assert ds.evidence.claim_states("review-v1", [], branch="work", timeout=0.2)["claims"] == []
         with pytest.raises(ConflictError, match="open transaction"):
             ds.evidence.configure(_settings())
         with pytest.raises(ConflictError, match="open transaction"):
@@ -464,8 +469,9 @@ def test_evidence_closed_dataset_and_transaction_guards(tmp_path: Path) -> None:
     # Closed dataset refuses both read and write evidence operations before payload serialization.
     ev = ds.evidence
     ds.close()
-    with pytest.raises(InvalidInputError, match="closed"):
+    with pytest.raises(InvalidInputError, match="closed") as iexc:
         ev.settings()
+    assert iexc.value.code is None
     with pytest.raises(InvalidInputError, match="closed"):
         ev.holds()
     with pytest.raises(InvalidInputError, match="closed"):
@@ -628,3 +634,88 @@ def test_evidence_configure_timeout_before_and_after_publication(tmp_path: Path)
         finally:
             t.join(5.0)
             br.close()
+
+
+def test_evidence_reentrant_serialization_guards(tmp_path: Path) -> None:
+    """Regression for R2-2 (Sol P2 #2): opening a transaction or closing the dataset inside
+    Python JSON encoding must be caught before dispatching the native operation."""
+    with Dataset(tmp_path / "txn") as ds:
+        ds.evidence.configure(_settings())
+        ds.branches.create("work")
+        work = ds.branch("work")
+
+        class OpeningDict(dict[str, Any]):
+            def __init__(self, target: Dataset, data: dict[str, Any]) -> None:
+                super().__init__(data)
+                self._target = target
+                self.tx: Any = None
+
+            def items(self) -> Any:
+                if self.tx is None:
+                    self.tx = self._target.transaction()
+                    self.tx.__enter__()
+                return super().items()
+
+        try:
+            for call_name, target, payload, fn in [
+                (
+                    "propose",
+                    ds,
+                    _claim_proposal(),
+                    lambda p: ds.evidence.propose(p, timeout=0.2),
+                ),
+                (
+                    "review",
+                    ds,
+                    {"policy": "review-v1", "policyVersion": 1, "ifHead": 0, "decisions": []},
+                    lambda p: ds.evidence.review(p, timeout=0.2),
+                ),
+                (
+                    "withdraw",
+                    ds,
+                    {"withdrawals": []},
+                    lambda p: ds.evidence.withdraw(p, timeout=0.2),
+                ),
+                (
+                    "configure-main",
+                    ds,
+                    _settings(),
+                    lambda p: ds.evidence.configure(p, timeout=0.2),
+                ),
+                (
+                    "configure-branch",
+                    work,
+                    _settings(),
+                    lambda p: ds.evidence.configure(p, timeout=0.2),
+                ),
+                (
+                    "acquire_hold",
+                    ds,
+                    {"commit": 0},
+                    lambda p: ds.evidence.acquire_hold([p]),
+                ),
+            ]:
+                evil = OpeningDict(target, payload)
+                try:
+                    with pytest.raises(ConflictError, match="open transaction") as exc:
+                        fn(evil)
+                    assert exc.value.code is None, f"{call_name} should expose code=None"
+                    assert evil.tx is not None
+                finally:
+                    if evil.tx is not None:
+                        evil.tx.__exit__(None, None, None)
+        finally:
+            work.close()
+
+    # Closing the dataset inside JSON serialization must also be refused before dispatch.
+    ds_close = Dataset(tmp_path / "close")
+    ds_close.evidence.configure(_settings())
+
+    class ClosingDict(dict[str, Any]):
+        def items(self) -> Any:
+            ds_close.close()
+            return super().items()
+
+    with pytest.raises(InvalidInputError, match="closed") as exc:
+        ds_close.evidence.propose(ClosingDict(_claim_proposal()), timeout=0.2)
+    assert exc.value.code is None

@@ -281,8 +281,31 @@ impl Store {
         at: &At,
         preparation: &Preparation,
     ) -> Result<BoundEvidenceView> {
+        self.evidence_view_with_branch_mode(store, at, preparation, false)
+    }
+
+    /// Like [`evidence_view_with_branch`](Self::evidence_view_with_branch), but resolves
+    /// against each resident store's already-published committed snapshot instead of
+    /// acquiring `store.writer`, so callers that hold a write transaction on the same
+    /// store or branch read the committed state without waiting on their own writer.
+    pub fn evidence_view_committed_with_branch(
+        &self,
+        store: &Store,
+        at: &At,
+        preparation: &Preparation,
+    ) -> Result<BoundEvidenceView> {
+        self.evidence_view_with_branch_mode(store, at, preparation, true)
+    }
+
+    fn evidence_view_with_branch_mode(
+        &self,
+        store: &Store,
+        at: &At,
+        preparation: &Preparation,
+        committed_only: bool,
+    ) -> Result<BoundEvidenceView> {
         let selection = preparation.selection_scope();
-        let pair = self.select_configuration_pair(store, at, &selection)?;
+        let pair = self.select_configuration_pair_mode(store, at, &selection, committed_only)?;
         let configuration = pair.semantic.configuration().ok_or_else(|| {
             managed_history::unavailable("historical evidence configuration is explicitly unbound")
         })?;
@@ -339,6 +362,16 @@ impl Store {
         at: &At,
         preparation: &Preparation,
     ) -> Result<SelectedPair> {
+        self.select_configuration_pair_mode(store, at, preparation, false)
+    }
+
+    fn select_configuration_pair_mode(
+        &self,
+        store: &Store,
+        at: &At,
+        preparation: &Preparation,
+        committed_only: bool,
+    ) -> Result<SelectedPair> {
         let preparation = &preparation.selection_scope();
         preparation.check()?;
         if self.is_branch() || !Arc::ptr_eq(&self.family, &store.family) {
@@ -369,8 +402,14 @@ impl Store {
             cancel: Some(preparation.control().cancel.flag()),
             deadline: preparation.control().deadline,
         };
-        let (snapshot, resolved, serving_branch, charge) =
-            self.snapshot_at_with_branch_limited_charged(store, at, &options, allowance)?;
+        let (snapshot, resolved, serving_branch, charge) = self
+            .snapshot_at_with_branch_limited_charged_mode(
+                store,
+                at,
+                &options,
+                allowance,
+                committed_only,
+            )?;
         let limit = ReadLimit {
             options: &options,
             memory: Some(allowance),
