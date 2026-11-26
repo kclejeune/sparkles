@@ -96,7 +96,11 @@ impl WorkBudget {
     }
 
     pub(crate) fn step(&mut self) -> Result<()> {
-        self.steps = self.steps.saturating_add(1);
+        self.charge_steps(1)
+    }
+
+    pub(crate) fn charge_steps(&mut self, steps: usize) -> Result<()> {
+        self.steps = self.steps.saturating_add(steps);
         if self.steps > self.limit {
             return Err(limit_err(format!(
                 "SPIN query exceeds maximum node budget ({})",

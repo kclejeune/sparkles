@@ -4097,4 +4097,151 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn round8_prefix_discovery_budget_and_incremental_header_bound() {
+        // R8-2: Long repeated-keyword prefix tokens must charge lookup bytes before hashing
+        // and enforce the header byte bound incrementally during admission rather than doing
+        // quadratic suffix hashing or creating unbounded entries first.
+        let long_kw_prefix = format!("{}p", "BY".repeat(3_000));
+        let subquery = format!("SELECT ?x WHERE {{ ?s {long_kw_prefix}:pred ?x }}");
+
+        // 1. Standalone mode: incremental header bound rejects with SpinLimitError before
+        //    admitting unbounded entries.
+        let mut budget = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        let err =
+            super::template::validate_subquery_text(&subquery, None, &mut budget).unwrap_err();
+        assert!(
+            super::rdf::is_limit_or_cycle_error(&err)
+                && format!("{err:#}").contains("exceeds maximum size"),
+            "standalone repeated-keyword prefix must hit incremental header limit: {err:#}"
+        );
+
+        // 2. Known-prefix mode with a long declared prefix key: byte-charged suffix lookups
+        //    trip WorkBudget well before scanning every suffix quadratically.
+        let long_declared = "z".repeat(long_kw_prefix.len());
+        let mut long_map = rustc_hash::FxHashMap::default();
+        long_map.insert(long_declared.as_str(), "http://example.org/z/");
+        let env_long = super::template::KnownPrefixes::new(long_map);
+        let mut budget_long = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        let err =
+            super::template::validate_subquery_text(&subquery, Some(&env_long), &mut budget_long)
+                .unwrap_err();
+        assert!(
+            super::rdf::is_limit_or_cycle_error(&err)
+                && format!("{err:#}").contains("exceeds maximum node budget"),
+            "known-prefix repeated-keyword scan with long key must hit step budget: {err:#}"
+        );
+
+        // 3. Known-prefix mode with short declared prefix `p`: skipping candidates longer than
+        //    `max_prefix_len` avoids hashing the long suffixes while still finding `p` when
+        //    under the strip budget.
+        let moderate_kw_prefix = format!("{}p", "BY".repeat(200));
+        let moderate_subquery = format!(
+            "SELECT ?x WHERE {{ ?s <urn:in> ?x . VALUES ?v {{ {moderate_kw_prefix}:x }} }}"
+        );
+        let mut short_map = rustc_hash::FxHashMap::default();
+        short_map.insert("p", "http://example.org/p/");
+        let env_short = super::template::KnownPrefixes::new(short_map);
+        let mut budget_short = super::rdf::WorkBudget::new(super::rdf::MAX_NODES);
+        // Syntax fails (BY isn't a VALUES token), not a budget error, confirming short-prefix
+        // skipping did not charge quadratic hashing steps for the 200 long suffixes.
+        let err = super::template::validate_subquery_text(
+            &moderate_subquery,
+            Some(&env_short),
+            &mut budget_short,
+        )
+        .unwrap_err();
+        assert!(
+            !super::rdf::is_limit_or_cycle_error(&err),
+            "short-prefix max_prefix_len filter must not charge quadratic steps: {err:#}"
+        );
+    }
+
+    #[test]
+    fn round8_standalone_grouped_multi_arg_sibling_subselects_and_compact_a() {
+        let wrap_subquery = |subquery: &str| {
+            let mut g = parse_ttl(
+                r#"
+                ex:q a sp:Construct ;
+                  sp:templates ( [ sp:subject spin:_this ; sp:predicate ex:var ; sp:object [ sp:varName "n" ] ] ) ;
+                  sp:where ( [ a sp:SubQuery ; sp:query ex:inner ] ) .
+                "#,
+            );
+            g.insert(&Triple::new(
+                NamedNode::new_unchecked("http://example.org/inner"),
+                super::vocab::sp::TEXT,
+                Literal::new_simple_literal(subquery),
+            ));
+            g
+        };
+
+        // R8-3: Multi-argument and zero-argument scalar calls in grouped SELECT projections
+        // succeed when arguments are bound and fail when arguments are unbound.
+        for ok_subquery in [
+            "SELECT (p:f(1, 2) AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f() AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(?g, 1) AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:g> ?g ; <urn:p> ?v } GROUP BY ?g",
+        ] {
+            let g = wrap_subquery(ok_subquery);
+            assert!(
+                serialize_query(&g, &ex("q")).is_ok(),
+                "must accept grouped scalar call in standalone subquery: {ok_subquery}"
+            );
+        }
+        let g_unbound =
+            wrap_subquery("SELECT (p:f(?v, 1) AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v }");
+        assert!(
+            serialize_query(&g_unbound, &ex("q")).is_err(),
+            "must reject unbound argument in grouped multi-arg scalar call"
+        );
+
+        // R8-4: Sibling subselects inferring an aggregate in either order reject nested calls.
+        for bad_subquery in [
+            "SELECT ?n WHERE { \
+                { SELECT (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v } ORDER BY p:f(COUNT(?v)) } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+            "SELECT ?n WHERE { \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+                { SELECT (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v } ORDER BY p:f(COUNT(?v)) } \
+            }",
+            "SELECT ?n WHERE { \
+                { SELECT (p:f(p:f(?v)) AS ?n) WHERE { ?s <urn:p> ?v } } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+        ] {
+            let g = wrap_subquery(bad_subquery);
+            assert!(
+                serialize_query(&g, &ex("q")).is_err(),
+                "must reject cross-subselect nested inferred aggregate: {bad_subquery}"
+            );
+        }
+        let g_ok_sibling = wrap_subquery(
+            "SELECT ?n WHERE { \
+                { SELECT (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v } ORDER BY p:f(?v) } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+        );
+        assert!(serialize_query(&g_ok_sibling, &ex("q")).is_ok());
+
+        // R8-5: Standalone mode accepts both compact `a` shorthand (`?n ap:C .`, `?n a:C .`)
+        // and real two-term `ap`/`a` predicates (`?n ap:p ?o .`), while still rejecting bare `a`.
+        for ok_subquery in [
+            "SELECT ?n WHERE { ?n ap:C . }",
+            "SELECT ?n WHERE { ?n a:C . }",
+            "SELECT ?n WHERE { ?n ap:C , p:D . }",
+            "SELECT ?n WHERE { ?n <urn:q> ?o ; ap:C . }",
+            "SELECT ?n WHERE { ?n ap:p ?o . }",
+            "SELECT ?n WHERE { ?n <urn:q> ap:C . }",
+        ] {
+            let g = wrap_subquery(ok_subquery);
+            assert!(
+                serialize_query(&g, &ex("q")).is_ok(),
+                "must accept standalone compact `a` / `ap` query: {ok_subquery}"
+            );
+        }
+        let g_bad_a = wrap_subquery("SELECT ?n WHERE { ?n a . }");
+        assert!(serialize_query(&g_bad_a, &ex("q")).is_err());
+    }
 }

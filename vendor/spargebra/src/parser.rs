@@ -148,8 +148,11 @@ impl SparqlParser {
 
     /// Sets an upper bound on cumulative resolved IRI bytes materialized during parsing
     /// (`BASE` / `PREFIX` declarations, `IRIREF`s, and `PrefixedName` expansions). When
-    /// exceeded, parsing fails before allocating the over-budget IRI with a structured
-    /// error reportable via [`SparqlSyntaxError::is_resolved_iri_limit_exceeded`].
+    /// exceeded, parsing fails before allocating the over-budget IRI (including escaped
+    /// `IRIREF`s, whose decoded length is measured without allocation first; an admitted
+    /// escaped relative `IRIREF` allocates only its already-admitted decoded scratch buffer
+    /// before resolution) with a structured error reportable via
+    /// [`SparqlSyntaxError::is_resolved_iri_limit_exceeded`].
     #[inline]
     pub fn with_max_resolved_iri_bytes(mut self, max_bytes: usize) -> Self {
         self.max_resolved_iri_bytes = Some(max_bytes);
@@ -783,12 +786,13 @@ fn build_select(
     let aggregates = state.aggregates.pop().unwrap_or_default();
     let placeholder_calls = state.placeholder_calls.pop().unwrap_or_default();
     let _ = state.aggregate_arg_depth.pop();
-    let agg_vars: HashSet<Variable> =
-        if !state.inferred_synthetic_aggregates.is_empty() && !placeholder_calls.is_empty() {
-            aggregates.iter().map(|(v, _)| v.clone()).collect()
-        } else {
-            HashSet::new()
-        };
+    let agg_vars: HashSet<Variable> = if !placeholder_calls.is_empty() && !aggregates.is_empty() {
+        aggregates.iter().map(|(v, _)| v.clone()).collect()
+    } else {
+        HashSet::new()
+    };
+    let mut local_wrapping_aggregates = HashSet::new();
+    let mut local_nesting_pairs = HashSet::new();
     if group.is_none() && !aggregates.is_empty() {
         group = Some((vec![], vec![]));
     }
@@ -811,16 +815,19 @@ fn build_select(
 
     // HAVING
     if let Some(expr) = having {
-        if !state.inferred_synthetic_aggregates.is_empty()
-            && !placeholder_calls.is_empty()
-            && has_nested_inferred_aggregate(
+        if !placeholder_calls.is_empty() {
+            record_placeholder_nesting(
                 &expr,
                 &placeholder_calls,
                 &agg_vars,
-                &state.inferred_synthetic_aggregates,
-            )
-        {
-            return Err("Aggregate functions cannot be nested");
+                &mut local_wrapping_aggregates,
+                &mut local_nesting_pairs,
+            );
+            if state
+                .has_nested_inferred_aggregate(&local_wrapping_aggregates, &local_nesting_pairs)
+            {
+                return Err("Aggregate functions cannot be nested");
+            }
         }
         let expr = if placeholder_calls.is_empty() {
             expr
@@ -871,16 +878,20 @@ fn build_select(
                                 "The SELECT contains an expression with a variable that is unbound",
                             );
                         }
-                        if !state.inferred_synthetic_aggregates.is_empty()
-                            && !placeholder_calls.is_empty()
-                            && has_nested_inferred_aggregate(
+                        if !placeholder_calls.is_empty() {
+                            record_placeholder_nesting(
                                 &expression,
                                 &placeholder_calls,
                                 &agg_vars,
-                                &state.inferred_synthetic_aggregates,
-                            )
-                        {
-                            return Err("Aggregate functions cannot be nested");
+                                &mut local_wrapping_aggregates,
+                                &mut local_nesting_pairs,
+                            );
+                            if state.has_nested_inferred_aggregate(
+                                &local_wrapping_aggregates,
+                                &local_nesting_pairs,
+                            ) {
+                                return Err("Aggregate functions cannot be nested");
+                            }
                         }
                         let expression = if placeholder_calls.is_empty() {
                             expression
@@ -927,16 +938,19 @@ fn build_select(
             let e = match &order_expr {
                 OrderExpression::Asc(e) | OrderExpression::Desc(e) => e,
             };
-            if !state.inferred_synthetic_aggregates.is_empty()
-                && !placeholder_calls.is_empty()
-                && has_nested_inferred_aggregate(
+            if !placeholder_calls.is_empty() {
+                record_placeholder_nesting(
                     e,
                     &placeholder_calls,
                     &agg_vars,
-                    &state.inferred_synthetic_aggregates,
-                )
-            {
-                return Err("Aggregate functions cannot be nested");
+                    &mut local_wrapping_aggregates,
+                    &mut local_nesting_pairs,
+                );
+                if state
+                    .has_nested_inferred_aggregate(&local_wrapping_aggregates, &local_nesting_pairs)
+                {
+                    return Err("Aggregate functions cannot be nested");
+                }
             }
             expression.push(if placeholder_calls.is_empty() {
                 order_expr
@@ -978,6 +992,12 @@ fn build_select(
             length,
         }
     }
+    state
+        .synthetic_calls_wrapping_aggregates
+        .extend(local_wrapping_aggregates);
+    state
+        .synthetic_call_nesting_pairs
+        .extend(local_nesting_pairs);
     Ok(m)
 }
 
@@ -996,7 +1016,12 @@ fn are_variables_bound(
             variables.contains(var)
                 || placeholder_calls
                     .get(var)
-                    .is_some_and(|(_, _, allow_unbound)| *allow_unbound)
+                    .is_some_and(|(_, args, allow_unbound)| {
+                        *allow_unbound
+                            || args
+                                .iter()
+                                .all(|arg| are_variables_bound(arg, variables, placeholder_calls))
+                    })
         }
         Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
             are_variables_bound(e, variables, placeholder_calls)
@@ -1087,119 +1112,73 @@ fn collect_placeholder_iris(
     }
 }
 
-fn expression_contains_aggregate_or_inferred(
+fn record_placeholder_nesting(
     expression: &Expression,
     placeholder_calls: &HashMap<Variable, (NamedNode, Vec<Expression>, bool)>,
     agg_vars: &HashSet<Variable>,
-    inferred: &HashSet<NamedNode>,
+    wrapping_aggregates: &mut HashSet<NamedNode>,
+    nesting_pairs: &mut HashSet<(NamedNode, NamedNode)>,
+) {
+    let mut ignored = HashSet::new();
+    let _ = collect_and_record_placeholder_nesting(
+        expression,
+        placeholder_calls,
+        agg_vars,
+        wrapping_aggregates,
+        nesting_pairs,
+        &mut ignored,
+    );
+}
+
+fn collect_and_record_placeholder_nesting(
+    expression: &Expression,
+    placeholder_calls: &HashMap<Variable, (NamedNode, Vec<Expression>, bool)>,
+    agg_vars: &HashSet<Variable>,
+    wrapping_aggregates: &mut HashSet<NamedNode>,
+    nesting_pairs: &mut HashSet<(NamedNode, NamedNode)>,
+    out_iris: &mut HashSet<NamedNode>,
 ) -> bool {
     match expression {
         Expression::NamedNode(_) | Expression::Literal(_) | Expression::Exists(_) => false,
-        Expression::Variable(var) | Expression::Bound(var) => {
+        Expression::Bound(var) => agg_vars.contains(var),
+        Expression::Variable(var) => {
             if agg_vars.contains(var) {
                 return true;
             }
             if let Some((iri, args, _)) = placeholder_calls.get(var) {
-                return inferred.contains(iri)
-                    || args.iter().any(|arg| {
-                        expression_contains_aggregate_or_inferred(
-                            arg,
-                            placeholder_calls,
-                            agg_vars,
-                            inferred,
-                        )
-                    });
-            }
-            false
-        }
-        Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
-            expression_contains_aggregate_or_inferred(e, placeholder_calls, agg_vars, inferred)
-        }
-        Expression::Or(a, b)
-        | Expression::And(a, b)
-        | Expression::Equal(a, b)
-        | Expression::SameTerm(a, b)
-        | Expression::Greater(a, b)
-        | Expression::GreaterOrEqual(a, b)
-        | Expression::Less(a, b)
-        | Expression::LessOrEqual(a, b)
-        | Expression::Add(a, b)
-        | Expression::Subtract(a, b)
-        | Expression::Multiply(a, b)
-        | Expression::Divide(a, b) => {
-            expression_contains_aggregate_or_inferred(a, placeholder_calls, agg_vars, inferred)
-                || expression_contains_aggregate_or_inferred(
-                    b,
-                    placeholder_calls,
-                    agg_vars,
-                    inferred,
-                )
-        }
-        Expression::In(a, b) => {
-            expression_contains_aggregate_or_inferred(a, placeholder_calls, agg_vars, inferred)
-                || b.iter().any(|e| {
-                    expression_contains_aggregate_or_inferred(
-                        e,
+                let mut child_iris = HashSet::new();
+                let mut child_has_agg = false;
+                for arg in args {
+                    child_has_agg |= collect_and_record_placeholder_nesting(
+                        arg,
                         placeholder_calls,
                         agg_vars,
-                        inferred,
-                    )
-                })
-        }
-        Expression::FunctionCall(_, parameters) | Expression::Coalesce(parameters) => {
-            parameters.iter().any(|p| {
-                expression_contains_aggregate_or_inferred(p, placeholder_calls, agg_vars, inferred)
-            })
-        }
-        Expression::If(a, b, c) => {
-            expression_contains_aggregate_or_inferred(a, placeholder_calls, agg_vars, inferred)
-                || expression_contains_aggregate_or_inferred(
-                    b,
-                    placeholder_calls,
-                    agg_vars,
-                    inferred,
-                )
-                || expression_contains_aggregate_or_inferred(
-                    c,
-                    placeholder_calls,
-                    agg_vars,
-                    inferred,
-                )
-        }
-    }
-}
-
-fn has_nested_inferred_aggregate(
-    expression: &Expression,
-    placeholder_calls: &HashMap<Variable, (NamedNode, Vec<Expression>, bool)>,
-    agg_vars: &HashSet<Variable>,
-    inferred: &HashSet<NamedNode>,
-) -> bool {
-    match expression {
-        Expression::NamedNode(_)
-        | Expression::Literal(_)
-        | Expression::Bound(_)
-        | Expression::Exists(_) => false,
-        Expression::Variable(var) => {
-            if let Some((iri, args, _)) = placeholder_calls.get(var) {
-                if inferred.contains(iri) {
-                    return args.iter().any(|arg| {
-                        expression_contains_aggregate_or_inferred(
-                            arg,
-                            placeholder_calls,
-                            agg_vars,
-                            inferred,
-                        )
-                    });
+                        wrapping_aggregates,
+                        nesting_pairs,
+                        &mut child_iris,
+                    );
                 }
-                return args.iter().any(|arg| {
-                    has_nested_inferred_aggregate(arg, placeholder_calls, agg_vars, inferred)
-                });
+                if child_has_agg {
+                    wrapping_aggregates.insert(iri.clone());
+                }
+                for inner_iri in &child_iris {
+                    nesting_pairs.insert((iri.clone(), inner_iri.clone()));
+                }
+                out_iris.extend(child_iris);
+                out_iris.insert(iri.clone());
+                return child_has_agg;
             }
             false
         }
         Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
-            has_nested_inferred_aggregate(e, placeholder_calls, agg_vars, inferred)
+            collect_and_record_placeholder_nesting(
+                e,
+                placeholder_calls,
+                agg_vars,
+                wrapping_aggregates,
+                nesting_pairs,
+                out_iris,
+            )
         }
         Expression::Or(a, b)
         | Expression::And(a, b)
@@ -1213,22 +1192,85 @@ fn has_nested_inferred_aggregate(
         | Expression::Subtract(a, b)
         | Expression::Multiply(a, b)
         | Expression::Divide(a, b) => {
-            has_nested_inferred_aggregate(a, placeholder_calls, agg_vars, inferred)
-                || has_nested_inferred_aggregate(b, placeholder_calls, agg_vars, inferred)
+            let lhs = collect_and_record_placeholder_nesting(
+                a,
+                placeholder_calls,
+                agg_vars,
+                wrapping_aggregates,
+                nesting_pairs,
+                out_iris,
+            );
+            let rhs = collect_and_record_placeholder_nesting(
+                b,
+                placeholder_calls,
+                agg_vars,
+                wrapping_aggregates,
+                nesting_pairs,
+                out_iris,
+            );
+            lhs || rhs
         }
         Expression::In(a, b) => {
-            has_nested_inferred_aggregate(a, placeholder_calls, agg_vars, inferred)
-                || b.iter().any(|e| {
-                    has_nested_inferred_aggregate(e, placeholder_calls, agg_vars, inferred)
-                })
+            let mut has_agg = collect_and_record_placeholder_nesting(
+                a,
+                placeholder_calls,
+                agg_vars,
+                wrapping_aggregates,
+                nesting_pairs,
+                out_iris,
+            );
+            for e in b {
+                has_agg |= collect_and_record_placeholder_nesting(
+                    e,
+                    placeholder_calls,
+                    agg_vars,
+                    wrapping_aggregates,
+                    nesting_pairs,
+                    out_iris,
+                );
+            }
+            has_agg
         }
-        Expression::FunctionCall(_, parameters) | Expression::Coalesce(parameters) => parameters
-            .iter()
-            .any(|p| has_nested_inferred_aggregate(p, placeholder_calls, agg_vars, inferred)),
+        Expression::FunctionCall(_, parameters) | Expression::Coalesce(parameters) => {
+            let mut has_agg = false;
+            for p in parameters {
+                has_agg |= collect_and_record_placeholder_nesting(
+                    p,
+                    placeholder_calls,
+                    agg_vars,
+                    wrapping_aggregates,
+                    nesting_pairs,
+                    out_iris,
+                );
+            }
+            has_agg
+        }
         Expression::If(a, b, c) => {
-            has_nested_inferred_aggregate(a, placeholder_calls, agg_vars, inferred)
-                || has_nested_inferred_aggregate(b, placeholder_calls, agg_vars, inferred)
-                || has_nested_inferred_aggregate(c, placeholder_calls, agg_vars, inferred)
+            let ha = collect_and_record_placeholder_nesting(
+                a,
+                placeholder_calls,
+                agg_vars,
+                wrapping_aggregates,
+                nesting_pairs,
+                out_iris,
+            );
+            let hb = collect_and_record_placeholder_nesting(
+                b,
+                placeholder_calls,
+                agg_vars,
+                wrapping_aggregates,
+                nesting_pairs,
+                out_iris,
+            );
+            let hc = collect_and_record_placeholder_nesting(
+                c,
+                placeholder_calls,
+                agg_vars,
+                wrapping_aggregates,
+                nesting_pairs,
+                out_iris,
+            );
+            ha || hb || hc
         }
     }
 }
@@ -1557,34 +1599,149 @@ fn has_iri_scheme(s: &str) -> bool {
     false
 }
 
-fn relative_iri_resolution_bound(base_iri: &Iri<String>, relative: &str) -> usize {
-    let base = base_iri.as_str();
-    if relative.starts_with("//") {
-        return base_iri.scheme().len().saturating_add(1).saturating_add(relative.len());
+#[derive(Clone, Copy)]
+struct IriRefHead {
+    len: usize,
+    has_scheme: bool,
+    first: Option<u8>,
+    second: Option<u8>,
+}
+
+impl IriRefHead {
+    fn from_plain(raw: &str) -> Self {
+        let bytes = raw.as_bytes();
+        Self {
+            len: raw.len(),
+            has_scheme: has_iri_scheme(raw),
+            first: bytes.first().copied(),
+            second: bytes.get(1).copied(),
+        }
     }
-    if relative.starts_with('/') {
-        let auth_len = base_iri
+}
+
+fn measure_unescaped_iriref(mut input: &str) -> Result<IriRefHead, &'static str> {
+    #[derive(Clone, Copy)]
+    enum SchemeState {
+        Start,
+        InScheme,
+        HasScheme,
+        NoScheme,
+    }
+
+    struct Scanner {
+        len: usize,
+        scheme_state: SchemeState,
+        first: Option<u8>,
+        second: Option<u8>,
+    }
+
+    impl Scanner {
+        fn feed_bytes(&mut self, bytes: &[u8]) {
+            self.len = self.len.saturating_add(bytes.len());
+            if self.second.is_some()
+                && matches!(
+                    self.scheme_state,
+                    SchemeState::HasScheme | SchemeState::NoScheme
+                )
+            {
+                return;
+            }
+            for &b in bytes {
+                if self.first.is_none() {
+                    self.first = Some(b);
+                } else if self.second.is_none() {
+                    self.second = Some(b);
+                }
+                self.scheme_state = match self.scheme_state {
+                    SchemeState::Start => {
+                        if b.is_ascii_alphabetic() {
+                            SchemeState::InScheme
+                        } else {
+                            SchemeState::NoScheme
+                        }
+                    }
+                    SchemeState::InScheme => {
+                        if b == b':' {
+                            SchemeState::HasScheme
+                        } else if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.') {
+                            SchemeState::InScheme
+                        } else {
+                            SchemeState::NoScheme
+                        }
+                    }
+                    other => other,
+                };
+                if self.second.is_some()
+                    && matches!(
+                        self.scheme_state,
+                        SchemeState::HasScheme | SchemeState::NoScheme
+                    )
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut scanner = Scanner {
+        len: 0,
+        scheme_state: SchemeState::Start,
+        first: None,
+        second: None,
+    };
+    let mut utf8_buf = [0u8; 4];
+    while let Some((before, after)) = input.split_once('\\') {
+        scanner.feed_bytes(before.as_bytes());
+        let mut after = after.chars();
+        let (escape, rest) = match after.next() {
+            Some('u') => read_hex_char::<4>(after.as_str())?,
+            Some('U') => read_hex_char::<8>(after.as_str())?,
+            Some(_) => {
+                return Err(
+                    "IRIs are only allowed to contain escape sequences \\uXXXX and \\UXXXXXXXX",
+                );
+            }
+            None => return Err("IRIs are not allowed to end with a '\\'"),
+        };
+        let encoded = escape.encode_utf8(&mut utf8_buf);
+        scanner.feed_bytes(encoded.as_bytes());
+        input = rest;
+    }
+    scanner.feed_bytes(input.as_bytes());
+    Ok(IriRefHead {
+        len: scanner.len,
+        has_scheme: matches!(scanner.scheme_state, SchemeState::HasScheme),
+        first: scanner.first,
+        second: scanner.second,
+    })
+}
+
+fn relative_iri_resolution_bound(base_iri: &Iri<String>, relative: IriRefHead) -> usize {
+    let scheme_end = base_iri.scheme().len().saturating_add(1);
+    if relative.first == Some(b'/') && relative.second == Some(b'/') {
+        return scheme_end.saturating_add(relative.len);
+    }
+    let authority_end = scheme_end.saturating_add(
+        base_iri
             .authority()
-            .map_or(0, |a| a.len().saturating_add(2));
-        return base_iri
-            .scheme()
-            .len()
-            .saturating_add(1)
-            .saturating_add(auth_len)
-            .saturating_add(relative.len());
+            .map_or(0, |a| a.len().saturating_add(2)),
+    );
+    if relative.first == Some(b'/') {
+        return authority_end.saturating_add(relative.len);
     }
-    let base_no_frag = base.split('#').next().unwrap_or(base);
-    if relative.is_empty() || relative.starts_with('#') {
-        return base_no_frag.len().saturating_add(relative.len());
+    let path_end = authority_end.saturating_add(base_iri.path().len());
+    if relative.len == 0 || relative.first == Some(b'#') {
+        let query_end = path_end.saturating_add(
+            base_iri
+                .query()
+                .map_or(0, |q| q.len().saturating_add(1)),
+        );
+        return query_end.saturating_add(relative.len);
     }
-    let base_no_query = base_no_frag.split('?').next().unwrap_or(base_no_frag);
-    if relative.starts_with('?') {
-        return base_no_query.len().saturating_add(relative.len());
+    if relative.first == Some(b'?') {
+        return path_end.saturating_add(relative.len);
     }
-    base_no_query
-        .len()
-        .saturating_add(1)
-        .saturating_add(relative.len())
+    path_end.saturating_add(1).saturating_add(relative.len)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1604,6 +1761,8 @@ pub struct ParserState {
     aggregate_arg_depth: Vec<usize>,
     inferred_synthetic_aggregates: HashSet<NamedNode>,
     synthetic_calls_in_aggregates: HashSet<NamedNode>,
+    synthetic_calls_wrapping_aggregates: HashSet<NamedNode>,
+    synthetic_call_nesting_pairs: HashSet<(NamedNode, NamedNode)>,
     max_resolved_iri_bytes: Option<usize>,
     resolved_iri_bytes: usize,
     resolved_iri_limit_exceeded: Option<usize>,
@@ -1630,6 +1789,8 @@ impl ParserState {
             aggregate_arg_depth: Vec::new(),
             inferred_synthetic_aggregates: HashSet::new(),
             synthetic_calls_in_aggregates: HashSet::new(),
+            synthetic_calls_wrapping_aggregates: HashSet::new(),
+            synthetic_call_nesting_pairs: HashSet::new(),
             max_resolved_iri_bytes: None,
             resolved_iri_bytes: 0,
             resolved_iri_limit_exceeded: None,
@@ -1638,6 +1799,23 @@ impl ParserState {
             aggregates: Vec::new(),
             arq: true,
         }
+    }
+
+    fn has_nested_inferred_aggregate(
+        &self,
+        wrapping_aggregates: &HashSet<NamedNode>,
+        nesting_pairs: &HashSet<(NamedNode, NamedNode)>,
+    ) -> bool {
+        if self.inferred_synthetic_aggregates.is_empty() {
+            return false;
+        }
+        wrapping_aggregates
+            .iter()
+            .any(|iri| self.inferred_synthetic_aggregates.contains(iri))
+            || nesting_pairs.iter().any(|(outer, inner)| {
+                self.inferred_synthetic_aggregates.contains(outer)
+                    && self.inferred_synthetic_aggregates.contains(inner)
+            })
     }
 
     fn charge_resolved_iri_bytes(&mut self, bytes: usize) -> Result<(), &'static str> {
@@ -1659,30 +1837,65 @@ impl ParserState {
         if self.resolved_iri_limit_exceeded.is_some() {
             return Err("query exceeds maximum resolved IRI size");
         }
-        let unescaped = if raw.contains('\\') {
+        let has_escape = raw.contains('\\');
+        if self.max_resolved_iri_bytes.is_some() {
+            let head = if has_escape {
+                measure_unescaped_iriref(raw)?
+            } else {
+                IriRefHead::from_plain(raw)
+            };
+            if let Some(base_iri) = &self.base_iri {
+                if head.has_scheme {
+                    self.charge_resolved_iri_bytes(head.len)?;
+                    let iri_str = if has_escape {
+                        unescape_iriref_with_capacity(raw, head.len)?
+                    } else {
+                        raw.to_owned()
+                    };
+                    return Iri::parse(iri_str).map_err(|_| "IRI parsing failed");
+                }
+                let bound = relative_iri_resolution_bound(base_iri, head);
+                self.charge_resolved_iri_bytes(bound)?;
+                let unescaped = if has_escape {
+                    Cow::Owned(unescape_iriref_with_capacity(raw, head.len)?)
+                } else {
+                    Cow::Borrowed(raw)
+                };
+                let mut resolved = String::new();
+                self.base_iri
+                    .as_ref()
+                    .expect("checked")
+                    .resolve_into(&unescaped, &mut resolved)
+                    .map_err(|_| "IRI parsing failed")?;
+                if resolved.len() > bound {
+                    self.charge_resolved_iri_bytes(resolved.len() - bound)?;
+                }
+                return Ok(Iri::parse_unchecked(resolved));
+            }
+            self.charge_resolved_iri_bytes(head.len)?;
+            let iri_str = if has_escape {
+                unescape_iriref_with_capacity(raw, head.len)?
+            } else {
+                raw.to_owned()
+            };
+            return Iri::parse(iri_str).map_err(|_| "IRI parsing failed");
+        }
+
+        let unescaped = if has_escape {
             Cow::Owned(unescape_iriref(raw)?)
         } else {
             Cow::Borrowed(raw)
         };
         if let Some(base_iri) = &self.base_iri {
             if has_iri_scheme(&unescaped) {
-                self.charge_resolved_iri_bytes(unescaped.len())?;
                 return Iri::parse(unescaped.into_owned()).map_err(|_| "IRI parsing failed");
             }
-            let bound = relative_iri_resolution_bound(base_iri, &unescaped);
-            self.charge_resolved_iri_bytes(bound)?;
             let mut resolved = String::new();
-            self.base_iri
-                .as_ref()
-                .expect("checked")
+            base_iri
                 .resolve_into(&unescaped, &mut resolved)
                 .map_err(|_| "IRI parsing failed")?;
-            if resolved.len() > bound {
-                self.charge_resolved_iri_bytes(resolved.len() - bound)?;
-            }
             Ok(Iri::parse_unchecked(resolved))
         } else {
-            self.charge_resolved_iri_bytes(unescaped.len())?;
             Iri::parse(unescaped.into_owned()).map_err(|_| "IRI parsing failed")
         }
     }
@@ -1789,7 +2002,14 @@ impl ParserState {
         };
         if let Some(name) = inferred_synth_agg {
             self.inferred_synthetic_aggregates.insert(name.clone());
-            if self.synthetic_calls_in_aggregates.contains(&name) {
+            if self.synthetic_calls_in_aggregates.contains(&name)
+                || self.synthetic_calls_wrapping_aggregates.contains(&name)
+                || self.synthetic_call_nesting_pairs.iter().any(|(outer, inner)| {
+                    (outer == &name || inner == &name)
+                        && self.inferred_synthetic_aggregates.contains(outer)
+                        && self.inferred_synthetic_aggregates.contains(inner)
+                })
+            {
                 return Err("Aggregate functions cannot be nested");
             }
         }
@@ -1830,8 +2050,12 @@ impl ParserState {
     }
 }
 
-fn unescape_iriref(mut input: &str) -> Result<String, &'static str> {
-    let mut output = String::with_capacity(input.len());
+fn unescape_iriref(input: &str) -> Result<String, &'static str> {
+    unescape_iriref_with_capacity(input, input.len())
+}
+
+fn unescape_iriref_with_capacity(mut input: &str, capacity: usize) -> Result<String, &'static str> {
+    let mut output = String::with_capacity(capacity);
     while let Some((before, after)) = input.split_once('\\') {
         output.push_str(before);
         let mut after = after.chars();
@@ -1843,7 +2067,7 @@ fn unescape_iriref(mut input: &str) -> Result<String, &'static str> {
                     "IRIs are only allowed to contain escape sequences \\uXXXX and \\UXXXXXXXX",
                 );
             }
-            None => return Err("IRIs are not allowed to end with a '\'"),
+            None => return Err("IRIs are not allowed to end with a '\\'"),
         };
         output.push(escape);
         input = after;
@@ -2661,7 +2885,24 @@ parser! {
             PropertyListNotEmpty() /
             { FocusedTriplePattern::default() }
 
-        rule PropertyListNotEmpty() -> FocusedTriplePattern<Vec<(NamedNodePattern,Vec<ReifiedTerm>)>> = hp:Verb() _ ho:ObjectList() _ l:PropertyListNotEmpty_item()* {
+        rule PlaceholderCompactA_guard() = ns:PNAME_NS() {?
+            if state.resolved_iri_limit_exceeded.is_none()
+                && ns.starts_with('a')
+                && state.placeholder_prefixes.contains(ns)
+            {
+                Ok(())
+            } else {
+                Err("not a placeholder-shadowed compact `a` verb")
+            }
+        }
+        rule PlaceholderCompactA() = &PlaceholderCompactA_guard() "a" {}
+
+        rule PropertyListNotEmpty_head() -> (NamedNodePattern, FocusedTriplePattern<Vec<ReifiedTerm>>) =
+            hp:Verb() _ ho:ObjectList() { (hp, ho) } /
+            PlaceholderCompactA() _ ho:ObjectList() { (rdf::TYPE.into_owned().into(), ho) }
+
+        rule PropertyListNotEmpty() -> FocusedTriplePattern<Vec<(NamedNodePattern,Vec<ReifiedTerm>)>> = head:PropertyListNotEmpty_head() _ l:PropertyListNotEmpty_item()* {
+            let (hp, ho) = head;
             l.into_iter().flatten().fold(FocusedTriplePattern {
                 focus: vec![(hp, ho.focus)],
                 patterns: ho.patterns
@@ -2674,7 +2915,8 @@ parser! {
         rule PropertyListNotEmpty_item() -> Option<FocusedTriplePattern<(NamedNodePattern,Vec<ReifiedTerm>)>> = ";" _ c:PropertyListNotEmpty_item_content()? {
             c
         }
-        rule PropertyListNotEmpty_item_content() -> FocusedTriplePattern<(NamedNodePattern,Vec<ReifiedTerm>)> = p:Verb() _ o:ObjectList() _ {
+        rule PropertyListNotEmpty_item_content() -> FocusedTriplePattern<(NamedNodePattern,Vec<ReifiedTerm>)> = head:PropertyListNotEmpty_head() _ {
+            let (p, o) = head;
             FocusedTriplePattern {
                 focus: (p, o.focus),
                 patterns: o.patterns
@@ -2730,7 +2972,12 @@ parser! {
             PropertyListPathNotEmpty() /
             { FocusedTripleOrPathPattern::default() }
 
-        rule PropertyListPathNotEmpty() -> FocusedTripleOrPathPattern<Vec<(VariableOrPropertyPath,Vec<ReifiedTerm>)>> = hp:(VerbPath() / VerbSimple()) _ ho:ObjectListPath() _ t:PropertyListPathNotEmpty_item()* {
+        rule PropertyListPathNotEmpty_head() -> (VariableOrPropertyPath, FocusedTripleOrPathPattern<Vec<ReifiedTerm>>) =
+            hp:(VerbPath() / VerbSimple()) _ ho:ObjectListPath() { (hp, ho) } /
+            PlaceholderCompactA() _ ho:ObjectListPath() { (PropertyPathExpression::NamedNode(rdf::TYPE.into_owned()).into(), ho) }
+
+        rule PropertyListPathNotEmpty() -> FocusedTripleOrPathPattern<Vec<(VariableOrPropertyPath,Vec<ReifiedTerm>)>> = head:PropertyListPathNotEmpty_head() _ t:PropertyListPathNotEmpty_item()* {
+                let (hp, ho) = head;
                 t.into_iter().flatten().fold(FocusedTripleOrPathPattern {
                     focus: vec![(hp, ho.focus)],
                     patterns: ho.patterns
@@ -2743,7 +2990,8 @@ parser! {
         rule PropertyListPathNotEmpty_item() -> Option<FocusedTripleOrPathPattern<(VariableOrPropertyPath,Vec<ReifiedTerm>)>> = ";" _ c:PropertyListPathNotEmpty_item_content()? {
             c
         }
-        rule PropertyListPathNotEmpty_item_content() -> FocusedTripleOrPathPattern<(VariableOrPropertyPath,Vec<ReifiedTerm>)> = p:(VerbPath() / VerbSimple()) _ o:ObjectListPath() _ {
+        rule PropertyListPathNotEmpty_item_content() -> FocusedTripleOrPathPattern<(VariableOrPropertyPath,Vec<ReifiedTerm>)> = head:PropertyListPathNotEmpty_head() _ {
+            let (p, o) = head;
             FocusedTripleOrPathPattern {
                 focus: (p, o.focus),
                 patterns: o.patterns
@@ -3031,9 +3279,14 @@ parser! {
             t:VarOrTerm() { FocusedTripleOrPathPattern::new(t) } /
             TriplesNodePath()
 
-        rule ReifiedTriple() -> FocusedTriplePattern<TermPattern> = "<<" _ s:ReifiedTripleSubject() _ p:Verb() _ o:ReifiedTripleObject() _ r:Reifier()? _ ">>" {?
+        rule ReifiedTriple_po() -> (NamedNodePattern, FocusedTriplePattern<TermPattern>) =
+            p:Verb() _ o:ReifiedTripleObject() { (p, o) } /
+            PlaceholderCompactA() _ o:ReifiedTripleObject() { (rdf::TYPE.into_owned().into(), o) }
+
+        rule ReifiedTriple() -> FocusedTriplePattern<TermPattern> = "<<" _ s:ReifiedTripleSubject() _ po:ReifiedTriple_po() _ r:Reifier()? _ ">>" {?
             #[cfg(feature = "sparql-12")]
             {
+                let (p, o) = po;
                 let r = r.unwrap_or_else(|| BlankNode::default().into());
                 let mut output = FocusedTriplePattern::new(r.clone());
                 output.patterns.push(TriplePattern {
@@ -3070,7 +3323,12 @@ parser! {
             l:BooleanLiteral() { FocusedTriplePattern::new(l) } /
             b:BlankNode() { FocusedTriplePattern::new(b) }
 
-        rule TripleTerm() -> TriplePattern = "<<(" _ s:TripleTermSubject() _ p:Verb() _ o:TripleTermObject() _ ")>>" {
+        rule TripleTerm_po() -> (NamedNodePattern, TermPattern) =
+            p:Verb() _ o:TripleTermObject() { (p, o) } /
+            PlaceholderCompactA() _ o:TripleTermObject() { (rdf::TYPE.into_owned().into(), o) }
+
+        rule TripleTerm() -> TriplePattern = "<<(" _ s:TripleTermSubject() _ po:TripleTerm_po() _ ")>>" {
+            let (p, o) = po;
             TriplePattern {
                 subject: s,
                 predicate: p,
@@ -3092,7 +3350,12 @@ parser! {
             l:BooleanLiteral() { l.into() } /
             b:BlankNode() { b.into() }
 
-        rule TripleTermData() -> GroundTriple = "<<(" _ s:TripleTermDataSubject() _ p:TripleTermData_p() _ o:TripleTermDataObject() _ ")>>" {
+        rule TripleTermData_po() -> (NamedNode, GroundTerm) =
+            p:TripleTermData_p() _ o:TripleTermDataObject() { (p, o) } /
+            PlaceholderCompactA() _ o:TripleTermDataObject() { (rdf::TYPE.into_owned(), o) }
+
+        rule TripleTermData() -> GroundTriple = "<<(" _ s:TripleTermDataSubject() _ po:TripleTermData_po() _ ")>>" {
+            let (p, o) = po;
             GroundTriple {
                 subject: s,
                 predicate: p,
@@ -3200,8 +3463,16 @@ parser! {
             l:BooleanLiteral() { l.into() } /
             BuiltInCall()
 
-        rule ExprTripleTerm() -> Expression = "<<(" _ s:ExprTripleTermSubject() _ p:Verb() _ o:ExprTripleTermObject() _ ")>>" {?
-            #[cfg(feature = "sparql-12")]{Ok(Expression::FunctionCall(Function::Triple, vec![s, p.into(), o]))}
+        rule ExprTripleTerm_po() -> (NamedNodePattern, Expression) =
+            p:Verb() _ o:ExprTripleTermObject() { (p, o) } /
+            PlaceholderCompactA() _ o:ExprTripleTermObject() { (rdf::TYPE.into_owned().into(), o) }
+
+        rule ExprTripleTerm() -> Expression = "<<(" _ s:ExprTripleTermSubject() _ po:ExprTripleTerm_po() _ ")>>" {?
+            #[cfg(feature = "sparql-12")]
+            {
+                let (p, o) = po;
+                Ok(Expression::FunctionCall(Function::Triple, vec![s, p.into(), o]))
+            }
             #[cfg(not(feature = "sparql-12"))]{Err("Triple terms are only available in SPARQL 1.2")}
         }
 
@@ -3808,5 +4079,267 @@ mod tests {
         ] {
             assert!(parse(ok).is_ok(), "must accept valid query: {ok}");
         }
+    }
+
+    #[test]
+    fn round8_relative_iri_bounds_and_escaped_iriref_admission() {
+        // R8-1: O(1) cached component bounds across authority/path/query/fragment shapes.
+        let base_with_query = Iri::parse(format!(
+            "https://example.org/dir/page?{}",
+            "q".repeat(100_000)
+        ))
+        .unwrap();
+        let path_end = "https://example.org/dir/page".len();
+        let query_end = base_with_query.as_str().len();
+        assert_eq!(
+            relative_iri_resolution_bound(&base_with_query, IriRefHead::from_plain("item")),
+            path_end + 1 + "item".len()
+        );
+        assert_eq!(
+            relative_iri_resolution_bound(&base_with_query, IriRefHead::from_plain("?k=1")),
+            path_end + "?k=1".len()
+        );
+        assert_eq!(
+            relative_iri_resolution_bound(&base_with_query, IriRefHead::from_plain("#frag")),
+            query_end + "#frag".len()
+        );
+        assert_eq!(
+            relative_iri_resolution_bound(&base_with_query, IriRefHead::from_plain("")),
+            query_end
+        );
+        assert_eq!(
+            relative_iri_resolution_bound(&base_with_query, IriRefHead::from_plain("/root")),
+            "https://example.org".len() + "/root".len()
+        );
+        assert_eq!(
+            relative_iri_resolution_bound(&base_with_query, IriRefHead::from_plain("//host/p")),
+            "https:".len() + "//host/p".len()
+        );
+
+        // Edge cases: empty authority (`file:///a`) and empty query (`https://ex/p?`).
+        let empty_auth = Iri::parse("file:///a".to_string()).unwrap();
+        assert_eq!(
+            relative_iri_resolution_bound(&empty_auth, IriRefHead::from_plain("/b")),
+            "file://".len() + "/b".len()
+        );
+        let empty_query = Iri::parse("https://ex/p?".to_string()).unwrap();
+        assert_eq!(
+            relative_iri_resolution_bound(&empty_query, IriRefHead::from_plain("#f")),
+            "https://ex/p?".len() + "#f".len()
+        );
+
+        // Long query component in BASE: many path-relative and query-relative IRIs stay under
+        // budget while fragment-relative IRIs (which retain the query) exceed it.
+        let long_query_base = base_with_query.as_str();
+        let budget = long_query_base.len() + 10_000;
+        let mut path_rel_query = format!("BASE <{long_query_base}>\nSELECT * WHERE {{\n");
+        for i in 0..64 {
+            path_rel_query.push_str(&format!("  ?s <item{i}> <?k={i}> .\n"));
+        }
+        path_rel_query.push('}');
+        assert!(
+            SparqlParser::new()
+                .with_max_resolved_iri_bytes(budget)
+                .parse_query(&path_rel_query)
+                .is_ok()
+        );
+
+        let frag_rel_query =
+            format!("BASE <{long_query_base}>\nSELECT * WHERE {{ ?s <#f1> <#f2> . }}");
+        let err = SparqlParser::new()
+            .with_max_resolved_iri_bytes(budget)
+            .parse_query(&frag_rel_query)
+            .unwrap_err();
+        assert!(err.is_resolved_iri_limit_exceeded(), "{err}");
+
+        // R8-6: Escaped absolute and relative IRIREFs measure decoded bytes before admission.
+        let escaped_abs = r"SELECT * WHERE { ?s <https://example.org/\u0061\u0062\u00e9> ?o }";
+        // Decoded IRI is "https://example.org/abé" (20 + 2 + 2 = 24 bytes).
+        let decoded_len = "https://example.org/ab\u{00e9}".len();
+        assert!(
+            SparqlParser::new()
+                .with_max_resolved_iri_bytes(decoded_len)
+                .parse_query(escaped_abs)
+                .is_ok()
+        );
+        let err = SparqlParser::new()
+            .with_max_resolved_iri_bytes(decoded_len - 1)
+            .parse_query(escaped_abs)
+            .unwrap_err();
+        assert!(err.is_resolved_iri_limit_exceeded(), "{err}");
+
+        // Escaped scheme (`\u0068ttps://...`) under a long BASE is recognized as absolute
+        // without charging the long BASE path.
+        let long_path_base = format!("https://example.org/{}/", "a".repeat(20_000));
+        let escaped_scheme = format!(
+            r"BASE <{long_path_base}> SELECT * WHERE {{ ?s <\u0068ttps://s.example/\u0061> ?o }}"
+        );
+        let tight_budget = long_path_base.len() + "https://s.example/a".len();
+        assert!(
+            SparqlParser::new()
+                .with_max_resolved_iri_bytes(tight_budget)
+                .parse_query(&escaped_scheme)
+                .is_ok()
+        );
+        let err = SparqlParser::new()
+            .with_max_resolved_iri_bytes(tight_budget - 1)
+            .parse_query(&escaped_scheme)
+            .unwrap_err();
+        assert!(err.is_resolved_iri_limit_exceeded(), "{err}");
+
+        // Escaped root-relative (`\u002fshort`) under a long BASE path uses authority bound.
+        let escaped_root =
+            format!(r"BASE <{long_path_base}> SELECT * WHERE {{ ?s <\u002fshort> ?o }}");
+        let root_budget = long_path_base.len() + "https://example.org/short".len();
+        assert!(
+            SparqlParser::new()
+                .with_max_resolved_iri_bytes(root_budget)
+                .parse_query(&escaped_root)
+                .is_ok()
+        );
+        let err = SparqlParser::new()
+            .with_max_resolved_iri_bytes(root_budget - 1)
+            .parse_query(&escaped_root)
+            .unwrap_err();
+        assert!(err.is_resolved_iri_limit_exceeded(), "{err}");
+    }
+
+    #[test]
+    fn round8_grouped_projection_multi_arg_and_sibling_subselect_inference() {
+        let parse = |q: &str| {
+            SparqlParser::new()
+                .with_placeholder_prefix("p", "urn:sparkles:test:p0/")
+                .unwrap()
+                .parse_query(q)
+        };
+
+        // R8-3: Multi-argument and zero-argument synthetic scalar calls in grouped projections
+        // preserve argument-based variable binding checks.
+        for ok in [
+            "SELECT (p:f(1, 2) AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f() AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:f(?g, 1) AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:g> ?g ; <urn:p> ?v } GROUP BY ?g",
+            "SELECT (p:f(COUNT(?v), 1) AS ?x) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:g(p:f(?v), 1) AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v }",
+        ] {
+            assert!(parse(ok).is_ok(), "must accept grouped scalar call: {ok}");
+        }
+        for bad in [
+            "SELECT (p:f(?v, 1) AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v }",
+            "SELECT (p:g(p:h(?v, 2), 1) AS ?x) (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v }",
+        ] {
+            assert!(
+                parse(bad).is_err(),
+                "must reject unbound arg in grouped scalar call: {bad}"
+            );
+        }
+
+        // R8-4: Sibling subselects inferring an aggregate in either order reject nested calls
+        // in ORDER BY, HAVING, and SELECT projections, including self- and cross-nesting.
+        for bad in [
+            // Earlier sibling ORDER BY wraps COUNT; later sibling infers p:f.
+            "SELECT ?n WHERE { \
+                { SELECT (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v } ORDER BY p:f(COUNT(?v)) } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+            // Reverse sibling order.
+            "SELECT ?n WHERE { \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+                { SELECT (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v } ORDER BY p:f(COUNT(?v)) } \
+            }",
+            // Earlier sibling HAVING wraps COUNT; later sibling infers p:f.
+            "SELECT ?n WHERE { \
+                { SELECT (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v } HAVING (p:f(COUNT(?v)) > 0) } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+            // Earlier sibling SELECT projection wraps COUNT; later sibling infers p:f.
+            "SELECT ?n WHERE { \
+                { SELECT (p:f(COUNT(?v)) AS ?n) WHERE { ?s <urn:p> ?v } } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+            // Inner subselect wraps COUNT; outer ORDER BY infers p:f.
+            "SELECT (COUNT(?n) AS ?c) WHERE { \
+                { SELECT (p:f(COUNT(?v)) AS ?n) WHERE { ?s <urn:p> ?v } } \
+            } ORDER BY p:f(DISTINCT ?n)",
+            // Earlier sibling nests p:f(p:f(?v)); later sibling infers p:f.
+            "SELECT ?n WHERE { \
+                { SELECT (p:f(p:f(?v)) AS ?n) WHERE { ?s <urn:p> ?v } } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+            // Earlier sibling nests p:f(p:g(?v)); later siblings infer p:f and p:g.
+            "SELECT ?n WHERE { \
+                { SELECT (p:f(p:g(?v)) AS ?n) WHERE { ?s <urn:p> ?v } } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+                { SELECT (p:g(DISTINCT ?z) AS ?k) WHERE { ?s <urn:r> ?z } } \
+            }",
+        ] {
+            assert!(
+                parse(bad).is_err(),
+                "must reject cross-subselect nested inferred aggregate: {bad}"
+            );
+        }
+
+        // Valid controls: non-nested sibling calls and explicit-IRI controls must pass.
+        for ok in [
+            "SELECT ?n WHERE { \
+                { SELECT (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v } ORDER BY p:f(?v) } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+            "SELECT ?n WHERE { \
+                { SELECT (COUNT(?v) AS ?n) WHERE { ?s <urn:p> ?v } ORDER BY <urn:sparkles:test:p0/f>(COUNT(?v)) } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+            "SELECT ?n WHERE { \
+                { SELECT (p:f(p:g(?v)) AS ?n) WHERE { ?s <urn:p> ?v } } \
+                { SELECT (p:f(DISTINCT ?w) AS ?m) WHERE { ?s <urn:q> ?w } } \
+            }",
+        ] {
+            assert!(parse(ok).is_ok(), "must accept valid sibling query: {ok}");
+        }
+    }
+
+    #[test]
+    fn round8_placeholder_compact_a_shorthand() {
+        let parse_with_placeholders = |q: &str| {
+            SparqlParser::new()
+                .with_placeholder_prefix("ap", "urn:sparkles:test:p0/")
+                .unwrap()
+                .with_placeholder_prefix("p", "urn:sparkles:test:p1/")
+                .unwrap()
+                .with_placeholder_prefix("a", "urn:sparkles:test:p2/")
+                .unwrap()
+                .with_placeholder_prefix("", "urn:sparkles:test:p3/")
+                .unwrap()
+                .parse_query(q)
+        };
+
+        // Both compact `a` shorthand and real two-term `ap`/`a` predicates succeed when synthetic.
+        for ok in [
+            "SELECT ?s WHERE { ?s ap:C . }",
+            "SELECT ?s WHERE { ?s a:C . }",
+            "SELECT ?s WHERE { ?s ap:C , p:D . }",
+            "SELECT ?s WHERE { ?s <urn:q> ?o ; ap:C . }",
+            "SELECT ?s WHERE { [ ap:C ] <urn:q> ?s . }",
+            "SELECT ?s WHERE { ?s ap:p ?o . }",
+            "SELECT ?s WHERE { ?s a:p ?o . }",
+            "SELECT ?s WHERE { ?s <urn:q> ap:C . }",
+            "CONSTRUCT { ?s ap:C . } WHERE { ?s ap:p ?o . }",
+        ] {
+            assert!(
+                parse_with_placeholders(ok).is_ok(),
+                "must accept placeholder compact `a` / `ap` query: {ok}"
+            );
+        }
+
+        // Explicitly declaring `PREFIX ap:` removes it from placeholder_prefixes, so `?s ap:C .`
+        // must fail under standard SPARQL longest-match semantics.
+        assert!(
+            parse_with_placeholders(
+                "PREFIX ap: <http://example.org/ap/> SELECT ?s WHERE { ?s ap:C . }"
+            )
+            .is_err()
+        );
+        // Bare `a` with no object must still fail.
+        assert!(parse_with_placeholders("SELECT ?s WHERE { ?s a . }").is_err());
     }
 }

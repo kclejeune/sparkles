@@ -1443,6 +1443,7 @@ fn classify_namespace_placeholder(
 /// charging the initial namespace scan against `WorkBudget`.
 pub(crate) struct KnownPrefixes<'a> {
     pub(crate) map: FxHashMap<&'a str, &'a str>,
+    max_prefix_len: usize,
     shapes: std::cell::RefCell<
         FxHashMap<&'a str, std::result::Result<NamespacePlaceholderShape, String>>,
     >,
@@ -1452,8 +1453,10 @@ pub(crate) struct KnownPrefixes<'a> {
 
 impl<'a> KnownPrefixes<'a> {
     pub(crate) fn new(map: FxHashMap<&'a str, &'a str>) -> Self {
+        let max_prefix_len = map.keys().map(|k| k.len()).max().unwrap_or(0);
         Self {
             map,
+            max_prefix_len,
             shapes: std::cell::RefCell::new(FxHashMap::default()),
             #[cfg(test)]
             classification_scans: std::cell::Cell::new(0),
@@ -1482,10 +1485,7 @@ impl<'a> KnownPrefixes<'a> {
         }
         // Charge the initial namespace scan to `budget` at the same 256-byte cadence
         // as `tokenize_sparql` before running `oxiri::Iri::parse` over `real_ns`.
-        let steps = (real_ns.len() / 256).max(1);
-        for _ in 0..steps {
-            budget.step()?;
-        }
+        budget.charge_steps((real_ns.len() / 256).max(1))?;
         #[cfg(test)]
         self.classification_scans
             .set(self.classification_scans.get().saturating_add(1));
@@ -1602,9 +1602,11 @@ pub(crate) fn validate_subquery_text(
     if !first.is_word(text, "SELECT") {
         bail!("sp:SubQuery sp:text must be a SELECT query");
     }
+    const WRAPPER_OVERHEAD: usize = "SELECT * WHERE { {\n\n} }".len();
     let mut brace_depth: isize = 0;
     let mut prefix_indices: FxHashMap<&str, usize> = FxHashMap::default();
     let mut used_prefixes: Vec<(&str, String)> = Vec::new();
+    let mut header_bytes = 0usize;
     for tok in &tokens {
         match tok.kind {
             TokKind::LBrace => brace_depth += 1,
@@ -1617,6 +1619,15 @@ pub(crate) fn validate_subquery_text(
             TokKind::PrefixedName => {
                 if let Some((prefix, _local)) = tok.as_str(text).split_once(':') {
                     for_each_candidate_prefix(prefix, budget, |cand, budget| {
+                        if let Some(env) = known_prefixes
+                            && cand.len() > env.max_prefix_len
+                        {
+                            return Ok(());
+                        }
+                        // Charge hash lookup work at the same 256-byte-per-step cadence as
+                        // `tokenize_sparql` before hashing `cand` into `prefix_indices` or
+                        // `known_prefixes.map`.
+                        budget.charge_steps((cand.len() / 256).max(1))?;
                         if prefix_indices.contains_key(cand) {
                             return Ok(());
                         }
@@ -1625,6 +1636,23 @@ pub(crate) fn validate_subquery_text(
                             None => Some(indexed_placeholder_ns(used_prefixes.len())),
                         };
                         if let Some(ns) = effective_ns {
+                            // "PREFIX " (7) + cand + ": <" (3) + ns + ">\n" (2)
+                            let next_header_bytes = header_bytes
+                                .saturating_add(12)
+                                .saturating_add(cand.len())
+                                .saturating_add(ns.len());
+                            let next_wrapped_len = next_header_bytes
+                                .saturating_add(text.len())
+                                .saturating_add(WRAPPER_OVERHEAD);
+                            if next_header_bytes > MAX_OUTPUT_BYTES
+                                || next_wrapped_len > super::rdf::MAX_RETAINED_BYTES
+                            {
+                                return Err(limit_err(format!(
+                                    "SPIN subquery validation wrapper exceeds maximum size ({} bytes)",
+                                    super::rdf::MAX_RETAINED_BYTES
+                                )));
+                            }
+                            header_bytes = next_header_bytes;
                             let new_slot = used_prefixes.len();
                             prefix_indices.insert(cand, new_slot);
                             used_prefixes.push((cand, ns));
@@ -1640,17 +1668,9 @@ pub(crate) fn validate_subquery_text(
         bail!("sp:SubQuery sp:text has unbalanced braces");
     }
 
-    let mut header_bytes = 0usize;
-    for (p, ns) in &used_prefixes {
-        // "PREFIX " (7) + p + ": <" (3) + ns + ">\n" (2)
-        header_bytes = header_bytes
-            .saturating_add(12)
-            .saturating_add(p.len())
-            .saturating_add(ns.len());
-    }
     let wrapped_len = header_bytes
         .saturating_add(text.len())
-        .saturating_add("SELECT * WHERE { {\n\n} }".len());
+        .saturating_add(WRAPPER_OVERHEAD);
     if header_bytes > MAX_OUTPUT_BYTES || wrapped_len > super::rdf::MAX_RETAINED_BYTES {
         return Err(limit_err(format!(
             "SPIN subquery validation wrapper exceeds maximum size ({} bytes)",
