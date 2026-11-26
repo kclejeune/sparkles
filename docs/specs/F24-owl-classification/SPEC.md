@@ -5497,8 +5497,9 @@ ROBOT's error messages and its exit status 1 are kept. The transformations live 
 the classification passed in as a function, so they use the classifier without changing
 it. `sparkles::handles::ontology::transform::WorkingOntology` reads a file through
 `OntologyFile` or a database with `--loc`, runs the classifier with the caller's
-threads, deadline and budgets, and writes functional-style syntax, RDF/XML, Turtle and
-N-Triples, gzipped when the name ends in `.gz`.
+threads, deadline and budgets, and writes functional-style syntax, OWL/XML, Manchester
+OWL syntax, OBO 1.4, OBO Graphs JSON, RDF/XML, Turtle and N-Triples, gzipped when the
+name ends in `.gz`.
 
 **What each command does.** `reason` validates as ROBOT's `ReasonerHelper.validate` does.
 An inconsistent ontology, an unsatisfiable class or an unsatisfiable object property
@@ -5588,8 +5589,19 @@ and 30.63 s, and the chain took 3.87 s and 10.27 s. The run record of the
 [ROBOT comparison](../../benchmarks/el-classification/RESULTS.md#robot) keeps the
 comparison and the timings.
 
-**Limits.** The commands read no dataset on a server (item 685), write no OWL/XML,
-Manchester, OBO or OBO Graphs JSON (item 686), and refuse
+**Output formats.** `sparkles_owl::owx`, `sparkles_owl::manchester`, `sparkles_owl::obo`
+and `sparkles_owl::obographs` write OWL/XML (`.owx`), Manchester OWL syntax (`.omn`),
+OBO 1.4 (`.obo`) and OBO Graphs JSON (`.json`) documents deterministically with proper
+escaping, prefix handling and nesting bounds (item 686). OWL/XML covers all 37 OWL 2
+axiom kinds losslessly, while the Manchester, OBO 1.4 and OBO Graphs JSON writers accept
+`WriteOptions` so callers can either refuse the first unrepresentable axiom in strict mode
+or skip it and receive a bounded `WriteReport` capped at `MAX_REPORTED_SKIPPED` entries.
+`sparkles ontology reason`, `reduce`, `relax`, `materialize` and chains select these
+writers from the output file extension, including `.gz` variants, and log a concise
+warning to stderr whenever a lossy format skips axioms. `sparkles ontology axioms` and
+`sparkles ontology classify` also accept `--format owx`, `omn`, `obo` and `obographs`.
+
+**Limits.** The commands read no dataset on a server (item 685) and refuse
 `--prevent-invalid-references true` (item 687). `reason --reasoner emr` asserts
 named superclasses only, as ELK does, not the class expressions that ROBOT's expression
 materializing reasoner adds, which item 691 follows.
