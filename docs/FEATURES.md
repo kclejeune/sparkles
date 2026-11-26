@@ -118,8 +118,10 @@ walkthroughs of each view.
 ### Libraries and integrations
 
 Embed the same engine through [Rust, Python, JVM and Node.js APIs](integrations/README.md#libraries-and-bindings),
-or connect through the Rust HTTP client. The guide describes Jena integration and the
-administration, callback and platform coverage that differs between bindings.
+or connect through the Rust HTTP client. Python branch updates clear notes on explicit
+`note=None` while preserving them when `note` is omitted, and the guide describes Jena
+integration and the administration, callback and platform coverage that differs between
+bindings.
 
 ### Deployment and operations
 

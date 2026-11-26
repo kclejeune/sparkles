@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import threading
 import time
 from pathlib import Path
@@ -361,3 +362,61 @@ def test_branch_conflict_preview_contains_cells(tmp_path: Path) -> None:
         merged = ds.branches.merge("work", on_conflict="theirs")
         assert merged["conflicts"]["resolved"] == 1
         branch.close()
+
+
+@pytest.mark.parametrize("kind", ["mem", "persistent"])
+def test_branch_update_note_argument_presence(tmp_path: Path, kind: str) -> None:
+    sig = inspect.signature(sparkles.Branches.update)
+    assert list(sig.parameters) == ["self", "name", "protected", "note", "new_name"]
+    note_param = sig.parameters["note"]
+    assert note_param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert note_param.default is Ellipsis
+
+    ds = Dataset() if kind == "mem" else Dataset(tmp_path / "db")
+    with ds:
+        created = ds.branches.create("work", note="initial")
+        assert created["note"] == "initial"
+
+        # Omitting note leaves the existing note unchanged across no-op and other updates.
+        assert ds.branches.update("work")["note"] == "initial"
+        protected = ds.branches.update("work", protected=True)
+        assert protected["protected"] is True and protected["note"] == "initial"
+
+        # Explicit string values replace the note, including the empty string.
+        assert ds.branches.update("work", note="updated")["note"] == "updated"
+        assert ds.branches.update("work", note="")["note"] == ""
+        assert ds.branches.update("work", note="before clear")["note"] == "before clear"
+
+        # Invalid note types raise TypeError without changing the stored note.
+        for bad in (123, True, b"bytes", ["note"], Ellipsis, object()):
+            with pytest.raises(TypeError):
+                ds.branches.update("work", note=bad)  # type: ignore[arg-type]
+        assert ds.branches.get("work")["note"] == "before clear"
+
+        # Engine validation errors still apply to string notes and leave the note intact.
+        with pytest.raises(InvalidInputError):
+            ds.branches.update("work", note="x" * 1025)
+        assert ds.branches.get("work")["note"] == "before clear"
+
+        # Explicit note=None clears the note, and clearing again stays None.
+        cleared = ds.branches.update("work", note=None)
+        assert cleared["note"] is None and cleared["protected"] is True
+        assert ds.branches.get("work")["note"] is None
+        assert ds.branches.update("work", protected=False)["note"] is None
+        assert ds.branches.update("work", note=None)["note"] is None
+
+        # Combined update clears the note before renaming.
+        ds.branches.update("work", note="renamed-soon")
+        renamed = ds.branches.update("work", protected=True, note=None, new_name="moved")
+        assert renamed["name"] == "moved"
+        assert renamed["protected"] is True
+        assert renamed["note"] is None
+
+        # Main branch notes also distinguish omission from explicit clearing.
+        assert ds.branches.update("main", note="main note")["note"] == "main note"
+        assert ds.branches.update("main", protected=True)["note"] == "main note"
+        assert ds.branches.update("main", note=None)["note"] is None
+        assert ds.branches.get("main")["note"] is None
+
+    with pytest.raises(InvalidInputError, match="closed"):
+        ds.branches.update("moved", note=None)
