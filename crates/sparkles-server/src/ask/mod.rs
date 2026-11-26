@@ -227,6 +227,8 @@ pub struct AskOptions {
     pub rows_for_summary: usize,
     /// the deadline of the whole ask
     pub deadline: Duration,
+    /// optional absolute deadline (takes precedence over `started + deadline`)
+    pub deadline_at: Option<Instant>,
     /// the token budget of the whole ask
     pub max_tokens: u64,
     /// the complexity score from which a stronger pair starts (§5.5)
@@ -291,6 +293,7 @@ impl Default for AskOptions {
             max_rows: 1000,
             rows_for_summary: 50,
             deadline: Duration::from_secs(120),
+            deadline_at: None,
             max_tokens: 50_000,
             complexity_threshold: DEFAULT_COMPLEXITY_THRESHOLD,
             example_score: DEFAULT_EXAMPLE_SCORE,
@@ -333,7 +336,7 @@ pub fn ask(
     let pipeline = tracing::debug_span!(target: profile::TARGET, "ask.pipeline", pipeline_id = profile.id(), context_tokens = tracing::field::Empty);
     let _entered = pipeline.enter();
     let cancel = o.cancel.clone().unwrap_or_default();
-    let deadline = started + o.deadline;
+    let deadline = o.deadline_at.unwrap_or_else(|| started + o.deadline);
     let preparation = match o.preparation.clone() {
         Some(AskPreparation(preparation)) => preparation,
         None => match sparkles::access::Preparation::for_request(&sparkles::sparql::QueryOptions {
@@ -718,10 +721,15 @@ impl Asking<'_, '_> {
             };
             let admission: Option<&dyn crate::models::admission::Admission> =
                 if self.fenced { Some(&fence) } else { None };
-            match self
-                .models
-                .call_prompt(Some(role), &pair, prompt, out, self.deadline, admission)
-            {
+            match self.models.call_prompt_with_cancel(
+                Some(role),
+                &pair,
+                prompt,
+                out,
+                self.deadline,
+                admission,
+                Some(&self.cancel),
+            ) {
                 Ok(a) => {
                     self.push_step(role, a.record);
                     return Ok((a.value, a.level, pair));
@@ -739,6 +747,9 @@ impl Asking<'_, '_> {
                             return Err((AUTHORITY_CHANGED, message));
                         }
                         StepError::Deadline => return Err(("timeout", message)),
+                        StepError::Cancelled => {
+                            return Err(("cancelled", "the ask was cancelled".into()));
+                        }
                         _ => {
                             self.failed_calls += 1;
                             if self.failed_calls >= MAX_FAILED_CALLS
@@ -790,8 +801,14 @@ impl Asking<'_, '_> {
         {
             m.insert("reasoning".into(), r.into());
         }
+        if self.cancelled() {
+            return Err(ToolError::new("cancelled", 503, "the ask was cancelled"));
+        }
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(ToolError::new("timeout", 504, "the ask's deadline passed"));
+        }
         if timed {
-            let left = self.deadline.saturating_duration_since(Instant::now());
             let secs = left.min(self.server.cfg().max_timeout).as_secs_f64();
             if secs < 0.05 {
                 return Err(ToolError::new("timeout", 504, "the ask's deadline passed"));
@@ -823,7 +840,17 @@ impl Asking<'_, '_> {
 
     fn tool_unprofiled(&self, name: &str, args: Value, timed: bool) -> Result<Value, ToolError> {
         let (m, mut call) = self.tool_call(name, args, timed)?;
-        Ok(match self.server.run_now(name, m, &mut call)? {
+        let out = if timed {
+            self.server.run_now(name, m, &mut call)?
+        } else {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(ToolError::new("timeout", 504, "the ask's deadline passed"));
+            }
+            let bounded = self.server.with_max_timeout(left);
+            bounded.run_now(name, m, &mut call)?
+        };
+        Ok(match out {
             Outcome::Structured(v) => v,
             Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
         })
@@ -913,9 +940,16 @@ impl Asking<'_, '_> {
         if let Some(q) = self.o.query.clone() {
             return self.given(&q);
         }
+        if !self.o.run && self.o.mode == AskMode::Global {
+            return self.error(
+                "bad-argument",
+                "run: false previews a checked SPARQL query and does not apply to mode global",
+            );
+        }
         // C22 §7: the reports a global answer may use, and the explicit global mode.
-        // An ask that cites claims answers from the data.
-        if self.o.mode != AskMode::Local
+        // An ask that cites claims or previews a query without running answers from the data.
+        if self.o.run
+            && self.o.mode != AskMode::Local
             && self.o.review_policy.is_none()
             && self.o.matching_policy.is_none()
         {
@@ -961,6 +995,12 @@ impl Asking<'_, '_> {
         profile::context_tokens(context_tokens);
         tracing::Span::current().record("context_tokens", context_tokens);
         let ground = self.ground(context_tokens);
+        if self.cancelled() {
+            return self.error("cancelled", "the ask was cancelled");
+        }
+        if Instant::now() >= self.deadline {
+            return self.error("timeout", "the ask's deadline passed");
+        }
         // C22 §7.1: a question that names an entity linked exactly is local
         if ground.exact {
             self.reports = None;

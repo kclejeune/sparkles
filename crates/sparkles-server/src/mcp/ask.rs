@@ -141,12 +141,12 @@ pub(super) fn tool_def(cfg: &McpConfig) -> ToolDef {
             "run": {
                 "type": "boolean",
                 "default": true,
-                "description": "Run the checked query (false stops after check_query and returns outcome checked)."
+                "description": "Run the checked query in local or auto mode (false stops after check_query and returns outcome checked; rejected with mode global)."
             },
             "summary": {
                 "type": "boolean",
                 "default": true,
-                "description": "Summarize the rows with citations when the dataset allows sending rows to a model."
+                "description": "Summarize the query result rows with citations in local mode when the dataset allows sending rows to a model (ignored in global mode, which answers from community reports)."
             },
             "maxRows": {
                 "type": "integer",
@@ -255,7 +255,7 @@ pub(super) fn tool_def(cfg: &McpConfig) -> ToolDef {
                     "provider": {"type": "string"},
                     "model": {"type": "string"},
                     "uncited": {"type": "boolean"},
-                    "uncitedSentences": {"type": "array", "items": {"type": "integer"}}
+                    "uncitedSentences": {"type": "array", "items": {"type": "string"}}
                 }
             },
             "clarify": {
@@ -278,7 +278,7 @@ pub(super) fn tool_def(cfg: &McpConfig) -> ToolDef {
                     "query": {"type": "string"}
                 }
             },
-            "claims": {"type": "array", "items": {"type": "object"}},
+            "claims": {"type": "object"},
             "resolution": {"type": "object"},
             "points": {"type": "array", "items": {"type": "object"}},
             "reports": {"type": "array", "items": {"type": "object"}},
@@ -308,9 +308,10 @@ pub(super) fn tool_def(cfg: &McpConfig) -> ToolDef {
 }
 
 /// Build the internal MCP server the Ask pipeline uses to invoke grounding, checking
-/// and query sub-tools. It keeps the caller-visible dataset patterns and resource limits
-/// while enabling all read-only internal tools regardless of the outer tool profile.
-fn internal_server(outer: &McpServer) -> McpServer {
+/// and query sub-tools. It keeps the caller-visible dataset patterns, resource limits
+/// and snapshot pin table while enabling all read-only internal tools regardless of the
+/// outer tool profile.
+fn internal_server(outer: &McpServer, max_timeout: Duration) -> McpServer {
     let mut cfg = outer.cfg().clone();
     cfg.disabled.clear();
     cfg.profiles.clear();
@@ -318,7 +319,9 @@ fn internal_server(outer: &McpServer) -> McpServer {
     cfg.allow_update = false;
     cfg.allow_service = false;
     cfg.stored_queries = false;
-    McpServer::new(outer.state.clone(), cfg)
+    cfg.max_timeout = cfg.max_timeout.min(max_timeout);
+    cfg.default_timeout = cfg.default_timeout.min(cfg.max_timeout);
+    outer.with_config_shared_pins(cfg)
 }
 
 impl Tools<'_> {
@@ -451,6 +454,8 @@ impl Tools<'_> {
 
         // Validate optional provider/model override against permissions, configured
         // providers, allowedModels and per-provider row egress rules.
+        let mut override_active = false;
+        let mut override_allows_rows = true;
         let forced_pairs = match override_pair {
             None => Vec::new(),
             Some((provider_name, model_name)) => {
@@ -472,9 +477,11 @@ impl Tools<'_> {
                         "provider {provider_name:?} does not allow the model {model_name:?}"
                     )));
                 }
+                override_active = true;
+                override_allows_rows = settings.send_to(&provider_name) >= Send::Rows;
                 let pair = Pair::new(&provider_name, &model_name);
                 let mut pairs = vec![(Role::Draft, pair.clone()), (Role::Repair, pair.clone())];
-                if settings.send_to(&provider_name) >= Send::Rows {
+                if override_allows_rows {
                     pairs.push((Role::Summarize, pair.clone()));
                     pairs.push((Role::Community, pair));
                 }
@@ -500,16 +507,14 @@ impl Tools<'_> {
             Some(n) => n,
         };
 
-        // Effective deadline: bounded by both the MCP call timeout and dataset deadline.
+        // Effective deadline: bounded by both the MCP call timeout (defaulting to the
+        // advertised 30 s default) and the dataset deadline.
         let ds_deadline = Duration::from_secs_f64(
             settings
                 .deadline_secs
                 .unwrap_or(assistant::DEFAULT_DEADLINE_SECS),
         );
-        let budget_duration = match a.timeout_seconds {
-            Some(s) => self.timeout(Some(s))?.min(ds_deadline),
-            None => ds_deadline.min(cfg.max_timeout),
-        };
+        let budget_duration = self.timeout(a.timeout_seconds)?.min(ds_deadline);
         let deadline_at = self.call.arrived + budget_duration;
         let left = remaining(deadline_at)
             .map_err(|e| self.ctx(&[], budget_duration.as_secs_f64()).engine(e))?;
@@ -564,7 +569,13 @@ impl Tools<'_> {
             }
         };
 
-        let lists = assistant::lists(&models, &settings);
+        let mut lists = assistant::lists(&models, &settings);
+        if override_active && !override_allows_rows {
+            // Do not silently fall back to another configured provider for summarization
+            // or global mode when the caller's overridden provider is schema-only.
+            lists.remove(&Role::Summarize);
+            lists.remove(&Role::Community);
+        }
         let report_context = assistant::rows_allowed(
             &settings,
             &lists,
@@ -592,7 +603,7 @@ impl Tools<'_> {
             self.call.principal.clone()
         };
 
-        let rows_allowed = settings.send >= Send::Rows;
+        let rows_allowed = settings.send >= Send::Rows && override_allows_rows;
         let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
         let routing = settings.routing.clone().unwrap_or_default();
         let model_routing = models.config.routing.clone().unwrap_or_default();
@@ -621,6 +632,7 @@ impl Tools<'_> {
             max_rows,
             rows_for_summary: settings.rows_for_summary(),
             deadline: left,
+            deadline_at: Some(deadline_at),
             max_tokens,
             complexity_threshold: routing
                 .complexity_threshold
@@ -659,7 +671,10 @@ impl Tools<'_> {
         };
         let start = pinned_to_head.then_some(start);
 
-        let inner = internal_server(self.server);
+        let inner = internal_server(
+            self.server,
+            remaining(deadline_at).unwrap_or(Duration::ZERO),
+        );
         let mut ground = Value::Null;
         let mut on = |event: &str, data: &Value| {
             if event == "ground" {
@@ -686,7 +701,7 @@ impl Tools<'_> {
                     .as_u64()
                     .is_none_or(|c| c == s.commit)
         });
-        let access = assistant::answer_access(
+        let mut access = assistant::answer_access(
             read.as_ref(),
             ask_principal.view(&view_name, Endpoint::Query).as_ref(),
             &ask_principal.caller(),
@@ -694,6 +709,17 @@ impl Tools<'_> {
             branch.as_deref(),
             &me,
         );
+        if ask_principal.can_at(&view_name, Endpoint::Info, Level::Read) {
+            access.info = Some(Box::new(assistant::answer_access_for(
+                read.as_ref(),
+                ask_principal.view(&view_name, Endpoint::Info).as_ref(),
+                &ask_principal.caller(),
+                &main_ds.name,
+                branch.as_deref(),
+                &me,
+                "info",
+            )));
+        }
         let rec = assistant::record_of(&id, &me, &out).with_answer(
             &id,
             &written,
@@ -705,11 +731,14 @@ impl Tools<'_> {
 
         if out["outcome"] == "error" {
             let raw_code = out["error"]["code"].as_str().unwrap_or("internal");
-            let code = if raw_code == "provider-unavailable" && Instant::now() >= deadline_at {
-                "timeout"
-            } else {
-                raw_code
-            };
+            let code =
+                if raw_code == "provider-unavailable" && self.call.cancel.load(Ordering::Relaxed) {
+                    "cancelled"
+                } else if raw_code == "provider-unavailable" && Instant::now() >= deadline_at {
+                    "timeout"
+                } else {
+                    raw_code
+                };
             let message = out["error"]["message"]
                 .as_str()
                 .unwrap_or("the ask failed")

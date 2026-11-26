@@ -319,10 +319,14 @@ pub fn settings_at(dir: &std::path::Path) -> anyhow::Result<Option<AssistantSett
 }
 
 /// The role lists of a dataset (§3.5, §3.7): its overrides over the server's lists, with
-/// `summarize` limited to the providers that may receive rows.
+/// pairs filtered to active chat providers and allowed models, and `summarize` limited to
+/// the providers that may receive rows.
 #[cfg(feature = "mcp")]
 pub fn lists(models: &Models, s: &AssistantSettings) -> crate::ask::RoleLists {
     let mut l = crate::ask::resolve_lists(models, &s.roles);
+    for pairs in l.values_mut() {
+        pairs.retain(|p| models.allows_chat(p));
+    }
     if let Some(sum) = l.get_mut(&Role::Summarize) {
         sum.retain(|p| s.send_to(&p.provider) >= Send::Rows);
     }
@@ -369,7 +373,7 @@ pub fn ask_status(st: &AppState, s: &AssistantSettings) -> Result<(), &'static s
         .get(&Role::Draft)
         .cloned()
         .unwrap_or_else(|| m.pairs(Role::Draft));
-    if draft.is_empty() {
+    if !draft.iter().any(|p| m.allows_chat(p)) {
         return Err("no provider and model answers the draft role");
     }
     Ok(())
@@ -902,11 +906,14 @@ pub struct AnswerAccess {
     /// the branch the ask read, `main` when absent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// what the grounding (`Endpoint::Info`) could read, when the asker could read `info`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<Box<AnswerAccess>>,
 }
 
 /// The access record of an ask over `snap`, the state its answer read (`None` when
 /// that state cannot be opened, which keeps no footprint), read through `view`
-/// (`None`: unrestricted) by `principal`.
+/// (`None`: unrestricted) by `principal` on the `query` endpoint.
 pub fn answer_access(
     snap: Option<&Arc<sparkles::store::Snapshot>>,
     view: Option<&Arc<sparkles::access::GraphAccess>>,
@@ -914,6 +921,19 @@ pub fn answer_access(
     dataset: &str,
     branch: Option<&str>,
     principal: &str,
+) -> AnswerAccess {
+    answer_access_for(snap, view, caller, dataset, branch, principal, "query")
+}
+
+/// [`answer_access`] for a named endpoint (`"query"` or `"info"`).
+pub fn answer_access_for(
+    snap: Option<&Arc<sparkles::store::Snapshot>>,
+    view: Option<&Arc<sparkles::access::GraphAccess>>,
+    caller: &sparkles::access::Caller,
+    dataset: &str,
+    branch: Option<&str>,
+    principal: &str,
+    endpoint: &str,
 ) -> AnswerAccess {
     use crate::graphrag::guard::{CaptureInput, capture, capture_guarded};
     use crate::graphrag::settings::is_guarded;
@@ -923,6 +943,7 @@ pub fn answer_access(
             guarded: Vec::new(),
             guarded_footprint: None,
             branch: branch.map(str::to_string),
+            info: None,
         };
     };
     let bound = view.map(|v| v.bound(snap));
@@ -957,7 +978,7 @@ pub fn answer_access(
             branch: branch.unwrap_or(sparkles::branch::MAIN),
             source_commit: snap.commit,
             principal,
-            endpoint: "query",
+            endpoint,
             view: bound.as_deref(),
             caller,
             graphs,
@@ -985,6 +1006,7 @@ pub fn answer_access(
         guarded: if fits { guarded } else { Vec::new() },
         guarded_footprint,
         branch: branch.map(str::to_string),
+        info: None,
     }
 }
 
@@ -1261,6 +1283,9 @@ fn expired(r: &AskRecord, days: u32) -> bool {
 
 /// Keep a finished ask in its principal's history, when the dataset keeps history.
 pub fn remember(st: &AppState, ds: &Dataset, rec: AskRecord) {
+    if st.read_only {
+        return;
+    }
     let days = settings(st, ds).history_days(st);
     if days == 0 {
         return;
@@ -1286,6 +1311,9 @@ pub fn remember(st: &AppState, ds: &Dataset, rec: AskRecord) {
 
 /// Delete the entries older than each dataset's retention (hourly, from `serve`).
 pub fn prune(st: &AppState) {
+    if st.read_only {
+        return;
+    }
     for ds in st.datasets().values() {
         let days = settings(st, ds).history_days(st);
         let _g = HISTORY_LOCK.lock();
@@ -1435,7 +1463,7 @@ pub fn feedback(
         .recent(id)
         .is_some_and(|r| r.principal == principal && r.dataset == ds.name);
     let mut in_history = false;
-    {
+    if !st.read_only {
         let _g = HISTORY_LOCK.lock();
         // a file this release cannot read keeps its entries as they are
         let mut list = history_of(st, ds).unwrap_or_else(|e| {
@@ -1483,17 +1511,19 @@ fn settings_json(st: &AppState, s: &AssistantSettings) -> Value {
         Ok(()) => {
             status["ask"] = true.into();
             if let Some(m) = st.models() {
-                let draft = s
+                let mut draft = s
                     .roles
                     .get(&Role::Draft)
                     .cloned()
                     .unwrap_or_else(|| m.pairs(Role::Draft));
+                draft.retain(|p| m.allows_chat(p));
                 status["draft"] = serde_json::to_value(&draft).unwrap_or_default();
-                let sum = s
+                let mut sum = s
                     .roles
                     .get(&Role::Summarize)
                     .cloned()
                     .unwrap_or_else(|| m.pairs(Role::Summarize));
+                sum.retain(|p| m.allows_chat(p));
                 status["summary"] = (s.send >= Send::Rows
                     && sum.iter().any(|p| s.send_to(&p.provider) >= Send::Rows))
                 .into();
@@ -1602,15 +1632,41 @@ async fn list_asks(
                     r.reports.clear();
                     r.reports_graph = None;
                 }
-                // C18 §6.4: the answer only to a reader whose view covers what it read,
-                // and a global answer's text only while its reports are readable
-                if r.answer.is_some() {
-                    let visible = !reports_hidden
-                        && reader_view(&st, &ds, &p, &opts, &snap, r.access.as_ref()).is_some_and(
-                            |(view, snap)| answer_visible(r.access.as_ref(), view.as_ref(), &snap),
-                        );
+                // C18 §6.4: derived content (the stored answer and generated query) only to a
+                // reader whose Query and grounding (Info) views cover what it read, and a global
+                // answer's text only while its reports are readable.
+                if r.answer.is_some() || r.query.is_some() {
+                    let query_visible = reader_view_at(
+                        &st,
+                        &ds,
+                        &p,
+                        &opts,
+                        &snap,
+                        r.access.as_ref(),
+                        crate::auth::Endpoint::Query,
+                    )
+                    .is_some_and(|(view, snap)| {
+                        answer_visible(r.access.as_ref(), view.as_ref(), &snap)
+                    });
+                    let info_visible = match r.access.as_ref().and_then(|a| a.info.as_deref()) {
+                        None => true,
+                        Some(info_access) => reader_view_at(
+                            &st,
+                            &ds,
+                            &p,
+                            &opts,
+                            &snap,
+                            r.access.as_ref(),
+                            crate::auth::Endpoint::Info,
+                        )
+                        .is_some_and(|(view, snap)| {
+                            answer_visible(Some(info_access), view.as_ref(), &snap)
+                        }),
+                    };
+                    let visible = !reports_hidden && query_visible && info_visible;
                     if !visible {
                         r.answer = None;
+                        r.query = None;
                     }
                     let mut v = record_json(&r);
                     if !visible {
@@ -1649,17 +1705,19 @@ fn record_json(r: &AskRecord) -> Value {
 }
 
 /// The reader's view of the branch a record's answer read (`None` in it:
-/// unrestricted), with that branch's current state, or `None` when the reader may not
-/// query the branch or it cannot be opened, which withholds the answer.
+/// unrestricted), on `endpoint`, with that branch's current state, or `None` when the
+/// reader may not read the branch on that endpoint or it cannot be opened, which
+/// withholds the answer.
 #[cfg_attr(not(feature = "auth"), allow(unused_variables))]
 #[allow(clippy::type_complexity)]
-fn reader_view(
+fn reader_view_at(
     st: &AppState,
     ds: &Arc<Dataset>,
     p: &Principal,
     opts: &sparkles::sparql::QueryOptions,
     snap: &Arc<sparkles::store::Snapshot>,
     access: Option<&AnswerAccess>,
+    endpoint: crate::auth::Endpoint,
 ) -> Option<(
     Option<Arc<sparkles::access::GraphAccess>>,
     Arc<sparkles::store::Snapshot>,
@@ -1669,14 +1727,15 @@ fn reader_view(
         .filter(|b| *b != sparkles::branch::MAIN);
     let Some(b) = branch else {
         #[cfg(feature = "auth")]
-        if st.auth.is_some()
-            && !p.can_at(
-                &ds.name,
-                crate::auth::Endpoint::Query,
-                crate::auth::Level::Read,
-            )
         {
-            return None;
+            if (st.auth.is_some() || !p.is_local())
+                && !p.can_at(&ds.name, endpoint, crate::auth::Level::Read)
+            {
+                return None;
+            }
+            if endpoint != crate::auth::Endpoint::Query {
+                return Some((p.view(&ds.name, endpoint), snap.clone()));
+            }
         }
         return Some((opts.graphs.clone(), snap.clone()));
     };
@@ -1686,16 +1745,12 @@ fn reader_view(
     let view = {
         let name = format!("{}@{b}", ds.name);
         // an ungranted branch has no view, which is not an unrestricted one
-        if st.auth.is_some()
-            && !p.can_at(
-                &name,
-                crate::auth::Endpoint::Query,
-                crate::auth::Level::Read,
-            )
+        if (st.auth.is_some() || !p.is_local())
+            && !p.can_at(&name, endpoint, crate::auth::Level::Read)
         {
             return None;
         }
-        p.view(&name, crate::auth::Endpoint::Query)
+        p.view(&name, endpoint)
     };
     #[cfg(not(feature = "auth"))]
     let view = opts.graphs.clone();

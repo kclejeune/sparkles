@@ -48,6 +48,7 @@ use serde_json::{Value, json};
 use sparkles::vector::embed::SecretSource;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 /// `--model-config` and `--model-secret`, shared by `serve` and `ask`.
@@ -299,6 +300,8 @@ pub enum StepError {
     UnknownPair(String),
     /// the deadline passed before the step could start
     Deadline,
+    /// the request was cancelled before it finished
+    Cancelled,
 }
 
 impl StepError {
@@ -309,6 +312,7 @@ impl StepError {
             StepError::Budget(_) => "budget-exceeded",
             StepError::UnknownPair(_) => "unknown-pair",
             StepError::Deadline => "deadline",
+            StepError::Cancelled => "cancelled",
         }
     }
 
@@ -320,11 +324,12 @@ impl StepError {
             }
             StepError::Budget(m) | StepError::UnknownPair(m) => m.clone(),
             StepError::Deadline => "the deadline passed".into(),
+            StepError::Cancelled => "the request was cancelled".into(),
         }
     }
 }
 
-/// Counting slots with a deadline.
+/// Counting slots with a deadline and optional cancellation.
 struct Slots {
     max: usize,
     used: Mutex<usize>,
@@ -341,15 +346,34 @@ impl Drop for SlotGuard<'_> {
 }
 
 impl Slots {
-    fn acquire(&self, deadline: Instant) -> Option<SlotGuard<'_>> {
+    /// Wait until a slot is free, returning `Err(true)` on cancellation or `Err(false)`
+    /// on deadline expiry.
+    fn acquire(
+        &self,
+        deadline: Instant,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> Result<SlotGuard<'_>, bool> {
         let mut used = self.used.lock();
         while *used >= self.max {
-            if self.cv.wait_until(&mut used, deadline).timed_out() && *used >= self.max {
-                return None;
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err(true);
             }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(false);
+            }
+            let wait_until = if cancel.is_some() {
+                deadline.min(now + Duration::from_millis(20))
+            } else {
+                deadline
+            };
+            let _ = self.cv.wait_until(&mut used, wait_until);
+        }
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(true);
         }
         *used += 1;
-        Some(SlotGuard(self))
+        Ok(SlotGuard(self))
     }
 }
 
@@ -528,6 +552,14 @@ impl Models {
     /// The provider `name`.
     pub fn provider(&self, name: &str) -> Option<&ProviderConfig> {
         self.config.providers.get(name)
+    }
+
+    /// Whether `pair` names a configured chat provider whose active allowlist permits
+    /// its model.
+    pub fn allows_chat(&self, pair: &Pair) -> bool {
+        self.provider(&pair.provider).is_some_and(|p| {
+            p.kind != Kind::Local && !pair.model.is_empty() && p.allows(&pair.model)
+        })
     }
 
     /// The members of a pair's model after the provider's defaults.
@@ -717,6 +749,22 @@ impl Models {
         deadline: Instant,
         admission: Option<&dyn admission::Admission>,
     ) -> Result<Answer, Failure> {
+        self.call_prompt_with_cancel(role, pair, prompt, out, deadline, admission, None)
+    }
+
+    /// [`Models::call_prompt`] with an optional cancellation flag observed during slot
+    /// waits, RPM pacing, retry backoff, and HTTP I/O.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_prompt_with_cancel(
+        &self,
+        role: Option<Role>,
+        pair: &Pair,
+        prompt: &Prompt,
+        out: &OutputSchema,
+        deadline: Instant,
+        admission: Option<&dyn admission::Admission>,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> Result<Answer, Failure> {
         let mut rec = StepRecord {
             role,
             provider: pair.provider.clone(),
@@ -730,6 +778,9 @@ impl Models {
                 record: Box::new(rec),
             })
         };
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return fail(StepError::Cancelled, rec);
+        }
         let (Some(p), Some(rt)) = (
             self.provider(&pair.provider),
             self.runtime.get(&pair.provider),
@@ -744,6 +795,15 @@ impl Models {
                 StepError::UnknownPair(format!(
                     "provider {} is of the local kind, which computes embeddings and does not answer prompts",
                     pair.provider
+                )),
+                rec,
+            );
+        }
+        if pair.model.is_empty() || !p.allows(&pair.model) {
+            return fail(
+                StepError::UnknownPair(format!(
+                    "provider {} does not allow the model {:?}",
+                    pair.provider, pair.model
                 )),
                 rec,
             );
@@ -765,6 +825,24 @@ impl Models {
         };
         let m = p.model(&pair.model);
         let pricing = m.pricing;
+        let charge_usage = |rec: &mut StepRecord, usage: admission::Usage| {
+            if usage == admission::Usage::default() {
+                return;
+            }
+            // the provider's budget counts what the step's budget grew by, so both
+            // round the step's cache classes once
+            let before = rec.budget_tokens();
+            rec.add(usage);
+            {
+                let mut t = rt.tokens.lock();
+                if t.0 != today() {
+                    *t = (today(), 0);
+                }
+                t.1 =
+                    t.1.saturating_add(rec.budget_tokens().saturating_sub(before));
+            }
+            rec.estimated_cost = pricing.map(|pr| rec.usage().cost(&pr));
+        };
         // the provider's own connect timeout and certificate checks; the destination
         // checks of the policy stay as they are
         let outbound = sparkles::outbound::OutboundPolicy {
@@ -789,6 +867,10 @@ impl Models {
                 _ => structured::messages(&prompt.user, out, level),
             };
             for attempt in 0..2 {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    rec.latency = started.elapsed();
+                    return fail(StepError::Cancelled, rec);
+                }
                 if let Some(cap) = p.budget.and_then(|b| b.tokens_per_day) {
                     let mut t = rt.tokens.lock();
                     if t.0 != today() {
@@ -808,6 +890,51 @@ impl Models {
                 let timeout = pair
                     .request_timeout_secs
                     .map_or(m.request_timeout_secs, |s| s.secs());
+                if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                    rec.latency = started.elapsed();
+                    return fail(StepError::Deadline, rec);
+                }
+                let _slot = match rt.slots.acquire(deadline, cancel) {
+                    Ok(slot) => slot,
+                    Err(true) => {
+                        rec.latency = started.elapsed();
+                        return fail(StepError::Cancelled, rec);
+                    }
+                    Err(false) => {
+                        rec.latency = started.elapsed();
+                        return fail(StepError::Deadline, rec);
+                    }
+                };
+                if let Some(rpm) = p.requests_per_minute.filter(|r| *r > 0) {
+                    let target = {
+                        let mut next = rt.next.lock();
+                        let now = Instant::now();
+                        let at = (*next).max(now);
+                        if at >= deadline {
+                            rec.latency = started.elapsed();
+                            return fail(StepError::Deadline, rec);
+                        }
+                        *next = at + Duration::from_secs_f64(60.0 / rpm as f64);
+                        at
+                    };
+                    match client::sleep_until(target, deadline, cancel) {
+                        Ok(()) => {}
+                        Err(true) => {
+                            rec.latency = started.elapsed();
+                            return fail(StepError::Cancelled, rec);
+                        }
+                        Err(false) => {
+                            rec.latency = started.elapsed();
+                            return fail(StepError::Deadline, rec);
+                        }
+                    }
+                }
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    rec.latency = started.elapsed();
+                    return fail(StepError::Cancelled, rec);
+                }
+                // Recompute the HTTP timeout after waiting on slots and rate limits so
+                // the request never overshoots the call deadline.
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     rec.latency = started.elapsed();
@@ -825,76 +952,59 @@ impl Models {
                     num_ctx: m.num_ctx,
                     timeout: Duration::from_secs_f64(timeout).min(left),
                 };
-                let Some(_slot) = rt.slots.acquire(deadline) else {
-                    rec.latency = started.elapsed();
-                    return fail(
-                        StepError::Call(CallError::Unavailable(format!(
-                            "provider {} had no free slot before the deadline",
-                            pair.provider
-                        ))),
-                        rec,
-                    );
-                };
-                if let Some(rpm) = p.requests_per_minute.filter(|r| *r > 0) {
-                    let wait = {
-                        let mut next = rt.next.lock();
-                        let now = Instant::now();
-                        let at = (*next).max(now);
-                        *next = at + Duration::from_secs_f64(60.0 / rpm as f64);
-                        at - now
-                    };
-                    if !wait.is_zero() {
-                        std::thread::sleep(wait);
-                    }
-                }
                 rec.requests += 1;
                 rec.level = Some(level);
                 let t = client::Transport {
                     outbound: &outbound,
                     key: key.clone(),
                 };
-                let resp = client::send_admitted(&t, &pair.provider, p, &req, admission);
+                let resp = client::send_admitted_cancellable(
+                    &t,
+                    &pair.provider,
+                    p,
+                    &req,
+                    admission,
+                    cancel,
+                );
                 drop(_slot);
                 let resp = match resp {
                     Ok(r) => r,
-                    Err(e) if has_next && structured::unsupported(&e) => {
-                        tracing::info!(target: "sparkles::models", "{}: level {} refused, trying the next: {e}", pair.label(), level.as_str());
-                        last = Some(StepError::Call(e));
-                        break;
-                    }
-                    Err(CallError::Admission(code, m, sent_before)) => {
-                        // a refusal before sending says nothing about the pair's health;
-                        // the request counts when an earlier attempt of it was sent
-                        if !sent_before {
-                            rec.requests -= 1;
+                    Err((e, usage)) => {
+                        charge_usage(&mut rec, usage);
+                        match e {
+                            CallError::Cancelled => {
+                                rec.latency = started.elapsed();
+                                return fail(StepError::Cancelled, rec);
+                            }
+                            e if has_next && structured::unsupported(&e) => {
+                                tracing::info!(target: "sparkles::models", "{}: level {} refused, trying the next: {e}", pair.label(), level.as_str());
+                                last = Some(StepError::Call(e));
+                                break;
+                            }
+                            CallError::Admission(code, m, sent_before) => {
+                                // a refusal before sending says nothing about the pair's health;
+                                // the request counts when an earlier attempt of it was sent
+                                if !sent_before {
+                                    rec.requests -= 1;
+                                }
+                                rec.latency = started.elapsed();
+                                let error = if code == "budget-exceeded" {
+                                    StepError::Budget(m)
+                                } else {
+                                    StepError::Call(CallError::Admission(code, m, sent_before))
+                                };
+                                return fail(error, rec);
+                            }
+                            e => {
+                                rec.latency = started.elapsed();
+                                self.note(pair, false, Some(e.to_string()));
+                                return fail(StepError::Call(e), rec);
+                            }
                         }
-                        rec.latency = started.elapsed();
-                        let error = if code == "budget-exceeded" {
-                            StepError::Budget(m)
-                        } else {
-                            StepError::Call(CallError::Admission(code, m, sent_before))
-                        };
-                        return fail(error, rec);
-                    }
-                    Err(e) => {
-                        rec.latency = started.elapsed();
-                        self.note(pair, false, Some(e.to_string()));
-                        return fail(StepError::Call(e), rec);
                     }
                 };
-                // the provider's budget counts what the step's budget grew by, so both
-                // round the step's cache classes once
-                let before = rec.budget_tokens();
-                rec.add(resp.usage);
+                charge_usage(&mut rec, resp.usage);
                 rec.stop = resp.stop.clone();
-                {
-                    let mut t = rt.tokens.lock();
-                    if t.0 != today() {
-                        *t = (today(), 0);
-                    }
-                    t.1 =
-                        t.1.saturating_add(rec.budget_tokens().saturating_sub(before));
-                }
                 match structured::value_of(&resp, out, level) {
                     Ok(value) => {
                         if detecting {

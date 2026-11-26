@@ -478,16 +478,18 @@ impl Asking<'_, '_> {
                         let user = prompt(&groups[gi]);
                         let pair = pair.clone();
                         let schema = &schema;
+                        let cancel = &self.cancel;
                         s.spawn(move || {
                             (
                                 gi,
-                                models.call(
+                                models.call_prompt_with_cancel(
                                     Some(Role::Summarize),
                                     &pair,
-                                    MAP_SYSTEM,
-                                    &user,
+                                    &Prompt::plain(MAP_SYSTEM, &user),
                                     schema,
                                     deadline,
+                                    None,
+                                    Some(cancel),
                                 ),
                             )
                         })
@@ -515,6 +517,11 @@ impl Asking<'_, '_> {
                             }
                             crate::models::StepError::Deadline => {
                                 terminal.get_or_insert(("timeout", f.error.message()));
+                                continue;
+                            }
+                            crate::models::StepError::Cancelled => {
+                                terminal
+                                    .get_or_insert(("cancelled", "the ask was cancelled".into()));
                                 continue;
                             }
                             _ => {}

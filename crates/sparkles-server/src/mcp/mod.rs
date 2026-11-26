@@ -296,7 +296,7 @@ impl McpConfig {
 /// State shared by every connection (and, later, every transport).
 pub struct Shared {
     pub cfg: McpConfig,
-    pub pins: pins::Pins,
+    pub pins: Arc<pins::Pins>,
     /// one permit per concurrent tool call
     pub slots: Arc<Semaphore>,
     tools: Vec<schemas::ToolDef>,
@@ -417,6 +417,10 @@ impl McpServer {
     }
 
     pub fn new(state: Arc<AppState>, cfg: McpConfig) -> McpServer {
+        Self::new_with_pins(state, cfg, Arc::new(pins::Pins::default()))
+    }
+
+    fn new_with_pins(state: Arc<AppState>, cfg: McpConfig, pins: Arc<pins::Pins>) -> McpServer {
         let read_only = state.read_only;
         let tools = schemas::tools(&cfg)
             .into_iter()
@@ -432,13 +436,27 @@ impl McpServer {
             state,
             shared: Arc::new(Shared {
                 slots: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
-                pins: pins::Pins::default(),
+                pins,
                 tools,
                 tasks: tasks::Tasks::default(),
                 subscriptions: Arc::new(Semaphore::new(notify::MAX_SUBSCRIPTIONS)),
                 cfg,
             }),
         }
+    }
+
+    /// Build a derived MCP server with `cfg` that shares this server's snapshot pin table.
+    pub(super) fn with_config_shared_pins(&self, cfg: McpConfig) -> McpServer {
+        Self::new_with_pins(self.state.clone(), cfg, self.shared.pins.clone())
+    }
+
+    /// Build a derived MCP server whose `max_timeout` is capped to `max_timeout`, sharing
+    /// this server's snapshot pin table.
+    pub(crate) fn with_max_timeout(&self, max_timeout: Duration) -> McpServer {
+        let mut cfg = self.cfg().clone();
+        cfg.max_timeout = cfg.max_timeout.min(max_timeout);
+        cfg.default_timeout = cfg.default_timeout.min(cfg.max_timeout);
+        Self::new_with_pins(self.state.clone(), cfg, self.shared.pins.clone())
     }
 
     pub fn cfg(&self) -> &McpConfig {
@@ -634,7 +652,7 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
     if let Some(url) = &args.url {
         if args.models.model_config.is_some() || !args.models.model_secret.is_empty() {
             bail!(
-                "--model-config and --model-secret apply with --loc or --data; a bridged server uses its own model configuration"
+                "--model-config and --model-secret apply only with local databases (--loc); a bridged server uses its own model configuration"
             );
         }
         return bridge::run(url, args.token.clone(), args.insecure_http);

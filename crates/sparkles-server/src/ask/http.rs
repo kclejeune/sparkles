@@ -372,7 +372,7 @@ async fn ask_route(
                         .as_u64()
                         .is_none_or(|c| c == s.commit)
             });
-            let access = assistant::answer_access(
+            let mut access = assistant::answer_access(
                 read.as_ref(),
                 principal
                     .view(&view_name, crate::auth::Endpoint::Query)
@@ -382,6 +382,23 @@ async fn ask_route(
                 branch.as_deref(),
                 &me,
             );
+            if principal.can_at(
+                &view_name,
+                crate::auth::Endpoint::Info,
+                crate::auth::Level::Read,
+            ) {
+                access.info = Some(Box::new(assistant::answer_access_for(
+                    read.as_ref(),
+                    principal
+                        .view(&view_name, crate::auth::Endpoint::Info)
+                        .as_ref(),
+                    &principal.caller(),
+                    &ds.name,
+                    branch.as_deref(),
+                    &me,
+                    "info",
+                )));
+            }
             let rec = assistant::record_of(&id, &me, out).with_answer(
                 &thread,
                 &written,
