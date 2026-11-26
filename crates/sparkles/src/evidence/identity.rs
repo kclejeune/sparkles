@@ -30,8 +30,8 @@
 use super::{
     Changed, Decided, Evidence, G, MapChange, Options, ProjectionChange, Reviewed, State,
     branch_name, caller_view, caller_view_evidence, capability, check_identities, check_store,
-    claim_graphs, hidden, incomplete, operation, projection_unavailable, publish, readable,
-    record_graph_nonces, replayed, writable,
+    claim_graphs, hidden, incomplete, operation, publish, readable, record_graph_nonces, replayed,
+    writable,
 };
 use crate::access::GraphAccess;
 use crate::evidence::propose::{READS_BYTES, managed, settings_of};
@@ -39,6 +39,7 @@ use crate::evidence::resolve::{Resolution, unavailable};
 use crate::managed::ManagedErrorKind;
 use crate::task::Control;
 use crate::{Catalog, Dataset, Error, Result};
+use oxrdf::vocab::xsd;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use sparkles_core::evidence::review::{
     self as rv, BOUNDARY_PROTECTION, Batch, DecisionInput, Disposition, MAP_NONCE_PREDICATES,
@@ -56,6 +57,32 @@ const MAX_OUTPUT_TRIPLES: usize = 1_000_000;
 
 fn ev(local: &str) -> String {
     super::ev(local)
+}
+
+fn map_unavailable(policy: &str) -> Error {
+    managed(
+        ManagedErrorKind::ProjectionUnavailable,
+        format!(
+            "policy {policy}: its resolution map is unavailable because a graph protection or boundary changed or the latest revision cannot be verified; the resolution map must be rebuilt first"
+        ),
+    )
+}
+
+fn parse_map_revision_literal(term: &Term) -> Option<u64> {
+    match term {
+        Term::Literal(l) if l.datatype() == xsd::INTEGER => {
+            l.value().parse::<u64>().ok().filter(|&n| n >= 1)
+        }
+        _ => None,
+    }
+}
+
+fn map_revision_number(state: &mut State<'_>, s: &NamedNode, g: &G) -> Result<Option<u64>> {
+    Ok(state
+        .reads
+        .single(s.as_str(), &ev("mapRevision"), g.0.as_str())?
+        .as_ref()
+        .and_then(parse_map_revision_literal))
 }
 
 /// The predicate of the resolution map's output triples.
@@ -192,7 +219,7 @@ fn latest_present(
         match state.reads.record(&iri, std::slice::from_ref(&m.maps))? {
             ExistingRecord::Absent => Ok(None),
             ExistingRecord::Present { authenticated, .. } => Ok(Some((iri, authenticated))),
-            ExistingRecord::Many => Err(projection_unavailable(&m.name)),
+            ExistingRecord::Many => Err(map_unavailable(&m.name)),
         }
     };
     let Some((first, first_auth)) = probe(1, state)? else {
@@ -208,9 +235,7 @@ fn latest_present(
                 lo = hi;
                 lo_iri = iri;
                 lo_auth = auth;
-                hi = hi
-                    .checked_mul(2)
-                    .ok_or_else(|| projection_unavailable(&m.name))?;
+                hi = hi.checked_mul(2).ok_or_else(|| map_unavailable(&m.name))?;
             }
             None => break,
         }
@@ -239,16 +264,17 @@ fn latest(
     state: &mut State<'_>,
     dataset: Uuid,
     m: &MapGraphs,
+    masked_view: bool,
     control: &Control,
 ) -> Result<Option<Latest>> {
     let Some((lo_iri, lo, lo_auth)) = latest_present(state, dataset, m, control)? else {
         if state.reads.graph_nonempty(m.output.0.as_str())? {
-            return Err(projection_unavailable(&m.name));
+            return Err(map_unavailable(&m.name));
         }
         return Ok(None);
     };
     if !lo_auth || !state.typed(&lo_iri, &m.maps, RecordKind::ResolutionMap)? {
-        return Err(projection_unavailable(&m.name));
+        return Err(map_unavailable(&m.name));
     }
     // the latest revision's protections must be the current ones
     let now = m.nonces().map(|n| [n.decisions, n.maps, n.output]);
@@ -261,7 +287,7 @@ fn latest(
         );
     }
     if !now.is_some_and(|n| recorded.iter().zip(n).all(|(a, b)| *a == Some(b))) {
-        return Err(projection_unavailable(&m.name));
+        return Err(map_unavailable(&m.name));
     }
     // Every identity graph the map was built from must still be in the boundary under
     // the same protection, or matches the map follows would no longer be read. A graph
@@ -285,7 +311,7 @@ fn latest(
         MAX_BOUNDARY,
     )?;
     if more {
-        return Err(projection_unavailable(&m.name));
+        return Err(map_unavailable(&m.name));
     }
     let mut built_set: BTreeSet<String> = BTreeSet::new();
     for t in built {
@@ -293,7 +319,7 @@ fn latest(
             Term::Literal(l) if current.contains(l.value()) => {
                 built_set.insert(l.value().to_string());
             }
-            _ => return Err(projection_unavailable(&m.name)),
+            _ => return Err(map_unavailable(&m.name)),
         }
     }
     let added: Vec<G> = current_entries
@@ -302,12 +328,12 @@ fn latest(
         .map(|(g, _)| g)
         .collect();
     if !added.is_empty()
-        && (state.seen.is_some()
+        && (masked_view
             || state
                 .reads
                 .has_live_accepted_in_graphs(&added, &m.decisions, &m.policy_iri)?)
     {
-        return Err(projection_unavailable(&m.name));
+        return Err(map_unavailable(&m.name));
     }
     Ok(Some(Latest {
         iri: lo_iri,
@@ -728,6 +754,7 @@ pub(super) fn review(
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
     let mask_preparation =
         crate::access::Preparation::new(control.clone(), super::super::resolve::MEMORY_BYTES)?;
+    let masked;
     let mut state = State {
         reads: Reads::new(&preparation, &head),
         seen: None,
@@ -811,11 +838,15 @@ pub(super) fn review(
             ),
         ));
     }
-    let masked = caller_view(access.as_ref(), &head, &mask_preparation)?;
+    if let Some(a) = access.as_deref() {
+        a.validate_bound_snapshot(&head)?;
+    }
+    let hides_triples = access.as_deref().is_some_and(GraphAccess::hides_triples);
+    let previous = latest(&mut state, main.dataset_id(), &m, hides_triples, control)?;
+    masked = caller_view(access.as_ref(), &head, &mask_preparation)?;
     state.seen = masked
         .as_ref()
         .map(|v| Reads::from_prepared(&mask_preparation, v));
-    let previous = latest(&mut state, main.dataset_id(), &m, control)?;
     let mut resolution = Resolution::new(control.clone())?;
     let mut evidence = Evidence {
         resolution: &mut resolution,
@@ -1256,23 +1287,34 @@ fn verify_maps_for_rebuild(
                 state
                     .reads
                     .contains(r.as_str(), super::RDF_TYPE, &class, m.maps.0.as_str())?;
-            let rev_num_raw = state.text(&r, &ev("mapRevision"), &m.maps)?;
-            if !is_map_type && rev_num_raw.is_none() {
+            let (rev_objs, rev_more) =
+                state
+                    .reads
+                    .objects_up_to(r.as_str(), &ev("mapRevision"), m.maps.0.as_str(), 2)?;
+            if !is_map_type && rev_objs.is_empty() {
                 continue;
             }
-            if let Some(raw) = &rev_num_raw {
-                let Some(n) = raw.parse::<u64>().ok().filter(|&n| n >= 1) else {
-                    return Err(managed(
-                        ManagedErrorKind::ImmutableRecordConflict,
-                        format!(
-                            "policy {}: maps graph holds an invalid revision number on <{}>",
-                            m.name,
-                            r.as_str()
-                        ),
-                    ));
-                };
-                max_rev = max_rev.max(n);
+            if rev_more || rev_objs.len() != 1 {
+                return Err(managed(
+                    ManagedErrorKind::ImmutableRecordConflict,
+                    format!(
+                        "policy {}: maps graph holds an invalid revision number on <{}>",
+                        m.name,
+                        r.as_str()
+                    ),
+                ));
             }
+            let Some(n) = parse_map_revision_literal(&rev_objs[0]) else {
+                return Err(managed(
+                    ManagedErrorKind::ImmutableRecordConflict,
+                    format!(
+                        "policy {}: maps graph holds an invalid revision number on <{}>",
+                        m.name,
+                        r.as_str()
+                    ),
+                ));
+            };
+            max_rev = max_rev.max(n);
             revision_subjects.push(r);
         }
         if max_rev > MAX_EVIDENCE as u64 {
@@ -1297,16 +1339,9 @@ fn verify_maps_for_rebuild(
                         &class,
                         m.maps.0.as_str(),
                     )?;
-                    let has_policy = state.reads.contains(
-                        iri.as_str(),
-                        &ev("reviewPolicy"),
-                        &policy_term,
-                        m.maps.0.as_str(),
-                    )?;
-                    let has_number = state
-                        .text(&iri, &ev("mapRevision"), &m.maps)?
-                        .and_then(|v| v.parse::<u64>().ok())
-                        == Some(k);
+                    let has_policy = state.iri(&iri, &ev("reviewPolicy"), &m.maps)?.as_ref()
+                        == Some(&m.policy_iri);
+                    let has_number = map_revision_number(state, &iri, &m.maps)? == Some(k);
                     if !has_type || !has_policy || !has_number {
                         return Err(managed(
                             ManagedErrorKind::ImmutableRecordConflict,
@@ -1358,9 +1393,7 @@ fn verify_maps_for_rebuild(
         probe_slots.insert(after_next);
         let mut hi = 2u64;
         while hi <= next_number {
-            hi = hi
-                .checked_mul(2)
-                .ok_or_else(|| projection_unavailable(&m.name))?;
+            hi = hi.checked_mul(2).ok_or_else(|| map_unavailable(&m.name))?;
         }
         probe_slots.insert(hi);
         let mut lo = hi / 2;
@@ -1707,10 +1740,8 @@ fn rebuild_inner(
                 ),
             ));
         };
-        let number = state
-            .text(&revision, &ev("mapRevision"), &m.maps)?
-            .and_then(|v| v.parse::<u64>().ok())
-            .ok_or_else(|| projection_unavailable(&m.name))?;
+        let number = map_revision_number(&mut state, &revision, &m.maps)?
+            .ok_or_else(|| map_unavailable(&m.name))?;
         let previous = state.iri(&revision, &format!("{PROV}wasRevisionOf"), &m.maps)?;
         let recorded_version = state
             .text(&revision, &ev("policyVersion"), &m.maps)?
@@ -1795,7 +1826,7 @@ fn rebuild_inner(
         };
         let next_number = prev_number
             .checked_add(1)
-            .ok_or_else(|| projection_unavailable(&m.name))?;
+            .ok_or_else(|| map_unavailable(&m.name))?;
         verify_maps_for_rebuild(
             &mut state,
             main.dataset_id(),
@@ -2473,24 +2504,28 @@ fn resolve_in(
         readable(access.as_ref(), g)?;
     }
     let preparation = crate::access::Preparation::new(control.clone(), reads_bytes)?;
-    let view = head.caller_view(access.as_ref(), &preparation)?;
+    let hides_triples = access.as_deref().is_some_and(GraphAccess::hides_triples);
     // Records are read at the unmasked head with the caller's view beside it. The map's
-    // consistency is checked there, so that a mask cannot hide the metadata that would
-    // refuse it, and a revision the caller's view masks is refused rather than read. A
-    // proposal or decision the view hides any triple of takes no part in a cluster, and
-    // the output graph is read in the caller's view.
+    // consistency is checked first using `hides_triples` before materializing the masked
+    // view, so a boundary refusal cannot be preempted by data-dependent mask limits. A
+    // revision the caller's view masks is then refused rather than read, any proposal or
+    // decision the view hides any triple of takes no part in a cluster, and the output
+    // graph is read in the caller's view.
+    let view;
     let mut state = State {
         reads: head.reads(&preparation),
-        seen: view.as_ref().map(|v| Reads::from_prepared(&preparation, v)),
+        seen: None,
         claim_graphs: Vec::new(),
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
     };
-    let latest = latest(&mut state, dataset_id, &m, control)?;
+    let latest = latest(&mut state, dataset_id, &m, hides_triples, control)?;
+    view = head.caller_view(access.as_ref(), &preparation)?;
+    state.seen = view.as_ref().map(|v| Reads::from_prepared(&preparation, v));
     if let Some(l) = &latest
         && state.masked(&l.iri, &m.maps.0)?
     {
-        return Err(projection_unavailable(&m.name));
+        return Err(map_unavailable(&m.name));
     }
     let mut clusters = Clusters::new(&m, BTreeMap::new());
     clusters.hide_masked = true;
@@ -3358,7 +3393,104 @@ mod tests {
         assert_eq!(folded, set_b);
         assert!(folded.is_disjoint(&set_a));
 
-        // Under cap 2, both before (3) and after (3) exceed the cap and must refuse.
+        // Publish revision 5 from the admissible 3-decision state at rev4: end 1 decision
+        // from `set_b` and accept 3 new proposals so the post-state alone has 5 effective
+        // decisions (exceeding cap 4 while rev1..rev4 all stay within cap 4).
+        let mut third_targets = Vec::new();
+        for i in 0..3 {
+            third_targets.push(propose(
+                &ds,
+                IDENTITY,
+                &format!("c{i}"),
+                &[&format!("urn:e{i}"), &format!("urn:f{i}")],
+            ));
+        }
+        let ended_b0 = map_change.decisions_added[0].clone();
+        let mut batch5 = vec![DecisionInput {
+            key: "end_b0".into(),
+            target: next_targets[0].0.clone(),
+            target_digest: next_targets[0].1,
+            disposition: Disposition::Rejected,
+            supersedes: Some(ended_b0.clone()),
+        }];
+        for (i, p) in third_targets.iter().enumerate() {
+            batch5.push(DecisionInput {
+                key: format!("add_c{i}"),
+                target: p.0.clone(),
+                target_digest: p.1,
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            });
+        }
+        let mut opts5 = Options::new(n("urn:principal:reviewer"));
+        opts5.if_head = Some(ds.store().head_commit().seq);
+        let reviewed5 = review(
+            None,
+            &ds,
+            &ds,
+            Request {
+                name: "people",
+                policy: settings.matching_policies.get("people").unwrap(),
+                settings: &settings,
+                settings_bytes: &settings_bytes,
+                version: 1,
+                if_head: ds.store().head_commit().seq,
+                candidates: MAX_EVIDENCE,
+            },
+            &batch5,
+            &opts5,
+            &mut |_, _| Some(Arc::new(GraphAccess::all())),
+            &Control::none(),
+        )
+        .unwrap();
+        let rev5 = reviewed5.map_revision.clone().unwrap();
+        let map_change5 = reviewed5.changed.map.as_ref().unwrap();
+        assert_eq!(map_change5.number, 5);
+        assert_eq!(map_change5.decisions_ended.len(), 1);
+        assert_eq!(map_change5.decisions_added.len(), 3);
+        let mut set_c = set_b.clone();
+        assert!(set_c.remove(&ended_b0));
+        set_c.extend(map_change5.decisions_added.iter().cloned());
+        assert_eq!(set_c.len(), 5);
+
+        let head5 = ds.store().snapshot();
+        let mut state5 = State {
+            reads: Reads::new(&prep, &head5),
+            seen: None,
+            claim_graphs: Vec::new(),
+            superseded: BTreeSet::new(),
+            withdrawn: BTreeSet::new(),
+        };
+        // Under cap 4, rev1..rev4 are admissible, and rev5's post-state of 5 must refuse.
+        let mut retained5_fail = 0usize;
+        let err5 = fold_previous_effective_bounded(
+            &mut state5,
+            &m,
+            &rev5,
+            &mut retained5_fail,
+            RETAINED_BYTES,
+            4,
+            &Control::none(),
+        )
+        .unwrap_err();
+        assert_eq!(err5.code(), "incomplete-evidence", "{err5}");
+        assert!(err5.to_string().contains("4 records"), "{err5}");
+
+        // Under cap 5, rev5 folds to the exact 5 effective decisions.
+        let mut retained5_ok = 0usize;
+        let folded5 = fold_previous_effective_bounded(
+            &mut state5,
+            &m,
+            &rev5,
+            &mut retained5_ok,
+            RETAINED_BYTES,
+            5,
+            &Control::none(),
+        )
+        .unwrap();
+        assert_eq!(folded5, set_c);
+
+        // Under cap 2, rev3 already exceeds the cap before reaching rev4.
         let mut retained2 = 0usize;
         let err = fold_previous_effective_bounded(
             &mut state,

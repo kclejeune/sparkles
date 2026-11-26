@@ -1148,7 +1148,19 @@ fn a_resolution_of_every_member_reads_its_cluster_once() {
 
 /// A caller whose view hides `predicate` in `graph`.
 fn masking(predicate: &str, graph: &str) -> Option<Arc<GraphAccess>> {
+    masking_with_limit(predicate, graph, None)
+}
+
+fn masking_with_limit(
+    predicate: &str,
+    graph: &str,
+    max_hidden: Option<u64>,
+) -> Option<Arc<GraphAccess>> {
     use sparkles::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    let mut limits = Limits::default();
+    if let Some(max_hidden) = max_hidden {
+        limits.max_hidden = max_hidden;
+    }
     Some(Arc::new(GraphAccess::with_triples(
         Graphs::All,
         Graphs::All,
@@ -1168,7 +1180,7 @@ fn masking(predicate: &str, graph: &str) -> Option<Arc<GraphAccess>> {
                 write: Graphs::none(),
             }],
             caller: Caller::default(),
-            limits: Limits::default(),
+            limits,
         },
     )))
 }
@@ -2306,6 +2318,90 @@ fn rebuilding_refuses_maps_numbering_gaps_and_stray_minted_slots() {
         "immutable-record-conflict"
     );
     assert_eq!(ds4.store().head_commit().seq, head4);
+
+    // 5. Deleted intermediate revision 3 replaced by a subject with rdf:type and
+    //    ev:reviewPolicy preserved but an incorrectly typed ev:mapRevision literal
+    //    (`"3"@en` instead of `xsd:integer`) must refuse without committing.
+    let ds5 = configured();
+    let mut revs5 = Vec::new();
+    for i in 0..4 {
+        let p = matched(
+            &ds5,
+            &format!("t{i}"),
+            &[&format!("k{i}"), &format!("l{i}")],
+            None,
+        );
+        let r = review(&ds5, &[decision("x", &p, Disposition::Accepted, None)]).unwrap();
+        revs5.push(r.map_revision.unwrap());
+    }
+    let policy_iri = sparkles_core::evidence::review::policy_iri("people");
+    evidence::detach(&ds5, MAPS).unwrap();
+    ds5.update(&format!(
+        "DELETE WHERE {{ GRAPH <{MAPS}> {{ <{}> ?p ?o }} }}",
+        revs5[2].as_str()
+    ))
+    .unwrap();
+    ds5.update(&format!(
+        "INSERT DATA {{ GRAPH <{MAPS}> {{ <{}> a <{EV}ResolutionMap> ; <{EV}reviewPolicy> <{}> ; <{EV}mapRevision> \"3\"@en }} }}",
+        revs5[2].as_str(),
+        policy_iri.as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds5, &settings(1), &Control::none()).unwrap();
+    let head5 = ds5.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds5,
+            &ds5,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds5.store().head_commit().seq, head5);
+
+    // 6. Deleted intermediate revision 3 replaced by a subject carrying an extra
+    //    ev:reviewPolicy value alongside the expected policy must also refuse.
+    let ds6 = configured();
+    let mut revs6 = Vec::new();
+    for i in 0..4 {
+        let p = matched(
+            &ds6,
+            &format!("u{i}"),
+            &[&format!("m{i}"), &format!("n{i}")],
+            None,
+        );
+        let r = review(&ds6, &[decision("x", &p, Disposition::Accepted, None)]).unwrap();
+        revs6.push(r.map_revision.unwrap());
+    }
+    evidence::detach(&ds6, MAPS).unwrap();
+    ds6.update(&format!(
+        "DELETE WHERE {{ GRAPH <{MAPS}> {{ <{}> ?p ?o }} }}",
+        revs6[2].as_str()
+    ))
+    .unwrap();
+    ds6.update(&format!(
+        "INSERT DATA {{ GRAPH <{MAPS}> {{ <{}> a <{EV}ResolutionMap> ; <{EV}reviewPolicy> <{}>, <urn:policy:other> ; <{EV}mapRevision> 3 }} }}",
+        revs6[2].as_str(),
+        policy_iri.as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds6, &settings(1), &Control::none()).unwrap();
+    let head6 = ds6.store().head_commit().seq;
+    assert_eq!(
+        code(evidence::rebuild_resolution_map(
+            &ds6,
+            &ds6,
+            "people",
+            None,
+            &admin,
+            &Control::none()
+        )),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds6.store().head_commit().seq, head6);
 }
 
 /// Adding a new identity graph with more than 10,000 unreviewed proposals when the policy
@@ -2508,11 +2604,15 @@ fn triple_masked_caller_cannot_infer_hidden_acceptance_on_added_boundary_graph()
         (e.code().to_string(), e.to_string())
     };
 
-    // Both a proposal mask on HIDDEN and a decision mask on DECISIONS must produce
-    // byte-identical `projection-unavailable` refusals across State 1 and State 2.
+    // Both a proposal mask on HIDDEN and a decision mask on DECISIONS — including a tight
+    // `max_hidden = 1` ceiling that State 1 stays within and State 2's hidden decision
+    // rows would otherwise cross during mask preparation — must produce byte-identical
+    // `projection-unavailable` refusals across State 1 and State 2 with a matching-map
+    // message that does not claim a detachment or claim supports failure.
     for mask in [
         masking(&format!("{EV}entity"), HIDDEN),
         masking(&format!("{EV}disposition"), DECISIONS),
+        masking_with_limit(&format!("{EV}disposition"), DECISIONS, Some(1)),
     ] {
         let r1 = err_pair(evidence::resolve_entities(
             &s1,
@@ -2531,15 +2631,26 @@ fn triple_masked_caller_cannot_infer_hidden_acceptance_on_added_boundary_graph()
             &Control::none(),
         ));
         assert_eq!(r1.0, "projection-unavailable");
+        assert!(
+            r1.1.contains("resolution map")
+                && !r1.1.contains("supports")
+                && !r1.1.contains("detached and protected again"),
+            "unexpected refusal message: {}",
+            r1.1
+        );
         assert_eq!(r1, r2);
 
         let w1 = review_err_pair(&s1, &ef1, mask.clone());
         let w2 = review_err_pair(&s2, &ef2, mask);
         assert_eq!(w1.0, "projection-unavailable");
         assert_eq!(w1, w2);
+        assert_eq!(w1, r1);
     }
 
-    // After an admin rebuild records HIDDEN on the latest revision, masked reads resume.
+    // After an admin rebuild records HIDDEN on the latest revision, masked reads resume
+    // under normal limits, while the tight `max_hidden = 1` limit on State 2 actually
+    // crosses the hidden-quad budget (proving the pre-rebuild refusal ran before mask
+    // preparation).
     evidence::rebuild_resolution_map(&s2, &s2, "people", None, &admin, &Control::none()).unwrap();
     let resumed = evidence::resolve_entities(
         &s2,
@@ -2552,4 +2663,69 @@ fn triple_masked_caller_cannot_infer_hidden_acceptance_on_added_boundary_graph()
     .unwrap();
     assert_eq!(resumed.entities[0].representative, e("c"));
     assert_eq!(resumed.entities[0].members, vec![e("c"), e("d")]);
+    let post_rebuild_limited = evidence::resolve_entities(
+        &s2,
+        &s2,
+        "people",
+        &[e("c")],
+        masking_with_limit(&format!("{EV}disposition"), DECISIONS, Some(1)),
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            post_rebuild_limited,
+            sparkles::Error::BudgetExceeded(ref b)
+                if b.kind == sparkles_core::error::BudgetKind::HiddenQuads
+        ),
+        "expected HiddenQuads after rebuild under max_hidden=1, got {post_rebuild_limited:?}"
+    );
+}
+
+/// Adding a populated graph holding thousands of unrelated quads plus one current-epoch
+/// unreviewed proposal keeps reads and reviews available, and still refuses once an
+/// accepted decision exists for that proposal.
+#[test]
+fn added_boundary_graph_with_many_unrelated_quads_and_few_proposals() {
+    let ds = Dataset::memory();
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let ab = matched(&ds, "ab", &["a", "b"], None);
+    accept(&ds, "ab", &ab);
+
+    // Populate HIDDEN with 5,000 unrelated quads while it is detached, then re-protect
+    // it with one current-epoch unreviewed proposal and add it to the boundary.
+    evidence::detach(&ds, HIDDEN).unwrap();
+    let mut inserts = String::from("INSERT DATA { GRAPH <");
+    inserts.push_str(HIDDEN);
+    inserts.push_str("> { ");
+    for i in 0..5_000usize {
+        inserts.push_str(&format!("<urn:bg:s{i}> <urn:bg:p> <urn:bg:o{i}> . "));
+    }
+    inserts.push_str("} }");
+    ds.update(&inserts).unwrap();
+    evidence::configure(
+        &ds,
+        &settings_with(1, &[IDENTITY, SOURCES, CLAIMS]),
+        &Control::none(),
+    )
+    .unwrap();
+    let _unreviewed = propose_in(
+        &ds,
+        HIDDEN,
+        proposal("xy", IdentityRelation::PossibleMatch, &["x", "y"], None),
+    );
+    evidence::configure(&ds, &settings(1), &Control::none()).unwrap();
+
+    // Reads and reviews stay available because the added graph has no accepted proposal.
+    let res =
+        evidence::resolve_entities(&ds, &ds, "people", &[e("a")], all(), &Control::none()).unwrap();
+    assert_eq!(res.entities[0].representative, e("a"));
+    let cd = matched(&ds, "cd", &["c", "d"], None);
+    accept(&ds, "cd", &cd);
+    assert_eq!(map(&ds), pairs(&["a a", "b a", "c c", "d c"]));
 }

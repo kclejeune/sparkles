@@ -1403,20 +1403,31 @@ impl<'a> Reads<'a> {
     /// `ev:IdentityProposal` with a current authenticated `ev:Accepted` decision under
     /// `policy` in `decisions`.
     ///
-    /// Streams directly over physical term IDs without decoding unreviewed proposals or
-    /// caching per-proposal IRIs, so unrelated decision history and large unreviewed
-    /// proposal populations neither hit record limits nor exhaust the reader's cache.
+    /// Uses exact `Perm::Pos` prefix counts to scan the smallest selective candidate set
+    /// (current protection nonces on the added graphs, `ev:IdentityProposal` types,
+    /// `ev:Accepted` dispositions, or policy decisions) without walking unrelated quads in
+    /// the added graphs or populating per-proposal / per-graph entries in `Reads.ids`.
     pub fn has_live_accepted_in_graphs(
         &mut self,
         graphs: &[ProtectedGraph],
         decisions: &ProtectedGraph,
         policy: &NamedNode,
     ) -> Result<bool> {
+        let (found, _) = self.has_live_accepted_in_graphs_counted(graphs, decisions, policy)?;
+        Ok(found)
+    }
+
+    pub(crate) fn has_live_accepted_in_graphs_counted(
+        &mut self,
+        graphs: &[ProtectedGraph],
+        decisions: &ProtectedGraph,
+        policy: &NamedNode,
+    ) -> Result<(bool, usize)> {
         let Some(decisions_nonce) = decisions.1 else {
-            return Ok(false);
+            return Ok((false, 0));
         };
         let Some(decisions_g) = self.id(decisions.0.as_str())? else {
-            return Ok(false);
+            return Ok((false, 0));
         };
         let (
             Some(rdf_type),
@@ -1447,11 +1458,55 @@ impl<'a> Reads<'a> {
                 .lookup_term(self.snap, &string(&decisions_nonce.to_string()))?,
         )
         else {
-            return Ok(false);
+            return Ok((false, 0));
         };
         let supersedes_pred = self.id(&format!("{EV}supersedes"))?;
         let prep = self.preparation;
         let snap = self.snap;
+        let mut active: Vec<(Id, Id)> = Vec::new();
+        for (g, nonce) in graphs {
+            prep.check()?;
+            let Some(nonce) = nonce else {
+                continue;
+            };
+            let (Some(g_id), Some(g_nonce_id)) = (
+                prep.lookup_iri(snap, g.as_str())?,
+                prep.lookup_term(snap, &string(&nonce.to_string()))?,
+            ) else {
+                continue;
+            };
+            active.push((g_id, g_nonce_id));
+        }
+        active.sort_unstable();
+        active.dedup();
+        let mut keep = 0usize;
+        let mut c_protected = 0u64;
+        for i in 0..active.len() {
+            prep.check()?;
+            let (g_id, g_nonce_id) = active[i];
+            let n = snap.count(Perm::Pos, &[protection_pred.0, g_nonce_id.0])?;
+            if n > 0 {
+                c_protected = c_protected.saturating_add(n);
+                active[keep] = (g_id, g_nonce_id);
+                keep += 1;
+            }
+        }
+        active.truncate(keep);
+        if active.is_empty() {
+            return Ok((false, 0));
+        }
+        let c_proposals = snap.count(Perm::Pos, &[rdf_type.0, identity_proposal.0])?;
+        if c_proposals == 0 {
+            return Ok((false, 0));
+        }
+        let c_accepted = snap.count(Perm::Pos, &[disposition_pred.0, accepted_obj.0])?;
+        if c_accepted == 0 {
+            return Ok((false, 0));
+        }
+        let c_policy = snap.count(Perm::Pos, &[review_policy.0, policy_id.0])?;
+        if c_policy == 0 {
+            return Ok((false, 0));
+        }
         let one_id = |g_id: Id, s_id: Id, p_id: Id| -> Result<Option<Id>> {
             let mut found = None;
             let mut count = 0u8;
@@ -1505,58 +1560,153 @@ impl<'a> Reads<'a> {
             })?;
             Ok(superseded)
         };
-        for (g, nonce) in graphs {
-            prep.check()?;
-            let Some(nonce) = nonce else {
-                continue;
-            };
-            let (Some(g_id), Some(g_nonce_id)) = (
-                prep.lookup_iri(snap, g.as_str())?,
-                prep.lookup_term(snap, &string(&nonce.to_string()))?,
-            ) else {
-                continue;
-            };
-            let mut found_live = false;
-            prep.scan(snap, Perm::Gspo, &[g_id.0], |q| {
-                if q[1] != rdf_type || q[2] != identity_proposal {
+        let proposal_has_live_accepted = |p_id: Id, g_id: Id, g_nonce_id: Id| -> Result<bool> {
+            let mut p_live = false;
+            prep.scan(snap, Perm::Pos, &[target_pred.0, p_id.0], |dq| {
+                if dq[3] != decisions_g {
                     return Ok(true);
                 }
-                let p_id = q[0];
-                let mut p_live = false;
-                prep.scan(snap, Perm::Pos, &[target_pred.0, p_id.0], |dq| {
-                    if dq[3] != decisions_g {
+                let d_id = dq[0];
+                if !snap.contains(&[d_id, rdf_type, review_decision, decisions_g])?
+                    || !snap.contains(&[d_id, review_policy, policy_id, decisions_g])?
+                    || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
+                {
+                    return Ok(true);
+                }
+                if !id_authenticated(d_id, decisions_g, decisions_nonce_id)?
+                    || !is_named(d_id)?
+                    || is_superseded(d_id)?
+                {
+                    return Ok(true);
+                }
+                if id_authenticated(p_id, g_id, g_nonce_id)? && is_named(p_id)? {
+                    p_live = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            Ok(p_live)
+        };
+        let decision_targets_added_proposal = |d_id: Id| -> Result<bool> {
+            if !snap.contains(&[d_id, rdf_type, review_decision, decisions_g])?
+                || !snap.contains(&[d_id, review_policy, policy_id, decisions_g])?
+                || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
+            {
+                return Ok(false);
+            }
+            let mut targets_added = false;
+            let mut decision_checked = false;
+            let mut decision_ok = false;
+            prep.scan(
+                snap,
+                Perm::Gspo,
+                &[decisions_g.0, d_id.0, target_pred.0],
+                |tq| {
+                    let p_id = tq[2];
+                    prep.scan(
+                        snap,
+                        Perm::Spo,
+                        &[p_id.0, rdf_type.0, identity_proposal.0],
+                        |pq| {
+                            let g_id = pq[3];
+                            let mut idx = active.partition_point(|&(id, _)| id < g_id);
+                            while idx < active.len() && active[idx].0 == g_id {
+                                let g_nonce_id = active[idx].1;
+                                idx += 1;
+                                if !decision_checked {
+                                    decision_checked = true;
+                                    decision_ok =
+                                        id_authenticated(d_id, decisions_g, decisions_nonce_id)?
+                                            && is_named(d_id)?
+                                            && !is_superseded(d_id)?;
+                                }
+                                if !decision_ok {
+                                    return Ok(false);
+                                }
+                                if id_authenticated(p_id, g_id, g_nonce_id)? && is_named(p_id)? {
+                                    targets_added = true;
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        },
+                    )?;
+                    Ok(!targets_added && (!decision_checked || decision_ok))
+                },
+            )?;
+            Ok(targets_added)
+        };
+        let min_count = c_protected.min(c_proposals).min(c_accepted).min(c_policy);
+        let mut outer_rows = 0usize;
+        let mut found_live = false;
+        if c_protected == min_count {
+            for &(g_id, g_nonce_id) in &active {
+                prep.check()?;
+                prep.scan(snap, Perm::Pos, &[protection_pred.0, g_nonce_id.0], |q| {
+                    outer_rows += 1;
+                    if q[3] != g_id {
                         return Ok(true);
                     }
-                    let d_id = dq[0];
-                    if !snap.contains(&[d_id, rdf_type, review_decision, decisions_g])?
-                        || !snap.contains(&[d_id, review_policy, policy_id, decisions_g])?
-                        || one_id(decisions_g, d_id, disposition_pred)? != Some(accepted_obj)
-                    {
+                    let p_id = q[0];
+                    if !snap.contains(&[p_id, rdf_type, identity_proposal, g_id])? {
                         return Ok(true);
                     }
-                    if !id_authenticated(d_id, decisions_g, decisions_nonce_id)?
-                        || !is_named(d_id)?
-                        || is_superseded(d_id)?
-                    {
-                        return Ok(true);
-                    }
-                    if id_authenticated(p_id, g_id, g_nonce_id)? && is_named(p_id)? {
-                        p_live = true;
+                    if proposal_has_live_accepted(p_id, g_id, g_nonce_id)? {
+                        found_live = true;
                         return Ok(false);
                     }
                     Ok(true)
                 })?;
-                if p_live {
+                if found_live {
+                    return Ok((true, outer_rows));
+                }
+            }
+        } else if c_proposals == min_count {
+            prep.scan(snap, Perm::Pos, &[rdf_type.0, identity_proposal.0], |q| {
+                outer_rows += 1;
+                let g_id = q[3];
+                let mut idx = active.partition_point(|&(id, _)| id < g_id);
+                while idx < active.len() && active[idx].0 == g_id {
+                    let g_nonce_id = active[idx].1;
+                    idx += 1;
+                    if proposal_has_live_accepted(q[0], g_id, g_nonce_id)? {
+                        found_live = true;
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+        } else if c_accepted == min_count {
+            prep.scan(
+                snap,
+                Perm::Pos,
+                &[disposition_pred.0, accepted_obj.0],
+                |q| {
+                    outer_rows += 1;
+                    if q[3] != decisions_g {
+                        return Ok(true);
+                    }
+                    if decision_targets_added_proposal(q[0])? {
+                        found_live = true;
+                        return Ok(false);
+                    }
+                    Ok(true)
+                },
+            )?;
+        } else {
+            prep.scan(snap, Perm::Pos, &[review_policy.0, policy_id.0], |q| {
+                outer_rows += 1;
+                if q[3] != decisions_g {
+                    return Ok(true);
+                }
+                if decision_targets_added_proposal(q[0])? {
                     found_live = true;
                     return Ok(false);
                 }
                 Ok(true)
             })?;
-            if found_live {
-                return Ok(true);
-            }
         }
-        Ok(false)
+        Ok((found_live, outer_rows))
     }
 
     /// Scan all quads in `g`, up to `limit`, returning:
