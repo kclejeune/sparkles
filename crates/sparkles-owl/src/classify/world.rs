@@ -2755,6 +2755,10 @@ impl<'a> World<'a> {
             since_poll = since_poll.saturating_add(work);
             if since_poll >= DEP_POLL_STEP {
                 since_poll = 0;
+                #[cfg(test)]
+                super::el_test_hooks::scan_periodic_poll(
+                    super::el_test_hooks::ScanKind::WorldBuildDep,
+                );
                 if !budget.poll_stop() {
                     return Err(Halt::Stopped);
                 }
@@ -2877,6 +2881,8 @@ impl<'a> World<'a> {
                 }
             }
         }
+        #[cfg(test)]
+        super::el_test_hooks::scan_pass1_completed(super::el_test_hooks::ScanKind::WorldBuildDep);
         let add_class_ctx = (class as usize) < self.ctx.len() && !self.slots.contains_key(&class);
         if add_class_ctx {
             used_contexts_count = used_contexts_count.saturating_add(1);

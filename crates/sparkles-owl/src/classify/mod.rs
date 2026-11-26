@@ -10775,25 +10775,6 @@ impl Saturation {
                     }
                 }
             }
-            let mut seeds: Vec<(Ex, saturate::Concl)> = std::iter::once(TOP)
-                .chain(ix.nominals.iter().copied())
-                .filter(|&e| {
-                    !self
-                        .ctx
-                        .get(e as usize)
-                        .and_then(|c| c.get())
-                        .is_some_and(|c| c.st.lock().real)
-                })
-                .map(|e| (e, saturate::Concl::Real(saturate::REAL_ROOT)))
-                .collect();
-            for (e, p) in reseed_real.drain(..) {
-                seeds.push((e, saturate::Concl::Real(p)));
-            }
-            if reseed_real_bytes > 0 {
-                reseed_real = Vec::new();
-                totals.memory = totals.memory.saturating_sub(reseed_real_bytes);
-                reseed_real_bytes = 0;
-            }
             macro_rules! shed_phase2_tracking {
                 () => {{
                     #[cfg(test)]
@@ -10824,6 +10805,8 @@ impl Saturation {
                     }
                 }};
             }
+            let mut seeds: Vec<(Ex, saturate::Concl)> = Vec::new();
+            let mut first_round = true;
             loop {
                 if let Err(e) = poll(limits) {
                     if partial && !disj {
@@ -10832,17 +10815,163 @@ impl Saturation {
                     }
                     return Err(e);
                 }
+                let seed_count = if first_round {
+                    let root_nom = std::iter::once(TOP)
+                        .chain(ix.nominals.iter().copied())
+                        .filter(|&e| {
+                            self.ctx
+                                .get(e as usize)
+                                .and_then(|c| c.get())
+                                .is_some_and(|c| !c.st.lock().real)
+                        })
+                        .count();
+                    let reseed = reseed_real
+                        .iter()
+                        .filter(|&&(e, _)| self.ctx.get(e as usize).and_then(|x| x.get()).is_some())
+                        .count();
+                    root_nom + reseed
+                } else {
+                    seeds
+                        .iter()
+                        .filter(|&&(e, _)| self.ctx.get(e as usize).and_then(|x| x.get()).is_some())
+                        .count()
+                };
+                let woken_bytes = seed_count.checked_mul(std::mem::size_of::<Ex>());
+                let seeds_overlap_bytes = seeds
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(Ex, saturate::Concl)>());
+                let mut woken: Vec<Ex> = Vec::new();
+                if seed_count > 0 {
+                    let try_admit_transfer = |mem: usize, paid: &mut usize| -> Option<usize> {
+                        let wb = woken_bytes?;
+                        let sb = seeds_overlap_bytes?;
+                        let held_overlap = mem.checked_add(wb)?.checked_add(sb)?;
+                        let total_queued = pending.checked_add(seed_count)?;
+                        let used = saturate::live_memory(
+                            held_overlap,
+                            total_queued,
+                            dynamic.as_ref(),
+                            dl_run.as_ref(),
+                        )?;
+                        if max_memory.is_some_and(|m| used > m) {
+                            return None;
+                        }
+                        if charge_fn.is_some() && !cover_memory(used, max_memory, charge_fn, paid) {
+                            return None;
+                        }
+                        Some(used)
+                    };
+                    let mut transfer_used = try_admit_transfer(totals.memory, &mut totals.paid);
+                    if transfer_used.is_none()
+                        && !horn
+                        && !disj
+                        && (track_el
+                            || real_parent_bytes > 0
+                            || phase2_dep_bytes > 0
+                            || kept_el_deps_in_totals > 0
+                            || kept_worlds_in_totals > 0
+                            || kept_el_aux_in_totals > 0)
+                    {
+                        shed_phase2_tracking!();
+                        transfer_used = try_admit_transfer(totals.memory, &mut totals.paid);
+                    }
+                    let admitted_transfer = match transfer_used {
+                        Some(used) if woken.try_reserve_exact(seed_count).is_ok() => Some(used),
+                        _ => None,
+                    };
+                    let Some(used) = admitted_transfer else {
+                        let attempted = woken_bytes
+                            .and_then(|wb| {
+                                seeds_overlap_bytes.and_then(|sb| {
+                                    totals
+                                        .memory
+                                        .checked_add(wb)
+                                        .and_then(|m| m.checked_add(sb))
+                                        .and_then(|held| {
+                                            pending.checked_add(seed_count).and_then(|q| {
+                                                saturate::live_memory(
+                                                    held,
+                                                    q,
+                                                    dynamic.as_ref(),
+                                                    dl_run.as_ref(),
+                                                )
+                                            })
+                                        })
+                                })
+                            })
+                            .unwrap_or(usize::MAX);
+                        #[cfg(test)]
+                        el_test_hooks::record_phase2_transfer_refused(attempted);
+                        let err = Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used: attempted,
+                        };
+                        if reseed_real_bytes > 0 && !horn && !disj && !self.el_no_track {
+                            self.el_track_memory_stop = Some(totals.peak.max(totals.paid));
+                            return Err(err);
+                        }
+                        if partial && !disj {
+                            halted = Some(err);
+                            break;
+                        }
+                        if partial {
+                            self.partial_over = true;
+                            self.dirty = true;
+                        }
+                        return Err(err);
+                    };
+                    #[cfg(test)]
+                    let pre_transfer_peak = totals.peak;
+                    totals.peak = totals.peak.max(used);
+                    #[cfg(test)]
+                    el_test_hooks::record_phase2_transfer_admitted(pre_transfer_peak, used);
+                }
                 #[cfg(test)]
                 let before = admission_test::observing()
                     .then(|| admission_test::queued(&self.ctx, dynamic.as_ref()));
-                let mut woken: Vec<Ex> = Vec::with_capacity(seeds.len());
-                for (e, c) in seeds.drain(..) {
-                    if let Some(x) = self.ctx.get(e as usize).and_then(|x| x.get()) {
-                        x.todo.lock().push(c);
-                        woken.push(e);
+                if first_round {
+                    for e in std::iter::once(TOP).chain(ix.nominals.iter().copied()) {
+                        if let Some(x) = self.ctx.get(e as usize).and_then(|c| c.get())
+                            && !x.st.lock().real
+                        {
+                            let mut todo = x.todo.lock();
+                            if todo.len() == todo.capacity() {
+                                let _ = todo.try_reserve_exact(1);
+                            }
+                            todo.push(saturate::Concl::Real(saturate::REAL_ROOT));
+                            woken.push(e);
+                        }
+                    }
+                    for (e, p) in reseed_real.drain(..) {
+                        if let Some(x) = self.ctx.get(e as usize).and_then(|x| x.get()) {
+                            let mut todo = x.todo.lock();
+                            if todo.len() == todo.capacity() {
+                                let _ = todo.try_reserve_exact(1);
+                            }
+                            todo.push(saturate::Concl::Real(p));
+                            woken.push(e);
+                        }
+                    }
+                    if reseed_real_bytes > 0 {
+                        reseed_real = Vec::new();
+                        totals.memory = totals.memory.saturating_sub(reseed_real_bytes);
+                        reseed_real_bytes = 0;
+                    }
+                    first_round = false;
+                } else {
+                    let round_seeds = std::mem::take(&mut seeds);
+                    for (e, c) in round_seeds {
+                        if let Some(x) = self.ctx.get(e as usize).and_then(|x| x.get()) {
+                            let mut todo = x.todo.lock();
+                            if todo.len() == todo.capacity() {
+                                let _ = todo.try_reserve_exact(1);
+                            }
+                            todo.push(c);
+                            woken.push(e);
+                        }
                     }
                 }
-                let base_queued = if charge_fn.is_some() {
+                let base_queued = if charge_fn.is_some() || max_memory.is_some() {
                     pending + woken.len()
                 } else {
                     0
@@ -10858,8 +10987,9 @@ impl Saturation {
                 }
                 woken.sort_unstable();
                 woken.dedup();
+                let woken_live_bytes = woken.capacity().saturating_mul(std::mem::size_of::<Ex>());
                 let round = Bounds {
-                    base_memory: totals.memory,
+                    base_memory: totals.memory.saturating_add(woken_live_bytes),
                     base_queued,
                     peak_memory: totals.peak,
                     paid_memory: totals.paid,
@@ -10896,10 +11026,11 @@ impl Saturation {
                         None
                     },
                 );
+                drop(woken);
                 let pre_round_peak = totals.peak;
                 totals = saturate::Totals {
                     conclusions: totals.conclusions + more.conclusions,
-                    memory: more.memory,
+                    memory: more.memory.saturating_sub(woken_live_bytes),
                     peak: totals.peak.max(more.peak),
                     admitted_peak: totals.admitted_peak.max(more.admitted_peak),
                     paid: more.paid,
@@ -11958,6 +12089,12 @@ impl Saturation {
                             if let Some(used) = join_used
                                 && self.worlds.try_reserve(new_rows_count).is_ok()
                             {
+                                #[cfg(test)]
+                                el_test_hooks::record_worlds_join_reserved(
+                                    totals.peak,
+                                    used,
+                                    self.worlds.phys_cap(),
+                                );
                                 totals.peak = totals.peak.max(used);
                                 budget.paid.store(totals.paid, Ordering::Release);
                                 budget.peak.fetch_max(totals.peak, Ordering::Relaxed);
@@ -11980,6 +12117,8 @@ impl Saturation {
                                         })
                                     })
                                     .unwrap_or(usize::MAX);
+                                #[cfg(test)]
+                                el_test_hooks::record_worlds_join_refused(attempted);
                                 drop(chunks);
                                 world_err.get_or_insert(Error::Memory {
                                     limit: limits.max_memory.unwrap_or(usize::MAX),
@@ -12405,6 +12544,8 @@ impl Saturation {
                                         })
                                     })
                                     .unwrap_or(usize::MAX);
+                                #[cfg(test)]
+                                el_test_hooks::record_worlds_join_refused(attempted);
                                 drop(found);
                                 if partial {
                                     self.partial_over = true;
@@ -12416,6 +12557,8 @@ impl Saturation {
                                 });
                             };
                             if self.worlds.try_reserve(new_rows_count).is_err() {
+                                #[cfg(test)]
+                                el_test_hooks::record_worlds_join_refused(usize::MAX);
                                 drop(found);
                                 if partial {
                                     self.partial_over = true;
@@ -12426,6 +12569,12 @@ impl Saturation {
                                     used: usize::MAX,
                                 });
                             }
+                            #[cfg(test)]
+                            el_test_hooks::record_worlds_join_reserved(
+                                totals.peak,
+                                used,
+                                self.worlds.phys_cap(),
+                            );
                             totals.peak = totals.peak.max(used);
                             budget.paid.store(totals.paid, Ordering::Release);
                             budget.peak.fetch_max(totals.peak, Ordering::Relaxed);
@@ -17152,6 +17301,8 @@ pub(super) mod el_test_hooks {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum ScanEvent {
         Progress(ScanKind),
+        PeriodicPoll(ScanKind),
+        Pass1Completed(ScanKind),
         Completed(ScanKind),
     }
 
@@ -17165,6 +17316,16 @@ pub(super) mod el_test_hooks {
         pub orphan_prune_used: usize,
         pub no_track_retries: usize,
         pub opt_dep_refusals: usize,
+        pub phase2_transfer_refusals: usize,
+        pub phase2_transfer_attempted: usize,
+        pub phase2_transfer_pre_peak: usize,
+        pub phase2_transfer_admitted_used: usize,
+        pub worlds_join_refused: usize,
+        pub worlds_join_attempted: usize,
+        pub worlds_join_reserved: usize,
+        pub worlds_join_pre_peak: usize,
+        pub worlds_join_reserved_used: usize,
+        pub worlds_join_reserved_phys_cap: usize,
     }
 
     type ScanCallback = Arc<dyn Fn(ScanEvent) + Send + Sync>;
@@ -17178,6 +17339,16 @@ pub(super) mod el_test_hooks {
         orphan_prune_used: AtomicUsize,
         no_track_retries: AtomicUsize,
         opt_dep_refusals: AtomicUsize,
+        phase2_transfer_refusals: AtomicUsize,
+        phase2_transfer_attempted: AtomicUsize,
+        phase2_transfer_pre_peak: AtomicUsize,
+        phase2_transfer_admitted_used: AtomicUsize,
+        worlds_join_refused: AtomicUsize,
+        worlds_join_attempted: AtomicUsize,
+        worlds_join_reserved: AtomicUsize,
+        worlds_join_pre_peak: AtomicUsize,
+        worlds_join_reserved_used: AtomicUsize,
+        worlds_join_reserved_phys_cap: AtomicUsize,
         scan_cb: Option<ScanCallback>,
     }
 
@@ -17192,6 +17363,16 @@ pub(super) mod el_test_hooks {
                 orphan_prune_used: AtomicUsize::new(0),
                 no_track_retries: AtomicUsize::new(0),
                 opt_dep_refusals: AtomicUsize::new(0),
+                phase2_transfer_refusals: AtomicUsize::new(0),
+                phase2_transfer_attempted: AtomicUsize::new(0),
+                phase2_transfer_pre_peak: AtomicUsize::new(0),
+                phase2_transfer_admitted_used: AtomicUsize::new(0),
+                worlds_join_refused: AtomicUsize::new(0),
+                worlds_join_attempted: AtomicUsize::new(0),
+                worlds_join_reserved: AtomicUsize::new(0),
+                worlds_join_pre_peak: AtomicUsize::new(0),
+                worlds_join_reserved_used: AtomicUsize::new(0),
+                worlds_join_reserved_phys_cap: AtomicUsize::new(0),
                 scan_cb,
             }
         }
@@ -17206,6 +17387,20 @@ pub(super) mod el_test_hooks {
                 orphan_prune_used: self.orphan_prune_used.load(Ordering::Relaxed),
                 no_track_retries: self.no_track_retries.load(Ordering::Relaxed),
                 opt_dep_refusals: self.opt_dep_refusals.load(Ordering::Relaxed),
+                phase2_transfer_refusals: self.phase2_transfer_refusals.load(Ordering::Relaxed),
+                phase2_transfer_attempted: self.phase2_transfer_attempted.load(Ordering::Relaxed),
+                phase2_transfer_pre_peak: self.phase2_transfer_pre_peak.load(Ordering::Relaxed),
+                phase2_transfer_admitted_used: self
+                    .phase2_transfer_admitted_used
+                    .load(Ordering::Relaxed),
+                worlds_join_refused: self.worlds_join_refused.load(Ordering::Relaxed),
+                worlds_join_attempted: self.worlds_join_attempted.load(Ordering::Relaxed),
+                worlds_join_reserved: self.worlds_join_reserved.load(Ordering::Relaxed),
+                worlds_join_pre_peak: self.worlds_join_pre_peak.load(Ordering::Relaxed),
+                worlds_join_reserved_used: self.worlds_join_reserved_used.load(Ordering::Relaxed),
+                worlds_join_reserved_phys_cap: self
+                    .worlds_join_reserved_phys_cap
+                    .load(Ordering::Relaxed),
             }
         }
     }
@@ -17314,10 +17509,69 @@ pub(super) mod el_test_hooks {
         });
     }
 
+    pub(super) fn record_phase2_transfer_refused(attempted: usize) {
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.phase2_transfer_refusals.fetch_add(1, Ordering::Relaxed);
+                p.phase2_transfer_attempted
+                    .fetch_max(attempted, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn record_phase2_transfer_admitted(pre_peak: usize, used: usize) {
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.phase2_transfer_pre_peak
+                    .fetch_max(pre_peak, Ordering::Relaxed);
+                p.phase2_transfer_admitted_used
+                    .fetch_max(used, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn record_worlds_join_refused(attempted: usize) {
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.worlds_join_refused.fetch_add(1, Ordering::Relaxed);
+                p.worlds_join_attempted
+                    .fetch_max(attempted, Ordering::Relaxed);
+            }
+        });
+    }
+
+    pub(super) fn record_worlds_join_reserved(pre_peak: usize, used: usize, phys_cap: usize) {
+        ACTIVE_PROBE.with(|slot| {
+            if let Some(p) = slot.borrow().as_ref() {
+                p.worlds_join_reserved.fetch_add(1, Ordering::Relaxed);
+                p.worlds_join_pre_peak
+                    .fetch_max(pre_peak, Ordering::Relaxed);
+                p.worlds_join_reserved_used
+                    .fetch_max(used, Ordering::Relaxed);
+                p.worlds_join_reserved_phys_cap
+                    .fetch_max(phys_cap, Ordering::Relaxed);
+            }
+        });
+    }
+
     pub(super) fn scan_progress(kind: ScanKind) {
         let cb = ACTIVE_PROBE.with(|slot| slot.borrow().as_ref().and_then(|p| p.scan_cb.clone()));
         if let Some(cb) = cb {
             cb(ScanEvent::Progress(kind));
+        }
+    }
+
+    pub(super) fn scan_periodic_poll(kind: ScanKind) {
+        let cb = ACTIVE_PROBE.with(|slot| slot.borrow().as_ref().and_then(|p| p.scan_cb.clone()));
+        if let Some(cb) = cb {
+            cb(ScanEvent::PeriodicPoll(kind));
+        }
+    }
+
+    pub(super) fn scan_pass1_completed(kind: ScanKind) {
+        let cb = ACTIVE_PROBE.with(|slot| slot.borrow().as_ref().and_then(|p| p.scan_cb.clone()));
+        if let Some(cb) = cb {
+            cb(ScanEvent::Pass1Completed(kind));
         }
     }
 
@@ -27561,9 +27815,13 @@ mod tests {
             assert!(base.consistent, "{label}: base run must be consistent");
 
             let progress = std::sync::Arc::new(AtomicUsize::new(0));
+            let periodic_polls = std::sync::Arc::new(AtomicUsize::new(0));
+            let pass1_completed = std::sync::Arc::new(AtomicUsize::new(0));
             let completed = std::sync::Arc::new(AtomicUsize::new(0));
             let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let progress_cb = progress.clone();
+            let periodic_polls_cb = periodic_polls.clone();
+            let pass1_completed_cb = pass1_completed.clone();
             let completed_cb = completed.clone();
             let armed_cb = armed.clone();
             let armed_cancel = armed.clone();
@@ -27581,6 +27839,12 @@ mod tests {
                         if seen >= arm_after {
                             armed_cb.store(true, Ordering::Release);
                         }
+                    }
+                    el_test_hooks::ScanEvent::PeriodicPoll(kind) if kind == target => {
+                        periodic_polls_cb.fetch_add(1, Ordering::Relaxed);
+                    }
+                    el_test_hooks::ScanEvent::Pass1Completed(kind) if kind == target => {
+                        pass1_completed_cb.fetch_add(1, Ordering::Relaxed);
                     }
                     el_test_hooks::ScanEvent::Completed(kind) if kind == target => {
                         completed_cb.fetch_add(1, Ordering::Relaxed);
@@ -27614,6 +27878,17 @@ mod tests {
                 "{label}: {target:?} must abort via its periodic in-scan poll before normal completion (progress={})",
                 progress.load(Ordering::Acquire),
             );
+            if target == el_test_hooks::ScanKind::WorldBuildDep {
+                assert!(
+                    periodic_polls.load(Ordering::Acquire) >= 1,
+                    "{label}: World::build_dep must execute its periodic poll_step inside Pass 1"
+                );
+                assert_eq!(
+                    pass1_completed.load(Ordering::Acquire),
+                    0,
+                    "{label}: World::build_dep must observe cancellation before Pass 1 completes"
+                );
+            }
 
             // Recover by replaying the edit WITH its `Some(Changes { ... })` list.
             let recovered = sat
@@ -27930,7 +28205,11 @@ mod tests {
         assert!(cal_a_inc.stats.incremental);
 
         let high_a = cal_a_inc.stats.peak_memory;
-        let low_a = plain_a_out.stats.peak_memory;
+        // Fresh `plain_a` merges all 80 base+new individuals at once (holding their full
+        // `woken` buffer in `Bounds::base_memory`), which sits slightly above incremental
+        // Round 1's `key_merges_with_deps` peak (~514 KB) even though post-shed incremental
+        // Round 2 only needs ~350 KB; include the incremental shedding window below it.
+        let low_a = plain_a_out.stats.peak_memory.saturating_sub(64 * 1024);
         let step_a = ((high_a.saturating_sub(low_a)) / 40).max(256);
         let mut cap = high_a.saturating_sub(step_a);
         let mut saw_phase2_shed_inc = false;
@@ -28422,6 +28701,506 @@ mod tests {
     }
 
     #[test]
+    fn el_phase2_reseed_transfer_preadmits_cap_and_pool() {
+        // Regression for R5-1 (Sol P2): a broad alternative-parent `reseed_real` frontier
+        // entering Phase 2 must not copy into an unadmitted overlapping `seeds` vector and
+        // must pre-admit the remaining transfer staging (`woken` + queued `Concl` messages)
+        // against both a numeric `max_memory` cap and a refusing `charge` pool BEFORE
+        // allocating `woken` or pushing to `x.todo`, while charging live `woken` capacity
+        // across `saturate_counted_tracked`.
+        const FRONTIER: usize = 400;
+        const PHASE1_CHAIN: usize = 260;
+        let unrestricted = Limits {
+            threads: 1,
+            ..Limits::default()
+        };
+
+        let mut base_ofn = String::from(
+            "Prefix(:=<http://ex.org/reseedxfer#>) Ontology(\n\
+             ClassAssertion(:R1Root :r1_root)\n\
+             ClassAssertion(:R2Root :r2_root)\n\
+             SubClassOf(:S0 ObjectSomeValuesFrom(:s :T0))\n\
+             SubClassOf(:T0 ObjectOneOf(:b))\n\
+             SubClassOf(:T0 :Extra)\n\
+             SubClassOf(:Probe ObjectOneOf(:b))\n\
+             Declaration(Class(:Probe))\n\
+             Declaration(Class(:Extra))\n",
+        );
+        // Two parent existential links per frontier class `:S{i}`:
+        // index `8 + 2*i` is `:R1Root ⊑ ∃:r1.:S{i}`, index `8 + 2*i + 1` is `:R2Root ⊑ ∃:r2.:S{i}`.
+        for i in 0..FRONTIER {
+            base_ofn.push_str(&format!(
+                "SubClassOf(:R1Root ObjectSomeValuesFrom(:r1 :S{i}))\n\
+                 SubClassOf(:R2Root ObjectSomeValuesFrom(:r2 :S{i}))\n"
+            ));
+        }
+        base_ofn.push_str(")\n");
+        let base_ax = crate::ofn_read::parse(&base_ofn).unwrap().axioms;
+        let base_kinds: Vec<&AxiomKind> = base_ax.iter().map(|a| &a.kind).collect();
+
+        // Run 1: identify each `:S{i}`'s recorded causal `real_parent` so Run 2 removes
+        // EVERY recorded parent link while keeping the alternative already-real parent.
+        let mut probe_sat = Saturation::new();
+        let probe_out1 = probe_sat
+            .classify(&base_kinds, None, &unrestricted)
+            .unwrap();
+        assert!(probe_out1.consistent);
+        assert!(probe_sat.el_deps.phase2_ran);
+        let r1_ind = NamedIndividual::new("http://ex.org/reseedxfer#r1_root");
+        let r2_ind = NamedIndividual::new("http://ex.org/reseedxfer#r2_root");
+        let r1_ex = probe_sat
+            .interner
+            .individuals
+            .get(&r1_ind)
+            .and_then(|id| {
+                probe_sat
+                    .interner
+                    .nodes
+                    .iter()
+                    .position(|n| *n == Node::Nominal(id))
+            })
+            .unwrap() as Ex;
+        let r2_ex = probe_sat
+            .interner
+            .individuals
+            .get(&r2_ind)
+            .and_then(|id| {
+                probe_sat
+                    .interner
+                    .nodes
+                    .iter()
+                    .position(|n| *n == Node::Nominal(id))
+            })
+            .unwrap() as Ex;
+        let mut remove_indices: Vec<usize> = Vec::with_capacity(FRONTIER);
+        for i in 0..FRONTIER {
+            let s_cls = Class::new(format!("http://ex.org/reseedxfer#S{i}"));
+            let s_ex = probe_sat.interner.class_ex(&s_cls).unwrap();
+            let rp = probe_sat.el_deps.real_parent[s_ex as usize];
+            assert!(
+                rp == r1_ex || rp == r2_ex,
+                "expected :S{i} real_parent to be :r1_root ({r1_ex}) or :r2_root ({r2_ex}), got {rp}"
+            );
+            let ax_idx = 8 + 2 * i + usize::from(rp == r2_ex);
+            remove_indices.push(ax_idx);
+        }
+
+        // Add a Phase 1 chain in Run 2 so `totals.memory` entering Phase 2 is well above
+        // `CompareAdmit` + `el_invalidation_scratch_peak`, making the Phase 2 `reseed_real`
+        // handoff strictly the global peak.
+        let mut add_ofn = String::from("Prefix(:=<http://ex.org/reseedxfer#>) Ontology(\n");
+        for i in 0..PHASE1_CHAIN {
+            add_ofn.push_str(&format!("SubClassOf(:P{i} :P{})\n", i + 1));
+        }
+        add_ofn.push_str(")\n");
+        let add_ax = crate::ofn_read::parse(&add_ofn).unwrap().axioms;
+        let added_refs: Vec<&AxiomKind> = add_ax.iter().map(|a| &a.kind).collect();
+        let removed_refs: Vec<&AxiomKind> = remove_indices
+            .iter()
+            .map(|&idx| &base_ax[idx].kind)
+            .collect();
+        let mut next_kinds: Vec<&AxiomKind> = base_ax
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| !remove_indices.contains(&idx))
+            .map(|(_, a)| &a.kind)
+            .collect();
+        next_kinds.extend_from_slice(&added_refs);
+
+        let mut fresh = Saturation::new();
+        let fresh_out = fresh.classify(&next_kinds, None, &unrestricted).unwrap();
+        let probe_cls = Class::new("http://ex.org/reseedxfer#Probe");
+        let extra_cls = Class::new("http://ex.org/reseedxfer#Extra");
+        assert!(fresh_out.taxonomy.is_subclass(&probe_cls, &extra_cls));
+
+        // 1. Calibration run with `FORCE_REFUSE_REAL_PARENT = true` (leaving `reseed_real`
+        //    live and charged while optional tracking is dropped): confirm Phase 2 transfer
+        //    is strictly the global peak, actual heap is covered, and all 400 contexts
+        //    are re-marked real with exact fresh parity.
+        let mut cal = Saturation::new();
+        cal.classify(&base_kinds, None, &unrestricted).unwrap();
+        FORCE_REFUSE_REAL_PARENT.with(|c| c.set(true));
+        let ((cal_res, cal_counts), cal_sample) = numeric::tests::measure(|| {
+            el_test_hooks::with_counts(|| {
+                cal.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &added_refs,
+                        removed: &removed_refs,
+                    }),
+                    &unrestricted,
+                )
+            })
+        });
+        assert!(!FORCE_REFUSE_REAL_PARENT.with(|c| c.get()));
+        let cal_out = cal_res.unwrap();
+        assert!(cal_out.stats.incremental);
+        assert!(cal.el_deps.is_empty() && cal.entangled);
+        assert_eq!(cal_out.taxonomy, fresh_out.taxonomy);
+        assert!(
+            cal_counts.phase2_transfer_pre_peak < cal_counts.phase2_transfer_admitted_used,
+            "expected Phase 2 reseed transfer ({}) to strictly exceed all earlier phases ({})",
+            cal_counts.phase2_transfer_admitted_used,
+            cal_counts.phase2_transfer_pre_peak,
+        );
+        assert!(
+            cal_out.stats.peak_memory >= cal_sample.peak,
+            "admitted peak ({}) undercounted measured heap ({}) across Phase 2 reseed handoff",
+            cal_out.stats.peak_memory,
+            cal_sample.peak,
+        );
+        for i in 0..FRONTIER {
+            let s_cls = Class::new(format!("http://ex.org/reseedxfer#S{i}"));
+            let s_ex = cal.interner.class_ex(&s_cls).unwrap();
+            assert!(
+                cal.ctx[s_ex as usize]
+                    .get()
+                    .is_some_and(|c| c.st.lock().real),
+                ":S{i} must be re-marked real through its surviving alternative parent"
+            );
+        }
+
+        let handoff_peak = cal_counts.phase2_transfer_admitted_used;
+        let accept_cap = cal_out.stats.peak_memory;
+        let refuse_cap = handoff_peak - 1;
+
+        // 2. With pre-Phase-1 real-parent refusal preserving `reseed_real`, test the exact
+        //    handoff boundary (`refuse_cap` refuses BEFORE pushing to `x.todo`, `handoff_peak`
+        //    accepts incrementally) under BOTH a numeric `max_memory` cap and a refusing pool.
+        // 2a. Numeric `max_memory` refusal at `refuse_cap`.
+        {
+            let mut sat = Saturation::new();
+            sat.classify(&base_kinds, None, &unrestricted).unwrap();
+            let lim = Limits {
+                max_memory: Some(refuse_cap),
+                ..unrestricted.clone()
+            };
+            let saw_retry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let marking_before_retry = std::sync::Arc::new(AtomicUsize::new(0));
+            let saw_retry_cb = saw_retry.clone();
+            let marking_cb = marking_before_retry.clone();
+            FORCE_REFUSE_REAL_PARENT.with(|c| c.set(true));
+            let (res, counts) = el_test_hooks::with_counts(|| {
+                admission_test::with_hook(
+                    move |pt| {
+                        if matches!(pt, admission_test::Point::KeptRetry { .. }) {
+                            saw_retry_cb.store(true, Ordering::Release);
+                        }
+                    },
+                    || {
+                        admission_test::with_attempt(
+                            None,
+                            true,
+                            move |attempt| {
+                                if matches!(attempt, admission_test::Attempt::Marking { .. })
+                                    && !saw_retry.load(Ordering::Acquire)
+                                {
+                                    marking_cb.fetch_add(1, Ordering::Relaxed);
+                                }
+                            },
+                            || {
+                                sat.classify(
+                                    &next_kinds,
+                                    Some(Changes {
+                                        added: &added_refs,
+                                        removed: &removed_refs,
+                                    }),
+                                    &lim,
+                                )
+                            },
+                        )
+                    },
+                )
+            });
+            assert!(
+                counts.phase2_transfer_refusals >= 1,
+                "cap {refuse_cap} must refuse at Phase 2 transfer handoff (counts={counts:?})"
+            );
+            assert!(
+                counts.phase2_transfer_attempted > refuse_cap,
+                "transfer attempted ({}) must exceed cap {refuse_cap}",
+                counts.phase2_transfer_attempted
+            );
+            assert_eq!(
+                marking_before_retry.load(Ordering::Acquire),
+                0,
+                "cap refusal must happen BEFORE pushing seeds to x.todo"
+            );
+            match res {
+                Ok(out) => {
+                    assert!(!out.stats.incremental);
+                    assert!(out.stats.peak_memory <= refuse_cap);
+                    assert_eq!(out.taxonomy, fresh_out.taxonomy);
+                }
+                Err(Error::Memory { .. }) => {}
+                Err(e) => panic!("unexpected error under cap {refuse_cap}: {e:?}"),
+            }
+        }
+
+        // 2b. Refusing `charge` pool at `refuse_cap`.
+        {
+            let mut sat = Saturation::new();
+            sat.classify(&base_kinds, None, &unrestricted).unwrap();
+            let paid = std::sync::Arc::new(AtomicUsize::new(0));
+            let paid_cb = paid.clone();
+            let lim = Limits {
+                charge: Some(std::sync::Arc::new(move |more| {
+                    let mut cur = paid_cb.load(Ordering::Relaxed);
+                    loop {
+                        let next = cur.saturating_add(more);
+                        if next > refuse_cap {
+                            return false;
+                        }
+                        match paid_cb.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => return true,
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                })),
+                ..unrestricted.clone()
+            };
+            let saw_retry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let marking_before_retry = std::sync::Arc::new(AtomicUsize::new(0));
+            let saw_retry_cb = saw_retry.clone();
+            let marking_cb = marking_before_retry.clone();
+            FORCE_REFUSE_REAL_PARENT.with(|c| c.set(true));
+            let (res, counts) = el_test_hooks::with_counts(|| {
+                admission_test::with_hook(
+                    move |pt| {
+                        if matches!(pt, admission_test::Point::KeptRetry { .. }) {
+                            saw_retry_cb.store(true, Ordering::Release);
+                        }
+                    },
+                    || {
+                        admission_test::with_attempt(
+                            None,
+                            true,
+                            move |attempt| {
+                                if matches!(attempt, admission_test::Attempt::Marking { .. })
+                                    && !saw_retry.load(Ordering::Acquire)
+                                {
+                                    marking_cb.fetch_add(1, Ordering::Relaxed);
+                                }
+                            },
+                            || {
+                                sat.classify(
+                                    &next_kinds,
+                                    Some(Changes {
+                                        added: &added_refs,
+                                        removed: &removed_refs,
+                                    }),
+                                    &lim,
+                                )
+                            },
+                        )
+                    },
+                )
+            });
+            assert!(paid.load(Ordering::Acquire) <= refuse_cap);
+            assert!(
+                counts.phase2_transfer_refusals >= 1,
+                "pool {refuse_cap} must refuse at Phase 2 transfer handoff (counts={counts:?})"
+            );
+            assert!(
+                counts.phase2_transfer_attempted > refuse_cap,
+                "pool transfer attempted ({}) must exceed {refuse_cap}",
+                counts.phase2_transfer_attempted
+            );
+            assert_eq!(
+                marking_before_retry.load(Ordering::Acquire),
+                0,
+                "pool refusal must happen BEFORE pushing seeds to x.todo"
+            );
+            match res {
+                Ok(out) => {
+                    assert!(!out.stats.incremental);
+                    assert!(out.stats.peak_memory <= refuse_cap);
+                    assert_eq!(out.taxonomy, fresh_out.taxonomy);
+                }
+                Err(Error::Memory { .. }) => {}
+                Err(e) => panic!("unexpected error under pool {refuse_cap}: {e:?}"),
+            }
+        }
+
+        // 2c. Exact acceptance under both cap and pool at `accept_cap`.
+        {
+            let mut sat_cap = Saturation::new();
+            sat_cap.classify(&base_kinds, None, &unrestricted).unwrap();
+            let lim_cap = Limits {
+                max_memory: Some(accept_cap),
+                ..unrestricted.clone()
+            };
+            FORCE_REFUSE_REAL_PARENT.with(|c| c.set(true));
+            let (out_cap, counts_cap) = el_test_hooks::with_counts(|| {
+                sat_cap
+                    .classify(
+                        &next_kinds,
+                        Some(Changes {
+                            added: &added_refs,
+                            removed: &removed_refs,
+                        }),
+                        &lim_cap,
+                    )
+                    .unwrap()
+            });
+            assert!(out_cap.stats.incremental);
+            assert!(out_cap.stats.peak_memory <= accept_cap);
+            assert_eq!(counts_cap.phase2_transfer_refusals, 0);
+            assert_eq!(out_cap.taxonomy, fresh_out.taxonomy);
+
+            let mut sat_pool = Saturation::new();
+            sat_pool.classify(&base_kinds, None, &unrestricted).unwrap();
+            let paid = std::sync::Arc::new(AtomicUsize::new(0));
+            let paid_cb = paid.clone();
+            let lim_pool = Limits {
+                charge: Some(std::sync::Arc::new(move |more| {
+                    let mut cur = paid_cb.load(Ordering::Relaxed);
+                    loop {
+                        let next = cur.saturating_add(more);
+                        if next > accept_cap {
+                            return false;
+                        }
+                        match paid_cb.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => return true,
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                })),
+                ..unrestricted.clone()
+            };
+            FORCE_REFUSE_REAL_PARENT.with(|c| c.set(true));
+            let (out_pool, counts_pool) = el_test_hooks::with_counts(|| {
+                sat_pool
+                    .classify(
+                        &next_kinds,
+                        Some(Changes {
+                            added: &added_refs,
+                            removed: &removed_refs,
+                        }),
+                        &lim_pool,
+                    )
+                    .unwrap()
+            });
+            assert!(out_pool.stats.incremental);
+            assert!(out_pool.stats.peak_memory <= accept_cap);
+            assert!(paid.load(Ordering::Acquire) <= accept_cap);
+            assert_eq!(counts_pool.phase2_transfer_refusals, 0);
+            assert_eq!(out_pool.taxonomy, fresh_out.taxonomy);
+        }
+
+        // 3. Natural (unforced) metadata shedding at the Phase 2 transfer handoff: calibrate
+        //    with optional tracking live through Phase 1, verify Phase 2 transfer exceeds
+        //    all earlier phases, and cap at `tracked_handoff - 1` under both cap and pool
+        //    so Phase 2 transfer sheds optional tracking while preserving `reseed_real` and
+        //    admits the post-shed transfer with zero handoff refusals.
+        let mut cal_tracked = Saturation::new();
+        cal_tracked
+            .classify(&base_kinds, None, &unrestricted)
+            .unwrap();
+        let (tracked_res, tracked_counts) = el_test_hooks::with_counts(|| {
+            cal_tracked.classify(
+                &next_kinds,
+                Some(Changes {
+                    added: &added_refs,
+                    removed: &removed_refs,
+                }),
+                &unrestricted,
+            )
+        });
+        let tracked_out = tracked_res.unwrap();
+        assert!(tracked_out.stats.incremental);
+        assert!(
+            tracked_counts.phase2_transfer_pre_peak < tracked_counts.phase2_transfer_admitted_used,
+            "tracked Phase 2 transfer ({}) must exceed earlier phases ({})",
+            tracked_counts.phase2_transfer_admitted_used,
+            tracked_counts.phase2_transfer_pre_peak,
+        );
+        let shed_cap = tracked_counts.phase2_transfer_admitted_used - 1;
+        assert!(shed_cap >= handoff_peak);
+        {
+            let mut sat_cap = Saturation::new();
+            sat_cap.classify(&base_kinds, None, &unrestricted).unwrap();
+            let lim_cap = Limits {
+                max_memory: Some(shed_cap),
+                ..unrestricted.clone()
+            };
+            let (res_cap, counts_cap) = el_test_hooks::with_counts(|| {
+                sat_cap.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &added_refs,
+                        removed: &removed_refs,
+                    }),
+                    &lim_cap,
+                )
+            });
+            assert!(counts_cap.phase2_shed >= 1);
+            assert_eq!(counts_cap.phase2_transfer_refusals, 0);
+            if let Ok(out_cap) = res_cap {
+                if out_cap.stats.incremental {
+                    assert!(out_cap.stats.peak_memory <= shed_cap);
+                }
+                assert_eq!(out_cap.taxonomy, fresh_out.taxonomy);
+            }
+
+            let mut sat_pool = Saturation::new();
+            sat_pool.classify(&base_kinds, None, &unrestricted).unwrap();
+            let paid = std::sync::Arc::new(AtomicUsize::new(0));
+            let paid_cb = paid.clone();
+            let lim_pool = Limits {
+                charge: Some(std::sync::Arc::new(move |more| {
+                    let mut cur = paid_cb.load(Ordering::Relaxed);
+                    loop {
+                        let next = cur.saturating_add(more);
+                        if next > shed_cap {
+                            return false;
+                        }
+                        match paid_cb.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => return true,
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                })),
+                ..unrestricted.clone()
+            };
+            let (res_pool, counts_pool) = el_test_hooks::with_counts(|| {
+                sat_pool.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &added_refs,
+                        removed: &removed_refs,
+                    }),
+                    &lim_pool,
+                )
+            });
+            assert!(paid.load(Ordering::Acquire) <= shed_cap);
+            assert!(counts_pool.phase2_shed >= 1);
+            assert_eq!(counts_pool.phase2_transfer_refusals, 0);
+            if let Ok(out_pool) = res_pool {
+                if out_pool.stats.incremental {
+                    assert!(out_pool.stats.peak_memory <= shed_cap);
+                }
+                assert_eq!(out_pool.taxonomy, fresh_out.taxonomy);
+            }
+        }
+    }
+
+    #[test]
     fn tombstone_bearing_phys_hash_map_bounds_actual_growth() {
         // Regression for R4-2 (Sol P1 #2): retaining 14 entries in a full 32-bucket
         // hashbrown table can leave 14 tombstones (`capacity() == 14`, `phys_cap() == 28`).
@@ -28564,19 +29343,36 @@ mod tests {
             cal_retain.worlds.capacity(),
             cal_retain.worlds.phys_cap(),
         );
-        let add_count = (cal_retain.worlds.capacity() - cal_retain.worlds.len()) + 1;
+        let add_count = 56 - cal_retain.worlds.len();
         assert!(
-            cal_retain.worlds.len() + add_count > 28 && cal_retain.worlds.len() + add_count <= 56,
-            "expected surviving ({}) + add ({add_count}) in (28, 56]",
-            cal_retain.worlds.len()
+            cal_retain.worlds.len() + add_count > cal_retain.worlds.capacity()
+                && cal_retain.worlds.len() + add_count == 56,
+            "expected surviving ({}) + add ({add_count}) == 56 > cap ({})",
+            cal_retain.worlds.len(),
+            cal_retain.worlds.capacity(),
         );
         // Add `add_count` brand-new conditional worlds reaching an independent witness
         // `:WNew` (so `:W` is never modified and all surviving `:Q{i}` worlds stay reused
-        // with their tombstones intact in `self.worlds` across Phase 3 join).
+        // with their tombstones intact in `self.worlds` across Phase 3 join). Combine:
+        // - an unrelated 140-class Phase 1 chain `:P0 ⊑ ... ⊑ :P140` so Phase 1 lifts
+        //   `totals.memory` well above `CompareAdmit`, and
+        // - 200 `:QOut{j}` subsumers per `:QNew{i}` world so accumulated `found` (~20 KB)
+        //   plus 128-bucket `worlds_grow_peak` (~4.2 KB) exceeds Phase 1's optional-tracking
+        //   headroom while each single world's COW overhead (~2.4 KB) stays strictly below
+        //   `worlds_grow_peak` (~4.2 KB).
         let mut add_ofn = String::from(
             "Prefix(:=<http://ex.org/wtomb#>) Ontology(\n\
-             SubClassOf(:WNew ObjectOneOf(:w_new))\n",
+             SubClassOf(:WNew ObjectOneOf(:w_new))\n\
+             SubClassOf(:WNew :WNewTag)\n\
+             SubClassOf(ObjectIntersectionOf(ObjectOneOf(:w_new) :WNewTag) :WNewHit)\n\
+             SubClassOf(ObjectSomeValuesFrom(:s2 :WNewHit) :QHit)\n",
         );
+        for j in 0..140 {
+            add_ofn.push_str(&format!("SubClassOf(:P{j} :P{})\n", j + 1));
+        }
+        for j in 0..200 {
+            add_ofn.push_str(&format!("SubClassOf(:QHit :QOut{j})\n"));
+        }
         for i in 1..add_count {
             add_ofn.push_str(&format!(
                 "SubClassOf(:QNew{i} ObjectSomeValuesFrom(:s2 :WNew))\n"
@@ -28632,175 +29428,266 @@ mod tests {
             sample_inc.peak,
         );
 
-        // 2. Cap and pool boundary check: bracket the plain incremental join peak (after
-        //    optional tracking is shed) so we witness BOTH a refusal strictly BEFORE
-        //    `self.worlds.try_reserve` (keeping `worlds.phys_cap() <= 56`) AND an acceptance
-        //    covering the full 64+128 overlap cleanly under both cap and pool.
+        // 2. Cap and pool boundary check: calibrate the exact plain incremental Phase 3 join
+        //    admission (`worlds_join_reserved_used`), verify Phase 3 join is strictly the
+        //    global peak, and observe directly BEFORE the outer `self.reused` retry that:
+        //    - `join_peak - 1` refuses AT Phase 3 join (`worlds_join_refused >= 1`,
+        //      `worlds_join_attempted > cap`) without EVER reserving 128 buckets
+        //      (`worlds_join_reserved_phys_cap <= 56`);
+        //    - `join_peak` accepts incrementally and reserves 128 buckets (`phys_cap == 112`).
         let mut plain_cal = Saturation::new();
         plain_cal
             .classify(&base_kinds, None, &unrestricted)
             .unwrap();
-        let plain_inc = el_test_hooks::with_force_no_track(|| {
-            plain_cal.classify(
-                &next_kinds,
-                Some(Changes {
-                    added: &added_refs,
-                    removed: &removed_refs,
-                }),
-                &unrestricted,
-            )
-        })
-        .unwrap();
-        let entry_sz = std::mem::size_of::<(Ex, (bool, Vec<Ex>))>();
-        let delta_128_vs_64 =
-            dl_clause::hash_table_bytes(112, entry_sz) - dl_clause::hash_table_bytes(56, entry_sz);
-        let low = plain_inc
-            .stats
-            .peak_memory
-            .min(inc_out.stats.peak_memory)
-            .saturating_sub(delta_128_vs_64 * 2);
-        let high = inc_out.stats.peak_memory.max(plain_inc.stats.peak_memory);
-        let step = (delta_128_vs_64 / 4).max(64);
-        let mut saw_cap_refuse_before_reserve = false;
-        let mut saw_cap_accept = false;
-        let mut saw_pool_refuse_before_reserve = false;
-        let mut saw_pool_accept = false;
-        let mut cap = low;
-        while cap <= high {
-            if !saw_cap_refuse_before_reserve || !saw_cap_accept {
-                let mut sat = Saturation::new();
-                sat.classify(&base_kinds, None, &unrestricted).unwrap();
-                assert_eq!(sat.worlds.phys_cap(), 56);
-                let lim = Limits {
-                    max_memory: Some(cap),
-                    ..unrestricted.clone()
-                };
-                match sat.classify(
+        let (plain_res, plain_counts) = el_test_hooks::with_counts(|| {
+            el_test_hooks::with_force_no_track(|| {
+                plain_cal.classify(
                     &next_kinds,
                     Some(Changes {
                         added: &added_refs,
                         removed: &removed_refs,
                     }),
-                    &lim,
-                ) {
-                    Ok(out) => {
-                        assert_eq!(out.taxonomy, fresh_out.taxonomy);
-                        if out.stats.incremental {
-                            assert!(
-                                out.stats.peak_memory <= cap,
-                                "incremental cap run peak {} exceeded cap {cap}",
-                                out.stats.peak_memory,
-                            );
-                            assert_eq!(sat.worlds.phys_cap(), 112);
-                            saw_cap_accept = true;
-                        } else {
-                            // Incremental join refused before reserving 128 buckets and
-                            // fell back to fresh classification (`phys_cap == 56`).
-                            assert!(
-                                sat.worlds.phys_cap() <= 56,
-                                "fallback after cap refusal must not grow tombstone map to 128 buckets (phys_cap={})",
-                                sat.worlds.phys_cap(),
-                            );
-                            saw_cap_refuse_before_reserve = true;
-                        }
-                    }
-                    Err(Error::Memory { .. }) => {
-                        assert!(
-                            sat.worlds.phys_cap() <= 56,
-                            "cap refusal must happen BEFORE self.worlds.try_reserve grows to 128 buckets (phys_cap={})",
-                            sat.worlds.phys_cap(),
-                        );
-                        saw_cap_refuse_before_reserve = true;
-                    }
-                    Err(e) => panic!("unexpected error under cap {cap}: {e:?}"),
-                }
-            }
-            if !saw_pool_refuse_before_reserve || !saw_pool_accept {
-                let mut sat = Saturation::new();
-                sat.classify(&base_kinds, None, &unrestricted).unwrap();
-                assert_eq!(sat.worlds.phys_cap(), 56);
-                let paid = std::sync::Arc::new(AtomicUsize::new(0));
-                let paid_cb = paid.clone();
-                let lim = Limits {
-                    charge: Some(std::sync::Arc::new(move |more| {
-                        let mut cur = paid_cb.load(Ordering::Relaxed);
-                        loop {
-                            let next = cur.saturating_add(more);
-                            if next > cap {
-                                return false;
-                            }
-                            match paid_cb.compare_exchange_weak(
-                                cur,
-                                next,
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            ) {
-                                Ok(_) => return true,
-                                Err(actual) => cur = actual,
-                            }
-                        }
-                    })),
-                    ..unrestricted.clone()
-                };
-                match sat.classify(
-                    &next_kinds,
-                    Some(Changes {
-                        added: &added_refs,
-                        removed: &removed_refs,
-                    }),
-                    &lim,
-                ) {
-                    Ok(out) => {
-                        assert!(paid.load(Ordering::Acquire) <= cap);
-                        assert_eq!(out.taxonomy, fresh_out.taxonomy);
-                        if out.stats.incremental {
-                            assert!(
-                                out.stats.peak_memory <= cap,
-                                "incremental pool run peak {} exceeded cap {cap}",
-                                out.stats.peak_memory,
-                            );
-                            assert_eq!(sat.worlds.phys_cap(), 112);
-                            saw_pool_accept = true;
-                        } else {
-                            assert!(
-                                sat.worlds.phys_cap() <= 56,
-                                "fallback after pool refusal must not grow tombstone map to 128 buckets (phys_cap={})",
-                                sat.worlds.phys_cap(),
-                            );
-                            saw_pool_refuse_before_reserve = true;
-                        }
-                    }
-                    Err(Error::Memory { .. }) => {
-                        assert!(paid.load(Ordering::Acquire) <= cap);
-                        assert!(
-                            sat.worlds.phys_cap() <= 56,
-                            "pool refusal must happen BEFORE self.worlds.try_reserve grows to 128 buckets (phys_cap={})",
-                            sat.worlds.phys_cap(),
-                        );
-                        saw_pool_refuse_before_reserve = true;
-                    }
-                    Err(e) => panic!("unexpected error under pool cap {cap}: {e:?}"),
-                }
-            }
-            if saw_cap_refuse_before_reserve
-                && saw_cap_accept
-                && saw_pool_refuse_before_reserve
-                && saw_pool_accept
-            {
-                break;
-            }
-            if cap == high {
-                break;
-            }
-            cap = cap.saturating_add(step).min(high);
-        }
+                    &unrestricted,
+                )
+            })
+        });
+        let plain_inc = plain_res.unwrap();
+        assert!(plain_inc.stats.incremental);
+        assert!(plain_counts.worlds_join_reserved >= 1);
+        assert_eq!(plain_counts.worlds_join_reserved_phys_cap, 112);
         assert!(
-            saw_cap_refuse_before_reserve
-                && saw_cap_accept
-                && saw_pool_refuse_before_reserve
-                && saw_pool_accept,
-            "expected both cap (refuse={saw_cap_refuse_before_reserve}, accept={saw_cap_accept}) and pool (refuse={saw_pool_refuse_before_reserve}, accept={saw_pool_accept}) to cover or refuse tombstone worlds resize cleanly between {low} and {high}"
+            plain_counts.worlds_join_pre_peak < plain_counts.worlds_join_reserved_used,
+            "Phase 3 tombstone join ({}) must strictly exceed all earlier phases ({}) of the plain incremental run",
+            plain_counts.worlds_join_reserved_used,
+            plain_counts.worlds_join_pre_peak,
         );
+
+        let accept_cap = plain_inc.stats.peak_memory;
+
+        // Measure the exact minimal post-shed Phase 3 join requirement (after optional
+        // tracking and retained `el_deps` are dropped, including via `phase3_retry_plain`)
+        // by tightening once below each admitted join peak until the exact minimal join
+        // peak is reached, then set `refuse_cap = min_join_peak - 1` so both cap and pool
+        // refuse directly at Phase 3 join strictly BEFORE `self.worlds.try_reserve`.
+        let mut min_join_peak = plain_counts.worlds_join_reserved_used;
+        for _ in 0..3 {
+            let mut shed_cal = Saturation::new();
+            shed_cal.classify(&base_kinds, None, &unrestricted).unwrap();
+            let shed_lim = Limits {
+                max_memory: Some(min_join_peak - 1),
+                ..unrestricted.clone()
+            };
+            let (_shed_res, shed_counts) = el_test_hooks::with_counts(|| {
+                shed_cal.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &added_refs,
+                        removed: &removed_refs,
+                    }),
+                    &shed_lim,
+                )
+            });
+            if shed_counts.worlds_join_refused >= 1 {
+                break;
+            }
+            assert!(
+                shed_counts.phase3_shed >= 1
+                    && shed_counts.worlds_join_reserved_phys_cap == 112
+                    && shed_counts.worlds_join_reserved_used < min_join_peak,
+                "expected calibration run to shed optional tracking and lower join peak below {min_join_peak} (counts={shed_counts:?})"
+            );
+            min_join_peak = shed_counts.worlds_join_reserved_used;
+        }
+        let refuse_cap = min_join_peak - 1;
+
+        // 2a. Numeric `max_memory` refusal at `refuse_cap` strictly before `try_reserve`.
+        {
+            let mut sat = Saturation::new();
+            sat.classify(&base_kinds, None, &unrestricted).unwrap();
+            assert_eq!(sat.worlds.phys_cap(), 56);
+            let lim = Limits {
+                max_memory: Some(refuse_cap),
+                ..unrestricted.clone()
+            };
+            let (res, counts) = el_test_hooks::with_counts(|| {
+                sat.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &added_refs,
+                        removed: &removed_refs,
+                    }),
+                    &lim,
+                )
+            });
+            assert!(
+                counts.worlds_join_refused >= 1,
+                "cap {refuse_cap} must refuse directly at Phase 3 join (counts={counts:?})"
+            );
+            assert!(
+                counts.worlds_join_attempted > refuse_cap,
+                "join attempted bytes ({}) must exceed cap {refuse_cap}",
+                counts.worlds_join_attempted,
+            );
+            assert!(
+                counts.worlds_join_reserved_phys_cap <= 56,
+                "join refusal must happen BEFORE self.worlds.try_reserve grows to 128 buckets (reserved_phys_cap={})",
+                counts.worlds_join_reserved_phys_cap,
+            );
+            match res {
+                Ok(out) => {
+                    assert!(!out.stats.incremental);
+                    assert!(out.stats.peak_memory <= refuse_cap);
+                    assert_eq!(out.taxonomy, fresh_out.taxonomy);
+                    assert!(sat.worlds.phys_cap() <= 56);
+                }
+                Err(Error::Memory { .. }) => {
+                    assert!(sat.worlds.phys_cap() <= 56);
+                }
+                Err(e) => panic!("unexpected error under cap {refuse_cap}: {e:?}"),
+            }
+        }
+
+        // 2b. Refusing `charge` pool at `refuse_cap` strictly before `try_reserve`.
+        {
+            let mut sat = Saturation::new();
+            sat.classify(&base_kinds, None, &unrestricted).unwrap();
+            assert_eq!(sat.worlds.phys_cap(), 56);
+            let paid = std::sync::Arc::new(AtomicUsize::new(0));
+            let paid_cb = paid.clone();
+            let lim = Limits {
+                charge: Some(std::sync::Arc::new(move |more| {
+                    let mut cur = paid_cb.load(Ordering::Relaxed);
+                    loop {
+                        let next = cur.saturating_add(more);
+                        if next > refuse_cap {
+                            return false;
+                        }
+                        match paid_cb.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => return true,
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                })),
+                ..unrestricted.clone()
+            };
+            let (res, counts) = el_test_hooks::with_counts(|| {
+                sat.classify(
+                    &next_kinds,
+                    Some(Changes {
+                        added: &added_refs,
+                        removed: &removed_refs,
+                    }),
+                    &lim,
+                )
+            });
+            assert!(paid.load(Ordering::Acquire) <= refuse_cap);
+            assert!(
+                counts.worlds_join_refused >= 1,
+                "pool {refuse_cap} must refuse directly at Phase 3 join (counts={counts:?})"
+            );
+            assert!(
+                counts.worlds_join_attempted > refuse_cap,
+                "pool join attempted bytes ({}) must exceed {refuse_cap}",
+                counts.worlds_join_attempted,
+            );
+            assert!(
+                counts.worlds_join_reserved_phys_cap <= 56,
+                "pool join refusal must happen BEFORE self.worlds.try_reserve grows to 128 buckets (reserved_phys_cap={})",
+                counts.worlds_join_reserved_phys_cap,
+            );
+            match res {
+                Ok(out) => {
+                    assert!(!out.stats.incremental);
+                    assert!(out.stats.peak_memory <= refuse_cap);
+                    assert_eq!(out.taxonomy, fresh_out.taxonomy);
+                    assert!(sat.worlds.phys_cap() <= 56);
+                }
+                Err(Error::Memory { .. }) => {
+                    assert!(sat.worlds.phys_cap() <= 56);
+                }
+                Err(e) => panic!("unexpected error under pool {refuse_cap}: {e:?}"),
+            }
+        }
+
+        // 2c. Exact acceptance at `accept_cap` under both `max_memory` cap and `charge` pool.
+        {
+            let mut sat_cap = Saturation::new();
+            sat_cap.classify(&base_kinds, None, &unrestricted).unwrap();
+            assert_eq!(sat_cap.worlds.phys_cap(), 56);
+            let lim_cap = Limits {
+                max_memory: Some(accept_cap),
+                ..unrestricted.clone()
+            };
+            let (out_cap, counts_cap) = el_test_hooks::with_counts(|| {
+                sat_cap
+                    .classify(
+                        &next_kinds,
+                        Some(Changes {
+                            added: &added_refs,
+                            removed: &removed_refs,
+                        }),
+                        &lim_cap,
+                    )
+                    .unwrap()
+            });
+            assert!(out_cap.stats.incremental);
+            assert!(out_cap.stats.peak_memory <= accept_cap);
+            assert_eq!(out_cap.taxonomy, fresh_out.taxonomy);
+            assert!(counts_cap.worlds_join_reserved >= 1);
+            assert_eq!(counts_cap.worlds_join_reserved_phys_cap, 112);
+            assert_eq!(sat_cap.worlds.phys_cap(), 112);
+
+            let mut sat_pool = Saturation::new();
+            sat_pool.classify(&base_kinds, None, &unrestricted).unwrap();
+            assert_eq!(sat_pool.worlds.phys_cap(), 56);
+            let paid = std::sync::Arc::new(AtomicUsize::new(0));
+            let paid_cb = paid.clone();
+            let lim_pool = Limits {
+                charge: Some(std::sync::Arc::new(move |more| {
+                    let mut cur = paid_cb.load(Ordering::Relaxed);
+                    loop {
+                        let next = cur.saturating_add(more);
+                        if next > accept_cap {
+                            return false;
+                        }
+                        match paid_cb.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => return true,
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                })),
+                ..unrestricted.clone()
+            };
+            let (out_pool, counts_pool) = el_test_hooks::with_counts(|| {
+                sat_pool
+                    .classify(
+                        &next_kinds,
+                        Some(Changes {
+                            added: &added_refs,
+                            removed: &removed_refs,
+                        }),
+                        &lim_pool,
+                    )
+                    .unwrap()
+            });
+            assert!(out_pool.stats.incremental);
+            assert!(out_pool.stats.peak_memory <= accept_cap);
+            assert!(paid.load(Ordering::Acquire) <= accept_cap);
+            assert_eq!(out_pool.taxonomy, fresh_out.taxonomy);
+            assert!(counts_pool.worlds_join_reserved >= 1);
+            assert_eq!(counts_pool.worlds_join_reserved_phys_cap, 112);
+            assert_eq!(sat_pool.worlds.phys_cap(), 112);
+        }
     }
 
     #[test]
