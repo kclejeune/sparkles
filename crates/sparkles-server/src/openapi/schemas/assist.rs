@@ -1232,10 +1232,10 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                 &["changed"],
                 json!({
                     "changed": with_desc(json!({ "type": "array", "items": string(), "minItems": 1, "maxItems": 1000 }), "The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows."),
-                    "transitive": with_desc(boolean(), "Also find the assessments that depend on a dependent. Defaults to `false`."),
+                    "transitive": with_desc(boolean(), "Also find the assessments and community reports that depend on a dependent. Defaults to `false`."),
                 }),
             ),
-            "Changed evidence records whose dependent assessments to find.",
+            "Changed evidence records whose dependent assessments and community reports to find.",
             "evidence-dependents",
         ),
     );
@@ -1243,7 +1243,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
         "EvidenceDependentsResult",
         doc(
             closed(
-                &["commit", "dependents"],
+                &["commit", "dependents", "reports"],
                 json!({
                     "commit": commit("The commit the records were read at."),
                     "dependents": array(closed(
@@ -1253,12 +1253,23 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                             "graph": iri("Its proposal graph."),
                             "on": iri("The changed record it depends on, or for a transitive dependent the assessment it depends on."),
                             "dependence": string_enum(&["target", "used"]),
-                            "depth": with_desc(int(), "How many assessments lie between it and a changed record, 0 for a direct dependent."),
+                            "depth": with_desc(int(), "How many intermediate dependents lie between it and a changed record, 0 for a direct dependent."),
+                        }),
+                    )),
+                    "reports": array(closed(
+                        &["report", "community", "graph", "on", "dependence", "depth"],
+                        json!({
+                            "report": iri("A community report in a guarded reports graph."),
+                            "community": with_desc(or_null(string()), "The community the report summarizes, `null` when not recorded."),
+                            "graph": iri("Its guarded reports graph."),
+                            "on": iri("The changed record its activity used, or for a transitive dependent the assessment or report it depends on."),
+                            "dependence": string_enum(&["used"]),
+                            "depth": with_desc(int(), "How many intermediate dependents lie between it and a changed record, 0 for a direct dependent."),
                         }),
                     )),
                 }),
             ),
-            "The assessments that depend on the changed records, each once at its smallest depth.",
+            "The assessments and community reports that depend on the changed records, each once at its smallest depth.",
             "evidence-dependents",
         ),
     );

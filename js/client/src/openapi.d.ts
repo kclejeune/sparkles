@@ -4497,8 +4497,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Find the assessments that depend on changed records
-         * @description Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
+         * Find the assessments and reports that depend on changed records
+         * @description Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and the community reports in guarded reports graphs proven for the caller whose activity recorded `prov:used` for one of them (including person-edited reports via `gr:editOf`), and with `transitive` the assessments and reports that depend on those, each once at its smallest depth. A graph the caller cannot read or cannot prove under the disclosure guard is not searched, and a record any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
          */
         post: operations["listEvidenceDependents"];
         delete?: never;
@@ -7251,14 +7251,14 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** @description Changed evidence records whose dependent assessments to find. */
+        /** @description Changed evidence records whose dependent assessments and community reports to find. */
         EvidenceDependents: {
             /** @description The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows. */
             changed: string[];
-            /** @description Also find the assessments that depend on a dependent. Defaults to `false`. */
+            /** @description Also find the assessments and community reports that depend on a dependent. Defaults to `false`. */
             transitive?: boolean;
         };
-        /** @description The assessments that depend on the changed records, each once at its smallest depth. */
+        /** @description The assessments and community reports that depend on the changed records, each once at its smallest depth. */
         EvidenceDependentsResult: {
             /** @description The commit the records were read at. */
             commit: number;
@@ -7267,12 +7267,26 @@ export interface components {
                 assessment: string;
                 /** @enum {string} */
                 dependence: "target" | "used";
-                /** @description How many assessments lie between it and a changed record, 0 for a direct dependent. */
+                /** @description How many intermediate dependents lie between it and a changed record, 0 for a direct dependent. */
                 depth: number;
                 /** @description Its proposal graph. */
                 graph: string;
                 /** @description The changed record it depends on, or for a transitive dependent the assessment it depends on. */
                 on: string;
+            }[];
+            reports: {
+                /** @description The community the report summarizes, `null` when not recorded. */
+                community: string | null;
+                /** @enum {string} */
+                dependence: "used";
+                /** @description How many intermediate dependents lie between it and a changed record, 0 for a direct dependent. */
+                depth: number;
+                /** @description Its guarded reports graph. */
+                graph: string;
+                /** @description The changed record its activity used, or for a transitive dependent the assessment or report it depends on. */
+                on: string;
+                /** @description A community report in a guarded reports graph. */
+                report: string;
             }[];
         };
         /** @description The graph to stop protecting. */
@@ -26358,7 +26372,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The dependent assessments. */
+            /** @description The dependent assessments and community reports. */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -1498,3 +1498,374 @@ async fn declared_drift_refuses_policy_build_and_refresh_before_model_calls() {
     .unwrap();
     assert!(e.mock.requests().is_empty());
 }
+
+/// Item 810: `POST /{ds}/claims/dependents` and MCP `find_evidence_dependents` return
+/// community reports (including human edits via `gr:editOf` and transitive parent
+/// reports) whose activity used a changed claim or decision, strictly through the
+/// C22 §6 disclosure guard and caller visibility without leaking protected reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_dependents_finds_guarded_reports_and_enforces_disclosure_guard() {
+    let e = Arc::new(env(true));
+    let ds = e.dataset();
+    let a = propose(&ds, "advisory", leads());
+    let l = propose(&ds, "badge", label());
+    let r = propose(&ds, "rumour", owns());
+    let dec_a = {
+        let mut o = ReviewOptions::new(iri("urn:principal:reviewer"));
+        o.if_head = Some(ds.store().head_commit().seq);
+        evidence::review(
+            None,
+            &ds,
+            &ds,
+            "main",
+            1,
+            &[DecisionInput {
+                key: "d".into(),
+                target: a.0.clone(),
+                target_digest: a.1,
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            }],
+            &o,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap()
+        .decisions[0]
+            .iri
+            .clone()
+    };
+    decide(&ds, &l, Disposition::Accepted, 1);
+    decide(&ds, &r, Disposition::Rejected, 1);
+
+    let e2 = e.clone();
+    let o =
+        tokio::task::spawn_blocking(move || e2.run(settings(serde_json::json!({})), Mode::Build))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(o.stopped, None, "{o:?}");
+    let x_orig = e.report_of("http://ex/x0");
+    let x_comm = e.community_of("http://ex/x0");
+    let y_report = e.report_of("http://ex/y0");
+
+    // Edit community x's report so its current report has `gr:editOf` and no activity.
+    let edited = call(
+        &e.s.app,
+        "POST",
+        "/$/graphrag/ev/review",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({
+            "report": x_orig,
+            "status": "reviewed",
+            "title": "Edited community",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(edited.status, StatusCode::OK, "{}", edited.text());
+    let x_edit = e.report_of("http://ex/x0");
+    assert_ne!(x_edit, x_orig);
+
+    // Withdraw claim `a` and query `POST /ev/claims/dependents`.
+    withdraw(&ds, &a);
+    let body = serde_json::json!({ "changed": [a.0.as_str()], "transitive": true }).to_string();
+
+    // 1. Unrestricted admin (`rad`) and proven restricted reader (`rhide`) both see
+    //    `x_orig` and its human edit `x_edit`, and never the unrelated `y_report`.
+    for user in ["rad", "rp", "rhide"] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/claims/dependents",
+            &[
+                ("authorization", &b(user)),
+                ("content-type", "application/json"),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{user}: {}", res.text());
+        let j = res.json();
+        let reps = j["reports"].as_array().unwrap();
+        let iris: Vec<&str> = reps.iter().map(|r| r["report"].as_str().unwrap()).collect();
+        assert!(iris.contains(&x_orig.as_str()), "{user}: {j}");
+        assert!(iris.contains(&x_edit.as_str()), "{user}: {j}");
+        assert!(!iris.contains(&y_report.as_str()), "{user}: {j}");
+        for item in reps {
+            assert_eq!(item["graph"], REPORTS);
+            assert_eq!(item["dependence"], "used");
+            if item["report"] == x_orig || item["report"] == x_edit {
+                assert_eq!(item["community"], x_comm);
+                assert_eq!(item["on"], a.0.as_str());
+                assert_eq!(item["depth"], 0);
+            }
+        }
+    }
+
+    // 2. Searching by the accepted decision IRI or by the uncited label claim `l` also
+    //    finds `x_orig` and `x_edit` and excludes `y_report`.
+    for changed_iri in [dec_a.as_str(), l.0.as_str()] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/claims/dependents",
+            &[
+                ("authorization", &b("rhide")),
+                ("content-type", "application/json"),
+            ],
+            &serde_json::json!({ "changed": [changed_iri], "transitive": false }).to_string(),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+        let reps = res.json()["reports"].as_array().unwrap().clone();
+        let iris: Vec<&str> = reps.iter().map(|r| r["report"].as_str().unwrap()).collect();
+        assert!(iris.contains(&x_orig.as_str()), "{changed_iri}: {reps:?}");
+        assert!(iris.contains(&x_edit.as_str()), "{changed_iri}: {reps:?}");
+        assert!(
+            !iris.contains(&y_report.as_str()),
+            "{changed_iri}: {reps:?}"
+        );
+    }
+
+    // 3. Searching by rejected claim `r` (not used by any report activity) returns no reports.
+    let res = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({ "changed": [r.0.as_str()], "transitive": true }).to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    assert_eq!(res.json()["reports"], serde_json::json!([]));
+
+    // 4. Unauthorized callers failing the C22 §6 disclosure guard (`rnoclaims` missing
+    //    CLAIMS, `rnodec` missing DECISIONS) see `reports: []` and no leak.
+    for user in ["rnoclaims", "rnodec"] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/claims/dependents",
+            &[
+                ("authorization", &b(user)),
+                ("content-type", "application/json"),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{user}: {}", res.text());
+        assert_eq!(
+            res.json()["reports"],
+            serde_json::json!([]),
+            "{user} must not see protected reports"
+        );
+    }
+
+    // 5. MCP `find_evidence_dependents` matches HTTP for both proven and unproven callers.
+    let e_mcp = e.clone();
+    let claim_iri = a.0.as_str().to_string();
+    let (mcp_proven, mcp_unproven) = tokio::task::spawn_blocking(move || {
+        let args = serde_json::json!({ "changed": [claim_iri], "transitive": true });
+        (
+            tool_as(&e_mcp.s, "rhide", "find_evidence_dependents", args.clone()),
+            tool_as(&e_mcp.s, "rnoclaims", "find_evidence_dependents", args),
+        )
+    })
+    .await
+    .unwrap();
+    let http_proven = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rhide")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await
+    .json();
+    assert_eq!(mcp_proven, http_proven);
+    assert_eq!(mcp_unproven["reports"], serde_json::json!([]));
+
+    // 6. Removing the disclosure footprint immediately hides reports from restricted
+    //    readers (`rhide`) while unrestricted admin (`rad`) retains access (C22 §6.3).
+    e.dataset()
+        .update(&format!(
+            "CLEAR GRAPH <{}>",
+            crate::graphrag::guard::DISCLOSURE_GRAPH
+        ))
+        .unwrap();
+    let rhide_after = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rhide")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(rhide_after.status, StatusCode::OK);
+    assert_eq!(rhide_after.json()["reports"], serde_json::json!([]));
+    let rad_after = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(rad_after.status, StatusCode::OK);
+    assert!(!rad_after.json()["reports"].as_array().unwrap().is_empty());
+}
+
+/// Item 810: A caller whose grants cover the footprint but omit the reports graph itself,
+/// or whose `?user` binding in a triple protection pattern differs from the build
+/// principal, never sees protected reports in `POST /{ds}/claims/dependents`.
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_dependents_denies_missing_report_grant_and_mismatched_user_pattern() {
+    let h = |u: &str| hash_password_with(&format!("{u}-pw"), 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[protections]]
+name = "owner-only"
+dataset = "ev"
+predicates = ["http://ex/secret"]
+graphs = ["{ORG}"]
+pattern = "?s <http://ex/owner> ?user"
+
+[[users]]
+name = "rad"
+password = "{}"
+datasets = {{ ev = "admin" }}
+[[users]]
+name = "rp"
+password = "{}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ORG}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}", "{REPORTS}"]
+[[users]]
+name = "other"
+password = "{}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ORG}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}", "{REPORTS}"]
+[[users]]
+name = "rnoreports"
+password = "{}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ORG}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}"]
+"#,
+            h("rad"),
+            h("rp"),
+            h("other"),
+            h("rnoreports"),
+        ),
+        ..Default::default()
+    });
+    let ds = s.state.attach("ev", DbType::Memory, None).unwrap();
+    let p = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.dataset
+        .store()
+        .activate_memory_configuration_history(&p)
+        .unwrap();
+    evidence::configure(&ds.dataset, &evidence_settings(1), &Control::none()).unwrap();
+    let org = crate::graphrag::build::tests::data(4);
+    ds.store
+        .load(&[Source::from_bytes(
+            org.into_bytes(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let mock = MockModel::start(|r, _| (200, mock::openai(&answer_all(r))));
+    s.state
+        .models
+        .store(Some(Arc::new(crate::graphrag::build::tests::models_for(
+            &mock.url(),
+            &serde_json::json!({ "provider": "p", "model": "m" }),
+        ))));
+    crate::settings::store_runtime(
+        &s.state,
+        &ds,
+        &crate::settings::ASSISTANT,
+        &serde_json::json!({ "send": "rows" }),
+    )
+    .unwrap();
+    let e = Arc::new(Env { s, mock });
+    let a = propose(&e.dataset(), "advisory", leads());
+    decide(&e.dataset(), &a, Disposition::Accepted, 1);
+
+    let e2 = e.clone();
+    let o =
+        tokio::task::spawn_blocking(move || e2.run(settings(serde_json::json!({})), Mode::Build))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(o.stopped, None, "{o:?}");
+    let x = e.report_of("http://ex/x0");
+    let body = serde_json::json!({ "changed": [a.0.as_str()], "transitive": true }).to_string();
+
+    // Build principal `rp` matches the footprint and has the REPORTS grant -> sees `x`.
+    let rp_res = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rp")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(rp_res.status, StatusCode::OK, "{}", rp_res.text());
+    assert!(
+        rp_res.json()["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["report"] == x),
+        "{}",
+        rp_res.text()
+    );
+
+    // `other` has identical graph grants but a different `?user` binding in the
+    // protection pattern -> C22 §6 returns Unproven -> `reports: []`.
+    // `rnoreports` covers the footprint graphs but lacks the REPORTS graph grant -> `reports: []`.
+    for user in ["other", "rnoreports"] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/claims/dependents",
+            &[
+                ("authorization", &b(user)),
+                ("content-type", "application/json"),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{user}: {}", res.text());
+        assert_eq!(
+            res.json()["reports"],
+            serde_json::json!([]),
+            "{user} must not see protected reports"
+        );
+    }
+}

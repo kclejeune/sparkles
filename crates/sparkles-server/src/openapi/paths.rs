@@ -3784,11 +3784,11 @@ fn assist(p: &mut Paths) {
             .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
-        op(POST, "/{ds}/claims/dependents", "listEvidenceDependents", "SPARQL", "Find the assessments that depend on changed records")
-            .doc("Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
+        op(POST, "/{ds}/claims/dependents", "listEvidenceDependents", "SPARQL", "Find the assessments and reports that depend on changed records")
+            .doc("Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and the community reports in guarded reports graphs proven for the caller whose activity recorded `prov:used` for one of them (including person-edited reports via `gr:editOf`), and with `transitive` the assessments and reports that depend on those, each once at its smallest depth. A graph the caller cannot read or cannot prove under the disclosure guard is not searched, and a record any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-dependents")
             .json_body(true, "EvidenceDependents")
-            .json("200", "The dependent assessments.", "EvidenceDependentsResult")
+            .json("200", "The dependent assessments and community reports.", "EvidenceDependentsResult")
             .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
