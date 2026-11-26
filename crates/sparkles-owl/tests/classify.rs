@@ -1197,16 +1197,35 @@ fn opaque_literals_are_used_in_part() {
 }
 
 #[test]
-fn a_change_with_an_individual_runs_everything_again() {
-    let mut k = Classifier::of(&[sub(c("Y"), value("r", "b")), range("r", "C")]);
+fn a_change_with_an_individual_updates_incrementally() {
+    let mut axioms = vec![
+        sub(c("Y"), value("r", "b")),
+        range("r", "C"),
+        sub(c("U1"), c("U2")),
+        sub(c("U2"), c("U3")),
+    ];
+    let mut k = Classifier::of(&axioms);
     k.classify(&Limits::default()).unwrap();
-    k.add([&is_a("D", "b")]);
+    let added1 = is_a("D", "b");
+    k.add([&added1]);
+    axioms.push(added1);
     let out = k.classify(&Limits::default()).unwrap();
-    assert!(!out.stats.incremental);
-    k.add([&sub(c("Z"), c("Y"))]);
+    let fresh = Classifier::of(&axioms)
+        .classify(&Limits::default())
+        .unwrap();
+    assert!(out.stats.incremental);
+    assert_eq!(out.taxonomy, fresh.taxonomy);
+    assert_eq!(out.consistent, fresh.consistent);
+    let added2 = sub(c("Z"), c("Y"));
+    k.add([&added2]);
+    axioms.push(added2);
     let out = k.classify(&Limits::default()).unwrap();
-    // the previous run merged a context with b, which the invalidation does not follow
-    assert!(!out.stats.incremental);
+    let fresh = Classifier::of(&axioms)
+        .classify(&Limits::default())
+        .unwrap();
+    assert!(out.stats.incremental);
+    assert_eq!(out.taxonomy, fresh.taxonomy);
+    assert_eq!(out.consistent, fresh.consistent);
     assert!(out.taxonomy.is_subclass(&c("Z"), &c("Y")));
 }
 
