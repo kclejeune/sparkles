@@ -1213,8 +1213,10 @@ that holds triples while no revision exists answer `projection-unavailable`. The
 clusters before an operation are recomputed from the boundary, so a map whose matches
 are no longer read would otherwise keep stale triples for entities the operation does
 not reach. A graph added to the boundary is accepted, since no proposal in it was
-accepted under the policy while the map was built. Rebuilding a map after a boundary
-change is roadmap item 643. A split is a superseding rejection, and accepting the
+accepted under the policy while the map was built. An administrator can rebuild a map
+after a boundary or protection change through `sparkles::evidence::rebuild_resolution_map`
+and `POST /$/evidence/{ds}/identities/rebuild`, as described in
+[Rebuilding a resolution map after a boundary change](#rebuilding-a-resolution-map-after-a-boundary-change). A split is a superseding rejection, and accepting the
 match again restores the earlier map. Proposals, decisions and earlier revisions are
 never edited, and the output graph's history serves the map of any retained commit.
 `Changed::map` and the answer's `changed.map` name the policy, the new revision and its
@@ -2345,6 +2347,42 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+### Rebuilding a resolution map after a boundary change
+
+`sparkles::evidence::rebuild_resolution_map` and `POST /$/evidence/{ds}/identities/rebuild`
+provide an administered rebuild of a matching policy's resolution map on `main` or a
+branch after a boundary or protection change makes reviews and reads answer
+`projection-unavailable`. The HTTP route requires unrestricted `admin` on the dataset or
+branch, respects read-only mode, declared-settings drift and the authority fence, and
+supports optional `policyVersion`, `ifHead`, `idempotencyKey`, `dryRun` and `message`
+fields.
+
+The rebuild enumerates the policy's current authenticated `ev:ReviewDecision` records in
+its decisions graph under the existing record and memory bounds, keeps the accepted
+decisions whose targets are authenticated `ev:IdentityProposal` records in the protected
+identity graphs of the policy's current boundary, recomputes the connected components and
+their deterministic representatives, verifies every effective `ev:DistinctEntities`
+constraint and refuses with `identity-conflict` if any two separated entities would share
+a cluster. It scans the policy's output graph under the shared preparation budget and
+rewrites the output graph atomically to hold only the recomputed `<member> ev:resolvesTo
+<representative>` triples, removing stale or detached-epoch triples.
+
+In the same commit it appends a fresh immutable `ev:ResolutionMap` revision in the maps
+graph with the current `decisions`, `maps` and `output` protection nonces and the current
+`ev:boundaryProtection` entries. When the latest prior revision in the maps graph still
+authenticates, the new revision links it through `prov:wasRevisionOf` and records the
+exact `ev:adds` and `ev:ends` delta against the fold of that chain so dependent lookups
+find consumers of the prior revision and of decisions whose effect ended. When the maps
+graph itself was detached and protected again, the rebuild checks that no higher revision
+exists past a numbering gap and starts a new authenticated chain at the next revision
+number while `latest` requires the highest contiguous revision to authenticate.
+
+Tests cover boundary removal, detaching and re-protecting boundary identity graphs,
+output, maps and decisions graphs, dry runs, idempotent replays and conflicts, SHACL
+shape conformance of written revisions, dependent assessment lookups, separation
+conflicts on re-added boundary graphs, branch-scoped rebuilds, persistent restart
+durability, non-admin and drift refusals, OpenAPI parity and client types.
 
 ### Scope changes
 
