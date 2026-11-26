@@ -1019,12 +1019,11 @@ impl Store {
         ) else {
             return true;
         };
-        let dataset_id = self.owner_dataset_id();
         let check_store = |store: &Store| -> bool {
             let snap = store.snapshot();
             let reads = crate::evidence::write::Reads::new(&preparation, &snap);
             reads
-                .has_published_operation_in_output(output, Some(nonce), dataset_id)
+                .has_published_operation_in_output(output, Some(nonce))
                 .unwrap_or(true)
         };
         if check_store(self) {

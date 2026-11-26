@@ -1921,49 +1921,82 @@ impl<'a> Reads<'a> {
         Ok(self.single_object_id(g, s, graph_prot_pred)? == Some(g_nonce_id))
     }
 
-    /// Every typed record graph contains at least one record with these three
-    /// edges. Reusing a record leaves the edges of its first publication intact.
-    fn has_receipted_record(&self, graph: Id, op: Id, protection: (Id, Id)) -> Result<bool> {
-        let (Some(receipt), Some(generated_by)) = (
+    /// A protected record identifies its publisher through its availability receipt.
+    /// Legacy projection withdrawals can remove other edges, including wasGeneratedBy.
+    pub fn has_published_operation_in_output(
+        &self,
+        graph: &str,
+        nonce: Option<Uuid>,
+    ) -> Result<bool> {
+        self.output_has_receipt(graph, nonce, None)
+    }
+
+    fn output_has_receipt(
+        &self,
+        graph: &str,
+        nonce: Option<Uuid>,
+        named: Option<&NamedNode>,
+    ) -> Result<bool> {
+        let Some(nonce) = nonce else {
+            return Ok(false);
+        };
+        let (Some(g), Some(protection), Some(nonce), Some(receipt), Some(rdf_type), Some(op_class)) = (
+            self.preparation.lookup_iri(self.snap, graph)?,
+            self.preparation
+                .lookup_iri(self.snap, &format!("{EV}graphProtection"))?,
+            self.preparation
+                .lookup_term(self.snap, &string(&nonce.to_string()))?,
             self.preparation
                 .lookup_iri(self.snap, &format!("{EV}availabilityReceipt"))?,
+            self.preparation.lookup_iri(self.snap, RDF_TYPE)?,
             self.preparation
-                .lookup_iri(self.snap, &format!("{PROV}wasGeneratedBy"))?,
+                .lookup_iri(self.snap, &format!("{EV}Operation"))?,
         ) else {
             return Ok(false);
         };
+        let has_receipt = |op| {
+            let mut found = false;
+            self.for_each_pos_intersection_in_graph(
+                g,
+                &[(receipt, op), (protection, nonce)],
+                |record| {
+                    // Migration preserves ambiguous history. Replay needs a record whose
+                    // own receipt and protection identify this particular publication.
+                    found = named.is_none()
+                        || self.authenticated_record_id(
+                            record, g, nonce, rdf_type, op_class, protection, receipt,
+                        )?;
+                    Ok(!found)
+                },
+            )?;
+            Ok(found)
+        };
+        if let Some(named) = named {
+            let Some(op) = self.preparation.lookup_iri(self.snap, named.as_str())? else {
+                return Ok(false);
+            };
+            return has_receipt(op);
+        }
         let mut found = false;
         self.for_each_pos_intersection_in_graph(
-            graph,
-            &[(receipt, op), (generated_by, op), protection],
-            |_| {
-                found = true;
-                Ok(false)
+            g,
+            &[(rdf_type, op_class), (protection, nonce)],
+            |op| {
+                found = self.preparation.with_term(self.snap, op, |term| {
+                    Ok(matches!(term, Some(Term::NamedNode(_))))
+                })? && has_receipt(op)?;
+                Ok(!found)
             },
         )?;
         Ok(found)
     }
 
-    /// Whether an operation in this output is the receipt for a record there.
-    /// Describing an operation in projected RDF alone cannot establish record
-    /// history. After a supports reset this evidence is still local to the output.
-    pub fn has_published_operation_in_output(
+    fn described_output_operation(
         &self,
         graph: &str,
         nonce: Option<Uuid>,
         dataset_id: Uuid,
-    ) -> Result<bool> {
-        self.output_operation(graph, nonce, dataset_id, None)
-    }
-
-    /// A named lookup tests the operation description. A graph history check
-    /// also requires a record for which a described operation is the receipt.
-    fn output_operation(
-        &self,
-        graph: &str,
-        nonce: Option<Uuid>,
-        dataset_id: Uuid,
-        named: Option<&NamedNode>,
+        named: &NamedNode,
     ) -> Result<bool> {
         let Some(nonce) = nonce else {
             return Ok(false);
@@ -2011,74 +2044,55 @@ impl<'a> Reads<'a> {
         else {
             return Ok(false);
         };
-        // A projection can add other values to a genuinely published subject.
-        // Test for the writer's edges even when the subject also carries those values.
-        let description = |op: Id| -> Result<bool> {
-            use oxrdf::vocab::xsd;
-            let has_value = |predicate: Id, accepts: fn(&Term) -> bool| -> Result<bool> {
-                let mut found = false;
-                self.preparation.scan(
-                    self.snap,
-                    Perm::Gspo,
-                    &[g_id.0, op.0, predicate.0],
-                    |q| {
-                        found = self
-                            .preparation
-                            .with_term(self.snap, q[2], |term| Ok(term.is_some_and(accepts)))?;
-                        Ok(!found)
-                    },
-                )?;
-                Ok(found)
-            };
-            Ok(self.preparation.with_term(self.snap, op, |term| {
-                Ok(matches!(term, Some(Term::NamedNode(_))))
-            })? && has_value(was_assoc, |t| matches!(t, Term::NamedNode(_)))?
-                && has_value(
-                    ended_at,
-                    |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::DATE_TIME),
-                )?
-                && has_value(
-                    branch_id_pred,
-                    |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::STRING && Uuid::parse_str(l.value()).is_ok()),
-                )?
-                && has_value(
-                    commit_pred,
-                    |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::INTEGER && l.value().parse::<u64>().is_ok()),
-                )?
-                && has_value(
-                    payload_digest_pred,
-                    |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::STRING && l.value().parse::<Sha256Digest>().is_ok()),
-                )?)
-        };
         let markers = [
             (graph_prot_pred, nonce_id),
             (rdf_type, op_class),
             (rdf_type, prov_activity),
             (dataset_id_pred, expected_dataset_id),
         ];
-        if let Some(named) = named {
-            let Some(op) = self.preparation.lookup_iri(self.snap, named.as_str())? else {
+        let Some(op) = self.preparation.lookup_iri(self.snap, named.as_str())? else {
+            return Ok(false);
+        };
+        for (pred, obj) in markers {
+            if !self.contains_id(op, pred, obj, g_id)? {
                 return Ok(false);
-            };
-            for (pred, obj) in markers {
-                if !self.contains_id(op, pred, obj, g_id)? {
-                    return Ok(false);
-                }
             }
-            return description(op);
         }
-        let mut found = false;
-        self.for_each_pos_intersection_in_graph(g_id, &markers, |op| {
-            found = self.has_receipted_record(g_id, op, (graph_prot_pred, nonce_id))?
-                && description(op)?;
-            Ok(!found)
-        })?;
-        Ok(found)
+        // A projection can add other values to a genuinely published subject.
+        // Test for the writer's edges even when the subject also carries those values.
+        use oxrdf::vocab::xsd;
+        let has_value = |predicate: Id, accepts: fn(&Term) -> bool| -> Result<bool> {
+            let mut found = false;
+            self.preparation
+                .scan(self.snap, Perm::Gspo, &[g_id.0, op.0, predicate.0], |q| {
+                    found = self
+                        .preparation
+                        .with_term(self.snap, q[2], |term| Ok(term.is_some_and(accepts)))?;
+                    Ok(!found)
+                })?;
+            Ok(found)
+        };
+        Ok(has_value(was_assoc, |t| matches!(t, Term::NamedNode(_)))?
+            && has_value(
+                ended_at,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::DATE_TIME),
+            )?
+            && has_value(
+                branch_id_pred,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::STRING && Uuid::parse_str(l.value()).is_ok()),
+            )?
+            && has_value(
+                commit_pred,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::INTEGER && l.value().parse::<u64>().is_ok()),
+            )?
+            && has_value(
+                payload_digest_pred,
+                |t| matches!(t, Term::Literal(l) if l.datatype() == xsd::STRING && l.value().parse::<Sha256Digest>().is_ok()),
+            )?)
     }
 
-    /// Keyed operations may reuse every record in a graph. In that case the
-    /// earlier receipt establishes the graph's record history and the keyed
-    /// description identifies the later operation.
+    /// A keyed operation must have published a record here or used an authenticated
+    /// projection here. A receipt for an unrelated operation proves neither.
     pub fn has_keyed_operation_in_output(
         &mut self,
         op: &NamedNode,
@@ -2087,13 +2101,27 @@ impl<'a> Reads<'a> {
         nonce: Option<Uuid>,
         dataset_id: Uuid,
     ) -> Result<bool> {
-        Ok(self.contains(
+        if !self.contains(
             op.as_str(),
             &format!("{EV}idempotencyKey"),
             &string(key),
             graph,
-        )? && self.output_operation(graph, nonce, dataset_id, Some(op))?
-            && self.has_published_operation_in_output(graph, nonce, dataset_id)?)
+        )? || !self.described_output_operation(graph, nonce, dataset_id, op)?
+        {
+            return Ok(false);
+        }
+        if self.output_has_receipt(graph, nonce, Some(op))? {
+            return Ok(true);
+        }
+        let Some(Term::NamedNode(record)) =
+            self.single(op.as_str(), &format!("{PROV}used"), graph)?
+        else {
+            return Ok(false);
+        };
+        Ok(
+            self.contains(record.as_str(), RDF_TYPE, &ev("Projection").into(), graph)?
+                && self.authenticated(record.as_str(), graph, nonce)?,
+        )
     }
 
     /// Whether the named record bears a receipt for an operation in this graph.
@@ -2133,14 +2161,7 @@ impl<'a> Reads<'a> {
         else {
             return Ok(false);
         };
-        let Some(generated_by) = self
-            .preparation
-            .lookup_iri(self.snap, &format!("{PROV}wasGeneratedBy"))?
-        else {
-            return Ok(false);
-        };
-        Ok(self.contains_id(r_id, generated_by, op_id, g_id)?
-            && self.output_operation(graph, Some(nonce), dataset_id, Some(&op_iri))?)
+        self.described_output_operation(graph, Some(nonce), dataset_id, &op_iri)
     }
 
     /// Whether any continuously protected managed graph holds an active, authenticated

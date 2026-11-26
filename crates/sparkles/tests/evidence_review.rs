@@ -3218,6 +3218,12 @@ fn ordinary_review_skips_unrelated_unreadable_policy_rows() {
 /// conflicts, and return the original receipt without advancing the branch head.
 #[test]
 fn keyed_replay_finds_operation_after_supports_becomes_dedicated_output() {
+    for reuse_projection in [false, true] {
+        check_keyed_replay_in_former_supports(reuse_projection);
+    }
+}
+
+fn check_keyed_replay_in_former_supports(reuse_projection: bool) {
     use sparkles::managed::OwnerKind;
 
     let ds = Dataset::memory();
@@ -3231,11 +3237,13 @@ fn keyed_replay_finds_operation_after_supports_becomes_dedicated_output() {
     s1.supports.push(supports3.into());
     evidence::configure(&ds, &s1, &Control::none()).unwrap();
 
-    let a = claim_of(&propose(
-        &ds,
-        &occurrence_with("s1", "urn:cve1", Polarity::Positive),
-    ));
-    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    if reuse_projection {
+        let a = claim_of(&propose(
+            &ds,
+            &occurrence_with("s1", "urn:cve1", Polarity::Positive),
+        ));
+        review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    }
 
     // First keyed reconciliation with omitted policyVersion writes its operation only in SUPPORTS.
     let mut opts = reviewer();
@@ -3244,6 +3252,18 @@ fn keyed_replay_finds_operation_after_supports_becomes_dedicated_output() {
     assert!(first.committed && !first.replayed);
     assert_eq!(first.policy_version, 1);
     assert_eq!(first.output.as_str(), OUTPUT);
+
+    let op = &first.operation;
+    let projection = &first.projection;
+    let link = if reuse_projection {
+        format!("{op} <http://www.w3.org/ns/prov#used> {projection}")
+    } else {
+        format!("{projection} <{EV}availabilityReceipt> {op}")
+    };
+    assert!(
+        ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {link} }} }}"))
+            .unwrap()
+    );
 
     let nonce_before = ds
         .store()
@@ -3836,7 +3856,14 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
 
     // 1. Project a 9-triple lookalike into OUTPUT, then detach & re-protect SUPPORTS
     // while RETAINING old SUPPORTS quads and keeping OUTPUT continuously protected.
-    project_lookalike(&ds, "main", "retain", iri("urn:proj:op-retain"), out_nonce);
+    project_lookalike(
+        &ds,
+        "main",
+        "retain",
+        iri("urn:proj:op-retain"),
+        out_nonce,
+        None,
+    );
     evidence::detach(&ds, SUPPORTS).unwrap();
     evidence::configure(&ds, &s, &Control::none()).unwrap();
     let out_nonce_1 = ds
@@ -3863,7 +3890,14 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
 
     // 2. Project a 9-triple lookalike again, then detach, CLEAR, and re-protect SUPPORTS
     // while keeping OUTPUT continuously protected.
-    project_lookalike(&ds, "main", "clear", iri("urn:proj:op-clear"), out_nonce);
+    project_lookalike(
+        &ds,
+        "main",
+        "clear",
+        iri("urn:proj:op-clear"),
+        out_nonce,
+        None,
+    );
     evidence::detach(&ds, SUPPORTS).unwrap();
     ds.update(&format!(
         "DELETE WHERE {{ GRAPH <{SUPPORTS}> {{ ?s ?p ?o }} }}"
@@ -3901,6 +3935,7 @@ fn projected_operation_lookalike_empties_after_supports_rotation() {
         "promote",
         iri("urn:proj:op-promote"),
         out_nonce,
+        None,
     );
     let mut promoted = s.clone();
     promoted.supports.push(OUTPUT.into());
@@ -4672,6 +4707,7 @@ fn project_lookalike(
     tag: &str,
     op_iri: NamedNode,
     nonce: uuid::Uuid,
+    replay_key: Option<&str>,
 ) {
     use oxrdf::Literal;
 
@@ -4684,7 +4720,7 @@ fn project_lookalike(
     let payload_sha = sha(&format!("legacy-lookalike-{tag}")).to_string();
     let dt = Literal::new_typed_literal("2026-11-26T00:00:00.000Z", iri(&format!("{XSD}dateTime")));
     let commit_int = Literal::new_typed_literal("99", iri(&format!("{XSD}integer")));
-    let triples = vec![
+    let mut triples = vec![
         (
             "type",
             Triple::new(
@@ -4744,12 +4780,22 @@ fn project_lookalike(
         (
             "prot",
             Triple::new(
-                op_iri,
+                op_iri.clone(),
                 iri(&format!("{EV}graphProtection")),
                 Literal::new_simple_literal(nonce.to_string()),
             ),
         ),
     ];
+    if let Some(key) = replay_key {
+        triples.push((
+            "key",
+            Triple::new(
+                op_iri,
+                iri(&format!("{EV}idempotencyKey")),
+                Literal::new_simple_literal(key),
+            ),
+        ));
+    }
     let mut decs = Vec::new();
     for (k, t) in triples {
         let key = format!("{tag}-{k}");
@@ -4806,6 +4852,15 @@ fn legacy_settings(root: &std::path::Path, settings: &Settings) {
 /// graphs protected.
 #[test]
 fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
+    check_legacy_output_replay(false);
+}
+
+#[test]
+fn legacy_output_with_unrelated_receipt_ignores_projected_key_on_replay() {
+    check_legacy_output_replay(true);
+}
+
+fn check_legacy_output_replay(mixed_history: bool) {
     use sparkles::managed::OwnerKind;
 
     let decisions2 = "urn:ev:decisions2";
@@ -4881,6 +4936,7 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
         "v4-init",
         iri("urn:proj:v4-op"),
         legacy_out_nonce,
+        None,
     );
     let follow = claim_of(&propose(
         &ds,
@@ -4898,7 +4954,7 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     let first = reconcile(&ds, "main", Some(1), &keyed_opts).unwrap();
     assert!(first.committed && !first.replayed);
 
-    // 2. Project a 9-triple copy of `first.operation` (different payloadDigest) into
+    // 2. Project the description and key of `first.operation` with a different digest into
     // legacy `output2` via `other`. Narrow-grant keyed replay on `main` (without read
     // grants on `supports2` / `output2`) must succeed without conflict or NotPermitted.
     project_lookalike(
@@ -4907,7 +4963,38 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
         "v4-shadow",
         first.operation.clone(),
         legacy_out2_nonce,
+        keyed_opts.idempotency_key.as_deref(),
     );
+    let ds = if mixed_history {
+        drop(ds);
+        let mut swapped = s.clone();
+        swapped.policies.remove("other");
+        swapped.projections.retain(|g| g != output2);
+        swapped.source_records.push(output2.into());
+        legacy_settings(&root, &swapped);
+        let ds = Dataset::open(&root).unwrap();
+        let mut opts = ProposeOptions::new(iri("urn:principal:importer"));
+        opts.source_graph = Some(iri(output2));
+        let unrelated = evidence::propose(
+            None,
+            &ds,
+            &ds,
+            &EvidenceInput {
+                revisions: vec![revision("unrelated")],
+                ..Default::default()
+            },
+            &opts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap();
+        assert_ne!(unrelated.operation, first.operation);
+        drop(ds);
+        legacy_settings(&root, &s);
+        Dataset::open(&root).unwrap()
+    } else {
+        ds
+    };
     let main_only = Arc::new(GraphAccess::graphs(
         Graphs::Only(GraphRule::new(
             [SOURCES, CLAIMS, OTHER, DECISIONS, SUPPORTS, OUTPUT],
@@ -4932,6 +5019,10 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
     assert_eq!(replayed1.commit, first.commit);
     assert_eq!(replayed1.projection, first.projection);
     assert_eq!(ds.store().head_commit().seq, head_before_replay);
+
+    if mixed_history {
+        return;
+    }
 
     // 3. Supports reset (retained, then cleared) on `supports2` marks legacy `output2`
     // as `projectionOnly` (format 4) while preserving its existing protection nonce,
@@ -5013,6 +5104,7 @@ fn legacy_v4_dedicated_output_upgrade_review_supports_reset_and_replay() {
         "v4-clear",
         iri("urn:proj:v4-clear-op"),
         legacy_out_nonce,
+        None,
     );
     evidence::detach(&ds, SUPPORTS).unwrap();
     ds.update(&format!(
@@ -5461,7 +5553,7 @@ fn legacy_format2_pre_upgrade_supports_reset_reconciles_cleanly() {
         let nonce = ds.store().managed_graphs().unwrap().unwrap().owners[&OwnerKind::Evidence]
             .protections[OUTPUT];
         let op = evidence::operation_iri(uuid::Uuid::new_v4());
-        project_lookalike(&ds, "main", "pre-reset", op, nonce);
+        project_lookalike(&ds, "main", "pre-reset", op, nonce, None);
         assert_eq!(accepted(&ds).len(), 9);
         evidence::detach(&ds, SUPPORTS).unwrap();
         ds.update(&format!(
@@ -5497,11 +5589,22 @@ fn legacy_format2_pre_upgrade_supports_reset_reconciles_cleanly() {
 
 #[test]
 fn legacy_format2_projected_nonce_also_belongs_to_a_published_proposal() {
-    check_legacy_dual_origin(false);
-    check_legacy_dual_origin(true);
+    check_legacy_dual_origin(DualOrigin::Nonce);
+    check_legacy_dual_origin(DualOrigin::ExtraDigest);
 }
 
-fn check_legacy_dual_origin(extra_value: bool) {
+#[test]
+fn legacy_output_preserves_receipt_after_projected_generation_edge_is_withdrawn() {
+    check_legacy_dual_origin(DualOrigin::WithdrawGeneration);
+}
+
+enum DualOrigin {
+    Nonce,
+    ExtraDigest,
+    WithdrawGeneration,
+}
+
+fn check_legacy_dual_origin(case: DualOrigin) {
     use sparkles::managed::OwnerKind;
 
     let dir = tempfile::tempdir().unwrap();
@@ -5519,8 +5622,11 @@ fn check_legacy_dual_origin(extra_value: bool) {
         iri(&format!("{EV}graphProtection")),
         oxrdf::Literal::new_simple_literal(nonce.to_string()),
     );
-    let mut triples = vec![marker];
-    if extra_value {
+    let mut triples = vec![match case {
+        DualOrigin::WithdrawGeneration => affected(),
+        _ => marker,
+    }];
+    if matches!(case, DualOrigin::ExtraDigest) {
         triples.push(Triple::new(
             op.clone(),
             iri(&format!("{EV}payloadDigest")),
@@ -5542,6 +5648,7 @@ fn check_legacy_dual_origin(extra_value: bool) {
     assert_eq!(accepted(&ds).len(), decisions.len());
     drop(ds);
 
+    let initial_registry = std::fs::read(root.join("managed.json")).unwrap();
     let mut swapped = s.clone();
     swapped.source_records = vec![OUTPUT.into()];
     swapped.projections = vec![SOURCES.into()];
@@ -5573,11 +5680,52 @@ fn check_legacy_dual_origin(extra_value: bool) {
         ))
         .unwrap()
     );
-    let history = accepted(&ds);
     drop(ds);
     legacy_settings(&root, &s);
 
+    if matches!(case, DualOrigin::WithdrawGeneration) {
+        // The pre-581 reviewer could project into a former record graph. Restore the
+        // initial registry for this review so the newer history guard is skipped.
+        std::fs::write(root.join("managed.json"), initial_registry).unwrap();
+        let ds = Dataset::open(&root).unwrap();
+        let generated_by = iri("http://www.w3.org/ns/prov#wasGeneratedBy");
+        let edge = Triple::new(record.clone(), generated_by.clone(), op.clone());
+        let claim = claim_of(&propose(
+            &ds,
+            &EvidenceInput {
+                revisions: vec![revision("generation-edge")],
+                claims: vec![claim("c", Polarity::Positive, edge)],
+                ..Default::default()
+            },
+        ));
+        review(
+            &ds,
+            &[decision("generation", &claim, Disposition::Accepted, None)],
+        )
+        .unwrap();
+        drop(ds);
+        legacy_settings(&root, &s);
+        let ds = Dataset::open(&root).unwrap();
+        let generation = format!("ASK {{ GRAPH <{OUTPUT}> {{ {record} {generated_by} {op} }} }}");
+        assert!(ds.ask(&generation).unwrap());
+        withdraw(&ds, &claim);
+        assert!(!ds.ask(&generation).unwrap());
+        assert!(
+            ds.ask(&format!(
+                "ASK {{ GRAPH <{OUTPUT}> {{ {record} <{EV}availabilityReceipt> {op} }} }}"
+            ))
+            .unwrap()
+        );
+    }
     let ds = Dataset::open(&root).unwrap();
+    let history = accepted(&ds);
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(reconcile(&ds, "main", Some(1), &reviewer())),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    assert_eq!(accepted(&ds), history);
     evidence::configure(&ds, &s, &Control::none()).unwrap();
     let registry = ds.store().managed_graphs().unwrap().unwrap();
     let entry = &registry.owners[&OwnerKind::Evidence];

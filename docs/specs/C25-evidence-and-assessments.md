@@ -2379,17 +2379,20 @@ authenticate, so the output graph is emptied.
 
 On legacy registries a dedicated output can have held a record role under the same
 protection. Before assigning `projectionOnly`, the store checks the family for an
-operation whose graph contains a record bearing that protection and naming the
-operation as both `ev:availabilityReceipt` and `prov:wasGeneratedBy`. A typed write
-that reuses every record leaves the earlier receipts in place. An operation's nine
-mandatory description triples alone can all be projected, even when their supports
-have since been cleared. A projected protection triple can also coincide with a
-genuine publication. Reconciliation preserves the graph when it finds record history
-under the current protection. Format 2 records the current owner and nonce for each
-graph. It has no per-triple publication origin or history of graph roles. A projection
-that copies both a complete operation and its receipt-bearing record can therefore
-leave the same RDF after supports are cleared. The guard preserves that case too.
-Keyed replay also requires the operation's stored key in a former record graph.
+`ev:Operation` and a record that names it as its `ev:availabilityReceipt`. Both
+must carry the graph's current protection. A legacy withdrawal could remove a
+shared `prov:wasGeneratedBy` triple or other descriptive metadata while leaving
+the receipt intact. A typed write that reuses every record leaves the earlier
+receipts in place. An operation's nine mandatory description triples alone can
+all be projected, even when their supports have since been cleared.
+Reconciliation preserves the graph when it finds record history under the current
+protection. Format 2 records the current owner and nonce for each graph. It has
+no per-triple publication origin or history of graph roles. A projection that
+copies the receipt relationship and protection markers can therefore leave the
+same evidence. The guard preserves that case too. Keyed replay checks the named
+operation's stored key and description. The operation must itself be the receipt
+of an authenticated record in that graph or name an authenticated projection there
+through `prov:used`.
 
 In the same atomic commit of the evidence owner, the operation appends a fresh immutable
 `ev:Projection` record to the supports graph, minted from the policy, version, operation

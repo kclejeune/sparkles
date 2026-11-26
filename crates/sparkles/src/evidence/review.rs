@@ -52,7 +52,6 @@ const EV: &str = "urn:x-sparkles:evidence:";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
 const PROV_WAS_REVISION_OF: &str = "http://www.w3.org/ns/prov#wasRevisionOf";
-const PROV_WAS_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
 const PROV_USED: &str = "http://www.w3.org/ns/prov#used";
 
 fn ev(local: &str) -> String {
@@ -711,15 +710,14 @@ impl State<'_> {
     /// history under its unchanged protection nonce (as when a former record-role graph
     /// was reassigned as a dedicated projection output without detaching it first),
     /// while ignoring ordinary and support-projected RDF assertions in the output.
-    fn check_output_record_history(&self, p: &PolicyGraphs, dataset_id: Uuid) -> Result<()> {
+    fn check_output_record_history(&self, p: &PolicyGraphs) -> Result<()> {
         if p.output_projection_only {
             return Ok(());
         }
-        if self.reads.has_published_operation_in_output(
-            p.output.0.as_str(),
-            p.output.1,
-            dataset_id,
-        )? {
+        if self
+            .reads
+            .has_published_operation_in_output(p.output.0.as_str(), p.output.1)?
+        {
             return Err(managed(
                 ManagedErrorKind::ImmutableRecordConflict,
                 format!(
@@ -1875,7 +1873,7 @@ pub fn review(
             &protected_refs,
             control,
         )?;
-        state.check_output_record_history(&p, main.dataset_id())?;
+        state.check_output_record_history(&p)?;
         let existing = state.check_projection(&p, Some((policy_version, &record)))?;
         batch.records.push(record);
         skip.push(existing);
@@ -2676,13 +2674,13 @@ pub fn reconcile_projection_prepared(
                 }
                 let mut linked: Option<(NamedNode, G)> = None;
                 'find_linked: for g in &search_graphs {
-                    let mut gen_held = preparation.reserve(0)?;
+                    let mut receipts_held = preparation.reserve(0)?;
                     for r in state.subjects_held(
-                        PROV_WAS_GENERATED_BY,
+                        &ev("availabilityReceipt"),
                         &Term::NamedNode(op_iri.clone()),
                         g,
                         "projections",
-                        &mut gen_held,
+                        &mut receipts_held,
                     )? {
                         if state.typed(&r, g, RecordKind::Projection)?
                             && state.reads.contains(
@@ -2803,7 +2801,7 @@ pub fn reconcile_projection_prepared(
             &protected_refs,
             control,
         )?;
-        state.check_output_record_history(&p, main.dataset_id())?;
+        state.check_output_record_history(&p)?;
         // Existing projection records of this policy, and which remain unsuperseded.
         let mut proj_held = preparation.reserve(0)?;
         let (existing_projections, superseded_projections) =
