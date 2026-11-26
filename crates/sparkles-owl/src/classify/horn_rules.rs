@@ -506,7 +506,7 @@ pub fn succ<S: Sink>(
     // a real context's successors are real (roadmap item 692); the EL rule sent `Real`
     // to a successor it created
     if st.real && !sent {
-        out.send(n, Concl::Real);
+        out.send(n, Concl::Real(me));
         out.send(n, Concl::RealBack(me));
     }
     let h = hs(st);

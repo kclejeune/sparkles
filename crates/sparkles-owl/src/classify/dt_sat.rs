@@ -1012,6 +1012,23 @@ pub fn world<'s>(ix: &Index, states: impl Iterator<Item = &'s State>) {
     }
 }
 
+/// Replays retained non-`FINE` datatype-checker evaluations from a reused conditional
+/// world into `ix.dt.sticky` so `excluded` matches a fresh run (roadmap item 664).
+pub fn replay_sticky(ix: &Index, sticky_rows: &[(u32, u8)]) {
+    if sticky_rows.is_empty() {
+        return;
+    }
+    let Some(dt) = ix.dt.as_deref() else {
+        return;
+    };
+    let mut sticky = dt.sticky.lock();
+    for &(comp, last) in sticky_rows {
+        if let Some(slot) = sticky.get_mut(comp as usize) {
+            *slot = (*slot).max(last);
+        }
+    }
+}
+
 /// The worst last evaluation of each component among the contexts.
 pub fn collect(ix: &Index, ctx: &Contexts, dynamic: Option<&Dynamic>, worst: &mut Vec<u8>) {
     let Some(dt) = ix.dt.as_deref() else {

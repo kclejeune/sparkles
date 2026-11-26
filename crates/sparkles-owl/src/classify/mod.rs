@@ -1081,6 +1081,12 @@ pub struct Stats {
     /// rooted split tree (0 when no fork occurred)
     #[doc(hidden)]
     pub dl_rooted_leaves: usize,
+    /// number of conditional worlds executed during Phase 3 of this run
+    #[doc(hidden)]
+    pub worlds_run: usize,
+    /// number of cached conditional worlds reused without execution during Phase 3
+    #[doc(hidden)]
+    pub worlds_reused: usize,
     /// Tier D with counting passed its bound on derived conclusions, so the run
     /// classified again without counting and left the axioms that need it out
     pub dl_counting_over: bool,
@@ -1842,6 +1848,9 @@ pub struct Saturation {
     /// the subsumers of the classes that the last run classified in worlds of their own,
     /// with whether each is unsatisfiable
     worlds: FxHashMap<Ex, (bool, Vec<Ex>)>,
+    /// tracked EL dependency graph for merges, real reachability, keys, universal facts,
+    /// and conditional worlds across incremental edits (roadmap item 664)
+    el_deps: ElDeps,
     /// cached upward top closure and equivalence-inferred bottom closure for
     /// [`Saturation::describe`], cleared whenever a new run starts or finishes
     query_cache: std::sync::OnceLock<query::QueryClosure>,
@@ -2996,6 +3005,108 @@ impl Default for Saturation {
     }
 }
 
+/// Tracked EL dependency records across incremental runs with individuals, keys,
+/// universal roles, and conditional worlds (roadmap item 664). Empty on plain EL runs
+/// that do not enter Phase 2.
+#[derive(Default)]
+struct ElDeps {
+    /// Whether Phase 2 ran on the last completed EL run (so contexts may hold `real = true`).
+    phase2_ran: bool,
+    /// Grounded acyclic parent forest for `st.real`: `REAL_ROOT` for `{TOP} ∪ ix.nominals`,
+    /// `p` for the first context that sent `Concl::Real(p)`, or `REAL_NONE`.
+    real_parent: Vec<Ex>,
+    /// Global universal facts derived in Phase 2 with pre-broadcast grounded supports.
+    universals: Vec<world::UniversalSupport>,
+    /// Global key merges `(a, b)` fired in Phase 2 with their causal context dependencies.
+    key_merges: Vec<world::KeyMergeDep>,
+    /// Context- and key-level dependencies for each cached world in `Saturation::worlds`.
+    world_deps: FxHashMap<Ex, world::WorldDep>,
+}
+
+impl ElDeps {
+    fn is_empty(&self) -> bool {
+        !self.phase2_ran
+            && self.real_parent.is_empty()
+            && self.universals.is_empty()
+            && self.key_merges.is_empty()
+            && self.world_deps.is_empty()
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn bytes(&self) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+        self.real_parent
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Ex>())
+            .saturating_add(
+                self.universals
+                    .iter()
+                    .map(world::UniversalSupport::bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.universals
+                    .capacity()
+                    .saturating_sub(self.universals.len())
+                    .saturating_mul(std::mem::size_of::<world::UniversalSupport>()),
+            )
+            .saturating_add(
+                self.key_merges
+                    .iter()
+                    .map(world::KeyMergeDep::bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.key_merges
+                    .capacity()
+                    .saturating_sub(self.key_merges.len())
+                    .saturating_mul(std::mem::size_of::<world::KeyMergeDep>()),
+            )
+            .saturating_add(dl_clause::hash_table_bytes(
+                self.world_deps.capacity(),
+                std::mem::size_of::<(Ex, world::WorldDep)>(),
+            ))
+            .saturating_add(
+                self.world_deps
+                    .values()
+                    .map(|w| {
+                        w.bytes()
+                            .saturating_sub(std::mem::size_of::<world::WorldDep>())
+                    })
+                    .sum::<usize>(),
+            )
+    }
+}
+
+/// Summary extracted from `old_ix` before dropping it for incremental EL invalidation.
+#[derive(Default)]
+struct ElOldDiff {
+    dead_nominals: Vec<Ex>,
+    universal_rules_changed: bool,
+    added_universal_fillers: Vec<Ex>,
+    added_keys: Vec<index::Key>,
+    removed_keys: Vec<index::Key>,
+}
+
+/// Result of incremental EL invalidation with individuals/keys/universal roles/worlds.
+enum ElInvalidateOutcome {
+    /// A previously broadcast global universal fact lost all grounded supports: restart fresh.
+    Restart,
+    Done {
+        cleared: usize,
+        kept_universal: Vec<Ex>,
+        reseed_real: Vec<(Ex, Ex)>,
+        kept_merged: bool,
+        pre_dirty_keys: Vec<bool>,
+        modified_bits: Vec<u64>,
+    },
+}
+
 /// The axioms added to an ontology and removed from it since a saturation's last run.
 #[derive(Clone, Copy, Default)]
 pub struct Changes<'a> {
@@ -3004,24 +3115,28 @@ pub struct Changes<'a> {
 }
 
 /// Whether a change to the axiom needs a run that starts again: one that changes the
-/// role table or datatype definitions, which a run builds once, a key, one with an
-/// individual, whose merges the invalidation does not follow, one with the top or bottom
-/// data property, or one with a self restriction (roadmap item 1258). A negative self
-/// restriction gives its subsumer to every context with a loop by a subrole, and a loop
-/// comes from a self restriction of another role, a reflexive role or a chain as well as
-/// from the restriction itself, so a kept context can have the loop without holding the
-/// changed expression that the invalidation looks for.
+/// role table or datatype definitions, which a run builds once, or one with a self
+/// restriction (roadmap item 1258). A negative self restriction gives its subsumer to
+/// every context with a loop by a subrole, and a loop comes from a self restriction of
+/// another role, a reflexive role or a chain as well as from the restriction itself, so
+/// a kept context can have the loop without holding the changed expression that the
+/// invalidation looks for.
 fn needs_full_run(ax: &AxiomKind) -> bool {
-    if role_axiom(ax)
-        || matches!(
-            ax,
-            AxiomKind::HasKey(..) | AxiomKind::DatatypeDefinition(..)
-        )
-    {
+    if role_axiom(ax) || matches!(ax, AxiomKind::DatatypeDefinition(..)) {
         return true;
     }
-    // an anonymous individual is an individual of the run, though no signature holds it
-    // (roadmap item 1281)
+    let mut sig = crate::model::Signature::default();
+    sig.axiom(ax);
+    sig.2
+}
+
+/// Whether `ax` mentions an individual (named or anonymous), a key, or a top/bottom
+/// property, so a kept EL run must use index comparison and tracked individual/key/world
+/// invalidation (roadmap item 664), while Horn/Disj runs still start again.
+fn mentions_el_individual_or_key(ax: &AxiomKind) -> bool {
+    if matches!(ax, AxiomKind::HasKey(..)) {
+        return true;
+    }
     if profiles::individuals(ax)
         .iter()
         .any(|i| matches!(i, Individual::Anonymous(_)))
@@ -3030,12 +3145,12 @@ fn needs_full_run(ax: &AxiomKind) -> bool {
     }
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
-    sig.2
-        || sig.0.iter().any(|e| match e {
-            Entity::NamedIndividual(_) => true,
-            Entity::DataProperty(p) => *p == DataProperty::top() || *p == DataProperty::bottom(),
-            _ => false,
-        })
+    sig.0.iter().any(|e| match e {
+        Entity::NamedIndividual(_) => true,
+        Entity::DataProperty(p) => *p == DataProperty::top() || *p == DataProperty::bottom(),
+        Entity::ObjectProperty(p) => *p == ObjectProperty::top() || *p == ObjectProperty::bottom(),
+        _ => false,
+    })
 }
 
 /// Whether `ax` is a logical axiom or declaration mentioning any data property or
@@ -3747,6 +3862,7 @@ impl Saturation {
             rewritten_excluded: false,
             dirty: true,
             worlds: FxHashMap::default(),
+            el_deps: ElDeps::default(),
             query_cache: std::sync::OnceLock::new(),
             entangled: false,
             stale_tier: false,
@@ -7543,6 +7659,7 @@ impl Saturation {
         self.index = None;
         self.interner = Interner::default();
         self.worlds = FxHashMap::default();
+        self.el_deps.clear();
         self.partial = None;
         self.stale_tier = false;
         self.ctx = Vec::new();
@@ -8739,7 +8856,13 @@ impl Saturation {
             };
         self.stale_tier = stale && !full;
         let kept = kept.filter(|_| !full);
-        self.worlds = FxHashMap::default();
+        let el_index_diff = kept.as_ref().is_some_and(|k| k.tier == KeptTier::El)
+            && self.uses_el_index_diff(changes);
+        let keep_el_state = el_index_diff && !full;
+        if !keep_el_state {
+            self.worlds = FxHashMap::default();
+            self.el_deps.clear();
+        }
         self.query_cache = std::sync::OnceLock::new();
         if full {
             self.interner = Interner::default();
@@ -8749,15 +8872,13 @@ impl Saturation {
             self.dynamic = None;
             self.dl_run = None;
             self.last_roots = Vec::new();
+            self.el_deps.clear();
         }
         // a run that keeps the contexts of a run with the Horn rules, Tier D, datatype
-        // checker components, or data-bearing EL edits compares the two indexes, so the
-        // last one stays until the new one is built, and counts against the budget until
-        // then, as do the contexts above the index's and Tier D's clause table
-        let el_index_diff = kept.as_ref().is_some_and(|k| k.tier == KeptTier::El)
-            && (self.index.as_ref().is_some_and(|ix| ix.dt.is_some())
-                || changes
-                    .is_some_and(|c| c.added.iter().chain(c.removed).any(|k| mentions_data(k))));
+        // checker components, or data/individual/key/universal EL edits compares the two
+        // indexes, so the last one stays until the new one is built, and counts against
+        // the budget until then, as do the contexts above the index's, Tier D's clause
+        // table, and any retained EL worlds and dependency tables
         let old_ix = match &kept {
             Some(k) if k.tier != KeptTier::El || el_index_diff => self.index.take(),
             _ => None,
@@ -8782,7 +8903,12 @@ impl Saturation {
             + self.dl_run.as_ref().map_or(0, |d| {
                 d.table.bytes() + d.lits.bytes() + d.split_meta_bytes()
             })
-            + self.last_roots.capacity() * 4;
+            + self.last_roots.capacity() * 4
+            + if keep_el_state {
+                self.worlds_bytes().saturating_add(self.el_deps.bytes())
+            } else {
+                0
+            };
         // from here on a stop on the memory budget may be the kept state's, which a run
         // that starts again does not hold, whatever the tier of the kept contexts
         self.reused = kept.is_some();
@@ -8933,6 +9059,7 @@ impl Saturation {
                 normalized_peak,
             }));
         }
+        let el_indiv_reuse = el_index_diff && !horn && !disj;
         let reuse = match &old_ix {
             Some(old) => {
                 let stopped = std::cell::RefCell::new(None);
@@ -8944,7 +9071,12 @@ impl Saturation {
                     }
                     stop
                 };
-                match ix.same_tables_with_stop(old, &stop_tbl) {
+                let same = if el_indiv_reuse {
+                    ix.same_tables_el_with_stop(old, &stop_tbl)
+                } else {
+                    ix.same_tables_with_stop(old, &stop_tbl)
+                };
+                match same {
                     Some(true) => true,
                     Some(false) => {
                         return Ok(ControlFlow::Break(LateRestart::Incompatible {
@@ -8962,6 +9094,8 @@ impl Saturation {
             self.dynamic = None;
             self.dl_run = None;
             self.last_roots = Vec::new();
+            self.worlds.clear();
+            self.el_deps.clear();
         }
         let premises = if (horn || disj) && !reuse {
             self.ctx = Vec::new();
@@ -9181,6 +9315,12 @@ impl Saturation {
         roots.extend(rooted);
         roots.sort_unstable();
         roots.dedup();
+        let mut kept_universal: Vec<Ex> = Vec::new();
+        let mut reseed_real: Vec<(Ex, Ex)> = Vec::new();
+        let mut kept_merged = false;
+        let mut pre_dirty_keys: Vec<bool> = Vec::new();
+        let mut modified_bits: Vec<u64> = Vec::new();
+        let mut el_old_diff = ElOldDiff::default();
         if let Some(old) = old_ix.filter(|_| reuse) {
             stats.incremental = true;
             let d_len = dynamic.as_ref().map_or(0, |d| d.len());
@@ -9199,7 +9339,12 @@ impl Saturation {
                 + self.last_roots.capacity() * 4
                 + self.context_bytes()
                 + d_retained
-                + dl_run.as_ref().map_or(0, |d| d.bytes());
+                + dl_run.as_ref().map_or(0, |d| d.bytes())
+                + if el_indiv_reuse {
+                    self.worlds_bytes().saturating_add(self.el_deps.bytes())
+                } else {
+                    0
+                };
             let inv_peak = live_base
                 .saturating_add(old.changed_bytes())
                 .saturating_add(inv_closure_peak);
@@ -9257,20 +9402,85 @@ impl Saturation {
                 _ => None,
             };
             let changed = ix.changed_with_dt(&old, dt_align.as_ref(), &|| poll(limits))?;
+            if el_indiv_reuse {
+                el_old_diff.dead_nominals = old
+                    .nominals
+                    .iter()
+                    .copied()
+                    .filter(|n| ix.nominals.binary_search(n).is_err())
+                    .collect();
+                el_old_diff.universal_rules_changed = old.universal != ix.universal;
+                if el_old_diff.universal_rules_changed {
+                    el_old_diff.added_universal_fillers = ix
+                        .universal
+                        .iter()
+                        .filter(|pair| old.universal.binary_search(pair).is_err())
+                        .map(|&(f, _)| f)
+                        .collect();
+                    el_old_diff.added_universal_fillers.sort_unstable();
+                    el_old_diff.added_universal_fillers.dedup();
+                }
+                for k in &ix.keys {
+                    if !old.keys.contains(k) && !el_old_diff.added_keys.contains(k) {
+                        el_old_diff.added_keys.push(k.clone());
+                    }
+                }
+                for k in &old.keys {
+                    if !ix.keys.contains(k) && !el_old_diff.removed_keys.contains(k) {
+                        el_old_diff.removed_keys.push(k.clone());
+                    }
+                }
+            }
             drop(old);
             let last_roots = std::mem::take(&mut self.last_roots);
-            stats.cleared = self.invalidate_changed(
-                changed,
-                &ix,
-                dynamic.as_ref(),
-                dt_align.as_ref(),
-                &last_roots,
-                &roots,
-                renumbered,
-                limits,
-                live_base,
-                &mut normalized_peak,
-            )?;
+            if el_indiv_reuse {
+                match self.invalidate_changed_el(
+                    changed,
+                    &ix,
+                    dt_align.as_ref(),
+                    &last_roots,
+                    &roots,
+                    &el_old_diff.dead_nominals,
+                    renumbered,
+                    limits,
+                    live_base,
+                    &mut normalized_peak,
+                )? {
+                    ElInvalidateOutcome::Restart => {
+                        return Ok(ControlFlow::Break(LateRestart::Incompatible {
+                            normalized_peak,
+                        }));
+                    }
+                    ElInvalidateOutcome::Done {
+                        cleared,
+                        kept_universal: ku,
+                        reseed_real: rr,
+                        kept_merged: km,
+                        pre_dirty_keys: pdk,
+                        modified_bits: mb,
+                    } => {
+                        stats.cleared = cleared;
+                        kept_universal = ku;
+                        reseed_real = rr;
+                        kept_merged = km;
+                        pre_dirty_keys = pdk;
+                        modified_bits = mb;
+                    }
+                }
+            } else {
+                stats.cleared = self.invalidate_changed(
+                    changed,
+                    &ix,
+                    dynamic.as_ref(),
+                    dt_align.as_ref(),
+                    &last_roots,
+                    &roots,
+                    renumbered,
+                    limits,
+                    live_base,
+                    &mut normalized_peak,
+                )?;
+            }
             drop(last_roots);
             poll(limits)?;
         }
@@ -9278,6 +9488,11 @@ impl Saturation {
         debug_assert_eq!(self.last_roots.capacity(), 0);
         // the index, the caller's copy of the axioms, the normalized axioms and the roots,
         // and the contexts kept from the last run
+        let kept_worlds_bytes = if el_indiv_reuse {
+            self.worlds_bytes()
+        } else {
+            0
+        };
         let base = rebuilt_ix_bytes
             + held_bytes
             + excluded_copy_bytes(&self.excluded)
@@ -9285,6 +9500,12 @@ impl Saturation {
             + rebuilt_ax_bytes
             + roots.capacity() * 4
             + self.context_bytes()
+            + kept_worlds_bytes
+            + if el_indiv_reuse {
+                self.el_deps.bytes()
+            } else {
+                0
+            }
             // the states of the conjunctions' contexts kept from the last run, whose
             // table counts at the end of the saturation
             + dynamic
@@ -9624,12 +9845,59 @@ impl Saturation {
         // fallback chain reads in `dl_worked`: a check that saw the bound passed but lost
         // the stop to the caller's deadline, cancellation or memory refusal does not count
         let mut over_work = false;
+        let track_el = !horn && !disj && ix.has_individuals() && ix.top_chain.is_none();
+        let real_parent_atomics: Vec<std::sync::atomic::AtomicU32> = if track_el {
+            let mut v = Vec::with_capacity(self.ctx.len());
+            for i in 0..self.ctx.len() {
+                let init_parent = self
+                    .el_deps
+                    .real_parent
+                    .get(i)
+                    .copied()
+                    .unwrap_or(saturate::REAL_NONE);
+                v.push(std::sync::atomic::AtomicU32::new(init_parent));
+            }
+            v
+        } else {
+            Vec::new()
+        };
+        let modified_atomics: Vec<std::sync::atomic::AtomicU64> =
+            if !horn && !disj && !self.worlds.is_empty() {
+                let words = self.ctx.len().div_ceil(64);
+                let mut v = Vec::with_capacity(words);
+                for i in 0..words {
+                    let w = modified_bits.get(i).copied().unwrap_or(0);
+                    v.push(std::sync::atomic::AtomicU64::new(w));
+                }
+                v
+            } else {
+                Vec::new()
+            };
+        drop(modified_bits);
+        let any_newly_real = std::sync::atomic::AtomicBool::new(false);
+        let el_track = if track_el || !modified_atomics.is_empty() {
+            Some(saturate::ElTrack {
+                real_parent: (!real_parent_atomics.is_empty())
+                    .then_some(real_parent_atomics.as_slice()),
+                modified: (!modified_atomics.is_empty()).then_some(modified_atomics.as_slice()),
+                any_newly_real: Some(&any_newly_real),
+            })
+        } else {
+            None
+        };
         #[cfg(test)]
         if stats.incremental {
             admission_test::hit(admission_test::Point::KeptSaturationStart);
         }
-        let (sat_totals, sat_stop) =
-            saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds);
+        let (sat_totals, sat_stop) = saturate::saturate_counted_tracked(
+            &ix,
+            &self.ctx,
+            &roots,
+            &[],
+            &kept_universal,
+            &bounds,
+            el_track,
+        );
         #[cfg(test)]
         if stats.incremental {
             admission_test::hit(admission_test::Point::KeptSaturationEnd {
@@ -10079,18 +10347,34 @@ impl Saturation {
         // and so does what they reach, between rounds of the saturation, with the facts
         // of universal roles and the merges of keys, until none is new.
         let marking_start = Instant::now();
-        let mut universal: Vec<Ex> = Vec::new();
+        let mut universal: Vec<Ex> = kept_universal;
+        let mut new_universals: Vec<world::UniversalSupport> = Vec::new();
+        let mut new_key_merges: Vec<world::KeyMergeDep> = Vec::new();
         // a run with the Horn rules and individuals always marks them, since R7 reads
         // the real predecessors of the global state (roadmap item 692)
         let entangled = ix.has_individuals()
-            && (totals.merged || !ix.universal.is_empty() || !ix.keys.is_empty() || horn);
+            && (totals.merged
+                || kept_merged
+                || !ix.universal.is_empty()
+                || !ix.keys.is_empty()
+                || horn);
         let mut phase2_started = false;
         if entangled && (disj || halted.is_none()) {
             phase2_started = true;
             let mut seeds: Vec<(Ex, saturate::Concl)> = std::iter::once(TOP)
                 .chain(ix.nominals.iter().copied())
-                .map(|e| (e, saturate::Concl::Real))
+                .filter(|&e| {
+                    !self
+                        .ctx
+                        .get(e as usize)
+                        .and_then(|c| c.get())
+                        .is_some_and(|c| c.st.lock().real)
+                })
+                .map(|e| (e, saturate::Concl::Real(saturate::REAL_ROOT)))
                 .collect();
+            for (e, p) in reseed_real.drain(..) {
+                seeds.push((e, saturate::Concl::Real(p)));
+            }
             loop {
                 if let Err(e) = poll(limits) {
                     if partial && !disj {
@@ -10132,8 +10416,15 @@ impl Saturation {
                     paid_memory: totals.paid,
                     ..bounds
                 };
-                let (more, stop) =
-                    saturate::saturate_counted(&ix, &self.ctx, &[], &woken, &universal, &round);
+                let (more, stop) = saturate::saturate_counted_tracked(
+                    &ix,
+                    &self.ctx,
+                    &[],
+                    &woken,
+                    &universal,
+                    &round,
+                    el_track,
+                );
                 totals = saturate::Totals {
                     conclusions: totals.conclusions + more.conclusions,
                     memory: more.memory,
@@ -10157,7 +10448,14 @@ impl Saturation {
                     ctx: &self.ctx,
                     dynamic: dynamic.as_ref(),
                 };
-                let facts = world::universal_facts(&ix, &view, &universal);
+                let facts = if track_el {
+                    let supported = world::universal_facts_with_supports(&ix, &view, &universal);
+                    let facts: Vec<Ex> = supported.iter().map(|u| u.fact).collect();
+                    new_universals.extend(supported);
+                    facts
+                } else {
+                    world::universal_facts(&ix, &view, &universal)
+                };
                 let key_base = match world_base(totals.memory, pending) {
                     Ok(b) => b,
                     Err(e) if partial && !disj => {
@@ -10188,7 +10486,14 @@ impl Saturation {
                     }
                 };
                 let key_bound = |delta: isize| key_budget.tell(delta);
-                let merges = match world::key_merges(&ix, &view, &key_bound) {
+                let merges = match if track_el {
+                    world::key_merges_with_deps(&ix, &view, &key_bound).map(|(m, deps)| {
+                        new_key_merges.extend(deps);
+                        m
+                    })
+                } else {
+                    world::key_merges(&ix, &view, &key_bound)
+                } {
                     Ok(m) => {
                         key_budget.finish(&mut totals);
                         m
@@ -10237,6 +10542,19 @@ impl Saturation {
                     seeds.push((b, saturate::Concl::Sub(a)));
                 }
             }
+        } else if !horn && !disj && self.el_deps.phase2_ran {
+            // Phase 2 is no longer needed (e.g., the last merge/key/universal rule was
+            // removed): clear stale `real` marks on kept contexts and discard worlds.
+            for slot in &self.ctx {
+                if let Some(c) = slot.get() {
+                    let mut st = c.st.lock();
+                    if st.real {
+                        st.real = false;
+                    }
+                }
+            }
+            self.worlds.clear();
+            self.el_deps.clear();
         }
         // the classes whose instances reach an individual through a context that is not
         // real, each in a world of its own
@@ -10244,6 +10562,7 @@ impl Saturation {
         let mut world_live = 0usize;
         let mut world_open: Option<(partial::OpenClasses, Consistency)> = None;
         let mut phase12_consistent: Option<bool> = None;
+        let mut new_world_deps: Vec<(Ex, world::WorldDep)> = Vec::new();
         if entangled && (disj || halted.is_none()) {
             let skip_worlds = if partial && !disj {
                 let c = self.consistent(&ax, &ix.nominals, rooted);
@@ -10257,13 +10576,131 @@ impl Saturation {
             } else {
                 world::witnesses(&ix, &self.ctx, dynamic.as_ref(), &universal)
             };
-            if !witnesses.is_empty() {
-                let mut classes = Some(world::reaching(
+            let mut classes_opt = if witnesses.is_empty() {
+                None
+            } else {
+                Some(world::reaching(
                     &ix,
                     &self.ctx,
                     dynamic.as_ref(),
                     &witnesses,
-                ));
+                ))
+            };
+            if !horn && !disj && !self.worlds.is_empty() {
+                match classes_opt.as_mut() {
+                    None => {
+                        self.worlds.clear();
+                        self.el_deps.world_deps.clear();
+                    }
+                    Some(classes) => {
+                        let mod_has = |e: Ex| -> bool {
+                            let w = (e as usize) >> 6;
+                            modified_atomics.get(w).is_some_and(|a| {
+                                (a.load(Ordering::Relaxed) & (1u64 << (e & 63))) != 0
+                            })
+                        };
+                        let mut dirty_keys = if pre_dirty_keys.len() == ix.keys.len() {
+                            pre_dirty_keys
+                        } else {
+                            vec![false; ix.keys.len()]
+                        };
+                        for (ki, key) in ix.keys.iter().enumerate() {
+                            if !dirty_keys[ki] && el_old_diff.added_keys.contains(key) {
+                                dirty_keys[ki] = true;
+                            }
+                        }
+                        if !ix.keys.is_empty() && dirty_keys.iter().any(|&d| !d) {
+                            for (wi, word) in modified_atomics.iter().enumerate() {
+                                let mut bits = word.load(Ordering::Relaxed);
+                                while bits != 0 {
+                                    let tz = bits.trailing_zeros() as usize;
+                                    bits &= bits - 1;
+                                    let e = (wi * 64 + tz) as Ex;
+                                    if let Some(c) = self.ctx.get(e as usize).and_then(|c| c.get())
+                                    {
+                                        let st = c.st.lock();
+                                        if st.init {
+                                            for (ki, key) in ix.keys.iter().enumerate() {
+                                                if !dirty_keys[ki]
+                                                    && world::context_touches_key(&ix, e, &st, key)
+                                                {
+                                                    dirty_keys[ki] = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let newly_real = any_newly_real.load(Ordering::Relaxed);
+                        let any_key_dirty = dirty_keys.iter().any(|&d| d);
+                        let keys_added = !el_old_diff.added_keys.is_empty();
+                        let keys_removed = !el_old_diff.removed_keys.is_empty();
+                        let el_deps_worlds = &mut self.el_deps.world_deps;
+                        let ctx_ref = &self.ctx;
+                        self.worlds.retain(|&d, _| {
+                            if classes.binary_search(&d).is_err() {
+                                el_deps_worlds.remove(&d);
+                                return false;
+                            }
+                            let Some(dep) = el_deps_worlds.get(&d) else {
+                                return false;
+                            };
+                            if dep.used_contexts.iter().any(|&e| mod_has(e)) {
+                                el_deps_worlds.remove(&d);
+                                return false;
+                            }
+                            if dep.had_world_universal
+                                && (newly_real
+                                    || el_old_diff.universal_rules_changed
+                                    || keys_added
+                                    || keys_removed
+                                    || any_key_dirty)
+                            {
+                                el_deps_worlds.remove(&d);
+                                return false;
+                            }
+                            if !el_old_diff.added_universal_fillers.is_empty() {
+                                let hit = el_old_diff.added_universal_fillers.iter().any(|&f| {
+                                    dep.used_exprs.binary_search(&f).is_ok()
+                                        || dep.used_contexts.iter().any(|&e| {
+                                            ctx_ref
+                                                .get(e as usize)
+                                                .and_then(|c| c.get())
+                                                .is_some_and(|c| c.st.lock().subs.contains(&f))
+                                        })
+                                });
+                                if hit {
+                                    el_deps_worlds.remove(&d);
+                                    return false;
+                                }
+                            }
+                            if dep.touched_named && keys_added {
+                                el_deps_worlds.remove(&d);
+                                return false;
+                            }
+                            for wk in &dep.watched_keys {
+                                let clean = ix
+                                    .keys
+                                    .iter()
+                                    .position(|k| k == wk)
+                                    .is_some_and(|ki| !dirty_keys[ki]);
+                                if !clean {
+                                    el_deps_worlds.remove(&d);
+                                    return false;
+                                }
+                            }
+                            world::replay_world_dt_sticky(&ix, &dep.dt_sticky);
+                            true
+                        });
+                        el_deps_worlds.retain(|d, _| self.worlds.contains_key(d));
+                        stats.worlds_reused = self.worlds.len();
+                        classes.retain(|d| !self.worlds.contains_key(d));
+                    }
+                }
+            }
+            if let Some(classes) = classes_opt.filter(|c| !c.is_empty()) {
+                let mut classes = Some(classes);
                 let mut real: Vec<Ex> = (0..self.ctx.len() as Ex)
                     .filter(|&e| self.ctx[e as usize].get().is_some_and(|c| c.st.lock().real))
                     .collect();
@@ -10299,6 +10736,7 @@ impl Saturation {
                 };
                 if let Some(budget) = budget {
                     let mut classes = classes.expect("reaching classes");
+                    let record_world_dep = track_el;
                     if partial && !disj {
                         let bound = |delta: isize| budget.tell(delta);
                         let chunks: Vec<(FoundWorldChunk<'_, '_>, Option<index::Halt>)> =
@@ -10321,7 +10759,7 @@ impl Saturation {
                                         &bound,
                                         &budget,
                                     );
-                                    let f = match w.classify(d) {
+                                    let f = match w.classify_with_dep(d, record_world_dep) {
                                         Ok(f) => f,
                                         Err(h) => {
                                             chunk_halt = Some(h);
@@ -10387,6 +10825,10 @@ impl Saturation {
                                 };
                                 let remaining = debit.outstanding - kept;
                                 self.worlds.insert(d, (f.bottom, f.subs));
+                                if let Some(dep) = f.dep {
+                                    new_world_deps.push((d, dep));
+                                }
+                                stats.worlds_run += 1;
                                 world_bytes = next_bytes;
                                 debit.outstanding = remaining;
                             }
@@ -10447,7 +10889,7 @@ impl Saturation {
                                     &bound,
                                     &budget,
                                 );
-                                let f = w.classify(d)?;
+                                let f = w.classify_with_dep(d, record_world_dep)?;
                                 #[cfg(test)]
                                 if let Some(worker) = &mixed_worker {
                                     worker.after_world(d)?;
@@ -10555,6 +10997,10 @@ impl Saturation {
                                     test.before_insert(self.worlds.len());
                                 }
                                 self.worlds.insert(d, (f.bottom, f.subs));
+                                if let Some(dep) = f.dep {
+                                    new_world_deps.push((d, dep));
+                                }
+                                stats.worlds_run += 1;
                                 world_bytes = next_bytes;
                                 debit.outstanding = remaining;
                                 #[cfg(test)]
@@ -10579,7 +11025,7 @@ impl Saturation {
                     }
                 }
             }
-            self.entangled = entangled;
+            self.entangled = if horn || disj { entangled } else { false };
         } else {
             self.entangled = false;
         }
@@ -11065,8 +11511,51 @@ impl Saturation {
             }
             None => (0, 0),
         };
+        // Assemble tracked EL dependencies for completed EL Phase 2/3 runs. If a tight
+        // memory budget or pool charge refuses the dependency metadata, drop it cleanly
+        // and fall back to `entangled = true` so the current classification still
+        // succeeds within its budget and the next edit rebuilds fresh.
+        let retained_world_bytes = if stats.worlds_reused > 0 {
+            self.worlds_bytes()
+        } else {
+            world_bytes
+        };
+        if open.is_some() || !track_el || !entangled {
+            self.el_deps.clear();
+        } else {
+            let mut candidate = std::mem::take(&mut self.el_deps);
+            candidate.phase2_ran = true;
+            candidate.real_parent = real_parent_atomics
+                .into_iter()
+                .map(std::sync::atomic::AtomicU32::into_inner)
+                .collect();
+            candidate.universals.extend(new_universals);
+            candidate.key_merges.extend(new_key_merges);
+            for (d, dep) in new_world_deps {
+                candidate.world_deps.insert(d, dep);
+            }
+            candidate
+                .world_deps
+                .retain(|d, _| self.worlds.contains_key(d));
+            let base_without_deps = self
+                .retained_bytes(held_bytes, 0, retained_world_bytes)
+                .saturating_add(incomplete_bytes)
+                .saturating_add(root_bytes)
+                .saturating_add(pending.saturating_mul(std::mem::size_of::<saturate::Concl>()));
+            let with_deps = base_without_deps.saturating_add(candidate.bytes());
+            if limits.max_memory.is_some_and(|m| with_deps > m)
+                || (charge_fn.is_some()
+                    && !cover_memory(with_deps, limits.max_memory, charge_fn, &mut totals.paid))
+            {
+                drop(candidate);
+                self.el_deps.clear();
+                self.entangled = true;
+            } else {
+                self.el_deps = candidate;
+            }
+        }
         let retained_without_roots = self
-            .retained_bytes(held_bytes, 0, world_bytes)
+            .retained_bytes(held_bytes, 0, retained_world_bytes)
             .saturating_add(incomplete_bytes);
         let retained = retained_without_roots.saturating_add(root_bytes);
         let pending_bytes = pending.saturating_mul(std::mem::size_of::<saturate::Concl>());
@@ -11274,7 +11763,8 @@ impl Saturation {
     fn pre_plan_live_bytes(&self, held_bytes: usize) -> usize {
         let base = held_bytes
             .saturating_add(excluded_copy_bytes(&self.excluded))
-            .saturating_add(self.worlds_bytes());
+            .saturating_add(self.worlds_bytes())
+            .saturating_add(self.el_deps.bytes());
         if let Some(ix) = &self.index {
             base.saturating_add(self.index_bytes(ix))
                 .saturating_add(self.context_bytes())
@@ -11361,6 +11851,7 @@ impl Saturation {
                     .sum::<usize>(),
             )
             .saturating_add(self.worlds_bytes())
+            .saturating_add(self.el_deps.bytes())
             .saturating_add(excluded_copy_bytes(&self.excluded))
             .saturating_add(self.chain_ranged_bytes())
             .saturating_add(
@@ -11384,6 +11875,7 @@ impl Saturation {
                     d.table.bytes() + d.lits.bytes() + d.split_meta_bytes()
                 }))
                 .saturating_add(self.worlds_bytes())
+                .saturating_add(self.el_deps.bytes())
                 .saturating_add(self.chain_ranged_bytes())
                 .saturating_add(
                     self.leaf_individuals
@@ -11417,6 +11909,7 @@ impl Saturation {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<Ex>())
             + world_bytes
+            + self.el_deps.bytes()
             + self.chain_ranged_bytes()
             + excluded_copy_bytes(&self.excluded)
     }
@@ -11441,6 +11934,7 @@ impl Saturation {
             .saturating_add(dynamic.map_or(0, |d| d.retained_bytes()))
             .saturating_add(dl_run.map_or(0, |d| d.bytes()))
             .saturating_add(world_bytes)
+            .saturating_add(self.el_deps.bytes())
             .saturating_add(pending_count.saturating_mul(std::mem::size_of::<saturate::Concl>()))
     }
 
@@ -11515,6 +12009,25 @@ impl Saturation {
     /// when an axiom that needs case analysis is in play, which Tier D may then take or
     /// leave. A run with the Horn rules also starts again once it keeps more than twice
     /// the expressions and conjunctions of the last run that did.
+    /// Whether a kept EL run must use index comparison (`old_ix` vs `new_ix`) and
+    /// tracked individual/key/world invalidation instead of the premise bitset fast path.
+    fn uses_el_index_diff(&self, changes: Option<Changes<'_>>) -> bool {
+        self.index.as_ref().is_some_and(|ix| {
+            ix.dt.is_some()
+                || ix.has_individuals()
+                || !ix.keys.is_empty()
+                || ix.nominal_selfs
+                || ix.tops[1].is_some()
+        }) || self.el_deps.phase2_ran
+            || !self.worlds.is_empty()
+            || changes.is_some_and(|c| {
+                c.added
+                    .iter()
+                    .chain(c.removed)
+                    .any(|k| mentions_data(k) || mentions_el_individual_or_key(k))
+            })
+    }
+
     fn must_restart(&self, k: &Kept, c: Changes<'_>) -> bool {
         let changed = || c.added.iter().chain(c.removed).copied();
         if changed().any(needs_full_run) {
@@ -11537,23 +12050,505 @@ impl Saturation {
         match k.tier {
             KeptTier::El => {
                 !outside.is_empty()
-                    || ((self.index.as_ref().is_some_and(|ix| ix.dt.is_some())
-                        || changed().any(mentions_data))
+                    || (self.uses_el_index_diff(Some(c))
                         && self.interner.len() > 2 * k.nodes + KEPT_SLACK)
             }
             KeptTier::Horn => {
-                !outside.is_empty() && disj_in_play
+                changed().any(mentions_el_individual_or_key)
+                    || !outside.is_empty() && disj_in_play
                     || self.interner.len() > 2 * k.nodes + KEPT_SLACK
                     || self.dynamic.as_ref().map_or(0, |d| d.len()) > 2 * k.dynamic + KEPT_SLACK
             }
             // Tier D takes or leaves each axiom by the axiom alone, and a run that finds
             // another tier once its index is built starts again
             KeptTier::Disj => {
-                self.interner.len() > 2 * k.nodes + KEPT_SLACK
+                changed().any(mentions_el_individual_or_key)
+                    || self.interner.len() > 2 * k.nodes + KEPT_SLACK
                     || self.dynamic.as_ref().map_or(0, |d| d.len()) > 2 * k.dynamic + KEPT_SLACK
                     || self.dl_run.as_ref().map_or(0, |d| d.table.len()) > 2 * k.table + KEPT_SLACK
             }
         }
+    }
+
+    /// Incremental invalidation for strictly OWL 2 EL runs with individuals, merges,
+    /// keys, universal roles, and conditional worlds (roadmap item 664).
+    ///
+    /// Computes the exact fixed-point closure of:
+    /// 1. Contexts holding changed index expressions, changed datatype-checker
+    ///    components, dead roots, or dead nominals.
+    /// 2. Backward existential links (`st.back`), nominal member links
+    ///    (`extra.members`), and real-to-nominal merge edges (`st.real && extra.noms`).
+    /// 3. Grounded acyclic `real_parent` forest invalidation (`real_broken`), cascading
+    ///    into `extra.noms` whenever a real-merged context loses its grounded real root.
+    /// 4. Grounded `KeyMergeDep` invalidation whenever a key disappears or any of its
+    ///    `real_deps` / `ctx_deps` is affected or `real_broken`.
+    /// 5. Grounded `UniversalSupport` verification (restarting fresh if any previously
+    ///    broadcast global universal fact loses all pre-broadcast supports).
+    #[allow(clippy::too_many_arguments)]
+    fn invalidate_changed_el(
+        &mut self,
+        changed: Vec<bool>,
+        ix: &Index,
+        dt_align: Option<&dt_sat::DtAlign>,
+        last_roots: &[Ex],
+        new_roots: &[Ex],
+        dead_nominals: &[Ex],
+        renumbered: bool,
+        limits: &Limits,
+        live_base: usize,
+        normalized_peak: &mut usize,
+    ) -> Result<ElInvalidateOutcome, Error> {
+        let slots = self.ctx.len();
+        let mut since_poll = 0usize;
+        let mut tick = |work: usize| -> Result<(), Error> {
+            since_poll = since_poll.saturating_add(work);
+            if since_poll >= POLL_INVALIDATE {
+                poll(limits)?;
+                since_poll = 0;
+            }
+            Ok(())
+        };
+        let (affected, real_broken, affected_bytes) = {
+            let mut affected: FxHashSet<Ex> = FxHashSet::default();
+            let mut queue: Vec<Ex> = Vec::new();
+            for e in 0..slots as Ex {
+                tick(1)?;
+                let Some(c) = self.ctx[e as usize].get() else {
+                    continue;
+                };
+                let st = c.st.lock();
+                if !st.init {
+                    continue;
+                }
+                let mut hit = false;
+                for &s in &st.subs {
+                    tick(1)?;
+                    if changed.get(s as usize).copied().unwrap_or(true) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit
+                    && let Some(align) = dt_align
+                    && let Some(x) = st.extra.as_ref()
+                {
+                    for s in &x.dt {
+                        tick(1)?;
+                        if align
+                            .changed_comps
+                            .get(s.comp as usize)
+                            .copied()
+                            .unwrap_or(true)
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+                if hit && affected.insert(e) {
+                    push_capped(&mut queue, e, slots);
+                }
+            }
+            for &r in last_roots {
+                tick(1)?;
+                if (r as usize) < slots
+                    && new_roots.binary_search(&r).is_err()
+                    && self.ctx[r as usize].get().is_some_and(|c| c.st.lock().init)
+                    && affected.insert(r)
+                {
+                    push_capped(&mut queue, r, slots);
+                }
+            }
+            for &n in dead_nominals {
+                tick(1)?;
+                if (n as usize) < slots
+                    && self.ctx[n as usize].get().is_some_and(|c| c.st.lock().init)
+                    && affected.insert(n)
+                {
+                    push_capped(&mut queue, n, slots);
+                }
+            }
+            // Pre-filter cached worlds against `changed` and `dt_align` while `changed`
+            // is still live, and remap surviving world datatype component ids.
+            if !self.worlds.is_empty() {
+                let world_deps = &mut self.el_deps.world_deps;
+                self.worlds.retain(|&d, _| {
+                    let Some(dep) = world_deps.get_mut(&d) else {
+                        return false;
+                    };
+                    if dep
+                        .used_exprs
+                        .iter()
+                        .any(|&s| changed.get(s as usize).copied().unwrap_or(true))
+                    {
+                        world_deps.remove(&d);
+                        return false;
+                    }
+                    if let Some(align) = dt_align {
+                        if dep
+                            .dt_comps
+                            .iter()
+                            .any(|&c| align.changed_comps.get(c as usize).copied().unwrap_or(true))
+                        {
+                            world_deps.remove(&d);
+                            return false;
+                        }
+                        for c in &mut dep.dt_comps {
+                            if let Some(mapped) = align.comp_map.get(*c as usize).copied().flatten()
+                            {
+                                *c = mapped;
+                            } else {
+                                world_deps.remove(&d);
+                                return false;
+                            }
+                        }
+                        dep.dt_comps.sort_unstable();
+                        for (c, _) in &mut dep.dt_sticky {
+                            if let Some(mapped) = align.comp_map.get(*c as usize).copied().flatten()
+                            {
+                                *c = mapped;
+                            } else {
+                                world_deps.remove(&d);
+                                return false;
+                            }
+                        }
+                        dep.dt_sticky.sort_unstable_by_key(|&(c, _)| c);
+                    }
+                    true
+                });
+                world_deps.retain(|d, _| self.worlds.contains_key(d));
+            }
+            drop(changed);
+
+            // Build the child adjacency of the grounded `real_parent` forest.
+            let mut real_children: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+            let mut real_broken: FxHashSet<Ex> = FxHashSet::default();
+            let mut real_queue: Vec<Ex> = Vec::new();
+            if self.el_deps.phase2_ran {
+                for (i, &p) in self.el_deps.real_parent.iter().enumerate() {
+                    tick(1)?;
+                    let e = i as Ex;
+                    if p == saturate::REAL_ROOT {
+                        if e != TOP
+                            && ix.nominals.binary_search(&e).is_err()
+                            && real_broken.insert(e)
+                        {
+                            real_queue.push(e);
+                        }
+                    } else if p != saturate::REAL_NONE {
+                        real_children.entry(p).or_default().push(e);
+                    }
+                }
+                // Defensive check: any initialized real context missing a recorded parent
+                // is conservatively treated as `real_broken`.
+                for e in 0..slots as Ex {
+                    tick(1)?;
+                    if let Some(c) = self.ctx[e as usize].get() {
+                        let st = c.st.lock();
+                        if st.init
+                            && st.real
+                            && self
+                                .el_deps
+                                .real_parent
+                                .get(e as usize)
+                                .copied()
+                                .unwrap_or(saturate::REAL_NONE)
+                                == saturate::REAL_NONE
+                            && real_broken.insert(e)
+                        {
+                            real_queue.push(e);
+                        }
+                    }
+                }
+            }
+
+            loop {
+                let mut progressed = false;
+                while let Some(e) = queue.pop() {
+                    tick(1)?;
+                    if let Some(children) = real_children.get(&e) {
+                        for &ch in children {
+                            tick(1)?;
+                            if real_broken.insert(ch) {
+                                real_queue.push(ch);
+                                progressed = true;
+                            }
+                        }
+                    }
+                    let Some(c) = self.ctx.get(e as usize).and_then(|c| c.get()) else {
+                        continue;
+                    };
+                    let st = c.st.lock();
+                    for (_, srcs) in &st.back {
+                        for &s in &srcs.list {
+                            if affected.insert(s) {
+                                push_capped(&mut queue, s, slots);
+                                progressed = true;
+                            }
+                            tick(1)?;
+                        }
+                    }
+                    if let Some(x) = st.extra.as_ref() {
+                        for &m in &x.members.list {
+                            if affected.insert(m) {
+                                push_capped(&mut queue, m, slots);
+                                progressed = true;
+                            }
+                            tick(1)?;
+                        }
+                        if st.real {
+                            for &n in &x.noms {
+                                if affected.insert(n) {
+                                    push_capped(&mut queue, n, slots);
+                                    progressed = true;
+                                }
+                                tick(1)?;
+                            }
+                        }
+                    }
+                }
+                while let Some(e) = real_queue.pop() {
+                    tick(1)?;
+                    if let Some(children) = real_children.get(&e) {
+                        for &ch in children {
+                            tick(1)?;
+                            if real_broken.insert(ch) {
+                                real_queue.push(ch);
+                                progressed = true;
+                            }
+                        }
+                    }
+                    if !affected.contains(&e)
+                        && let Some(c) = self.ctx.get(e as usize).and_then(|c| c.get())
+                    {
+                        let st = c.st.lock();
+                        if st.init && st.real && !st.noms().is_empty() {
+                            for &n in st.noms() {
+                                if affected.insert(n) {
+                                    push_capped(&mut queue, n, slots);
+                                    progressed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                for m in &self.el_deps.key_merges {
+                    tick(1)?;
+                    if affected.contains(&m.a) && affected.contains(&m.b) {
+                        continue;
+                    }
+                    let broken = !ix.keys.contains(&m.key)
+                        || m.real_deps
+                            .iter()
+                            .any(|u| affected.contains(u) || real_broken.contains(u))
+                        || m.ctx_deps.iter().any(|v| affected.contains(v));
+                    if broken {
+                        if affected.insert(m.a) {
+                            push_capped(&mut queue, m.a, slots);
+                            progressed = true;
+                        }
+                        if affected.insert(m.b) {
+                            push_capped(&mut queue, m.b, slots);
+                            progressed = true;
+                        }
+                    }
+                }
+                if !progressed && queue.is_empty() && real_queue.is_empty() {
+                    break;
+                }
+            }
+            let affected_bytes =
+                dl_clause::hash_table_bytes(affected.capacity(), std::mem::size_of::<Ex>());
+            (affected, real_broken, affected_bytes)
+        };
+
+        // Verify that every previously broadcast global universal fact still has at least
+        // one intact, grounded pre-broadcast support. Otherwise restart fresh cleanly.
+        let mut surviving_universals = Vec::with_capacity(self.el_deps.universals.len());
+        let mut kept_universal = Vec::with_capacity(self.el_deps.universals.len());
+        for u in &self.el_deps.universals {
+            tick(1)?;
+            let mut kept_supports = Vec::new();
+            for &(f, w) in &u.supports {
+                if ix.universal.binary_search(&(f, u.fact)).is_ok()
+                    && !affected.contains(&w)
+                    && !real_broken.contains(&w)
+                    && self
+                        .ctx
+                        .get(w as usize)
+                        .and_then(|c| c.get())
+                        .is_some_and(|c| {
+                            let st = c.st.lock();
+                            st.init && st.real && st.subs.contains(&f)
+                        })
+                {
+                    kept_supports.push((f, w));
+                }
+            }
+            if kept_supports.is_empty() {
+                return Ok(ElInvalidateOutcome::Restart);
+            }
+            kept_universal.push(u.fact);
+            surviving_universals.push(world::UniversalSupport {
+                fact: u.fact,
+                supports: kept_supports,
+            });
+        }
+
+        // Record which keys are touched by about-to-be-cleared/reset contexts BEFORE
+        // clearing them, so Phase 3 invalidates cached worlds watching those keys.
+        let mut pre_dirty_keys = vec![false; ix.keys.len()];
+        if !self.worlds.is_empty() && !ix.keys.is_empty() {
+            for &e in affected.iter().chain(real_broken.iter()) {
+                tick(1)?;
+                if let Some(c) = self.ctx.get(e as usize).and_then(|c| c.get()) {
+                    let st = c.st.lock();
+                    if st.init {
+                        for (ki, key) in ix.keys.iter().enumerate() {
+                            if !pre_dirty_keys[ki] && world::context_touches_key(ix, e, &st, key) {
+                                pre_dirty_keys[ki] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if renumbered {
+            let mut maps = 0usize;
+            for e in 0..slots as Ex {
+                tick(1)?;
+                if affected.contains(&e) {
+                    continue;
+                }
+                let Some(c) = self.ctx[e as usize].get() else {
+                    continue;
+                };
+                let st = c.st.lock();
+                if st.init && !st.disj.is_empty() {
+                    maps = maps.saturating_add(st.disjoint_growth_poll(ix, &mut tick)?);
+                }
+            }
+            if maps > 0 {
+                let live_without_old = live_base.saturating_add(affected_bytes);
+                let used = live_without_old.saturating_add(maps);
+                let more = used.saturating_sub(*normalized_peak);
+                if limits.max_memory.is_some_and(|m| used > m)
+                    || limits
+                        .charge
+                        .as_deref()
+                        .is_some_and(|f| more > 0 && !f(more))
+                {
+                    return Err(Error::Memory {
+                        limit: limits.max_memory.unwrap_or(used),
+                        used,
+                    });
+                }
+                *normalized_peak = (*normalized_peak).max(used);
+            }
+        }
+
+        let mut modified_bits = if !self.worlds.is_empty() {
+            vec![0u64; slots.div_ceil(64)]
+        } else {
+            Vec::new()
+        };
+        let mut mark_mod = |e: Ex| {
+            if let Some(w) = modified_bits.get_mut((e as usize) >> 6) {
+                *w |= 1u64 << (e & 63);
+            }
+        };
+        let mut cleared = 0usize;
+        let mut kept_merged = false;
+        let mut reset_real_list: Vec<Ex> = Vec::new();
+        for e in 0..slots as Ex {
+            tick(1)?;
+            let Some(c) = self.ctx[e as usize].get() else {
+                continue;
+            };
+            if affected.contains(&e) {
+                if c.st.lock().init {
+                    cleared += 1;
+                }
+                c.clear();
+                mark_mod(e);
+                if let Some(rp) = self.el_deps.real_parent.get_mut(e as usize) {
+                    *rp = saturate::REAL_NONE;
+                }
+            } else {
+                let mut st = c.st.lock();
+                if st.init {
+                    st.drop_predecessors_poll(&affected, &mut tick)?;
+                    if renumbered && !st.disj.is_empty() {
+                        st.reindex_disjoint_poll(ix, &mut tick)?;
+                    }
+                    if let Some(align) = dt_align {
+                        st.reindex_dt_poll(&align.comp_map, &mut tick)?;
+                    }
+                    if real_broken.contains(&e) && st.real {
+                        st.real = false;
+                        mark_mod(e);
+                        if let Some(rp) = self.el_deps.real_parent.get_mut(e as usize) {
+                            *rp = saturate::REAL_NONE;
+                        }
+                        reset_real_list.push(e);
+                    }
+                    if !st.noms().is_empty() {
+                        kept_merged = true;
+                    }
+                }
+            }
+        }
+
+        // For any kept context whose `real` flag was reset because its previous causal
+        // parent was invalidated, check whether another kept real context still links
+        // directly to it via an existential restriction so Phase 2 re-seeds `Concl::Real`.
+        let mut reseed_real: Vec<(Ex, Ex)> = Vec::new();
+        for e in reset_real_list {
+            tick(1)?;
+            let mut candidates: Vec<Ex> = Vec::new();
+            if let Some(c) = self.ctx[e as usize].get() {
+                let st = c.st.lock();
+                for (_, srcs) in &st.back {
+                    candidates.extend(srcs.list.iter().copied());
+                }
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            for p in candidates {
+                if p == e {
+                    continue;
+                }
+                if let Some(pc) = self.ctx.get(p as usize).and_then(|c| c.get()) {
+                    let pst = pc.st.lock();
+                    if pst.init
+                        && pst.real
+                        && !pst.bottom
+                        && pst.subs.iter().any(|&s| {
+                            let h = ix.head(s);
+                            matches!(h.node, Node::Exist(..)) && h.succ == e
+                        })
+                    {
+                        reseed_real.push((e, p));
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.el_deps.universals = surviving_universals;
+        self.el_deps
+            .key_merges
+            .retain(|m| !affected.contains(&m.a) && !affected.contains(&m.b));
+
+        Ok(ElInvalidateOutcome::Done {
+            cleared,
+            kept_universal,
+            reseed_real,
+            kept_merged,
+            pre_dirty_keys,
+            modified_bits,
+        })
     }
 
     /// Clears the contexts that hold an expression whose rules `changed` says differ

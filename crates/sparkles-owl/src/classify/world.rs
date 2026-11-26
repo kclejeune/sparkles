@@ -25,8 +25,8 @@
 use super::data::Value;
 use super::index::{BOTTOM, Ex, Halt, Index, Node, Role};
 use super::saturate::{
-    CONCLUSION_BYTES, CONTEXT_BYTES, Concl, Contexts, Dynamic, Sink, State, apply, flatten, init,
-    init_conjunction,
+    CONCLUSION_BYTES, CONTEXT_BYTES, Concl, Contexts, Dynamic, REAL_ROOT, Sink, State, apply,
+    flatten, init, init_conjunction,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
@@ -84,6 +84,28 @@ impl View for GlobalAll<'_> {
     }
 }
 
+/// Maximum number of pre-broadcast grounded `(filler, witness_ctx)` supports kept per
+/// global universal fact for incremental EL invalidation (roadmap item 664).
+const MAX_UNIVERSAL_SUPPORTS: usize = 4;
+
+/// A global universal fact derived in Phase 2 together with pre-broadcast grounded
+/// `(filler, witness_ctx)` supports that held strictly before `fact` was injected.
+#[derive(Clone, Debug)]
+pub struct UniversalSupport {
+    pub fact: Ex,
+    pub supports: Vec<(Ex, Ex)>,
+}
+
+impl UniversalSupport {
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<UniversalSupport>().saturating_add(
+            self.supports
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(Ex, Ex)>()),
+        )
+    }
+}
+
 /// The facts of universal roles that `known` lacks and some real context now gives: a
 /// negative `∃u.F` on a universal role u holds everywhere once F has an instance.
 pub fn universal_facts(ix: &Index, view: &dyn View, known: &[Ex]) -> Vec<Ex> {
@@ -104,6 +126,46 @@ pub fn universal_facts(ix: &Index, view: &dyn View, known: &[Ex]) -> Vec<Ex> {
         });
     }
     out.sort_unstable();
+    out
+}
+
+/// Like [`universal_facts`], recording up to [`MAX_UNIVERSAL_SUPPORTS`] pre-broadcast
+/// `(filler, witness_ctx)` pairs per newly derived universal fact so incremental EL
+/// runs can verify whether the fact remains grounded without cycles.
+pub fn universal_facts_with_supports(
+    ix: &Index,
+    view: &dyn View,
+    known: &[Ex],
+) -> Vec<UniversalSupport> {
+    let mut out: Vec<UniversalSupport> = Vec::new();
+    if ix.universal.is_empty() {
+        return out;
+    }
+    for e in 0..view.len() as Ex {
+        view.with(e, &mut |st, real| {
+            if !real {
+                return;
+            }
+            for &(f, x) in &ix.universal {
+                if known.contains(&x) || !st.subs.contains(&f) {
+                    continue;
+                }
+                if let Some(entry) = out.iter_mut().find(|u| u.fact == x) {
+                    if entry.supports.len() < MAX_UNIVERSAL_SUPPORTS
+                        && !entry.supports.contains(&(f, e))
+                    {
+                        entry.supports.push((f, e));
+                    }
+                } else {
+                    out.push(UniversalSupport {
+                        fact: x,
+                        supports: vec![(f, e)],
+                    });
+                }
+            }
+        });
+    }
+    out.sort_unstable_by_key(|u| u.fact);
     out
 }
 
@@ -404,12 +466,367 @@ fn key_records(
     Ok(())
 }
 
+/// Exact causal dependency record for a pair `(a, b)` of named individuals merged by a
+/// key in global Phase 2 (roadmap item 664).
+#[derive(Clone, Debug)]
+pub struct KeyMergeDep {
+    pub key: super::index::Key,
+    pub a: Ex,
+    pub b: Ex,
+    /// Contexts that must stay kept and `still_real` (`a`, `b`, and every `src_a`/`src_b`).
+    pub real_deps: Vec<Ex>,
+    /// Contexts that must stay kept (every `t_a`/`t_b` object-property target context).
+    pub ctx_deps: Vec<Ex>,
+}
+
+impl KeyMergeDep {
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<KeyMergeDep>()
+            .saturating_add(
+                self.key
+                    .bytes()
+                    .saturating_sub(std::mem::size_of::<super::index::Key>()),
+            )
+            .saturating_add(
+                self.real_deps
+                    .capacity()
+                    .saturating_add(self.ctx_deps.capacity())
+                    .saturating_mul(std::mem::size_of::<Ex>()),
+            )
+    }
+}
+
+/// Whether `e` is a named individual or stands for one in `st`.
+pub fn has_named_alias(ix: &Index, e: Ex, st: &State) -> bool {
+    ix.named_nominal(e) || st.noms().iter().any(|&n| ix.named_nominal(n))
+}
+
+/// Whether context `e` (with state `st`) can contribute a member, source, object target,
+/// or data value to `key`.
+pub fn context_touches_key(ix: &Index, e: Ex, st: &State, key: &super::index::Key) -> bool {
+    if !has_named_alias(ix, e, st) {
+        return false;
+    }
+    if st.subs.contains(&key.class) {
+        return true;
+    }
+    for (role, _) in &st.back {
+        if key
+            .objects
+            .iter()
+            .any(|&op| !ix.is_universal(op) && ix.roles.sub(*role, op))
+        {
+            return true;
+        }
+    }
+    if !key.data.is_empty() {
+        let data_role = |r: Role| {
+            key.data
+                .iter()
+                .any(|&dp| !ix.is_universal(dp) && ix.roles.sub(r, dp))
+        };
+        for &sub in &st.subs {
+            if let Node::DataSome(role, _) = ix.head(sub).node
+                && data_role(role)
+            {
+                return true;
+            }
+        }
+        if let Some(extra) = &st.extra {
+            for group in &extra.groups {
+                if group.roles.iter().any(|&r| data_role(r)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Replays retained non-`FINE` datatype-checker evaluations from a reused conditional
+/// world into the new index's sticky vector so `excluded` matches a fresh run.
+pub fn replay_world_dt_sticky(ix: &Index, sticky_rows: &[(u32, u8)]) {
+    super::dt_sat::replay_sticky(ix, sticky_rows);
+}
+
 pub fn key_merges<'a>(
     ix: &Index,
     view: &dyn View,
     bound: &'a (dyn Fn(isize) -> bool + Sync),
 ) -> Result<KeyMerges<'a>, Halt> {
     key_merges_reported(ix, view, Reporter::Callback(bound))
+}
+
+/// Like [`key_merges`], also returning one grounded [`KeyMergeDep`] for each distinct
+/// merged pair `(a, b)` so incremental EL invalidation can follow key dependencies.
+pub fn key_merges_with_deps<'a>(
+    ix: &Index,
+    view: &dyn View,
+    bound: &'a (dyn Fn(isize) -> bool + Sync),
+) -> Result<(KeyMerges<'a>, Vec<KeyMergeDep>), Halt> {
+    let reporter = Reporter::Callback(bound);
+    let mut found = 0;
+    for key in &ix.keys {
+        key_matches(ix, view, key, 0, reporter, |_| key_add(&mut found, 1))?;
+    }
+    let mut pairs = KeyStorage::new(found, reporter)?;
+    let live = pairs._scratch.bytes;
+    let mut deps: Vec<KeyMergeDep> = Vec::new();
+    for key in &ix.keys {
+        key_matches_with_deps(ix, view, key, live, reporter, |dep| {
+            pairs.push((dep.a, dep.b))?;
+            deps.push(dep);
+            Ok(())
+        })?;
+    }
+    pairs.rows.sort_unstable();
+    pairs.rows.dedup();
+    deps.sort_unstable_by_key(|d| (d.a, d.b));
+    deps.dedup_by_key(|d| (d.a, d.b));
+    Ok((KeyMerges { pairs }, deps))
+}
+
+fn key_records_with_ctx(
+    ix: &Index,
+    view: &dyn View,
+    key: &super::index::Key,
+    sources: &[(Ex, Ex)],
+    bound: &(dyn Fn(isize) -> bool + Sync),
+    mut object: impl FnMut((Ex, Role, Ex, Ex, Ex)) -> Result<(), Halt>,
+    mut data: impl FnMut(Ex, Role, &Value, Ex) -> Result<(), Halt>,
+) -> Result<(), Halt> {
+    let object_role = |r| {
+        key.objects
+            .iter()
+            .any(|&p| !ix.is_universal(p) && ix.roles.sub(r, p))
+    };
+    let data_role = |r| {
+        key.data
+            .iter()
+            .any(|&p| !ix.is_universal(p) && ix.roles.sub(r, p))
+    };
+    for e in 0..view.len() as Ex {
+        key_poll(bound)?;
+        let mut status = Ok(());
+        view.with(e, &mut |st, real| {
+            status = (|| {
+                for (role, srcs) in &st.back {
+                    key_poll(bound)?;
+                    if !object_role(*role) {
+                        continue;
+                    }
+                    for src in &srcs.list {
+                        key_poll(bound)?;
+                        for &(_, individual) in source_aliases(sources, *src) {
+                            for target in key_aliases(ix, e, st) {
+                                key_poll(bound)?;
+                                object((individual, *role, target, *src, e))?;
+                            }
+                        }
+                    }
+                }
+                if !real {
+                    return Ok(());
+                }
+                for &(_, individual) in source_aliases(sources, e) {
+                    for &sub in &st.subs {
+                        key_poll(bound)?;
+                        let head = ix.head(sub);
+                        if let Node::DataSome(role, _) = head.node
+                            && data_role(role)
+                            && let Some(value) = ix.vals[head.succ as usize].single()
+                        {
+                            data(individual, role, value, e)?;
+                        }
+                    }
+                    if let Some(extra) = &st.extra {
+                        for group in &extra.groups {
+                            key_poll(bound)?;
+                            if let Some(value) = group.val.single() {
+                                for &role in &group.roles {
+                                    key_poll(bound)?;
+                                    if data_role(role) {
+                                        data(individual, role, value, e)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })();
+        });
+        status?;
+    }
+    Ok(())
+}
+
+fn key_matches_with_deps(
+    ix: &Index,
+    view: &dyn View,
+    key: &super::index::Key,
+    live: usize,
+    reporter: Reporter<'_>,
+    mut emit: impl FnMut(KeyMergeDep) -> Result<(), Halt>,
+) -> Result<(), Halt> {
+    let report = |delta| reporter.tell(delta);
+    let bound: &(dyn Fn(isize) -> bool + Sync) = match reporter {
+        Reporter::Callback(bound) => bound,
+        Reporter::NamedDomain(_) => &report,
+    };
+    let count = key_member_count(ix, view, key.class, bound)?;
+    if count < 2 {
+        return Ok(());
+    }
+    let mut members = KeyStorage::with_live(count, 0, live, reporter)?;
+    for &individual in &ix.nominals {
+        key_poll(bound)?;
+        if key_member(ix, view, individual, key.class) {
+            members.push(individual)?;
+        }
+    }
+    let mut count = 0;
+    key_sources(ix, view, &members.rows, bound, |_| key_add(&mut count, 1))?;
+    let mut sources = KeyStorage::with_live(
+        count,
+        0,
+        key_live(&[live, members._scratch.bytes])?,
+        reporter,
+    )?;
+    key_sources(ix, view, &members.rows, bound, |row| sources.push(row))?;
+    sources.rows.sort_unstable();
+    let (mut object_count, mut data_count, mut data_payload) = (0, 0, 0);
+    key_records_with_ctx(
+        ix,
+        view,
+        key,
+        &sources.rows,
+        bound,
+        |_| key_add(&mut object_count, 1),
+        |_, _, value, _| {
+            key_add(&mut data_count, 1)?;
+            key_add(&mut data_payload, key_value_copy_bytes(value)?)
+        },
+    )?;
+    let held = key_live(&[live, members._scratch.bytes, sources._scratch.bytes])?;
+    let mut objects = KeyStorage::with_live(object_count, 0, held, reporter)?;
+    let mut data = KeyStorage::with_live(
+        data_count,
+        data_payload,
+        key_live(&[held, objects._scratch.bytes])?,
+        reporter,
+    )?;
+    key_records_with_ctx(
+        ix,
+        view,
+        key,
+        &sources.rows,
+        bound,
+        |row| objects.push(row),
+        |individual, role, value, src| data.push((individual, role, value.clone(), src)),
+    )?;
+    objects.rows.sort_unstable_by_key(|row| row.0);
+    data.rows.sort_unstable_by_key(|row| row.0);
+    for (position, &a) in members.rows.iter().enumerate() {
+        let (a_objects, a_data) = (
+            owned(&objects.rows, a, |row| row.0),
+            owned(&data.rows, a, |row| row.0),
+        );
+        for &b in &members.rows[position + 1..] {
+            key_poll(bound)?;
+            let mut already_merged = false;
+            view.with(a, &mut |st, _| already_merged = st.subs.contains(&b));
+            if already_merged {
+                continue;
+            }
+            let (b_objects, b_data) = (
+                owned(&objects.rows, b, |row| row.0),
+                owned(&data.rows, b, |row| row.0),
+            );
+            let mut matches = true;
+            let mut real_deps = vec![a, b];
+            let mut ctx_deps: Vec<Ex> = Vec::new();
+            for &role in &key.objects {
+                key_poll(bound)?;
+                if ix.is_universal(role) {
+                    continue;
+                }
+                let mut found = None;
+                for &(_, r, target, src_a, t_a) in a_objects {
+                    key_poll(bound)?;
+                    if !ix.roles.sub(r, role) {
+                        continue;
+                    }
+                    for &(_, s, shared, src_b, t_b) in b_objects {
+                        key_poll(bound)?;
+                        if shared == target && ix.roles.sub(s, role) {
+                            found = Some((src_a, t_a, src_b, t_b));
+                            break;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                if let Some((src_a, t_a, src_b, t_b)) = found {
+                    real_deps.push(src_a);
+                    real_deps.push(src_b);
+                    ctx_deps.push(t_a);
+                    ctx_deps.push(t_b);
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+            if !matches {
+                continue;
+            }
+            for &role in &key.data {
+                key_poll(bound)?;
+                if ix.is_universal(role) {
+                    continue;
+                }
+                let mut found = None;
+                for (_, r, value, src_a) in a_data {
+                    key_poll(bound)?;
+                    if !ix.roles.sub(*r, role) {
+                        continue;
+                    }
+                    for (_, s, shared, src_b) in b_data {
+                        key_poll(bound)?;
+                        if shared == value && ix.roles.sub(*s, role) {
+                            found = Some((*src_a, *src_b));
+                            break;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                if let Some((src_a, src_b)) = found {
+                    real_deps.push(src_a);
+                    real_deps.push(src_b);
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                real_deps.sort_unstable();
+                real_deps.dedup();
+                ctx_deps.sort_unstable();
+                ctx_deps.dedup();
+                emit(KeyMergeDep {
+                    key: key.clone(),
+                    a,
+                    b,
+                    real_deps,
+                    ctx_deps,
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn key_merges_reported<'a>(
@@ -1002,7 +1419,7 @@ impl Sink for WorldSink<'_> {
         if self.halted.get() {
             return;
         }
-        if to == self.me && c != Concl::Real {
+        if to == self.me && !matches!(c, Concl::Real(_)) {
             self.local.push(c);
         } else {
             self.out.push((to, c));
@@ -1148,10 +1565,67 @@ impl View for World<'_> {
     }
 }
 
-/// What a world found of its class: whether it is unsatisfiable, and its subsumers.
+/// Incremental dependency record for a cached conditional world (roadmap item 664).
+#[derive(Clone, Debug, Default)]
+pub struct WorldDep {
+    /// Sorted global contexts that this world read or copied.
+    pub used_contexts: Vec<Ex>,
+    /// Sorted subsumers derived or held in the world's copied slots, checked against
+    /// `changed` on the next run.
+    pub used_exprs: Vec<Ex>,
+    /// Keys in the index that interacted with any slot of this world.
+    pub watched_keys: Vec<super::index::Key>,
+    /// Whether any slot of this world had a named individual alias (so an added key
+    /// could potentially fire in this world).
+    pub touched_named: bool,
+    /// Whether this world derived any world-local universal fact.
+    pub had_world_universal: bool,
+    /// Sorted datatype-checker component ids evaluated in the world's copied slots.
+    pub dt_comps: Vec<u32>,
+    /// Non-`FINE` `(component, status)` pairs to replay into `ix.dt.sticky` when reused.
+    pub dt_sticky: Vec<(u32, u8)>,
+}
+
+impl WorldDep {
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<WorldDep>()
+            .saturating_add(
+                self.used_contexts
+                    .capacity()
+                    .saturating_add(self.used_exprs.capacity())
+                    .saturating_mul(std::mem::size_of::<Ex>()),
+            )
+            .saturating_add(
+                self.watched_keys
+                    .iter()
+                    .map(super::index::Key::bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.watched_keys
+                    .capacity()
+                    .saturating_sub(self.watched_keys.len())
+                    .saturating_mul(std::mem::size_of::<super::index::Key>()),
+            )
+            .saturating_add(
+                self.dt_comps
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.dt_sticky
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u32, u8)>()),
+            )
+    }
+}
+
+/// What a world found of its class: whether it is unsatisfiable, its subsumers, and
+/// optionally its incremental dependency record.
 pub struct Found {
     pub bottom: bool,
     pub subs: Vec<Ex>,
+    pub dep: Option<WorldDep>,
 }
 
 impl<'a> World<'a> {
@@ -1322,7 +1796,7 @@ impl<'a> World<'a> {
                 self.insert_slot(to, real);
             }
         }
-        if c == Concl::Real {
+        if matches!(c, Concl::Real(_)) {
             self.make_real(to);
             return;
         }
@@ -1353,7 +1827,7 @@ impl<'a> World<'a> {
         }
         slot.real = true;
         if slot.st.is_some() {
-            slot.todo.push(Concl::Real);
+            slot.todo.push(Concl::Real(REAL_ROOT));
             self.waiting += 1;
         } else {
             let ix = self.ix;
@@ -1368,7 +1842,7 @@ impl<'a> World<'a> {
                 init = true;
                 for &s in &st.subs {
                     if let Node::Exist(..) = ix.head(s).node {
-                        out.push((ix.head(s).succ, Concl::Real));
+                        out.push((ix.head(s).succ, Concl::Real(REAL_ROOT)));
                         if horn {
                             out.push((ix.head(s).succ, Concl::RealBack(e)));
                         }
@@ -1381,7 +1855,7 @@ impl<'a> World<'a> {
                     && horn
                 {
                     for &(_, n) in &x.horn.succ.list {
-                        out.push((n, Concl::Real));
+                        out.push((n, Concl::Real(REAL_ROOT)));
                         out.push((n, Concl::RealBack(e)));
                     }
                     for &n in &x.noms {
@@ -1404,7 +1878,7 @@ impl<'a> World<'a> {
             });
             if !init {
                 // a context that the global saturation never reached
-                slot.todo.push(Concl::Real);
+                slot.todo.push(Concl::Real(REAL_ROOT));
                 self.waiting += 1;
             }
             self.pending.extend(out);
@@ -1633,8 +2107,15 @@ impl<'a> World<'a> {
     /// Classifies `class` in its world: the class has an instance, and the world
     /// saturates what follows, with the facts of universal roles and the merges of keys
     /// that hold there.
-    pub fn classify(mut self, class: Ex) -> Result<Found, Halt> {
-        self.pending.push((class, Concl::Real));
+    #[cfg(test)]
+    pub fn classify(self, class: Ex) -> Result<Found, Halt> {
+        self.classify_with_dep(class, false)
+    }
+
+    /// Like [`World::classify`], optionally capturing a [`WorldDep`] dependency record
+    /// for incremental EL world reuse (roadmap item 664).
+    pub fn classify_with_dep(mut self, class: Ex, record_dep: bool) -> Result<Found, Halt> {
+        self.pending.push((class, Concl::Real(REAL_ROOT)));
         loop {
             self.drain();
             self.checkpoint(0);
@@ -1679,6 +2160,7 @@ impl<'a> World<'a> {
         let mut found = Found {
             bottom: clash,
             subs: Vec::new(),
+            dep: None,
         };
         self.with(class, &mut |st, _| {
             found.bottom |= st.bottom;
@@ -1686,6 +2168,9 @@ impl<'a> World<'a> {
         });
         if !found.bottom {
             super::dt_sat::world(self.ix, self.slots.values().filter_map(|s| s.st.as_ref()));
+        }
+        if record_dep {
+            found.dep = Some(self.build_dep(class, found.bottom));
         }
         #[cfg(test)]
         if let Some(rules) = &self.ix.top_chain {
@@ -1706,6 +2191,78 @@ impl<'a> World<'a> {
         }
         // the world's copies go when it does
         Ok(found)
+    }
+
+    fn build_dep(&self, class: Ex, bottom: bool) -> WorldDep {
+        let mut used_contexts: Vec<Ex> = Vec::with_capacity(self.slots.len().max(1));
+        let mut used_exprs: Vec<Ex> = Vec::new();
+        let mut watched_keys: Vec<super::index::Key> = Vec::new();
+        let mut touched_named = false;
+        let mut dt_comps: Vec<u32> = Vec::new();
+        let mut dt_sticky: Vec<(u32, u8)> = Vec::new();
+        let has_dt = self.ix.dt.is_some();
+        let global = self.global();
+        for (&e, slot) in &self.slots {
+            if (e as usize) < self.ctx.len() {
+                used_contexts.push(e);
+            }
+            if let Some(st) = slot.st.as_ref() {
+                used_exprs.extend(st.subs.iter().copied());
+                if has_named_alias(self.ix, e, st) {
+                    touched_named = true;
+                    for key in &self.ix.keys {
+                        if context_touches_key(self.ix, e, st, key) && !watched_keys.contains(key) {
+                            watched_keys.push(key.clone());
+                        }
+                    }
+                }
+                if has_dt && let Some(x) = st.extra.as_ref() {
+                    for s in &x.dt {
+                        dt_comps.push(s.comp);
+                        if !bottom && !st.bottom && s.last != super::dt_sat::FINE {
+                            if let Some(existing) = dt_sticky.iter_mut().find(|(c, _)| *c == s.comp)
+                            {
+                                existing.1 = existing.1.max(s.last);
+                            } else {
+                                dt_sticky.push((s.comp, s.last));
+                            }
+                        }
+                    }
+                }
+            } else if slot.real {
+                global.with(e, &mut |st, _| {
+                    if has_named_alias(self.ix, e, st) {
+                        touched_named = true;
+                        for key in &self.ix.keys {
+                            if context_touches_key(self.ix, e, st, key)
+                                && !watched_keys.contains(key)
+                            {
+                                watched_keys.push(key.clone());
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        if (class as usize) < self.ctx.len() && !used_contexts.contains(&class) {
+            used_contexts.push(class);
+        }
+        used_contexts.sort_unstable();
+        used_contexts.dedup();
+        used_exprs.sort_unstable();
+        used_exprs.dedup();
+        dt_comps.sort_unstable();
+        dt_comps.dedup();
+        dt_sticky.sort_unstable_by_key(|&(c, _)| c);
+        WorldDep {
+            used_contexts,
+            used_exprs,
+            watched_keys,
+            touched_named,
+            had_world_universal: !self.universal.is_empty(),
+            dt_comps,
+            dt_sticky,
+        }
     }
 }
 

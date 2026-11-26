@@ -33,8 +33,28 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::time::{Duration, Instant};
+
+/// Sender tag on [`Concl::Real`] when a context is a real root (`owl:Thing`, an
+/// individual, or a conditional world root) rather than reached from another context.
+pub const REAL_ROOT: Ex = Ex::MAX;
+/// Sentinel in the EL real-parent forest for a context that is not real.
+pub const REAL_NONE: Ex = Ex::MAX - 1;
+
+/// Lock-free incremental EL dependency trackers passed into [`saturate_counted_tracked`].
+#[derive(Clone, Copy)]
+pub struct ElTrack<'a> {
+    /// For each context `e`, the first parent context that sent [`Concl::Real`] to `e`
+    /// (or [`REAL_ROOT`]).
+    pub real_parent: Option<&'a [AtomicU32]>,
+    /// Atomic bitset marking every context that was initialized or stored a conclusion.
+    pub modified: Option<&'a [AtomicU64]>,
+    /// Set to `true` whenever any context transitions `real: false -> true`.
+    pub any_newly_real: Option<&'a AtomicBool>,
+}
 
 /// A conclusion waiting in a context's to-do list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -53,8 +73,9 @@ pub enum Concl {
     Loop(Role),
     /// the source context's instance is this context's individual
     Nom(Ex),
-    /// the context has an instance in every model
-    Real,
+    /// the context has an instance in every model, sent by the given context or
+    /// [`REAL_ROOT`]
+    Real(Ex),
     /// an instance of this context has the individual as an `r`-successor
     LinkTo(Role, Ex),
     /// Tier H: the context, a successor of this one, holds the at-most filler
@@ -488,7 +509,7 @@ impl State {
             Concl::Fwd(r, f) => self.fwd.contains(&(r, f)),
             Concl::Loop(r) => self.loops.contains(&r),
             Concl::Nom(k) => self.extra.as_ref().is_some_and(|x| x.members.contains(&k)),
-            Concl::Real => self.real,
+            Concl::Real(_) => self.real,
             Concl::LinkTo(r, n) => self
                 .extra
                 .as_ref()
@@ -608,6 +629,7 @@ impl State {
     ) -> Result<(), E> {
         self.drop_links_where_poll(&gone, tick)?;
         if let Some(x) = self.extra.as_mut() {
+            x.members.retain_poll(|&m| !gone(m), tick)?;
             let h = &mut x.horn;
             h.pred_in.retain_poll(|&(m, _)| !gone(m), tick)?;
             h.told.retain_poll(|&(m, _)| !gone(m), tick)?;
@@ -1091,6 +1113,7 @@ struct Run<'a> {
     steps: bool,
     dynamic: Option<&'a Dynamic>,
     bounds: &'a Bounds<'a>,
+    track: Option<ElTrack<'a>>,
     /// where the run records its start of the helpers, [`STARTED_NS`] outside tests
     started: &'static AtomicU64,
     #[cfg(test)]
@@ -1852,6 +1875,19 @@ pub fn saturate_counted(
     universal: &[Ex],
     bounds: &Bounds<'_>,
 ) -> (Totals, Option<Stop>) {
+    saturate_counted_tracked(ix, ctx, roots, seeds, universal, bounds, None)
+}
+
+/// [`saturate_counted`], with optional incremental EL dependency tracking hooks.
+pub fn saturate_counted_tracked(
+    ix: &Index,
+    ctx: &Contexts,
+    roots: &[Ex],
+    seeds: &[Ex],
+    universal: &[Ex],
+    bounds: &Bounds<'_>,
+    track: Option<ElTrack<'_>>,
+) -> (Totals, Option<Stop>) {
     let initial_batch = bounds.threads > 1;
     #[cfg(test)]
     let initial_batch = initial_batch || horn_accounting_tests::MIXED_OUTBOX.get();
@@ -1895,6 +1931,7 @@ pub fn saturate_counted(
         steps: bounds.steps && ix.dl.is_some() && bounds.dl.is_some(),
         dynamic: bounds.dynamic,
         bounds,
+        track,
         #[cfg(not(test))]
         started: &STARTED_NS,
         #[cfg(test)]
@@ -2349,6 +2386,8 @@ pub trait Sink {
     fn me(&mut self, c: Concl);
     /// the context the rules run in derived an individual other than its root
     fn merged(&mut self) {}
+    /// the context `me` transitioned `real: false -> true` due to `from` (or [`REAL_ROOT`])
+    fn became_real(&mut self, _me: Ex, _from: Ex) {}
     /// the conjunction a context stands for, as the sorted expressions that are not
     /// intersections, which the Horn rules read
     fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
@@ -2749,6 +2788,19 @@ impl Sink for Out<'_, '_> {
     fn merged(&mut self) {
         if !self.run.merged.load(Ordering::Relaxed) {
             self.run.merged.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn became_real(&mut self, me: Ex, from: Ex) {
+        if let Some(track) = &self.run.track {
+            if let Some(rp) = track.real_parent
+                && let Some(slot) = rp.get(me as usize)
+            {
+                slot.store(from, Ordering::Relaxed);
+            }
+            if let Some(flag) = track.any_newly_real {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -4659,7 +4711,9 @@ impl<'a> Run<'a> {
             already_panicking: std::thread::panicking(),
         };
         let mut skip = false;
+        let mut ctx_changed = false;
         if !st.init {
+            ctx_changed = true;
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
             if R::DISJ && me as usize >= self.ctx.len() {
                 let core = self.dynamic.expect("a run with Tier D").core(me);
@@ -4686,7 +4740,7 @@ impl<'a> Run<'a> {
                     && self.ix.has_individuals()
                     && (me == TOP || matches!(self.ix.head(me).node, Node::Nominal(_)))
                 {
-                    out.me(Concl::Real);
+                    out.me(Concl::Real(REAL_ROOT));
                 }
             }
             if !skip {
@@ -4735,8 +4789,11 @@ impl<'a> Run<'a> {
                     let prepaid = debit.is_some();
                     let stored =
                         apply_rules_owned::<_, R>(self.ix, me, &mut st, c, &mut out, debit);
-                    if stored && !prepaid {
-                        tally.stored += 1;
+                    if stored {
+                        ctx_changed = true;
+                        if !prepaid {
+                            tally.stored += 1;
+                        }
                     }
                     tally.applied += 1;
                     if top_chain && self.stopped() {
@@ -4892,6 +4949,13 @@ impl<'a> Run<'a> {
             t.append(out.local);
             // Any remaining top-chain tags and queued items now belong to `ctx.todo`.
             taken.active_run = None;
+        }
+        if ctx_changed
+            && let Some(track) = &self.track
+            && let Some(bits) = track.modified
+            && let Some(word) = bits.get((me as usize) >> 6)
+        {
+            word.fetch_or(1u64 << (me & 63), Ordering::Relaxed);
         }
         // the activation charges what it kept as it ends
         let wake_split = out.wake_split;
@@ -5107,7 +5171,7 @@ fn apply_rules_owned<S: Sink, R: Rules>(
                         out.me(Concl::Fwd(r, succ));
                     }
                     if R::FULL && st.real {
-                        out.send(succ, Concl::Real);
+                        out.send(succ, Concl::Real(me));
                         if R::HORN {
                             out.send(succ, Concl::RealBack(me));
                         }
@@ -5296,9 +5360,9 @@ fn apply_rules_owned<S: Sink, R: Rules>(
             true
         }
         Concl::Nom(k) if R::FULL => apply_nom(ix, me, st, k, out),
-        Concl::Real if R::FULL => apply_real(ix, me, st, out),
+        Concl::Real(from) if R::FULL => apply_real(ix, me, st, from, out),
         Concl::LinkTo(r, n) if R::FULL => apply_link_to(me, st, r, n, out),
-        Concl::Nom(_) | Concl::Real | Concl::LinkTo(..) => {
+        Concl::Nom(_) | Concl::Real(_) | Concl::LinkTo(..) => {
             unreachable!("a conclusion of individuals in a saturation without them")
         }
         Concl::SuccIn(n, b) if R::HORN => horn_rules::succ_in(ix, me, st, n, b, out),
@@ -5383,11 +5447,12 @@ fn apply_nom<S: Sink>(ix: &Index, me: Ex, st: &mut State, k: Ex, out: &mut S) ->
 /// knows.
 #[cold]
 #[inline(never)]
-fn apply_real<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool {
+fn apply_real<S: Sink>(ix: &Index, me: Ex, st: &mut State, from: Ex, out: &mut S) -> bool {
     if st.real {
         return false;
     }
     st.real = true;
+    out.became_real(me, from);
     if st.bottom {
         if let Some(x) = &st.extra {
             for &n in &x.noms {
@@ -5398,13 +5463,13 @@ fn apply_real<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool 
     }
     for &s in &st.subs {
         if let Node::Exist(..) = ix.head(s).node {
-            out.send(ix.head(s).succ, Concl::Real);
+            out.send(ix.head(s).succ, Concl::Real(me));
         }
     }
     if let Some(x) = &st.extra {
         // the successors the Horn rules made (roadmap item 692)
         for &(_, n) in &x.horn.succ.list {
-            out.send(n, Concl::Real);
+            out.send(n, Concl::Real(me));
         }
         for &n in &x.noms {
             for &s in &st.subs {
@@ -5656,6 +5721,7 @@ pub(super) fn test_concurrent_commit_dl_no_double_count() -> (bool, usize, usize
         steps: false,
         dynamic: None,
         bounds: &bounds,
+        track: None,
         started: &STARTED_NS,
         always_congested: false,
         helper_ran: AtomicBool::new(false),
@@ -6444,6 +6510,7 @@ mod horn_accounting_tests {
             steps: false,
             dynamic: None,
             bounds,
+            track: None,
             started: &STARTED_NS,
             always_congested: false,
             helper_ran: AtomicBool::new(false),
@@ -9979,8 +10046,8 @@ mod horn_delivery_tests {
              ClassAssertion(:M :a)",
         );
         let (m, n, r) = (f.class("M"), f.class("N"), f.role("r"));
-        let real_first = [Concl::Real, Concl::Succ(r, n)];
-        let succ_first = [Concl::Succ(r, n), Concl::Real];
+        let real_first = [Concl::Real(REAL_ROOT), Concl::Succ(r, n)];
+        let succ_first = [Concl::Succ(r, n), Concl::Real(REAL_ROOT)];
         for (name, seq) in [
             ("real first", &real_first),
             ("successor first", &succ_first),
@@ -9988,7 +10055,7 @@ mod horn_delivery_tests {
             let outs = deliver(&f, m, seq);
             assert_eq!(sent_to(&outs, n, Concl::Back(m, r)), 1, "{name}: the link");
             assert_eq!(
-                sent_to(&outs, n, Concl::Real),
+                sent_to(&outs, n, Concl::Real(m)),
                 1,
                 "{name}: the successor is real"
             );
