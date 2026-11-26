@@ -555,6 +555,10 @@ export class Dataset extends Queryable {
   get validation() {
     return this.administration.validation;
   }
+  /** Evidence settings, holds, reference resolution, proposals, reviews and withdrawals (spec C25). */
+  get evidence() {
+    return this.administration.evidence;
+  }
   private async admin<T>(
     op: string,
     args: Configuration = {},

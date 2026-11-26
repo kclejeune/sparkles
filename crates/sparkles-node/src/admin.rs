@@ -117,7 +117,7 @@ fn decode<T: serde::de::DeserializeOwned>(v: &Value) -> sparkles::Result<T> {
 fn meta(v: Value, key: &str) -> Value {
     if matches!(
         key,
-        "definition" | "config" | "variables" | "data" | "default"
+        "definition" | "config" | "variables" | "data" | "default" | "settings"
     ) {
         return v;
     }
@@ -157,6 +157,7 @@ fn u64_field(k: &str) -> bool {
             | "added"
             | "removed"
             | "commit"
+            | "servedBy"
             | "firstCommit"
             | "classifiedCommit"
             | "producerCommit"
@@ -373,6 +374,11 @@ fn writes(op: &str) -> bool {
             | "ontology.classify"
             | "ontology.parse"
             | "ontology.dlQuery"
+            | "evidence.settings"
+            | "evidence.holds"
+            | "evidence.resolve"
+            | "evidence.resolveEntities"
+            | "evidence.findDependents"
     )
 }
 #[napi]
@@ -1485,6 +1491,79 @@ fn run_admin(
             Value::Null
         }
         "backup" => value(ds.backup(text(a, "path")?)?.display().to_string())?,
+        "evidence.settings" => sparkles::evidence::binding::settings(ds)?,
+        "evidence.configure" => {
+            let bytes = if let Some(raw) = a["raw"].as_str() {
+                raw.as_bytes().to_vec()
+            } else {
+                serde_json::to_vec(&a["settings"])
+                    .map_err(|e| EngineError::invalid(e.to_string()))?
+            };
+            sparkles::evidence::binding::configure(ds, &bytes, ctl)?
+        }
+        "evidence.detach" => sparkles::evidence::binding::detach(ds, text(a, "graph")?)?,
+        "evidence.holds" => sparkles::evidence::binding::holds(
+            ds,
+            a["onBranch"].as_str(),
+            a["after"].as_str(),
+            optional_number(a, "limit")?
+                .map(|n| usize::try_from(n).map_err(|_| EngineError::invalid("limit is too large")))
+                .transpose()?,
+        )?,
+        "evidence.acquireHold" => sparkles::evidence::binding::acquire_hold(ds, a)?,
+        "evidence.releaseHold" => {
+            Value::Bool(sparkles::evidence::binding::release_hold(ds, text(a, "id")?)?)
+        }
+        "evidence.resolve" => sparkles::evidence::binding::resolve(
+            ds,
+            a["branch"].as_str(),
+            &a["request"],
+            ctl,
+        )?,
+        "evidence.propose" => sparkles::evidence::binding::propose(
+            ds,
+            a["branch"].as_str(),
+            a["principal"].as_str(),
+            a["author"].as_str(),
+            &a["request"],
+            ctl,
+        )?,
+        "evidence.review" => sparkles::evidence::binding::review(
+            ds,
+            a["branch"].as_str(),
+            a["principal"].as_str(),
+            a["author"].as_str(),
+            &a["request"],
+            ctl,
+        )?,
+        "evidence.withdraw" => sparkles::evidence::binding::withdraw(
+            ds,
+            a["branch"].as_str(),
+            a["principal"].as_str(),
+            a["author"].as_str(),
+            &a["request"],
+            ctl,
+        )?,
+        "evidence.resolveEntities" => {
+            let entities: Vec<String> = decode(&a["entities"])?;
+            sparkles::evidence::binding::resolve_entities(
+                ds,
+                a["branch"].as_str(),
+                text(a, "policy")?,
+                &entities,
+                ctl,
+            )?
+        }
+        "evidence.findDependents" => {
+            let changed: Vec<String> = decode(&a["changed"])?;
+            sparkles::evidence::binding::find_dependents(
+                ds,
+                a["branch"].as_str(),
+                &changed,
+                a["transitive"].as_bool().unwrap_or(false),
+                ctl,
+            )?
+        }
         _ => {
             return Err(EngineError::unsupported(format!(
                 "unknown or disabled administration operation {op}"

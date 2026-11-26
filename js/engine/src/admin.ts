@@ -800,6 +800,175 @@ export interface DlQueryAnswer extends OntologyState {
   directSubclasses?: string[];
   instances?: string[];
 }
+/** Evidence settings status and currently protected or detached role graphs (spec C25). */
+export interface EvidenceSettingsStatus {
+  settings: Configuration;
+  digest: string | null;
+  revision: number;
+  managed: string[];
+  detached: string[];
+}
+/** One commit named by a durable evidence source hold. */
+export interface EvidenceHoldCommit {
+  branch: string | null;
+  branchId: string;
+  commit: bigint;
+}
+/** A durable evidence source hold. */
+export interface EvidenceHold {
+  id: string;
+  owner: string;
+  created: string;
+  commits: EvidenceHoldCommit[];
+}
+/** A page of evidence source holds. */
+export interface EvidenceHoldsPage {
+  holds: EvidenceHold[];
+  next: string | null;
+  heldCommits: number;
+  maxCommits: number;
+}
+/** The result of acquiring a durable evidence source hold. */
+export interface EvidenceHoldAcquired {
+  created: boolean;
+  hold: EvidenceHold;
+}
+/** Common options for evidence operations targeting a branch and principal. */
+export type EvidenceWriteOptions = OperationOptions & {
+  branch?: string;
+  principal?: string;
+  author?: string;
+};
+/** Options for read-only evidence operations targeting an optional branch. */
+export type EvidenceReadOptions = OperationOptions & {
+  branch?: string;
+};
+/** Dry-run preview summary of an evidence write operation. */
+export interface EvidenceDryRun {
+  wouldCommit: boolean;
+  inserted: bigint;
+  deleted: bigint;
+  error: string | null;
+}
+/** One record created or matched by an evidence proposal. */
+export interface EvidenceProposedRecord {
+  key: string;
+  kind: string;
+  iri: string;
+  graph: string;
+  recordDigest: string;
+  existing: boolean;
+}
+/** Outcome of proposing claims and evidence records. */
+export interface EvidenceProposeResult {
+  operation: string;
+  committed: boolean;
+  replayed: boolean;
+  commit: bigint;
+  branchId: string;
+  firstAvailableAt: string | null;
+  hold: string | null;
+  records: EvidenceProposedRecord[];
+  dryRun?: EvidenceDryRun;
+}
+/** A triple added to or removed from an evidence projection graph. */
+export interface EvidenceProjectionChange {
+  output: string;
+  triple: string;
+}
+/** A new revision of a matching policy's resolution map. */
+export interface EvidenceMapChange {
+  policy: string;
+  revision: string;
+  number: number;
+  previous: string | null;
+  decisionsAdded: string[];
+  decisionsEnded: string[];
+  entities: string[];
+}
+/** Supports, projected triples and map revisions changed by a review or withdrawal. */
+export interface EvidenceChanged {
+  supportsAdded: string[];
+  supportsEnded: string[];
+  inserted: EvidenceProjectionChange[];
+  removed: EvidenceProjectionChange[];
+  map?: EvidenceMapChange;
+}
+/** One recorded review decision. */
+export interface EvidenceDecisionResult {
+  key: string;
+  iri: string;
+  target: string;
+  disposition: string;
+  supersedes: string | null;
+  support: string | null;
+  notProjected: string | null;
+  conflicts: string[];
+}
+/** Outcome of reviewing claims or identity proposals under a policy. */
+export interface EvidenceReviewResult {
+  operation: string;
+  committed: boolean;
+  replayed: boolean;
+  commit: bigint;
+  branchId: string;
+  decisions: EvidenceDecisionResult[];
+  changed: EvidenceChanged;
+  mapRevision: string | null;
+  dryRun?: EvidenceDryRun;
+}
+/** One recorded claim withdrawal. */
+export interface EvidenceWithdrawalResult {
+  key: string;
+  iri: string | null;
+  target: string;
+  existing: boolean;
+}
+/** Outcome of withdrawing claim occurrences. */
+export interface EvidenceWithdrawResult {
+  operation: string;
+  committed: boolean;
+  replayed: boolean;
+  commit: bigint;
+  branchId: string;
+  withdrawals: EvidenceWithdrawalResult[];
+  changed: EvidenceChanged;
+  dryRun?: EvidenceDryRun;
+}
+/** Outcome of resolving stored-fact and record references. */
+export interface EvidenceResolveResult {
+  resolved: Configuration[];
+}
+/** Resolution of one entity through a matching policy's resolution map. */
+export interface EvidenceResolvedEntity {
+  entity: string;
+  representative: string;
+  members: string[];
+  membersComplete: boolean;
+  decisions: string[];
+}
+/** Outcome of resolving entities under a matching policy. */
+export interface EvidenceEntitiesResult {
+  policy: string;
+  revision: string | null;
+  number: number;
+  commit: bigint;
+  entities: EvidenceResolvedEntity[];
+}
+/** One authenticated assessment depending on a changed record. */
+export interface EvidenceDependent {
+  assessment: string;
+  graph: string;
+  on: string;
+  dependence: 'target' | 'used';
+  depth: number;
+}
+/** Outcome of finding dependent assessments. */
+export interface EvidenceDependentsResult {
+  commit: bigint;
+  dependents: EvidenceDependent[];
+}
+
 export class Administration {
   readonly snapshots;
   readonly history;
@@ -814,6 +983,7 @@ export class Administration {
   readonly indexes;
   readonly reasoning;
   readonly validation;
+  readonly evidence;
   constructor(
     private call: AdminCall,
     getBranch: (name: string) => Promise<Dataset>,
@@ -1748,6 +1918,109 @@ export class Administration {
         reset: (o?: UpdateOptions) => call<void>('validation.guard.reset', {}, o, true),
       },
     };
+    const evidenceOpts = (o?: OperationOptions): OperationOptions | undefined =>
+      o ? { signal: o.signal, timeout: o.timeout } : undefined;
+    this.evidence = {
+      settings: (o?: OperationOptions) =>
+        call<EvidenceSettingsStatus>('evidence.settings', {}, evidenceOpts(o), false),
+      configure: (settings: Configuration | string, o?: OperationOptions) =>
+        call<EvidenceSettingsStatus>(
+          'evidence.configure',
+          typeof settings === 'string' ? { raw: settings } : { settings },
+          evidenceOpts(o),
+          true,
+        ),
+      detach: (graph: string, o?: OperationOptions) =>
+        call<EvidenceSettingsStatus>('evidence.detach', { graph }, evidenceOpts(o), true),
+      holds: (
+        options: OperationOptions & { onBranch?: string; after?: string; limit?: number } = {},
+      ) =>
+        call<EvidenceHoldsPage>(
+          'evidence.holds',
+          { onBranch: options.onBranch, after: options.after, limit: options.limit },
+          evidenceOpts(options),
+          false,
+        ),
+      acquireHold: (
+        commits: { commit: number | bigint; branch?: string; branchId?: string }[],
+        options: OperationOptions & { id?: string } = {},
+      ) =>
+        call<EvidenceHoldAcquired>(
+          'evidence.acquireHold',
+          { ...(options.id !== undefined ? { id: options.id } : {}), commits },
+          evidenceOpts(options),
+          true,
+        ),
+      releaseHold: (id: string, o?: OperationOptions) =>
+        call<boolean>('evidence.releaseHold', { id }, evidenceOpts(o), true),
+      resolve: (references: Configuration[] | Configuration, options: EvidenceReadOptions = {}) =>
+        call<EvidenceResolveResult>(
+          'evidence.resolve',
+          {
+            branch: options.branch,
+            request: Array.isArray(references) ? { references } : references,
+          },
+          evidenceOpts(options),
+          false,
+        ),
+      propose: (proposal: Configuration, options: EvidenceWriteOptions = {}) =>
+        call<EvidenceProposeResult>(
+          'evidence.propose',
+          {
+            branch: options.branch,
+            principal: options.principal,
+            author: options.author,
+            request: proposal,
+          },
+          evidenceOpts(options),
+          true,
+        ),
+      review: (review: Configuration, options: EvidenceWriteOptions = {}) =>
+        call<EvidenceReviewResult>(
+          'evidence.review',
+          {
+            branch: options.branch,
+            principal: options.principal,
+            author: options.author,
+            request: review,
+          },
+          evidenceOpts(options),
+          true,
+        ),
+      withdraw: (withdrawal: Configuration, options: EvidenceWriteOptions = {}) =>
+        call<EvidenceWithdrawResult>(
+          'evidence.withdraw',
+          {
+            branch: options.branch,
+            principal: options.principal,
+            author: options.author,
+            request: withdrawal,
+          },
+          evidenceOpts(options),
+          true,
+        ),
+      resolveEntities: (policy: string, entities: string[], options: EvidenceReadOptions = {}) =>
+        call<EvidenceEntitiesResult>(
+          'evidence.resolveEntities',
+          { branch: options.branch, policy, entities },
+          evidenceOpts(options),
+          false,
+        ),
+      findDependents: (
+        changed: string[],
+        options: EvidenceReadOptions & { transitive?: boolean } = {},
+      ) =>
+        call<EvidenceDependentsResult>(
+          'evidence.findDependents',
+          {
+            branch: options.branch,
+            changed,
+            transitive: options.transitive ?? false,
+          },
+          evidenceOpts(options),
+          false,
+        ),
+    };
   }
 }
 // Native numeric strings avoid lossy JSON parsing. Convert only numeric schema fields,
@@ -1765,6 +2038,7 @@ const counts = new Set([
   'added',
   'removed',
   'commit',
+  'servedBy',
   'firstCommit',
   'classifiedCommit',
   'producerCommit',
@@ -1810,7 +2084,7 @@ const numbers = new Set([
   'ifVersion',
 ]);
 export function adminResult(v: any, key = ''): any {
-  if (['definition', 'config', 'variables', 'data', 'default'].includes(key)) return v;
+  if (['definition', 'config', 'variables', 'data', 'default', 'settings'].includes(key)) return v;
   if (typeof v === 'string' && /^\d+$/.test(v)) {
     if (counts.has(key)) return BigInt(v);
     if (numbers.has(key)) return Number(v);
