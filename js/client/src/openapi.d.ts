@@ -20162,6 +20162,8 @@ export interface operations {
                 limit?: number;
                 /** @description Comma-separated preferred label languages, otherwise Accept-Language. */
                 lang?: string;
+                /** @description Read the kept EL-only classification instead of the default classification (false by default). */
+                elOnly?: boolean;
                 /** @description The read deadline in milliseconds. */
                 timeout?: number;
             };
@@ -20229,6 +20231,8 @@ export interface operations {
                 threads?: number;
                 /** @description `json` (the default) or `ofn`. */
                 format?: "json" | "ofn";
+                /** @description Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. Refused if repeated, malformed, or also set in the JSON body. */
+                elOnly?: boolean;
             };
             header?: {
                 /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
@@ -20250,6 +20254,8 @@ export interface operations {
                     about?: string;
                     /** @description Also classify the assertions the store holds, so that they can make the ontology inconsistent. Such a run is not kept. */
                     assertions?: boolean;
+                    /** @description Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. The dataset keeps EL-only classifications separately from default runs. */
+                    elOnly?: boolean;
                     /**
                      * @description The expansion strategy of the disjunctive rules, `cautious` by default. Both give the same answer.
                      * @enum {string}
@@ -20381,6 +20387,8 @@ export interface operations {
             content: {
                 "application/json": {
                     answers?: ("equivalents" | "superclasses" | "directSuperclasses" | "subclasses" | "directSubclasses" | "instances")[];
+                    /** @description Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL and using the dataset's EL-only kept saturation. Refused with `reasoning: "rl"` or an expression outside OWL 2 EL. */
+                    elOnly?: boolean;
                     /** @description The class expression: Manchester or functional-style text, or the JSON form. */
                     expression: unknown;
                     /** @description A graph IRI or `default`, or a list of them. */

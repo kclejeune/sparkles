@@ -803,6 +803,7 @@ fn ontology(p: &mut Paths) {
             .query("offset", json!({"type":"integer","minimum":0}), "The first row, zero by default. Nonzero offsets require an exact commit and resultId.")
             .query("limit", json!({"type":"integer","minimum":1,"maximum":1000}), "At most this many rows, 100 by default.")
             .query("lang", s(), "Comma-separated preferred label languages, otherwise Accept-Language.")
+            .query("elOnly", boolean(), "Read the kept EL-only classification instead of the default classification (false by default).")
             .query("timeout", json!({"type":"number","minimum":0}), "The read deadline in milliseconds.")
             .resp("200", "Availability and an optional bounded page from one immutable result.", Some(json!({"application/json":{"schema":sref("KeptClassification")}})))
             .errors(&[400,403,404,408,410]),
@@ -812,6 +813,7 @@ fn ontology(p: &mut Paths) {
             .doc("Classifies the ontology's terminology using the OWL 2 EL, Horn or disjunctive rules that the axioms need, and answers whether it is consistent, the unsatisfiable classes, the axioms that the classification left out or used only in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses, its equivalent classes and whether it is in the incomplete set, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. With `projection` set to `frame`, `about` returns bounded direct parents, equivalents, source samples and exclusion samples instead of the full taxonomy payload. The dataset keeps the last eligible classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what the active EL, Horn or disjunctive run proved after saturation began. `complete` is false when the run stopped early, left axioms out or used them only in part, left assertions unread or saw unmapped triples, and `incomplete` lists the classes whose superclasses may be missed while `consistency` is `consistent`, `inconsistent` or `unknown`. A finished run has `partial` false and `completeForTaken` true, and still leaves affected classes in `incomplete` when excluded axioms, unread assertions or unmapped triples could affect them. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.")
             .see("ontology")
             .query("format", json!({ "type": "string", "enum": ["json", "ofn"] }), "`json` (the default) or `ofn`.")
+            .query("elOnly", boolean(), "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. Refused if repeated, malformed, or also set in the JSON body.")
             .body(
                 false,
                 "The ontology and what to answer.",
@@ -823,6 +825,7 @@ fn ontology(p: &mut Paths) {
                         "imports": selection["imports"],
                         "mode": selection["mode"],
                         "assertions": { "type": "boolean", "description": "Also classify the assertions the store holds, so that they can make the ontology inconsistent. Such a run is not kept." },
+                        "elOnly": { "type": "boolean", "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. The dataset keeps EL-only classifications separately from default runs." },
                         "target": { "type": "string", "description": "A named graph outside the graphs read that takes the direct taxonomy." },
                         "message": { "type": "string", "description": "The commit message of the write, also kept as a comment on the header." },
                         "about": { "type": "string", "description": "A class IRI to describe." },
@@ -893,6 +896,7 @@ fn ontology(p: &mut Paths) {
                         "expression": { "description": "The class expression: Manchester or functional-style text, or the JSON form." },
                         "syntax": { "type": "string", "enum": ["manchester", "functional"], "description": "The syntax of a text expression (`manchester` by default). An object is read as the JSON form." },
                         "reasoning": { "type": "string", "enum": ["auto", "el", "rl"], "description": "The engine (`auto` by default)." },
+                        "elOnly": { "type": "boolean", "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL and using the dataset's EL-only kept saturation. Refused with `reasoning: \"rl\"` or an expression outside OWL 2 EL." },
                         "answers": { "type": "array", "items": { "type": "string", "enum": ["equivalents", "superclasses", "directSuperclasses", "subclasses", "directSubclasses", "instances"] } },
                         "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most IRIs each answer and the gaps list (1,000 by default)." },
                         "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads of the EL classifier, within the algorithm pool's grant (0 for the grant)." },

@@ -624,6 +624,68 @@ def test_manchester_and_dl_query(ds: sparkles.Dataset) -> None:
     assert j["reasoning"]["engine"] == "rl"
 
 
+def test_el_only_classify_kept_and_dl_query() -> None:
+    d = sparkles.Dataset()
+    d.update(
+        f"""{PREFIXES}
+        INSERT DATA {{
+          :o a owl:Ontology .
+          :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . :BC a owl:Class .
+          :r a owl:ObjectProperty .
+          :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] ,
+                             [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :C ] .
+          :BC owl:equivalentClass [ a owl:Class ; owl:intersectionOf ( :B :C ) ] .
+          [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :BC ] rdfs:subClassOf :D .
+        }}"""
+    )
+    full = d.ontology.classify(about=EX + "A")
+    assert full["reused"] is False
+    assert full["tier"] == "horn"
+    assert full["complete"] is True
+    assert full["classificationSource"]["producer"]["elOnly"] is False
+    assert EX + "D" in full["class"]["superClasses"]
+
+    elk = d.ontology.classify(about=EX + "A", el_only=True)
+    assert elk["reused"] is False
+    assert elk["tier"] == "horn"
+    assert elk["complete"] is False
+    assert elk["completeForTaken"] is True
+    assert elk["excludedCount"] == 1
+    assert elk["classificationSource"]["producer"]["elOnly"] is True
+    assert EX + "D" not in elk["class"]["superClasses"]
+
+    # Both modes stay cached separately without clobbering each other.
+    full2 = d.ontology.classify(about=EX + "A")
+    assert full2["reused"] is True and full2["resultId"] == full["resultId"]
+    elk2 = d.ontology.classify(about=EX + "A", el_only=True)
+    assert elk2["reused"] is True and elk2["resultId"] == elk["resultId"]
+
+    kept_full = d.ontology.kept_classification()
+    assert kept_full["status"] == "available"
+    assert kept_full["result"]["elOnly"] is False
+    assert kept_full["result"]["resultId"] == full["resultId"]
+
+    kept_elk = d.ontology.kept_classification(el_only=True)
+    assert kept_elk["status"] == "available"
+    assert kept_elk["result"]["elOnly"] is True
+    assert kept_elk["result"]["resultId"] == elk["resultId"]
+
+    # DL query reproduces ELK when el_only=True and uses Horn rules when reasoning="el", el_only=False.
+    q_horn = d.ontology.dl_query("r some (B and C)", reasoning="el", answers=["subclasses"])
+    assert q_horn["reasoning"]["engine"] == "el"
+    assert q_horn["reasoning"]["elOnly"] is False
+    assert q_horn["subclasses"] == [EX + "A"]
+
+    q_elk = d.ontology.dl_query("r some (B and C)", el_only=True, answers=["subclasses"])
+    assert q_elk["reasoning"]["engine"] == "el"
+    assert q_elk["reasoning"]["elOnly"] is True
+    assert q_elk["reasoning"]["complete"] is False
+    assert q_elk["subclasses"] == []
+
+    with pytest.raises(sparkles.InvalidInputError):
+        d.ontology.dl_query("r some (B and C)", reasoning="rl", el_only=True)
+
+
 def test_search_ranks_entities_with_typos() -> None:
     d = sparkles.Dataset()
     d.update(

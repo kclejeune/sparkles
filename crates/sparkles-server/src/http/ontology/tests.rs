@@ -4352,3 +4352,218 @@ async fn patterns_r4_shacl_warn_receipt_respects_response_cap() {
 
     *s._state.pattern_test_limits.lock() = None;
 }
+
+#[tokio::test]
+async fn el_only_http_classify_kept_and_dl_query_reproduce_elk_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    let ds = state.attach("horn", DbType::Mem, None).unwrap();
+    let ttl = "@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . :BC a owl:Class .
+:r a owl:ObjectProperty .
+:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] ,
+                   [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :C ] .
+:BC owl:equivalentClass [ a owl:Class ; owl:intersectionOf ( :B :C ) ] .
+[ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :BC ] rdfs:subClassOf :D .
+";
+    ds.store
+        .load(&[Source::from_bytes(
+            ttl.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let app = router(state);
+
+    // Default classification uses Horn rules and derives :A subClassOf :D.
+    let full = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"about": "http://ex.org/A"}),
+    )
+    .await;
+    assert_eq!(full.status, StatusCode::OK, "{}", full.text());
+    let fj = full.json();
+    assert_eq!(fj["reused"], false);
+    assert_eq!(fj["complete"], true);
+    assert_eq!(fj["tier"], "horn");
+    assert_eq!(fj["classificationSource"]["producer"]["elOnly"], false);
+    assert!(
+        fj["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("http://ex.org/D")),
+        "{fj}"
+    );
+
+    // EL-only classification reproduces ELK: leaves out ObjectAllValuesFrom and omits :D.
+    let elk = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"about": "http://ex.org/A", "elOnly": true}),
+    )
+    .await;
+    assert_eq!(elk.status, StatusCode::OK, "{}", elk.text());
+    let ej = elk.json();
+    assert_eq!(ej["reused"], false);
+    assert_eq!(ej["complete"], false);
+    assert_eq!(ej["completeForTaken"], true);
+    assert_eq!(ej["tier"], "horn");
+    assert_eq!(ej["excludedCount"], 1);
+    assert_eq!(ej["classificationSource"]["producer"]["elOnly"], true);
+    assert!(
+        !ej["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("http://ex.org/D")),
+        "{ej}"
+    );
+
+    // Both stay cached under their own keys without clobbering each other.
+    let full2 = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"about": "http://ex.org/A"}),
+    )
+    .await;
+    assert_eq!(full2.json()["reused"], true);
+    assert_eq!(full2.json()["resultId"], fj["resultId"]);
+
+    let elk2 = post(
+        &app,
+        "/$/ontology/horn/classify?elOnly=true",
+        json!({"about": "http://ex.org/A"}),
+    )
+    .await;
+    assert_eq!(elk2.status, StatusCode::OK, "{}", elk2.text());
+    assert_eq!(elk2.json()["reused"], true);
+    assert_eq!(elk2.json()["resultId"], ej["resultId"]);
+
+    // Frame projection with elOnly=true reports elOnly=true and keeps the EL-only pin.
+    let frame = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"projection": "frame", "about": "http://ex.org/A", "elOnly": true}),
+    )
+    .await;
+    assert_eq!(frame.status, StatusCode::OK, "{}", frame.text());
+    assert_eq!(frame.json()["frame"]["result"]["elOnly"], true);
+    assert_eq!(frame.json()["frame"]["retention"]["kept"], true);
+    assert_eq!(
+        frame.json()["frame"]["retention"]["resultId"],
+        ej["resultId"]
+    );
+
+    // GET /classification separates elOnly=false vs elOnly=true.
+    let kept_full = get(&app, "/$/ontology/horn/classification").await;
+    assert_eq!(kept_full.json()["status"], "available");
+    assert_eq!(kept_full.json()["result"]["elOnly"], false);
+    assert_eq!(kept_full.json()["result"]["resultId"], fj["resultId"]);
+
+    let kept_elk = get(&app, "/$/ontology/horn/classification?elOnly=true").await;
+    assert_eq!(kept_elk.json()["status"], "available");
+    assert_eq!(kept_elk.json()["result"]["elOnly"], true);
+    assert_eq!(kept_elk.json()["result"]["resultId"], ej["resultId"]);
+
+    // Strict mode succeeds for full and refuses EL-only (422 classification-incomplete).
+    let strict_full = post(&app, "/$/ontology/horn/classify", json!({"strict": true})).await;
+    assert_eq!(strict_full.status, StatusCode::OK, "{}", strict_full.text());
+    let strict_elk = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"strict": true, "elOnly": true}),
+    )
+    .await;
+    assert_eq!(
+        strict_elk.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        strict_elk.text()
+    );
+    assert_eq!(strict_elk.json()["code"], "classification-incomplete");
+
+    // Selector validation rejects invalid, duplicate, or conflicting elOnly values on
+    // GET /classification, projection classify, and ordinary POST /classify (leaving target
+    // writes uncommitted).
+    assert_eq!(
+        get(&app, "/$/ontology/horn/classification?elOnly=maybe")
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post(
+            &app,
+            "/$/ontology/horn/classify?projection=frame&elOnly=true",
+            json!({"about": "http://ex.org/A", "elOnly": true}),
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    let head_before = ds.store.snapshot().commit;
+    for (uri, body) in [
+        (
+            "/$/ontology/horn/classify?elOnly=treu",
+            json!({"about": "http://ex.org/A", "target": "urn:elk:bad-target"}),
+        ),
+        (
+            "/$/ontology/horn/classify?elOnly=false&elOnly=true",
+            json!({"about": "http://ex.org/A", "target": "urn:elk:bad-target"}),
+        ),
+        (
+            "/$/ontology/horn/classify?elOnly=true",
+            json!({"about": "http://ex.org/A", "elOnly": false, "target": "urn:elk:bad-target"}),
+        ),
+        (
+            "/$/ontology/horn/classify?elOnly=true",
+            json!({"about": "http://ex.org/A", "elOnly": true, "target": "urn:elk:bad-target"}),
+        ),
+    ] {
+        let bad = post(&app, uri, body).await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{uri}: {}", bad.text());
+        assert_eq!(
+            ds.store.snapshot().commit,
+            head_before,
+            "{uri} must not write target"
+        );
+    }
+
+    // DL query: default reasoning="el" derives :A; elOnly=true reproduces ELK and omits :A.
+    let q_horn = post(
+        &app,
+        "/$/ontology/horn/dl-query",
+        json!({"expression": "r some (B and C)", "reasoning": "el", "answers": ["subclasses"]}),
+    )
+    .await;
+    assert_eq!(q_horn.status, StatusCode::OK, "{}", q_horn.text());
+    assert_eq!(q_horn.json()["reasoning"]["engine"], "el");
+    assert_eq!(q_horn.json()["reasoning"]["elOnly"], false);
+    assert_eq!(q_horn.json()["subclasses"], json!(["http://ex.org/A"]));
+
+    let q_elk = post(
+        &app,
+        "/$/ontology/horn/dl-query",
+        json!({"expression": "r some (B and C)", "elOnly": true, "answers": ["subclasses"]}),
+    )
+    .await;
+    assert_eq!(q_elk.status, StatusCode::OK, "{}", q_elk.text());
+    assert_eq!(q_elk.json()["reasoning"]["engine"], "el");
+    assert_eq!(q_elk.json()["reasoning"]["elOnly"], true);
+    assert_eq!(q_elk.json()["reasoning"]["complete"], false);
+    assert_eq!(q_elk.json()["subclasses"], json!([]));
+
+    // elOnly=true with reasoning="rl" is 400.
+    let q_bad = post(
+        &app,
+        "/$/ontology/horn/dl-query",
+        json!({"expression": "r some (B and C)", "reasoning": "rl", "elOnly": true}),
+    )
+    .await;
+    assert_eq!(q_bad.status, StatusCode::BAD_REQUEST, "{}", q_bad.text());
+}

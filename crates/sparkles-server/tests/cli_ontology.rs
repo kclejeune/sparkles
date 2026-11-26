@@ -1406,3 +1406,157 @@ fn dl663_cli_materialize_defaults_to_elk() {
     assert_eq!(default, explicit);
     println!("dl663 ok: CLI omitted materialize reasoner is ELK");
 }
+
+#[test]
+fn classify_el_only_reproduces_elk_for_files_databases_and_chains() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let horn = "Prefix(:=<http://ex.org/>)
+Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+Ontology(<http://ex.org/horn>
+  Declaration(Class(:A)) Declaration(Class(:B)) Declaration(Class(:C))
+  Declaration(Class(:D)) Declaration(Class(:BC))
+  Declaration(ObjectProperty(:r))
+  SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+  SubClassOf(:A ObjectAllValuesFrom(:r :C))
+  EquivalentClasses(:BC ObjectIntersectionOf(:B :C))
+  SubClassOf(ObjectSomeValuesFrom(:r :BC) :D)
+)
+";
+    std::fs::write(dir.join("horn.ofn"), horn).unwrap();
+
+    // File classification: default derives :A ⊑ :D (Horn); --el-only reproduces ELK and omits it.
+    let full = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "horn.ofn",
+            "--about",
+            "http://ex.org/A",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(full.status.code(), Some(0), "{}", err(&full));
+    let fj: serde_json::Value = serde_json::from_slice(&full.stdout).unwrap();
+    assert_eq!(fj["tier"], "horn");
+    assert_eq!(fj["complete"], true);
+    assert!(
+        fj["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("http://ex.org/D")),
+        "{fj}"
+    );
+
+    let elk = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "horn.ofn",
+            "--el-only",
+            "--about",
+            "http://ex.org/A",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(elk.status.code(), Some(0), "{}", err(&elk));
+    let ej: serde_json::Value = serde_json::from_slice(&elk.stdout).unwrap();
+    assert_eq!(ej["tier"], "horn");
+    assert_eq!(ej["complete"], false);
+    assert_eq!(ej["completeForTaken"], true);
+    assert_eq!(ej["excludedCount"], 1);
+    assert!(
+        !ej["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("http://ex.org/D")),
+        "{ej}"
+    );
+
+    // dl663 top-chain file: --el-only keeps ELK parity (omits :D).
+    dl663_write_input(dir);
+    let dl663_elk = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "chain.ofn",
+            "--el-only",
+            "--about",
+            "urn:top-domain:A",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(dl663_elk.status.code(), Some(0), "{}", err(&dl663_elk));
+    let dj: serde_json::Value = serde_json::from_slice(&dl663_elk.stdout).unwrap();
+    assert!(
+        !dj["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("urn:top-domain:D")),
+        "{dj}"
+    );
+
+    // Database classification with --loc and --el-only.
+    let load = sparkles(dir, &["load", "--loc", "db", "horn.ofn"]);
+    assert_eq!(load.status.code(), Some(0), "{}", err(&load));
+    let db_elk = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "--loc",
+            "db",
+            "--el-only",
+            "--about",
+            "http://ex.org/A",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(db_elk.status.code(), Some(0), "{}", err(&db_elk));
+    let dbj: serde_json::Value = serde_json::from_slice(&db_elk.stdout).unwrap();
+    assert_eq!(dbj["tier"], "horn");
+    assert_eq!(dbj["excludedCount"], 1);
+    assert_eq!(dbj["classificationSource"]["producer"]["elOnly"], true);
+    assert!(
+        !dbj["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("http://ex.org/D")),
+        "{dbj}"
+    );
+
+    // Chained classify step with --el-only.
+    let chained = sparkles(
+        dir,
+        &[
+            "ontology",
+            "relax",
+            "--input",
+            "horn.ofn",
+            "classify",
+            "--el-only",
+            "--about",
+            "http://ex.org/A",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(chained.status.code(), Some(0), "{}", err(&chained));
+    let cj: serde_json::Value = serde_json::from_slice(&chained.stdout).unwrap();
+    assert_eq!(cj["tier"], "horn");
+    assert_eq!(cj["excludedCount"], 1);
+    assert!(
+        !cj["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("http://ex.org/D")),
+        "{cj}"
+    );
+}

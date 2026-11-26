@@ -36,13 +36,29 @@ fn read(ds: &Dataset, r: &OntologyRequest, q: &KeptQuery) -> KeptRead {
     ds.ontology().kept_classification(r, q, &opts()).unwrap()
 }
 fn result(ds: &Dataset) -> Option<Arc<KeptClassification>> {
-    ds.state().classify_cache.lock().publication.clone()
+    ds.state()
+        .classify_cache
+        .lock()
+        .slot(false)
+        .publication
+        .clone()
+}
+fn result_for(ds: &Dataset, el_only: bool) -> Option<Arc<KeptClassification>> {
+    ds.state()
+        .classify_cache
+        .lock()
+        .slot(el_only)
+        .publication
+        .clone()
 }
 fn empty_slot(ds: &Dataset) {
-    let slot = ds.state().classify_cache.lock();
-    assert!(slot.entry.is_none());
-    assert!(slot.publication.is_none());
-    assert!(slot.active.is_none());
+    let cache = ds.state().classify_cache.lock();
+    for el_only in [false, true] {
+        let slot = cache.slot(el_only);
+        assert!(slot.entry.is_none());
+        assert!(slot.publication.is_none());
+        assert!(slot.active.is_none());
+    }
 }
 
 #[test]
@@ -203,7 +219,7 @@ fn an_old_pin_stays_available_while_a_new_exact_flight_is_running() {
     let (end_tx, end_rx) = mpsc::channel();
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
-            h.with_kept(&o, &req(), &opts(), "dlQuery", |e| {
+            h.with_kept(&o, &req(), false, &opts(), "dlQuery", |e| {
                 start_tx.send(()).unwrap();
                 end_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 e.run_over(&o, vec![], |_, _, _| Ok(()))?;
@@ -272,7 +288,7 @@ fn restricted_status_never_discloses_cache_or_flight() {
     assert_eq!(get(), before);
     let h = ds.ontology();
     let o = h.open(&req(), &opts()).unwrap();
-    h.with_kept(&o, &req(), &opts(), "classify", |_| {
+    h.with_kept(&o, &req(), false, &opts(), "classify", |_| {
         assert_eq!(get(), before);
         Ok(((), true))
     })
@@ -294,7 +310,14 @@ fn refusal_before_mutation_preserves_and_later_admission_works() {
         Err(Error::Timeout)
     ));
     assert!(Arc::ptr_eq(&p, &result(&ds).unwrap()));
-    assert!(ds.state().classify_cache.lock().active.is_none());
+    assert!(
+        ds.state()
+            .classify_cache
+            .lock()
+            .slot(false)
+            .active
+            .is_none()
+    );
     assert_ne!(classify(&ds).id, p.id);
 }
 
@@ -307,10 +330,10 @@ fn mutation_errors_and_unwinds_discard_both_owners_but_not_a_read_arc() {
         let h = ds.ontology();
         let o = h.open(&req(), &opts()).unwrap();
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            h.with_kept(&o, &req(), &opts(), "dlQuery", |e| {
+            h.with_kept(&o, &req(), false, &opts(), "dlQuery", |e| {
                 e.run_over(&o, vec![], |s, axioms, changes| {
                     let par = super::super::classify::admit(1, &opts())?;
-                    super::super::classify::saturate(s, axioms, changes, par, &opts())?;
+                    super::super::classify::saturate(s, axioms, changes, par, false, &opts())?;
                     if panic {
                         panic!("controlled mutation unwind");
                     }
@@ -339,7 +362,7 @@ fn retention_counts_auxiliary_bytes_once_and_taxonomy_eviction_releases_owners()
     let p = classify(&ds);
     let h = ds.ontology();
     let o = h.open(&req(), &opts()).unwrap();
-    h.with_kept(&o, &req(), &opts(), "dlQuery", |e| {
+    h.with_kept(&o, &req(), false, &opts(), "dlQuery", |e| {
         let base = p
             .classification
             .stats
@@ -359,13 +382,19 @@ fn retention_counts_auxiliary_bytes_once_and_taxonomy_eviction_releases_owners()
         let tail = entry_aux_bytes(e) + p.classification.stats.taxonomy_memory + p.auxiliary_bytes;
         assert!(retain_dl(e, CACHE_MAX_BYTES - tail));
         assert!(e.result.is_some());
+        assert_eq!(e.retained_bytes, CACHE_MAX_BYTES);
         assert!(retain_dl(e, CACHE_MAX_BYTES - tail + 1));
         assert!(e.result.is_none());
+        assert_eq!(
+            e.retained_bytes,
+            dl_retained_bytes(e, CACHE_MAX_BYTES - tail + 1)
+        );
+        assert!(e.retained_bytes < CACHE_MAX_BYTES);
         Ok(((), true))
     })
     .unwrap();
     assert!(result(&ds).is_none());
-    assert!(ds.state().classify_cache.lock().entry.is_some());
+    assert!(ds.state().classify_cache.lock().slot(false).entry.is_some());
     assert!(!classify(&ds).classification.taxonomy.nodes().is_empty());
 }
 
@@ -845,7 +874,7 @@ fn cancellation_while_waiting_for_flight_leaves_the_proven_pair_untouched() {
                 cancel: Some(flag),
                 ..opts()
             };
-            h.with_kept(&o, &req(), &options, "classify", |_| Ok(((), true)))
+            h.with_kept(&o, &req(), false, &options, "classify", |_| Ok(((), true)))
         });
         let waiting = rx.recv_timeout(Duration::from_secs(5));
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -855,7 +884,14 @@ fn cancellation_while_waiting_for_flight_leaves_the_proven_pair_untouched() {
     });
     drop(held);
     assert!(Arc::ptr_eq(&result(&ds).unwrap(), &p));
-    assert!(ds.state().classify_cache.lock().active.is_none());
+    assert!(
+        ds.state()
+            .classify_cache
+            .lock()
+            .slot(false)
+            .active
+            .is_none()
+    );
     assert_eq!(classify(&ds).id, p.id);
 }
 
@@ -1075,14 +1111,14 @@ fn fingerprints_compare_actual_content_and_policies_without_run_ids_or_timing() 
 #[test]
 fn isolated_frame_records_actual_flags_and_never_advertises_a_shared_pin() {
     let ds = ds(":A a owl:Class ; rdfs:label \"Scoped\"@en .");
-    for (assertions, el_only) in [(true, false), (false, true)] {
+    for (assertions, skip_coverage) in [(true, false), (false, true)] {
         let c = ds
             .ontology()
             .classify(
                 &req(),
                 &ClassifyRequest {
                     assertions,
-                    el_only,
+                    skip_coverage,
                     ..Default::default()
                 },
                 &opts(),
@@ -1103,7 +1139,7 @@ fn isolated_frame_records_actual_flags_and_never_advertises_a_shared_pin() {
         )
         .unwrap();
         assert_eq!(frame["frame"]["result"]["assertions"], assertions);
-        assert_eq!(frame["frame"]["result"]["elOnly"], el_only);
+        assert_eq!(frame["frame"]["result"]["elOnly"], false);
         assert_eq!(frame["frame"]["retention"]["kept"], false);
         assert!(frame["frame"]["retention"]["resultId"].is_null());
         assert_eq!(
@@ -1111,6 +1147,53 @@ fn isolated_frame_records_actual_flags_and_never_advertises_a_shared_pin() {
             Status::Unavailable
         );
     }
+    // EL-only runs are kept under their own el_only slot and remain invisible to default reads.
+    let el = ds
+        .ontology()
+        .classify(
+            &req(),
+            &ClassifyRequest {
+                el_only: true,
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    let q = super::super::wire::ClassifyQuery {
+        projection: Some(super::super::wire::ClassifyProjection::Frame),
+        about: Some("http://ex.org/A".into()),
+        limit: 1,
+        ..Default::default()
+    };
+    let frame = super::super::wire::classify_body(
+        "test",
+        &el,
+        &req(),
+        &super::super::wire::renderer(&ds),
+        &q,
+    )
+    .unwrap();
+    assert_eq!(frame["frame"]["result"]["assertions"], false);
+    assert_eq!(frame["frame"]["result"]["elOnly"], true);
+    assert_eq!(frame["frame"]["retention"]["kept"], true);
+    assert_eq!(
+        frame["frame"]["retention"]["resultId"],
+        json!(el.publication.id)
+    );
+    assert_eq!(
+        read(&ds, &req(), &KeptQuery::default()).status,
+        Status::Unavailable
+    );
+    let kept_el = read(
+        &ds,
+        &req(),
+        &KeptQuery {
+            el_only: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(kept_el.status, Status::Available);
+    assert!(kept_el.result.unwrap().el_only);
 }
 
 #[test]
@@ -1521,4 +1604,323 @@ fn kept_entity_status_reports_per_class_incomplete_on_retained_finished_result()
     let entity_clean = read_clean.entity.as_ref().unwrap();
     assert!(entity_clean.present);
     assert_eq!(entity_clean.incomplete, Some(false));
+}
+
+#[test]
+fn el_only_and_full_classifications_are_keyed_separately_and_never_clobber() {
+    // Horn-not-EL ontology: A ⊑ ∃r.B, A ⊑ ∀r.C, BC ≡ B ⊓ C, ∃r.BC ⊑ D.
+    // Full classification derives A ⊑ D (Horn tier, complete); EL-only (ELK) leaves out
+    // ObjectAllValuesFrom and does not derive A ⊑ D.
+    let ds = ds("
+        :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . :BC a owl:Class .
+        :r a owl:ObjectProperty .
+        :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] ,
+                           [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :C ] .
+        :BC owl:equivalentClass [ a owl:Class ; owl:intersectionOf ( :B :C ) ] .
+        [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :BC ] rdfs:subClassOf :D .
+    ");
+    let a = sparkles_owl::Class::new("http://ex.org/A");
+    let d = sparkles_owl::Class::new("http://ex.org/D");
+
+    let full_req = ClassifyRequest::default();
+    let el_req = ClassifyRequest {
+        el_only: true,
+        ..Default::default()
+    };
+
+    let full1 = ds.ontology().classify(&req(), &full_req, &opts()).unwrap();
+    assert!(!full1.reused);
+    assert!(full1.retained);
+    assert!(full1.complete());
+    assert!(!full1.publication.source.el_only);
+    assert!(full1.classification.taxonomy.is_subclass(&a, &d));
+
+    // EL-only classification must not reuse or clobber the full classification.
+    let el1 = ds.ontology().classify(&req(), &el_req, &opts()).unwrap();
+    assert!(!el1.reused);
+    assert!(el1.retained);
+    assert!(!el1.complete());
+    assert!(el1.classification.complete_for_taken);
+    assert!(el1.publication.source.el_only);
+    assert_eq!(el1.excluded.len(), 1);
+    assert!(!el1.classification.taxonomy.is_subclass(&a, &d));
+    assert_ne!(full1.publication.id, el1.publication.id);
+
+    // Both slots stay live and reuse their own exact publication.
+    let full2 = ds.ontology().classify(&req(), &full_req, &opts()).unwrap();
+    assert!(full2.reused);
+    assert_eq!(full2.publication.id, full1.publication.id);
+    assert!(full2.classification.taxonomy.is_subclass(&a, &d));
+
+    let el2 = ds.ontology().classify(&req(), &el_req, &opts()).unwrap();
+    assert!(el2.reused);
+    assert_eq!(el2.publication.id, el1.publication.id);
+    assert!(!el2.classification.taxonomy.is_subclass(&a, &d));
+
+    // Kept reads distinguish el_only=false vs el_only=true and refuse cross-slot resultId pins.
+    let kept_full = read(
+        &ds,
+        &req(),
+        &KeptQuery {
+            part: Part::Parents,
+            about: Some("http://ex.org/A".into()),
+            el_only: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(kept_full.status, Status::Available);
+    assert_eq!(
+        kept_full.result.as_ref().unwrap().result_id,
+        full1.publication.id
+    );
+    assert!(!kept_full.result.as_ref().unwrap().el_only);
+    assert!(
+        kept_full
+            .page
+            .unwrap()
+            .items
+            .iter()
+            .any(|row| row["iri"] == "http://ex.org/D")
+    );
+
+    let kept_el = read(
+        &ds,
+        &req(),
+        &KeptQuery {
+            part: Part::Parents,
+            about: Some("http://ex.org/A".into()),
+            el_only: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(kept_el.status, Status::Available);
+    assert_eq!(
+        kept_el.result.as_ref().unwrap().result_id,
+        el1.publication.id
+    );
+    assert!(kept_el.result.as_ref().unwrap().el_only);
+    assert!(
+        !kept_el
+            .page
+            .unwrap()
+            .items
+            .iter()
+            .any(|row| row["iri"] == "http://ex.org/D")
+    );
+
+    // Cross-slot pin is refused as Mismatch (resultChanged).
+    let wrong_pin = read(
+        &ds,
+        &req(),
+        &KeptQuery {
+            result_id: Some(full1.publication.id),
+            el_only: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(wrong_pin.status, Status::Mismatch);
+    assert_eq!(wrong_pin.reason, Some("resultChanged"));
+
+    // An incremental edit updates each slot independently without cross-contamination.
+    ds.update(&format!(
+        "{BASE} INSERT DATA {{ :E a owl:Class . :F a owl:Class . :E rdfs:subClassOf :F . }}"
+    ))
+    .unwrap();
+    let e = sparkles_owl::Class::new("http://ex.org/E");
+    let f = sparkles_owl::Class::new("http://ex.org/F");
+
+    let el3 = ds.ontology().classify(&req(), &el_req, &opts()).unwrap();
+    assert!(!el3.reused);
+    assert!(el3.classification.stats.incremental);
+    assert!(el3.classification.taxonomy.is_subclass(&e, &f));
+    assert!(!el3.classification.taxonomy.is_subclass(&a, &d));
+
+    let full3 = ds.ontology().classify(&req(), &full_req, &opts()).unwrap();
+    assert!(!full3.reused);
+    assert!(full3.classification.taxonomy.is_subclass(&e, &f));
+    assert!(full3.classification.taxonomy.is_subclass(&a, &d));
+
+    // Strict mode succeeds on full (complete) and refuses EL-only (excluded ObjectAllValuesFrom).
+    assert!(
+        ds.ontology()
+            .classify(
+                &req(),
+                &ClassifyRequest {
+                    strict: true,
+                    ..full_req.clone()
+                },
+                &opts()
+            )
+            .is_ok()
+    );
+    assert!(
+        ds.ontology()
+            .classify(
+                &req(),
+                &ClassifyRequest {
+                    strict: true,
+                    ..el_req.clone()
+                },
+                &opts()
+            )
+            .is_err()
+    );
+
+    // Combined retention cap: when both slots together exceed the cap, storing one evicts the
+    // other slot's saturation owner and publication while keeping the surviving slot within cap.
+    struct CapRestore(usize);
+    impl Drop for CapRestore {
+        fn drop(&mut self) {
+            TEST_RETENTION_CAP.with(|c| c.set(self.0));
+        }
+    }
+    let full_bytes = ds
+        .state()
+        .classify_cache
+        .lock()
+        .slot(false)
+        .entry
+        .as_ref()
+        .unwrap()
+        .retained_bytes;
+    let el_bytes = ds
+        .state()
+        .classify_cache
+        .lock()
+        .slot(true)
+        .entry
+        .as_ref()
+        .unwrap()
+        .retained_bytes;
+    let cap = full_bytes.max(el_bytes) + full_bytes.min(el_bytes) / 2;
+    {
+        let _restore = CapRestore(TEST_RETENTION_CAP.with(|c| c.replace(cap)));
+        ds.update(&format!("{BASE} INSERT DATA {{ :G a owl:Class . }}"))
+            .unwrap();
+        let el4 = ds.ontology().classify(&req(), &el_req, &opts()).unwrap();
+        assert!(el4.retained);
+        assert!(result_for(&ds, true).is_some());
+        assert!(
+            result_for(&ds, false).is_none(),
+            "combined cap must evict the other slot's publication"
+        );
+        let cache = ds.state().classify_cache.lock();
+        assert!(
+            cache.slot(false).entry.is_none(),
+            "combined cap must release the other slot's saturation owner"
+        );
+        assert!(cache.slot(false).publication.is_none());
+        let surviving = cache
+            .slot(true)
+            .entry
+            .as_ref()
+            .expect("surviving slot must retain its entry");
+        assert!(
+            surviving.retained_bytes <= cap,
+            "surviving slot must stay within cap: {} <= {cap}",
+            surviving.retained_bytes
+        );
+    }
+
+    // Active flight isolation: an in-flight EL-only operation must not mark the default slot running.
+    let _full_warm = ds.ontology().classify(&req(), &full_req, &opts()).unwrap();
+    ds.update(&format!("{BASE} INSERT DATA {{ :H a owl:Class . }}"))
+        .unwrap();
+    let h = ds.ontology();
+    let opened = h.open(&req(), &opts()).unwrap();
+    h.with_kept(&opened, &req(), true, &opts(), "classify", |_e| {
+        let el_status = read(
+            &ds,
+            &req(),
+            &KeptQuery {
+                el_only: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(el_status.status, Status::Running);
+        let full_status = read(&ds, &req(), &KeptQuery::default());
+        assert_eq!(full_status.status, Status::Mismatch);
+        assert!(full_status.activity.is_none());
+        Ok(((), true))
+    })
+    .unwrap();
+
+    // DL refill under combined cap: start from an empty EL-only slot (retained_bytes == 0) while
+    // the default slot is warm, then run an EL-only DL query under a cap that only overflows once
+    // retain_dl updates the EL-only slot's retained_bytes.
+    let _full_dl = ds.ontology().classify(&req(), &full_req, &opts()).unwrap();
+    let full_bytes2 = ds
+        .state()
+        .classify_cache
+        .lock()
+        .slot(false)
+        .entry
+        .as_ref()
+        .unwrap()
+        .retained_bytes;
+    let mut dl_q = super::super::dl_query::DlQueryRequest::new(
+        sparkles_owl::ClassExpression::Class(sparkles_owl::Class::new("http://ex.org/A")),
+    );
+    dl_q.el_only = true;
+    dl_q.answers.instances = false;
+    {
+        let mut cache = ds.state().classify_cache.lock();
+        let el_slot = cache.slot_mut(true);
+        el_slot.entry = None;
+        el_slot.publication = None;
+    }
+    let _probe = ds.ontology().dl_query(&req(), &dl_q, &opts()).unwrap();
+    let el_dl_bytes = ds
+        .state()
+        .classify_cache
+        .lock()
+        .slot(true)
+        .entry
+        .as_ref()
+        .expect("EL-only DL query must retain its slot")
+        .retained_bytes;
+    assert!(
+        el_dl_bytes > 0,
+        "retain_dl must record a nonzero byte charge"
+    );
+    {
+        let mut cache = ds.state().classify_cache.lock();
+        let el_slot = cache.slot_mut(true);
+        el_slot.entry = None;
+        el_slot.publication = None;
+    }
+    let dl_cap = full_bytes2.max(el_dl_bytes) + full_bytes2.min(el_dl_bytes) / 2;
+    assert!(
+        full_bytes2 <= dl_cap && full_bytes2 + el_dl_bytes > dl_cap,
+        "cap must admit the warm default slot alone ({full_bytes2} <= {dl_cap}) and overflow once retain_dl charges {el_dl_bytes}"
+    );
+    {
+        let _restore = CapRestore(TEST_RETENTION_CAP.with(|c| c.replace(dl_cap)));
+        let answer = ds.ontology().dl_query(&req(), &dl_q, &opts()).unwrap();
+        assert!(answer.incremental);
+        assert!(answer.reasoning.el_only);
+        let cache = ds.state().classify_cache.lock();
+        assert!(
+            cache.slot(false).entry.is_none(),
+            "DL refill under combined cap must release the other slot's saturation owner"
+        );
+        assert!(
+            cache.slot(false).publication.is_none(),
+            "DL refill under combined cap must evict the other slot's publication"
+        );
+        let surviving = cache
+            .slot(true)
+            .entry
+            .as_ref()
+            .expect("EL-only slot must stay retained after DL refill");
+        assert_eq!(
+            surviving.retained_bytes, el_dl_bytes,
+            "retain_dl must record the exact updated byte charge"
+        );
+        assert!(
+            surviving.retained_bytes <= dl_cap,
+            "surviving EL-only slot must stay within cap after retain_dl: {} <= {dl_cap}",
+            surviving.retained_bytes
+        );
+    }
 }

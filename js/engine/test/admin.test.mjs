@@ -1386,6 +1386,80 @@ test('the ontology handle reads Manchester syntax and answers DL queries', async
   assert.equal(rl.reasoning.engine, 'rl');
 });
 
+test('ontology elOnly classifies, queries and caches separately from default runs', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
+  await ds.update(`PREFIX : <http://ex.org/>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA {
+      :o a owl:Ontology .
+      :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . :BC a owl:Class .
+      :r a owl:ObjectProperty .
+      :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] ,
+                         [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :C ] .
+      :BC owl:equivalentClass [ a owl:Class ; owl:intersectionOf ( :B :C ) ] .
+      [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :BC ] rdfs:subClassOf :D .
+    }`);
+  const onto = ds.ontology;
+
+  const full = await onto.classify({ about: 'http://ex.org/A' });
+  assert.equal(full.reused, false);
+  assert.equal(full.tier, 'horn');
+  assert.equal(full.complete, true);
+  assert.equal(full.classificationSource.producer.elOnly, false);
+  assert.ok(full.class.superClasses.includes('http://ex.org/D'));
+
+  const elk = await onto.classify({ about: 'http://ex.org/A', elOnly: true });
+  assert.equal(elk.reused, false);
+  assert.equal(elk.tier, 'horn');
+  assert.equal(elk.complete, false);
+  assert.equal(elk.completeForTaken, true);
+  assert.equal(elk.excludedCount, 1);
+  assert.equal(elk.classificationSource.producer.elOnly, true);
+  assert.ok(!elk.class.superClasses.includes('http://ex.org/D'));
+
+  // Both stay cached separately without clobbering each other.
+  const full2 = await onto.classify({ about: 'http://ex.org/A' });
+  assert.equal(full2.reused, true);
+  assert.equal(full2.resultId, full.resultId);
+  const elk2 = await onto.classify({ about: 'http://ex.org/A', elOnly: true });
+  assert.equal(elk2.reused, true);
+  assert.equal(elk2.resultId, elk.resultId);
+
+  const keptFull = await onto.keptClassification();
+  assert.equal(keptFull.status, 'available');
+  assert.equal(keptFull.result.elOnly, false);
+  assert.equal(keptFull.result.resultId, full.resultId);
+
+  const keptElk = await onto.keptClassification({ elOnly: true });
+  assert.equal(keptElk.status, 'available');
+  assert.equal(keptElk.result.elOnly, true);
+  assert.equal(keptElk.result.resultId, elk.resultId);
+
+  // DL query reproduces ELK with elOnly and uses Horn rules with reasoning: 'el'.
+  const qHorn = await onto.dlQuery('r some (B and C)', {
+    reasoning: 'el',
+    answers: ['subclasses'],
+  });
+  assert.equal(qHorn.reasoning.engine, 'el');
+  assert.equal(qHorn.reasoning.elOnly, false);
+  assert.deepEqual(qHorn.subclasses, ['http://ex.org/A']);
+
+  const qElk = await onto.dlQuery('r some (B and C)', {
+    elOnly: true,
+    answers: ['subclasses'],
+  });
+  assert.equal(qElk.reasoning.engine, 'el');
+  assert.equal(qElk.reasoning.elOnly, true);
+  assert.equal(qElk.reasoning.complete, false);
+  assert.deepEqual(qElk.subclasses, []);
+
+  await assert.rejects(
+    onto.dlQuery('r some (B and C)', { reasoning: 'rl', elOnly: true }),
+    (e) => e.name === 'InvalidInputError',
+  );
+});
+
 test('the ontology handle lists entities and answers entity accessors', async (t) => {
   const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
   await ds.update(`PREFIX : <http://ex.org/>

@@ -782,6 +782,8 @@ export interface DlQueryAnswer extends OntologyState {
     engine: 'el' | 'rl';
     title: string;
     why: string;
+    /** whether the classifier ran in EL-only (ELK) mode; always populated by the current engine */
+    elOnly?: boolean;
     complete: boolean;
     instancesComplete: boolean | null;
     gapCount: number;
@@ -989,6 +991,7 @@ export class Administration {
             offset?: number;
             limit?: number;
             lang?: string | string[];
+            elOnly?: boolean;
           } = {},
       ) => {
         if ((o as OntologyRead).inferences)
@@ -1004,6 +1007,7 @@ export class Administration {
             offset: o.offset,
             limit: o.limit,
             lang: o.lang,
+            elOnly: o.elOnly,
           },
           o,
           false,
@@ -1285,6 +1289,8 @@ export class Administration {
           UpdateOptions & {
             at?: string | number | bigint;
             assertions?: boolean;
+            /** classify by the OWL 2 EL rules alone, as ELK does */
+            elOnly?: boolean;
             about?: string;
             nodes?: boolean;
             limit?: number;
@@ -1313,6 +1319,7 @@ export class Administration {
             mode: o.mode,
             at: o.at === undefined || typeof o.at === 'string' ? o.at : unsigned(o.at),
             assertions: o.assertions,
+            elOnly: o.elOnly,
             about: o.about,
             nodes: o.nodes,
             limit: o.limit,
@@ -1355,6 +1362,8 @@ export class Administration {
           OperationOptions & {
             syntax?: 'manchester' | 'functional';
             reasoning?: 'auto' | 'el' | 'rl';
+            /** classify by the OWL 2 EL rules alone, as ELK does */
+            elOnly?: boolean;
             answers?: DlAnswer[];
             limit?: number;
             threads?: number;
@@ -1370,6 +1379,7 @@ export class Administration {
             expression,
             syntax: o.syntax,
             reasoning: o.reasoning,
+            elOnly: o.elOnly,
             answers: o.answers,
             limit: o.limit,
             threads: o.threads,

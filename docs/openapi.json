@@ -42979,6 +42979,14 @@
             }
           },
           {
+            "description": "Read the kept EL-only classification instead of the default classification (false by default).",
+            "in": "query",
+            "name": "elOnly",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "description": "The read deadline in milliseconds.",
             "in": "query",
             "name": "timeout",
@@ -43154,6 +43162,14 @@
               ],
               "type": "string"
             }
+          },
+          {
+            "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. Refused if repeated, malformed, or also set in the JSON body.",
+            "in": "query",
+            "name": "elOnly",
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "requestBody": {
@@ -43168,6 +43184,10 @@
                   },
                   "assertions": {
                     "description": "Also classify the assertions the store holds, so that they can make the ontology inconsistent. Such a run is not kept.",
+                    "type": "boolean"
+                  },
+                  "elOnly": {
+                    "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. The dataset keeps EL-only classifications separately from default runs.",
                     "type": "boolean"
                   },
                   "expansion": {
@@ -43522,6 +43542,10 @@
                       "type": "string"
                     },
                     "type": "array"
+                  },
+                  "elOnly": {
+                    "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL and using the dataset's EL-only kept saturation. Refused with `reasoning: \"rl\"` or an expression outside OWL 2 EL.",
+                    "type": "boolean"
                   },
                   "expression": {
                     "description": "The class expression: Manchester or functional-style text, or the JSON form."

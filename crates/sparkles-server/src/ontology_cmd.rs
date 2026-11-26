@@ -107,6 +107,10 @@ pub enum OntologyCmd {
         /// Also classify with the assertions the store holds
         #[arg(long)]
         assertions: bool,
+        /// Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom
+        /// outside OWL 2 EL
+        #[arg(long)]
+        el_only: bool,
         /// Write the taxonomy to this named graph in one commit
         #[arg(long)]
         target: Option<String>,
@@ -432,6 +436,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             at,
             read,
             assertions,
+            el_only,
             target,
             message,
             about,
@@ -490,7 +495,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     .transpose()?,
                 message: message.clone(),
                 about: about.clone(),
-                el_only: false,
+                el_only,
                 partial,
                 strict,
                 skip_coverage: false,
@@ -561,6 +566,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     body["limit"] = json!(MAX_LIMIT);
                     if partial {
                         body["partial"] = json!(true);
+                    }
+                    if el_only {
+                        body["elOnly"] = json!(true);
                     }
                     if strict {
                         body["strict"] = json!(true);

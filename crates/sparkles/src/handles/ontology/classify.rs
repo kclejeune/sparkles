@@ -89,8 +89,8 @@ pub struct ClassifyRequest {
     pub about: Option<String>,
     /// classify by the OWL 2 EL rules alone, as ELK does, with every axiom outside
     /// OWL 2 EL left out; the default also takes the Horn axioms outside OWL 2 EL
-    /// ([`sparkles_owl::classify::Limits::el_only`]). Such a run does not use the
-    /// dataset's kept classification.
+    /// ([`sparkles_owl::classify::Limits::el_only`]). The dataset keeps EL-only
+    /// classifications separately from default runs.
     pub el_only: bool,
     /// a classification run (EL, Horn, or disjunctive) that its deadline, cancellation or
     /// memory budget stops after saturation begins answers with what it proved, a
@@ -243,6 +243,8 @@ fn result_controls(opts: &QueryOptions, complete: bool) -> QueryOptions {
 /// copying them.
 pub struct CacheEntry {
     pub(super) key: InputKey,
+    pub(super) el_only: bool,
+    pub(super) retained_bytes: usize,
     pub(super) mutated: bool,
     ontology: Option<Arc<sparkles_owl::read::Ontology>>,
     /// the axioms beyond the ontology's that the saturation last read, such as a DL
@@ -255,9 +257,11 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
-    pub(super) fn new(key: InputKey) -> Self {
+    pub(super) fn new(key: InputKey, el_only: bool) -> Self {
         Self {
             key,
+            el_only,
+            retained_bytes: 0,
             mutated: false,
             ontology: None,
             extra: Vec::new(),
@@ -379,11 +383,7 @@ impl Ontologies {
         opts.graphs = opts.graphs.as_ref().map(|access| access.bound(&snap));
         let o = self.open_at(&snap, req, &opts)?;
         // a run that skips the modules' pass answers differently, so it is not kept
-        let keep = opts.graphs.is_none()
-            && snap.cacheable
-            && !c.assertions
-            && !c.el_only
-            && !c.skip_coverage;
+        let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.skip_coverage;
         let (publication, reused) = if keep {
             self.classify_kept(&o, req, c, &opts)?
         } else {
@@ -443,6 +443,7 @@ impl Ontologies {
                 .state()
                 .classify_cache
                 .lock()
+                .slot(c.el_only)
                 .publication
                 .as_ref()
                 .is_some_and(|p| p.id == publication.id);
@@ -484,16 +485,24 @@ impl Ontologies {
         let key = InputKey::of(self, req, &o.snapshot);
         let state = self.ds.state();
         if let Some(_idle) = state.classify_flight.try_lock() {
-            let cached = state.classify_cache.lock().publication.clone();
-            if let Some(p) =
-                cached.filter(|p| p.source.input == key && p.source.commit == o.snapshot.commit)
-            {
+            let cached = state
+                .classify_cache
+                .lock()
+                .slot(c.el_only)
+                .publication
+                .clone();
+            if let Some(p) = cached.filter(|p| {
+                p.source.input == key
+                    && p.source.commit == o.snapshot.commit
+                    && p.source.el_only == c.el_only
+            }) {
                 return Ok((p, true));
             }
         }
-        self.with_kept(o, req, opts, "classify", |e| {
+        self.with_kept(o, req, c.el_only, opts, "classify", |e| {
             if let Some(p) = &e.result
                 && p.source.commit == o.snapshot.commit
+                && p.source.el_only == c.el_only
             {
                 return Ok(((p.clone(), true), true));
             }
@@ -553,12 +562,15 @@ impl Ontologies {
                 Arc::new(excluded),
                 opts,
             )?;
-            let keep = p.classification.complete_for_taken
-                && classification_retained_bytes(e, &p) <= retention_cap();
+            let retained_bytes = classification_retained_bytes(e, &p);
+            let keep = p.classification.complete_for_taken && retained_bytes <= retention_cap();
             // A modules' pass that the deadline stopped answers by timing, so the next
             // request takes the pass again over the kept saturation.
             let publish = keep && !p.classification.stats.coverage_stopped;
             e.result = publish.then(|| p.clone());
+            if keep {
+                e.retained_bytes = retained_bytes;
+            }
             Ok(((p, false), keep))
         })
     }
@@ -570,6 +582,7 @@ impl Ontologies {
         &self,
         o: &Opened,
         req: &OntologyRequest,
+        el_only: bool,
         opts: &QueryOptions,
         kind: &'static str,
         f: impl FnOnce(&mut CacheEntry) -> Result<(T, bool)>,
@@ -593,7 +606,7 @@ impl Ontologies {
             check(opts)?;
         };
         check(opts)?;
-        let mut flight = KeptFlight::begin(state, lock, key, o.snapshot.commit, kind);
+        let mut flight = KeptFlight::begin(state, lock, key, el_only, o.snapshot.commit, kind);
         match f(flight.entry()) {
             Ok((out, keep)) => {
                 flight.finish(keep);
@@ -928,9 +941,16 @@ pub(super) fn saturate(
     axioms: &[&AxiomKind],
     changes: Option<Changes<'_>>,
     par: Par,
+    el_only: bool,
     opts: &QueryOptions,
 ) -> Result<sparkles_owl::classify::Saturated> {
-    bounded(par, opts, |limits| k.saturate(axioms, changes, limits))
+    bounded(par, opts, |limits| {
+        let limits = Limits {
+            el_only,
+            ..limits.clone()
+        };
+        k.saturate(axioms, changes, &limits)
+    })
 }
 
 /// Calls `f` on the threads of `par` with the limits of `opts`: its deadline,
