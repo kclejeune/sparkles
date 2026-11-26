@@ -1057,12 +1057,12 @@ pub(crate) struct Eval<'a> {
     /// the base-tier blocks builtins read last
     bmemo: Memo,
     /// the members of the RDF lists builtins read
-    lists: FxHashMap<u64, Option<std::rc::Rc<[u64]>>>,
+    lists: FxHashMap<u64, Option<Arc<[u64]>>>,
     /// when set, read RDF lists only from explicit (`base` and flagged) rows
     explicit_lists: bool,
-    /// when set, override the members of listed heads (used to enumerate old list-rule
-    /// instances before a list change)
-    list_override: Option<&'a FxHashMap<u64, Option<std::rc::Rc<[u64]>>>>,
+    /// when set, override the members of listed heads (used to share precomputed explicit
+    /// list views across preparation, backward proof, and replay)
+    list_override: Option<&'a FxHashMap<u64, Option<Arc<[u64]>>>>,
     /// stop at this plan step and keep the bindings instead, up to this many
     pub collect_at: Option<(usize, usize)>,
     pub collected: Vec<Vec<u64>>,
@@ -1171,7 +1171,7 @@ impl<'a> Eval<'a> {
     /// Override the members of RDF list heads present in `map`.
     pub(crate) fn set_list_override(
         &mut self,
-        map: Option<&'a FxHashMap<u64, Option<std::rc::Rc<[u64]>>>>,
+        map: Option<&'a FxHashMap<u64, Option<Arc<[u64]>>>>,
     ) {
         self.list_override = map;
     }
@@ -1194,10 +1194,12 @@ impl<'a> Eval<'a> {
 
     /// The members of the RDF list at `head` among the visible rows, or `None` when it
     /// is not a well-formed list.
-    pub fn list(&mut self, head: u64) -> Option<std::rc::Rc<[u64]>> {
+    pub fn list(&mut self, head: u64) -> Option<Arc<[u64]>> {
         if let Some(ov) = self.list_override
             && let Some(l) = ov.get(&head)
         {
+            #[cfg(test)]
+            self.g.list_probe.record_list_override_hit();
             return l.clone();
         }
         if let Some(l) = self.lists.get(&head) {
@@ -1223,7 +1225,7 @@ impl<'a> Eval<'a> {
                 self.end,
             )
         }
-        .map(std::rc::Rc::<[u64]>::from);
+        .map(Arc::<[u64]>::from);
         if self.lists.len() >= REMEMBER_LOOKUPS {
             self.forget();
         }

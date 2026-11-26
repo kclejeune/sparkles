@@ -86,6 +86,10 @@ pub(crate) struct Graph {
     /// the graph's heap, charged to the run's budget. Returned only after every owned
     /// graph payload above has been destroyed.
     held: Held,
+    /// per-graph atomic list lookup instrumentation for tests (captures Rayon workers
+    /// without cross-test interference)
+    #[cfg(test)]
+    pub(crate) list_probe: ListProbe,
 }
 
 impl Default for Graph {
@@ -101,6 +105,8 @@ impl Default for Graph {
             in_base: shards(),
             live: 0,
             pending: None,
+            #[cfg(test)]
+            list_probe: ListProbe::default(),
         }
     }
 }
@@ -280,6 +286,8 @@ impl Graph {
             relations: false,
             hides: false,
             held,
+            #[cfg(test)]
+            list_probe: ListProbe::default(),
         })
     }
 
@@ -1366,6 +1374,8 @@ impl Graph {
         nil: u64,
         hi: u32,
     ) -> Option<Vec<u64>> {
+        #[cfg(test)]
+        self.list_probe.record_explicit_list_walk();
         self.list_filtered(memo, head, first, rest, nil, hi, true)
     }
 
@@ -1422,7 +1432,7 @@ impl Graph {
         let mut best: Option<(u32, u64)> = None;
         for i in self.cands(Some(s), Some(p), None, 0, hi).iter() {
             #[cfg(test)]
-            FIRST_OBJECT_CANDS.with(|c| c.set(c.get() + 1));
+            self.list_probe.record_first_object_cand();
             if self.alive(i) && (!explicit_only || self.flagged(i)) {
                 let t = self.triple(i);
                 if t[0] == s && t[1] == p && best.is_none_or(|(bi, _)| i < bi) {
@@ -1435,13 +1445,120 @@ impl Graph {
 }
 
 #[cfg(test)]
-thread_local! {
-    static FIRST_OBJECT_CANDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ListProbePhase {
+    Other = 0,
+    Prepare = 1,
+    Proof = 2,
+    Replay = 3,
 }
 
 #[cfg(test)]
-pub(crate) fn take_first_object_cands() -> u64 {
-    FIRST_OBJECT_CANDS.with(|c| c.replace(0))
+pub(crate) struct ListProbe {
+    phase: std::sync::atomic::AtomicU8,
+    first_object_cands: [std::sync::atomic::AtomicU64; 4],
+    explicit_list_walks: [std::sync::atomic::AtomicU64; 4],
+    list_override_hits: [std::sync::atomic::AtomicU64; 4],
+    removed_list_checks: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl Default for ListProbe {
+    fn default() -> Self {
+        Self {
+            phase: std::sync::atomic::AtomicU8::new(ListProbePhase::Other as u8),
+            first_object_cands: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            explicit_list_walks: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            list_override_hits: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            removed_list_checks: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ListProbePhaseGuard<'a> {
+    probe: &'a ListProbe,
+    prev: u8,
+}
+
+#[cfg(test)]
+impl Drop for ListProbePhaseGuard<'_> {
+    fn drop(&mut self) {
+        self.probe
+            .phase
+            .store(self.prev, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl ListProbe {
+    pub(crate) fn enter_phase(&self, phase: ListProbePhase) -> ListProbePhaseGuard<'_> {
+        let prev = self
+            .phase
+            .swap(phase as u8, std::sync::atomic::Ordering::AcqRel);
+        ListProbePhaseGuard { probe: self, prev }
+    }
+
+    #[inline]
+    fn phase_idx(&self) -> usize {
+        (self.phase.load(std::sync::atomic::Ordering::Acquire) as usize).min(3)
+    }
+
+    #[inline]
+    pub(crate) fn record_first_object_cand(&self) {
+        self.first_object_cands[self.phase_idx()]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_explicit_list_walk(&self) {
+        self.explicit_list_walks[self.phase_idx()]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_list_override_hit(&self) {
+        self.list_override_hits[self.phase_idx()]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_removed_list_check(&self) {
+        self.removed_list_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn reset(&self) {
+        for c in &self.first_object_cands {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        for c in &self.explicit_list_walks {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        for c in &self.list_override_hits {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.removed_list_checks
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn first_object_cands(&self, phase: ListProbePhase) -> u64 {
+        self.first_object_cands[phase as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn explicit_list_walks(&self, phase: ListProbePhase) -> u64 {
+        self.explicit_list_walks[phase as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn list_override_hits(&self, phase: ListProbePhase) -> u64 {
+        self.list_override_hits[phase as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn removed_list_checks(&self) -> u64 {
+        self.removed_list_checks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]

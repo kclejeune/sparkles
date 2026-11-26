@@ -978,9 +978,9 @@ struct Deletion {
 /// (F16 §7.3).
 struct ChangedLists {
     heads: Vec<u64>,
-    old_members: FxHashMap<u64, Option<std::rc::Rc<[u64]>>>,
+    old_members: FxHashMap<u64, Option<Arc<[u64]>>>,
     old_held: Held,
-    new_members: FxHashMap<u64, Option<std::rc::Rc<[u64]>>>,
+    new_members: FxHashMap<u64, Option<Arc<[u64]>>>,
     _new_held: Held,
     removed_lists: FxHashSet<Triple>,
     removed_lists_held: Held,
@@ -1069,7 +1069,7 @@ impl<'a> Program for TierProgram<'a> {
                     return false;
                 }
                 #[cfg(test)]
-                tests::REMOVED_LIST_CHECKS.with(|n| n.set(n.get() + 1));
+                c.graph.list_probe.record_removed_list_check();
                 !self.removed_lists.contains(t)
             })
         {
@@ -1124,9 +1124,15 @@ impl<'a> Program for TierProgram<'a> {
         out: &mut Vec<Option<()>>,
     ) -> anyhow::Result<()> {
         let c: &Closure = store.c;
+        #[cfg(test)]
+        let _probe_guard = c
+            .graph
+            .list_probe
+            .enter_phase(crate::graph::ListProbePhase::Proof);
         let limits = cx.limits;
         let budget = &limits.budget;
         let explicit_lists = self.lists;
+        let list_override = self.changed_lists.as_ref().map(|cl| &cl.new_members);
         let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
         let is_list = |t: &Triple| t[1] == first || t[1] == rest;
         let Some(Deletion {
@@ -1183,6 +1189,7 @@ impl<'a> Program for TierProgram<'a> {
                 plans,
                 ops_ref,
                 explicit_lists,
+                list_override,
                 abort,
                 limits,
                 bound,
@@ -1197,6 +1204,7 @@ impl<'a> Program for TierProgram<'a> {
                 plans,
                 ops: ops_ref,
                 explicit_lists,
+                list_override,
                 abort,
                 cancel: limits.cancel.as_deref(),
                 budget,
@@ -1320,6 +1328,11 @@ impl<'a> Program for TierProgram<'a> {
             && (any_checked(cx.inserted, cx.limits, is_list)?
                 || any_checked(cx.removed, cx.limits, is_list)?)
         {
+            #[cfg(test)]
+            let _probe_guard = c
+                .graph
+                .list_probe
+                .enter_phase(crate::graph::ListProbePhase::Prepare);
             let b = prep_bound.get_or_insert_with(|| Bound::for_closure(c, budget));
             let mut changed =
                 changed_lists(c, cx.inserted, cx.removed, cx.multi_graph, cx.limits, b)?;
@@ -1332,9 +1345,11 @@ impl<'a> Program for TierProgram<'a> {
             if !changed.heads.is_empty() {
                 let (frontier, frontier_held) =
                     eval_list_rules_old(c, rules, &changed, cx.limits, b)?;
-                changed.drop_old();
                 self.list_frontier = frontier;
                 self.list_frontier_held = Some(frontier_held);
+            }
+            changed.drop_old();
+            if !changed.new_members.is_empty() {
                 self.changed_lists = Some(changed);
             }
         }
@@ -1488,28 +1503,11 @@ impl<'a> Program for TierProgram<'a> {
         };
         // Per-list tracking (F16 §7.3): evaluate list-reading rules for changed explicit
         // lists using their new member sequences so newly enabled instances enter `start..`.
-        if let Some(changed) = self.changed_lists.take() {
-            // `changed.new_members` was computed against the current snapshot's base tier
-            // plus flagged rows before `fresh` was appended. It remains exact for replay
-            // as long as no newly appended `fresh` list triple is absent from `base` (when
-            // `base` holds a list triple, `Graph::first_object` already resolves from
-            // `base` first).
-            let reuse_new_members = match c.graph.base() {
-                Some(base) => {
-                    let mut valid = true;
-                    let mut bmemo = Memo::default();
-                    for r in start..inferred_origin {
-                        let t = c.graph.triple(r);
-                        if is_list(&t) && !base.contains_with(&mut bmemo, &t)? {
-                            valid = false;
-                            break;
-                        }
-                    }
-                    base.add_scans(bmemo.scans);
-                    valid
-                }
-                None => !(start..inferred_origin).any(|r| is_list(&c.graph.triple(r))),
-            };
+        if let Some(changed) = self.changed_lists.take()
+            && !changed.heads.is_empty()
+        {
+            let reuse_new_members =
+                replay_new_members_valid(c, start, inferred_origin, eff_limits)?;
             eval_list_rules_new(
                 c,
                 rules,
@@ -2003,6 +2001,7 @@ fn prove_all(
     plans: &Plans,
     ops: Option<&DeletionOps>,
     explicit_lists: bool,
+    list_override: Option<&FxHashMap<u64, Option<Arc<[u64]>>>>,
     abort: &AtomicBool,
     limits: &Limits,
     bound: &Bound,
@@ -2022,6 +2021,7 @@ fn prove_all(
             plans,
             ops,
             explicit_lists,
+            list_override,
             abort,
             cancel: limits.cancel.as_deref(),
             budget,
@@ -2105,6 +2105,8 @@ struct Cx<'a> {
     ops: Option<&'a DeletionOps>,
     /// read RDF lists only from explicit (`base` and flagged) rows
     explicit_lists: bool,
+    /// precomputed new-snapshot explicit list members for affected heads
+    list_override: Option<&'a FxHashMap<u64, Option<Arc<[u64]>>>>,
     abort: &'a AtomicBool,
     cancel: Option<&'a AtomicBool>,
     budget: &'a Arc<Budget>,
@@ -2569,6 +2571,7 @@ impl Search {
                     cx.budget,
                 );
                 ev.set_explicit_lists(cx.explicit_lists);
+                ev.set_list_override(cx.list_override);
                 ev.lend_memo(memo);
                 ev.run(0, &mut b, None);
                 (ev.err.take(), ev.take_memo())
@@ -2752,6 +2755,86 @@ fn any_checked<T>(
         }
     }
     Ok(false)
+}
+
+/// Whether `changed.new_members` (computed in `prepare` against `base` plus flagged rows
+/// before `fresh` was appended in `saturate`) remains exact for list-rule replay over
+/// `start..end`. Polls [`Limits::stopped`] at bounded intervals so a long fresh insertion
+/// or bulk list edit cannot delay cancellation or deadlines.
+fn replay_new_members_valid(
+    c: &Closure,
+    start: u32,
+    end: u32,
+    limits: &Limits,
+) -> anyhow::Result<bool> {
+    replay_new_members_valid_with(c, start, end, limits, |_| {})
+}
+
+fn replay_new_members_valid_with(
+    c: &Closure,
+    start: u32,
+    end: u32,
+    limits: &Limits,
+    mut on_row: impl FnMut(u32),
+) -> anyhow::Result<bool> {
+    const MASK: usize = (VISIT_BATCH as usize) - 1;
+    const BASE_PROBE_POLL: usize = 64;
+    let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
+    let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+    match c.graph.base() {
+        Some(base) => {
+            let mut valid = true;
+            let mut bmemo = Memo::default();
+            let mut err: Option<anyhow::Error> = None;
+            let mut probes = 0usize;
+            for (i, r) in (start..end).enumerate() {
+                if i & MASK == 0 && limits.stopped() {
+                    err = Some(limits.stop_error());
+                    break;
+                }
+                on_row(r);
+                let t = c.graph.triple(r);
+                if is_list(&t) {
+                    probes += 1;
+                    if probes >= BASE_PROBE_POLL {
+                        probes = 0;
+                        if limits.stopped() {
+                            err = Some(limits.stop_error());
+                            break;
+                        }
+                    }
+                    match base.contains_with(&mut bmemo, &t) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            valid = false;
+                            break;
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            base.add_scans(bmemo.scans);
+            if let Some(e) = err {
+                return Err(e);
+            }
+            Ok(valid)
+        }
+        None => {
+            for (i, r) in (start..end).enumerate() {
+                if i & MASK == 0 && limits.stopped() {
+                    return Err(limits.stop_error());
+                }
+                on_row(r);
+                if is_list(&c.graph.triple(r)) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// List-head slots (`args[0]`) read by list builtins in `r`.
@@ -3142,8 +3225,8 @@ fn changed_lists_metered(
     let mut new_held = Held::new(budget);
     let mut removed_lists_held = Held::new(budget);
     let mut heads: Vec<u64> = Vec::new();
-    let mut old_members: FxHashMap<u64, Option<std::rc::Rc<[u64]>>> = FxHashMap::default();
-    let mut new_members: FxHashMap<u64, Option<std::rc::Rc<[u64]>>> = FxHashMap::default();
+    let mut old_members: FxHashMap<u64, Option<Arc<[u64]>>> = FxHashMap::default();
+    let mut new_members: FxHashMap<u64, Option<Arc<[u64]>>> = FxHashMap::default();
     let mut removed_lists: FxHashSet<Triple> = FxHashSet::default();
     let g = &c.graph;
     let mut memo = Memo::default();
@@ -3325,7 +3408,7 @@ fn changed_lists_metered(
                 .map_or(0, |v| v.len() * size_of::<u64>() + 16);
             new_held.try_grow(new_bytes)?;
             reserve_map_charged(&mut new_members, &h, &mut new_held)?;
-            let new_rc = new_m.map(std::rc::Rc::<[u64]>::from);
+            let new_rc = new_m.map(Arc::<[u64]>::from);
             reserve_map_charged(&mut old_members, &h, &mut old_held)?;
             let old_rc = if same {
                 new_rc.clone()
@@ -3334,7 +3417,7 @@ fn changed_lists_metered(
                     .as_ref()
                     .map_or(0, |v| v.len() * size_of::<u64>() + 16);
                 old_held.try_grow(old_bytes)?;
-                old_m.map(std::rc::Rc::<[u64]>::from)
+                old_m.map(Arc::<[u64]>::from)
             };
             new_members.insert(h, new_rc);
             old_members.insert(h, old_rc);
@@ -3485,6 +3568,10 @@ fn eval_list_rules_new(
     let mut fresh: Vec<Triple> = Vec::new();
     {
         let g = &c.graph;
+        #[cfg(test)]
+        let _probe_guard = g
+            .list_probe
+            .enter_phase(crate::graph::ListProbePhase::Replay);
         let already = g.inferred_since(inferred_origin);
         let mut seen_held = Held::new(&limits.budget);
         let mut seen: FxHashSet<Triple> = FxHashSet::default();
@@ -4036,13 +4123,6 @@ pub(crate) mod tests {
         /// The memory bound of the deletions this thread starts, in place of the closure's.
         pub(crate) static HELD_BOUND: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
-        /// Count of indexed removed-list membership checks in `consequences_batch`.
-        pub(crate) static REMOVED_LIST_CHECKS: std::cell::Cell<u64> =
-            const { std::cell::Cell::new(0) };
-    }
-
-    fn take_removed_list_checks() -> u64 {
-        REMOVED_LIST_CHECKS.with(|c| c.replace(0))
     }
 
     /// A removal whose search holds more than the deletion's memory bound stops the
@@ -4990,168 +5070,484 @@ pub(crate) mod tests {
             b_large.visits()
         );
 
-        // Also exercise the live `TierProgram::prepare` / `update` path for removal-only
-        // shared-tail edits: verify exact equivalence with full materialization and O(M)
-        // visits instead of Θ(N * M).
+        // Also exercise the live `TierProgram::prepare` / `prove_batch` / `saturate` path
+        // for removal-only and replacement shared-tail edits across explicit 1-thread and
+        // multi-thread Rayon pools and multiple removal sizes, using per-graph atomic
+        // probes to capture worker activity and verify exact triple-set equivalence with
+        // full materialization.
+        let live_derived_terms = |c: &Closure| -> Vec<(String, String, String)> {
+            let mut out: Vec<(String, String, String)> = (c.graph.offset()..c.graph.len())
+                .filter(|&r| c.graph.alive(r))
+                .map(|r| {
+                    let [s, p, o] = c.graph.triple(r);
+                    (
+                        c.terms.term(s).unwrap().to_string(),
+                        c.terms.term(p).unwrap().to_string(),
+                        c.terms.term(o).unwrap().to_string(),
+                    )
+                })
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        let full_derived_terms =
+            |snap: &Arc<Snapshot>, rule_text: &str| -> Vec<(String, String, String)> {
+                let tf = Terms::new(snap.clone());
+                let rf = compiled(rule_text, &tf);
+                let gf = Graph::with_base(Arc::new(
+                    Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+                ));
+                let mut cf = Closure::new(gf, tf).unwrap();
+                engine::run(&mut cf.graph, &rf, &cf.terms, &limits(), None).unwrap();
+                live_derived_terms(&cf)
+            };
+
+        let run_live_shared_tail = |threads: usize, m_removed: usize| {
+            use crate::graph::ListProbePhase;
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let live_store = Store::in_memory(StoreOptions::default());
+                let items = "http://ex.org/items";
+                let out_p = "http://ex.org/hasMember";
+                let rdf_first = format!("{RDF}first");
+                let rdf_rest = format!("{RDF}rest");
+                let rdf_nil = format!("{RDF}nil");
+                let tail_iri = "http://ex.org/tail";
+                let mut nq = format!("<{tail_iri}> <{rdf_rest}> <{rdf_nil}> .\n");
+                for i in 0..20usize {
+                    nq.push_str(&format!(
+                        "<http://ex.org/owner{i}> <{items}> <http://ex.org/head{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/head{i}> <{rdf_first}> <http://ex.org/val{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/head{i}> <{rdf_rest}> <{tail_iri}> .\n"
+                    ));
+                }
+                for j in 0..m_removed {
+                    nq.push_str(&format!(
+                        "<{tail_iri}> <{rdf_first}> <http://ex.org/mv{j}> .\n"
+                    ));
+                }
+                live_store
+                    .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+                    .unwrap();
+                let snap0 = live_store.snapshot();
+                let t0 = Terms::new(snap0.clone());
+                let ltext = "@prefix ex: <http://ex.org/>.\n\
+                             [m: (?c ex:items ?l), listMember(?l, ?x) -> (?c ex:hasMember ?x)]";
+                let lrules0 = compiled(ltext, &t0);
+                let g0 = Graph::with_base(Arc::new(
+                    Base::new(snap0.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+                ));
+                let mut c0 = Closure::new(g0, t0).unwrap();
+                engine::run(&mut c0.graph, &lrules0, &c0.terms, &limits(), None).unwrap();
+                let tail_id = snap0.lookup_iri(tail_iri).unwrap().0;
+                let first_id = snap0.lookup_iri(&rdf_first).unwrap().0;
+                let rem_ids: Vec<Triple> = (0..m_removed)
+                    .map(|j| {
+                        [
+                            tail_id,
+                            first_id,
+                            snap0.lookup_iri(&format!("http://ex.org/mv{j}")).unwrap().0,
+                        ]
+                    })
+                    .collect();
+                let mut txn = live_store.write();
+                for &[s, p, o] in &rem_ids {
+                    txn.delete([Id(s), Id(p), Id(o), Id::DEFAULT_GRAPH])
+                        .unwrap();
+                }
+                txn.commit().unwrap();
+                let snap1 = live_store.snapshot();
+                let moved = c0.terms.rebase(snap1.clone()).unwrap();
+                c0.remap(&moved).unwrap();
+                c0.set_inputs(snap1.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+                let lrules1 = compiled(ltext, &c0.terms);
+                c0.graph.list_probe.reset();
+                let up = update(&mut c0, &lrules1, &lim, &[], &rem_ids, None).unwrap();
+                let proof_cands = c0.graph.list_probe.first_object_cands(ListProbePhase::Proof);
+                let proof_walks = c0
+                    .graph
+                    .list_probe
+                    .explicit_list_walks(ListProbePhase::Proof);
+                let proof_hits = c0
+                    .graph
+                    .list_probe
+                    .list_override_hits(ListProbePhase::Proof);
+                let replay_cands = c0
+                    .graph
+                    .list_probe
+                    .first_object_cands(ListProbePhase::Replay);
+                let replay_walks = c0
+                    .graph
+                    .list_probe
+                    .explicit_list_walks(ListProbePhase::Replay);
+                let replay_hits = c0
+                    .graph
+                    .list_probe
+                    .list_override_hits(ListProbePhase::Replay);
+                let rem_checks = c0.graph.list_probe.removed_list_checks();
+                // Without per-cell caching, 20 heads * m_removed unflagged rows would add
+                // Θ(N * M) visits; with caching, visits stay O(M).
+                let visit_cap = (m_removed as u64) * 5 + 2_000;
+                assert!(
+                    up.visited < visit_cap,
+                    "threads={threads} M={m_removed}: live removal-only shared tail rescanned unflagged rows: visits={} (cap={visit_cap})",
+                    up.visited
+                );
+                // Both backward proof (across all Rayon workers) and forward replay must
+                // reuse `changed.new_members` with zero candidate scans or fallback walks.
+                assert_eq!(
+                    proof_cands, 0,
+                    "threads={threads} M={m_removed}: backward proof rescanned dead tail rows: proof_cands={proof_cands}"
+                );
+                assert_eq!(
+                    proof_walks, 0,
+                    "threads={threads} M={m_removed}: backward proof fell back to list_explicit: proof_walks={proof_walks}"
+                );
+                assert!(
+                    proof_hits >= 40,
+                    "threads={threads} M={m_removed}: expected >= 40 override hits in backward proof, got {proof_hits}"
+                );
+                assert_eq!(
+                    replay_cands, 0,
+                    "threads={threads} M={m_removed}: live replay rescanned dead derived list rows: replay_cands={replay_cands}"
+                );
+                assert_eq!(
+                    replay_walks, 0,
+                    "threads={threads} M={m_removed}: live replay fell back to list_explicit: replay_walks={replay_walks}"
+                );
+                assert!(
+                    replay_hits >= 20,
+                    "threads={threads} M={m_removed}: expected >= 20 override hits in removal replay, got {replay_hits}"
+                );
+                // `consequences_batch` checks each dead list triple against the indexed
+                // `removed_lists` set once instead of scanning `cx.removed` linearly.
+                assert_eq!(
+                    rem_checks, m_removed as u64,
+                    "threads={threads} M={m_removed}: expected {m_removed} indexed removed-list checks, got {rem_checks}"
+                );
+                let got_removed = live_derived_terms(&c0);
+                let expected_removed = full_derived_terms(&snap1, ltext);
+                assert_eq!(got_removed, expected_removed);
+                assert!(got_removed.is_empty());
+
+                // Also verify live shared-tail replacement (non-empty `new_members`
+                // override) proves cache reuse via override hits (not merely base-first
+                // short-circuiting) and matches exact full-materialization triples.
+                let rep_iri = "http://ex.org/replacement";
+                let mut txn2 = live_store.write();
+                let rep_id = txn2
+                    .intern(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                        rep_iri,
+                    )))
+                    .unwrap();
+                let tail_id2 = snap1.lookup_iri(tail_iri).unwrap();
+                let first_id2 = snap1.lookup_iri(&rdf_first).unwrap();
+                txn2.insert([tail_id2, first_id2, rep_id, Id::DEFAULT_GRAPH])
+                    .unwrap();
+                txn2.commit().unwrap();
+                let snap2 = live_store.snapshot();
+                let moved2 = c0.terms.rebase(snap2.clone()).unwrap();
+                c0.remap(&moved2).unwrap();
+                c0.set_inputs(snap2.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+                let lrules2 = compiled(ltext, &c0.terms);
+                let ins_rep = [[
+                    snap2.lookup_iri(tail_iri).unwrap().0,
+                    snap2.lookup_iri(&rdf_first).unwrap().0,
+                    snap2.lookup_iri(rep_iri).unwrap().0,
+                ]];
+                c0.graph.list_probe.reset();
+                let _up2 = update(&mut c0, &lrules2, &lim, &ins_rep, &[], None).unwrap();
+                assert_eq!(
+                    c0.graph.list_probe.first_object_cands(ListProbePhase::Replay),
+                    0,
+                    "threads={threads} M={m_removed}: replacement replay scanned candidate rows"
+                );
+                assert_eq!(
+                    c0.graph.list_probe.explicit_list_walks(ListProbePhase::Replay),
+                    0,
+                    "threads={threads} M={m_removed}: replacement replay fell back to list_explicit"
+                );
+                assert!(
+                    c0.graph.list_probe.list_override_hits(ListProbePhase::Replay) >= 20,
+                    "threads={threads} M={m_removed}: replacement replay did not hit cached new_members override"
+                );
+                let got_replaced = live_derived_terms(&c0);
+                let full_replaced = full_derived_terms(&snap2, ltext);
+                assert_eq!(got_replaced, full_replaced);
+                let mut expected_replaced: Vec<(String, String, String)> = Vec::with_capacity(40);
+                for i in 0..20usize {
+                    expected_replaced.push((
+                        format!("<http://ex.org/owner{i}>"),
+                        format!("<{out_p}>"),
+                        format!("<http://ex.org/val{i}>"),
+                    ));
+                    expected_replaced.push((
+                        format!("<http://ex.org/owner{i}>"),
+                        format!("<{out_p}>"),
+                        format!("<{rep_iri}>"),
+                    ));
+                }
+                expected_replaced.sort_unstable();
+                assert_eq!(got_replaced, expected_replaced);
+            });
+        };
+
+        run_live_shared_tail(1, 400);
+        run_live_shared_tail(4, 400);
+        run_live_shared_tail(4, 1_500);
+
+        // Broken shared tail with `changed.heads.is_empty()` (`old_m == None == new_m`):
+        // an unrelated deletion triggers backward proof over the affected heads, which
+        // must still reuse `changed.new_members` instead of rescanning the 400 removed
+        // unflagged `rdf:first` rows on both 1-thread and 4-thread pools.
+        for threads in [1usize, 4] {
+            use crate::graph::ListProbePhase;
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let live_store = Store::in_memory(StoreOptions::default());
+                let items = "http://ex.org/items";
+                let alt_p = "http://ex.org/alt";
+                let rdf_first = format!("{RDF}first");
+                let rdf_rest = format!("{RDF}rest");
+                let tail_iri = "http://ex.org/brokenTail";
+                let mut nq = String::new();
+                for i in 0..10usize {
+                    nq.push_str(&format!(
+                        "<http://ex.org/owner{i}> <{items}> <http://ex.org/head{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/owner{i}> <{alt_p}> <http://ex.org/val{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/head{i}> <{rdf_first}> <http://ex.org/val{i}> .\n"
+                    ));
+                    nq.push_str(&format!(
+                        "<http://ex.org/head{i}> <{rdf_rest}> <{tail_iri}> .\n"
+                    ));
+                }
+                for j in 0..400usize {
+                    nq.push_str(&format!(
+                        "<{tail_iri}> <{rdf_first}> <http://ex.org/mv{j}> .\n"
+                    ));
+                }
+                live_store
+                    .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+                    .unwrap();
+                let snap0 = live_store.snapshot();
+                let t0 = Terms::new(snap0.clone());
+                let rtext = "@prefix ex: <http://ex.org/>.\n\
+                             [m: (?c ex:items ?l), listMember(?l, ?x) -> (?c ex:hasMember ?x)]\n\
+                             [a: (?c ex:alt ?x) -> (?c ex:hasMember ?x)]";
+                let r0 = compiled(rtext, &t0);
+                let g0 = Graph::with_base(Arc::new(
+                    Base::new(snap0.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+                ));
+                let mut c0 = Closure::new(g0, t0).unwrap();
+                engine::run(&mut c0.graph, &r0, &c0.terms, &limits(), None).unwrap();
+                let tail_id = snap0.lookup_iri(tail_iri).unwrap().0;
+                let first_id = snap0.lookup_iri(&rdf_first).unwrap().0;
+                let alt_id = snap0.lookup_iri(alt_p).unwrap().0;
+                let mut rem_ids: Vec<Triple> = (0..400usize)
+                    .map(|j| {
+                        [
+                            tail_id,
+                            first_id,
+                            snap0.lookup_iri(&format!("http://ex.org/mv{j}")).unwrap().0,
+                        ]
+                    })
+                    .collect();
+                for i in 0..10usize {
+                    rem_ids.push([
+                        snap0
+                            .lookup_iri(&format!("http://ex.org/owner{i}"))
+                            .unwrap()
+                            .0,
+                        alt_id,
+                        snap0
+                            .lookup_iri(&format!("http://ex.org/val{i}"))
+                            .unwrap()
+                            .0,
+                    ]);
+                }
+                let mut txn = live_store.write();
+                for &[s, p, o] in &rem_ids {
+                    txn.delete([Id(s), Id(p), Id(o), Id::DEFAULT_GRAPH])
+                        .unwrap();
+                }
+                txn.commit().unwrap();
+                let snap1 = live_store.snapshot();
+                let moved = c0.terms.rebase(snap1.clone()).unwrap();
+                c0.remap(&moved).unwrap();
+                c0.set_inputs(snap1.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+                let r1 = compiled(rtext, &c0.terms);
+                c0.graph.list_probe.reset();
+                let _up = update(&mut c0, &r1, &lim, &[], &rem_ids, None).unwrap();
+                assert_eq!(
+                    c0.graph
+                        .list_probe
+                        .first_object_cands(ListProbePhase::Proof),
+                    0,
+                    "threads={threads}: empty-heads backward proof rescanned dead tail rows"
+                );
+                assert_eq!(
+                    c0.graph
+                        .list_probe
+                        .explicit_list_walks(ListProbePhase::Proof),
+                    0,
+                    "threads={threads}: empty-heads backward proof fell back to list_explicit"
+                );
+                assert!(
+                    c0.graph
+                        .list_probe
+                        .list_override_hits(ListProbePhase::Proof)
+                        >= 10,
+                    "threads={threads}: empty-heads backward proof missed new_members override"
+                );
+                assert_eq!(c0.graph.list_probe.removed_list_checks(), 400);
+                assert_eq!(live_derived_terms(&c0), full_derived_terms(&snap1, rtext));
+                assert!(live_derived_terms(&c0).is_empty());
+            });
+        }
+
+        // Replay visibility guard (`replay_new_members_valid`) polls cancellation and
+        // deadlines mid-scan across both store-backed (`Some(base)`) and in-memory
+        // (`None`) fresh ranges, including bulk list inserts.
         {
-            let live_store = Store::in_memory(StoreOptions::default());
-            let items = "http://ex.org/items";
-            let out_p = "http://ex.org/hasMember";
+            // (a) Store-backed non-list fresh range: cancel at row 500 stops at VISIT_BATCH.
+            let vis_store = Store::in_memory(StoreOptions::default());
+            let mut nq = String::new();
             let rdf_first = format!("{RDF}first");
-            let rdf_rest = format!("{RDF}rest");
-            let rdf_nil = format!("{RDF}nil");
-            let tail_iri = "http://ex.org/tail";
-            let mut nq = format!("<{tail_iri}> <{rdf_rest}> <{rdf_nil}> .\n");
-            for i in 0..20usize {
+            for j in 0..2_500usize {
                 nq.push_str(&format!(
-                    "<http://ex.org/owner{i}> <{items}> <http://ex.org/head{i}> .\n"
-                ));
-                nq.push_str(&format!(
-                    "<http://ex.org/head{i}> <{rdf_first}> <http://ex.org/val{i}> .\n"
-                ));
-                nq.push_str(&format!(
-                    "<http://ex.org/head{i}> <{rdf_rest}> <{tail_iri}> .\n"
+                    "<http://ex.org/l{j}> <{rdf_first}> <http://ex.org/v{j}> .\n"
                 ));
             }
-            for j in 0..400usize {
-                nq.push_str(&format!(
-                    "<{tail_iri}> <{rdf_first}> <http://ex.org/mv{j}> .\n"
-                ));
-            }
-            live_store
+            vis_store
                 .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
                 .unwrap();
-            let snap0 = live_store.snapshot();
-            let t0 = Terms::new(snap0.clone());
-            let ltext = "@prefix ex: <http://ex.org/>.\n\
-                         [m: (?c ex:items ?l), listMember(?l, ?x) -> (?c ex:hasMember ?x)]";
-            let lrules0 = compiled(ltext, &t0);
-            let g0 = Graph::with_base(Arc::new(
-                Base::new(snap0.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+            let vsnap = vis_store.snapshot();
+            let vfirst = vsnap.lookup_iri(&rdf_first).unwrap().0;
+            let mut vg_nonlist = Graph::with_base(Arc::new(
+                Base::new(vsnap.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
             ));
-            let mut c0 = Closure::new(g0, t0).unwrap();
-            engine::run(&mut c0.graph, &lrules0, &c0.terms, &limits(), None).unwrap();
-            let tail_id = snap0.lookup_iri(tail_iri).unwrap().0;
-            let first_id = snap0.lookup_iri(&rdf_first).unwrap().0;
-            let rem_ids: Vec<Triple> = (0..400usize)
+            let start_nl = vg_nonlist.len();
+            let nonlist_rows: Vec<Triple> = (0..2_500u64)
+                .map(|j| [10_000 + j, 888_888, 20_000 + j])
+                .collect();
+            vg_nonlist.try_add_batch(nonlist_rows).unwrap();
+            let end_nl = vg_nonlist.len();
+            let vc_nl = Closure::new(vg_nonlist, Terms::new(vsnap.clone())).unwrap();
+
+            let cancel_nl = Arc::new(AtomicBool::new(false));
+            let lim_nl = Limits {
+                cancel: Some(cancel_nl.clone()),
+                budget: Budget::new(Some(64 << 20)),
+                ..limits()
+            };
+            let mut seen_nl = 0usize;
+            let err_nl = replay_new_members_valid_with(&vc_nl, start_nl, end_nl, &lim_nl, |_| {
+                seen_nl += 1;
+                if seen_nl == 500 {
+                    cancel_nl.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect_err("store-backed visibility guard must poll cancel mid-scan");
+            assert!(err_nl.to_string().contains("cancelled"), "{err_nl:#}");
+            assert_eq!(seen_nl, VISIT_BATCH as usize);
+
+            // (b) Store-backed bulk list range: cancel at row 20 stops at BASE_PROBE_POLL (64).
+            let mut vg_list = Graph::with_base(Arc::new(
+                Base::new(vsnap.clone(), &[Id::DEFAULT_GRAPH]).unwrap(),
+            ));
+            let start_l = vg_list.len();
+            let bulk_list_rows: Vec<Triple> = (0..2_500usize)
                 .map(|j| {
                     [
-                        tail_id,
-                        first_id,
-                        snap0.lookup_iri(&format!("http://ex.org/mv{j}")).unwrap().0,
+                        vsnap.lookup_iri(&format!("http://ex.org/l{j}")).unwrap().0,
+                        vfirst,
+                        vsnap.lookup_iri(&format!("http://ex.org/v{j}")).unwrap().0,
                     ]
                 })
                 .collect();
-            let mut txn = live_store.write();
-            for &[s, p, o] in &rem_ids {
-                txn.delete([Id(s), Id(p), Id(o), Id::DEFAULT_GRAPH])
-                    .unwrap();
-            }
-            txn.commit().unwrap();
-            let snap1 = live_store.snapshot();
-            let moved = c0.terms.rebase(snap1.clone()).unwrap();
-            c0.remap(&moved).unwrap();
-            c0.set_inputs(snap1.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
-            let lrules1 = compiled(ltext, &c0.terms);
-            let _ = crate::graph::take_first_object_cands();
-            let _ = take_removed_list_checks();
-            let up = update(&mut c0, &lrules1, &lim, &[], &rem_ids, None).unwrap();
-            let replay_cands = crate::graph::take_first_object_cands();
-            let rem_checks = take_removed_list_checks();
-            // Without per-cell caching, 20 heads * 400 removed unflagged rows = 8,000+ extra
-            // visits; with caching, total visits stay well below 4,000.
-            assert!(
-                up.visited < 4_000,
-                "live removal-only shared tail rescanned unflagged rows: visits={}",
-                up.visited
-            );
-            // Replay must reuse `new_members` rather than rescanning all 400 dead rows for
-            // each of the 20 affected heads (`replay_cands` would be >= 8,000 otherwise).
-            assert_eq!(
-                replay_cands, 0,
-                "live replay rescanned dead derived list rows: replay_cands={replay_cands}"
-            );
-            // `consequences_batch` checks each dead list triple against the indexed
-            // `removed_lists` set once instead of scanning `cx.removed` linearly.
-            assert_eq!(
-                rem_checks, 400,
-                "expected 400 indexed removed-list checks, got {rem_checks}"
-            );
-            let out_p_id = c0
-                .terms
-                .id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-                    out_p,
-                )))
-                .unwrap();
-            assert_eq!(
-                c0.graph
-                    .cands(
-                        None,
-                        Some(out_p_id),
-                        None,
-                        c0.graph.offset(),
-                        c0.graph.len()
-                    )
-                    .iter()
-                    .filter(|&r| c0.graph.alive(r))
-                    .count(),
-                0
-            );
+            vg_list.try_add_batch(bulk_list_rows).unwrap();
+            let end_l = vg_list.len();
+            let vc_l = Closure::new(vg_list, Terms::new(vsnap.clone())).unwrap();
 
-            // Also verify live shared-tail replacement (non-empty `new_members` override)
-            // produces exact full-materialization equivalence with zero replay candidate
-            // rescans.
-            let rep_iri = "http://ex.org/replacement";
-            let mut txn2 = live_store.write();
-            let rep_id = txn2
-                .intern(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-                    rep_iri,
-                )))
-                .unwrap();
-            let tail_id2 = snap1.lookup_iri(tail_iri).unwrap();
-            let first_id2 = snap1.lookup_iri(&rdf_first).unwrap();
-            txn2.insert([tail_id2, first_id2, rep_id, Id::DEFAULT_GRAPH])
-                .unwrap();
-            txn2.commit().unwrap();
-            let snap2 = live_store.snapshot();
-            let moved2 = c0.terms.rebase(snap2.clone()).unwrap();
-            c0.remap(&moved2).unwrap();
-            c0.set_inputs(snap2.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
-            let lrules2 = compiled(ltext, &c0.terms);
-            let ins_rep = [[
-                snap2.lookup_iri(tail_iri).unwrap().0,
-                snap2.lookup_iri(&rdf_first).unwrap().0,
-                snap2.lookup_iri(rep_iri).unwrap().0,
-            ]];
-            let _ = crate::graph::take_first_object_cands();
-            let _ = take_removed_list_checks();
-            let _up2 = update(&mut c0, &lrules2, &lim, &ins_rep, &[], None).unwrap();
-            assert_eq!(
-                crate::graph::take_first_object_cands(),
-                0,
-                "live replacement replay must reuse cached new_members"
-            );
-            let out_p_id2 = c0
-                .terms
-                .id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-                    out_p,
-                )))
-                .unwrap();
-            // 20 owners * 2 members (`val_i` and `replacement`) = 40 derived `hasMember`.
-            assert_eq!(
-                c0.graph
-                    .cands(
-                        None,
-                        Some(out_p_id2),
-                        None,
-                        c0.graph.offset(),
-                        c0.graph.len()
-                    )
-                    .iter()
-                    .filter(|&r| c0.graph.alive(r))
-                    .count(),
-                40
-            );
+            let cancel_bl = Arc::new(AtomicBool::new(false));
+            let lim_bl = Limits {
+                cancel: Some(cancel_bl.clone()),
+                budget: Budget::new(Some(64 << 20)),
+                ..limits()
+            };
+            let mut seen_bl = 0usize;
+            let err_bl = replay_new_members_valid_with(&vc_l, start_l, end_l, &lim_bl, |_| {
+                seen_bl += 1;
+                if seen_bl == 20 {
+                    cancel_bl.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect_err("bulk list visibility guard must poll cancel across base probes");
+            assert!(err_bl.to_string().contains("cancelled"), "{err_bl:#}");
+            assert_eq!(seen_bl, 64);
+
+            // (c) In-memory (`None`) non-list fresh range: cancel at row 500 stops at VISIT_BATCH.
+            let mut mg = Graph::default();
+            let start_m = mg.len();
+            let mem_rows: Vec<Triple> = (0..2_500u64)
+                .map(|j| [10_000 + j, 888_888, 20_000 + j])
+                .collect();
+            mg.try_add_batch(mem_rows).unwrap();
+            let end_m = mg.len();
+            let mc = Closure::new(mg, Terms::new(vsnap.clone())).unwrap();
+
+            let cancel_m = Arc::new(AtomicBool::new(false));
+            let lim_m = Limits {
+                cancel: Some(cancel_m.clone()),
+                budget: Budget::new(Some(64 << 20)),
+                ..limits()
+            };
+            let mut seen_m = 0usize;
+            let err_m = replay_new_members_valid_with(&mc, start_m, end_m, &lim_m, |_| {
+                seen_m += 1;
+                if seen_m == 500 {
+                    cancel_m.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect_err("in-memory visibility guard must poll cancel mid-scan");
+            assert!(err_m.to_string().contains("cancelled"), "{err_m:#}");
+            assert_eq!(seen_m, VISIT_BATCH as usize);
+
+            // (d) Expired deadline stops immediately at row 0 in both branches.
+            let expired = Limits {
+                deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+                budget: Budget::new(Some(64 << 20)),
+                ..limits()
+            };
+            let mut seen_d1 = 0usize;
+            let err_d1 = replay_new_members_valid_with(&vc_nl, start_nl, end_nl, &expired, |_| {
+                seen_d1 += 1;
+            })
+            .expect_err("expired deadline must stop store-backed visibility guard");
+            assert!(err_d1.to_string().contains("deadline"), "{err_d1:#}");
+            assert_eq!(seen_d1, 0);
+
+            let mut seen_d2 = 0usize;
+            let err_d2 = replay_new_members_valid_with(&mc, start_m, end_m, &expired, |_| {
+                seen_d2 += 1;
+            })
+            .expect_err("expired deadline must stop in-memory visibility guard");
+            assert!(err_d2.to_string().contains("deadline"), "{err_d2:#}");
+            assert_eq!(seen_d2, 0);
         }
 
         // Large mixed update with 2,500 ordinary non-list triples before 1 list triple
