@@ -782,7 +782,8 @@ export interface DlQueryAnswer extends OntologyState {
     engine: 'el' | 'rl';
     title: string;
     why: string;
-    elOnly: boolean;
+    /** whether the classifier ran in EL-only (ELK) mode; always populated by the current engine */
+    elOnly?: boolean;
     complete: boolean;
     instancesComplete: boolean | null;
     gapCount: number;

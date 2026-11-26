@@ -453,9 +453,15 @@ impl Ontologies {
         let (engine, why) = match q.reasoning {
             DlReasoning::El => {
                 if let Some((rule, message)) = expression_el.first() {
-                    return Err(Error::invalid(format!(
-                        "the expression is outside OWL 2 EL ({rule}: {message}); ask for reasoning=rl or auto"
-                    )));
+                    return Err(Error::invalid(if q.el_only {
+                        format!(
+                            "the expression is outside OWL 2 EL ({rule}: {message}); leave out elOnly and use reasoning=auto or rl"
+                        )
+                    } else {
+                        format!(
+                            "the expression is outside OWL 2 EL ({rule}: {message}); ask for reasoning=rl or auto"
+                        )
+                    }));
                 }
                 (
                     DlEngine::El,
@@ -474,7 +480,7 @@ impl Ontologies {
             DlReasoning::Auto if q.el_only => {
                 if let Some((rule, message)) = expression_el.first() {
                     return Err(Error::invalid(format!(
-                        "the expression is outside OWL 2 EL ({rule}: {message}); leave out elOnly or ask for reasoning=rl"
+                        "the expression is outside OWL 2 EL ({rule}: {message}); leave out elOnly and use reasoning=auto or rl"
                     )));
                 }
                 (

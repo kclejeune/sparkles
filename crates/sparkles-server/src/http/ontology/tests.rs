@@ -3438,7 +3438,9 @@ async fn el_only_http_classify_kept_and_dl_query_reproduce_elk_separately() {
     );
     assert_eq!(strict_elk.json()["code"], "classification-incomplete");
 
-    // Selector validation rejects invalid or duplicate elOnly values.
+    // Selector validation rejects invalid, duplicate, or conflicting elOnly values on
+    // GET /classification, projection classify, and ordinary POST /classify (leaving target
+    // writes uncommitted).
     assert_eq!(
         get(&app, "/$/ontology/horn/classification?elOnly=maybe")
             .await
@@ -3455,6 +3457,33 @@ async fn el_only_http_classify_kept_and_dl_query_reproduce_elk_separately() {
         .status,
         StatusCode::BAD_REQUEST
     );
+    let head_before = ds.store.snapshot().commit;
+    for (uri, body) in [
+        (
+            "/$/ontology/horn/classify?elOnly=treu",
+            json!({"about": "http://ex.org/A", "target": "urn:elk:bad-target"}),
+        ),
+        (
+            "/$/ontology/horn/classify?elOnly=false&elOnly=true",
+            json!({"about": "http://ex.org/A", "target": "urn:elk:bad-target"}),
+        ),
+        (
+            "/$/ontology/horn/classify?elOnly=true",
+            json!({"about": "http://ex.org/A", "elOnly": false, "target": "urn:elk:bad-target"}),
+        ),
+        (
+            "/$/ontology/horn/classify?elOnly=true",
+            json!({"about": "http://ex.org/A", "elOnly": true, "target": "urn:elk:bad-target"}),
+        ),
+    ] {
+        let bad = post(&app, uri, body).await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{uri}: {}", bad.text());
+        assert_eq!(
+            ds.store.snapshot().commit,
+            head_before,
+            "{uri} must not write target"
+        );
+    }
 
     // DL query: default reasoning="el" derives :A; elOnly=true reproduces ELK and omits :A.
     let q_horn = post(

@@ -499,6 +499,8 @@ impl PyOntologies {
 
     /// Read an existing kept classification without classifying on a miss. Page
     /// continuations require its `result_id` and exact returned commit as `at`.
+    /// With `el_only=True`, reads the kept EL-only (ELK) classification instead of
+    /// the default classification.
     #[pyo3(signature=(graph=None, *, part="status", about=None, offset=0, limit=100, result_id=None, lang=None, el_only=false, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn kept_classification<'py>(
@@ -736,7 +738,9 @@ impl PyOntologies {
     /// disjunctive rules' expansion strategy.
     /// `complete` is true only when the answer is complete for the whole ontology, and
     /// `strict` raises `UnsupportedError`, with `code` `classification-incomplete`, when
-    /// the classifier would leave an axiom out or use one only in part.
+    /// the classifier would leave an axiom out or use one only in part. With
+    /// `el_only=True`, classifies by the OWL 2 EL rules alone, reproducing ELK's taxonomy
+    /// and caching separately from default runs.
     #[pyo3(signature=(graph=None, *, assertions=false, el_only=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, partial=false, strict=false, expansion=None, projection=None, lang=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn classify<'py>(
@@ -823,7 +827,9 @@ impl PyOntologies {
     /// (`syntax="functional"`) or the JSON form (a dict). The EL classifier answers
     /// inside OWL 2 EL and the RL rules by demand outside it; `reasoning` (`auto`, `el`
     /// or `rl`) chooses, and the answer's `reasoning` names the engine, whether the
-    /// answers are complete and the axioms that can make them incomplete.
+    /// answers are complete and the axioms that can make them incomplete. With
+    /// `el_only=True`, runs the EL classifier in EL-only mode against the EL-only kept
+    /// saturation and refuses `reasoning="rl"` or expressions outside OWL 2 EL.
     #[pyo3(signature=(expression, graph=None, *, syntax=None, reasoning="auto", el_only=false, answers=None, limit=None, threads=None, max_derived=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn dl_query<'py>(

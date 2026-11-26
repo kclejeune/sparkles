@@ -104,8 +104,9 @@ rules on ontologies with individuals, functional data properties and top propert
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.
 
-Item 694 exposes EL-only (ELK) classification across every user-facing surface and keys
-the dataset's kept classification cache by `el_only`. `POST /$/ontology/{ds}/classify`,
+Item 694 exposes EL-only (ELK) classification across the Rust API, HTTP routes, CLI and
+Python, Node.js and JVM bindings and keys the dataset's kept classification cache by
+`el_only`. `POST /$/ontology/{ds}/classify`,
 `GET /$/ontology/{ds}/classification`, `POST /$/ontology/{ds}/dl-query` and
 `sparkles::handles::ontology::wire::call` accept `elOnly`, `sparkles ontology classify`
 (both standalone and chained) accepts `--el-only`, Python's `Dataset.ontology.classify`,

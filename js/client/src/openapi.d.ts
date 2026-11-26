@@ -20186,6 +20186,8 @@ export interface operations {
                 threads?: number;
                 /** @description `json` (the default) or `ofn`. */
                 format?: "json" | "ofn";
+                /** @description Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. Refused if repeated, malformed, or also set in the JSON body. */
+                elOnly?: boolean;
             };
             header?: {
                 /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */

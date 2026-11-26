@@ -43157,6 +43157,14 @@
               ],
               "type": "string"
             }
+          },
+          {
+            "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. Refused if repeated, malformed, or also set in the JSON body.",
+            "in": "query",
+            "name": "elOnly",
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "requestBody": {

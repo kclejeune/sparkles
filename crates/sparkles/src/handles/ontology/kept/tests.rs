@@ -1760,7 +1760,8 @@ fn el_only_and_full_classifications_are_keyed_separately_and_never_clobber() {
             .is_err()
     );
 
-    // Combined retention cap: when both slots together exceed the cap, storing one evicts the other.
+    // Combined retention cap: when both slots together exceed the cap, storing one evicts the
+    // other slot's saturation owner and publication while keeping the surviving slot within cap.
     struct CapRestore(usize);
     impl Drop for CapRestore {
         fn drop(&mut self) {
@@ -1785,15 +1786,110 @@ fn el_only_and_full_classifications_are_keyed_separately_and_never_clobber() {
         .as_ref()
         .unwrap()
         .retained_bytes;
-    let _restore =
-        CapRestore(TEST_RETENTION_CAP.with(|c| c.replace(full_bytes.max(el_bytes) + 64)));
-    ds.update(&format!("{BASE} INSERT DATA {{ :G a owl:Class . }}"))
+    let cap = full_bytes.max(el_bytes) + full_bytes.min(el_bytes) / 2;
+    {
+        let _restore = CapRestore(TEST_RETENTION_CAP.with(|c| c.replace(cap)));
+        ds.update(&format!("{BASE} INSERT DATA {{ :G a owl:Class . }}"))
+            .unwrap();
+        let el4 = ds.ontology().classify(&req(), &el_req, &opts()).unwrap();
+        assert!(el4.retained);
+        assert!(result_for(&ds, true).is_some());
+        assert!(
+            result_for(&ds, false).is_none(),
+            "combined cap must evict the other slot's publication"
+        );
+        let cache = ds.state().classify_cache.lock();
+        assert!(
+            cache.slot(false).entry.is_none(),
+            "combined cap must release the other slot's saturation owner"
+        );
+        assert!(cache.slot(false).publication.is_none());
+        let surviving = cache
+            .slot(true)
+            .entry
+            .as_ref()
+            .expect("surviving slot must retain its entry");
+        assert!(
+            surviving.retained_bytes <= cap,
+            "surviving slot must stay within cap: {} <= {cap}",
+            surviving.retained_bytes
+        );
+    }
+
+    // Active flight isolation: an in-flight EL-only operation must not mark the default slot running.
+    let _full_warm = ds.ontology().classify(&req(), &full_req, &opts()).unwrap();
+    ds.update(&format!("{BASE} INSERT DATA {{ :H a owl:Class . }}"))
         .unwrap();
-    let el4 = ds.ontology().classify(&req(), &el_req, &opts()).unwrap();
-    assert!(el4.retained);
-    assert!(result_for(&ds, true).is_some());
-    assert!(
-        result_for(&ds, false).is_none(),
-        "combined cap must evict the other slot"
-    );
+    let h = ds.ontology();
+    let opened = h.open(&req(), &opts()).unwrap();
+    h.with_kept(&opened, &req(), true, &opts(), "classify", |_e| {
+        let el_status = read(
+            &ds,
+            &req(),
+            &KeptQuery {
+                el_only: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(el_status.status, Status::Running);
+        let full_status = read(&ds, &req(), &KeptQuery::default());
+        assert_eq!(full_status.status, Status::Mismatch);
+        assert!(full_status.activity.is_none());
+        Ok(((), true))
+    })
+    .unwrap();
+
+    // DL refill under combined cap: retain_dl updates retained_bytes and KeptFlight::finish evicts
+    // the opposite slot's saturation owner and publication.
+    let _full_dl = ds.ontology().classify(&req(), &full_req, &opts()).unwrap();
+    let _el_dl = ds.ontology().classify(&req(), &el_req, &opts()).unwrap();
+    let full_bytes2 = ds
+        .state()
+        .classify_cache
+        .lock()
+        .slot(false)
+        .entry
+        .as_ref()
+        .unwrap()
+        .retained_bytes;
+    let el_bytes2 = ds
+        .state()
+        .classify_cache
+        .lock()
+        .slot(true)
+        .entry
+        .as_ref()
+        .unwrap()
+        .retained_bytes;
+    let dl_cap = full_bytes2.max(el_bytes2) + full_bytes2.min(el_bytes2) / 2;
+    {
+        let _restore = CapRestore(TEST_RETENTION_CAP.with(|c| c.replace(dl_cap)));
+        let mut q = super::super::dl_query::DlQueryRequest::new(
+            sparkles_owl::ClassExpression::Class(sparkles_owl::Class::new("http://ex.org/A")),
+        );
+        q.el_only = true;
+        q.answers.instances = false;
+        let answer = ds.ontology().dl_query(&req(), &q, &opts()).unwrap();
+        assert!(answer.incremental);
+        assert!(answer.reasoning.el_only);
+        let cache = ds.state().classify_cache.lock();
+        assert!(
+            cache.slot(false).entry.is_none(),
+            "DL refill under combined cap must release the other slot's saturation owner"
+        );
+        assert!(
+            cache.slot(false).publication.is_none(),
+            "DL refill under combined cap must evict the other slot's publication"
+        );
+        let surviving = cache
+            .slot(true)
+            .entry
+            .as_ref()
+            .expect("EL-only slot must stay retained after DL refill");
+        assert!(
+            surviving.retained_bytes <= dl_cap,
+            "surviving EL-only slot must stay within cap after retain_dl: {} <= {dl_cap}",
+            surviving.retained_bytes
+        );
+    }
 }

@@ -1581,6 +1581,17 @@ pub(super) async fn classify(
             Some(_) => Err(bad(format!("{k}: a string"))),
         }
     };
+    if params.all("elOnly").len() > 1 {
+        return Err(bad("duplicate selector 'elOnly'"));
+    }
+    if params.has("elOnly") && o.get("elOnly").is_some_and(|v| !v.is_null()) {
+        return Err(bad("'elOnly' appears in both query and body"));
+    }
+    if let Some(value) = params.get("elOnly")
+        && !matches!(value, "true" | "false")
+    {
+        return Err(bad("elOnly: true or false"));
+    }
     let about = text("about")?.map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string());
     let c = ClassifyRequest {
         assertions: flag("assertions")?,

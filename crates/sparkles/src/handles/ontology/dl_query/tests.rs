@@ -801,14 +801,38 @@ fn el_only_dl_query_reproduces_elk_and_keeps_full_cache_intact() {
         Err(Error::Invalid(_))
     ));
 
-    // el_only=true with an expression outside OWL 2 EL is refused.
-    let mut bad_expr = DlQueryRequest::new(ClassExpression::ObjectAllValuesFrom(
+    // el_only=true with an expression outside OWL 2 EL is refused under both Auto and El,
+    // advising callers to leave out elOnly and use reasoning=auto or rl.
+    let non_el = ClassExpression::ObjectAllValuesFrom(
         ObjectProperty::new(ex("r")).into(),
         Box::new(ClassExpression::Class(c("C"))),
-    ));
-    bad_expr.el_only = true;
-    assert!(matches!(
-        h.dl_query(&req, &bad_expr, &Default::default()),
-        Err(Error::Invalid(_))
-    ));
+    );
+    for reasoning in [DlReasoning::Auto, DlReasoning::El] {
+        let mut bad_expr = DlQueryRequest::new(non_el.clone());
+        bad_expr.reasoning = reasoning;
+        bad_expr.el_only = true;
+        let err = h
+            .dl_query(&req, &bad_expr, &Default::default())
+            .err()
+            .expect("expected EL-only refusal");
+        assert!(matches!(err, Error::Invalid(_)), "{reasoning:?}: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("leave out elOnly and use reasoning=auto or rl"),
+            "{reasoning:?}: {msg}"
+        );
+    }
+
+    // Explicit reasoning=el with el_only=false preserves its existing diagnostic.
+    let mut explicit_el = DlQueryRequest::new(non_el);
+    explicit_el.reasoning = DlReasoning::El;
+    let err = h
+        .dl_query(&req, &explicit_el, &Default::default())
+        .err()
+        .expect("expected explicit EL refusal");
+    assert!(matches!(err, Error::Invalid(_)), "{err}");
+    assert!(
+        err.to_string().contains("ask for reasoning=rl or auto"),
+        "{err}"
+    );
 }

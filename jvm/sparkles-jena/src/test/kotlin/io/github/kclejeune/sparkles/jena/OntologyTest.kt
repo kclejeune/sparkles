@@ -774,6 +774,163 @@ class OntologyTest {
             assertThrows(SparklesInvalidException::class.java) {
                 onto.dlQuery(DlQuery("r some (B and C)", reasoning = "rl", elOnly = true))
             }
+
+            // Copy preserves elOnly across the legacy copy overload and allows toggling it.
+            val qBase = DlQuery("r some (B and C)", elOnly = true)
+            assertTrue(qBase.copy(limit = 20).elOnly)
+            assertFalse(qBase.copy(limit = 20, elOnly = false).elOnly)
+            val cBase = ClassifyQuery(about = "http://ex.org/A", elOnly = true)
+            assertTrue(cBase.copy(limit = 20).elOnly)
+            assertFalse(cBase.copy(limit = 20, elOnly = false).elOnly)
+            val kBase = KeptClassificationQuery(part = "roots", elOnly = true)
+            assertTrue(kBase.copy(limit = 20).elOnly)
+            assertFalse(kBase.copy(limit = 20, elOnly = false).elOnly)
         }
+    }
+
+    /**
+     * Regression guard for M1: previously compiled Kotlin callers link against the pre-694
+     * synthetic default-argument constructors and `copy` / `copy$default` descriptors.
+     */
+    @Test fun query_classes_preserve_legacy_kotlin_binary_descriptors() {
+        val marker = Class.forName("kotlin.jvm.internal.DefaultConstructorMarker")
+
+        // DlQuery: 6-arg primary, synthetic default constructor, copy, and copy$default
+        assertNotNull(
+            DlQuery::class.java.getDeclaredConstructor(
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                marker,
+            ),
+        )
+        assertNotNull(
+            DlQuery::class.java.getDeclaredMethod(
+                "copy",
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+            ),
+        )
+        assertNotNull(
+            DlQuery::class.java.getDeclaredMethod(
+                "copy\$default",
+                DlQuery::class.java,
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Any::class.java,
+            ),
+        )
+
+        // ClassifyQuery: 13-arg synthetic default constructor, copy, and copy$default
+        assertNotNull(
+            ClassifyQuery::class.java.getDeclaredConstructor(
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                marker,
+            ),
+        )
+        assertNotNull(
+            ClassifyQuery::class.java.getDeclaredMethod(
+                "copy",
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Boolean::class.javaPrimitiveType,
+            ),
+        )
+        assertNotNull(
+            ClassifyQuery::class.java.getDeclaredMethod(
+                "copy\$default",
+                ClassifyQuery::class.java,
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Any::class.java,
+            ),
+        )
+
+        // KeptClassificationQuery: 6-arg synthetic default constructor, copy, and copy$default
+        assertNotNull(
+            KeptClassificationQuery::class.java.getDeclaredConstructor(
+                String::class.java,
+                String::class.java,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                marker,
+            ),
+        )
+        assertNotNull(
+            KeptClassificationQuery::class.java.getDeclaredMethod(
+                "copy",
+                String::class.java,
+                String::class.java,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                List::class.java,
+            ),
+        )
+        assertNotNull(
+            KeptClassificationQuery::class.java.getDeclaredMethod(
+                "copy\$default",
+                KeptClassificationQuery::class.java,
+                String::class.java,
+                String::class.java,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Any::class.java,
+            ),
+        )
     }
 }
