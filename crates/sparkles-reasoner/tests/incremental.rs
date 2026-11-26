@@ -1845,7 +1845,7 @@ fn ordered_multi_graph_list_edits_match_full_runs() {
             "case 1 initial (kept {kept})"
         );
         commit_quads(&s, &[], &[q_in(&t("ex:l", "rdf:first", "ex:a"), &g1)]);
-        let _r1 = materialize_incremental(
+        let r1 = materialize_incremental(
             &s,
             &rules,
             &extras,
@@ -1856,6 +1856,14 @@ fn ordered_multi_graph_list_edits_match_full_runs() {
             &ropts,
         )
         .unwrap();
+        assert_eq!(r1.method, Method::Full);
+        assert!(
+            r1.fallback
+                .as_deref()
+                .is_some_and(|f| f.contains("moved across input graphs")),
+            "case 1 unexpected fallback (kept {kept}): {:?}",
+            r1.fallback
+        );
         assert_eq!(
             inferred(&s),
             full_expected(&s),
@@ -1904,7 +1912,7 @@ fn ordered_multi_graph_list_edits_match_full_runs() {
                 q_in(&t("ex:l", "rdf:first", "ex:a_low"), &g2),
             ],
         );
-        let _r1 = materialize_incremental(
+        let r1 = materialize_incremental(
             &s2,
             &rules,
             &extras,
@@ -1915,6 +1923,14 @@ fn ordered_multi_graph_list_edits_match_full_runs() {
             &ropts,
         )
         .unwrap();
+        assert_eq!(r1.method, Method::Full);
+        assert!(
+            r1.fallback
+                .as_deref()
+                .is_some_and(|f| f.contains("branching RDF list")),
+            "case 2 unexpected fallback (kept {kept}): {:?}",
+            r1.fallback
+        );
         assert_eq!(
             inferred(&s2),
             full_expected(&s2),
@@ -2092,4 +2108,84 @@ fn list_replay_and_revival_enforce_max_inferred() {
         rev_err.to_string().contains("inferred") || rev_err.to_string().contains("limit"),
         "unexpected error: {rev_err:#}"
     );
+}
+
+/// Cross-rule duplicates during list replay (`eval_list_rules_new`) are deduplicated before
+/// enforcing `max_inferred`, so 1,200 subjects derived by two rules with identical heads
+/// succeed at `max_inferred = 1200` and fail at `max_inferred = 1199`.
+#[test]
+fn list_replay_deduplicates_across_rules_at_exact_max_inferred() {
+    let rdf_nil = format!("{RDF}nil");
+    let nil = rdf_nil.as_str();
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [r1: (?c ex:items1 ?l), listMember(?l, ex:x) -> (?c ex:hit ex:ok)]
+         [r2: (?c ex:items2 ?l), listMember(?l, ex:x) -> (?c ex:hit ex:ok)]"
+            .into(),
+    );
+    let setup = || {
+        let (d, s) = persistent();
+        let cache = Cache::default();
+        let mut initial: Vec<Triple> = Vec::with_capacity(2_402);
+        initial.push(t("ex:l0", "rdf:first", "ex:y"));
+        initial.push(t("ex:l0", "rdf:rest", nil));
+        for i in 0..1_200 {
+            let c = format!("ex:c{i}");
+            initial.push(t(&c, "ex:items1", "ex:l0"));
+            initial.push(t(&c, "ex:items2", "ex:l0"));
+        }
+        change(&s, &initial, &[]);
+        let r0 = run(&s, &rules, None, Some(&cache));
+        let since = r0.receipt.unwrap().commit.seq;
+        change(
+            &s,
+            &[t("ex:l0", "rdf:first", "ex:x")],
+            &[t("ex:l0", "rdf:first", "ex:y")],
+        );
+        (d, s, cache, since)
+    };
+
+    // 1. At `max_inferred = 1199`, the 1,200 distinct heads must fail with the limit error.
+    let (_d_low, s_low, cache_low, since_low) = setup();
+    let too_low = ReasonOptions {
+        max_inferred: 1_199,
+        ..ReasonOptions::default()
+    };
+    let err = materialize_incremental(
+        &s_low,
+        &rules,
+        &Extras::default(),
+        Incremental {
+            since: Some(since_low),
+            cache: Some(&cache_low),
+        },
+        &too_low,
+    )
+    .expect_err("1,200 distinct heads must fail when max_inferred = 1199");
+    assert!(
+        err.to_string().contains("inferred") || err.to_string().contains("limit"),
+        "unexpected error: {err:#}"
+    );
+
+    // 2. At `max_inferred = 1200`, the second rule's 1,200 duplicates must deduplicate
+    //    against the first rule's staged output so the incremental run succeeds.
+    let (_d, s, cache, since) = setup();
+    let exact = ReasonOptions {
+        max_inferred: 1_200,
+        ..ReasonOptions::default()
+    };
+    let r1 = materialize_incremental(
+        &s,
+        &rules,
+        &Extras::default(),
+        Incremental {
+            since: Some(since),
+            cache: Some(&cache),
+        },
+        &exact,
+    )
+    .expect("exact max_inferred = 1200 with cross-rule duplicates must succeed");
+    assert_eq!(r1.method, Method::Incremental, "{:?}", r1.fallback);
+    assert_eq!(r1.inferred, 1_200);
+    check(&s, &rules, &r1, "exact max_inferred list replay");
 }

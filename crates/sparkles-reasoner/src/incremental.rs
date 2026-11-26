@@ -1100,10 +1100,11 @@ impl<'a> Program for TierProgram<'a> {
         // Materialize confirmed explicit-edge reachability graphs for any operator
         // predicates in this round before parallel search starts.
         if let Some(ops) = ops.as_mut() {
+            let mut preds_held = Held::new(budget);
             let mut preds: Vec<u64> = Vec::new();
             for t in facts {
                 if ops.is_governed(t[1], &c.graph) && !preds.contains(&t[1]) {
-                    preds.push(t[1]);
+                    push_charged(&mut preds, t[1], &mut preds_held)?;
                 }
             }
             let mut visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
@@ -1117,6 +1118,7 @@ impl<'a> Program for TierProgram<'a> {
                     &mut visit,
                 )?;
             }
+            drop(preds_held);
         }
         let out_start = out.len();
         let ops_ref = ops.as_ref();
@@ -1286,7 +1288,7 @@ impl<'a> Program for TierProgram<'a> {
             // and closure fan-out before running backward searches.
             if !cx.removed.is_empty() {
                 let max_visits = Bound::max_visits_for(c);
-                let est = estimate_deletion_visits(c, rules, &plans, cx.removed);
+                let est = estimate_deletion_visits(c, rules, &plans, cx.removed, cx.limits)?;
                 if est > max_visits {
                     return Err(Fallback(format!(
                         "the deletion is estimated to visit {est} rule instances, past the \
@@ -1349,7 +1351,7 @@ impl<'a> Program for TierProgram<'a> {
             if needs_revive {
                 saved_plans = Some((d.plans, d._plans_held));
             } else {
-                self.overdeleted_touching_op.clear();
+                self.overdeleted_touching_op = Vec::new();
                 self.overdeleted_held = None;
             }
             if cancelled(limits) {
@@ -1445,6 +1447,8 @@ impl<'a> Program for TierProgram<'a> {
                     &mut self.overdeleted_touching_op,
                     &mut cx.out.iterations,
                 )?;
+                self.overdeleted_touching_op = Vec::new();
+                self.overdeleted_held = None;
             }
             if self.lists && cx.out.added(c).any(|t| is_list(&t) && !c.explicit_held(&t)) {
                 return Err(Fallback("an RDF list fact was derived".into()).into());
@@ -2631,6 +2635,37 @@ fn list_head_slots(r: &CRule) -> Vec<Slot> {
     out
 }
 
+/// Summary of removed `rdf:first` or `rdf:rest` objects for one list cell: the lowest
+/// removed object id and whether more than one distinct object was removed.
+#[derive(Clone, Copy)]
+struct RemovedObj {
+    min: u64,
+    multi: bool,
+}
+
+fn record_removed_obj(
+    map: &mut FxHashMap<u64, RemovedObj>,
+    cell: u64,
+    obj: u64,
+    held: &mut Held,
+) -> Result<(), BudgetFailure> {
+    reserve_map_charged(map, &cell, held)?;
+    map.entry(cell)
+        .and_modify(|e| {
+            if obj != e.min {
+                e.multi = true;
+                if obj < e.min {
+                    e.min = obj;
+                }
+            }
+        })
+        .or_insert(RemovedObj {
+            min: obj,
+            multi: false,
+        });
+    Ok(())
+}
+
 /// Walk an explicit RDF list at `head` in the current snapshot with memory charging,
 /// cancellation polling, and visit counting against `bound`.
 #[allow(clippy::too_many_arguments)]
@@ -2650,28 +2685,36 @@ fn new_explicit_list(
     let mut seen: FxHashSet<u64> = FxHashSet::default();
     let mut cur = head;
     let mut pending: u64 = 0;
-    let first_obj = |memo: &mut Memo, s: u64, p: u64| -> Option<u64> {
-        if let Some(b) = g.base() {
-            let mut found = None;
-            let _ = b.for_each_with(memo, Some(s), Some(p), None, |t| {
-                found = Some(t[2]);
-                false
-            });
-            if found.is_some() {
-                return found;
-            }
-        }
-        let mut best: Option<(u32, u64)> = None;
-        for i in g.cands(Some(s), Some(p), None, g.offset(), g.len()).iter() {
-            if g.alive(i) && g.flagged(i) {
-                let t = g.triple(i);
-                if t[0] == s && t[1] == p && best.is_none_or(|(bi, _)| i < bi) {
-                    best = Some((i, t[2]));
+    let first_obj =
+        |memo: &mut Memo, s: u64, p: u64, pending: &mut u64| -> anyhow::Result<Option<u64>> {
+            if let Some(b) = g.base() {
+                let mut found = None;
+                let _ = b.for_each_with(memo, Some(s), Some(p), None, |t| {
+                    found = Some(t[2]);
+                    false
+                });
+                if found.is_some() {
+                    return Ok(found);
                 }
             }
-        }
-        best.map(|(_, o)| o)
-    };
+            let mut best: Option<(u32, u64)> = None;
+            for i in g.cands(Some(s), Some(p), None, g.offset(), g.len()).iter() {
+                *pending += 1;
+                if *pending >= VISIT_BATCH {
+                    bound.add(std::mem::take(pending))?;
+                    if cancelled(limits) {
+                        anyhow::bail!("reasoning cancelled");
+                    }
+                }
+                if g.alive(i) && g.flagged(i) {
+                    let t = g.triple(i);
+                    if t[0] == s && t[1] == p && best.is_none_or(|(bi, _)| i < bi) {
+                        best = Some((i, t[2]));
+                    }
+                }
+            }
+            Ok(best.map(|(_, o)| o))
+        };
     while cur != nil {
         pending += 1;
         if pending >= VISIT_BATCH {
@@ -2686,14 +2729,14 @@ fn new_explicit_list(
             }
             return Ok(None);
         }
-        let Some(f) = first_obj(memo, cur, first) else {
+        let Some(f) = first_obj(memo, cur, first, &mut pending)? else {
             if pending > 0 {
                 bound.add(pending)?;
             }
             return Ok(None);
         };
         push_charged(&mut out, f, &mut held)?;
-        let Some(r) = first_obj(memo, cur, rest) else {
+        let Some(r) = first_obj(memo, cur, rest, &mut pending)? else {
             if pending > 0 {
                 bound.add(pending)?;
             }
@@ -2720,8 +2763,8 @@ fn old_explicit_list(
     rest: u64,
     nil: u64,
     inserted_list: &FxHashSet<Triple>,
-    removed_first: &FxHashMap<u64, Vec<u64>>,
-    removed_rest: &FxHashMap<u64, Vec<u64>>,
+    removed_first: &FxHashMap<u64, RemovedObj>,
+    removed_rest: &FxHashMap<u64, RemovedObj>,
     multi_graph: bool,
     limits: &Limits,
     bound: &Bound,
@@ -2730,26 +2773,42 @@ fn old_explicit_list(
     let find_obj = |memo: &mut Memo,
                     s: u64,
                     p: u64,
-                    rem: &FxHashMap<u64, Vec<u64>>|
+                    rem: &FxHashMap<u64, RemovedObj>,
+                    pending: &mut u64|
      -> anyhow::Result<Option<u64>> {
-        let rem_list = rem.get(&s);
-        let rem_o = rem_list.and_then(|v| v.iter().copied().min());
+        let rem_entry = rem.get(&s).copied();
+        let rem_o = rem_entry.map(|r| r.min);
         if let Some(b) = g.base() {
             let is_multi = multi_graph || b.passes() > 1;
-            if is_multi && rem_list.is_some_and(|v| v.len() > 1) {
+            if is_multi && rem_entry.is_some_and(|r| r.multi) {
                 return Err(Fallback(
                     "a branching RDF list changed across multiple input graphs".into(),
                 )
                 .into());
             }
             let mut base_o = None;
-            let _ = b.for_each_with(memo, Some(s), Some(p), None, |t| {
+            let mut err: Option<anyhow::Error> = None;
+            b.for_each_with(memo, Some(s), Some(p), None, |t| {
+                *pending += 1;
+                if *pending >= VISIT_BATCH {
+                    if let Err(e) = bound.add(std::mem::take(pending)) {
+                        err = Some(e.into());
+                        return false;
+                    }
+                    if cancelled(limits) {
+                        err = Some(anyhow::anyhow!("reasoning cancelled"));
+                        return false;
+                    }
+                }
                 if !inserted_list.contains(&t) {
                     base_o = Some(t[2]);
                     return false;
                 }
                 true
-            });
+            })?;
+            if let Some(e) = err {
+                return Err(e);
+            }
             match (base_o, rem_o) {
                 (Some(bo), Some(ro)) => {
                     if is_multi {
@@ -2769,6 +2828,13 @@ fn old_explicit_list(
         }
         let mut best: Option<(u32, u64)> = None;
         for i in g.cands(Some(s), Some(p), None, g.offset(), g.len()).iter() {
+            *pending += 1;
+            if *pending >= VISIT_BATCH {
+                bound.add(std::mem::take(pending))?;
+                if cancelled(limits) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+            }
             if g.alive(i) && g.flagged(i) {
                 let t = g.triple(i);
                 if t[0] == s
@@ -2804,14 +2870,14 @@ fn old_explicit_list(
             }
             return Ok(None);
         }
-        let Some(f) = find_obj(memo, cur, first, removed_first)? else {
+        let Some(f) = find_obj(memo, cur, first, removed_first, &mut pending)? else {
             if pending > 0 {
                 bound.add(pending)?;
             }
             return Ok(None);
         };
         push_charged(&mut out, f, &mut held)?;
-        let Some(r) = find_obj(memo, cur, rest, removed_rest)? else {
+        let Some(r) = find_obj(memo, cur, rest, removed_rest, &mut pending)? else {
             if pending > 0 {
                 bound.add(pending)?;
             }
@@ -2835,30 +2901,46 @@ fn changed_lists(
     limits: &Limits,
     bound: &Bound,
 ) -> anyhow::Result<ChangedLists> {
+    if cancelled(limits) {
+        anyhow::bail!("reasoning cancelled");
+    }
     let budget = &limits.budget;
     let (first, rest, nil) = (c.terms.rdf_first, c.terms.rdf_rest, c.terms.rdf_nil);
     let is_list = |t: &Triple| t[1] == first || t[1] == rest;
     let mut work_held = Held::new(budget);
     let mut kept_held = Held::new(budget);
     let mut inserted_list: FxHashSet<Triple> = FxHashSet::default();
-    let mut removed_first: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
-    let mut removed_rest: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    let mut removed_first: FxHashMap<u64, RemovedObj> = FxHashMap::default();
+    let mut removed_rest: FxHashMap<u64, RemovedObj> = FxHashMap::default();
     let mut removed_rev_rest: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     let mut affected: FxHashSet<u64> = FxHashSet::default();
     let mut queue: Vec<u64> = Vec::new();
+    let mut pending: u64 = 0;
     for &t in inserted.iter().filter(|t| is_list(t)) {
+        pending += 1;
+        if pending >= VISIT_BATCH {
+            bound.add(std::mem::take(&mut pending))?;
+            if cancelled(limits) {
+                anyhow::bail!("reasoning cancelled");
+            }
+        }
         insert_set_charged(&mut inserted_list, t, &mut work_held)?;
         if insert_set_charged(&mut affected, t[0], &mut work_held)? {
             push_charged(&mut queue, t[0], &mut work_held)?;
         }
     }
     for &t in removed.iter().filter(|t| is_list(t)) {
+        pending += 1;
+        if pending >= VISIT_BATCH {
+            bound.add(std::mem::take(&mut pending))?;
+            if cancelled(limits) {
+                anyhow::bail!("reasoning cancelled");
+            }
+        }
         if t[1] == first {
-            reserve_map_charged(&mut removed_first, &t[0], &mut work_held)?;
-            push_charged(removed_first.entry(t[0]).or_default(), t[2], &mut work_held)?;
+            record_removed_obj(&mut removed_first, t[0], t[2], &mut work_held)?;
         } else {
-            reserve_map_charged(&mut removed_rest, &t[0], &mut work_held)?;
-            push_charged(removed_rest.entry(t[0]).or_default(), t[2], &mut work_held)?;
+            record_removed_obj(&mut removed_rest, t[0], t[2], &mut work_held)?;
             reserve_map_charged(&mut removed_rev_rest, &t[2], &mut work_held)?;
             push_charged(
                 removed_rev_rest.entry(t[2]).or_default(),
@@ -2870,10 +2952,12 @@ fn changed_lists(
             push_charged(&mut queue, t[0], &mut work_held)?;
         }
     }
-    bound.add(0)?;
+    bound.add(std::mem::take(&mut pending))?;
+    if cancelled(limits) {
+        anyhow::bail!("reasoning cancelled");
+    }
     let g = &c.graph;
     let mut memo = Memo::default();
-    let mut pending: u64 = 0;
     while let Some(cell) = queue.pop() {
         pending += 1;
         if pending >= VISIT_BATCH {
@@ -2938,6 +3022,13 @@ fn changed_lists(
         }
         if let Some(prevs) = removed_rev_rest.get(&cell) {
             for &p in prevs {
+                pending += 1;
+                if pending >= VISIT_BATCH {
+                    bound.add(std::mem::take(&mut pending))?;
+                    if cancelled(limits) {
+                        anyhow::bail!("reasoning cancelled");
+                    }
+                }
                 if insert_set_charged(&mut affected, p, &mut work_held)? {
                     push_charged(&mut queue, p, &mut work_held)?;
                 }
@@ -3104,8 +3195,8 @@ fn eval_list_rules_old(
 }
 
 /// Evaluate list-reading rules for `changed.heads` using the new explicit RDF lists and
-/// merge any newly derived facts into `c.graph`, counting all derived rows against
-/// `limits.max_inferred` from `inferred_origin`.
+/// merge any newly derived facts into `c.graph`, deduplicating across rules before
+/// counting distinct new rows against `limits.max_inferred` from `inferred_origin`.
 fn eval_list_rules_new(
     c: &mut Closure,
     rules: &[CRule],
@@ -3121,16 +3212,36 @@ fn eval_list_rules_new(
         let already = g.inferred_since(inferred_origin);
         let mut seen_held = Held::new(&limits.budget);
         let mut seen: FxHashSet<Triple> = FxHashSet::default();
+        let mut memo = Memo::default();
         for r in rules {
             if !engine::reads_lists(r) {
                 continue;
             }
             let ranges = vec![(0, g.len()); r.atoms.len()];
             for slot in list_head_slots(r) {
-                let remaining = limits
-                    .max_inferred
-                    .saturating_sub(already.saturating_add(fresh.len()));
-                let max_out = remaining.saturating_mul(4).saturating_add(1024);
+                let rule_name = &r.name;
+                let mut admit = |t: Triple| -> anyhow::Result<()> {
+                    if g.position(&t).is_some() {
+                        return Ok(());
+                    }
+                    if let Some(base) = g.base()
+                        && base.contains_with(&mut memo, &t)?
+                    {
+                        return Ok(());
+                    }
+                    if !insert_set_charged(&mut seen, t, &mut seen_held)? {
+                        return Ok(());
+                    }
+                    if already.saturating_add(fresh.len()) >= limits.max_inferred {
+                        return Err(crate::InferredLimitExceeded {
+                            limit: limits.max_inferred,
+                            context: format!(" (in rule '{rule_name}')"),
+                        }
+                        .into());
+                    }
+                    push_charged(&mut fresh, t, &mut fresh_held)?;
+                    Ok(())
+                };
                 match slot {
                     Slot::Var(lv) => {
                         let Some(steps) = engine::plan_with(r, &ranges, Some(g), None, &[lv])
@@ -3145,45 +3256,24 @@ fn eval_list_rules_new(
                             g.len(),
                             &abort,
                             limits.cancel.as_deref(),
-                            max_out,
-                            Mode::New,
+                            usize::MAX,
+                            Mode::NewSink { sink: &mut admit },
                             &limits.budget,
                         );
                         ev.set_explicit_lists(true);
+                        ev.set_deadline(limits.deadline);
                         let mut b = vec![0u64; r.nvars];
                         for &h in &changed.heads {
-                            if cancelled(limits) {
-                                anyhow::bail!("reasoning cancelled");
+                            if limits.stopped() {
+                                return Err(limits.stop_error());
                             }
                             b[lv] = h;
                             ev.run(0, &mut b, None);
                             if let Some(e) = ev.err.take() {
                                 return Err(e);
                             }
-                        }
-                        let (found, _h) = ev.take_out();
-                        if found.len() > max_out {
-                            return Err(crate::InferredLimitExceeded {
-                                limit: limits.max_inferred,
-                                context: format!(" (in rule '{}')", r.name),
-                            }
-                            .into());
-                        }
-                        for t in found {
-                            if g.position(&t).is_none()
-                                && !g
-                                    .base()
-                                    .is_some_and(|base| base.contains(&t).unwrap_or(false))
-                                && insert_set_charged(&mut seen, t, &mut seen_held)?
-                            {
-                                if already.saturating_add(fresh.len()) >= limits.max_inferred {
-                                    return Err(crate::InferredLimitExceeded {
-                                        limit: limits.max_inferred,
-                                        context: format!(" (in rule '{}')", r.name),
-                                    }
-                                    .into());
-                                }
-                                push_charged(&mut fresh, t, &mut fresh_held)?;
+                            if limits.stopped() {
+                                return Err(limits.stop_error());
                             }
                         }
                     }
@@ -3199,45 +3289,27 @@ fn eval_list_rules_new(
                             g.len(),
                             &abort,
                             limits.cancel.as_deref(),
-                            max_out,
-                            Mode::New,
+                            usize::MAX,
+                            Mode::NewSink { sink: &mut admit },
                             &limits.budget,
                         );
                         ev.set_explicit_lists(true);
+                        ev.set_deadline(limits.deadline);
                         let mut b = vec![0u64; r.nvars];
                         ev.run(0, &mut b, None);
                         if let Some(e) = ev.err.take() {
                             return Err(e);
                         }
-                        let (found, _h) = ev.take_out();
-                        if found.len() > max_out {
-                            return Err(crate::InferredLimitExceeded {
-                                limit: limits.max_inferred,
-                                context: format!(" (in rule '{}')", r.name),
-                            }
-                            .into());
-                        }
-                        for t in found {
-                            if g.position(&t).is_none()
-                                && !g
-                                    .base()
-                                    .is_some_and(|base| base.contains(&t).unwrap_or(false))
-                                && insert_set_charged(&mut seen, t, &mut seen_held)?
-                            {
-                                if already.saturating_add(fresh.len()) >= limits.max_inferred {
-                                    return Err(crate::InferredLimitExceeded {
-                                        limit: limits.max_inferred,
-                                        context: format!(" (in rule '{}')", r.name),
-                                    }
-                                    .into());
-                                }
-                                push_charged(&mut fresh, t, &mut fresh_held)?;
-                            }
+                        if limits.stopped() {
+                            return Err(limits.stop_error());
                         }
                     }
                     _ => {}
                 }
             }
+        }
+        if let Some(base) = g.base() {
+            base.add_scans(memo.scans);
         }
     }
     if !fresh.is_empty() {
@@ -3250,63 +3322,22 @@ fn eval_list_rules_new(
 /// Estimate rule-instance visits for a deletion from the removed triples matching each
 /// non-operator rule's constant `(s, p, o)` slots and the closure's fan-out (`plans`),
 /// to compare against item 798's visit bound (F16 §7.3, replacing `LARGE_DELETION`).
+/// Only keys required by active compiled patterns are indexed, and all projection tables
+/// are charged to `limits.budget` before growth.
 fn estimate_deletion_visits(
     c: &Closure,
     rules: &[CRule],
     plans: &Plans,
     removed: &[Triple],
-) -> u64 {
+    limits: &Limits,
+) -> anyhow::Result<u64> {
     let g = &c.graph;
     let hi = g.len();
     let total_facts = g.offset() as u64 + g.live() as u64;
     if total_facts == 0 || removed.is_empty() {
-        return 0;
+        return Ok(0);
     }
-    // Determine which constant subject/object slot combinations appear in active forward
-    // atoms and backward heads so we only index the needed projections over `removed`.
-    let mut need_ps: FxHashSet<u64> = FxHashSet::default();
-    let mut need_po: FxHashSet<u64> = FxHashSet::default();
-    let mut need_pso: FxHashSet<u64> = FxHashSet::default();
-    let mut need_s = false;
-    let mut need_o = false;
-    let mut need_so = false;
-    let mut note_pattern = |s: Slot, p: Slot, o: Slot| match (s, p, o) {
-        (Slot::Const(_), Slot::Const(kp), Slot::Const(_)) => {
-            need_pso.insert(kp);
-        }
-        (Slot::Const(_), Slot::Const(kp), _) => {
-            need_ps.insert(kp);
-        }
-        (_, Slot::Const(kp), Slot::Const(_)) => {
-            need_po.insert(kp);
-        }
-        (Slot::Const(_), _, Slot::Const(_)) => {
-            need_so = true;
-        }
-        (Slot::Const(_), _, _) => {
-            need_s = true;
-        }
-        (_, _, Slot::Const(_)) => {
-            need_o = true;
-        }
-        _ => {}
-    };
-    for (ri, r) in rules.iter().enumerate() {
-        if !plans.forward[ri].is_empty() {
-            for (d, a) in r.atoms.iter().enumerate() {
-                if plans.forward[ri][d].is_some() {
-                    note_pattern(a.s, a.p, a.o);
-                }
-            }
-        }
-        for (hi_head, h) in r.head.iter().enumerate() {
-            if plans.back[ri].get(hi_head).is_some_and(Option::is_some)
-                && let CHead::Triple(s, p, o) = *h
-            {
-                note_pattern(s, p, o);
-            }
-        }
-    }
+    let mut held = Held::new(&limits.budget);
     let mut by_p: FxHashMap<u64, u64> = FxHashMap::default();
     let mut by_ps: FxHashMap<(u64, u64), u64> = FxHashMap::default();
     let mut by_po: FxHashMap<(u64, u64), u64> = FxHashMap::default();
@@ -3314,26 +3345,99 @@ fn estimate_deletion_visits(
     let mut by_s: FxHashMap<u64, u64> = FxHashMap::default();
     let mut by_o: FxHashMap<u64, u64> = FxHashMap::default();
     let mut by_so: FxHashMap<(u64, u64), u64> = FxHashMap::default();
-    for &t in removed {
+    let mut register_pattern = |s: Slot, p: Slot, o: Slot| -> Result<(), BudgetFailure> {
+        match (s, p, o) {
+            (Slot::Const(ks), Slot::Const(kp), Slot::Const(ko)) => {
+                let k = [ks, kp, ko];
+                reserve_map_charged(&mut by_pso, &k, &mut held)?;
+                by_pso.entry(k).or_insert(0);
+            }
+            (Slot::Const(ks), Slot::Const(kp), _) => {
+                let k = (kp, ks);
+                reserve_map_charged(&mut by_ps, &k, &mut held)?;
+                by_ps.entry(k).or_insert(0);
+            }
+            (_, Slot::Const(kp), Slot::Const(ko)) => {
+                let k = (kp, ko);
+                reserve_map_charged(&mut by_po, &k, &mut held)?;
+                by_po.entry(k).or_insert(0);
+            }
+            (_, Slot::Const(kp), _) => {
+                reserve_map_charged(&mut by_p, &kp, &mut held)?;
+                by_p.entry(kp).or_insert(0);
+            }
+            (Slot::Const(ks), _, Slot::Const(ko)) => {
+                let k = (ks, ko);
+                reserve_map_charged(&mut by_so, &k, &mut held)?;
+                by_so.entry(k).or_insert(0);
+            }
+            (Slot::Const(ks), _, _) => {
+                reserve_map_charged(&mut by_s, &ks, &mut held)?;
+                by_s.entry(ks).or_insert(0);
+            }
+            (_, _, Slot::Const(ko)) => {
+                reserve_map_charged(&mut by_o, &ko, &mut held)?;
+                by_o.entry(ko).or_insert(0);
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    for (ri, r) in rules.iter().enumerate() {
+        if !plans.forward[ri].is_empty() {
+            for (d, a) in r.atoms.iter().enumerate() {
+                if plans.forward[ri][d].is_some() {
+                    register_pattern(a.s, a.p, a.o)?;
+                }
+            }
+        }
+        for (hi_head, h) in r.head.iter().enumerate() {
+            if plans.back[ri].get(hi_head).is_some_and(Option::is_some)
+                && let CHead::Triple(s, p, o) = *h
+            {
+                register_pattern(s, p, o)?;
+            }
+        }
+    }
+    for (idx, &t) in removed.iter().enumerate() {
+        if (idx & (VISIT_BATCH as usize - 1)) == 0 && cancelled(limits) {
+            anyhow::bail!("reasoning cancelled");
+        }
         let [s, p, o] = t;
-        *by_p.entry(p).or_default() += 1;
-        if need_ps.contains(&p) {
-            *by_ps.entry((p, s)).or_default() += 1;
+        if !by_p.is_empty()
+            && let Some(cnt) = by_p.get_mut(&p)
+        {
+            *cnt += 1;
         }
-        if need_po.contains(&p) {
-            *by_po.entry((p, o)).or_default() += 1;
+        if !by_ps.is_empty()
+            && let Some(cnt) = by_ps.get_mut(&(p, s))
+        {
+            *cnt += 1;
         }
-        if need_pso.contains(&p) {
-            *by_pso.entry(t).or_default() += 1;
+        if !by_po.is_empty()
+            && let Some(cnt) = by_po.get_mut(&(p, o))
+        {
+            *cnt += 1;
         }
-        if need_s {
-            *by_s.entry(s).or_default() += 1;
+        if !by_pso.is_empty()
+            && let Some(cnt) = by_pso.get_mut(&t)
+        {
+            *cnt += 1;
         }
-        if need_o {
-            *by_o.entry(o).or_default() += 1;
+        if !by_s.is_empty()
+            && let Some(cnt) = by_s.get_mut(&s)
+        {
+            *cnt += 1;
         }
-        if need_so {
-            *by_so.entry((s, o)).or_default() += 1;
+        if !by_o.is_empty()
+            && let Some(cnt) = by_o.get_mut(&o)
+        {
+            *cnt += 1;
+        }
+        if !by_so.is_empty()
+            && let Some(cnt) = by_so.get_mut(&(s, o))
+        {
+            *cnt += 1;
         }
     }
     let total_removed = removed.len() as u64;
@@ -3357,7 +3461,7 @@ fn estimate_deletion_visits(
     let avg_p = total_facts.div_ceil(dist_p).max(1);
 
     let plan_fanout = |r: &CRule, steps: &[Step], skip_atom: Option<usize>, pre: &[usize]| -> u64 {
-        let mut bound = vec![false; r.nvars];
+        let mut bound: smallvec::SmallVec<[bool; 16]> = smallvec::smallvec![false; r.nvars];
         let bind = |s: Slot, b: &mut [bool]| {
             if let Slot::Var(v) = s {
                 b[v] = true;
@@ -3462,17 +3566,16 @@ fn estimate_deletion_visits(
         let f = plan_fanout(&rules[ri], steps, None, pre);
         total = total.saturating_add(count.saturating_mul(f));
     };
-    for &p in by_p.keys() {
-        if let Some(list) = plans.by_pred.get(&p) {
-            for &(ri, hi_head) in list {
-                add_head(ri, hi_head);
-            }
+    for list in plans.by_pred.values() {
+        for &(ri, hi_head) in list {
+            add_head(ri, hi_head);
         }
     }
     for &(ri, hi_head) in &plans.any_pred {
         add_head(ri, hi_head);
     }
-    total
+    drop(held);
+    Ok(total)
 }
 
 /// Re-derive any fact deleted during Phase 1 after its proof search touched a surviving
@@ -3772,6 +3875,301 @@ pub(crate) mod tests {
             "{} > {lused}",
             llim.budget.used()
         );
+    }
+
+    /// `estimate_deletion_visits` only indexes constant keys appearing in compiled rules
+    /// and admits its projection tables against `limits.budget` before growth.
+    #[test]
+    fn estimate_deletion_visits_charges_and_ignores_unmatched_removed_objects() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let terms = Terms::new(snap);
+        let text = "@prefix ex: <http://ex.org/>.\n\
+                    [r: (?s ex:p ex:c) -> (?s ex:q ex:ok)]";
+        let rules = compiled(text, &terms);
+        let p = terms
+            .id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                "http://ex.org/p",
+            )))
+            .unwrap();
+        let mut g = Graph::default();
+        // Seed one fact so total_facts > 0.
+        g.try_add_batch(vec![[10_000, p, 20_000]]).unwrap();
+        let mut c = Closure::new(g, terms).unwrap();
+        let plans = Plans::new(&mut c.graph, &rules).unwrap();
+
+        // 5,000 removed `ex:p` triples with distinct non-matching objects.
+        let removed: Vec<Triple> = (0..5_000u64)
+            .map(|i| [100_000 + i, p, 200_000 + i])
+            .collect();
+
+        // A tight 8 KiB budget fits the single compiled `(ex:p, ex:c)` key in `by_po`
+        // (whereas indexing all 5,000 removed `(p, o)` pairs would need >120 KiB).
+        let tight = Limits {
+            budget: Budget::new(Some(8 * 1024)),
+            ..limits()
+        };
+        let est = estimate_deletion_visits(&c, &rules, &plans, &removed, &tight)
+            .expect("unmatched removed objects must not grow projection tables");
+        assert_eq!(est, 0);
+        assert_eq!(tight.budget.used(), 0);
+        assert!(tight.budget.peak() > 0 && tight.budget.peak() <= 8 * 1024);
+
+        // A 1-byte budget must refuse before allocating the compiled pattern table.
+        let tiny = Limits {
+            budget: Budget::new(Some(1)),
+            ..limits()
+        };
+        let err = estimate_deletion_visits(&c, &rules, &plans, &removed, &tiny)
+            .expect_err("1-byte budget must reject estimator table allocation");
+        assert!(
+            crate::budget::BudgetFailure::from_anyhow(&err).is_some(),
+            "{err:#}"
+        );
+        assert_eq!(tiny.budget.used(), 0);
+    }
+
+    /// With a nonzero memory allowance, operator candidate scans (`build_undirected`,
+    /// `build_directed`, and guarded symmetric `pred_has_explicit_literal_obj`) count
+    /// rejected unflagged derived rows against `Bound` and poll cancellation.
+    #[test]
+    fn operator_candidate_scans_respect_visit_bound_and_cancel() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let terms = Terms::new(snap);
+        let iri = |u: &str| {
+            terms
+                .id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(u)))
+                .unwrap()
+        };
+        let eq_p = iri(&format!("{OWL}sameAs"));
+        let sub_p = iri(&format!("{RDFS}subClassOf"));
+        let rdf_type = iri(&format!("{RDF}type"));
+        let owl_transitive = iri(&format!("{OWL}TransitiveProperty"));
+        let owl_symmetric = iri(&format!("{OWL}SymmetricProperty"));
+        let sym_tr_p = 50_000u64;
+        let rules_text = "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.\n\
+                          @prefix owl: <http://www.w3.org/2002/07/owl#>.\n\
+                          @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>.\n\
+                          [eq-sym: (?x owl:sameAs ?y) -> (?y owl:sameAs ?x)]\n\
+                          [eq-trans: (?x owl:sameAs ?y), (?y owl:sameAs ?z) -> (?x owl:sameAs ?z)]\n\
+                          [sub: (?x rdfs:subClassOf ?y), (?y rdfs:subClassOf ?z) -> (?x rdfs:subClassOf ?z)]\n\
+                          [trp: (?p rdf:type owl:TransitiveProperty), (?x ?p ?y), (?y ?p ?z) -> (?x ?p ?z)]\n\
+                          [symp: (?p rdf:type owl:SymmetricProperty), (?x ?p ?y), notLiteral(?y) -> (?y ?p ?x)]";
+        let rules = compiled(rules_text, &terms);
+
+        // Build a derived tier with 2,500 unflagged derived rows per predicate and only 1
+        // flagged explicit edge, so scanning only flagged matches would visit 1 row while
+        // scanning all candidates visits > 2,500 rows.
+        let mut g = Graph::default();
+        let mut rows: Vec<Triple> = Vec::new();
+        rows.push([sym_tr_p, rdf_type, owl_transitive]);
+        rows.push([sym_tr_p, rdf_type, owl_symmetric]);
+        let guard_end = rows.len() as u32;
+        for &p in &[eq_p, sub_p, sym_tr_p] {
+            rows.push([100_001, p, 100_002]);
+            for i in 0..2_500u64 {
+                rows.push([200_000 + i, p, 300_000 + i]);
+            }
+        }
+        g.try_add_batch(rows).unwrap();
+        for r in 0..guard_end {
+            g.set_flag_with(r, true, false).unwrap();
+        }
+        // Flag only the single explicit edge for each predicate.
+        for idx in 0..3u32 {
+            g.set_flag_with(guard_end + idx * 2_501, true, false)
+                .unwrap();
+        }
+
+        let budget = Budget::new(Some(64 << 20));
+        for (label, pred) in [
+            ("undirected equivalence", eq_p),
+            ("directed transitive", sub_p),
+            ("guarded symmetric literal precheck", sym_tr_p),
+        ] {
+            // 1. Tight visit bound with generous nonzero memory allowance triggers Fallback.
+            let mut ops = crate::closure::DeletionOps::detect(&rules, &g, &terms, &budget)
+                .unwrap()
+                .expect("closure ops");
+            let bound = Bound::new(&budget, 1_500, 64 << 20);
+            let mut visit = |n: u64| bound.add(n).map_err(anyhow::Error::from);
+            let err = ops
+                .ensure_pred(pred, &g, &terms, &budget, None, &mut visit)
+                .expect_err(&format!(
+                    "{label}: large unflagged scan must hit visit bound"
+                ));
+            assert!(
+                err.downcast_ref::<Fallback>()
+                    .is_some_and(|f| f.0.contains("visited more than 1500")),
+                "{label}: unexpected error: {err:#}"
+            );
+            assert!(
+                bound.visits() > 1_500,
+                "{label}: expected >1500 visits, got {}",
+                bound.visits()
+            );
+
+            // 2. Cancellation during candidate scan with nonzero memory allowance stops cleanly.
+            let mut ops_c = crate::closure::DeletionOps::detect(&rules, &g, &terms, &budget)
+                .unwrap()
+                .expect("closure ops");
+            let cancel = AtomicBool::new(false);
+            let seen_batch = AtomicBool::new(false);
+            let mut visit_c = |n: u64| {
+                if n > 0 {
+                    seen_batch.store(true, Ordering::Relaxed);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            };
+            let cerr = ops_c
+                .ensure_pred(pred, &g, &terms, &budget, Some(&cancel), &mut visit_c)
+                .expect_err(&format!("{label}: cancellation must stop candidate scan"));
+            assert!(
+                seen_batch.load(Ordering::Relaxed),
+                "{label}: must reach scan loop"
+            );
+            assert!(
+                cerr.to_string().contains("cancelled"),
+                "{label}: unexpected cancel error: {cerr:#}"
+            );
+        }
+    }
+
+    /// Shared-tail `changed_lists` with nonzero memory allowance scales linearly with
+    /// removed objects `M` independently of head count `N`, and hits visit-bound and
+    /// cancellation checks during removal indexing.
+    #[test]
+    fn shared_tail_changed_lists_scales_linearly_and_respects_bound_and_cancel() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let terms = Terms::new(snap.clone());
+        let (first, rest, nil) = (terms.rdf_first, terms.rdf_rest, terms.rdf_nil);
+
+        let build_closure = |n_heads: u64| -> (Closure, u64) {
+            let tail = 900_000u64;
+            let mut g = Graph::default();
+            let mut rows: Vec<Triple> = Vec::new();
+            rows.push([tail, rest, nil]);
+            rows.push([tail, first, 800_000]); // new surviving value
+            for i in 0..n_heads {
+                let h = 100_000 + i;
+                rows.push([h, first, 200_000 + i]);
+                rows.push([h, rest, tail]);
+            }
+            let n = rows.len() as u32;
+            g.try_add_batch(rows).unwrap();
+            for r in 0..n {
+                g.set_flag_with(r, true, false).unwrap();
+            }
+            (Closure::new(g, Terms::new(snap.clone())).unwrap(), tail)
+        };
+
+        let n_heads = 40u64;
+        let (c_small, tail) = build_closure(n_heads);
+        let lim = Limits {
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let ins = vec![[tail, first, 800_000]];
+        let rem_small: Vec<Triple> = (0..2u64).map(|j| [tail, first, 500_000 + j]).collect();
+        let b_small = Bound::new(&lim.budget, u64::MAX, 64 << 20);
+        let ch_small = changed_lists(&c_small, &ins, &rem_small, false, &lim, &b_small).unwrap();
+        assert_eq!(ch_small.heads.len(), (n_heads + 1) as usize);
+
+        // Increase M from 2 to 1,500 while keeping N = 40 fixed: visits must grow by
+        // ~O(M) (not O(N * M) = 60,000).
+        let (c_large, tail) = build_closure(n_heads);
+        let rem_large: Vec<Triple> = (0..1_500u64).map(|j| [tail, first, 500_000 + j]).collect();
+        let b_large = Bound::new(&lim.budget, u64::MAX, 64 << 20);
+        let ch_large = changed_lists(&c_large, &ins, &rem_large, false, &lim, &b_large).unwrap();
+        assert_eq!(ch_large.heads.len(), (n_heads + 1) as usize);
+        let delta_visits = b_large.visits() - b_small.visits();
+        assert!(
+            (1_400..=2_000).contains(&delta_visits),
+            "expected O(M) delta visits (~1498), got {delta_visits} (small={}, large={})",
+            b_small.visits(),
+            b_large.visits()
+        );
+
+        // Tight visit bound with nonzero memory allowance stops the removal indexing pass.
+        let (c_bound, tail) = build_closure(2);
+        let rem_many: Vec<Triple> = (0..2_500u64).map(|j| [tail, first, 500_000 + j]).collect();
+        let b_tight = Bound::new(&lim.budget, 1_200, 64 << 20);
+        let Err(err) = changed_lists(&c_bound, &ins, &rem_many, false, &lim, &b_tight) else {
+            panic!("large removal indexing pass must hit visit bound");
+        };
+        assert!(
+            err.downcast_ref::<Fallback>()
+                .is_some_and(|f| f.0.contains("visited more than 1200")),
+            "unexpected error: {err:#}"
+        );
+
+        // Cancellation with nonzero memory allowance stops `changed_lists`.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let lim_cancel = Limits {
+            cancel: Some(cancel),
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let b_unlim = Bound::new(&lim_cancel.budget, u64::MAX, 64 << 20);
+        let Err(cerr) = changed_lists(&c_bound, &ins, &rem_many, false, &lim_cancel, &b_unlim)
+        else {
+            panic!("cancellation must stop changed_lists");
+        };
+        assert!(cerr.to_string().contains("cancelled"), "{cerr:#}");
+    }
+
+    /// The no-revival branch in `TierProgram::saturate` drops the backing allocation of
+    /// `overdeleted_touching_op` before releasing `overdeleted_held`.
+    #[test]
+    fn overdeleted_no_revival_drops_buffer_before_releasing_charge() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let terms = Terms::new(snap);
+        let rules = compiled(crate::RDFS_RULES, &terms);
+        let g = Graph::default();
+        let mut c = Closure::new(g, terms).unwrap();
+        let lim = Limits {
+            budget: Budget::new(Some(64 << 20)),
+            ..limits()
+        };
+        let mut prog = TierProgram::default();
+        let mut held = Held::new(&lim.budget);
+        for i in 0..256u64 {
+            push_charged(&mut prog.overdeleted_touching_op, [i, 1, 2], &mut held).unwrap();
+        }
+        assert!(prog.overdeleted_touching_op.capacity() >= 256);
+        assert!(held.bytes() >= 256 * size_of::<Triple>());
+        prog.overdeleted_held = Some(held);
+        let plans = Plans::new(&mut c.graph, &rules).unwrap();
+        let plans_held = Held::try_new(&lim.budget, plans.bytes).unwrap();
+        prog.del = Some(Deletion {
+            plans,
+            _plans_held: plans_held,
+            ops: None,
+            bound: None,
+            search: Search::new(&lim.budget),
+            abort: AtomicBool::new(false),
+        });
+        let mut cx = TierCx {
+            rules: &rules,
+            limits: &lim,
+            inserted: &[],
+            removed: &[],
+            moved: &[],
+            multi_graph: false,
+            before_delete: None,
+            rebuild: None,
+            out: Update::default(),
+            started: std::time::Instant::now(),
+        };
+        let mut tstore = TierStore::new(&mut c, &lim.budget);
+        prog.saturate(&mut cx, &mut tstore).unwrap();
+        assert_eq!(prog.overdeleted_touching_op.capacity(), 0);
+        assert!(prog.overdeleted_held.is_none());
+        assert_eq!(lim.budget.used(), 0);
     }
 
     #[test]

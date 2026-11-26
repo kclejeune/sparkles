@@ -993,6 +993,11 @@ pub(crate) const VISIT_BATCH: u64 = 1 << 10;
 pub(crate) enum Mode<'s> {
     /// heads not in the graph yet (forward chaining)
     New,
+    /// heads not in the graph yet, streamed directly to a caller-supplied admission sink
+    /// (used for cross-rule deduplication and exact `max_inferred` accounting)
+    NewSink {
+        sink: &'s mut (dyn FnMut(Triple) -> anyhow::Result<()> + 's),
+    },
     /// heads in the graph, each once (the consequences of deleted facts), with what is
     /// told of the instances matched
     Existing { visit: Option<&'s Visit<'s>> },
@@ -1278,6 +1283,15 @@ impl<'a> Eval<'a> {
     /// allocation while the old one is alive); false when it does not fit, and the
     /// evaluation stops.
     pub fn push_out(&mut self, t: Triple) -> bool {
+        if let Mode::NewSink { sink } = &mut self.mode {
+            if let Err(e) = sink(t) {
+                self.err.get_or_insert(e);
+                self.stop = true;
+                self.abort.store(true, Ordering::Relaxed);
+                return false;
+            }
+            return true;
+        }
         let cap = self.out.capacity();
         if self.out.len() == cap {
             let next = (cap * 2).max(64);
@@ -1942,6 +1956,7 @@ impl<'a> Eval<'a> {
             return;
         }
         let existing = matches!(self.mode, Mode::Existing { .. });
+        let to_sink = matches!(self.mode, Mode::NewSink { .. });
         if existing && !self.visited() {
             return;
         }
@@ -1958,6 +1973,8 @@ impl<'a> Eval<'a> {
                             }
                     } else if self.known_head(&t) {
                         false
+                    } else if to_sink {
+                        true
                     } else {
                         match self.see(t) {
                             Some(new) => new,

@@ -624,11 +624,13 @@ triple patterns with constant-time predicate lookup, replacing `InferredFootprin
 watched-graph and schema-read tracking in `inputs.rs`, `demand.rs`, `query.rs` and
 `reuse.rs`.
 
-Two full-run fallbacks are removed. Explicit RDF list edits no longer trigger a full
-re-materialization because `incremental.rs` tracks the heads of lists whose `rdf:first` or
-`rdf:rest` cells changed, evaluates list-reading rules against the old and new explicit
-lists, and feeds the difference through `FixedPoint::advance`. Derived list cells still
-trigger a full run. The fixed 5% `LARGE_DELETION` ratio in `lib.rs` is replaced by a
+Two full-run fallbacks are narrowed or removed. Ordinary edits to explicit RDF lists no
+longer trigger a full re-materialization because `incremental.rs` tracks the heads of
+lists whose `rdf:first` or `rdf:rest` cells changed, evaluates list-reading rules against
+the old and new explicit lists, and feeds the difference through `FixedPoint::advance`.
+Derived list cells, list triples moved across input graphs, and branching list cells whose
+competing objects change across multiple input graphs without a recoverable prior order
+still trigger a full run. The fixed 5% `LARGE_DELETION` ratio in `lib.rs` is replaced by a
 pre-deletion visit estimate from F16 §7.3 that compares the estimated backward rule
 instances of the removed triples against `Bound::max_visits_for`, while the runtime visit
 and memory bounds of item 798 continue to guard skewed closures during execution.
