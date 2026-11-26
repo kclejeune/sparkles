@@ -2000,32 +2000,48 @@ impl<'a> Reads<'a> {
                 Ok(matches!(term, Some(Term::NamedNode(_))))
             })
         };
+        let has_record_digest = |record, digest| {
+            self.has_value_matching(g, record, digest, |term| {
+                matches!(term, Term::Literal(l)
+                    if l.datatype() == oxrdf::vocab::xsd::STRING
+                        && l.value().parse::<Sha256Digest>().is_ok())
+            })
+        };
         let mut found = false;
         self.for_each_pos_intersection_in_graph(g, &[(protection, nonce)], |subject| {
-            // When the publisher loses its operation type or nonce, the
-            // protected record still names the same activity through both links.
-            if let (Some(receipt), Some(generated), Some((p, activity))) =
-                (receipt, generated, activity_type)
+            if let (Some(receipt), Some((p, activity))) = (receipt, activity_type)
                 && is_iri(subject)?
             {
+                let mut receipt_to_operation = false;
                 self.preparation.scan(
                     self.snap,
                     Perm::Gspo,
                     &[g.0, subject.0, receipt.0],
                     |quad| {
                         let op = quad[2];
-                        found = op != subject
-                            && self.contains_id(subject, generated, op, g)?
-                            && is_iri(op)?
-                            && self.contains_id(op, p, activity, g)?
-                            && (self.contains_id(op, protection, nonce, g)?
-                                || match operation_type {
-                                    Some((p, class)) => self.contains_id(op, p, class, g)?,
-                                    None => false,
-                                });
+                        if op == subject || !is_iri(op)? || !self.contains_id(op, p, activity, g)? {
+                            return Ok(true);
+                        }
+                        let is_operation = match operation_type {
+                            Some((p, class)) => self.contains_id(op, p, class, g)?,
+                            None => false,
+                        };
+                        receipt_to_operation |= is_operation;
+                        if let Some(generated) = generated {
+                            found = self.contains_id(subject, generated, op, g)?
+                                && (is_operation || self.contains_id(op, protection, nonce, g)?);
+                        }
                         Ok(!found)
                     },
                 )?;
+                // A digest on this protected record corroborates its receipt
+                // even when the generation edge and publisher nonce are gone.
+                if !found
+                    && receipt_to_operation
+                    && let Some(digest) = digest
+                {
+                    found = has_record_digest(subject, digest)?;
+                }
             }
             if !found
                 && let Some(digest) = digest
@@ -2039,11 +2055,7 @@ impl<'a> Reads<'a> {
                     self.for_each_pos_intersection_in_graph(g, &[(edge, subject)], |record| {
                         found = record != subject
                             && is_iri(record)?
-                            && self.has_value_matching(g, record, digest, |term| {
-                                matches!(term, Term::Literal(l)
-                                    if l.datatype() == oxrdf::vocab::xsd::STRING
-                                        && l.value().parse::<Sha256Digest>().is_ok())
-                            })?;
+                            && has_record_digest(record, digest)?;
                         Ok(!found)
                     })?;
                     if found {

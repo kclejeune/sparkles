@@ -3234,6 +3234,7 @@ enum LegacyChange {
     ConflictingKey,
     KeyOnProjection,
     WithdrawGeneration,
+    WithdrawPublisherNonceAndGeneration,
     WithdrawLink,
     ProjectReceipt,
 }
@@ -3286,6 +3287,14 @@ fn legacy_replay_reserves_the_sole_publishers_key_after_withdrawal() {
     ] {
         check_keyed_replay_in_former_supports(false, Some(change));
     }
+}
+
+#[test]
+fn legacy_replay_preserves_a_receipt_after_withdrawing_nonce_and_generation() {
+    check_keyed_replay_in_former_supports(
+        false,
+        Some(LegacyChange::WithdrawPublisherNonceAndGeneration),
+    );
 }
 
 #[test]
@@ -3526,11 +3535,22 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                 triples.push(stamp(first.commit + 100));
                 triples
             }
-            LegacyChange::WithdrawGeneration => vec![Triple::new(
-                projection.clone(),
-                iri("http://www.w3.org/ns/prov#wasGeneratedBy"),
-                op.clone(),
-            )],
+            LegacyChange::WithdrawGeneration
+            | LegacyChange::WithdrawPublisherNonceAndGeneration => {
+                let mut triples = vec![Triple::new(
+                    projection.clone(),
+                    iri("http://www.w3.org/ns/prov#wasGeneratedBy"),
+                    op.clone(),
+                )];
+                if matches!(case, LegacyChange::WithdrawPublisherNonceAndGeneration) {
+                    triples.push(Triple::new(
+                        op.clone(),
+                        iri(&format!("{EV}graphProtection")),
+                        oxrdf::Literal::new_simple_literal(nonce_before.to_string()),
+                    ));
+                }
+                triples
+            }
             LegacyChange::WithdrawLink => vec![Triple::new(
                 op.clone(),
                 iri("http://www.w3.org/ns/prov#used"),
@@ -3573,8 +3593,7 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                 ]
             }
         };
-        let shared = triples[0].clone();
-        let claims = project_legacy_triples(&ds, "other", triples);
+        let claims = project_legacy_triples(&ds, "other", &triples);
         drop(ds);
         legacy_settings(&root, &s2);
         let ds = Dataset::open(&root).unwrap();
@@ -3622,14 +3641,40 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
             case,
             LegacyChange::WithdrawMetadata(_)
                 | LegacyChange::WithdrawProjectionField(_)
+                | LegacyChange::WithdrawPublisherNonceAndGeneration
                 | LegacyChange::ReplaceCommit
         ) {
             assert_conflict(&opts);
-            withdraw(&ds, &claims[0]);
-            assert!(
-                !ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {shared} }} }}"))
-                    .unwrap()
-            );
+            // Keep the projected replacement when withdrawing the original commit stamp.
+            let shared = if matches!(case, LegacyChange::ReplaceCommit) {
+                &triples[..1]
+            } else {
+                &triples[..]
+            };
+            let withdrawals: Vec<_> = claims[..shared.len()]
+                .iter()
+                .enumerate()
+                .map(|(i, (target, digest))| WithdrawalInput {
+                    key: format!("w{i}"),
+                    target: target.clone(),
+                    target_digest: *digest,
+                })
+                .collect();
+            evidence::withdraw(
+                &ds,
+                &ds,
+                &withdrawals,
+                &reviewer(),
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+            .unwrap();
+            for triple in shared {
+                assert!(
+                    !ds.ask(&format!("ASK {{ GRAPH <{SUPPORTS}> {{ {triple} }} }}"))
+                        .unwrap()
+                );
+            }
             if !matches!(
                 case,
                 LegacyChange::WithdrawProjectionField("ev:availabilityReceipt ?o")
@@ -3650,6 +3695,12 @@ fn check_keyed_replay_in_former_supports(reuse_projection: bool, legacy: Option<
                     ))
                     .unwrap()
                 );
+            }
+            if matches!(case, LegacyChange::WithdrawPublisherNonceAndGeneration) {
+                assert_conflict(&ReviewOptions {
+                    dry_run: true,
+                    ..opts.clone()
+                });
             }
             assert_conflict(&opts);
             if !reuse_projection {
@@ -5227,17 +5278,17 @@ fn legacy_projection_writer(root: &std::path::Path, graph: &str) -> Dataset {
 fn project_legacy_triples(
     ds: &Dataset,
     policy: &str,
-    triples: Vec<Triple>,
+    triples: &[Triple],
 ) -> Vec<(NamedNode, Sha256Digest)> {
     let mut claims = Vec::new();
     let mut decisions = Vec::new();
-    for (i, triple) in triples.into_iter().enumerate() {
+    for (i, triple) in triples.iter().enumerate() {
         let key = format!("legacy-edge-{i}");
         let c = claim_of(&propose(
             ds,
             &EvidenceInput {
                 revisions: vec![revision(&key)],
-                claims: vec![claim("c", Polarity::Positive, triple)],
+                claims: vec![claim("c", Polarity::Positive, triple.clone())],
                 ..Default::default()
             },
         ));
@@ -5289,7 +5340,7 @@ fn check_legacy_output_edge(receipt: bool) {
     } else {
         Triple::new(other, iri("http://www.w3.org/ns/prov#wasGeneratedBy"), op)
     };
-    project_legacy_triples(&ds, "main", vec![edge]);
+    project_legacy_triples(&ds, "main", &[edge]);
     drop(ds);
     legacy_settings(&root, &s);
 
@@ -5545,7 +5596,7 @@ fn check_legacy_output_replay(mixed_history: Option<LegacyRecord>) {
         project_legacy_triples(
             &ds,
             "other",
-            vec![Triple::new(
+            &[Triple::new(
                 first.operation.clone(),
                 iri("http://www.w3.org/ns/prov#used"),
                 third.projection.clone(),
