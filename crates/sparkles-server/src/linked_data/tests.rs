@@ -110,6 +110,7 @@ fn linked_data_routes_classify_as_queries_for_rate_limiting() {
         ("/$/ld", "/$/ld?iri=http://ex/a"),
         ("/$/ld/doc", "/$/ld/doc?iri=http://ex/a"),
         ("/$/ld/ns/{prefix}", "/$/ld/ns/ex"),
+        ("/$/ld/ns/{prefix}/", "/$/ld/ns/ex/"),
         ("/$/ld/ns/{prefix}/{*local}", "/$/ld/ns/ex/Person"),
     ] {
         let c = crate::ratelimit::classify(
@@ -644,6 +645,29 @@ async fn purl_and_w3id_recipe_export_covers_namespaces_and_versions() {
     let st = Arc::new(
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
     );
+    let ds = st.attach("recds", DbType::Mem, None).unwrap();
+    let trig = r#"
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+<http://example.org/rec/g> {
+  <https://w3id.org/myorg/mv/> a owl:Ontology ;
+    rdfs:label "My Slash Root" .
+  <https://w3id.org/myorg/mv/Person> a owl:Class ;
+    rdfs:label "My Slash Person" .
+  <https://w3id.org/myorg/mvh> a owl:Ontology ;
+    owl:versionIRI <https://w3id.org/myorg/mvh/1.0#> ;
+    rdfs:label "My Hash Vocab v1" .
+  <https://w3id.org/myorg/mvh#Concept> a owl:Class ;
+    rdfs:label "My Hash Concept" .
+}
+"#;
+    ds.store
+        .load(&[Source::from_bytes(
+            trig.as_bytes().to_vec(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
     let app = crate::http::router(st.clone());
 
     let reg = send(
@@ -658,11 +682,16 @@ async fn purl_and_w3id_recipe_export_covers_namespaces_and_versions() {
                     {"prefix": "mv", "iri": "https://w3id.org/myorg/mv/"},
                     {"prefix": "mvh", "iri": "https://w3id.org/myorg/mvh#"}
                 ],
+                "graphs": [{"dataset": "recds", "graph": "http://example.org/rec/g"}],
                 "versions": [
                     {
                         "version": "1.0",
                         "versionIri": "https://w3id.org/myorg/mv/1.0",
                         "snapshot": "snapshot:v1"
+                    },
+                    {
+                        "version": "1.0-hash",
+                        "versionIri": "https://w3id.org/myorg/mvh/1.0#"
                     }
                 ]
             }),
@@ -672,8 +701,8 @@ async fn purl_and_w3id_recipe_export_covers_namespaces_and_versions() {
     .await;
     assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
 
-    // Default w3id .htaccess text output: strips shared 'myorg' mount and leaves
-    // content negotiation to Sparkles.
+    // Default w3id .htaccess text output: strips shared 'myorg' mount, matches raw
+    // %{THE_REQUEST} paths and leaves content negotiation to Sparkles.
     let w3id = send(
         &app,
         get_req(
@@ -692,27 +721,31 @@ async fn purl_and_w3id_recipe_export_covers_namespaces_and_versions() {
     let text = w3id.text();
     assert!(text.contains("RewriteEngine on"), "{text}");
     assert!(text.contains("ids/myorg/.htaccess"), "{text}");
-    assert!(text.contains("RewriteRule ^mv/1\\.0/?$ "), "{text}");
-    assert!(!text.contains("RewriteRule ^myorg/"), "{text}");
+    assert!(
+        text.contains(r"RewriteCond %{THE_REQUEST} ^\S+\s+/myorg/mv/1\.0/?(?:\?|\s|$)"),
+        "{text}"
+    );
     assert!(!text.contains("RewriteCond %{HTTP_ACCEPT}"), "{text}");
     assert!(
         text.contains(
-            "https://rdf.example.org/$/ld/doc?iri=https\\%3A\\%2F\\%2Fw3id.org\\%2Fmyorg\\%2Fmv\\%2F1.0 [R=303,L,NE]"
+            "RewriteRule ^ https://rdf.example.org/$/ld/doc?iri=https\\%3A\\%2F\\%2Fw3id.org\\%2Fmyorg\\%2Fmv\\%2F1.0 [R=303,L,NE]"
         ),
         "{text}"
     );
     assert!(
         text.contains(
-            "RewriteRule ^mv/(.+)$ https://rdf.example.org/$/ld/doc?iri=https\\%3A\\%2F\\%2Fw3id.org\\%2Fmyorg\\%2Fmv\\%2F$1 [B,R=303,L,NE]"
+            "RewriteRule ^__sparkles_ld__/(.+)$ https://rdf.example.org/$/ld/doc?iri=https\\%3A\\%2F\\%2Fw3id.org\\%2Fmyorg\\%2Fmv\\%2F$1 [B,R=303,L,NE]"
         ),
         "{text}"
     );
     assert!(
-        text.contains("RewriteRule ^mvh/?$ https://rdf.example.org/$/ld/ns/mvh [R=303,L,NE]"),
+        text.contains("RewriteRule ^ https://rdf.example.org/$/ld/ns/mvh [R=303,L,NE]"),
         "{text}"
     );
 
-    // PURL recipe JSON output uses PURL's supported `partial` type (not `303 partial`).
+    // PURL recipe JSON output uses PURL's supported `partial` type, strips `#` from
+    // hash-terminated version IRIs, and its slash partial target works for both the
+    // empty-suffix root (`/$/ld/ns/mv/`) and subterms (`/$/ld/ns/mv/Person`).
     let purl_json = send(
         &app,
         get_req(
@@ -726,13 +759,132 @@ async fn purl_and_w3id_recipe_export_covers_namespaces_and_versions() {
     let j = purl_json.json();
     assert_eq!(j["kind"], "purl");
     assert_eq!(j["namespaces"].as_array().unwrap().len(), 2);
-    assert_eq!(j["versions"].as_array().unwrap().len(), 1);
+    assert_eq!(j["versions"].as_array().unwrap().len(), 2);
     let purl_content = j["content"].as_str().unwrap();
     assert!(
-        purl_content.contains("partial https://w3id.org/myorg/mv/ -> "),
+        purl_content
+            .contains("partial https://w3id.org/myorg/mv/ -> https://rdf.example.org/$/ld/ns/mv/"),
+        "{purl_content}"
+    );
+    assert!(
+        purl_content.contains("303 https://w3id.org/myorg/mvh/1.0 -> "),
+        "hash-terminated versionIri PURL source must omit fragment:\n{purl_content}"
+    );
+    assert!(
+        !purl_content.contains("303 https://w3id.org/myorg/mvh/1.0#"),
         "{purl_content}"
     );
     assert!(!purl_content.contains("303 partial"), "{purl_content}");
+
+    // Follow exported PURL targets directly against Sparkles's router:
+    // 1. Slash partial with empty suffix (`/$/ld/ns/mv/`) resolves identically to `/$/ld/ns/mv`.
+    let slash_root = send(&app, get_req("/$/ld/ns/mv/", Some("text/turtle"), None)).await;
+    assert_eq!(
+        slash_root.status,
+        StatusCode::SEE_OTHER,
+        "PURL empty-suffix slash root failed: {}",
+        slash_root.text()
+    );
+    let slash_root_doc = send(
+        &app,
+        get_req(
+            slash_root.header("location").unwrap(),
+            Some("text/turtle"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        slash_root_doc.status,
+        StatusCode::OK,
+        "{}",
+        slash_root_doc.text()
+    );
+    assert!(
+        slash_root_doc.text().contains("My Slash Root"),
+        "{}",
+        slash_root_doc.text()
+    );
+
+    // 2. Slash partial with term suffix (`/$/ld/ns/mv/Person`).
+    let slash_term = send(
+        &app,
+        get_req("/$/ld/ns/mv/Person", Some("text/turtle"), None),
+    )
+    .await;
+    assert_eq!(
+        slash_term.status,
+        StatusCode::SEE_OTHER,
+        "{}",
+        slash_term.text()
+    );
+    let slash_term_doc = send(
+        &app,
+        get_req(
+            slash_term.header("location").unwrap(),
+            Some("text/turtle"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        slash_term_doc.status,
+        StatusCode::OK,
+        "{}",
+        slash_term_doc.text()
+    );
+    assert!(
+        slash_term_doc.text().contains("My Slash Person"),
+        "{}",
+        slash_term_doc.text()
+    );
+
+    // 3. Hash version IRI PURL target answers 200 OK directly.
+    let hver_target = j["versions"][1]["targetUrl"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("https://rdf.example.org")
+        .unwrap();
+    let hver_resp = send(&app, get_req(hver_target, Some("text/turtle"), None)).await;
+    assert_eq!(hver_resp.status, StatusCode::OK, "{}", hver_resp.text());
+    assert!(
+        hver_resp.text().contains("My Hash Vocab v1"),
+        "{}",
+        hver_resp.text()
+    );
+
+    // Unsupported recipe inputs (non-http(s) scheme or query-bearing IRI) are rejected explicitly.
+    for (id, ns_iri) in [
+        ("urnvocab", "urn:example:vocab:"),
+        ("qvocab", "https://example.org/q?x=1"),
+    ] {
+        let cr = send(
+            &app,
+            post_json(
+                "/$/resources",
+                json!({
+                    "id": id,
+                    "kind": "vocabulary",
+                    "title": id,
+                    "namespaces": [{"prefix": id, "iri": ns_iri}]
+                }),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(cr.status, StatusCode::CREATED, "{}", cr.text());
+        let bad = send(
+            &app,
+            get_req(
+                &format!("/$/resources/{id}/recipes?base=https://rdf.example.org"),
+                None,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{id}: {}", bad.text());
+        assert_eq!(bad.json()["code"], "bad-recipe");
+    }
 
     // Invalid base URLs (injection / mod_rewrite metacharacters / non-http) are rejected with 400.
     for bad_base in [
@@ -1105,6 +1257,302 @@ datasets = {{ other_ds = "read" }}
     .await;
     assert_eq!(adm_sc.status, StatusCode::BAD_REQUEST, "{}", adm_sc.text());
     assert_eq!(adm_sc.json()["code"], "snapshot-conflict");
+
+    // 8. Unrelated readable owl:Ontology / skos:ConceptScheme and unlinked vocabulary
+    //    terms in the same allowed graph must NOT authorize a private hash-version lookup
+    //    or leak catalog metadata / history headers / 400 conflict responses.
+    let hash_ver_trig = r#"
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix acl: <http://example.org/acl/> .
+<http://example.org/g/public> {
+  <http://unrelated.example/ont> a owl:Ontology ;
+    rdfs:label "Unrelated Public Ontology" .
+  <http://unrelated.example/scheme> a skos:ConceptScheme ;
+    rdfs:label "Unrelated Public Scheme" .
+  <http://example.org/aclh#PublicTerm> rdfs:label "Unlinked Hash Term" .
+  <http://example.org/aclh/v1#> acl:secretNote "HIDDEN HASH VERSION META" .
+}
+"#;
+    ds.store
+        .load(&[Source::from_bytes(
+            hash_ver_trig.as_bytes().to_vec(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let reg_hv = send(
+        &app,
+        post_json(
+            "/$/resources",
+            json!({
+                "id": "aclhvocab",
+                "kind": "vocabulary",
+                "title": "Classified Hash Vocabulary",
+                "namespaces": [{"prefix": "aclh", "iri": "http://example.org/aclh#"}],
+                "graphs": [{"dataset": "acl_ds", "graph": "http://example.org/g/public"}],
+                "versions": [{
+                    "version": "1.0",
+                    "versionIri": "http://example.org/aclh/v1#",
+                    "snapshot": "commit:3"
+                }]
+            }),
+            Some(&admin_auth),
+        ),
+    )
+    .await;
+    assert_eq!(reg_hv.status, StatusCode::CREATED, "{}", reg_hv.text());
+
+    for uri in [
+        format!("/$/ld?iri={}", enc("http://example.org/aclh/v1")),
+        format!("/$/ld?iri={}", enc("http://example.org/aclh/v1#")),
+        format!(
+            "/$/ld/doc?iri={}&version=2.0",
+            enc("http://example.org/aclh/v1")
+        ),
+        format!(
+            "/$/ld/doc?iri={}&at=commit:999",
+            enc("http://example.org/aclh/v1#")
+        ),
+    ] {
+        let r = send(&app, get_req(&uri, Some("text/turtle"), Some(&pub_auth))).await;
+        assert_eq!(
+            r.status,
+            StatusCode::NOT_FOUND,
+            "unrelated graph ontology authorized private hash version on {uri}: {}",
+            r.text()
+        );
+        assert!(r.header("sparkles-at").is_none());
+        assert!(!r.text().contains("Classified Hash Vocabulary"));
+        assert!(!r.text().contains("Unrelated Public Ontology"));
+    }
+
+    // admin CAN read the hidden hash version and receives neither unrelated ontology.
+    let adm_hv = send(
+        &app,
+        get_req(
+            &format!("/$/ld?iri={}", enc("http://example.org/aclh/v1")),
+            Some("text/turtle"),
+            Some(&admin_auth),
+        ),
+    )
+    .await;
+    assert_eq!(adm_hv.status, StatusCode::OK, "{}", adm_hv.text());
+    assert!(
+        adm_hv.text().contains("HIDDEN HASH VERSION META"),
+        "{}",
+        adm_hv.text()
+    );
+    assert!(
+        !adm_hv.text().contains("Unrelated Public Ontology"),
+        "unrelated ontology leaked into hash version DESCRIBE:\n{}",
+        adm_hv.text()
+    );
+    let adm_hv_conflict = send(
+        &app,
+        get_req(
+            &format!(
+                "/$/ld/doc?iri={}&version=2.0",
+                enc("http://example.org/aclh/v1")
+            ),
+            Some("text/turtle"),
+            Some(&admin_auth),
+        ),
+    )
+    .await;
+    assert_eq!(adm_hv_conflict.status, StatusCode::BAD_REQUEST);
+    assert_eq!(adm_hv_conflict.json()["code"], "version-conflict");
+}
+
+#[cfg(feature = "auth")]
+#[tokio::test]
+async fn hidden_target_cold_replay_budget_failure_returns_404_not_507() {
+    use base64::Engine as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h = |pw: &str| crate::auth::hash_password_with(pw, 8, 1, 1).unwrap();
+    let auth_toml = format!(
+        r#"
+version = 1
+
+[server]
+public_url = "http://localhost:3030"
+
+[anonymous]
+datasets = {{}}
+
+[[protections]]
+name = "secret_notes"
+dataset = "cold_ds"
+predicates = ["http://example.org/cold/secretNote"]
+
+[[users]]
+name = "admin"
+password = "{admin}"
+server = ["server-admin"]
+
+[[users]]
+name = "pub_reader"
+password = "{pub_reader}"
+[[users.grants]]
+dataset = "cold_ds"
+level = "read"
+graphs = ["http://example.org/cold/g"]
+"#,
+        admin = h("admin-pw"),
+        pub_reader = h("pub-pw"),
+    );
+    let auth_path = dir.path().join("auth.toml");
+    std::fs::write(&auth_path, auth_toml).unwrap();
+    let auth = crate::auth::load(Some(&auth_path), dir.path(), "127.0.0.1", false).unwrap();
+
+    let basic = |u: &str, pw: &str| {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{u}:{pw}"))
+        )
+    };
+    let admin_auth = basic("admin", "admin-pw");
+    let pub_auth = basic("pub_reader", "pub-pw");
+
+    // Populate a persistent dataset with enough quads in commit 1 that cold replay exceeds
+    // a small query memory ceiling, then advance to commit 2 so snapshot:cold is historical.
+    {
+        let mut st =
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        st.auth = auth.clone();
+        let st = Arc::new(st);
+        st.create("cold_ds", DbType::Persistent).unwrap();
+        let app = crate::http::router(st.clone());
+
+        let mut ttl = String::from(
+            "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+             @prefix cold: <http://example.org/cold/> .\n\
+             cold:PublicTerm rdfs:label \"Public Term\" .\n\
+             cold:v1 cold:secretNote \"HIDDEN COLD VERSION\" .\n",
+        );
+        for i in 0..400 {
+            ttl.push_str(&format!(
+                "cold:Pad{i} rdfs:comment \"padding-entry-{i:04}-payload-for-wal-replay\" .\n"
+            ));
+        }
+        let put1 = send(
+            &app,
+            Request::put("/cold_ds/data?graph=http%3A%2F%2Fexample.org%2Fcold%2Fg")
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::from(ttl))
+                .unwrap(),
+        )
+        .await;
+        assert!(put1.status.is_success(), "{}", put1.text());
+
+        let snap = send(
+            &app,
+            post_json(
+                "/$/snapshots/cold_ds",
+                json!({"name": "cold"}),
+                Some(&admin_auth),
+            ),
+        )
+        .await;
+        assert_eq!(snap.status, StatusCode::CREATED, "{}", snap.text());
+
+        // Commit 2 keeps both PublicTerm and the hidden v1 triple at head so live probes
+        // see PublicTerm (for pub_reader) and v1 (for admin only), while snapshot:cold
+        // requires WAL replay of commit 1.
+        let post2 = send(
+            &app,
+            Request::post("/cold_ds/data?graph=http%3A%2F%2Fexample.org%2Fcold%2Fg")
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .header(header::AUTHORIZATION, &admin_auth)
+                .body(Body::from(
+                    "<http://example.org/cold/PublicTerm> <http://www.w3.org/2000/01/rdf-schema#comment> \"head\" .",
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert!(post2.status.is_success(), "{}", post2.text());
+
+        let reg = send(
+            &app,
+            post_json(
+                "/$/resources",
+                json!({
+                    "id": "coldv",
+                    "kind": "vocabulary",
+                    "title": "Cold Vocab",
+                    "namespaces": [{"prefix": "cold", "iri": "http://example.org/cold/"}],
+                    "graphs": [{"dataset": "cold_ds", "graph": "http://example.org/cold/g"}],
+                    "versions": [{
+                        "version": "1.0",
+                        "versionIri": "http://example.org/cold/v1",
+                        "snapshot": "snapshot:cold"
+                    }]
+                }),
+                Some(&admin_auth),
+            ),
+        )
+        .await;
+        assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
+    }
+
+    // Reopen with a cold history cache and a 24 KiB per-query memory ceiling: live 1-triple
+    // probes succeed easily, whereas cold replay of commit 1 exceeds 24 KiB.
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.auth = auth;
+    st.limits.query_memory_bytes = Some(24 * 1024);
+    let st = Arc::new(st);
+    let app = crate::http::router(st.clone());
+
+    // pub_reader cannot read cold/v1 (hidden by triple protection): direct lookup,
+    // redirect probe and conflict probes must all return the generic 404 — identical to
+    // an absent IRI — and must NEVER return 507 or leak replay byte counts.
+    for uri in [
+        format!("/$/ld?iri={}", enc("http://example.org/cold/v1")),
+        format!("/$/ld/doc?iri={}", enc("http://example.org/cold/v1")),
+        format!(
+            "/$/ld/doc?iri={}&version=2.0",
+            enc("http://example.org/cold/v1")
+        ),
+        format!(
+            "/$/ld/doc?iri={}&at=commit:999",
+            enc("http://example.org/cold/v1")
+        ),
+    ] {
+        let r = send(&app, get_req(&uri, Some("text/turtle"), Some(&pub_auth))).await;
+        assert_eq!(
+            r.status,
+            StatusCode::NOT_FOUND,
+            "cold replay failure disclosed hidden catalog entry on {uri}: {}",
+            r.text()
+        );
+        assert_eq!(r.json()["code"], "linked-data-not-found");
+        assert!(!r.text().contains("requested"), "{}", r.text());
+    }
+
+    // Authorized caller on a live-readable target (pub_reader on PublicTerm?at=snapshot:cold
+    // or admin on cold/v1) still receives 507 when replay exceeds the budget.
+    let auth_cold = send(
+        &app,
+        get_req(
+            &format!(
+                "/$/ld/doc?iri={}&at=snapshot:cold",
+                enc("http://example.org/cold/PublicTerm")
+            ),
+            Some("text/turtle"),
+            Some(&pub_auth),
+        ),
+    )
+    .await;
+    assert_eq!(
+        auth_cold.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        auth_cold.text()
+    );
 }
 
 #[tokio::test]
@@ -1173,13 +1621,18 @@ async fn html_rendering_enforces_max_result_bytes_during_construction() {
     let dir = tempfile::tempdir().unwrap();
     let mut st =
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
-    st.limits.max_result_bytes = Some(1024);
+    // 4 KiB comfortably fits the fixed HTML page scaffold (~2 KiB) so Small succeeds
+    // while Big fails while streaming its literal.
+    st.limits.max_result_bytes = Some(4096);
     let st = Arc::new(st);
 
     let ds = st.attach("htmlds", DbType::Mem, None).unwrap();
     let big = "a".repeat(32 * 1024);
     let trig = format!(
-        "<http://example.org/h/g> {{\n  <http://example.org/h/Big> <http://www.w3.org/2000/01/rdf-schema#comment> \"{big}\" .\n}}\n"
+        "<http://example.org/h/g> {{\n  \
+         <http://example.org/h/Small> <http://www.w3.org/2000/01/rdf-schema#label> \"Small\" .\n  \
+         <http://example.org/h/Big> <http://www.w3.org/2000/01/rdf-schema#comment> \"{big}\" .\n\
+         }}\n"
     );
     ds.store
         .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
@@ -1202,6 +1655,17 @@ async fn html_rendering_enforces_max_result_bytes_during_construction() {
     )
     .await;
 
+    let small_r = send(
+        &app,
+        get_req(
+            &format!("/$/ld/doc?iri={}", enc("http://example.org/h/Small")),
+            Some("text/html"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(small_r.status, StatusCode::OK, "{}", small_r.text());
+
     let r = send(
         &app,
         get_req(
@@ -1212,6 +1676,110 @@ async fn html_rendering_enforces_max_result_bytes_during_construction() {
     )
     .await;
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+}
+
+#[tokio::test]
+async fn html_escaping_expansion_and_response_body_charge_shared_memory_account() {
+    let dir = tempfile::tempdir().unwrap();
+    // 1.5 MiB query memory limit and 1.5 MiB query memory pool, with default 1 GiB
+    // max_result_bytes: a 120 KiB `rdfs:label` of `&` characters fits comfortably
+    // through DESCRIBE (~1.2 MiB peak) and as Turtle (~120.5 KiB, 1x), while HTML
+    // rendering escapes `&` -> `&amp;` (5x) in `<title>`, `<h1>` and the table (~1.8 MiB
+    // total), exceeding the shared memory account and answering 507.
+    let mut st = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(1536 * 1024),
+    )
+    .unwrap();
+    st.limits.query_memory_bytes = Some(1536 * 1024);
+    st.set_phase(crate::obs::Phase::Ready);
+    let st = Arc::new(st);
+
+    let ds = st.attach("escds", DbType::Mem, None).unwrap();
+    let amps = "&".repeat(120 * 1024);
+    let trig = format!(
+        "<http://example.org/esc/g> {{\n  \
+         <http://example.org/esc/Expand> <http://www.w3.org/2000/01/rdf-schema#label> \"{amps}\" .\n\
+         }}\n"
+    );
+    ds.store
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    let app = crate::http::router(st.clone());
+    let reg = send(
+        &app,
+        post_json(
+            "/$/resources",
+            json!({
+                "id": "escv",
+                "kind": "vocabulary",
+                "title": "Escape Vocab",
+                "namespaces": [{"prefix": "esc", "iri": "http://example.org/esc/"}],
+                "graphs": [{"dataset": "escds", "graph": "http://example.org/esc/g"}]
+            }),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
+
+    // Turtle output (~120.5 KiB) fits inside 1.5 MiB and holds its pool grant until the
+    // HTTP response body is dropped.
+    let pool = st.catalog.pool().expect("pool configured");
+    let raw_ttl = app
+        .clone()
+        .oneshot(get_req(
+            &format!("/$/ld/doc?iri={}", enc("http://example.org/esc/Expand")),
+            Some("text/turtle"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let ttl_status = raw_ttl.status();
+    if ttl_status != StatusCode::OK {
+        let err_body = axum::body::to_bytes(raw_ttl.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        panic!(
+            "expected 200 OK for Turtle within 1.5 MiB budget, got {ttl_status}: {}",
+            String::from_utf8_lossy(&err_body)
+        );
+    }
+    assert!(
+        pool.granted() > 0,
+        "response body must keep its pool grant charged until consumed/dropped"
+    );
+    let ttl_bytes = axum::body::to_bytes(raw_ttl.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(ttl_bytes.len() >= 120 * 1024);
+    assert_eq!(
+        pool.granted(),
+        0,
+        "pool grant must be released once response body drops"
+    );
+
+    // HTML output (~1.8 MiB escaped + live QueryResult > 1.5 MiB) exceeds the shared
+    // memory account and answers 507 even though max_result_bytes is 1 GiB.
+    let html_r = send(
+        &app,
+        get_req(
+            &format!("/$/ld/doc?iri={}", enc("http://example.org/esc/Expand")),
+            Some("text/html"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        html_r.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "escaped HTML expansion should exceed shared memory budget: {}",
+        html_r.text()
+    );
+    assert_eq!(pool.granted(), 0);
 }
 
 #[tokio::test]
@@ -1239,6 +1807,25 @@ async fn accept_negotiation_combines_headers_checks_params_and_emits_only_offere
         )),
         Some(Format::Turtle)
     );
+    // Media parameters following `q` still participate in matching (RFC 9110 §12.5.1).
+    assert_eq!(
+        negotiate_format(Some(
+            "text/html;q=0.8;charset=iso-8859-1, text/turtle;q=0.7"
+        )),
+        Some(Format::Turtle)
+    );
+    assert_eq!(
+        negotiate_format(Some("text/html;q=0.8;charset=utf-8, text/turtle;q=0.7")),
+        Some(Format::Html)
+    );
+    assert_eq!(
+        negotiate_format(Some(
+            "text/html;q=0.5;charset=utf-8, text/html;q=0.9, text/turtle;q=0.7"
+        )),
+        Some(Format::Turtle)
+    );
+    // Duplicate weight parameter is malformed and ignored.
+    assert_eq!(negotiate_format(Some("text/html;q=0.8;q=0.9")), None);
 
     // Multiple Accept header fields are combined per RFC 9110 §5.3.
     let dir = tempfile::tempdir().unwrap();
@@ -1368,6 +1955,140 @@ async fn hash_terminated_version_iri_resolves_with_and_without_fragment() {
         assert!(body.contains("Hash Versioned Ontology v1"), "{iri}: {body}");
         assert!(body.contains("Hash Version Item"), "{iri}: {body}");
     }
+
+    // Descendant under a slash versionIri also pins history via its IRI, so even when
+    // requested with matching explicit `?version=` or `?at=`, `rel="original"` is omitted.
+    let slash_v1 = r#"
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+<http://example.org/sver/1.0/Item> rdfs:label "Slash Version Descendant v1" .
+"#;
+    send(
+        &app,
+        Request::put("/hverds/data?graph=http%3A%2F%2Fexample.org%2Fsver%2Fg")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(slash_v1))
+            .unwrap(),
+    )
+    .await;
+    send(
+        &app,
+        post_json("/$/snapshots/hverds", json!({"name": "sv1"}), None),
+    )
+    .await;
+    // Advance head so snapshot:sv1 is historical.
+    send(
+        &app,
+        Request::post("/hverds/data?graph=http%3A%2F%2Fexample.org%2Fsver%2Fg")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://example.org/sver/1.0/Item> <http://www.w3.org/2000/01/rdf-schema#comment> \"v2\" .",
+            ))
+            .unwrap(),
+    )
+    .await;
+    send(
+        &app,
+        post_json(
+            "/$/resources",
+            json!({
+                "id": "sverv",
+                "kind": "vocabulary",
+                "title": "Slash Versioned",
+                "namespaces": [{"prefix": "sver", "iri": "http://example.org/sver/"}],
+                "graphs": [{"dataset": "hverds", "graph": "http://example.org/sver/g"}],
+                "versions": [{
+                    "version": "1.0",
+                    "versionIri": "http://example.org/sver/1.0/",
+                    "snapshot": "snapshot:sv1"
+                }]
+            }),
+            None,
+        ),
+    )
+    .await;
+    for suffix in [
+        "&version=1.0",
+        "&at=snapshot:sv1",
+        "&version=1.0&at=snapshot:sv1",
+    ] {
+        let r = send(
+            &app,
+            get_req(
+                &format!(
+                    "/$/ld/doc?iri={}{suffix}",
+                    enc("http://example.org/sver/1.0/Item")
+                ),
+                Some("text/turtle"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{suffix}: {}", r.text());
+        assert_eq!(r.header("sparkles-at"), Some("snapshot:sv1"));
+        assert!(r.header("memento-datetime").is_some());
+        assert!(
+            !r.header("link").unwrap_or("").contains("rel=\"original\""),
+            "slash versionIri descendant with {suffix} must not emit rel=\"original\": {:?}",
+            r.header("link")
+        );
+    }
+
+    // Hash-document 200/201 term-limit boundary check: 200 terms are not truncated,
+    // adding a 201st term sets `Sparkles-Describe-Truncated: true`.
+    let mut two_hundred = String::from("@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n");
+    for i in 0..200 {
+        two_hundred.push_str(&format!(
+            "<http://example.org/lim#T{i:03}> rdfs:label \"T{i:03}\" .\n"
+        ));
+    }
+    let put_lim = send(
+        &app,
+        Request::put("/hverds/data?graph=http%3A%2F%2Fexample.org%2Flim%2Fg")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(two_hundred))
+            .unwrap(),
+    )
+    .await;
+    assert!(put_lim.status.is_success(), "{}", put_lim.text());
+    send(
+        &app,
+        post_json(
+            "/$/resources",
+            json!({
+                "id": "limv",
+                "kind": "vocabulary",
+                "title": "Limit Vocab",
+                "namespaces": [{"prefix": "lim", "iri": "http://example.org/lim#"}],
+                "graphs": [{"dataset": "hverds", "graph": "http://example.org/lim/g"}]
+            }),
+            None,
+        ),
+    )
+    .await;
+    let r200 = send(&app, get_req("/$/ld/ns/lim", Some("text/turtle"), None)).await;
+    assert_eq!(r200.status, StatusCode::OK, "{}", r200.text());
+    assert!(
+        r200.header("sparkles-describe-truncated").is_none(),
+        "200 terms must not be marked truncated"
+    );
+    let post_201 = send(
+        &app,
+        Request::post("/hverds/data?graph=http%3A%2F%2Fexample.org%2Flim%2Fg")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(
+                "<http://example.org/lim#T200> <http://www.w3.org/2000/01/rdf-schema#label> \"T200\" .",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert!(post_201.status.is_success(), "{}", post_201.text());
+    let r201 = send(&app, get_req("/$/ld/ns/lim", Some("text/turtle"), None)).await;
+    assert_eq!(r201.status, StatusCode::OK, "{}", r201.text());
+    assert_eq!(
+        r201.header("sparkles-describe-truncated"),
+        Some("true"),
+        "201 terms must trigger hash-document truncation"
+    );
 }
 
 #[tokio::test]
@@ -1530,10 +2251,15 @@ async fn cross_vocabulary_html_links_do_not_propagate_version_param() {
 <http://example.org/x/g1> {
   <http://example.org/v1/A>
     rdfs:label "Term A" ;
-    rdfs:seeAlso <http://example.org/v1/B>, <http://example.org/v2/Other> .
+    rdfs:seeAlso <http://example.org/v1/B>,
+                 <http://example.org/v2/Other>,
+                 <http://example.org/v1/nested/SubTerm> .
 }
 <http://example.org/x/g2> {
   <http://example.org/v2/Other> rdfs:label "Other" .
+}
+<http://example.org/x/g3> {
+  <http://example.org/v1/nested/SubTerm> rdfs:label "Nested SubTerm" .
 }
 "#;
     let put = send(
@@ -1594,6 +2320,22 @@ async fn cross_vocabulary_html_links_do_not_propagate_version_param() {
         ),
     )
     .await;
+    // Nested vocabulary whose namespace sits inside vocab1's `/v1/` prefix.
+    send(
+        &app,
+        post_json(
+            "/$/resources",
+            json!({
+                "id": "vocab_nested",
+                "kind": "vocabulary",
+                "title": "Nested Vocab",
+                "namespaces": [{"prefix": "v1n", "iri": "http://example.org/v1/nested/"}],
+                "graphs": [{"dataset": "xds", "graph": "http://example.org/x/g3"}]
+            }),
+            None,
+        ),
+    )
+    .await;
 
     let resp = send(
         &app,
@@ -1624,6 +2366,10 @@ async fn cross_vocabulary_html_links_do_not_propagate_version_param() {
         enc("http://example.org/v1/B")
     );
     let cross_link = format!("/$/ld?iri={}\"", enc("http://example.org/v2/Other"));
+    let nested_link = format!(
+        "/$/ld?iri={}\"",
+        enc("http://example.org/v1/nested/SubTerm")
+    );
     assert!(
         html.contains(&same_link),
         "missing same-vocab version link:\n{html}"
@@ -1632,47 +2378,128 @@ async fn cross_vocabulary_html_links_do_not_propagate_version_param() {
         html.contains(&cross_link),
         "cross-vocab link must omit version=1.0:\n{html}"
     );
+    assert!(
+        html.contains(&nested_link),
+        "nested-namespace link owned by another vocabulary must omit version=1.0:\n{html}"
+    );
 }
 
-/// Simulate Apache 2.4 `mod_rewrite` expansion of a `RewriteRule` substitution string
-/// (`\%` -> `%`, `\$` -> `$`, `$1` replaced with `B`-escaped capture when `B` is set).
-fn simulate_apache_rewrite(subst: &str, flags: &str, capture_1: Option<&str>) -> String {
-    let has_b = flags.split(',').any(|f| f == "B");
-    let has_ne = flags.split(',').any(|f| f == "NE");
-    let mut out = String::new();
-    let mut chars = subst.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(next) = chars.next() {
-                out.push(next);
-            }
-        } else if c == '%' && chars.peek().is_some_and(char::is_ascii_digit) {
-            // Unescaped %N expands as an empty RewriteCond backreference in Apache!
-            let _ = chars.next();
-        } else if c == '$' && chars.peek() == Some(&'1') {
-            let _ = chars.next();
-            if let Some(cap) = capture_1 {
-                if has_b {
-                    let escaped: String =
-                        url::form_urlencoded::byte_serialize(cap.as_bytes()).collect();
-                    out.push_str(&escaped);
+/// Evaluate generated Apache 2.4 `.htaccess` `RewriteCond %{THE_REQUEST}` / `RewriteRule`
+/// directives against a raw HTTP/1.1 request line (`GET <raw_target> HTTP/1.1`), including
+/// internal `[DPI,E=SPARKLES_LD:...]` handoff and `[B]` backreference escaping.
+fn eval_htaccess_request(htaccess: &str, raw_target: &str) -> Option<String> {
+    let the_request = format!("GET {raw_target} HTTP/1.1");
+    let mut uri = raw_target
+        .split('?')
+        .next()
+        .unwrap_or(raw_target)
+        .trim_start_matches('/')
+        .to_string();
+    let mut env_sparkles_ld = String::new();
+    let mut pending_conds: Vec<(String, String)> = Vec::new();
+
+    for line in htaccess.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("RewriteCond ") {
+            let mut parts = rest.splitn(2, ' ');
+            let test = parts.next().unwrap().trim().to_string();
+            let pat = parts.next().unwrap().trim().to_string();
+            pending_conds.push((test, pat));
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("RewriteRule ") else {
+            pending_conds.clear();
+            continue;
+        };
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(parts.len(), 3, "malformed RewriteRule: {line}");
+        let (rule_pat, subst, flags) = (parts[0], parts[1], parts[2].trim_matches(['[', ']']));
+
+        let rule_re = regex::Regex::new(rule_pat).unwrap();
+        let Some(rule_caps) = rule_re.captures(&uri) else {
+            pending_conds.clear();
+            continue;
+        };
+
+        let mut cond_match = true;
+        let mut last_cond_cap1: Option<String> = None;
+        for (test, pat) in pending_conds.drain(..) {
+            let val = match test.as_str() {
+                "%{THE_REQUEST}" => the_request.as_str(),
+                "%{ENV:SPARKLES_LD}" => env_sparkles_ld.as_str(),
+                other => panic!("unexpected RewriteCond test string: {other}"),
+            };
+            if let Some(eq) = pat.strip_prefix('=') {
+                if val != eq {
+                    cond_match = false;
+                    break;
+                }
+            } else {
+                let re = regex::Regex::new(&pat).unwrap();
+                if let Some(c) = re.captures(val) {
+                    last_cond_cap1 = c.get(1).map(|m| m.as_str().to_string());
                 } else {
-                    out.push_str(cap);
+                    cond_match = false;
+                    break;
                 }
             }
-        } else {
-            out.push(c);
         }
+        if !cond_match {
+            continue;
+        }
+
+        let has_b = flags.split(',').any(|f| f == "B");
+        let has_ne = flags.split(',').any(|f| f == "NE");
+        let is_redirect = flags.split(',').any(|f| f.starts_with("R="));
+        for f in flags.split(',') {
+            if let Some(ev) = f.strip_prefix("E=SPARKLES_LD:") {
+                env_sparkles_ld = ev.to_string();
+            }
+        }
+
+        let rule_cap1 = rule_caps.get(1).map(|m| m.as_str());
+        let mut out = String::new();
+        let mut chars = subst.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else if c == '%' && chars.peek() == Some(&'1') {
+                let _ = chars.next();
+                if let Some(cap) = &last_cond_cap1 {
+                    out.push_str(cap);
+                }
+            } else if c == '$' && chars.peek() == Some(&'1') {
+                let _ = chars.next();
+                if let Some(cap) = rule_cap1 {
+                    if has_b {
+                        let escaped: String =
+                            url::form_urlencoded::byte_serialize(cap.as_bytes()).collect();
+                        out.push_str(&escaped);
+                    } else {
+                        out.push_str(cap);
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        if is_redirect {
+            if !has_ne {
+                out = out.replace('%', "%25");
+            }
+            return Some(out);
+        }
+        uri = out;
     }
-    if !has_ne {
-        // Without NE, Apache re-encodes '%' as '%25'.
-        out = out.replace('%', "%25");
-    }
-    out
+    None
 }
 
 #[tokio::test]
-async fn apache_recipe_round_trips_version_iri_and_punctuated_local_term() {
+async fn apache_recipe_round_trips_encoded_version_iri_and_dynamic_encoded_terms() {
     let dir = tempfile::tempdir().unwrap();
     let st = Arc::new(
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
@@ -1685,10 +2512,18 @@ async fn apache_recipe_round_trips_version_iri_and_punctuated_local_term() {
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 <http://example.org/ap/g> {
   <https://w3id.org/myorg/mv/> a owl:Ontology ;
-    owl:versionIRI <https://w3id.org/myorg/mv/1.0> ;
-    rdfs:label "Apache Vocab v1" .
-  <https://w3id.org/myorg/mv/a&b?c=1> a owl:Class ;
-    rdfs:label "Punctuated Term" .
+    owl:versionIRI <https://w3id.org/myorg/mv/rev%3B1> ;
+    rdfs:label "Encoded Version rev%3B1" .
+  <https://w3id.org/myorg/mv/rev;1> a owl:Class ;
+    rdfs:label "Unencoded Distinct rev;1" .
+  <https://w3id.org/myorg/mv/code%3Bpart> a owl:Class ;
+    rdfs:label "Dynamic Encoded code%3Bpart" .
+  <https://w3id.org/myorg/mv/code;part> a owl:Class ;
+    rdfs:label "Dynamic Unencoded code;part" .
+  <https://w3id.org/myorg/mv/a&b> a owl:Class ;
+    rdfs:label "Ampersand Term" .
+  <https://w3id.org/myorg/mv/a+b> a owl:Class ;
+    rdfs:label "Plus Term" .
 }
 "#;
     let put = send(
@@ -1717,7 +2552,7 @@ async fn apache_recipe_round_trips_version_iri_and_punctuated_local_term() {
                 "graphs": [{"dataset": "apds", "graph": "http://example.org/ap/g"}],
                 "versions": [{
                     "version": "1.0",
-                    "versionIri": "https://w3id.org/myorg/mv/1.0",
+                    "versionIri": "https://w3id.org/myorg/mv/rev%3B1",
                     "snapshot": "snapshot:v1"
                 }]
             }),
@@ -1738,58 +2573,163 @@ async fn apache_recipe_round_trips_version_iri_and_punctuated_local_term() {
     assert_eq!(recipe.status, StatusCode::OK, "{}", recipe.text());
     let text = recipe.text();
 
-    let mut ver_target = None;
-    let mut term_target = None;
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("RewriteRule ") else {
-            continue;
-        };
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        assert_eq!(parts.len(), 3, "malformed RewriteRule: {line}");
-        let (pat, subst, flags) = (parts[0], parts[1], parts[2].trim_matches(['[', ']']));
-        if pat == "^mv/1\\.0/?$" {
-            ver_target = Some(simulate_apache_rewrite(subst, flags, None));
-        } else if pat == "^mv/(.+)$" {
-            // Apache decodes incoming `/myorg/mv/a%26b%3Fc=1` to `mv/a&b?c=1` before capture.
-            term_target = Some(simulate_apache_rewrite(subst, flags, Some("a&b?c=1")));
-        }
+    let cases = [
+        (
+            "/myorg/mv/rev%3B1",
+            "Encoded Version rev%3B1",
+            Some("snapshot:v1"),
+        ),
+        ("/myorg/mv/rev;1", "Unencoded Distinct rev;1", None),
+        ("/myorg/mv/code%3Bpart", "Dynamic Encoded code%3Bpart", None),
+        ("/myorg/mv/code;part", "Dynamic Unencoded code;part", None),
+        ("/myorg/mv/a&b", "Ampersand Term", None),
+        ("/myorg/mv/a+b", "Plus Term", None),
+    ];
+
+    for (raw_path, want_label, want_at) in cases {
+        let loc = eval_htaccess_request(&text, raw_path)
+            .unwrap_or_else(|| panic!("no rule matched {raw_path} in:\n{text}"));
+        let rel = loc
+            .strip_prefix("https://rdf.example.org")
+            .unwrap_or_else(|| panic!("bad redirect {loc}"));
+        let resp = send(&app, get_req(rel, Some("text/turtle"), None)).await;
+        assert_eq!(
+            resp.status,
+            StatusCode::OK,
+            "{raw_path} -> {rel} failed: {}",
+            resp.text()
+        );
+        assert!(
+            resp.text().contains(want_label),
+            "{raw_path} -> {rel} missing {want_label:?}:\n{}",
+            resp.text()
+        );
+        assert_eq!(resp.header("sparkles-at"), want_at, "{raw_path}");
     }
 
-    let ver_url = ver_target.expect("version RewriteRule missing");
-    let ver_rel = ver_url
-        .strip_prefix("https://rdf.example.org")
-        .expect("base prefix");
-    let ver_resp = send(&app, get_req(ver_rel, Some("text/turtle"), None)).await;
-    assert_eq!(
-        ver_resp.status,
-        StatusCode::OK,
-        "version redirect {ver_rel} failed: {}",
-        ver_resp.text()
-    );
-    assert!(
-        ver_resp.text().contains("Apache Vocab v1"),
-        "{}",
-        ver_resp.text()
-    );
+    // If Apache 2.4 (`apache2` or `httpd`) is installed on this host, verify the exact
+    // generated `.htaccess` against real HTTP/1.1 requests to Apache as well.
+    let apache_bin = ["/usr/sbin/apache2", "/usr/sbin/httpd"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists());
+    if let Some(bin) = apache_bin
+        && std::path::Path::new("/usr/lib/apache2/modules/mod_rewrite.so").exists()
+    {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
 
-    let term_url = term_target.expect("term RewriteRule missing");
-    let term_rel = term_url
-        .strip_prefix("https://rdf.example.org")
-        .expect("base prefix");
-    let term_resp = send(&app, get_req(term_rel, Some("text/turtle"), None)).await;
-    assert_eq!(
-        term_resp.status,
-        StatusCode::OK,
-        "punctuated term redirect {term_rel} failed: {}",
-        term_resp.text()
-    );
-    assert!(
-        term_resp.text().contains("Punctuated Term"),
-        "{}",
-        term_resp.text()
-    );
+        let apache_dir = tempfile::tempdir().unwrap();
+        let docroot = apache_dir.path().join("docroot");
+        let mount_dir = docroot.join("myorg");
+        let logs_dir = apache_dir.path().join("logs");
+        std::fs::create_dir_all(&mount_dir).unwrap();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(mount_dir.join(".htaccess"), &text).unwrap();
 
-    // Root-path slash versionIri (`https://example.org/`) emits `^$` and `^(.+)$`, never `^/(.+)$`.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let conf = format!(
+            "ServerRoot \"{}\"\n\
+             ServerName localhost\n\
+             PidFile \"{}/httpd.pid\"\n\
+             Listen 127.0.0.1:{port}\n\
+             LoadModule mpm_event_module /usr/lib/apache2/modules/mod_mpm_event.so\n\
+             LoadModule authz_core_module /usr/lib/apache2/modules/mod_authz_core.so\n\
+             LoadModule rewrite_module /usr/lib/apache2/modules/mod_rewrite.so\n\
+             LoadModule dir_module /usr/lib/apache2/modules/mod_dir.so\n\
+             ErrorLog \"{}/error.log\"\n\
+             DocumentRoot \"{}\"\n\
+             <Directory \"{}\">\n\
+                 AllowOverride All\n\
+                 Require all granted\n\
+             </Directory>\n",
+            apache_dir.path().display(),
+            apache_dir.path().display(),
+            logs_dir.display(),
+            docroot.display(),
+            docroot.display(),
+        );
+        let conf_path = apache_dir.path().join("httpd.conf");
+        std::fs::write(&conf_path, conf).unwrap();
+
+        struct ApacheGuard(std::process::Child);
+        impl Drop for ApacheGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // `-X` runs Apache in single-process mode with no forked worker children so
+        // `ApacheGuard` reliably tears down every process and inherited FD on exit.
+        let _apache = ApacheGuard(
+            Command::new(bin)
+                .args(["-X", "-f", conf_path.to_str().unwrap()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn apache2"),
+        );
+
+        // Wait up to 3s for Apache to listen.
+        let mut ready = false;
+        for _ in 0..30 {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "apache2 did not start on port {port}");
+
+        for (raw_path, want_label, want_at) in cases {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(
+                stream,
+                "GET {raw_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut raw_resp = String::new();
+            stream.read_to_string(&mut raw_resp).unwrap();
+            assert!(
+                raw_resp.starts_with("HTTP/1.1 303"),
+                "apache2 {raw_path}: {raw_resp}"
+            );
+            let loc = raw_resp
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("location").then(|| v.trim())
+                })
+                .unwrap_or_else(|| panic!("no Location header for {raw_path}: {raw_resp}"));
+            let rel = loc
+                .strip_prefix("https://rdf.example.org")
+                .unwrap_or_else(|| panic!("unexpected apache2 Location {loc}"));
+            let resp = send(&app, get_req(rel, Some("text/turtle"), None)).await;
+            assert_eq!(
+                resp.status,
+                StatusCode::OK,
+                "apache2 {raw_path} -> {rel} failed: {}",
+                resp.text()
+            );
+            assert!(
+                resp.text().contains(want_label),
+                "apache2 {raw_path} -> {rel} missing {want_label:?}:\n{}",
+                resp.text()
+            );
+            assert_eq!(resp.header("sparkles-at"), want_at, "apache2 {raw_path}");
+        }
+
+        drop(_apache);
+    }
+
+    // Root-path slash versionIri (`https://example.org/`) matches `/` and `/<term>` cleanly.
     send(
         &app,
         post_json(
@@ -1816,7 +2756,12 @@ async fn apache_recipe_round_trips_version_iri_and_punctuated_local_term() {
     .await;
     assert_eq!(root_rec.status, StatusCode::OK, "{}", root_rec.text());
     let root_text = root_rec.text();
-    assert!(root_text.contains("RewriteRule ^$ "), "{root_text}");
-    assert!(root_text.contains("RewriteRule ^(.+)$ "), "{root_text}");
-    assert!(!root_text.contains("RewriteRule ^/"), "{root_text}");
+    assert_eq!(
+        eval_htaccess_request(&root_text, "/").as_deref(),
+        Some("https://rdf.example.org/$/ld/doc?iri=https%3A%2F%2Fexample.org%2F")
+    );
+    assert_eq!(
+        eval_htaccess_request(&root_text, "/code%3Bpart").as_deref(),
+        Some("https://rdf.example.org/$/ld/doc?iri=https%3A%2F%2Fexample.org%2Fcode%253Bpart")
+    );
 }

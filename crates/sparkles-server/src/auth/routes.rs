@@ -203,6 +203,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ld", &["GET"]),
     ("/$/ld/doc", &["GET"]),
     ("/$/ld/ns/{prefix}", &["GET"]),
+    ("/$/ld/ns/{prefix}/", &["GET"]),
     ("/$/ld/ns/{prefix}/{*local}", &["GET"]),
     ("/$/asks/{ds}", &["GET", "DELETE"]),
     ("/$/asks/{ds}/{id}/feedback", &["POST"]),
@@ -506,7 +507,11 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/resources/{id}/recipes" => Server(ServerPerm::ServerAdmin),
         // linked-data publishing front end (C32): handlers enforce dataset, graph and
         // triple read permissions
-        "/$/ld" | "/$/ld/doc" | "/$/ld/ns/{prefix}" | "/$/ld/ns/{prefix}/{*local}" => Caller,
+        "/$/ld"
+        | "/$/ld/doc"
+        | "/$/ld/ns/{prefix}"
+        | "/$/ld/ns/{prefix}/"
+        | "/$/ld/ns/{prefix}/{*local}" => Caller,
         // only the caller's own entries, whatever its role (C18 §6.4)
         "/$/asks/{ds}" | "/$/asks/{ds}/{id}/feedback" => Dataset(Read),
         // endpoints, models, budgets and the secret names of the operator's providers

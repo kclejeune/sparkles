@@ -11,19 +11,22 @@
 //!   of PURL / w3id Apache `.htaccess` redirection recipes.
 
 use super::{
-    Format, LookupOutcome, LookupTarget, html, negotiate_format, recipes, resolve_and_describe,
-    serialize_rdf, valid_local_part, valid_lookup_iri,
+    Format, LookupOutcome, LookupTarget, MemoryCharge, html, negotiate_format, recipes,
+    resolve_and_describe, serialize_rdf, valid_local_part, valid_lookup_iri,
 };
 use crate::auth::Principal;
 use crate::http::{ApiError, ApiResult, Params, blocking, err_code};
 use crate::state::AppState;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use sparkles::history::Resolved;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 type St = State<Arc<AppState>>;
 
@@ -32,6 +35,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/ld", get(resolve_query))
         .route("/$/ld/doc", get(document))
         .route("/$/ld/ns/{prefix}", get(resolve_ns_root))
+        .route("/$/ld/ns/{prefix}/", get(resolve_ns_root))
         .route("/$/ld/ns/{prefix}/{*local}", get(resolve_ns_local))
 }
 
@@ -123,10 +127,11 @@ fn link_header(
 }
 
 /// Live original URI for a historical linked-data response, stripping both `at` and
-/// `version`. Returns `None` when the request targets a pinned version IRI directly or
-/// when stripping `at`/`version` would leave the URI unchanged.
-fn live_original_uri(uri: &Uri, is_exact_version_iri: bool) -> Option<String> {
-    if is_exact_version_iri {
+/// `version`. Returns `None` when the request IRI itself selected a catalog version
+/// (exact or slash version prefix) or when stripping `at`/`version` would leave the URI
+/// unchanged.
+fn live_original_uri(uri: &Uri, iri_pinned_version: bool) -> Option<String> {
+    if iri_pinned_version {
         return None;
     }
     let query_raw = uri.query().unwrap_or("");
@@ -148,6 +153,38 @@ fn live_original_uri(uri: &Uri, is_exact_version_iri: bool) -> Option<String> {
     (original != current).then_some(original)
 }
 
+/// Response body that retains the [`MemoryCharge`] for its buffered bytes until the body
+/// itself is dropped after transmission or disconnect.
+struct ChargedBody {
+    data: Option<Bytes>,
+    _charge: MemoryCharge,
+}
+
+impl http_body::Body for ChargedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        match self.data.take() {
+            Some(bytes) if !bytes.is_empty() => {
+                Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
+            }
+            _ => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.as_ref().is_none_or(Bytes::is_empty)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.data.as_ref().map_or(0, Bytes::len) as u64)
+    }
+}
+
 enum RenderedBody {
     Rdf(Vec<u8>),
     Html(String),
@@ -158,7 +195,8 @@ struct RenderedDocument {
     body: RenderedBody,
     truncated: bool,
     resolved_history: Option<Resolved>,
-    is_exact_version_iri: bool,
+    iri_pinned_version: bool,
+    memory_charge: MemoryCharge,
 }
 
 enum RenderedOutcome {
@@ -174,32 +212,31 @@ fn build_document_response(
     at_param: Option<&str>,
     extra: &[(String, String)],
 ) -> Response {
-    let mut resp = match doc.body {
-        RenderedBody::Rdf(bytes) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, format.media_type())],
-            bytes,
-        )
-            .into_response(),
-        RenderedBody::Html(html_body) => {
-            let mut r = (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, format.media_type())],
-                html_body,
-            )
-                .into_response();
-            let h = r.headers_mut();
-            h.insert(
-                header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_static(html::HTML_CSP),
-            );
-            h.insert(
-                header::REFERRER_POLICY,
-                HeaderValue::from_static("no-referrer"),
-            );
-            r
-        }
+    let (is_html, bytes) = match doc.body {
+        RenderedBody::Rdf(bytes) => (false, Bytes::from(bytes)),
+        RenderedBody::Html(html_body) => (true, Bytes::from(html_body.into_bytes())),
     };
+    let body = Body::new(ChargedBody {
+        data: Some(bytes),
+        _charge: doc.memory_charge,
+    });
+    let mut resp = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, format.media_type())],
+        body,
+    )
+        .into_response();
+    if is_html {
+        let h = resp.headers_mut();
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(html::HTML_CSP),
+        );
+        h.insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        );
+    }
 
     let h = resp.headers_mut();
     h.insert(header::VARY, HeaderValue::from_static("Accept"));
@@ -222,7 +259,7 @@ fn build_document_response(
             if let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(t)) {
                 h.insert("memento-datetime", v);
             }
-            if let Some(orig) = live_original_uri(uri, doc.is_exact_version_iri) {
+            if let Some(orig) = live_original_uri(uri, doc.iri_pinned_version) {
                 links.push_str(&format!(", <{orig}>; rel=\"original\""));
             }
         }
@@ -310,16 +347,17 @@ async fn handle_lookup(
             redirect_slash,
         )? {
             LookupOutcome::Redirect { iri } => Ok(RenderedOutcome::Redirect { iri }),
-            LookupOutcome::Document(desc) => {
+            LookupOutcome::Document(mut desc) => {
                 // Serialize RDF or render HTML on the blocking thread while `desc`
-                // still holds its memory charge against the request budget and pool.
+                // charges the output buffer against the shared request memory budget and
+                // pool grant.
                 let body = match format.rdf_format() {
                     Some(rdf_fmt) => {
-                        RenderedBody::Rdf(serialize_rdf(&desc, rdf_fmt, max_result_bytes)?)
+                        RenderedBody::Rdf(serialize_rdf(&mut desc, rdf_fmt, max_result_bytes)?)
                     }
                     None => RenderedBody::Html(
                         html::render(
-                            &desc,
+                            &mut desc,
                             ver_c.as_deref(),
                             at_str_c.as_deref(),
                             &extra_c,
@@ -328,12 +366,29 @@ async fn handle_lookup(
                         .map_err(ApiError::from)?,
                     ),
                 };
+                // Drop the input triples/QueryResult and release their charge, keeping
+                // the rendered body bytes charged inside `memory_charge` until the HTTP
+                // response body itself is dropped.
+                let super::Description {
+                    iri,
+                    triples,
+                    truncated,
+                    resolved_history,
+                    iri_pinned_version,
+                    mut memory_charge,
+                    retained_triples_bytes,
+                    ..
+                } = *desc;
+                drop(triples);
+                memory_charge.clear_external();
+                memory_charge.release(retained_triples_bytes);
                 Ok(RenderedOutcome::Document(RenderedDocument {
-                    iri: desc.iri,
+                    iri,
                     body,
-                    truncated: desc.truncated,
-                    resolved_history: desc.resolved_history,
-                    is_exact_version_iri: desc.is_exact_version_iri,
+                    truncated,
+                    resolved_history,
+                    iri_pinned_version,
+                    memory_charge,
                 }))
             }
         }

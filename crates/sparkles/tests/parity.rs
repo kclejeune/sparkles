@@ -1159,7 +1159,15 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("getResourceLicense", Process),
         server_only!("getResourceNotice", Process),
         server_only!("getVocabularyHeader", Process),
+        server_only!("getVocabularyRecipes", Process),
         server_only!("installVocabularyPrefixes", Process),
+        // C32: linked-data publishing serves HTTP content negotiation, 303 redirects and
+        // HTML/RDF documents over the server's resource catalog
+        server_only!("resolveLinkedData", Process),
+        server_only!("getLinkedDataDocument", Process),
+        server_only!("resolveHostedNamespace", Process),
+        server_only!("resolveHostedNamespaceSlash", Process),
+        server_only!("resolveHostedTerm", Process),
         server_only!("listAsks", Process),
         server_only!("deleteAsks", Process),
         server_only!("askFeedback", Process),

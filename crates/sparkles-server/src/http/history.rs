@@ -56,37 +56,55 @@ pub(crate) fn snapshot_for(
     at: Option<&At>,
     opts: &QueryOptions,
 ) -> sparkles::Result<(Arc<Snapshot>, Option<Resolved>)> {
-    snapshot_for_limited(ds, at, opts, None)
+    let (snap, resolved, _) = snapshot_for_limited(ds, at, opts, None)?;
+    Ok((snap, resolved))
 }
 
 /// Like [`snapshot_for`], bounding historical replay memory to `max_memory_bytes` when
-/// given.
+/// given and returning the snapshot's retained byte charge (`0` for live or unbounded
+/// snapshots).
 pub(crate) fn snapshot_for_limited(
     ds: &Dataset,
     at: Option<&At>,
     opts: &QueryOptions,
     max_memory_bytes: Option<u64>,
-) -> sparkles::Result<(Arc<Snapshot>, Option<Resolved>)> {
+) -> sparkles::Result<(Arc<Snapshot>, Option<Resolved>, u64)> {
     let Some(at) = at else {
-        return Ok((ds.store.snapshot(), None));
+        return Ok((ds.store.snapshot(), None, 0));
     };
     let o = HistoryOptions {
         cancel: opts.cancel.clone(),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
     };
-    let res = match max_memory_bytes {
-        Some(cap) => ds.store.snapshot_at_limited(at, &o, cap),
-        None => ds.store.snapshot_at(at, &o),
-    };
-    let (snap, r) = match res {
-        // a commit a branch shares with its upstream is read there
-        Err(e) if sparkles::branch::inherited_commit(&e).is_some() => match ds.main() {
-            Some(main) => main.store.branch_snapshot_at(&ds.branch_name(), at, &o)?,
-            None => return Err(e),
+    let (snap, r, retained) = match max_memory_bytes {
+        Some(cap) => match ds.store.snapshot_at_limited_bytes(at, &o, cap) {
+            // a commit a branch shares with its upstream is read there under the same cap
+            Err(e) if sparkles::branch::inherited_commit(&e).is_some() => match ds.main() {
+                Some(main) => {
+                    let (snap, r, _, retained) = main
+                        .store
+                        .snapshot_at_with_branch_limited_bytes(&ds.store, at, &o, cap)?;
+                    (snap, r, retained)
+                }
+                None => return Err(e),
+            },
+            r => r?,
         },
-        r => r?,
+        None => match ds.store.snapshot_at(at, &o) {
+            Err(e) if sparkles::branch::inherited_commit(&e).is_some() => match ds.main() {
+                Some(main) => {
+                    let (snap, r) = main.store.branch_snapshot_at(&ds.branch_name(), at, &o)?;
+                    (snap, r, 0)
+                }
+                None => return Err(e),
+            },
+            r => {
+                let (snap, r) = r?;
+                (snap, r, 0)
+            }
+        },
     };
-    Ok((snap, Some(r)))
+    Ok((snap, Some(r), retained))
 }
 
 /// `Sparkles-At`, `Sparkles-Head`, and for a past state the Memento headers:

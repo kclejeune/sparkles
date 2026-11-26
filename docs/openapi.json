@@ -40819,6 +40819,222 @@
         "x-sparkles-permission": "any caller"
       }
     },
+    "/$/ld/ns/{prefix}/": {
+      "get": {
+        "description": "Resolves the namespace IRI owned by `prefix`, matching PURL partial redirects with an empty suffix. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "resolveHostedNamespaceSlash",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/prefix"
+          },
+          {
+            "description": "Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`).",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "html",
+                "turtle",
+                "jsonld",
+                "rdfxml",
+                "ntriples"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Catalog version name to resolve against its pinned snapshot.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/ld+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/n-triples": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The negotiated HTML or bounded DESCRIBE RDF representation.",
+            "headers": {
+              "Content-Security-Policy": {
+                "description": "Script-free Content Security Policy sent on `text/html` responses.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Link": {
+                "description": "Alternate representation links (and `rel=\"original\"` for historical snapshots of live IRIs).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Memento-Datetime": {
+                "description": "HTTP-date timestamp of the resolved historical commit (RFC 7089).",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-At": {
+                "description": "Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Describe-Truncated": {
+                "description": "`true` when the bounded DESCRIBE reached its triple or term limit.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Head": {
+                "description": "Current head commit sequence of the resolved dataset when reading a historical state.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "303": {
+            "description": "Redirect from a slash namespace IRI to its negotiated document representation.",
+            "headers": {
+              "Location": {
+                "description": "The document URL for the negotiated representation.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "406": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "No supported representation matches `Accept`.",
+            "headers": {
+              "Vary": {
+                "description": "`Accept`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Resolve a hosted namespace root by prefix with a trailing slash",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
     "/$/ld/ns/{prefix}/{local}": {
       "get": {
         "description": "Resolves `<namespace_iri><local>` for the hosted namespace owned by `prefix`. Slash IRIs answer `303 See Other` with `Vary: Accept`; hash IRIs answer `200 OK` directly.",

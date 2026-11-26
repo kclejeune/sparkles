@@ -6052,7 +6052,7 @@ agents receive bounded `DESCRIBE` RDF, negotiated through `Accept` with `Vary: A
 |---|---|
 | `GET /$/ld` | Resolves `?iri=<IRI>`, answering `303 See Other` to `/$/ld/doc` for slash IRIs and `200 OK` directly for hash IRIs. |
 | `GET /$/ld/doc` | Returns the negotiated HTML or RDF representation of `?iri=<IRI>` directly with `200 OK`. |
-| `GET /$/ld/ns/{prefix}` | Resolves the namespace root of hosted `prefix` with the same 303 or 200 behaviour as `/$/ld`. |
+| `GET /$/ld/ns/{prefix}` | Resolves the namespace root of hosted `prefix` with the same 303 or 200 behaviour as `/$/ld` (also served with a trailing slash at `/$/ld/ns/{prefix}/`). |
 | `GET /$/ld/ns/{prefix}/{*local}` | Resolves `<namespace_iri><local>` under hosted `prefix` with the same 303 or 200 behaviour as `/$/ld`. |
 | `GET /$/resources/{id}/recipes` | Exports w3id, Apache `.htaccess` or PURL redirection rules for a vocabulary resource. |
 
@@ -6062,10 +6062,13 @@ Content negotiation supports `text/html`, `text/turtle`, `application/ld+json`,
 `406 Not Acceptable` with `Vary: Accept`.
 
 Version IRIs configured with `versionIri` and `snapshot` on a catalog version, or requests
-that pass `version=<ver>`, resolve against the pinned snapshot or commit and return
-`Sparkles-At`, `Sparkles-Head` and `Memento-Datetime` headers when reading a past state.
-Descriptions run through the caller's query permissions, dataset and graph access rules,
-triple protections, rate limits and query budgets, with a default ceiling of 10,000
+that pass `version=<ver>`, resolve against the pinned snapshot or commit. When all
+returned triples come from a single dataset at a resolved historical state, the response
+carries `Sparkles-At`, `Sparkles-Head` and `Memento-Datetime` headers, together with
+`Link: <...>; rel="original"` when stripping `version` and `at` yields a live equivalent
+URL. Descriptions merged from multiple contributing datasets omit single-dataset history
+headers. Descriptions run through the caller's query permissions, dataset and graph access
+rules, triple protections, rate limits and query budgets, with a default ceiling of 10,000
 triples and depth 16 that dataset `DESCRIBE` settings and `describe-*` parameters may
 lower. When the caller has no read access to the backing dataset or graph, or when no
 readable triples match the IRI, the server answers `404 Not Found` without issuing a

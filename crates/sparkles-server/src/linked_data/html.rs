@@ -6,7 +6,7 @@
 //! is rendered as plain escaped text. Output is bounded against `max_result_bytes` as
 //! chunks are written so oversized pages abort without allocating past the limit.
 
-use super::{Description, Format};
+use super::{Description, Format, HostedTarget, MemoryCharge};
 use oxrdf::{NamedOrBlankNode, Term, Triple};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -81,31 +81,25 @@ fn compact_iri<'a>(
     best.map(|(p, ns)| (p, &iri[ns.len()..]))
 }
 
-fn is_in_namespaces(iri: &str, namespaces: &[String]) -> bool {
-    namespaces.iter().any(|ns| {
-        iri == ns.as_str()
-            || ((ns.ends_with('/') || ns.ends_with('#') || ns.ends_with(':'))
-                && iri.starts_with(ns.as_str()))
-    })
-}
-
-/// Bounded HTML writer enforcing `max_result_bytes` before every append.
-struct HtmlWriter {
+/// Bounded HTML writer enforcing both `max_result_bytes` and the request's shared
+/// [`MemoryCharge`] (query memory budget and admitted pool grant) before every append.
+struct HtmlWriter<'a> {
     buf: String,
     limit: Option<u64>,
+    charge: &'a mut MemoryCharge,
 }
 
-impl HtmlWriter {
-    fn new(limit: Option<u64>) -> Self {
-        let cap = limit.map_or(4096, |l| l.min(4096) as usize);
+impl<'a> HtmlWriter<'a> {
+    fn new(limit: Option<u64>, charge: &'a mut MemoryCharge) -> Self {
         Self {
-            buf: String::with_capacity(cap),
+            buf: String::new(),
             limit,
+            charge,
         }
     }
 
     #[inline]
-    fn check(&self, add: usize) -> sparkles::Result<()> {
+    fn reserve(&mut self, add: usize) -> sparkles::Result<()> {
         if let Some(limit) = self.limit {
             let requested = (self.buf.len() as u64).saturating_add(add as u64);
             if requested > limit {
@@ -116,11 +110,12 @@ impl HtmlWriter {
                 }));
             }
         }
+        self.charge.charge(add as u64)?;
         Ok(())
     }
 
     fn push_str(&mut self, s: &str) -> sparkles::Result<()> {
-        self.check(s.len())?;
+        self.reserve(s.len())?;
         self.buf.push_str(s);
         Ok(())
     }
@@ -130,8 +125,8 @@ impl HtmlWriter {
         self.push_str(&s)
     }
 
-    /// Write `s` with HTML escaping directly into `self.buf`, checking `limit` as slices
-    /// are emitted so oversized literals abort immediately.
+    /// Write `s` with HTML escaping directly into `self.buf`, checking `limit` and
+    /// `charge` as slices are emitted so oversized literals abort immediately.
     fn push_escaped(&mut self, s: &str) -> sparkles::Result<()> {
         let mut last = 0usize;
         for (i, c) in s.char_indices() {
@@ -161,7 +156,7 @@ impl HtmlWriter {
 }
 
 fn write_compact_or_iri(
-    w: &mut HtmlWriter,
+    w: &mut HtmlWriter<'_>,
     iri: &str,
     prefixes: &BTreeMap<String, String>,
 ) -> sparkles::Result<()> {
@@ -177,18 +172,16 @@ fn write_compact_or_iri(
 
 #[allow(clippy::too_many_arguments)]
 fn write_iri(
-    w: &mut HtmlWriter,
+    w: &mut HtmlWriter<'_>,
     iri: &str,
     prefixes: &BTreeMap<String, String>,
-    own_namespaces: &[String],
-    readable_namespaces: &[String],
+    readable_targets: &[HostedTarget],
     version: Option<&str>,
     at: Option<&str>,
 ) -> sparkles::Result<()> {
-    if is_in_namespaces(iri, readable_namespaces) {
-        let same_resource = is_in_namespaces(iri, own_namespaces);
+    if let Some(hit) = super::classify_hosted_link(iri, readable_targets) {
         let mut href = format!("/$/ld?iri={}", percent_encode_param(iri));
-        if same_resource {
+        if hit.same_resource && !hit.is_version_iri {
             if let Some(v) = version {
                 let _ = write!(href, "&version={}", percent_encode_param(v));
             }
@@ -222,24 +215,17 @@ fn write_iri(
 
 #[allow(clippy::too_many_arguments)]
 fn write_subject(
-    w: &mut HtmlWriter,
+    w: &mut HtmlWriter<'_>,
     subj: &NamedOrBlankNode,
     prefixes: &BTreeMap<String, String>,
-    own_namespaces: &[String],
-    readable_namespaces: &[String],
+    readable_targets: &[HostedTarget],
     version: Option<&str>,
     at: Option<&str>,
 ) -> sparkles::Result<()> {
     match subj {
-        NamedOrBlankNode::NamedNode(n) => write_iri(
-            w,
-            n.as_str(),
-            prefixes,
-            own_namespaces,
-            readable_namespaces,
-            version,
-            at,
-        ),
+        NamedOrBlankNode::NamedNode(n) => {
+            write_iri(w, n.as_str(), prefixes, readable_targets, version, at)
+        }
         NamedOrBlankNode::BlankNode(b) => {
             w.push_str("<code>_:")?;
             w.push_escaped(b.as_str())?;
@@ -250,24 +236,15 @@ fn write_subject(
 
 #[allow(clippy::too_many_arguments)]
 fn write_term(
-    w: &mut HtmlWriter,
+    w: &mut HtmlWriter<'_>,
     term: &Term,
     prefixes: &BTreeMap<String, String>,
-    own_namespaces: &[String],
-    readable_namespaces: &[String],
+    readable_targets: &[HostedTarget],
     version: Option<&str>,
     at: Option<&str>,
 ) -> sparkles::Result<()> {
     match term {
-        Term::NamedNode(n) => write_iri(
-            w,
-            n.as_str(),
-            prefixes,
-            own_namespaces,
-            readable_namespaces,
-            version,
-            at,
-        ),
+        Term::NamedNode(n) => write_iri(w, n.as_str(), prefixes, readable_targets, version, at),
         Term::BlankNode(b) => {
             w.push_str("<code>_:")?;
             w.push_escaped(b.as_str())?;
@@ -376,21 +353,22 @@ fn preferred_label<'a>(iri: &'a str, triples: &'a [Triple]) -> &'a str {
         .unwrap_or(iri)
 }
 
-/// Render a self-contained, escaped HTML5 page for `desc`, enforcing `max_result_bytes`
-/// during construction.
+/// Render a self-contained, escaped HTML5 page for `desc`, enforcing both
+/// `max_result_bytes` and `desc.memory_charge` during construction.
 pub fn render(
-    desc: &Description,
+    desc: &mut Description,
     version_param: Option<&str>,
     at_param: Option<&str>,
     extra_describe: &[(String, String)],
     max_result_bytes: Option<u64>,
 ) -> sparkles::Result<String> {
-    let title = preferred_label(&desc.iri, &desc.triples);
+    let triples = desc.triples.as_slice();
+    let title = preferred_label(&desc.iri, triples);
     let mut outgoing: Vec<&Triple> = Vec::new();
     let mut incoming: Vec<&Triple> = Vec::new();
     let mut related: Vec<&Triple> = Vec::new();
 
-    for t in &desc.triples {
+    for t in triples {
         let is_subj =
             matches!(&t.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == desc.iri);
         let is_obj = matches!(&t.object, Term::NamedNode(n) if n.as_str() == desc.iri);
@@ -423,7 +401,7 @@ pub fn render(
             .then_with(|| cmp_term(&a.object, &b.object))
     });
 
-    let mut w = HtmlWriter::new(max_result_bytes);
+    let mut w = HtmlWriter::new(max_result_bytes, &mut desc.memory_charge);
     w.push_str(
         "<!DOCTYPE html>\n\
          <html lang=\"en\">\n\
@@ -534,8 +512,7 @@ pub fn render(
                 &mut w,
                 t.predicate.as_str(),
                 &desc.prefixes,
-                &desc.own_namespaces,
-                &desc.readable_namespaces,
+                &desc.readable_targets,
                 version_param,
                 at_param,
             )?;
@@ -544,8 +521,7 @@ pub fn render(
                 &mut w,
                 &t.object,
                 &desc.prefixes,
-                &desc.own_namespaces,
-                &desc.readable_namespaces,
+                &desc.readable_targets,
                 version_param,
                 at_param,
             )?;
@@ -562,8 +538,7 @@ pub fn render(
                 &mut w,
                 t.predicate.as_str(),
                 &desc.prefixes,
-                &desc.own_namespaces,
-                &desc.readable_namespaces,
+                &desc.readable_targets,
                 version_param,
                 at_param,
             )?;
@@ -572,8 +547,7 @@ pub fn render(
                 &mut w,
                 &t.subject,
                 &desc.prefixes,
-                &desc.own_namespaces,
-                &desc.readable_namespaces,
+                &desc.readable_targets,
                 version_param,
                 at_param,
             )?;
@@ -590,8 +564,7 @@ pub fn render(
                 &mut w,
                 &t.subject,
                 &desc.prefixes,
-                &desc.own_namespaces,
-                &desc.readable_namespaces,
+                &desc.readable_targets,
                 version_param,
                 at_param,
             )?;
@@ -600,8 +573,7 @@ pub fn render(
                 &mut w,
                 t.predicate.as_str(),
                 &desc.prefixes,
-                &desc.own_namespaces,
-                &desc.readable_namespaces,
+                &desc.readable_targets,
                 version_param,
                 at_param,
             )?;
@@ -610,8 +582,7 @@ pub fn render(
                 &mut w,
                 &t.object,
                 &desc.prefixes,
-                &desc.own_namespaces,
-                &desc.readable_namespaces,
+                &desc.readable_targets,
                 version_param,
                 at_param,
             )?;

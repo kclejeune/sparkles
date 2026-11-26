@@ -752,6 +752,13 @@ fn resources(p: &mut Paths) {
     );
     p.add(
         ld_common(
+            op(GET, "/$/ld/ns/{prefix}/", "resolveHostedNamespaceSlash", tag, "Resolve a hosted namespace root by prefix with a trailing slash")
+                .doc("Resolves the namespace IRI owned by `prefix`, matching PURL partial redirects with an empty suffix. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.")
+                .resp_h("303", "Redirect from a slash namespace IRI to its negotiated document representation.", None, ld_redirect_headers.clone()),
+        ),
+    );
+    p.add(
+        ld_common(
             op(GET, "/$/ld/ns/{prefix}/{*local}", "resolveHostedTerm", tag, "Resolve a term under a hosted namespace prefix")
                 .doc("Resolves `<namespace_iri><local>` for the hosted namespace owned by `prefix`. Slash IRIs answer `303 See Other` with `Vary: Accept`; hash IRIs answer `200 OK` directly.")
                 .resp_h("303", "Redirect from a slash IRI to its negotiated document representation.", None, ld_redirect_headers),

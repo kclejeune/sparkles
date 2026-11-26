@@ -1920,6 +1920,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ld/ns/{prefix}/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Resolve a hosted namespace root by prefix with a trailing slash
+         * @description Resolves the namespace IRI owned by `prefix`, matching PURL partial redirects with an empty suffix. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.
+         */
+        get: operations["resolveHostedNamespaceSlash"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ld/ns/{prefix}/{local}": {
         parameters: {
             query?: never;
@@ -19153,6 +19173,95 @@ export interface operations {
         };
     };
     resolveHostedNamespace: {
+        parameters: {
+            query?: {
+                /** @description Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`). */
+                format?: "html" | "turtle" | "jsonld" | "rdfxml" | "ntriples";
+                /** @description Catalog version name to resolve against its pinned snapshot. */
+                version?: string;
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description The DESCRIBE mode of this query, over the dataset's setting. */
+                describe?: components["parameters"]["describe"];
+                /** @description Add the labels of the IRIs a DESCRIBE result links to. */
+                "describe-labels"?: components["parameters"]["describeLabels"];
+                /** @description Include the reifiers of described triples. */
+                "describe-reifiers"?: components["parameters"]["describeReifiers"];
+                /** @description A lower limit on the triples of a DESCRIBE result. */
+                "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
+                /** @description A lower limit on the levels a DESCRIBE follows. */
+                "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+            };
+            header?: never;
+            path: {
+                /** @description A hosted vocabulary namespace prefix. */
+                prefix: components["parameters"]["prefix"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The negotiated HTML or bounded DESCRIBE RDF representation. */
+            200: {
+                headers: {
+                    /** @description Script-free Content Security Policy sent on `text/html` responses. */
+                    "Content-Security-Policy"?: string;
+                    /** @description Alternate representation links (and `rel="original"` for historical snapshots of live IRIs). */
+                    Link?: string;
+                    /** @description HTTP-date timestamp of the resolved historical commit (RFC 7089). */
+                    "Memento-Datetime"?: string;
+                    /** @description Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state. */
+                    "Sparkles-At"?: string;
+                    /** @description `true` when the bounded DESCRIBE reached its triple or term limit. */
+                    "Sparkles-Describe-Truncated"?: string;
+                    /** @description Current head commit sequence of the resolved dataset when reading a historical state. */
+                    "Sparkles-Head"?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/ld+json": string;
+                    "application/n-triples": string;
+                    "application/rdf+xml": string;
+                    "text/html": string;
+                    "text/turtle": string;
+                };
+            };
+            /** @description Redirect from a slash namespace IRI to its negotiated document representation. */
+            303: {
+                headers: {
+                    /** @description The document URL for the negotiated representation. */
+                    Location?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /** @description No supported representation matches `Accept`. */
+            406: {
+                headers: {
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resolveHostedNamespaceSlash: {
         parameters: {
             query?: {
                 /** @description Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`). */

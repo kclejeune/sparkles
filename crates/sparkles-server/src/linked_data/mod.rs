@@ -30,10 +30,11 @@ use axum::http::StatusCode;
 use oxrdf::{BlankNode, NamedNode, NamedOrBlankNode, Term, Triple};
 use oxrdfio::{JsonLdProfileSet, RdfFormat, RdfSerializer};
 use sparkles::history::{At, Resolved};
+use sparkles::sparql::QueryResult;
 use sparkles::sparql::describe::DescribeOptions;
 use sparkles::sparql::pool::PoolGrant;
-use sparkles::sparql::results::LimitedWriter;
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -236,6 +237,10 @@ pub fn negotiate_format(accept: Option<&str>) -> Option<Format> {
             };
             let key = k.trim().to_ascii_lowercase();
             if key == "q" {
+                if seen_q {
+                    bad = true;
+                    break;
+                }
                 seen_q = true;
                 match v.trim().parse::<f32>() {
                     Ok(n) if n.is_finite() && (0.0..=1.0).contains(&n) => q = n,
@@ -244,14 +249,14 @@ pub fn negotiate_format(accept: Option<&str>) -> Option<Format> {
                         break;
                     }
                 }
-            } else if !seen_q {
+            } else {
+                // RFC 9110 §12.5.1: process weight regardless of position among parameters.
                 let Some(val) = unquote_param(v) else {
                     bad = true;
                     break;
                 };
                 params.push((key, val));
             }
-            // Parameters after `q` are accept-ext and do not participate in media matching.
         }
         if !bad {
             ranges.push(MediaRange { mt, params, q });
@@ -360,6 +365,10 @@ pub struct ResolvedTarget<'a> {
     pub is_hash_document: bool,
     /// True when the IRI matched a version's `versionIri` exactly.
     pub is_exact_version_iri: bool,
+    /// True when the IRI itself selected a catalog version (exact match or slash version
+    /// prefix), so stripping `at`/`version` query parameters would still resolve to a
+    /// pinned version rather than a live resource.
+    pub iri_pinned_version: bool,
     /// True when `?version=` was given and conflicts with the matched `versionIri`.
     pub version_conflict: bool,
     /// True when `?version=` was given and does not exist on the matched resource.
@@ -439,38 +448,44 @@ pub fn resolve_iri<'a>(
     }
 
     // Pick the more specific match: exact version IRI > longer prefix (version IRI breaks ties).
-    let (resource, mut version, namespace, is_hash_document, is_exact_version_iri) =
-        match (best_ver, best_ns) {
-            (Some((true, _, hdoc, r, v)), _) => {
-                let ns = r
-                    .input
-                    .namespaces
-                    .iter()
-                    .find(|n| prefix_matches(&n.iri, iri))
-                    .or_else(|| r.input.namespaces.first());
-                (r, Some(v), ns, hdoc, true)
-            }
-            (Some((false, vlen, hdoc, r, v)), Some((nlen, _, _, _))) if vlen >= nlen => {
-                let ns = r
-                    .input
-                    .namespaces
-                    .iter()
-                    .find(|n| prefix_matches(&n.iri, iri))
-                    .or_else(|| r.input.namespaces.first());
-                (r, Some(v), ns, hdoc, false)
-            }
-            (Some((false, _, hdoc, r, v)), None) => {
-                let ns = r
-                    .input
-                    .namespaces
-                    .iter()
-                    .find(|n| prefix_matches(&n.iri, iri))
-                    .or_else(|| r.input.namespaces.first());
-                (r, Some(v), ns, hdoc, false)
-            }
-            (_, Some((_, hdoc, r, ns))) => (r, None, Some(ns), hdoc, false),
-            (None, None) => return None,
-        };
+    let (
+        resource,
+        mut version,
+        namespace,
+        is_hash_document,
+        is_exact_version_iri,
+        iri_pinned_version,
+    ) = match (best_ver, best_ns) {
+        (Some((true, _, hdoc, r, v)), _) => {
+            let ns = r
+                .input
+                .namespaces
+                .iter()
+                .find(|n| prefix_matches(&n.iri, iri))
+                .or_else(|| r.input.namespaces.first());
+            (r, Some(v), ns, hdoc, true, true)
+        }
+        (Some((false, vlen, hdoc, r, v)), Some((nlen, _, _, _))) if vlen >= nlen => {
+            let ns = r
+                .input
+                .namespaces
+                .iter()
+                .find(|n| prefix_matches(&n.iri, iri))
+                .or_else(|| r.input.namespaces.first());
+            (r, Some(v), ns, hdoc, false, true)
+        }
+        (Some((false, _, hdoc, r, v)), None) => {
+            let ns = r
+                .input
+                .namespaces
+                .iter()
+                .find(|n| prefix_matches(&n.iri, iri))
+                .or_else(|| r.input.namespaces.first());
+            (r, Some(v), ns, hdoc, false, true)
+        }
+        (_, Some((_, hdoc, r, ns))) => (r, None, Some(ns), hdoc, false, false),
+        (None, None) => return None,
+    };
 
     let mut version_conflict = false;
     let mut version_missing = false;
@@ -498,6 +513,7 @@ pub fn resolve_iri<'a>(
         is_hash,
         is_hash_document,
         is_exact_version_iri,
+        iri_pinned_version,
         version_conflict,
         version_missing,
     })
@@ -616,20 +632,29 @@ fn hash_doc_term_pattern(iri: &str, target: &ResolvedTarget<'_>) -> (String, Str
     };
     let without_hash = with_hash.trim_end_matches('#').to_string();
     let prefix = escape_sparql_string(&with_hash);
-    let ns_clause = target
-        .namespace
-        .filter(|n| n.iri.ends_with('#') && n.iri != with_hash)
-        .map(|n| {
-            let p = escape_sparql_string(&n.iri);
-            format!(
-                " UNION {{ ?term ?p2 ?o2 . FILTER(ISIRI(?term) && STRSTARTS(STR(?term), \"{p}\")) }}"
-            )
-        })
-        .unwrap_or_default();
+    let ns_clause = if target.is_exact_version_iri {
+        target
+            .namespace
+            .filter(|n| n.iri.ends_with('#') && n.iri != with_hash)
+            .map(|n| {
+                let p = escape_sparql_string(&n.iri);
+                // Bind fallback vocabulary-namespace term discovery to a readable
+                // owl:versionIRI assertion so unrelated readable triples in the same
+                // backing graph can never authorize a private hash version lookup.
+                format!(
+                    " UNION {{ \
+                      {{ ?ver_ont <http://www.w3.org/2002/07/owl#versionIRI> <{with_hash}> }} \
+                      UNION {{ ?ver_ont <http://www.w3.org/2002/07/owl#versionIRI> <{without_hash}> }} \
+                      ?term ?p2 ?o2 . FILTER(ISIRI(?term) && STRSTARTS(STR(?term), \"{p}\")) \
+                    }}"
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let pattern = format!(
-        "{{ ?term a <http://www.w3.org/2002/07/owl#Ontology> }} \
-         UNION {{ ?term a <http://www.w3.org/2004/02/skos/core#ConceptScheme> }} \
-         UNION {{ ?term ?p ?o . FILTER(ISIRI(?term) && STRSTARTS(STR(?term), \"{prefix}\")) }}{ns_clause}"
+        "{{ ?term ?p ?o . FILTER(ISIRI(?term) && STRSTARTS(STR(?term), \"{prefix}\")) }}{ns_clause}"
     );
     (with_hash, without_hash, pattern)
 }
@@ -727,13 +752,30 @@ fn triple_bytes(t: &Triple) -> u64 {
     64 + s + p + o
 }
 
+/// Estimated byte size of `t` after scoping blank nodes with `prefix` (without allocating).
+fn scoped_triple_bytes(t: &Triple, prefix: &str) -> u64 {
+    let extra = (prefix.len() + 1) as u64;
+    let mut bytes = triple_bytes(t);
+    if matches!(&t.subject, NamedOrBlankNode::BlankNode(_)) {
+        bytes = bytes.saturating_add(extra);
+    }
+    if matches!(&t.object, Term::BlankNode(_)) {
+        bytes = bytes.saturating_add(extra);
+    }
+    bytes
+}
+
 /// Request-wide memory charge against both `--query-memory-mb` and the admitted
-/// [`PoolGrant`], keeping retained merged triples accounted until response serialization
-/// finishes.
+/// [`PoolGrant`], keeping live historical snapshots, retained triples/results, and
+/// buffered response bodies accounted until the HTTP response body drops.
 pub(crate) struct MemoryCharge {
     grant: Option<Arc<PoolGrant>>,
     limit: Option<u64>,
+    /// Bytes directly charged on `grant` and against `limit` by this account.
     held: u64,
+    /// Bytes retained by a live `QueryResult` (which already holds its own credit on
+    /// `grant`, so counted only against `limit` here).
+    external_held: u64,
 }
 
 impl MemoryCharge {
@@ -742,11 +784,17 @@ impl MemoryCharge {
             grant,
             limit,
             held: 0,
+            external_held: 0,
         }
     }
 
+    #[inline]
+    fn total_held(&self) -> u64 {
+        self.held.saturating_add(self.external_held)
+    }
+
     pub(crate) fn charge(&mut self, n: u64) -> sparkles::Result<()> {
-        let total = self.held.saturating_add(n);
+        let total = self.total_held().saturating_add(n);
         if let Some(limit) = self.limit
             && total > limit
         {
@@ -759,7 +807,7 @@ impl MemoryCharge {
         if let Some(g) = &self.grant {
             g.charge(n)?;
         }
-        self.held = total;
+        self.held = self.held.saturating_add(n);
         Ok(())
     }
 
@@ -771,34 +819,80 @@ impl MemoryCharge {
         self.held -= n;
     }
 
+    pub(crate) fn set_external(&mut self, bytes: u64) {
+        self.external_held = bytes;
+    }
+
+    pub(crate) fn clear_external(&mut self) {
+        self.external_held = 0;
+    }
+
     /// Remaining per-query memory budget for the next engine invocation.
     pub(crate) fn engine_budget(&self) -> sparkles::Result<Option<u64>> {
         let Some(limit) = self.limit else {
             return Ok(None);
         };
-        if self.held >= limit {
+        let used = self.total_held();
+        if used >= limit {
             return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
                 kind: sparkles::BudgetKind::Memory,
                 limit,
-                requested: self.held,
+                requested: used,
             }));
         }
-        Ok(Some(limit - self.held))
+        Ok(Some(limit - used))
     }
 
-    /// Memory cap for historical WAL replay: lower of remaining per-query budget and pool
-    /// capacity.
-    pub(crate) fn replay_budget(&self) -> sparkles::Result<Option<u64>> {
-        let query_rem = self.engine_budget()?;
-        let pool_rem = self
+    /// Atomically reserve a pool-aware historical replay allowance up to `history_cap`,
+    /// retrying once with the grant's already-covered room if another grant claims free
+    /// pool granules first. Returns `Ok(None)` only when neither a per-query limit nor a
+    /// query memory pool is configured.
+    pub(crate) fn reserve_replay(&mut self, history_cap: u64) -> sparkles::Result<Option<u64>> {
+        let local_rem = match self.engine_budget()? {
+            Some(rem) => Some(rem),
+            None if self.grant.is_some() => Some(u64::MAX),
+            None => return Ok(None),
+        };
+        let local = local_rem.unwrap_or(u64::MAX).min(history_cap);
+        let desired = self
             .grant
             .as_ref()
-            .map(|g| g.pool().capacity().saturating_sub(self.held));
-        match (query_rem, pool_rem) {
-            (Some(a), Some(b)) => Ok(Some(a.min(b))),
-            (Some(a), None) => Ok(Some(a)),
-            (None, Some(b)) => Ok(Some(b)),
-            (None, None) => Ok(None),
+            .map_or(local, |g| local.min(g.growth_room()));
+        match self.charge(desired) {
+            Ok(()) => Ok(Some(desired)),
+            Err(sparkles::Error::BudgetExceeded(_)) => {
+                if let Some(g) = &self.grant {
+                    let covered = local.min(g.granted().saturating_sub(g.used()));
+                    self.charge(covered)?;
+                    Ok(Some(covered))
+                } else {
+                    Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                        kind: sparkles::BudgetKind::Memory,
+                        limit: self.limit.unwrap_or(0),
+                        requested: self.total_held().saturating_add(desired),
+                    }))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Settle a replay reservation down (or up) to the snapshot's actual retained charge
+    /// while the snapshot remains live.
+    pub(crate) fn settle_replay(
+        &mut self,
+        reserved: Option<u64>,
+        retained: u64,
+    ) -> sparkles::Result<u64> {
+        let Some(res) = reserved else {
+            return Ok(0);
+        };
+        if retained <= res {
+            self.release(res - retained);
+            Ok(retained)
+        } else {
+            self.charge(retained - res)?;
+            Ok(retained)
         }
     }
 }
@@ -832,10 +926,82 @@ impl Deadline {
     }
 }
 
+/// Readable hosted namespace or version IRI entry used by the HTML renderer to apply the
+/// same longest-match ownership precedence as [`resolve_iri`].
+#[derive(Clone, Debug)]
+pub struct HostedTarget {
+    pub iri: String,
+    pub same_resource: bool,
+    pub is_version_iri: bool,
+}
+
+/// Classify `iri` against the caller's readable hosted targets using the same precedence
+/// as [`resolve_iri`]: exact version IRI > longest prefix (version IRI breaks ties).
+pub(crate) fn classify_hosted_link<'a>(
+    iri: &str,
+    targets: &'a [HostedTarget],
+) -> Option<&'a HostedTarget> {
+    let mut best_ver: Option<(bool, usize, &'a HostedTarget)> = None;
+    let mut best_ns: Option<(usize, &'a HostedTarget)> = None;
+    for t in targets {
+        if t.is_version_iri {
+            let exact =
+                iri == t.iri || (t.iri.ends_with('#') && iri == t.iri.trim_end_matches('#'));
+            if !exact && !prefix_matches(&t.iri, iri) {
+                continue;
+            }
+            let len = t.iri.len();
+            let better = match best_ver {
+                None => true,
+                Some((b_exact, b_len, _)) => {
+                    (exact && !b_exact) || (exact == b_exact && len > b_len)
+                }
+            };
+            if better {
+                best_ver = Some((exact, len, t));
+            }
+        } else {
+            let is_hash_doc =
+                t.iri.ends_with('#') && (iri == t.iri || iri == t.iri.trim_end_matches('#'));
+            if !is_hash_doc && !prefix_matches(&t.iri, iri) {
+                continue;
+            }
+            let len = t.iri.len();
+            if best_ns.is_none_or(|(b_len, _)| len > b_len) {
+                best_ns = Some((len, t));
+            }
+        }
+    }
+    match (best_ver, best_ns) {
+        (Some((true, _, t)), _) => Some(t),
+        (Some((false, vlen, t)), Some((nlen, _))) if vlen >= nlen => Some(t),
+        (Some((false, _, t)), None) => Some(t),
+        (_, Some((_, t))) => Some(t),
+        (None, None) => None,
+    }
+}
+
+/// Owned triple storage for a [`Description`]: single-dataset lookups retain the engine's
+/// charged [`QueryResult`] directly without cloning; multi-dataset merges hold a charged
+/// deduplicated vector.
+pub enum TriplesSource {
+    Single(QueryResult),
+    Merged(Vec<Triple>),
+}
+
+impl TriplesSource {
+    pub fn as_slice(&self) -> &[Triple] {
+        match self {
+            TriplesSource::Single(res) => res.triples(),
+            TriplesSource::Merged(triples) => triples.as_slice(),
+        }
+    }
+}
+
 /// Authorized, bounded description of an IRI.
 pub struct Description {
     pub iri: String,
-    pub triples: Vec<Triple>,
+    pub triples: TriplesSource,
     pub truncated: bool,
     pub prefixes: BTreeMap<String, String>,
     pub resolved_history: Option<Resolved>,
@@ -843,12 +1009,15 @@ pub struct Description {
     pub version_name: Option<String>,
     pub namespace_prefix: Option<String>,
     pub license: Option<String>,
-    pub is_exact_version_iri: bool,
-    /// Hosted namespace IRIs owned by the matched resource itself.
-    pub own_namespaces: Vec<String>,
-    /// Hosted namespace IRIs that the caller is permitted to read (for safe internal links).
-    pub readable_namespaces: Vec<String>,
-    pub(crate) _memory_charge: MemoryCharge,
+    /// True when the requested IRI itself pinned a catalog version (exact or prefix).
+    pub iri_pinned_version: bool,
+    /// Hosted namespaces and version IRIs readable by the caller (for safe internal links
+    /// and ownership-accurate `version`/`at` propagation).
+    pub readable_targets: Vec<HostedTarget>,
+    pub(crate) memory_charge: MemoryCharge,
+    /// Bytes inside `memory_charge.held` that belong to `TriplesSource::Merged` (0 for
+    /// `Single`, whose `QueryResult` holds its own pool grant credit).
+    pub(crate) retained_triples_bytes: u64,
 }
 
 /// Outcome of resolving and authorizing a linked-data lookup.
@@ -876,27 +1045,54 @@ fn history_gone() -> ApiError {
     )
 }
 
-/// Namespaces of vocabularies in `catalog` that `principal` may read at least one graph of.
-fn readable_namespaces(st: &AppState, principal: &Principal, catalog: &CatalogFile) -> Vec<String> {
+/// Hosted namespaces and version IRIs of catalog resources that `principal` may read at
+/// least one backing location of.
+fn readable_targets(
+    st: &AppState,
+    principal: &Principal,
+    catalog: &CatalogFile,
+    current_resource_id: &str,
+) -> Vec<HostedTarget> {
     let mut out = Vec::new();
     for r in &catalog.resources {
-        if r.input.kind != Kind::Vocabulary {
+        let readable = match r.input.kind {
+            Kind::Vocabulary => r.input.graphs.iter().any(|l| {
+                if !principal.can_at(&l.dataset, Endpoint::Query, Level::Read) {
+                    return false;
+                }
+                let Ok(ds) = crate::http::dataset(st, &l.dataset) else {
+                    return false;
+                };
+                principal
+                    .view(&ds.name, Endpoint::Query)
+                    .is_none_or(|v| v.read.allows_named_iri(&l.graph))
+            }),
+            Kind::Dataset => r.input.dataset.as_deref().is_some_and(|ds_name| {
+                principal.can_at(ds_name, Endpoint::Query, Level::Read)
+                    && crate::http::dataset(st, ds_name).is_ok()
+            }),
+            Kind::Source => false,
+        };
+        if !readable {
             continue;
         }
-        let readable = r.input.graphs.iter().any(|l| {
-            if !principal.can_at(&l.dataset, Endpoint::Query, Level::Read) {
-                return false;
-            }
-            let Ok(ds) = crate::http::dataset(st, &l.dataset) else {
-                return false;
-            };
-            principal
-                .view(&ds.name, Endpoint::Query)
-                .is_none_or(|v| v.read.allows_named_iri(&l.graph))
-        });
-        if readable {
+        let same_resource = r.id == current_resource_id;
+        if r.input.kind == Kind::Vocabulary {
             for ns in &r.input.namespaces {
-                out.push(ns.iri.clone());
+                out.push(HostedTarget {
+                    iri: ns.iri.clone(),
+                    same_resource,
+                    is_version_iri: false,
+                });
+            }
+        }
+        for v in &r.versions {
+            if let Some(vi) = &v.input.version_iri {
+                out.push(HostedTarget {
+                    iri: vi.clone(),
+                    same_resource,
+                    is_version_iri: true,
+                });
             }
         }
     }
@@ -909,6 +1105,13 @@ struct DatasetPlan {
     describe: DescribeOptions,
 }
 
+enum ProbeResult {
+    Readable,
+    Empty,
+    HistoryGone,
+    ReplayFailed(sparkles::Error),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn probe_one_dataset(
     st: &AppState,
@@ -917,13 +1120,12 @@ fn probe_one_dataset(
     sparql: &str,
     at: Option<&At>,
     grant: &Option<Arc<PoolGrant>>,
-    charge: &MemoryCharge,
+    charge: &mut MemoryCharge,
     deadline: &Deadline,
 ) -> ApiResult<ProbeResult> {
     let mut opts = CallerContext::for_caller(st, &plan.ds, principal).read_options();
     opts.grant = grant.clone();
     opts.timeout = deadline.left().map_err(ApiError::from)?;
-    opts.max_memory_bytes = charge.engine_budget().map_err(ApiError::from)?;
     let mut desc = plan.describe.clone();
     desc.max_triples = Some(1);
     opts.describe = desc;
@@ -931,15 +1133,55 @@ fn probe_one_dataset(
         opts.default_graph_uris = plan.allowed_graphs.clone();
         opts.default_graph_extra.clear();
     }
-    let replay_cap = charge.replay_budget().map_err(ApiError::from)?;
-    let (snap, _) =
-        match crate::http::history::snapshot_for_limited(&plan.ds, at, &opts, replay_cap) {
-            Ok(pair) => pair,
-            Err(sparkles::Error::NotFound(_)) => return Ok(ProbeResult::Empty),
-            Err(sparkles::Error::HistoryGone(_)) => return Ok(ProbeResult::HistoryGone),
-            Err(e) => return Err(ApiError::from(e)),
+
+    let (snap, snap_charge) = if at.is_some() {
+        let reserved = match charge.reserve_replay(plan.ds.store.history_cache_capacity()) {
+            Ok(r) => r,
+            Err(sparkles::Error::Cancelled) => {
+                return Err(ApiError::from(sparkles::Error::Cancelled));
+            }
+            Err(e) => return Ok(ProbeResult::ReplayFailed(e)),
         };
-    let res = sparkles::sparql::query(snap, sparql, &opts).map_err(ApiError::from)?;
+        let (snap, _, retained) =
+            match crate::http::history::snapshot_for_limited(&plan.ds, at, &opts, reserved) {
+                Ok(triple) => triple,
+                Err(e) => {
+                    if let Some(r) = reserved {
+                        charge.release(r);
+                    }
+                    return match e {
+                        sparkles::Error::NotFound(_) => Ok(ProbeResult::Empty),
+                        sparkles::Error::HistoryGone(_) => Ok(ProbeResult::HistoryGone),
+                        sparkles::Error::Cancelled => Err(ApiError::from(e)),
+                        other => Ok(ProbeResult::ReplayFailed(other)),
+                    };
+                }
+            };
+        let held = match charge.settle_replay(reserved, retained) {
+            Ok(h) => h,
+            Err(e) => {
+                if let Some(r) = reserved {
+                    charge.release(r);
+                }
+                return Ok(ProbeResult::ReplayFailed(e));
+            }
+        };
+        (snap, held)
+    } else {
+        (plan.ds.store.snapshot(), 0)
+    };
+
+    opts.max_memory_bytes = match charge.engine_budget() {
+        Ok(b) => b,
+        Err(e) => {
+            drop(snap);
+            charge.release(snap_charge);
+            return Err(ApiError::from(e));
+        }
+    };
+    let res = sparkles::sparql::query(snap, sparql, &opts);
+    charge.release(snap_charge);
+    let res = res.map_err(ApiError::from)?;
     if res.triples().is_empty() {
         Ok(ProbeResult::Empty)
     } else {
@@ -947,10 +1189,23 @@ fn probe_one_dataset(
     }
 }
 
-enum ProbeResult {
-    Readable,
-    Empty,
-    HistoryGone,
+/// Whether `principal` can read at least one triple for `sparql` on `plan`'s live
+/// snapshot. Returns `false` if live readability cannot be established within the
+/// remaining budget or deadline.
+#[allow(clippy::too_many_arguments)]
+fn live_is_readable(
+    st: &AppState,
+    principal: &Principal,
+    plan: &DatasetPlan,
+    sparql: &str,
+    grant: &Option<Arc<PoolGrant>>,
+    charge: &mut MemoryCharge,
+    deadline: &Deadline,
+) -> bool {
+    matches!(
+        probe_one_dataset(st, principal, plan, sparql, None, grant, charge, deadline),
+        Ok(ProbeResult::Readable)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -961,8 +1216,9 @@ fn probe_any_readable(
     sparql: &str,
     at: Option<&At>,
     grant: &Option<Arc<PoolGrant>>,
-    charge: &MemoryCharge,
+    charge: &mut MemoryCharge,
     deadline: &Deadline,
+    hide_replay_errors: bool,
 ) -> ApiResult<ProbeResult> {
     let mut saw_gone = false;
     for plan in plans {
@@ -972,11 +1228,19 @@ fn probe_any_readable(
             ProbeResult::HistoryGone => {
                 // Only report 410 if the caller can read at least one triple on the live
                 // snapshot; otherwise hidden terms stay 404.
-                if matches!(
-                    probe_one_dataset(st, principal, plan, sparql, None, grant, charge, deadline)?,
-                    ProbeResult::Readable
-                ) {
+                if !hide_replay_errors
+                    && live_is_readable(st, principal, plan, sparql, grant, charge, deadline)
+                {
                     saw_gone = true;
+                }
+            }
+            ProbeResult::ReplayFailed(e) => {
+                // Never disclose a matched catalog entry or replay byte count before
+                // establishing that the caller can read the target.
+                if !hide_replay_errors
+                    && live_is_readable(st, principal, plan, sparql, grant, charge, deadline)
+                {
+                    return Err(ApiError::from(e));
                 }
             }
         }
@@ -1078,8 +1342,9 @@ pub fn resolve_and_describe(
             &sparql,
             pin_at.as_ref(),
             &grant,
-            &charge,
+            &mut charge,
             &deadline,
+            true,
         )? {
             ProbeResult::Readable => {
                 return Err(err_code(
@@ -1088,7 +1353,9 @@ pub fn resolve_and_describe(
                     "version parameter conflicts with the requested version IRI",
                 ));
             }
-            ProbeResult::Empty | ProbeResult::HistoryGone => return Err(not_found()),
+            ProbeResult::Empty | ProbeResult::HistoryGone | ProbeResult::ReplayFailed(_) => {
+                return Err(not_found());
+            }
         }
     }
 
@@ -1109,8 +1376,9 @@ pub fn resolve_and_describe(
                     &sparql,
                     Some(&pin_at),
                     &grant,
-                    &charge,
+                    &mut charge,
                     &deadline,
+                    true,
                 )? {
                     ProbeResult::Readable => {
                         return Err(err_code(
@@ -1119,7 +1387,9 @@ pub fn resolve_and_describe(
                             "at parameter conflicts with the version's pinned snapshot",
                         ));
                     }
-                    ProbeResult::Empty | ProbeResult::HistoryGone => return Err(not_found()),
+                    ProbeResult::Empty
+                    | ProbeResult::HistoryGone
+                    | ProbeResult::ReplayFailed(_) => return Err(not_found()),
                 }
             }
             Some(pin_at)
@@ -1144,17 +1414,20 @@ pub fn resolve_and_describe(
             &sparql,
             effective_at.as_ref(),
             &grant,
-            &charge,
+            &mut charge,
             &deadline,
+            false,
         )? {
             ProbeResult::Readable => Ok(LookupOutcome::Redirect { iri }),
             ProbeResult::HistoryGone => Err(history_gone()),
-            ProbeResult::Empty => Err(not_found()),
+            ProbeResult::Empty | ProbeResult::ReplayFailed(_) => Err(not_found()),
         };
     }
 
     let multi = plans.len() > 1;
+    let mut single_result: Option<QueryResult> = None;
     let mut merged: Vec<Triple> = Vec::new();
+    let mut merged_bytes: u64 = 0;
     let mut seen: Option<HashSet<Triple>> = multi.then(HashSet::new);
     let mut seen_bytes: u64 = 0;
     let mut truncated = false;
@@ -1182,7 +1455,6 @@ pub fn resolve_and_describe(
         let mut opts = CallerContext::for_caller(st, &plan.ds, principal).read_options();
         opts.grant = grant.clone();
         opts.timeout = deadline.left().map_err(ApiError::from)?;
-        opts.max_memory_bytes = charge.engine_budget().map_err(ApiError::from)?;
         let mut desc = plan.describe.clone();
         desc.max_triples = Some(global_cap as u64);
         opts.describe = desc;
@@ -1192,29 +1464,114 @@ pub fn resolve_and_describe(
             // vocabulary's linked-data view.
             opts.default_graph_extra.clear();
         }
-        let replay_cap = charge.replay_budget().map_err(ApiError::from)?;
-        let (snap, resolved) = match crate::http::history::snapshot_for_limited(
-            &plan.ds,
-            effective_at.as_ref(),
-            &opts,
-            replay_cap,
-        ) {
-            Ok(pair) => pair,
-            Err(sparkles::Error::NotFound(_)) => continue,
-            Err(sparkles::Error::HistoryGone(_)) => {
-                if matches!(
-                    probe_one_dataset(
-                        st, principal, plan, &sparql, None, &grant, &charge, &deadline
-                    )?,
-                    ProbeResult::Readable
-                ) {
-                    saw_history_gone = true;
+
+        let (snap, resolved, snap_charge) = if effective_at.is_some() {
+            let reserved = match charge.reserve_replay(plan.ds.store.history_cache_capacity()) {
+                Ok(r) => r,
+                Err(sparkles::Error::Cancelled) => {
+                    return Err(ApiError::from(sparkles::Error::Cancelled));
                 }
-                continue;
-            }
-            Err(e) => return Err(ApiError::from(e)),
+                Err(e) => {
+                    if live_is_readable(
+                        st,
+                        principal,
+                        plan,
+                        &sparql,
+                        &grant,
+                        &mut charge,
+                        &deadline,
+                    ) {
+                        return Err(ApiError::from(e));
+                    }
+                    continue;
+                }
+            };
+            let (snap, resolved, retained) = match crate::http::history::snapshot_for_limited(
+                &plan.ds,
+                effective_at.as_ref(),
+                &opts,
+                reserved,
+            ) {
+                Ok(triple) => triple,
+                Err(e) => {
+                    if let Some(r) = reserved {
+                        charge.release(r);
+                    }
+                    match e {
+                        sparkles::Error::NotFound(_) => continue,
+                        sparkles::Error::HistoryGone(_) => {
+                            if live_is_readable(
+                                st,
+                                principal,
+                                plan,
+                                &sparql,
+                                &grant,
+                                &mut charge,
+                                &deadline,
+                            ) {
+                                saw_history_gone = true;
+                            }
+                            continue;
+                        }
+                        sparkles::Error::Cancelled => return Err(ApiError::from(e)),
+                        other => {
+                            if live_is_readable(
+                                st,
+                                principal,
+                                plan,
+                                &sparql,
+                                &grant,
+                                &mut charge,
+                                &deadline,
+                            ) {
+                                return Err(ApiError::from(other));
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
+            let held = match charge.settle_replay(reserved, retained) {
+                Ok(h) => h,
+                Err(e) => {
+                    if let Some(r) = reserved {
+                        charge.release(r);
+                    }
+                    if live_is_readable(
+                        st,
+                        principal,
+                        plan,
+                        &sparql,
+                        &grant,
+                        &mut charge,
+                        &deadline,
+                    ) {
+                        return Err(ApiError::from(e));
+                    }
+                    continue;
+                }
+            };
+            (snap, resolved, held)
+        } else {
+            (plan.ds.store.snapshot(), None, 0)
         };
-        let res = sparkles::sparql::query(snap.clone(), &sparql, &opts).map_err(ApiError::from)?;
+
+        opts.max_memory_bytes = match charge.engine_budget() {
+            Ok(b) => b,
+            Err(e) => {
+                drop(snap);
+                charge.release(snap_charge);
+                return Err(ApiError::from(e));
+            }
+        };
+        let res = match sparkles::sparql::query(snap.clone(), &sparql, &opts) {
+            Ok(r) => r,
+            Err(e) => {
+                drop(snap);
+                charge.release(snap_charge);
+                return Err(ApiError::from(e));
+            }
+        };
         if res.describe_truncated {
             truncated = true;
         }
@@ -1224,50 +1581,116 @@ pub fn resolve_and_describe(
             && !truncated
             && res.triples().len() >= HASH_NS_TERM_LIMIT
         {
-            let mut check_opts = opts.clone();
-            check_opts.timeout = deadline.left().map_err(ApiError::from)?;
-            check_opts.max_memory_bytes = charge.engine_budget().map_err(ApiError::from)?;
-            let overflow_q = hash_doc_overflow_sparql(&iri, &resolved_target);
-            let overflow =
-                sparkles::sparql::query(snap, &overflow_q, &check_opts).map_err(ApiError::from)?;
-            if !overflow.is_empty() {
-                truncated = true;
+            let res_bytes: u64 = res.triples().iter().map(triple_bytes).sum();
+            charge.set_external(res_bytes);
+            let overflow_res = (|| -> ApiResult<bool> {
+                let mut check_opts = opts.clone();
+                check_opts.timeout = deadline.left().map_err(ApiError::from)?;
+                check_opts.max_memory_bytes = charge.engine_budget().map_err(ApiError::from)?;
+                let overflow_q = hash_doc_overflow_sparql(&iri, &resolved_target);
+                let overflow = sparkles::sparql::query(snap.clone(), &overflow_q, &check_opts)
+                    .map_err(ApiError::from)?;
+                Ok(!overflow.is_empty())
+            })();
+            charge.clear_external();
+            match overflow_res {
+                Ok(true) => truncated = true,
+                Ok(false) => {}
+                Err(e) => {
+                    drop(snap);
+                    charge.release(snap_charge);
+                    return Err(e);
+                }
             }
         }
+        // Snapshot is no longer needed once this dataset's queries have finished.
+        drop(snap);
+        charge.release(snap_charge);
+
+        if !multi {
+            if !res.triples().is_empty() {
+                let res_bytes: u64 = res.triples().iter().map(triple_bytes).sum();
+                charge.set_external(res_bytes);
+                single_history = resolved;
+                for (p, ns) in plan.ds.dataset.prefixes() {
+                    prefixes.entry(p).or_insert(ns);
+                }
+                single_result = Some(res);
+            }
+            break;
+        }
+
+        // Multi-dataset merge: keep `res`'s live bytes accounted against `--query-memory-mb`
+        // while iterating, and charge every triple BEFORE cloning it.
+        let res_bytes: u64 = res.triples().iter().map(triple_bytes).sum();
+        charge.set_external(res_bytes);
         let bnode_prefix = format!("d{idx}");
         let mut contributed = false;
-        for t in res.triples() {
-            let triple = if multi {
-                scope_bnode(t.clone(), &bnode_prefix)
-            } else {
-                t.clone()
-            };
-            let is_new = match &mut seen {
-                Some(set) => {
-                    if set.contains(&triple) {
-                        false
-                    } else {
-                        let bytes = triple_bytes(&triple);
-                        charge.charge(bytes).map_err(ApiError::from)?;
-                        seen_bytes = seen_bytes.saturating_add(bytes);
-                        set.insert(triple.clone());
-                        true
+        let merge_res: ApiResult<()> = (|| {
+            for t in res.triples() {
+                let has_bnode = matches!(&t.subject, NamedOrBlankNode::BlankNode(_))
+                    || matches!(&t.object, Term::BlankNode(_));
+                let add_bytes = scoped_triple_bytes(t, &bnode_prefix);
+                if !has_bnode {
+                    if let Some(set) = &seen
+                        && set.contains(t)
+                    {
+                        continue;
                     }
+                    if merged.len() >= global_cap {
+                        truncated = true;
+                        break;
+                    }
+                    let total_add = if seen.is_some() {
+                        add_bytes.saturating_mul(2)
+                    } else {
+                        add_bytes
+                    };
+                    charge.charge(total_add).map_err(ApiError::from)?;
+                    let triple = t.clone();
+                    if let Some(set) = &mut seen {
+                        set.insert(triple.clone());
+                        seen_bytes = seen_bytes.saturating_add(add_bytes);
+                    }
+                    merged.push(triple);
+                    merged_bytes = merged_bytes.saturating_add(add_bytes);
+                    contributed = true;
+                } else {
+                    charge.charge(add_bytes).map_err(ApiError::from)?;
+                    let triple = scope_bnode(t.clone(), &bnode_prefix);
+                    if let Some(set) = &seen
+                        && set.contains(&triple)
+                    {
+                        drop(triple);
+                        charge.release(add_bytes);
+                        continue;
+                    }
+                    if merged.len() >= global_cap {
+                        drop(triple);
+                        charge.release(add_bytes);
+                        truncated = true;
+                        break;
+                    }
+                    if let Some(set) = &mut seen {
+                        if let Err(e) = charge.charge(add_bytes) {
+                            drop(triple);
+                            charge.release(add_bytes);
+                            return Err(ApiError::from(e));
+                        }
+                        set.insert(triple.clone());
+                        seen_bytes = seen_bytes.saturating_add(add_bytes);
+                    }
+                    merged.push(triple);
+                    merged_bytes = merged_bytes.saturating_add(add_bytes);
+                    contributed = true;
                 }
-                None => true,
-            };
-            if is_new {
-                if merged.len() >= global_cap {
-                    truncated = true;
-                    break;
-                }
-                charge
-                    .charge(triple_bytes(&triple))
-                    .map_err(ApiError::from)?;
-                merged.push(triple);
-                contributed = true;
             }
-        }
+            Ok(())
+        })();
+        drop(res);
+        charge.clear_external();
+        merge_res?;
+
         if contributed {
             contributing_datasets += 1;
             if contributing_datasets == 1 {
@@ -1287,29 +1710,26 @@ pub fn resolve_and_describe(
     drop(seen);
     charge.release(seen_bytes);
 
-    if merged.is_empty() {
+    let triples_source = if let Some(res) = single_result {
+        TriplesSource::Single(res)
+    } else if !merged.is_empty() {
+        TriplesSource::Merged(merged)
+    } else {
         if saw_history_gone {
             return Err(history_gone());
         }
         return Err(not_found());
-    }
+    };
 
     let licence = resolved_target
         .resource
         .licence_of(resolved_target.version)
         .expression
         .map(str::to_string);
-    let own_namespaces = resolved_target
-        .resource
-        .input
-        .namespaces
-        .iter()
-        .map(|n| n.iri.clone())
-        .collect();
 
     Ok(LookupOutcome::Document(Box::new(Description {
         iri,
-        triples: merged,
+        triples: triples_source,
         truncated,
         prefixes,
         resolved_history: single_history,
@@ -1317,31 +1737,84 @@ pub fn resolve_and_describe(
         version_name: resolved_target.version.map(|v| v.input.version.clone()),
         namespace_prefix: resolved_target.namespace.map(|n| n.prefix.clone()),
         license: licence,
-        is_exact_version_iri: resolved_target.is_exact_version_iri,
-        own_namespaces,
-        readable_namespaces: readable_namespaces(st, principal, catalog),
-        _memory_charge: charge,
+        iri_pinned_version: resolved_target.iri_pinned_version,
+        readable_targets: readable_targets(st, principal, catalog, &resolved_target.resource.id),
+        memory_charge: charge,
+        retained_triples_bytes: merged_bytes,
     })))
 }
 
-/// Serialize `desc` into the requested RDF syntax, respecting `max_bytes`.
+struct ChargedLimitedWriter<'a> {
+    buf: Vec<u8>,
+    max_bytes: Option<u64>,
+    charge: &'a mut MemoryCharge,
+    budget_err: Option<sparkles::Error>,
+}
+
+impl<'a> ChargedLimitedWriter<'a> {
+    fn new(max_bytes: Option<u64>, charge: &'a mut MemoryCharge) -> Self {
+        Self {
+            buf: Vec::new(),
+            max_bytes,
+            charge,
+            budget_err: None,
+        }
+    }
+}
+
+impl std::io::Write for ChargedLimitedWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let add = data.len() as u64;
+        if let Some(limit) = self.max_bytes {
+            let requested = (self.buf.len() as u64).saturating_add(add);
+            if requested > limit {
+                self.budget_err = Some(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                    kind: sparkles::BudgetKind::ResultBytes,
+                    limit,
+                    requested,
+                }));
+                return Err(std::io::Error::other("result byte budget exceeded"));
+            }
+        }
+        if let Err(e) = self.charge.charge(add) {
+            self.budget_err = Some(e);
+            return Err(std::io::Error::other("memory budget exceeded"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize `desc` into the requested RDF syntax, enforcing both `max_bytes` and
+/// `desc.memory_charge` (query memory ceiling and admitted pool grant) before growing the
+/// output buffer.
 pub fn serialize_rdf(
-    desc: &Description,
+    desc: &mut Description,
     format: RdfFormat,
     max_bytes: Option<u64>,
 ) -> ApiResult<Vec<u8>> {
     let prefix_iter = desc.prefixes.iter().map(|(p, ns)| (p.clone(), ns.clone()));
     let ser = sparkles::io::with_prefixes(RdfSerializer::from_format(format), prefix_iter);
-    let mut writer = LimitedWriter::new(Vec::new(), max_bytes, None);
+    let triples = desc.triples.as_slice();
+    let mut writer = ChargedLimitedWriter::new(max_bytes, &mut desc.memory_charge);
     let mut w = ser.for_writer(&mut writer);
-    for t in &desc.triples {
+    for t in triples {
         if let Err(e) = w.serialize_triple(t) {
             drop(w);
-            return Err(ApiError::from(writer.classify(sparkles::Error::Io(e))));
+            return Err(ApiError::from(
+                writer.budget_err.unwrap_or(sparkles::Error::Io(e)),
+            ));
         }
     }
     if let Err(e) = w.finish() {
-        return Err(ApiError::from(writer.classify(sparkles::Error::Io(e))));
+        return Err(ApiError::from(
+            writer.budget_err.unwrap_or(sparkles::Error::Io(e)),
+        ));
     }
-    Ok(writer.into_inner())
+    let _ = writer.flush();
+    Ok(writer.buf)
 }
