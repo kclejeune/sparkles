@@ -102,14 +102,15 @@ resources and source identity go ahead of unrelated feature expansion.
 The first release fixes the storage formats that later versions must read and completes
 backup. Item 479 set the first-release format cutoff, item 343 settles the dataset-local
 codec settings in Wave E before the release fixture, and item 61 completes backup in
-Wave F. Waves A through F complete their declared scope ahead of the first release
-artifacts, and items 343 and 61 may also use capacity that earlier waves leave free.
-Published artifacts follow the first release: the server binaries and container images
-of item 59 and the PyPI, Maven Central and npm packages of item 58, both after the
-format cutoff and API policy of item 60. The later encryption phases of item 65, security
-and audit in item 466, the developer ecosystem of items 468 and 47, the remaining
-notification work in item 785, the per-crate Nix builds of item 92 and the replication
-refresh of item 280 follow the first release.
+Wave F. Waves A through F complete their declared scope ahead of cutting the first
+release, and items 343 and 61 may also use capacity that earlier waves leave free.
+The first release publishes the server binaries and container images of item 59 and
+the PyPI, Maven Central and npm packages of item 58 after the format cutoff, while
+the remaining X12 Phase 4 compatibility policy checks of item 60 may follow the first
+release as [X12](specs/X12-release-engineering.md) specifies. The later encryption
+phases of item 65, security and audit in item 466, the developer ecosystem of items
+468 and 47, the remaining notification work in item 785, the per-crate Nix builds of
+item 92 and the replication refresh of item 280 follow the first release.
 
 ### Wave A: engine quality and consolidation
 
@@ -241,16 +242,18 @@ X11 before the first release. It keeps the existing completion rule that documen
 close cases and deferrals are acceptable and that a benchmark loss alone does not block
 completion.
 
-* Benchmark coverage and large-scale gates run sustained-write, 100M BSBM, BI-driver
-  and competitive refreshes in item 1, large SP²Bench answers in item 91, and noise
-  controls and table regeneration in items 290 to 292, 299, 306, 328 and 575 to 577.
-  Cold-start I/O, counter-cost and 1.01B dense export follow-ups run in items 516, 572
-  to 574, 1273 and 1274.
-* Spill, group-commit and codec optimization cover spill execution and cache accounting
-  in items 40, 88 and 210, parallel checkpoint reader tail and indexed group-commit
-  overhead in items 170 and 448, FSST and front-coding lookup costs in items 160 and
-  241, and dataset-local codec settings in item 343. Item 448 may run ahead of Wave E
-  whenever Wave A needs it as a prerequisite for item 833.
+* Benchmark coverage and large-scale gates run sustained-write, 100M BSBM, BI-driver,
+  table-regeneration and competitive refreshes in item 1, large SP²Bench answers in
+  item 91, and targeted cost checks and tuning such as durable writes, thread placement
+  and query-history aging in items 290 to 292, 299, 306, 328 and 575 to 577. Cold-start
+  I/O, counter-cost and 1.01B dense export follow-ups run in items 516, 572 to 574,
+  1273 and 1274.
+* Spill, memory footprint, group-commit and codec optimization cover spill execution
+  and cache accounting in items 88 and 210, idle server RSS, Python process RSS and
+  full-text index footprint in item 40, parallel checkpoint reader tail and indexed
+  group-commit overhead in items 170 and 448, FSST and front-coding lookup costs in
+  items 160 and 241, and dataset-local codec settings in item 343. Item 448 may run ahead
+  of Wave E whenever Wave A needs it as a prerequisite for item 833.
 
 ### Wave F: bindings parity, web UI and operational completion
 
