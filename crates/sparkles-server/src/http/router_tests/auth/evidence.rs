@@ -837,3 +837,156 @@ async fn evidence_settings_reads_use_admin_middleware() {
         }
     }
 }
+
+#[tokio::test]
+async fn projection_reconciliation_requires_admin_and_respects_drift() {
+    let s = proposal_server();
+    let alice = b("alice");
+    let evw = basic("evw", "evw-pw");
+    let bob = b("bob");
+
+    let settings = serde_json::json!({
+        "format": 1, "profile": 1, "enabled": true,
+        "sourceRecords": ["urn:ev:sources"],
+        "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"],
+        "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "main": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/evidence/ev/settings",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    let body = serde_json::json!({"policy": "main"}).to_string();
+
+    // Anonymous caller gets 401.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[("content-type", "application/json")],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+
+    // Non-admin writer (evw) and unauthorized user (bob) are refused.
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &evw),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &bob),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert!(
+        matches!(r.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+        "{}: {}",
+        r.status,
+        r.text()
+    );
+
+    // Introduce declared evidence settings drift and confirm 409 evidence-settings-drift.
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    std::fs::write(
+        &f,
+        serde_json::json!({
+            "datasets": {
+                "ev": {
+                    "evidence": {
+                        "enabled": true,
+                        "sourceRecords": ["urn:ev:sources", "urn:ev:extra-sources"],
+                        "proposals": ["urn:ev:claims"],
+                        "decisions": ["urn:ev:decisions"],
+                        "supports": ["urn:ev:supports"],
+                        "projections": ["urn:ev:accepted"],
+                        "policies": settings["policies"]
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let declared = crate::settings::Settings::load(&f, None)
+        .unwrap()
+        .declared();
+    s.state.settings.replace_declared_for_test(declared);
+
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "evidence-settings-drift");
+
+    // Reconcile the declared settings, then admin projection reconciliation succeeds.
+    let r = call(
+        &s.app,
+        "DELETE",
+        "/$/settings/ev/evidence",
+        &[("authorization", &alice)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/evidence/ev/projections/reconcile",
+        &[
+            ("authorization", &alice),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["committed"], true);
+    drop(dir);
+}

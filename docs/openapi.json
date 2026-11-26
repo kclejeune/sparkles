@@ -8518,6 +8518,271 @@
         ],
         "type": "object"
       },
+      "EvidenceProjectionReconcile": {
+        "additionalProperties": false,
+        "description": "Reconcile a review policy's accepted projection after a changed protection.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "properties": {
+          "dryRun": {
+            "description": "Check and preview the reconciliation without committing it.",
+            "type": "boolean"
+          },
+          "idempotencyKey": {
+            "description": "Makes a retry with the same payload answer the first receipt.",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ifHead": {
+            "description": "Publish only while this commit is the branch head, else `409 head-changed`.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "description": "The commit message.",
+            "type": "string"
+          },
+          "policy": {
+            "description": "The name of a review policy of the evidence settings.",
+            "type": "string"
+          },
+          "policyVersion": {
+            "description": "Optional expected policy version, else `409 policy-changed`.",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "policy"
+        ],
+        "type": "object"
+      },
+      "EvidenceProjectionReconcileResult": {
+        "additionalProperties": false,
+        "description": "The outcome of reconciling a review policy's accepted projection.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "properties": {
+          "branchId": {
+            "description": "The branch the commit published on.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "changed": {
+            "additionalProperties": false,
+            "description": "The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "properties": {
+              "inserted": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "map": {
+                "additionalProperties": false,
+                "description": "A review under a matching policy that changed which accepted decisions its resolution map follows.",
+                "properties": {
+                  "decisionsAdded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "decisionsEnded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "entities": {
+                    "description": "The entities whose selected entity changed.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "number": {
+                    "type": "integer"
+                  },
+                  "policy": {
+                    "description": "The matching policy.",
+                    "type": "string"
+                  },
+                  "previous": {
+                    "description": "The revision it follows, whose consumers may need review.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "revision": {
+                    "description": "The resolution map revision the operation published.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "policy",
+                  "revision",
+                  "number",
+                  "previous",
+                  "decisionsAdded",
+                  "decisionsEnded",
+                  "entities"
+                ],
+                "type": "object"
+              },
+              "removed": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "output": {
+                      "description": "The output graph.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The projected triple in N-Triples.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "output",
+                    "triple"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "supportsAdded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "supportsEnded": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "supportsAdded",
+              "supportsEnded",
+              "inserted",
+              "removed"
+            ],
+            "type": "object"
+          },
+          "commit": {
+            "description": "The publishing commit, the first one for a replay, or the head for a dry run.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "Whether this request published a commit.",
+            "type": "boolean"
+          },
+          "dryRun": {
+            "additionalProperties": false,
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "inserted": {
+                "type": "integer"
+              },
+              "wouldCommit": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wouldCommit",
+              "inserted",
+              "deleted",
+              "error"
+            ],
+            "type": "object"
+          },
+          "operation": {
+            "description": "The operation, which is the projection record's availability receipt.",
+            "type": "string"
+          },
+          "output": {
+            "description": "The policy's output graph.",
+            "type": "string"
+          },
+          "policy": {
+            "description": "The reconciled review policy.",
+            "type": "string"
+          },
+          "policyVersion": {
+            "description": "The policy version recorded in the projection record.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "projection": {
+            "description": "The active projection record carrying the current protections.",
+            "type": "string"
+          },
+          "replayed": {
+            "description": "Whether the idempotency key had published the same payload, whose receipt this is.",
+            "type": "boolean"
+          },
+          "vouchedSupports": {
+            "description": "The live authenticated acceptance supports vouched for under the current protections, sorted by IRI. Empty on a replay.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation",
+          "committed",
+          "replayed",
+          "commit",
+          "branchId",
+          "policy",
+          "policyVersion",
+          "output",
+          "projection",
+          "vouchedSupports",
+          "changed"
+        ],
+        "type": "object"
+      },
       "EvidenceProposal": {
         "additionalProperties": false,
         "description": "One batch of evidence records. At most 1,000 claims, 10,000 links, 1,000 identity proposals and 16 MiB of decoded input.",
@@ -35554,6 +35819,99 @@
           }
         ],
         "summary": "Release an evidence hold",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/projections/reconcile": {
+      "post": {
+        "description": "Needs `admin` on the dataset or selected branch, with update grants on the policy's supports and output graphs and unmasked read grants on its decisions, supports and output graphs and on every configured proposal graph. Rebuilds the review policy's output graph strictly from the live acceptance supports that authenticate under the current protections, or empties it when none vouch, and records the new protection nonces in a fresh `ev:Projection` record that supersedes prior unsuperseded projection records of the policy. Restores normal reviews, withdrawals and policy reads after a detach and new protection of the policy's decisions, supports or output graph. Refusals write nothing: `400` for a malformed request, unknown policy or matching policy, `403` for a read-only server or missing or masked grants, `409 evidence-settings-drift`, `409 policy-changed`, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile` when the profile is disabled or a policy graph is still detached, `422 incomplete-evidence`, and `503` for `managed-unavailable`, `projection-unavailable` when the output or conflict mode changed without raising the policy version, or `authority-changed`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
+        },
+        "operationId": "reconcileEvidenceProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceProjectionReconcile"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceProjectionReconcileResult"
+                }
+              }
+            },
+            "description": "The reconciled projection, vouched supports and output changes."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Reconcile a review policy's accepted projection",
         "tags": [
           "Datasets"
         ],

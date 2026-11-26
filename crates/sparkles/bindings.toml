@@ -461,6 +461,11 @@ python = "planned: evidence proposals in the bindings with the typed evidence op
 jvm = "planned: evidence proposals in the bindings with the typed evidence operations"
 node = "planned: evidence proposals in the bindings with the typed evidence operations"
 
+["evidence.reconcile_projection"]
+python = "planned: evidence projection reconciliation in the bindings with the typed evidence operations"
+jvm = "planned: evidence projection reconciliation in the bindings with the typed evidence operations"
+node = "planned: evidence projection reconciliation in the bindings with the typed evidence operations"
+
 ["evidence.release_hold"]
 python = "planned: evidence holds in the bindings with the typed evidence operations"
 jvm = "planned: evidence holds in the bindings with the typed evidence operations"

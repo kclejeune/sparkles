@@ -1224,3 +1224,295 @@ async fn identities_are_proposed_reviewed_and_resolved_over_http() {
         "/{ds}/claims/dependents"
     );
 }
+
+/// Administered projection reconciliation through `POST /$/evidence/{ds}/projections/reconcile`
+/// after detaching and re-protecting a policy's output or supports graph, including dry runs,
+/// idempotent replays, branches and refusals.
+#[tokio::test]
+async fn projection_reconciliation_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    let ds = state.get("d").unwrap();
+    let post = |path: String, body: J| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                &path,
+                Some("application/json"),
+                &body.to_string(),
+            )
+            .await
+        }
+    };
+    let settings = json!({
+        "format": 1, "profile": 1, "enabled": true,
+        "sourceRecords": ["urn:ev:sources"], "proposals": ["urn:ev:claims"],
+        "decisions": ["urn:ev:decisions"], "supports": ["urn:ev:supports"],
+        "projections": ["urn:ev:accepted"],
+        "policies": {
+            "main": {
+                "version": 1,
+                "admittedKinds": ["reported"],
+                "conflicts": "refuse",
+                "boundary": ["urn:ev:sources", "urn:ev:claims"],
+                "decisions": "urn:ev:decisions",
+                "supports": "urn:ev:supports",
+                "output": "urn:ev:accepted"
+            }
+        }
+    });
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    let propose_claim = |occ: &str, obj: &str| {
+        post(
+            "/d/claims".into(),
+            json!({
+                "revisions": [{
+                    "key": "rev", "source": "urn:src", "sourceKey": occ,
+                    "content": {"text": occ}
+                }],
+                "claims": [{
+                    "key": "claim", "occurrenceKey": occ, "revision": {"key": "rev"},
+                    "proposition": format!("<urn:release> <urn:affectedBy> <{obj}>"),
+                    "kind": "reported", "polarity": "positive", "author": "urn:publisher"
+                }]
+            }),
+        )
+    };
+    let (status, p1) = propose_claim("c1", "urn:cve1").await;
+    assert_eq!(status, StatusCode::OK, "{p1}");
+    let c1 = p1["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "claim")
+        .unwrap()
+        .clone();
+    let (status, p2) = propose_claim("c2", "urn:cve2").await;
+    assert_eq!(status, StatusCode::OK, "{p2}");
+    let c2 = p2["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "claim")
+        .unwrap()
+        .clone();
+
+    let head = ds.store.head_commit().seq;
+    let (status, r) = post(
+        "/d/claims/review".into(),
+        json!({
+            "policy": "main", "policyVersion": 1, "ifHead": head,
+            "decisions": [{"key": "d1", "target": c1["iri"], "targetDigest": c1["recordDigest"], "disposition": "accepted"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    let support1 = r["decisions"][0]["support"].as_str().unwrap().to_string();
+
+    // Branch dev copies the accepted state before detach.
+    ds.store
+        .create_branch("dev", &sparkles::branch::BranchOptions::default())
+        .unwrap();
+
+    // Detach output, inject bogus triple, delete valid triple, re-protect.
+    let (status, j) = post(
+        "/$/evidence/d/detach".into(),
+        json!({"graph": "urn:ev:accepted"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/d/update",
+        Some(UPDATE),
+        "DELETE DATA { GRAPH <urn:ev:accepted> { <urn:release> <urn:affectedBy> <urn:cve1> } } ; \
+         INSERT DATA { GRAPH <urn:ev:accepted> { <urn:bogus> <urn:p> 1 } }",
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+
+    // Review and withdraw fail with 503 projection-unavailable.
+    let head = ds.store.head_commit().seq;
+    let (status, j) = post(
+        "/d/claims/review".into(),
+        json!({
+            "policy": "main", "policyVersion": 1, "ifHead": head,
+            "decisions": [{"key": "d2", "target": c2["iri"], "targetDigest": c2["recordDigest"], "disposition": "accepted"}]
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, j["code"].as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("projection-unavailable")
+        ),
+        "{j}"
+    );
+
+    // Dry run previews rebuild without committing.
+    let (status, dry) = post(
+        "/$/evidence/d/projections/reconcile".into(),
+        json!({"policy": "main", "policyVersion": 1, "ifHead": head, "dryRun": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dry}");
+    assert_eq!(dry["committed"], false);
+    assert_eq!(dry["dryRun"]["wouldCommit"], true);
+    assert_eq!(dry["changed"]["inserted"].as_array().unwrap().len(), 1);
+    assert_eq!(dry["changed"]["removed"].as_array().unwrap().len(), 1);
+    assert_eq!(ds.store.head_commit().seq, head);
+
+    // Real reconciliation rebuilds output from vouched support and replays cleanly.
+    let (status, rec) = post(
+        "/$/evidence/d/projections/reconcile".into(),
+        json!({
+            "policy": "main", "policyVersion": 1, "ifHead": head,
+            "idempotencyKey": "reconcile-http-1", "message": "rebuild output"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rec}");
+    assert_eq!(rec["committed"], true);
+    assert_eq!(rec["replayed"], false);
+    assert_eq!(rec["vouchedSupports"], json!([support1]));
+    assert!(
+        ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { <urn:release> <urn:affectedBy> <urn:cve1> } }")
+            .unwrap()
+    );
+    assert!(
+        !ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { <urn:bogus> <urn:p> 1 } }")
+            .unwrap()
+    );
+
+    let (status, replay) = post(
+        "/$/evidence/d/projections/reconcile".into(),
+        json!({
+            "policy": "main", "policyVersion": 1,
+            "idempotencyKey": "reconcile-http-1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["projection"], rec["projection"]);
+
+    // Subsequent review and withdrawal succeed.
+    let head = ds.store.head_commit().seq;
+    let (status, r2) = post(
+        "/d/claims/review".into(),
+        json!({
+            "policy": "main", "policyVersion": 1, "ifHead": head,
+            "decisions": [{"key": "d2", "target": c2["iri"], "targetDigest": c2["recordDigest"], "disposition": "accepted"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{r2}");
+    let (status, w) = post(
+        "/d/claims/withdraw".into(),
+        json!({"withdrawals": [{"key": "w1", "target": c1["iri"], "targetDigest": c1["recordDigest"]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{w}");
+    assert!(
+        !ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { <urn:release> <urn:affectedBy> <urn:cve1> } }")
+            .unwrap()
+    );
+    assert!(
+        ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { <urn:release> <urn:affectedBy> <urn:cve2> } }")
+            .unwrap()
+    );
+
+    // Branch reconciliation works via ?branch=dev.
+    let (status, rec_dev) = post(
+        "/$/evidence/d/projections/reconcile?branch=dev".into(),
+        json!({"policy": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rec_dev}");
+    assert_eq!(rec_dev["committed"], true);
+
+    // Detach & re-protect SUPPORTS -> reconciliation empties output.
+    let (status, _) = post(
+        "/$/evidence/d/detach".into(),
+        json!({"graph": "urn:ev:supports"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        &settings.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, emptied) = post(
+        "/$/evidence/d/projections/reconcile".into(),
+        json!({"policy": "main"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{emptied}");
+    assert_eq!(emptied["vouchedSupports"], json!([]));
+    assert!(
+        !ds.dataset
+            .ask("ASK { GRAPH <urn:ev:accepted> { ?s ?p ?o } }")
+            .unwrap()
+    );
+
+    // Error cases: wrong policyVersion, stale ifHead, unknown policy, unknown field.
+    for (body, want, code) in [
+        (
+            json!({"policy": "main", "policyVersion": 2}),
+            StatusCode::CONFLICT,
+            Some("policy-changed"),
+        ),
+        (
+            json!({"policy": "main", "ifHead": 0}),
+            StatusCode::CONFLICT,
+            Some("head-changed"),
+        ),
+        (json!({"policy": "unknown"}), StatusCode::BAD_REQUEST, None),
+        (
+            json!({"policy": "main", "extra": 1}),
+            StatusCode::BAD_REQUEST,
+            Some("invalid-proposal"),
+        ),
+    ] {
+        let (status, j) = post("/$/evidence/d/projections/reconcile".into(), body.clone()).await;
+        assert_eq!(status, want, "{body}: {j}");
+        if let Some(code) = code {
+            assert_eq!(j["code"], code, "{body}: {j}");
+        }
+    }
+}

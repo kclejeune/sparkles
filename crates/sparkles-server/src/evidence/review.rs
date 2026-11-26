@@ -23,6 +23,7 @@ use crate::state::AppState;
 use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value as J, json};
 use sparkles::evidence::{Changed, DecisionInput, Disposition, ReviewOptions, WithdrawalInput};
@@ -556,6 +557,96 @@ pub(super) fn dependents_now(
             "depth": d.depth,
         })).collect::<Vec<_>>(),
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReconcileProjectionRequest {
+    policy: String,
+    policy_version: Option<u32>,
+    if_head: Option<u64>,
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    message: Option<String>,
+}
+
+/// `POST /$/evidence/{ds}/projections/reconcile`: administered reconciliation of a
+/// review policy's accepted projection after a changed protection. Rebuilds the output
+/// graph from the live authenticated supports it vouches for (or empties it when none
+/// vouch) and records the current protections in a fresh `ev:Projection` record. Needs
+/// `admin` on the dataset (or selected branch).
+pub(super) async fn reconcile_projection(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(bytes): AdminBody,
+) -> ApiResult {
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    let execution = super::Execution {
+        branch: crate::http::branches::current()
+            .unwrap_or_else(|| sparkles::branch::MAIN.to_string()),
+        cancel,
+        deadline: None,
+        grant: None,
+    };
+    let out =
+        crate::http::blocking(move || reconcile_projection_now(st, name, p, bytes, execution))
+            .await?;
+    Ok(axum::Json(out).into_response())
+}
+
+fn reconcile_projection_now(
+    st: Arc<AppState>,
+    name: String,
+    p: Principal,
+    bytes: axum::body::Bytes,
+    execution: super::Execution,
+) -> ApiResult<J> {
+    let r: ReconcileProjectionRequest = body_of(&st, &bytes, "projection reconciliation")?;
+    let branch = execution.branch.clone();
+    let main = crate::http::main_dataset(&st, &name)?;
+    crate::settings::evidence::require_reconciled(&st, &main)?;
+    let prepared = prepare(
+        &st,
+        &name,
+        &p,
+        &branch,
+        &execution,
+        r.idempotency_key,
+        r.if_head,
+        r.dry_run,
+        r.message,
+    )?;
+    use crate::auth::{Endpoint, on_branch};
+    let here = on_branch(&prepared.main.name, &branch);
+    let read_opts = crate::http::caller::CallerContext::for_caller(&st, &prepared.logical, &p)
+        .options_on(&crate::http::Params::empty(), &here, Endpoint::Query);
+    let reconciled = sparkles::evidence::reconcile_projection(
+        &prepared.main.dataset,
+        &prepared.logical.dataset,
+        &r.policy,
+        r.policy_version,
+        &prepared.options,
+        read_opts.graphs.clone(),
+        &prepared.control,
+    )?;
+    let mut out = json!({
+        "operation": reconciled.operation.as_str(),
+        "committed": reconciled.committed,
+        "replayed": reconciled.replayed,
+        "commit": reconciled.commit,
+        "branchId": reconciled.branch,
+        "policy": reconciled.policy.as_str(),
+        "policyVersion": reconciled.policy_version,
+        "output": reconciled.output.as_str(),
+        "projection": reconciled.projection.as_str(),
+        "vouchedSupports": reconciled.vouched_supports.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        "changed": changed_json(&reconciled.changed),
+    });
+    preview_json(&mut out, reconciled.preview.as_deref());
+    prepared.fence.check_uncommitted(reconciled.committed)?;
+    Ok(out)
 }
 
 type Policy = Option<Arc<sparkles::access::GraphAccess>>;
