@@ -1038,8 +1038,10 @@ reconciliation and a retry.
 2. **Holds in other datasets.** A stored fact of another dataset is verified but not held.
    Roadmap item 550 tracks holding it under the operation.
 3. **Records of an earlier protection.** A detach and a new protection invalidate the
-   records written before them, which then answer `origin-not-reproduced`. Roadmap item
-   552 tracks an administered re-authentication.
+   records written before them, which then answer `origin-not-reproduced`. Administered
+   re-authentication (`sparkles::evidence::reauthenticate` and
+   `POST /$/evidence/{ds}/reauthenticate`) reconciles those records as described under
+   [Re-authentication after a detach](#re-authentication-after-a-detach).
 4. **Blank nodes.** Record content refuses blank nodes, except in a stored fact's
    expected triple, so that the record digest and the conflict check compare ground
    content.
@@ -2345,6 +2347,53 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+### Re-authentication after a detach
+
+Roadmap item 552 delivers administered re-authentication in
+`sparkles_core::evidence::reauth`, `sparkles::evidence::reauthenticate` and
+`POST /$/evidence/{ds}/reauthenticate`. Detaching a protected evidence graph drops its
+protection nonce and protecting it again assigns a new nonce, so records written under
+an earlier protection answer `origin-not-reproduced` and their identities refuse new
+proposals as `immutable-record-conflict`.
+
+An administrator with `admin` on the dataset and target branch reconciles one protected
+record-role graph (`sourceRecords`, `proposals`, `decisions`, `supports` or `identity`)
+at a time, either every profile record in the graph up to 10,000 records or an explicit
+list of record IRIs with optional expected `ev:recordDigest` values. Projection graphs
+are refused because they hold projected assertions rather than profile records. The
+operation checks each candidate under the 64 MiB preparation allowance, verifying that
+the record is absent from all other record graphs, carries a single profile class,
+matches its recomputed canonical `ev:recordDigest` across its direct triples and
+fragment sub-nodes, matches any retained `ev:retainedBytes` or `ev:normalizedText`
+against its `ev:contentDigest`, matches its passage quote and retained rendition span
+when applicable, matches any retained JSON structured selection, and carries an
+`ev:Operation` receipt of this dataset and a known branch whose timestamp matches
+`ev:firstAvailableAt` or `prov:invalidatedAtTime` and whose earlier nonce matches the
+record or was already renewed by an authenticated reconciliation linked through
+`prov:wasInformedBy`.
+
+Any tampered, missing or mismatched candidate refuses the entire operation without
+writing, returning `409 immutable-record-conflict`, `409 target-changed`,
+`422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable` or
+`422 incomplete-evidence`. When every candidate verifies, one atomic managed-write
+commit rewrites `ev:graphProtection` on each verified record and its receipt operation
+to the graph's current nonce while preserving `ev:availabilityReceipt`,
+`prov:wasGeneratedBy`, `ev:recordDigest` and availability timestamps, and records an
+audit `ev:Operation` linking vouched records via `prov:used` and renewed receipts via
+`prov:wasInformedBy`. The operation honors `ifHead`, `idempotencyKey`, `dryRun`,
+declared evidence-settings drift checks and the caller authority fence. Replaying an
+idempotent proposal checks that every record of the replayed payload remains
+authenticated, so a partial re-authentication never replays an unvouched record.
+Projection and resolution-map records keep their immutable nonce fields, so
+`projection-unavailable` remains enforced until the projection or map is reconciled.
+
+Unit, library, router and auth tests cover detach and re-protect cycles across all
+record kinds, retained bytes and normalized text tampering, sub-node and timestamp
+tampering, planted records targeting predictable future operations, selective
+re-authentication and partial-replay safety, dry runs, branch scoping, persistent
+reopen durability, non-admin and drift refusals, idempotency replays and conflicts,
+and OpenAPI schema conformance.
 
 ### Scope changes
 
