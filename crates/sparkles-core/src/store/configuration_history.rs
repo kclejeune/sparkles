@@ -14,6 +14,8 @@ mod validation;
 
 pub(super) use imported::Identities as OriginalIdentities;
 pub(super) use imported::context::{Pending as ImportedOpening, Retained as ImportedRetained};
+#[cfg(test)]
+pub(super) use imported::context::{RETAINED_WAL_BINDING_HOOK, RetainedWalBindingStage};
 pub(crate) use imported::reidentify::reidentify_activated_dir;
 pub(super) use imported::reidentify::{
     BranchProvenanceCapture, DirectBranchWalInput, DiskClosure, PriorImportFiles,
@@ -263,7 +265,7 @@ impl Store {
         } else {
             // Hold the available temporary decoder allowance before using the existing
             // cold reader. Its buffers are gone before this reservation returns.
-            let (allowance, _held) = preparation.reserve_available()?;
+            let (allowance, mut held) = preparation.reserve_available()?;
             let options = HistoryOptions {
                 cancel: Some(preparation.control().cancel.flag()),
                 deadline: preparation.control().deadline,
@@ -295,11 +297,10 @@ impl Store {
                 .ok_or_else(|| managed_history::unavailable("retained generation is missing"))?;
             let mut budget = cold::ColdBudget::new(limit)?;
             // Paths remain borrowed while history keeps this generation alive.
-            budget.charge(
-                (entry.dir.as_os_str().len() as u64)
-                    .saturating_mul(4)
-                    .saturating_add(4096),
-            )?;
+            let path_charge = (entry.dir.as_os_str().len() as u64)
+                .saturating_mul(4)
+                .saturating_add(4096);
+            budget.charge(path_charge)?;
             let physical = commit::read_gen_commit_controlled(&entry.dir, &mut budget)?
                 .ok_or_else(|| {
                     managed_history::unavailable("retained generation has no commit identity")
@@ -318,24 +319,33 @@ impl Store {
                 && entry.name != retained.generation_name()
                 && retained.has_ranges_for(&entry.name)
             {
-                let gen_name = entry.name.clone();
-                let gen_dir = entry.dir.clone();
+                let physical_charge = physical.charge;
                 let physical_commit = physical.value;
+                budget.release(path_charge);
+                debug_assert_eq!(budget.used(), physical_charge);
                 let _ = budget;
-                drop(_held);
-                // Keep `history` locked so `gen_dir` cannot be collected while the
+                // Keep the decoded destination commit's charge reserved while the
+                // callee compares and reads from it; drop the commit before releasing
+                // its reservation. Borrow `entry.dir` and `entry.name` under `history`.
+                held.release_to(physical_charge);
+                // Keep `history` locked so `entry.dir` cannot be collected while the
                 // retained generation's WAL prefix is proved in a single open.
                 let resolved = retained.resolve_retained_wal_binding(
                     &self.family,
-                    &gen_dir,
-                    &gen_name,
+                    &entry.dir,
+                    &entry.name,
                     &physical_commit,
                     seq,
                     preparation,
-                )?;
+                );
+                drop(physical_commit);
+                drop(held);
                 drop(history);
-                resolved
+                resolved?
             } else {
+                let physical_charge = physical.charge;
+                drop(physical.value);
+                budget.release(physical_charge);
                 let from = wal::WalPoint {
                     seq: entry.base.seq,
                     offset: 0,
@@ -364,7 +374,7 @@ impl Store {
                         let gen_name = entry.name.clone();
                         drop(cursor);
                         let _ = budget;
-                        drop(_held);
+                        drop(held);
                         drop(history);
                         if !self.is_branch()
                             && let Some(retained) = &self.imported_opening

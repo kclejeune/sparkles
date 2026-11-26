@@ -1414,7 +1414,10 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
         (res, stages)
     };
 
-    let assert_full_disjoint_stages = |label: &str, stages: &[ProveWalStage], expected_max: u64| {
+    let assert_full_disjoint_stages = |label: &str,
+                                       stages: &[ProveWalStage],
+                                       expected_max: u64,
+                                       require_native: bool| {
         let entered = stages
             .iter()
             .find(|s| s.stage == "entered")
@@ -1431,10 +1434,28 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
             .iter()
             .find(|s| s.stage == "before_physical")
             .unwrap_or_else(|| panic!("{label}: missing before_physical stage"));
-        let callback = stages
+        let callbacks: Vec<&ProveWalStage> = stages
             .iter()
-            .find(|s| s.stage == "callback")
-            .unwrap_or_else(|| panic!("{label}: missing callback stage"));
+            .filter(|s| s.stage == "callback_imported" || s.stage == "callback_native")
+            .collect();
+        let imported_callbacks = callbacks
+            .iter()
+            .filter(|s| s.stage == "callback_imported")
+            .count();
+        let native_callbacks = callbacks
+            .iter()
+            .filter(|s| s.stage == "callback_native")
+            .count();
+        assert!(
+            imported_callbacks > 0,
+            "{label}: expected at least one callback_imported stage; stages={stages:?}"
+        );
+        if require_native {
+            assert!(
+                native_callbacks > 0,
+                "{label}: expected at least one callback_native stage to exercise the native cache-miss constructor; stages={stages:?}"
+            );
+        }
         let cap = entered.budget_used + entered.budget_available;
         assert!(
             cap <= expected_max,
@@ -1471,23 +1492,28 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
             setup_meta.sub_limit.unwrap(),
             setup_meta.budget_used
         );
-        assert!(
-            callback.budget_used > before_physical.budget_used,
-            "{label}: physical proof buffer/state must be charged during callback ({} > {})",
-            callback.budget_used,
-            before_physical.budget_used
-        );
-        assert_eq!(
-            callback.sub_limit.unwrap(),
-            callback.budget_available,
-            "{label}: callback_prep must receive only proof_budget.available()"
-        );
-        assert!(
-            callback.budget_used + callback.sub_limit.unwrap() <= cap,
-            "{label}: callback_prep limit ({}) must not overlap proof_budget charge ({}) against cap ({cap})",
-            callback.sub_limit.unwrap(),
-            callback.budget_used
-        );
+        for (index, callback) in callbacks.iter().enumerate() {
+            assert!(
+                callback.budget_used > before_physical.budget_used,
+                "{label}: callback[{index}] ({}) must charge physical proof buffer/state ({} > {})",
+                callback.stage,
+                callback.budget_used,
+                before_physical.budget_used
+            );
+            assert_eq!(
+                callback.sub_limit.unwrap(),
+                callback.budget_available,
+                "{label}: callback[{index}] ({}) callback_prep must receive only proof_budget.available()",
+                callback.stage
+            );
+            assert!(
+                callback.budget_used + callback.sub_limit.unwrap() <= cap,
+                "{label}: callback[{index}] ({}) callback_prep limit ({}) must not overlap proof_budget charge ({}) against cap ({cap})",
+                callback.stage,
+                callback.sub_limit.unwrap(),
+                callback.budget_used
+            );
+        }
         (
             cap,
             before_physical.budget_used,
@@ -1511,8 +1537,27 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
     });
     res.unwrap();
     let (retained_cap, retained_before_physical, retained_setup_peak) =
-        assert_full_disjoint_stages("retained_cold_read", &retained_stages, full_budget);
+        assert_full_disjoint_stages("retained_cold_read", &retained_stages, full_budget, false);
     assert_eq!(retained_cap, full_budget);
+
+    // Also exercise the native cache-miss callback on `authenticate_retained_generation`
+    // by proving through `own_1_seq`.
+    let (res, retained_native_stages) = capture_stages(&mut || {
+        super::branching::readonly::authenticate_retained_generation(
+            &dst,
+            &entry,
+            &full_limit,
+            own_1_seq,
+        )
+    });
+    res.unwrap();
+    let (retained_native_cap, _, _) = assert_full_disjoint_stages(
+        "retained_cold_read_native",
+        &retained_native_stages,
+        full_budget,
+        true,
+    );
+    assert_eq!(retained_native_cap, full_budget);
 
     let (res, validate_stages) = capture_stages(&mut || {
         let prep = Preparation::new(crate::task::Control::none(), full_budget)?;
@@ -1520,7 +1565,7 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
     });
     res.unwrap();
     let (validate_cap, validate_before_physical, validate_setup_peak) =
-        assert_full_disjoint_stages("closed_copy_validate", &validate_stages, full_budget);
+        assert_full_disjoint_stages("closed_copy_validate", &validate_stages, full_budget, true);
     assert!(
         validate_cap < full_budget,
         "closed-copy validation must reserve DiskClosure in Preparation before ColdBudget ({validate_cap} < {full_budget})"
@@ -1579,10 +1624,10 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
     let err = res.unwrap_err();
     let cb = tight_retained_stages
         .iter()
-        .find(|s| s.stage == "callback")
+        .find(|s| s.stage == "callback_imported")
         .unwrap_or_else(|| {
             panic!(
-                "retained tight budget ({tight_retained}) must reach callback before failing; stages={tight_retained_stages:?}, err={err:?}"
+                "retained tight budget ({tight_retained}) must reach callback_imported before failing; stages={tight_retained_stages:?}, err={err:?}"
             )
         });
     assert!(
@@ -1616,10 +1661,10 @@ fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
     let err = res.unwrap_err();
     let v_cb = tight_validate_stages
         .iter()
-        .find(|s| s.stage == "callback")
+        .find(|s| s.stage == "callback_imported")
         .unwrap_or_else(|| {
             panic!(
-                "closed-copy tight budget ({tight_validate}) must reach callback before failing; stages={tight_validate_stages:?}, err={err:?}"
+                "closed-copy tight budget ({tight_validate}) must reach callback_imported before failing; stages={tight_validate_stages:?}, err={err:?}"
             )
         });
     assert!(
@@ -1967,15 +2012,112 @@ fn retained_binding_uses_authoritative_proof_observation() {
     };
 
     let dst = Store::open(&dst_root, retain_opts).unwrap();
-    let prep = preparation();
+    let full_budget = 64u64 << 20;
+    let prep = Preparation::new(crate::task::Control::none(), full_budget).unwrap();
+    let baseline_used = prep.used();
+    let gen1_dir = dst_root.join("gen-0001");
+    let gen1_meta_len = std::fs::metadata(gen1_dir.join("meta.json")).unwrap().len();
+    let gen1_commit_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(gen1_dir.join("commit.json")).unwrap()).unwrap();
+    let origin_len = gen1_commit_json
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .expect("commit.json origin")
+        .len() as u64;
+    let min_commit_charge =
+        std::mem::size_of::<crate::commit::RetainedGenerationCommit>() as u64 + origin_len;
+
+    let capture_binding_stages = |run: &mut dyn FnMut() -> Result<ConfigurationBinding>| -> (
+        Result<ConfigurationBinding>,
+        Vec<RetainedWalBindingStage>,
+    ) {
+        let observed = std::sync::Arc::new(parking_lot::Mutex::new(
+            Vec::<RetainedWalBindingStage>::new(),
+        ));
+        let observed_clone = observed.clone();
+        RETAINED_WAL_BINDING_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |stage| {
+                observed_clone.lock().push(stage);
+            }));
+        });
+        let res = run();
+        RETAINED_WAL_BINDING_HOOK.with(|hook| hook.borrow_mut().take());
+        let stages = observed.lock().clone();
+        (res, stages)
+    };
+    let assert_retained_commit_charged = |label: &str, stages: &[RetainedWalBindingStage]| {
+        let entered = stages
+            .iter()
+            .find(|s| s.stage == "entered")
+            .unwrap_or_else(|| panic!("{label}: missing entered stage"));
+        let setup_meta = stages
+            .iter()
+            .find(|s| s.stage == "setup_meta")
+            .unwrap_or_else(|| panic!("{label}: missing setup_meta stage"));
+        let setup_source = stages
+            .iter()
+            .find(|s| s.stage == "setup_source")
+            .unwrap_or_else(|| panic!("{label}: missing setup_source stage"));
+        let before_proof = stages
+            .iter()
+            .find(|s| s.stage == "before_proof")
+            .unwrap_or_else(|| panic!("{label}: missing before_proof stage"));
+        assert_eq!(entered.limit, full_budget);
+        assert!(
+            entered.used >= baseline_used + min_commit_charge,
+            "{label}: live destination commit charge ({min_commit_charge}) must remain reserved on entry to resolve_retained_wal_binding ({} >= {} + {min_commit_charge})",
+            entered.used,
+            baseline_used
+        );
+        assert_eq!(
+            entered.room,
+            entered.limit - entered.used,
+            "{label}: setup allowance must exclude live destination commit charge"
+        );
+        assert!(
+            entered.room <= full_budget - baseline_used - min_commit_charge,
+            "{label}: setup allowance ({}) must exclude retained commit charge ({min_commit_charge})",
+            entered.room
+        );
+        assert!(
+            setup_meta.used >= entered.used + gen1_meta_len * 128 + 1024,
+            "{label}: destination meta charge must stack on top of held commit charge ({} >= {} + {})",
+            setup_meta.used,
+            entered.used,
+            gen1_meta_len * 128 + 1024
+        );
+        assert!(
+            setup_source.used > setup_meta.used + gen1_meta_len * 128,
+            "{label}: source base charge must stack on top of destination commit and meta charges ({} > {} + {})",
+            setup_source.used,
+            setup_meta.used,
+            gen1_meta_len * 128
+        );
+        assert!(
+            before_proof.used >= entered.used,
+            "{label}: destination commit charge must remain held through proof setup ({} >= {})",
+            before_proof.used,
+            entered.used
+        );
+    };
+
     // Both the imported commit and the valid annotated native suffix commit in retained
-    // gen-0001 resolve cleanly through the authoritative WAL proof.
-    let imp_binding = dst.configuration_binding_at(imported_seq, &prep).unwrap();
+    // gen-0001 resolve cleanly through the authoritative WAL proof while keeping the
+    // decoded destination commit charged in `prep`.
+    let (imp_res, imp_stages) =
+        capture_binding_stages(&mut || dst.configuration_binding_at(imported_seq, &prep));
+    let imp_binding = imp_res.unwrap();
+    assert_retained_commit_charged("imported_seq", &imp_stages);
+    assert_eq!(prep.used(), baseline_used);
     assert!(matches!(
         imp_binding,
         ConfigurationBinding::ImportedUnbound { .. }
     ));
-    let native_binding = dst.configuration_binding_at(own_1_seq, &prep).unwrap();
+    let (native_res, native_stages) =
+        capture_binding_stages(&mut || dst.configuration_binding_at(own_1_seq, &prep));
+    let native_binding = native_res.unwrap();
+    assert_retained_commit_charged("own_1_seq", &native_stages);
+    assert_eq!(prep.used(), baseline_used);
     assert!(matches!(native_binding, ConfigurationBinding::Known { .. }));
 
     // Truncate retained `gen-0001/wal.log` right after `own-1` (so `own-1` is the tail
@@ -2009,6 +2151,11 @@ fn retained_binding_uses_authoritative_proof_observation() {
         dst.configuration_binding_at(own_1_seq, &prep).is_err(),
         "retained WAL binding must refuse a commit omitted by the authoritative proof"
     );
+    assert_eq!(
+        prep.used(),
+        baseline_used,
+        "error path must release the destination commit reservation cleanly"
+    );
     assert!(
         matches!(
             dst.configuration_binding_at(imported_seq, &prep).unwrap(),
@@ -2016,6 +2163,7 @@ fn retained_binding_uses_authoritative_proof_observation() {
         ),
         "earlier imported commit must still resolve via the authoritative proof"
     );
+    assert_eq!(prep.used(), baseline_used);
 }
 
 #[test]

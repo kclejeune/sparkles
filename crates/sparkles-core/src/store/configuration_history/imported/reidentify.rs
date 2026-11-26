@@ -706,7 +706,7 @@ impl DiskClosure {
                             .options
                             .temporary(proof_budget.available())?;
                         prove_wal_stage_hook(
-                            "callback",
+                            "callback_imported",
                             proof_budget.used(),
                             proof_budget.available(),
                             Some(callback_prep.limit()),
@@ -734,7 +734,7 @@ impl DiskClosure {
                                     .options
                                     .temporary(proof_budget.available())?;
                                 prove_wal_stage_hook(
-                                    "callback",
+                                    "callback_native",
                                     proof_budget.used(),
                                     proof_budget.available(),
                                     Some(callback_prep.limit()),

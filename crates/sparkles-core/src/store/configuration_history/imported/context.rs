@@ -140,6 +140,39 @@ struct Headers {
     _held: Reservation,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::store) struct RetainedWalBindingStage {
+    pub(in crate::store) stage: &'static str,
+    pub(in crate::store) used: u64,
+    pub(in crate::store) room: u64,
+    pub(in crate::store) limit: u64,
+}
+
+#[cfg(test)]
+pub(in crate::store) type RetainedWalBindingHook = Option<Box<dyn FnMut(RetainedWalBindingStage)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only stage observer for `Retained::resolve_retained_wal_binding`.
+    pub(in crate::store) static RETAINED_WAL_BINDING_HOOK: std::cell::RefCell<RetainedWalBindingHook> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retained_wal_binding_hook(_stage: &'static str, _preparation: &Preparation) {
+    #[cfg(test)]
+    RETAINED_WAL_BINDING_HOOK.with(|hook| {
+        if let Some(cb) = hook.borrow_mut().as_mut() {
+            cb(RetainedWalBindingStage {
+                stage: _stage,
+                used: _preparation.used(),
+                room: _preparation.room(),
+                limit: _preparation.limit(),
+            });
+        }
+    });
+}
+
 impl Retained {
     /// Name of the opening generation whose imported ranges were proven at open.
     pub(in crate::store) fn generation_name(&self) -> &str {
@@ -203,6 +236,7 @@ impl Retained {
         preparation: &Preparation,
     ) -> Result<ConfigurationBinding> {
         preparation.check()?;
+        retained_wal_binding_hook("entered", preparation);
         family.verify_origin_lock(&self.root, &self.lock)?;
         family.check_origin_selection(opening_origin_selection(&self.root, preparation)?)?;
         if !self.has_ranges_for(gen_name) {
@@ -210,6 +244,13 @@ impl Retained {
                 "retained generation has no declared imported ranges",
             ));
         }
+        let _paths = preparation.reserve(
+            (gen_dir.as_os_str().len() as u64)
+                .checked_add(gen_name.len() as u64)
+                .and_then(|n| n.checked_mul(4))
+                .and_then(|n| n.checked_add(1024))
+                .ok_or_else(|| preparation.exhausted())?,
+        )?;
         let local = Location {
             branch: None,
             generation: gen_name.to_owned(),
@@ -217,6 +258,7 @@ impl Retained {
         local.validate()?;
         let actual_meta =
             super::reidentify::read_meta_controlled(&gen_dir.join("meta.json"), preparation)?;
+        retained_wal_binding_hook("setup_meta", preparation);
         let count = self
             .sources
             .origin
@@ -253,6 +295,7 @@ impl Retained {
                     managed_history::unavailable("imported range has no declared source interval")
                 })?;
             let original = original_base(node, &interval.root, &interval.generation, preparation)?;
+            retained_wal_binding_hook("setup_source", preparation);
             if original.meta != actual_meta.value
                 || original.physical.commit != actual.commit
                 || original.physical.origin != actual.origin
@@ -327,6 +370,7 @@ impl Retained {
             state.as_deref(),
             preparation,
         )?;
+        retained_wal_binding_hook("before_proof", preparation);
         // Loan half of the remaining preparation room to the WAL parser's ColdBudget
         // while keeping the other half available for source publication callbacks.
         let allowance = preparation.room() / 2;
