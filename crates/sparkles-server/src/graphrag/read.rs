@@ -280,7 +280,14 @@ fn reports_named_in(
         return Ok(Vec::new());
     }
     let values = format!("VALUES ?r {{ {} }}", names.join(" "));
-    reports_where_in(input, opts, graph, &values, filter, names.len())
+    reports_where_in(
+        input,
+        opts,
+        graph,
+        &values,
+        filter,
+        names.len().saturating_mul(4).max(DEFAULT_MAX_REPORTS),
+    )
 }
 
 fn reports_where(
@@ -304,7 +311,7 @@ fn reports_where_in(
 ) -> Result<Vec<ReportRef>, Error> {
     let policy_clause = filter.policy_clause()?;
     let q = format!(
-        "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n ?policy ?version ?configuration WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{report}> ?r ; <{count}> ?n . ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary{policy_clause} . OPTIONAL {{ ?r <{rating}> ?rating }} OPTIONAL {{ ?r <{policy}> ?policy OPTIONAL {{ ?r <{version}> ?version }} OPTIONAL {{ ?r <{configuration}> ?configuration }} }} }} }} ORDER BY DESC(?rating) ?r LIMIT {limit}",
+        "SELECT ?r ?c ?l ?title ?summary ?status ?rating ?n ?policy ?version ?configuration WHERE {{ {values} {extra} GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{report}> ?r ; <{count}> ?n . ?r <{status}> ?status ; <{label}> ?title ; <{summary}> ?summary{policy_clause} . OPTIONAL {{ ?r <{rating}> ?rating }} OPTIONAL {{ ?r <{policy}> ?policy }} OPTIONAL {{ ?r <{version}> ?version }} OPTIONAL {{ ?r <{configuration}> ?configuration }} }} }} ORDER BY DESC(?rating) ?r LIMIT {limit}",
         values = filter.values(),
         community = gr("Community"),
         level = gr("level"),

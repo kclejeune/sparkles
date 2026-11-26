@@ -2647,18 +2647,27 @@ async fn policy_scoped_text_search_enumerates_many_small_reports_and_deduplicate
     );
 
     let mut trig = format!("<{REPORTS}> {{\n");
-    // 1) Duplicate community links pointing to the same report at level 0.
+    // 1) Duplicate community links pointing to the same report at level 0, separated by
+    //    > REPORT_BATCH (16) filler communities so they land in different anchor batches,
+    //    paired with an equal-length single-link peer (`urn:r:dup-peer`) so double-counting
+    //    `marigold` would lower its IDF and flip the tie/ranking.
     trig.push_str(&format!(
-        r#"  <urn:c:dup-a> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-comm> .
-  <urn:c:dup-b> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-comm> .
+        r#"  <urn:c:0000-dup-a> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-comm> .
+  <urn:c:zzzz-dup-b> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-comm> .
   <urn:r:dup-comm> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Dup" ; <{sum}> "Unique marigold summary." ; <{stat}> "reviewed" ; <{rat}> 2 ; <{rp}> <{main}> ; <{pv}> 1 .
+  <urn:c:0001-dup-peer> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:dup-peer> .
+  <urn:r:dup-peer> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Peer" ; <{sum}> "Unique verbena summary." ; <{stat}> "reviewed" ; <{rat}> 2 ; <{rp}> <{main}> ; <{pv}> 1 .
 "#,
         main = main_iri.as_str(),
     ));
-    // 2) Report carrying two admitted statuses ("reviewed" and "stale").
+    // 2) Report carrying two admitted statuses ("reviewed" and "stale"), paired with an
+    //    equal-length single-status peer (`urn:r:multi-peer`) so double-counting `saffron`
+    //    across status scans would lower its IDF and break the exact tie.
     trig.push_str(&format!(
         r#"  <urn:c:multi-stat> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:multi-stat> .
   <urn:r:multi-stat> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Multi" ; <{sum}> "Unique saffron summary." ; <{stat}> "reviewed", "stale" ; <{rat}> 2 ; <{rp}> <{main}> ; <{pv}> 1 .
+  <urn:c:multi-peer> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:multi-peer> .
+  <urn:r:multi-peer> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Peer" ; <{sum}> "Unique ochre summary." ; <{stat}> "reviewed" ; <{rat}> 2 ; <{rp}> <{main}> ; <{pv}> 1 .
 "#,
         main = main_iri.as_str(),
     ));
@@ -2717,37 +2726,160 @@ async fn policy_scoped_text_search_enumerates_many_small_reports_and_deduplicate
         assert_eq!(res["reports"][0]["score"], res["reports"][1]["score"]);
     }
 
-    // Duplicate community link yields one hit (never duplicated).
+    // R5-2: Duplicate community link must not double-count `marigold` in Pass 1 corpus
+    // stats; otherwise `df(marigold) = 2 > df(verbena) = 1`, lowering `idf(marigold)` and
+    // letting `urn:r:dup-peer` strictly outscore `urn:r:dup-comm`.
     let dup = mcp_tool_with_cfg(
         &st,
         tight_mcp.clone(),
         "community_reports",
-        json!({ "query": "marigold", "reviewPolicy": "main", "level": 0, "limit": 3 }),
+        json!({ "query": "marigold verbena", "reviewPolicy": "main", "level": 0, "limit": 3 }),
     )
     .unwrap();
     assert_eq!(dup["ranking"], "search", "{dup}");
-    assert_eq!(dup["reports"][0]["iri"], "urn:r:dup-comm");
-    assert!(dup["reports"][0]["score"].is_number());
-    assert!(
-        dup["reports"][1]["score"].is_null(),
-        "duplicate community link must not emit report twice: {dup}"
+    assert_eq!(dup["reports"][0]["iri"], "urn:r:dup-comm", "{dup}");
+    assert_eq!(dup["reports"][1]["iri"], "urn:r:dup-peer", "{dup}");
+    assert_eq!(
+        dup["reports"][0]["score"], dup["reports"][1]["score"],
+        "duplicate community link altered BM25 corpus statistics: {dup}"
     );
+    assert!(dup["reports"][2]["score"].is_null(), "{dup}");
 
-    // Multi-status report yields one hit across unpolicied status scans (never duplicated).
+    // R5-2: Multi-status report must not double-count `saffron` across status scans;
+    // otherwise `df(saffron) = 2 > df(ochre) = 1`, letting `urn:r:multi-peer` strictly
+    // outscore `urn:r:multi-stat`.
     let multi = mcp_tool_with_cfg(
         &st,
         tight_mcp,
         "community_reports",
-        json!({ "query": "saffron", "level": 0, "limit": 3 }),
+        json!({ "query": "saffron ochre", "level": 0, "limit": 3 }),
     )
     .unwrap();
     assert_eq!(multi["ranking"], "search", "{multi}");
-    assert_eq!(multi["reports"][0]["iri"], "urn:r:multi-stat");
-    assert!(multi["reports"][0]["score"].is_number());
-    assert!(
-        multi["reports"][1]["score"].is_null(),
-        "multi-status report must not emit twice across status scans: {multi}"
+    assert_eq!(multi["reports"][0]["iri"], "urn:r:multi-peer", "{multi}");
+    assert_eq!(multi["reports"][1]["iri"], "urn:r:multi-stat", "{multi}");
+    assert_eq!(
+        multi["reports"][0]["score"], multi["reports"][1]["score"],
+        "multi-status report altered BM25 corpus statistics: {multi}"
     );
+    assert!(multi["reports"][2]["score"].is_null(), "{multi}");
+}
+
+/// R5-1: Retained non-current revisions (`gr:editOf` edit history), rejected/failed
+/// reports, and other-level reports under the same `reviewPolicy` must not exhaust
+/// `max_rows` when the eligible level-0 set is small.
+#[cfg(feature = "text")]
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_scoped_text_search_ignores_retained_revisions_under_tight_row_budget() {
+    const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+    let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
+    st.limits.max_rows = 1_000;
+    st.limits.max_result_bytes = None;
+    let st = Arc::new(st);
+    let state_ds = st.attach("org", DbType::Mem, None).unwrap();
+    let p = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    state_ds
+        .dataset
+        .store()
+        .activate_memory_configuration_history(&p)
+        .unwrap();
+    state_ds
+        .store
+        .load(&[Source::from_bytes(
+            ORG.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let ds = state_ds.dataset.clone();
+    evidence::configure(&ds, &settings(), &Control::none()).unwrap();
+    ds.indexes()
+        .text()
+        .enable(sparkles::text::TextConfig::default())
+        .unwrap();
+
+    let gr = crate::graphrag::guard::gr;
+    let main_iri = sparkles::evidence::review::policy_iri("main");
+    let (c_cls, lv, cnt, rep, r_cls, sum, stat, rat, rp, pv, edit_of) = (
+        gr("Community"),
+        gr("level"),
+        gr("memberCount"),
+        gr("report"),
+        gr("Report"),
+        gr("summary"),
+        gr("status"),
+        gr("rating"),
+        gr("reviewPolicy"),
+        gr("policyVersion"),
+        gr("editOf"),
+    );
+
+    // 1 linked reviewed level-0 report under `main`, plus 1,050 retained non-current
+    // revisions under `main` (exceeding `max_rows = 1_000`), plus 200 rejected/failed
+    // same-policy reports and 10 level-1 same-policy reports.
+    let mut trig = format!("<{REPORTS}> {{\n");
+    trig.push_str(&format!(
+        r#"  <urn:c:live-0> a <{c_cls}> ; <{lv}> 0 ; <{cnt}> 2 ; <{rep}> <urn:r:main-live> .
+  <urn:r:main-live> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Live Main" ; <{sum}> "Current zephyr summary." ; <{stat}> "reviewed" ; <{rat}> 5 ; <{rp}> <{main}> ; <{pv}> 1 ; <{edit_of}> <urn:r:rev-0000> .
+"#,
+        main = main_iri.as_str(),
+    ));
+    for i in 0..1_050 {
+        let next_edit = if i + 1 < 1_050 {
+            format!(" ; <{edit_of}> <urn:r:rev-{:04}>", i + 1)
+        } else {
+            String::new()
+        };
+        trig.push_str(&format!(
+            r#"  <urn:r:rev-{i:04}> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "Rev {i}" ; <{sum}> "Superseded zephyr zephyr revision {i}." ; <{stat}> "reviewed" ; <{rat}> 10 ; <{rp}> <{main}> ; <{pv}> 1{next_edit} .
+"#,
+            main = main_iri.as_str(),
+        ));
+    }
+    for i in 0..100 {
+        trig.push_str(&format!(
+            r#"  <urn:r:rej-{i:03}> a <{r_cls}> ; <{sum}> "Rejected zephyr {i}" ; <{stat}> "rejected" ; <{rp}> <{main}> ; <{pv}> 1 .
+  <urn:r:fail-{i:03}> a <{r_cls}> ; <{sum}> "Failed zephyr {i}" ; <{stat}> "failed" ; <{rp}> <{main}> ; <{pv}> 1 .
+"#,
+            main = main_iri.as_str(),
+        ));
+    }
+    for i in 0..10 {
+        trig.push_str(&format!(
+            r#"  <urn:c:lvl1-{i:03}> a <{c_cls}> ; <{lv}> 1 ; <{cnt}> 2 ; <{rep}> <urn:r:lvl1-{i:03}> .
+  <urn:r:lvl1-{i:03}> a <{r_cls}> ; <http://www.w3.org/2000/01/rdf-schema#label> "L1 {i}" ; <{sum}> "Other level zephyr {i}" ; <{stat}> "reviewed" ; <{rat}> 8 ; <{rp}> <{main}> ; <{pv}> 1 .
+"#,
+            main = main_iri.as_str(),
+        ));
+    }
+    trig.push_str("}\n");
+    ds.store()
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+
+    crate::settings::store_runtime(
+        &st,
+        &state_ds,
+        &crate::settings::GRAPHRAG,
+        &json!({ "enabled": true, "principal": "local", "projection": { "graphs": ["urn:g:org"] } }),
+    )
+    .unwrap();
+
+    let tight_mcp = crate::mcp::McpConfig {
+        query_memory_bytes: Some(1 << 20),
+        ..crate::mcp::McpConfig::default()
+    };
+
+    for args in [
+        json!({ "query": "zephyr", "reviewPolicy": "main", "level": 0, "limit": 1 }),
+        json!({ "query": "zephyr", "level": 0, "limit": 1 }),
+    ] {
+        let res = mcp_tool_with_cfg(&st, tight_mcp.clone(), "community_reports", args).unwrap();
+        assert_eq!(res["ranking"], "search", "{res}");
+        let reps = res["reports"].as_array().unwrap();
+        assert_eq!(reps.len(), 1, "{res}");
+        assert_eq!(reps[0]["iri"], "urn:r:main-live", "{res}");
+    }
 }
 
 /// R3-2: Scoped text search preserves the full-text index's default accent-insensitive
