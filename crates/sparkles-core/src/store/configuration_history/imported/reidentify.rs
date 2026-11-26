@@ -473,7 +473,9 @@ impl DiskClosure {
     }
 
     /// Prove a copied WAL against both its declared imported intervals and native
-    /// suffix (`validation.rs`).
+    /// suffix (`validation.rs` and retained cold reads). When `through < u64::MAX`,
+    /// scopes the proof to `through` and every complete imported interval starting
+    /// at or before `through`.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::store) fn prove_wal<R: Read + Seek>(
         &self,
@@ -483,6 +485,7 @@ impl DiskClosure {
         input: R,
         extent: u64,
         base: u64,
+        through: u64,
         terms: u64,
         annotated: Option<&[u64]>,
         wal_path: &Path,
@@ -564,6 +567,9 @@ impl DiskClosure {
                 "ambiguous imported physical intervals",
             ));
         }
+        if through < u64::MAX {
+            ranges.retain(|r| r.span.first_seq <= through);
+        }
         let spans: Vec<physical::Span> = ranges
             .iter()
             .map(|r| physical::Span {
@@ -575,131 +581,67 @@ impl DiskClosure {
             })
             .collect();
         let mut config_error = None;
-        let _ = physical::prove_prefix(
-            input,
-            &spans,
-            extent,
-            base,
-            u64::MAX,
-            terms,
-            annotated,
-            wal_path,
-            budget,
-            &mut |observation| {
-                if config_error.is_none() {
-                    let matched = ranges.iter_mut().find(|r| {
-                        r.span.start <= observation.start_offset
-                            && observation.point.offset <= r.span.end
-                    });
-                    let result = if let Some(range) = matched {
-                        let node = &self.nodes[range.source];
-                        range
-                            .header
-                            .observation_using(preparation, observation, &mut |identity| {
-                                documents::source_publication(
-                                    &node.directory,
-                                    &node.descriptor.value,
-                                    identity,
-                                    preparation,
-                                )
-                                .map(|_| ())
-                            })
-                    } else {
-                        native.observation(family_root, preparation, observation)
-                    };
-                    if let Err(error) = result {
-                        config_error = Some(error);
-                    }
+        let mut visit = |observation: wal::probe::WalCommitObservation| {
+            if config_error.is_none() {
+                let matched = ranges.iter_mut().find(|r| {
+                    (r.span.start <= observation.start_offset
+                        || (r.span.start == 0 && observation.start_offset == WAL_REC as u64))
+                        && observation.point.offset <= r.span.end
+                });
+                let result = if let Some(range) = matched {
+                    let node = &self.nodes[range.source];
+                    range
+                        .header
+                        .observation_using(preparation, observation, &mut |identity| {
+                            documents::source_publication(
+                                &node.directory,
+                                &node.descriptor.value,
+                                identity,
+                                preparation,
+                            )
+                            .map(|_| ())
+                        })
+                } else {
+                    native.observation(family_root, preparation, observation)
+                };
+                if let Err(error) = result {
+                    config_error = Some(error);
                 }
-                Ok(())
-            },
-        )?;
+            }
+            Ok(())
+        };
+        if through == u64::MAX {
+            let _ = physical::prove_prefix(
+                input,
+                &spans,
+                extent,
+                base,
+                u64::MAX,
+                terms,
+                annotated,
+                wal_path,
+                budget,
+                &mut visit,
+            )?;
+        } else {
+            let proof_target = spans.last().map_or(through, |s| through.max(s.last_seq));
+            let _ = physical::prove_prefix_through(
+                input,
+                &spans,
+                extent,
+                base,
+                proof_target,
+                terms,
+                annotated,
+                wal_path,
+                budget,
+                &mut visit,
+            )?;
+        }
         if let Some(error) = config_error {
             return Err(error);
         }
         Ok(())
-    }
-
-    /// Resolve a WAL commit binding when `(None, gen_name)` has an imported range
-    /// covering `end_offset` / `seq`. Returns `Ok(None)` if the commit lies outside
-    /// every imported range (so the caller resolves it as a native commit).
-    pub(in crate::store) fn resolve_wal_binding(
-        &self,
-        gen_name: &str,
-        end_offset: u64,
-        seq: u64,
-        digest: Option<Sha256Digest>,
-        preparation: &Preparation,
-    ) -> Result<Option<ConfigurationBinding>> {
-        let local = Location {
-            branch: None,
-            generation: gen_name.to_owned(),
-        };
-        for assignment in &self.origin.value.ranges {
-            if assignment.local != local {
-                continue;
-            }
-            let index = self.source_index(assignment.source)?;
-            let node = &self.nodes[index];
-            let interval = node
-                .descriptor
-                .value
-                .intervals
-                .get(assignment.interval as usize)
-                .ok_or_else(|| {
-                    managed_history::unavailable("imported range has no declared source interval")
-                })?;
-            if end_offset > interval.start
-                && end_offset <= interval.end
-                && seq >= interval.first_seq
-                && seq <= interval.last_seq
-            {
-                let registry = documents::read_member(
-                    &node.directory,
-                    &node.descriptor.value,
-                    crate::managed::FILE,
-                    preparation,
-                )?;
-                let history = primary::recorded_root_bytes(&registry.value, preparation)?
-                    .ok_or_else(|| {
-                        managed_history::unavailable("imported source root is missing")
-                    })?;
-                drop(registry);
-                return match digest {
-                    Some(generation) => {
-                        let identity = ConfigurationIdentity {
-                            dataset_id: node.descriptor.value.family_id,
-                            lineage_id: history.lineage_id,
-                            generation,
-                        };
-                        drop(documents::source_publication(
-                            &node.directory,
-                            &node.descriptor.value,
-                            identity,
-                            preparation,
-                        )?);
-                        Ok(Some(ConfigurationBinding::ImportedUnbound {
-                            source: identity,
-                        }))
-                    }
-                    None => {
-                        let header = documents::source_header(
-                            &node.directory,
-                            &node.descriptor.value,
-                            &interval.root,
-                            preparation,
-                        )?;
-                        if !header.is_pre_cutoff(seq) {
-                            return Err(managed_history::unavailable(
-                                "covered imported commit is missing its configuration reference",
-                            ));
-                        }
-                        Ok(Some(ConfigurationBinding::LegacyUnbound))
-                    }
-                };
-            }
-        }
-        Ok(None)
     }
 }
 
@@ -757,7 +699,7 @@ fn read_disk_original_base(
     Ok((physical.value, meta.value))
 }
 
-fn read_meta_controlled(
+pub(super) fn read_meta_controlled(
     path: &Path,
     preparation: &Preparation,
 ) -> Result<crate::builder::IndexMeta> {
@@ -844,22 +786,6 @@ fn check_acyclic(
         }
     }
     Ok(())
-}
-
-/// Resolve an imported WAL commit binding on a live store root, if the store has
-/// a format 2 `evidence-history/origin.json` covering `(gen_name, end_offset, seq)`.
-pub(in crate::store) fn resolve_imported_wal_binding(
-    root: &Path,
-    gen_name: &str,
-    end_offset: u64,
-    seq: u64,
-    digest: Option<Sha256Digest>,
-    preparation: &Preparation,
-) -> Result<Option<ConfigurationBinding>> {
-    let Some(closure) = DiskClosure::load(root, preparation)? else {
-        return Ok(None);
-    };
-    closure.resolve_wal_binding(gen_name, end_offset, seq, digest, preparation)
 }
 
 /// Verify that an `ImportedUnbound` identity is published in one of `root`'s
@@ -970,12 +896,13 @@ fn pin_closure_import_members(
 /// with empty `bases` and `ranges` reflecting the freshly materialized `gen-0001`.
 pub(in crate::store) fn capture_materialized_imported_origin(
     family_root: &Path,
+    family: &crate::store::family::Family,
     staging_dir: &Path,
     preparation: &Preparation,
     control: &WriteOptions,
 ) -> Result<Vec<CapturedFile>> {
     control.check()?;
-    let Some(closure) = DiskClosure::load(family_root, preparation)? else {
+    let Some(closure) = DiskClosure::load_for_family(family_root, family, preparation)? else {
         return Ok(Vec::new());
     };
     let reconciled =
@@ -1164,6 +1091,134 @@ pub(in crate::store) fn clone_creation_digest(
     )
 }
 
+/// Materialize an in-memory clone's retained [`managed_history::MemoryOrigin`]
+/// into `(origin_json_bytes, prior_imports, prior_direct_sources)` so downstream
+/// clones and branch backups preserve the complete ancestor provenance DAG.
+pub(in crate::store) fn materialize_memory_origin_imports(
+    family_id: Uuid,
+    installed: &Installed,
+    memory: &managed_history::MemoryHistory,
+    memory_origin: &managed_history::MemoryOrigin,
+    preparation: &Preparation,
+) -> Result<(
+    managed_history::Bytes,
+    Vec<PriorImportFiles>,
+    Vec<Sha256Digest>,
+)> {
+    preparation.check()?;
+    let mut all_sources: BTreeSet<[u8; 32]> = BTreeSet::new();
+    let mut prior_imports: Vec<PriorImportFiles> = Vec::new();
+    prior_imports
+        .try_reserve_exact(memory_origin.prior_imports.len() + 1)
+        .map_err(|_| preparation.exhausted())?;
+    for (prior_digest, files) in &memory_origin.prior_imports {
+        all_sources.insert(*prior_digest.as_bytes());
+        let mut copied_files = Vec::new();
+        copied_files
+            .try_reserve_exact(files.len())
+            .map_err(|_| preparation.exhausted())?;
+        for (rel, bytes) in files {
+            preparation.check()?;
+            copied_files.push((
+                rel.clone(),
+                managed_history::Bytes::copy_from_slice(&bytes.value, preparation)?,
+            ));
+        }
+        prior_imports.push((*prior_digest, copied_files));
+    }
+
+    let mut file_pins = BTreeMap::new();
+    for (rel, bytes) in &memory_origin.source_files {
+        preparation.check()?;
+        if !source_member(rel) {
+            return Err(managed_history::unavailable(
+                "memory clone source provenance contains an invalid member path",
+            ));
+        }
+        let pin = SourceFile {
+            bytes: bytes.value.len() as u64,
+            sha256: Sha256Digest::of_bytes(&bytes.value, preparation.control())?,
+        };
+        if file_pins.insert(rel.clone(), pin).is_some() {
+            return Err(managed_history::unavailable(
+                "memory clone source provenance repeats a member",
+            ));
+        }
+    }
+    let mut direct_sources = memory_origin.prior_direct_sources.clone();
+    direct_sources.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    direct_sources.dedup();
+    let descriptor = Descriptor {
+        format: FORMAT,
+        family_id: memory_origin.src_family,
+        roots: BTreeMap::from([(
+            "main".to_owned(),
+            SourceRoot {
+                logical_id: memory_origin.src_logical,
+                head: memory_origin.src_head,
+                generation: memory_origin.src_generation.clone(),
+            },
+        )]),
+        files: file_pins,
+        sources: direct_sources,
+        intervals: Vec::new(),
+    };
+    descriptor.validate(preparation)?;
+    let desc_bytes = managed_history::encode(&descriptor, preparation)?;
+    let src_digest = Sha256Digest::of_bytes(&desc_bytes.value, preparation.control())?;
+    let mut immediate_files = Vec::new();
+    immediate_files
+        .try_reserve_exact(memory_origin.source_files.len() + 1)
+        .map_err(|_| preparation.exhausted())?;
+    immediate_files.push(("origin.json".to_owned(), desc_bytes));
+    for (rel, bytes) in &memory_origin.source_files {
+        preparation.check()?;
+        immediate_files.push((
+            format!("source/{rel}"),
+            managed_history::Bytes::copy_from_slice(&bytes.value, preparation)?,
+        ));
+    }
+    prior_imports.push((src_digest, immediate_files));
+    all_sources.insert(*src_digest.as_bytes());
+    let sorted_sources: Vec<Sha256Digest> = all_sources
+        .into_iter()
+        .map(Sha256Digest::from_digest_bytes)
+        .collect();
+
+    let history = installed.configuration_history.as_ref().ok_or_else(|| {
+        managed_history::unavailable("in-memory clone has no published configuration root")
+    })?;
+    let genesis = ConfigurationIdentity {
+        dataset_id: family_id,
+        lineage_id: history.lineage_id,
+        generation: memory.coverage.value.activation_generation,
+    };
+    let origin = Origin {
+        format: 2,
+        dataset_id: family_id,
+        destination: Some(destination::Publication {
+            genesis,
+            coverage: history.coverage,
+            creation_commit: Some(memory_origin.creation_commit),
+        }),
+        sources: sorted_sources.clone(),
+        bases: Vec::new(),
+        ranges: Vec::new(),
+    };
+    origin.validate(preparation)?;
+    let origin_bytes = managed_history::encode(&origin, preparation)?;
+    Ok((origin_bytes, prior_imports, sorted_sources))
+}
+
+/// Branch identity documents captured under the branch writer lock so concurrent
+/// compaction cannot shift `CURRENT` relative to the captured head and generation.
+pub(in crate::store) struct BranchProvenanceCapture {
+    pub(in crate::store) identities: super::Identities,
+    pub(in crate::store) source_generation: String,
+    pub(in crate::store) source_dataset: Option<managed_history::Bytes>,
+    pub(in crate::store) source_current: Option<managed_history::Bytes>,
+}
+
 /// Build standalone destination provenance for a public backup of a branch of an
 /// activated family (materialized or direct unlinked). Establishes a fresh
 /// destination lineage for `branch_id` with `first_bound_own = head_seq + 1` and
@@ -1173,19 +1228,31 @@ pub(in crate::store) fn clone_creation_digest(
 pub(in crate::store) fn build_branch_standalone_provenance(
     staging_dir: &Path,
     family_root: Option<&Path>,
+    family: &crate::store::family::Family,
     branch_root: Option<&Path>,
     family_id: Uuid,
     branch_id: Uuid,
     head_seq: u64,
-    gen_name: &str,
+    dest_generation: &str,
     installed: &Installed,
-    identities: &super::Identities,
+    captured: &BranchProvenanceCapture,
     wal_interval_inputs: Option<(&Path, u64, u64)>,
     preparation: &Preparation,
     control: &WriteOptions,
 ) -> Result<Vec<CapturedFile>> {
     control.check()?;
     preparation.check()?;
+    let source_generation = captured.source_generation.as_str();
+    if !generation(source_generation) || !generation(dest_generation) {
+        return Err(managed_history::unavailable(
+            "branch backup generation name is invalid",
+        ));
+    }
+    if wal_interval_inputs.is_some() && source_generation != dest_generation {
+        return Err(managed_history::unavailable(
+            "direct branch backup source and destination generations differ",
+        ));
+    }
     let mut source_files: BTreeMap<String, managed_history::Bytes> = BTreeMap::new();
     let mut push_src = |rel: String, bytes: managed_history::Bytes| -> Result<()> {
         if source_files.len() >= MAX_MEMBERS {
@@ -1198,56 +1265,72 @@ pub(in crate::store) fn build_branch_standalone_provenance(
     };
     push_src(
         "family-dataset.json".into(),
-        managed_history::Bytes::from_vec(identities.family_document().to_vec(), preparation)?,
+        managed_history::Bytes::copy_from_slice(
+            captured.identities.family_document(),
+            preparation,
+        )?,
     )?;
-    if let Some(branch_bytes) = identities.branch_document() {
+    if let Some(branch_bytes) = captured.identities.branch_document() {
         push_src(
             "branch.json".into(),
-            managed_history::Bytes::from_vec(branch_bytes.to_vec(), preparation)?,
+            managed_history::Bytes::copy_from_slice(branch_bytes, preparation)?,
         )?;
     }
     let (prior_imports, prior_direct) = if let Some(froot) = family_root {
-        // Read branch's own dataset.json, CURRENT, and (if direct unlinked) gen commit/meta.
+        // Use the branch dataset.json and CURRENT captured under the writer lock
+        // when persistent, and (if direct unlinked) read the leased generation's
+        // immutable commit.json and meta.json via anchored FD.
         if let Some(broot) = branch_root {
-            let bdir = documents::Opened::root(broot, preparation)?;
-            push_src(
-                "dataset.json".into(),
-                bdir.child("dataset.json", false, preparation)?
+            let ds_bytes = match &captured.source_dataset {
+                Some(bytes) => managed_history::Bytes::copy_from_slice(&bytes.value, preparation)?,
+                None => documents::Opened::root(broot, preparation)?
+                    .child("dataset.json", false, preparation)?
                     .bytes(None, preparation)?,
-            )?;
-            push_src(
-                "CURRENT".into(),
-                bdir.child("CURRENT", false, preparation)?
+            };
+            let cur_bytes = match &captured.source_current {
+                Some(bytes) => managed_history::Bytes::copy_from_slice(&bytes.value, preparation)?,
+                None => documents::Opened::root(broot, preparation)?
+                    .child("CURRENT", false, preparation)?
                     .bytes(None, preparation)?,
-            )?;
+            };
+            if std::str::from_utf8(&cur_bytes.value).ok().map(str::trim) != Some(source_generation)
+            {
+                return Err(managed_history::unavailable(
+                    "captured branch CURRENT differs from its source generation",
+                ));
+            }
+            push_src("dataset.json".into(), ds_bytes)?;
+            push_src("CURRENT".into(), cur_bytes)?;
             if wal_interval_inputs.is_some() {
-                let gdir = bdir.child(gen_name, true, preparation)?;
+                let bdir = documents::Opened::root(broot, preparation)?;
+                let gdir = bdir.child(source_generation, true, preparation)?;
                 push_src(
-                    format!("{gen_name}/commit.json"),
+                    format!("{source_generation}/commit.json"),
                     gdir.child("commit.json", false, preparation)?
                         .bytes(None, preparation)?,
                 )?;
                 push_src(
-                    format!("{gen_name}/meta.json"),
+                    format!("{source_generation}/meta.json"),
                     gdir.child("meta.json", false, preparation)?
                         .bytes(None, preparation)?,
                 )?;
             }
         } else {
-            let ds = crate::commit::with_reader(
-                &crate::commit::dataset_file_bytes(branch_id, "memory", crate::commit::now_ms()),
-                managed_history::READER,
-            )?;
-            push_src(
-                "dataset.json".into(),
-                managed_history::Bytes::from_vec(ds, preparation)?,
-            )?;
+            let ds = managed_history::Bytes::from_serialized(2048, preparation, || {
+                crate::commit::with_reader(
+                    &crate::commit::dataset_file_bytes(
+                        branch_id,
+                        "memory",
+                        crate::commit::now_ms(),
+                    ),
+                    managed_history::READER,
+                )
+            })?;
+            push_src("dataset.json".into(), ds)?;
+            let current_text = format!("{source_generation}\n");
             push_src(
                 "CURRENT".into(),
-                managed_history::Bytes::from_vec(
-                    format!("{gen_name}\n").into_bytes(),
-                    preparation,
-                )?,
+                managed_history::Bytes::copy_from_slice(current_text.as_bytes(), preparation)?,
             )?;
         }
         let fdir = documents::Opened::root(froot, preparation)?;
@@ -1262,7 +1345,7 @@ pub(in crate::store) fn build_branch_standalone_provenance(
         for (owner, bytes) in &installed.settings {
             push_src(
                 owner.settings_file().into(),
-                managed_history::Bytes::from_vec(bytes.to_vec(), preparation)?,
+                managed_history::Bytes::copy_from_slice(bytes, preparation)?,
             )?;
         }
         let lineage = src_history.lineage_id;
@@ -1315,40 +1398,50 @@ pub(in crate::store) fn build_branch_standalone_provenance(
             }
         }
         drop(cov);
-        // Include family's origin.json as a source member if present.
-        if let Ok(origin_bytes) = fdir
-            .child("evidence-history", true, preparation)?
-            .child("origin.json", false, preparation)
-            .and_then(|f| f.bytes(None, preparation))
-        {
-            push_src(ROOT_FILE.into(), origin_bytes)?;
+        // Include family's origin.json as a source member if present, propagating
+        // any non-NotFound error (such as symlink refusal, budget, or cancellation).
+        match fdir.child("evidence-history", true, preparation)?.child(
+            "origin.json",
+            false,
+            preparation,
+        ) {
+            Ok(file) => {
+                let origin_bytes = file.bytes(None, preparation)?;
+                push_src(ROOT_FILE.into(), origin_bytes)?;
+            }
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
-        read_prior_imports_for_clone(froot, preparation)?
+        read_prior_imports_for_clone(froot, family, preparation)?
     } else {
         // In-memory branch.
-        let ds = crate::commit::with_reader(
-            &crate::commit::dataset_file_bytes(branch_id, "memory", crate::commit::now_ms()),
-            managed_history::READER,
-        )?;
-        push_src(
-            "dataset.json".into(),
-            managed_history::Bytes::from_vec(ds, preparation)?,
-        )?;
+        let ds = managed_history::Bytes::from_serialized(2048, preparation, || {
+            crate::commit::with_reader(
+                &crate::commit::dataset_file_bytes(branch_id, "memory", crate::commit::now_ms()),
+                managed_history::READER,
+            )
+        })?;
+        push_src("dataset.json".into(), ds)?;
+        let current_text = format!("{source_generation}\n");
         push_src(
             "CURRENT".into(),
-            managed_history::Bytes::from_vec(format!("{gen_name}\n").into_bytes(), preparation)?,
+            managed_history::Bytes::copy_from_slice(current_text.as_bytes(), preparation)?,
         )?;
         let memory = installed.history_memory.as_ref().ok_or_else(|| {
             managed_history::unavailable("in-memory configuration history missing")
         })?;
         push_src(
             crate::managed::FILE.into(),
-            managed_history::Bytes::from_vec(installed.file_bytes(), preparation)?,
+            managed_history::Bytes::from_serialized(
+                managed_history::MAX_BYTES as u64,
+                preparation,
+                || Ok(installed.file_bytes()),
+            )?,
         )?;
         for (owner, bytes) in &installed.settings {
             push_src(
                 owner.settings_file().into(),
-                managed_history::Bytes::from_vec(bytes.to_vec(), preparation)?,
+                managed_history::Bytes::copy_from_slice(bytes, preparation)?,
             )?;
         }
         let lineage = memory.coverage.value.lineage_id;
@@ -1365,11 +1458,23 @@ pub(in crate::store) fn build_branch_standalone_provenance(
             let hex = hex.strip_prefix("sha256:").expect("canonical digest");
             push_src(
                 format!("evidence-history/{lineage}/generations/{hex}.json"),
-                managed_history::Bytes::from_vec(cur.prepared.bytes.value.clone(), preparation)?,
+                managed_history::Bytes::copy_from_slice(&cur.prepared.bytes.value, preparation)?,
             )?;
             node = cur.previous.as_deref();
         }
-        (Vec::new(), Vec::new())
+        if let Some(mem_origin) = memory.origin.as_deref() {
+            let (origin_bytes, prior_imports, prior_direct) = materialize_memory_origin_imports(
+                family_id,
+                installed,
+                memory,
+                mem_origin,
+                preparation,
+            )?;
+            push_src(ROOT_FILE.into(), origin_bytes)?;
+            (prior_imports, prior_direct)
+        } else {
+            (Vec::new(), Vec::new())
+        }
     };
 
     // Optional WAL interval when capturing an unlinked branch directly.
@@ -1380,7 +1485,7 @@ pub(in crate::store) fn build_branch_standalone_provenance(
         && let Some(interval) = compute_wal_suffix_interval_bounded(
             broot,
             gdir,
-            gen_name,
+            source_generation,
             branch_id,
             base_seq,
             0,
@@ -1429,7 +1534,7 @@ pub(in crate::store) fn build_branch_standalone_provenance(
             SourceRoot {
                 logical_id: branch_id,
                 head: head_seq,
-                generation: gen_name.to_owned(),
+                generation: source_generation.to_owned(),
             },
         )]),
         files: file_pins,
@@ -1454,6 +1559,13 @@ pub(in crate::store) fn build_branch_standalone_provenance(
     crate::store::write_synced(&desc_target, &desc_bytes.value)?;
     staged_immutable.push((desc_rel, src_digest));
     all_sources.insert(*src_digest.as_bytes());
+    // Authenticate the staged source descriptor identities before returning a public capture.
+    let staged_node_dir = documents::Opened::root(
+        &staging_dir.join(format!("evidence-history/imports/{src_hex}")),
+        preparation,
+    )?;
+    documents::source_identities(&staged_node_dir, &descriptor, preparation)?;
+    drop(staged_node_dir);
 
     // Establish fresh destination lineage for `branch_id` as a standalone dataset.
     let mut dest_installed = Installed::new(installed.graphs.clone(), installed.settings.clone())?;
@@ -1503,13 +1615,16 @@ pub(in crate::store) fn build_branch_standalone_provenance(
 
     let local = Location {
         branch: None,
-        generation: gen_name.to_owned(),
+        generation: dest_generation.to_owned(),
     };
     if wal_interval_inputs.is_some() {
         bases.push(BaseImport {
             local: local.clone(),
             source: src_digest,
-            original: local.clone(),
+            original: Location {
+                branch: None,
+                generation: source_generation.to_owned(),
+            },
         });
     }
     let ranges: Vec<RangeImport> = (0..descriptor.intervals.len())
@@ -1541,7 +1656,16 @@ pub(in crate::store) fn build_branch_standalone_provenance(
     crate::store::write_synced(&origin_target, &origin_bytes.value)?;
     staged_immutable.push((ROOT_FILE.to_owned(), origin_digest));
 
-    let mut out = Vec::with_capacity(staged_immutable.len() + 1 + dest_installed.settings.len());
+    let total_files = staged_immutable
+        .len()
+        .saturating_add(1)
+        .saturating_add(dest_installed.settings.len());
+    if total_files >= managed_history::capture::MAX_FILES {
+        return Err(managed_history::unavailable(
+            "configuration closure exceeds backup manifest limits",
+        ));
+    }
+    let mut out = Vec::with_capacity(total_files);
     for (rel, digest) in staged_immutable {
         control.check()?;
         let file = managed_history::capture::pinned_file(
@@ -1812,8 +1936,10 @@ pub(in crate::store) fn write_clone_destination_with_sync(
     Ok(genesis.identity)
 }
 
-/// Reidentify a closed, already-validated persistent directory whose
-/// configuration history is activated (used by new-identity backup restores).
+/// Reidentify a closed, already-validated, single-generation standalone restored
+/// persistent directory whose configuration history is activated (used by
+/// new-identity backup restores). Refuses directories with extra generations or
+/// branch-table state (`branches.json` or `branches/`).
 ///
 /// Preserves the source's immutable configuration history and small identity/base
 /// documents under `evidence-history/imports/<source-digest>/`, preserves any
@@ -1832,7 +1958,7 @@ pub fn reidentify_activated_dir(
     reidentify_activated_dir_with(root, new_id, forked_from, &preparation)
 }
 
-fn reidentify_activated_dir_with(
+pub(in crate::store) fn reidentify_activated_dir_with(
     root: &Path,
     new_id: Uuid,
     forked_from: ForkedFrom,
@@ -1842,15 +1968,46 @@ fn reidentify_activated_dir_with(
     if new_id.is_nil() {
         return Err(Error::invalid("new dataset identity is nil"));
     }
-    crate::formats::check_configuration_versions(root)?;
-    let old_dataset_bytes = managed_history::read_bytes(&root.join("dataset.json"), preparation)?;
-    let old_id = documents::dataset_id(&old_dataset_bytes.value, preparation)?;
+    // Enforce the standalone single-generation precondition before reading or
+    // mutating any files: refuse branch state (`branches.json` or `branches/`).
+    for unsupported in [
+        crate::store::branching::BRANCHES_FILE,
+        crate::store::branching::BRANCHES_DIR,
+    ] {
+        match std::fs::symlink_metadata(root.join(unsupported)) {
+            Ok(_) => {
+                return Err(Error::Invalid(format!(
+                    "cannot reidentify directory containing branch state ({unsupported}); \
+                     supply a standalone restored database directory"
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Read dataset identity and validate any existing origin through anchored,
+    // budgeted decoders rather than unanchored path reads.
+    let root_dir = documents::Opened::root(root, preparation)?;
+    let old_dataset_bytes = root_dir
+        .child("dataset.json", false, preparation)?
+        .bytes(None, preparation)?;
+    let (old_id, old_reader) =
+        documents::dataset_id_and_reader(&old_dataset_bytes.value, preparation)?;
     if old_id != forked_from.id {
         return Err(managed_history::unavailable(
             "restored dataset identity differs from backup source",
         ));
     }
-    let current_bytes = managed_history::read_bytes(&root.join("CURRENT"), preparation)?;
+    let _ = opening_origin_info(root, preparation)?;
+    if old_reader < managed_history::READER {
+        return Err(Error::Unsupported(format!(
+            "activated configuration history requires dataset reader {}; this dataset records reader {old_reader}",
+            managed_history::READER
+        )));
+    }
+    let current_bytes = root_dir
+        .child("CURRENT", false, preparation)?
+        .bytes(None, preparation)?;
     let gen_name = std::str::from_utf8(&current_bytes.value)
         .map_err(|_| managed_history::unavailable("CURRENT is not UTF-8"))?
         .trim()
@@ -1880,8 +2037,9 @@ fn reidentify_activated_dir_with(
     let gen_dir = root.join(&gen_name);
 
     // 1. Load the existing managed registry and any prior format 2 origin closure.
-    let src_managed_bytes =
-        managed_history::read_bytes(&root.join(crate::managed::FILE), preparation)?;
+    let src_managed_bytes = root_dir
+        .child(crate::managed::FILE, false, preparation)?
+        .bytes(None, preparation)?;
     let src_history = primary::recorded_root_bytes(&src_managed_bytes.value, preparation)?
         .ok_or_else(|| {
             managed_history::unavailable("activated restore has no published configuration root")
@@ -1915,36 +2073,43 @@ fn reidentify_activated_dir_with(
     };
     insert_source(
         "dataset.json".into(),
-        managed_history::Bytes::from_vec(old_dataset_bytes.value.clone(), preparation)?,
+        managed_history::Bytes::copy_from_slice(&old_dataset_bytes.value, preparation)?,
     )?;
     insert_source(
         "family-dataset.json".into(),
-        managed_history::Bytes::from_vec(old_dataset_bytes.value.clone(), preparation)?,
+        managed_history::Bytes::copy_from_slice(&old_dataset_bytes.value, preparation)?,
     )?;
     insert_source("CURRENT".into(), current_bytes)?;
     insert_source(crate::managed::FILE.into(), src_managed_bytes)?;
     for (owner, bytes) in &src_installed.settings {
         insert_source(
             owner.settings_file().into(),
-            managed_history::Bytes::from_vec(bytes.to_vec(), preparation)?,
+            managed_history::Bytes::copy_from_slice(bytes, preparation)?,
         )?;
     }
-    let src_commit_bytes = managed_history::read_bytes(&gen_dir.join("commit.json"), preparation)?;
-    let src_meta_bytes = managed_history::read_bytes(&gen_dir.join("meta.json"), preparation)?;
+    let anchored_gen = root_dir.child(&gen_name, true, preparation)?;
+    let src_commit_bytes = anchored_gen
+        .child("commit.json", false, preparation)?
+        .bytes(None, preparation)?;
+    let src_meta_bytes = anchored_gen
+        .child("meta.json", false, preparation)?
+        .bytes(None, preparation)?;
+    drop(anchored_gen);
     insert_source(
         format!("{gen_name}/commit.json"),
-        managed_history::Bytes::from_vec(src_commit_bytes.value.clone(), preparation)?,
+        managed_history::Bytes::copy_from_slice(&src_commit_bytes.value, preparation)?,
     )?;
     insert_source(format!("{gen_name}/meta.json"), src_meta_bytes)?;
     for optional in ["history.json", "prefixes.json", "origin.json", ROOT_FILE] {
-        match managed_history::read_bytes(&root.join(optional), preparation) {
-            Ok(bytes) => {
-                insert_source(optional.into(), bytes)?;
+        match root_dir.relative(optional, false, preparation) {
+            Ok(file) => {
+                insert_source(optional.into(), file.bytes(None, preparation)?)?;
             }
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
     }
+    drop(root_dir);
     // Collect the source's complete `evidence-history/<src-lineage>` closure.
     let src_lineage = src_history.lineage_id;
     let src_lineage_dir = managed_history::directory(root, src_lineage)?;
@@ -2216,6 +2381,27 @@ fn reidentify_activated_dir_with(
     Ok(())
 }
 
+#[cfg(test)]
+pub(in crate::store) type WalHashChunkHook = Option<Box<dyn FnMut(usize)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only hook invoked after each 64 KiB chunk hashed in
+    /// `compute_wal_suffix_interval_bounded`, allowing tests to trigger
+    /// in-flight cancellation after WAL hashing has started.
+    pub(in crate::store) static WAL_HASH_CHUNK_HOOK: std::cell::RefCell<WalHashChunkHook> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn wal_hash_chunk_hook(_chunk_index: usize) {
+    #[cfg(test)]
+    WAL_HASH_CHUNK_HOOK.with(|hook| {
+        if let Some(cb) = hook.borrow_mut().as_mut() {
+            cb(_chunk_index);
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_wal_suffix_interval_bounded(
     root: &Path,
@@ -2301,12 +2487,15 @@ fn compute_wal_suffix_interval_bounded(
     let mut hash = Sha256::new();
     let mut remaining = end - start;
     let mut buf = [0u8; 64 << 10];
+    let mut chunk_index = 0usize;
     while remaining > 0 {
         preparation.check()?;
         let want = (remaining as usize).min(buf.len());
         file.read_exact(&mut buf[..want])?;
         hash.update(&buf[..want]);
         remaining -= want as u64;
+        wal_hash_chunk_hook(chunk_index);
+        chunk_index += 1;
     }
     preparation.check()?;
     Ok(Some(SourceInterval {
@@ -2455,12 +2644,14 @@ fn sync_directories_deepest_first(
 
 /// Collect the files of every prior `evidence-history/imports/<digest>/` directory
 /// on disk under `root` through anchored `Opened` handles (for carrying forward
-/// repeated identity changes during a clone), retaining `Preparation` reservations.
+/// repeated identity changes during a clone), checking the live `family` origin
+/// selection and retaining `Preparation` reservations.
 pub(in crate::store) fn read_prior_imports_for_clone(
     root: &Path,
+    family: &crate::store::family::Family,
     preparation: &Preparation,
 ) -> Result<PriorImportsSnapshot> {
-    let Some(closure) = DiskClosure::load(root, preparation)? else {
+    let Some(closure) = DiskClosure::load_for_family(root, family, preparation)? else {
         return Ok((Vec::new(), Vec::new()));
     };
     let mut prior_dirs = Vec::new();
@@ -2497,4 +2688,120 @@ pub(in crate::store) fn read_prior_imports_for_clone(
     }
     let direct = closure.origin.value.sources.clone();
     Ok((prior_dirs, direct))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_node(
+        dir: &Path,
+        digest: Sha256Digest,
+        edges: Vec<Sha256Digest>,
+        preparation: &Preparation,
+    ) -> DiskNode {
+        let family_id = Uuid::new_v4();
+        let descriptor = Descriptor {
+            format: FORMAT,
+            family_id,
+            roots: BTreeMap::from([(
+                "main".to_owned(),
+                SourceRoot {
+                    logical_id: family_id,
+                    head: 1,
+                    generation: "gen-0001".to_owned(),
+                },
+            )]),
+            files: BTreeMap::from([
+                (
+                    "CURRENT".to_owned(),
+                    SourceFile {
+                        bytes: 1,
+                        sha256: digest,
+                    },
+                ),
+                (
+                    "dataset.json".to_owned(),
+                    SourceFile {
+                        bytes: 1,
+                        sha256: digest,
+                    },
+                ),
+                (
+                    "family-dataset.json".to_owned(),
+                    SourceFile {
+                        bytes: 1,
+                        sha256: digest,
+                    },
+                ),
+                (
+                    "managed.json".to_owned(),
+                    SourceFile {
+                        bytes: 1,
+                        sha256: digest,
+                    },
+                ),
+            ]),
+            sources: edges,
+            intervals: Vec::new(),
+        };
+        let encoded = managed_history::encode(&descriptor, preparation).unwrap();
+        let owned = Descriptor::decode(&encoded.value, preparation).unwrap();
+        let directory = documents::Opened::root(dir, preparation).unwrap();
+        DiskNode {
+            digest,
+            descriptor: owned,
+            directory,
+        }
+    }
+
+    #[test]
+    fn check_acyclic_rejects_self_loop_two_node_cycle_and_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prep = Preparation::new(crate::task::Control::none(), 8 << 20).unwrap();
+        let d_a = Sha256Digest::from_digest_bytes([0x11; 32]);
+        let d_b = Sha256Digest::from_digest_bytes([0x22; 32]);
+
+        // 1. Valid acyclic edge A -> B passes.
+        let ok_nodes = vec![
+            synthetic_node(tmp.path(), d_a, vec![d_b], &prep),
+            synthetic_node(tmp.path(), d_b, vec![], &prep),
+        ];
+        check_acyclic(&[d_a, d_b], &ok_nodes, &prep).unwrap();
+
+        // 2. Direct self-loop A -> A is refused as a cycle.
+        let self_nodes = vec![synthetic_node(tmp.path(), d_a, vec![d_a], &prep)];
+        let err = check_acyclic(&[d_a], &self_nodes, &prep).unwrap_err();
+        assert!(
+            err.to_string().contains("cycle"),
+            "expected cycle refusal for self-loop, got {err}"
+        );
+
+        // 3. Two-node cycle A -> B -> A is refused as a cycle.
+        let cycle_nodes = vec![
+            synthetic_node(tmp.path(), d_a, vec![d_b], &prep),
+            synthetic_node(tmp.path(), d_b, vec![d_a], &prep),
+        ];
+        let err = check_acyclic(&[d_a, d_b], &cycle_nodes, &prep).unwrap_err();
+        assert!(
+            err.to_string().contains("cycle"),
+            "expected cycle refusal for 2-node cycle, got {err}"
+        );
+
+        // 4. Tight preparation refuses reservation cleanly.
+        let tiny = Preparation::new(crate::task::Control::none(), 512).unwrap();
+        assert!(matches!(
+            check_acyclic(&[d_a, d_b], &ok_nodes, &tiny),
+            Err(Error::BudgetExceeded(_))
+        ));
+
+        // 5. Cancelled preparation returns Error::Cancelled.
+        let ctl = crate::task::Control::none();
+        let cancelled = Preparation::new(ctl.clone(), 8 << 20).unwrap();
+        ctl.cancel.cancel();
+        assert!(matches!(
+            check_acyclic(&[d_a, d_b], &ok_nodes, &cancelled),
+            Err(Error::Cancelled)
+        ));
+    }
 }

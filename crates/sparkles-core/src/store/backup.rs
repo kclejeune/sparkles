@@ -1590,7 +1590,8 @@ impl Store {
             } else {
                 self.managed_files_at(state.as_deref())?
             };
-            let (binding, branch_identities) = if history {
+            let snap = self.snapshot().without_cache_fill();
+            let (binding, branch_capture) = if history {
                 let adm_prep = super::managed_history::administrative_preparation_with(
                     crate::task::Control {
                         cancel: control
@@ -1603,14 +1604,39 @@ impl Store {
                     },
                 )?;
                 let binding = self.configuration_binding_at(w.head.seq, &adm_prep)?;
-                let branch_identities = if preparation.is_none() && self.is_branch() {
-                    Some(super::configuration_history::OriginalIdentities::capture(
+                let branch_capture = if preparation.is_none() && self.is_branch() {
+                    let identities = super::configuration_history::OriginalIdentities::capture(
                         self, &w, &state, &adm_prep,
-                    )?)
+                    )?;
+                    let source_generation = if self.root.is_some() {
+                        snap.generation.name.clone()
+                    } else {
+                        "gen-0001".to_owned()
+                    };
+                    let (source_dataset, source_current) = if let Some(broot) = &self.root {
+                        let ds = super::configuration_history::read_anchored_local_file(
+                            broot,
+                            "dataset.json",
+                            false,
+                            &adm_prep,
+                        )?;
+                        let cur = super::configuration_history::read_anchored_local_file(
+                            broot, "CURRENT", false, &adm_prep,
+                        )?;
+                        (ds, cur)
+                    } else {
+                        (None, None)
+                    };
+                    Some(super::configuration_history::BranchProvenanceCapture {
+                        identities,
+                        source_generation,
+                        source_dataset,
+                        source_current,
+                    })
                 } else {
                     None
                 };
-                (binding, branch_identities)
+                (binding, branch_capture)
             } else {
                 (crate::history::ConfigurationBinding::LegacyUnbound, None)
             };
@@ -1626,7 +1652,7 @@ impl Store {
                 ));
             }
             (
-                self.snapshot().without_cache_fill(),
+                snap,
                 w.next_bnode,
                 w.head,
                 self.prefixes.lock().clone(),
@@ -1635,7 +1661,7 @@ impl Store {
                 state,
                 binding,
                 original,
-                branch_identities,
+                branch_capture,
             )
         };
         let lock_hold = t0.elapsed();
@@ -1668,19 +1694,20 @@ impl Store {
                 if preparation.is_none() && self.is_branch() {
                     let adm_prep =
                         super::managed_history::administrative_preparation_with(adm_control)?;
-                    let identities = branch_identities.as_ref().ok_or_else(|| {
+                    let captured = branch_identities.as_ref().ok_or_else(|| {
                         Error::Corrupt("captured branch has no identities".into())
                     })?;
                     let files = super::configuration_history::build_branch_standalone_provenance(
                         dir,
                         self.managed_root().as_deref(),
+                        &self.family,
                         self.root.as_deref(),
                         self.owner_dataset_id(),
                         self.dataset_id,
                         head.seq,
                         generation,
                         installed,
-                        identities,
+                        captured,
                         None,
                         &adm_prep,
                         &control,
@@ -1710,8 +1737,19 @@ impl Store {
                     )?;
                     let imported =
                         super::configuration_history::capture_materialized_imported_origin(
-                            &root, dir, &adm_prep, &control,
+                            &root,
+                            &self.family,
+                            dir,
+                            &adm_prep,
+                            &control,
                         )?;
+                    if files.len().saturating_add(imported.len())
+                        >= super::managed_history::capture::MAX_FILES
+                    {
+                        return Err(super::managed_history::unavailable(
+                            "configuration closure exceeds backup manifest limits",
+                        ));
+                    }
                     files.extend(imported);
                     (files, binding)
                 } else {
@@ -1753,6 +1791,13 @@ impl Store {
                             &adm_prep,
                             &control,
                         )?;
+                        if files.len().saturating_add(origin_files.len())
+                            >= super::managed_history::capture::MAX_FILES
+                        {
+                            return Err(super::managed_history::unavailable(
+                                "configuration closure exceeds backup manifest limits",
+                            ));
+                        }
                         files.extend(origin_files);
                     }
                     (files, binding)
@@ -2094,7 +2139,7 @@ impl Store {
                 CapturedOriginal::under_writer(self, &w, &managed_state, preparation)
             })
             .transpose()?;
-        let branch_identities =
+        let branch_capture =
             if preparation.is_none() && self.is_branch() && history_installed.is_some() {
                 let adm_prep = super::managed_history::administrative_preparation_with(
                     crate::task::Control {
@@ -2107,12 +2152,27 @@ impl Store {
                         ..Default::default()
                     },
                 )?;
-                Some(super::configuration_history::OriginalIdentities::capture(
+                let identities = super::configuration_history::OriginalIdentities::capture(
                     self,
                     &w,
                     &managed_state,
                     &adm_prep,
-                )?)
+                )?;
+                let source_dataset = super::configuration_history::read_anchored_local_file(
+                    root,
+                    "dataset.json",
+                    false,
+                    &adm_prep,
+                )?;
+                let source_current = super::configuration_history::read_anchored_local_file(
+                    root, "CURRENT", false, &adm_prep,
+                )?;
+                Some(super::configuration_history::BranchProvenanceCapture {
+                    identities,
+                    source_generation: generation.clone(),
+                    source_dataset,
+                    source_current,
+                })
             } else {
                 None
             };
@@ -2188,15 +2248,37 @@ impl Store {
                             ..Default::default()
                         },
                     )?;
-                    let identities = branch_identities.as_ref().ok_or_else(|| {
+                    let captured_branch = branch_capture.as_ref().ok_or_else(|| {
                         Error::Corrupt("captured branch has no identities".into())
                     })?;
-                    let orig_commit_bytes =
-                        super::managed_history::read_bytes(&gdir.join("commit.json"), &adm_prep)?;
-                    let physical_base =
-                        crate::commit::read_gen_commit_full(&gdir)?.ok_or_else(|| {
-                            Error::Corrupt("captured branch generation commit is missing".into())
+                    let orig_commit_bytes = super::configuration_history::read_anchored_local_file(
+                        root,
+                        &format!("{generation}/commit.json"),
+                        false,
+                        &adm_prep,
+                    )?
+                    .ok_or_else(|| {
+                        Error::Corrupt("captured branch generation commit is missing".into())
+                    })?;
+                    let physical_base = {
+                        let allowance = adm_prep.room();
+                        let _loan = adm_prep.reserve(allowance)?;
+                        let options = crate::history::HistoryOptions {
+                            cancel: Some(adm_prep.control().cancel.flag()),
+                            deadline: adm_prep.control().deadline,
+                        };
+                        let mut budget = super::cold::ColdBudget::new(crate::history::ReadLimit {
+                            options: &options,
+                            memory: Some(allowance),
+                            held: 0,
                         })?;
+                        crate::commit::decode_gen_commit_bytes_controlled(
+                            &gdir.join("commit.json"),
+                            &orig_commit_bytes.value,
+                            &mut budget,
+                        )?
+                        .value
+                    };
                     let retagged = crate::commit::reidentified_generation_bytes(
                         &orig_commit_bytes.value,
                         self.dataset_id,
@@ -2209,20 +2291,24 @@ impl Store {
                     let captured = super::configuration_history::build_branch_standalone_provenance(
                         staging.path(),
                         Some(&family_root),
+                        &self.family,
                         Some(root),
                         self.owner_dataset_id(),
                         self.dataset_id,
                         head.seq,
                         &generation,
                         installed,
-                        identities,
+                        captured_branch,
                         Some((&gdir, physical_base.commit.seq, wal_len)),
                         &adm_prep,
                         control,
                     );
                     control.check()?;
                     check_preparation()?;
-                    if !self.same_managed_state(&managed_state) {
+                    let current_after = std::fs::read(root.join("CURRENT"))?;
+                    if String::from_utf8_lossy(&current_after).trim() != generation
+                        || !self.same_managed_state(&managed_state)
+                    {
                         return Ok(None);
                     }
                     *branch_staging.lock() = Some(staging);

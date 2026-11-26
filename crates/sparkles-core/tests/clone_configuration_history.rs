@@ -977,32 +977,35 @@ fn reidentify_streams_annotations_respects_cancel_and_guards_misuse() {
     let tmp = tempfile::tempdir().unwrap();
     let src_root = tmp.path().join("src");
     let src = activated_store(&src_root);
-    // Write multiple annotated commits to exercise streaming annotations.bin & commits.bin.
-    for i in 0..8 {
+    // Write multiple large annotated commits so both `annotations.bin` and `wal.log`
+    // span multiple 64 KiB chunks (messages stay within the 1024-byte commit message cap).
+    for i in 0..180 {
         let mut w = src.write_with(
             sparkles_core::commit::CommitKind::Update,
             sparkles_core::guard::WriteOptions {
-                message: Some(Arc::from(format!("commit-{i}-{}", "x".repeat(512)))),
+                message: Some(Arc::from(format!("commit-{i:03}-{}", "x".repeat(960)))),
                 ..Default::default()
             },
         );
-        let s = w
-            .intern(&oxrdf::Term::NamedNode(
-                oxrdf::NamedNode::new(format!("urn:ann:{i}")).unwrap(),
-            ))
-            .unwrap();
         let p = w
             .intern(&oxrdf::Term::NamedNode(
                 oxrdf::NamedNode::new("urn:p").unwrap(),
             ))
             .unwrap();
-        let o = w
-            .intern(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
-                format!("v{i}"),
-            )))
-            .unwrap();
-        w.insert([s, p, o, sparkles_core::id::Id::DEFAULT_GRAPH])
-            .unwrap();
+        for j in 0..20 {
+            let s = w
+                .intern(&oxrdf::Term::NamedNode(
+                    oxrdf::NamedNode::new(format!("urn:ann:{i}:{j}")).unwrap(),
+                ))
+                .unwrap();
+            let o = w
+                .intern(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                    format!("v{i}-{j}"),
+                )))
+                .unwrap();
+            w.insert([s, p, o, sparkles_core::id::Id::DEFAULT_GRAPH])
+                .unwrap();
+        }
         w.commit().unwrap();
     }
     let src_id = src.dataset_id();
@@ -1084,5 +1087,208 @@ fn reidentify_streams_annotations_respects_cancel_and_guards_misuse() {
     let reopened = Store::open(&ok_dir, StoreOptions::default()).unwrap();
     assert_eq!(reopened.dataset_id(), new_id);
     let anns = sparkles_core::annotations::read(&ok_dir).unwrap();
-    assert_eq!(anns.len(), 8);
+    assert_eq!(anns.len(), 180);
+    assert!(
+        std::fs::metadata(ok_dir.join(sparkles_core::annotations::FILE))
+            .unwrap()
+            .len()
+            > 150_000,
+        "annotations.bin must span multiple 64 KiB chunks"
+    );
+}
+
+#[test]
+fn reidentify_configuration_history_refuses_branch_table_and_preserves_bytes() {
+    fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn walk(
+            base: &Path,
+            dir: &Path,
+            out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let rel = path.strip_prefix(base).unwrap().to_path_buf();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(base, &path, out);
+                } else {
+                    out.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Case 1: single-generation activated main store with an existing branch.
+    let branched_root = tmp.path().join("branched");
+    let src_id;
+    let src_seq;
+    {
+        let s = activated_store(&branched_root);
+        s.create_branch("feature", &Default::default()).unwrap();
+        src_id = s.dataset_id();
+        src_seq = s.head_commit().seq;
+    }
+    let before = snapshot_tree(&branched_root);
+    let err = sparkles_core::commit::reidentify_configuration_history(
+        &branched_root,
+        uuid::Uuid::new_v4(),
+        sparkles_core::commit::ForkedFrom {
+            id: src_id,
+            seq: src_seq,
+        },
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, sparkles_core::Error::Invalid(_)),
+        "expected Error::Invalid refusing branch state, got {err:?}"
+    );
+    assert_eq!(
+        snapshot_tree(&branched_root),
+        before,
+        "refusal must preserve every byte on disk"
+    );
+    let reopened = Store::open(&branched_root, StoreOptions::default()).unwrap();
+    assert_eq!(reopened.dataset_id(), src_id);
+    assert!(reopened.branch("feature").is_ok());
+    drop(reopened);
+
+    // Case 2: single-generation activated store with only an ordinal-reservation branches.json.
+    let ordinal_root = tmp.path().join("ordinal-only");
+    let ord_id;
+    let ord_seq;
+    {
+        let s = activated_store(&ordinal_root);
+        ord_id = s.dataset_id();
+        ord_seq = s.head_commit().seq;
+    }
+    sparkles_core::commit::reserve_branch_ordinals(&ordinal_root, ord_id, 5).unwrap();
+    let before_ord = snapshot_tree(&ordinal_root);
+    assert!(
+        sparkles_core::commit::reidentify_configuration_history(
+            &ordinal_root,
+            uuid::Uuid::new_v4(),
+            sparkles_core::commit::ForkedFrom {
+                id: ord_id,
+                seq: ord_seq,
+            },
+            &Control::none(),
+        )
+        .is_err(),
+        "reidentify_configuration_history must refuse branches.json ordinal table"
+    );
+    assert_eq!(snapshot_tree(&ordinal_root), before_ord);
+    assert_eq!(
+        Store::open(&ordinal_root, StoreOptions::default())
+            .unwrap()
+            .dataset_id(),
+        ord_id
+    );
+}
+
+#[test]
+fn transitive_memory_clone_preserves_ancestor_provenance_dag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a_root = tmp.path().join("a");
+    let a = activated_store(&a_root);
+    let a_id = a.dataset_id();
+    let a_cur = std::fs::read_to_string(a_root.join("CURRENT"))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // A (disk) -> B (in-memory clone) -> C (disk clone)
+    let (b, _) = a
+        .clone_to_memory(&Default::default(), StoreOptions::default())
+        .unwrap();
+    let b_id = b.dataset_id();
+    let c_root = tmp.path().join("c");
+    b.clone_to(&c_root, &Default::default()).unwrap();
+
+    sparkles_core::check::imported_configuration_history(&c_root, &Control::none()).unwrap();
+    let c = Store::open(&c_root, StoreOptions::default()).unwrap();
+    assert_eq!(c.snapshot().len(), a.snapshot().len());
+
+    // Inspect C's evidence-history/imports/: both B and A must be present, with A's
+    // original familyId and generation preserved.
+    let mut found_families = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(c_root.join("evidence-history/imports")).unwrap() {
+        let entry = entry.unwrap();
+        let desc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.path().join("origin.json")).unwrap())
+                .unwrap();
+        let fid = desc["familyId"].as_str().unwrap().to_string();
+        let gen_name = desc["roots"]["main"]["generation"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        found_families.insert(fid, gen_name);
+    }
+    assert_eq!(
+        found_families.get(&a_id.to_string()).map(String::as_str),
+        Some(a_cur.as_str()),
+        "ancestor A must survive in C's imports: {found_families:?}"
+    );
+    assert!(
+        found_families.contains_key(&b_id.to_string()),
+        "intermediate memory clone B must survive in C's imports: {found_families:?}"
+    );
+
+    // 3-hop chain: A (disk) -> B (memory) -> B2 (memory) -> C2 (disk)
+    let (b2, _) = b
+        .clone_to_memory(&Default::default(), StoreOptions::default())
+        .unwrap();
+    let b2_id = b2.dataset_id();
+    let c2_root = tmp.path().join("c2");
+    b2.clone_to(&c2_root, &Default::default()).unwrap();
+    sparkles_core::check::imported_configuration_history(&c2_root, &Control::none()).unwrap();
+    let mut found_3 = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(c2_root.join("evidence-history/imports")).unwrap() {
+        let entry = entry.unwrap();
+        let desc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.path().join("origin.json")).unwrap())
+                .unwrap();
+        found_3.insert(desc["familyId"].as_str().unwrap().to_string());
+    }
+    assert!(found_3.contains(&a_id.to_string()));
+    assert!(found_3.contains(&b_id.to_string()));
+    assert!(found_3.contains(&b2_id.to_string()));
+}
+
+#[cfg(unix)]
+#[test]
+fn reidentify_configuration_history_refuses_symlinked_origin_preflight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = activated_store(&src_root);
+    let src_id = src.dataset_id();
+    let src_seq = src.head_commit().seq;
+    let cap = src.backup_capture("b-sym-preflight").unwrap();
+    drop(src);
+
+    let sym_dir = tmp.path().join("sym-origin");
+    cap.write_to(&sym_dir).unwrap();
+    let decoy = tmp.path().join("decoy-origin.json");
+    std::fs::write(&decoy, b"{\"format\":99}").unwrap();
+    std::os::unix::fs::symlink(&decoy, sym_dir.join("evidence-history/origin.json")).unwrap();
+    let err = sparkles_core::commit::reidentify_configuration_history(
+        &sym_dir,
+        uuid::Uuid::new_v4(),
+        sparkles_core::commit::ForkedFrom {
+            id: src_id,
+            seq: src_seq,
+        },
+        &Control::none(),
+    )
+    .unwrap_err();
+    // Must fail via anchored O_NOFOLLOW (not Error::Unsupported from unanchored format probe).
+    assert!(
+        !matches!(err, sparkles_core::Error::Unsupported(_)),
+        "anchored preflight must refuse symlinked origin before decoding format, got {err:?}"
+    );
 }

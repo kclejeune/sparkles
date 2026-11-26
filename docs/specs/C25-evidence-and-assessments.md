@@ -488,21 +488,6 @@ cancellation controls cover this preparation contract.
 The same module decodes complete versioned evidence settings and produces canonical
 bytes, values and digests. Source and proposal roles select unordered graph sets and
 may share a graph. The union is bounded to 1024 IRIs, each at most 4096 UTF-8 bytes.
-
-Clones and new-identity backup restores of datasets with activated configuration
-history now publish a fresh destination configuration-history lineage and a format 2
-`evidence-history/origin.json` closure under dataset reader 10, while backup manifests
-carrying imported provenance declare `evidence-configuration-history/2`. Persistent
-clones across auto, link, copy, rebuild, past-state, graph-subset and branch modes pin
-their sequence-zero root with `creationCommit`, carry source provenance under
-`evidence-history/imports/<digest>/`, pause copied view definitions with reason
-`cloned` and start with an empty control keyspace. In-memory clones establish an
-independent in-memory lineage with retained origin provenance so materialized backups
-and restores remain valid from sequence zero onward. New-identity restores verify
-copied closures before publication, preserve paused definitions and durable job
-recovery across WAL header upgrades, authenticate disjoint imported WAL intervals
-without duplicating logs across repeated identity changes, and keep retained cold
-history and branch reads consistent with destination cutoffs.
 Raw JSON strings are bounded before decoding can allocate escaped-string scratch.
 Canonical settings are data for the managed configuration factory, not an authenticated
 revision, graph reservation or administration capability.
@@ -2367,6 +2352,21 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+Clones and new-identity backup restores of datasets with activated configuration
+history now publish a fresh destination configuration-history lineage and a format 2
+`evidence-history/origin.json` closure under dataset reader 10, while backup manifests
+carrying imported provenance declare `evidence-configuration-history/2`. Persistent
+clones across auto, link, copy, rebuild, past-state, graph-subset and branch modes pin
+their sequence-zero root with `creationCommit`, carry source provenance under
+`evidence-history/imports/<digest>/`, pause copied view definitions with reason
+`cloned` and start with an empty control keyspace. In-memory clones establish an
+independent in-memory lineage with retained origin provenance so materialized backups
+and restores remain valid from sequence zero onward. New-identity restores verify
+copied closures before publication, preserve paused definitions and durable job
+recovery across WAL header upgrades, authenticate disjoint imported WAL intervals
+without duplicating logs across repeated identity changes, and keep retained cold
+history and branch reads consistent with destination cutoffs.
 
 ### Scope changes
 

@@ -9,7 +9,7 @@ use std::io::{Seek, SeekFrom};
 
 // Each history entry needs more than 256 bytes in the existing 16 MiB backup
 // manifest. Refuse a closure that cannot fit it before retaining more handles.
-const MAX_FILES: usize = (16 << 20) / 256;
+pub(in crate::store) const MAX_FILES: usize = (16 << 20) / 256;
 
 fn controlled_preparation(control: &WriteOptions) -> Result<Preparation> {
     administrative_preparation_with(crate::task::Control {

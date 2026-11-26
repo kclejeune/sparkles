@@ -770,20 +770,20 @@ impl Store {
             push_src(
                 &mut source_files,
                 "family-dataset.json".into(),
-                super::managed_history::Bytes::from_vec(
-                    locked.identities.family_document().to_vec(),
+                super::managed_history::Bytes::copy_from_slice(
+                    locked.identities.family_document(),
                     &prep,
                 )?,
             )?;
             let ds_bytes = match locked.local_dataset {
                 Some(b) => b,
                 None if locked.identities.family() == locked.identities.logical() => {
-                    super::managed_history::Bytes::from_vec(
-                        locked.identities.family_document().to_vec(),
+                    super::managed_history::Bytes::copy_from_slice(
+                        locked.identities.family_document(),
                         &prep,
                     )?
                 }
-                None => super::managed_history::Bytes::from_vec(
+                None => super::managed_history::Bytes::from_serialized(2048, &prep, || {
                     commit::with_reader(
                         &commit::dataset_file_bytes(
                             locked.identities.logical(),
@@ -791,24 +791,23 @@ impl Store {
                             self.now_ms(),
                         ),
                         super::managed_history::READER,
-                    )?,
-                    &prep,
-                )?,
+                    )
+                })?,
             };
             push_src(&mut source_files, "dataset.json".into(), ds_bytes)?;
             let cur_bytes = match locked.local_current {
                 Some(b) => b,
-                None => super::managed_history::Bytes::from_vec(
-                    format!("{}\n", locked.src_generation).into_bytes(),
-                    &prep,
-                )?,
+                None => {
+                    let text = format!("{}\n", locked.src_generation);
+                    super::managed_history::Bytes::copy_from_slice(text.as_bytes(), &prep)?
+                }
             };
             push_src(&mut source_files, "CURRENT".into(), cur_bytes)?;
             if let Some(branch_bytes) = locked.identities.branch_document() {
                 push_src(
                     &mut source_files,
                     "branch.json".into(),
-                    super::managed_history::Bytes::from_vec(branch_bytes.to_vec(), &prep)?,
+                    super::managed_history::Bytes::copy_from_slice(branch_bytes, &prep)?,
                 )?;
             }
             if let Some(cj) = locked.local_commit {
@@ -869,7 +868,11 @@ impl Store {
                         origin_bytes,
                     )?;
                 }
-                super::configuration_history::read_prior_imports_for_clone(&family_root, &prep)?
+                super::configuration_history::read_prior_imports_for_clone(
+                    &family_root,
+                    &self.family,
+                    &prep,
+                )?
             } else {
                 let memory = installed.history_memory.as_ref().ok_or_else(|| {
                     super::managed_history::unavailable("in-memory configuration history missing")
@@ -877,13 +880,17 @@ impl Store {
                 push_src(
                     &mut source_files,
                     crate::managed::FILE.into(),
-                    super::managed_history::Bytes::from_vec(installed.file_bytes(), &prep)?,
+                    super::managed_history::Bytes::from_serialized(
+                        super::managed_history::MAX_BYTES as u64,
+                        &prep,
+                        || Ok(installed.file_bytes()),
+                    )?,
                 )?;
                 for (owner, bytes) in &installed.settings {
                     push_src(
                         &mut source_files,
                         owner.settings_file().into(),
-                        super::managed_history::Bytes::from_vec(bytes.to_vec(), &prep)?,
+                        super::managed_history::Bytes::copy_from_slice(bytes, &prep)?,
                     )?;
                 }
                 let lineage = memory.coverage.value.lineage_id;
@@ -898,24 +905,34 @@ impl Store {
                     prep.check()?;
                     let hex = cur.prepared.identity.generation.to_string();
                     let hex = hex.strip_prefix("sha256:").expect("canonical digest");
-                    let held =
-                        prep.reserve((cur.prepared.bytes.value.len() as u64).saturating_add(64))?;
-                    let mut copied = Vec::new();
-                    copied
-                        .try_reserve_exact(cur.prepared.bytes.value.len())
-                        .map_err(|_| prep.exhausted())?;
-                    copied.extend_from_slice(&cur.prepared.bytes.value);
                     push_src(
                         &mut source_files,
                         format!("evidence-history/{lineage}/generations/{hex}.json"),
-                        super::managed_history::Bytes {
-                            value: copied,
-                            _held: held,
-                        },
+                        super::managed_history::Bytes::copy_from_slice(
+                            &cur.prepared.bytes.value,
+                            &prep,
+                        )?,
                     )?;
                     node = cur.previous.as_deref();
                 }
-                (Vec::new(), Vec::new())
+                if let Some(mem_origin) = memory.origin.as_deref() {
+                    let (origin_bytes, prior_imports, prior_direct) =
+                        super::configuration_history::materialize_memory_origin_imports(
+                            self.owner_dataset_id(),
+                            installed,
+                            memory,
+                            mem_origin,
+                            &prep,
+                        )?;
+                    push_src(
+                        &mut source_files,
+                        "evidence-history/origin.json".into(),
+                        origin_bytes,
+                    )?;
+                    (prior_imports, prior_direct)
+                } else {
+                    (Vec::new(), Vec::new())
+                }
             };
             Some(ActivatedCapture {
                 prep,

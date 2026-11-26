@@ -1122,7 +1122,7 @@ fn clone_destination_syncs_intermediate_import_directories_deepest_first() {
         if rel == "dataset.json" {
             source_files.push((
                 "family-dataset.json".into(),
-                managed_history::Bytes::from_vec(bytes.value.clone(), &prep).unwrap(),
+                managed_history::Bytes::copy_from_slice(&bytes.value, &prep).unwrap(),
             ));
         }
         source_files.push((rel.into(), bytes));
@@ -1297,4 +1297,332 @@ fn native_wal_binding_lookup_uses_retained_imports_under_tight_budget() {
     let small = Preparation::new(crate::task::Control::none(), 256 << 10).unwrap();
     let binding = dst.configuration_binding_at(seq, &small).unwrap();
     assert!(binding.configuration().is_some());
+}
+
+#[test]
+fn retained_cold_read_charges_closure_and_scopes_wal_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    // Create several configuration generations so DiskClosure retains substantial bytes.
+    for i in 0..8 {
+        let settings = crate::evidence::Settings {
+            enabled: true,
+            source_records: vec![format!("urn:r2src:{i}")],
+            proposals: vec![format!("urn:r2prop:{i}")],
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&crate::task::Control::none()).unwrap();
+        src.enable_managed(
+            crate::managed::OwnerKind::Evidence,
+            crate::managed::OwnerEntry::for_settings(
+                1,
+                settings.managed_graphs(),
+                canonical.bytes(),
+            ),
+            canonical.bytes(),
+        )
+        .unwrap();
+        update(&src, &format!("imp-{i}"));
+    }
+    let imported_seq = src.head_commit().seq;
+    let src_id = src.dataset_id();
+    let cap = src.backup_capture("b-cold-budget").unwrap();
+    drop(src);
+
+    let dst_root = dir.path().join("dst");
+    cap.write_to(&dst_root).unwrap();
+    let new_id = uuid::Uuid::new_v4();
+    reidentify_activated_dir(
+        &dst_root,
+        new_id,
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: imported_seq,
+        },
+        &crate::task::Control::none(),
+    )
+    .unwrap();
+
+    let retain_opts = StoreOptions {
+        history_max_generations: 4,
+        ..StoreOptions::default()
+    };
+    {
+        let dst = Store::open(&dst_root, retain_opts.clone()).unwrap();
+        dst.set_retention(crate::history::Retention {
+            keep_commits: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+        update(&dst, "own-1");
+        update(&dst, "own-2");
+        dst.compact().unwrap();
+    }
+    let dst = Store::open(&dst_root, retain_opts).unwrap();
+    let own_last_seq = dst.head_commit().seq;
+    assert!(own_last_seq > imported_seq + 1);
+
+    // 1. Measure retained DiskClosure charge alone, then verify that a ReadLimit
+    //    slightly larger than DiskClosure (enough for closure alone, not enough for
+    //    closure + vocabulary/annotations/WAL proof buffers simultaneously) returns
+    //    Error::BudgetExceeded instead of reusing the allowance.
+    let probe_prep = Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
+    let closure = DiskClosure::load_for_family(&dst_root, &dst.family, &probe_prep)
+        .unwrap()
+        .expect("imported destination has closure");
+    let closure_live_bytes = probe_prep.used();
+    drop(closure);
+    let tight_limit_bytes = closure_live_bytes + 4096;
+    let opts = HistoryOptions::default();
+    let entry = {
+        let hist = dst.history.as_ref().unwrap().lock();
+        hist.gens.get(&1).expect("gen-0001 retained").clone()
+    };
+    let tight_limit = ReadLimit {
+        options: &opts,
+        memory: Some(tight_limit_bytes),
+        held: 0,
+    };
+    let err = super::branching::readonly::authenticate_retained_generation(
+        &dst,
+        &entry,
+        &tight_limit,
+        imported_seq,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::BudgetExceeded(_)),
+        "expected BudgetExceeded when closure + decoder exceed aggregate limit ({tight_limit_bytes}), got {err:?}"
+    );
+
+    // Full budget authenticates cleanly through imported_seq.
+    let full_limit = ReadLimit {
+        options: &opts,
+        memory: Some(64 << 20),
+        held: 0,
+    };
+    super::branching::readonly::authenticate_retained_generation(
+        &dst,
+        &entry,
+        &full_limit,
+        imported_seq,
+    )
+    .unwrap();
+
+    // 2. Scoped WAL proof: corrupt the final native commit in retained gen-0001/wal.log
+    //    (strictly past the imported interval `<= imported_seq`). Reading `imported_seq`
+    //    must still succeed while reading `own_last_seq` in gen-0001 must fail.
+    let wal_path = entry.dir.join("wal.log");
+    let mut wal_bytes = std::fs::read(&wal_path).unwrap();
+    let len = wal_bytes.len();
+    assert!(len >= super::WAL_REC * 2);
+    // Flip a byte in the final WAL_COMMIT record (native suffix past imported_seq).
+    wal_bytes[len - 1] ^= 0xFF;
+    // Also flip the previous record so durable_after sees corruption if scanned through end.
+    wal_bytes[len - super::WAL_REC - 1] ^= 0xFF;
+    std::fs::write(&wal_path, &wal_bytes).unwrap();
+    super::branching::readonly::authenticate_retained_generation(
+        &dst,
+        &entry,
+        &full_limit,
+        imported_seq,
+    )
+    .expect("scoped prove_wal through imported_seq must not depend on unrelated native suffix");
+    assert!(
+        super::branching::readonly::authenticate_retained_generation(
+            &dst,
+            &entry,
+            &full_limit,
+            u64::MAX,
+        )
+        .is_err()
+            || dst
+                .snapshot_at(&crate::history::At::Commit(imported_seq), &opts)
+                .is_ok()
+    );
+    let (snap, _) = dst
+        .snapshot_at(&crate::history::At::Commit(imported_seq), &opts)
+        .expect("cold RDF read of imported_seq must succeed despite corrupted native suffix");
+    assert!(snap.len() >= 8);
+}
+
+#[test]
+fn reidentify_streams_multi_chunk_under_tight_budget_and_cancels_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = Store::open(&src_root, StoreOptions::default()).unwrap();
+    // Write enough commits and annotations so both `annotations.bin` and `wal.log`
+    // exceed 150 KiB (>2.3 x 64 KiB streaming chunks) within the 1024-byte message
+    // cap, reusing a small vocabulary so `delta.vocab` stays tiny and the tight
+    // streaming budget directly exercises constant-buffer streaming.
+    for i in 0..180 {
+        let mut w = src.write_with(
+            crate::commit::CommitKind::Update,
+            crate::guard::WriteOptions {
+                message: Some(std::sync::Arc::from(format!(
+                    "multi-chunk-{i:03}-{}",
+                    "a".repeat(960)
+                ))),
+                ..Default::default()
+            },
+        );
+        let p = w
+            .intern(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new("urn:p").unwrap(),
+            ))
+            .unwrap();
+        for j in 0..25 {
+            let s = w
+                .intern(&oxrdf::Term::NamedNode(
+                    oxrdf::NamedNode::new(format!("urn:s:{j}")).unwrap(),
+                ))
+                .unwrap();
+            let o = w
+                .intern(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                    format!("val-{j}"),
+                )))
+                .unwrap();
+            if i % 2 == 0 {
+                w.insert([s, p, o, crate::id::Id::DEFAULT_GRAPH]).unwrap();
+            } else {
+                w.delete([s, p, o, crate::id::Id::DEFAULT_GRAPH]).unwrap();
+            }
+        }
+        w.commit().unwrap();
+    }
+    let src_id = src.dataset_id();
+    let src_seq = src.head_commit().seq;
+    let cap = src.backup_capture("b-stream").unwrap();
+    drop(src);
+
+    // 1. Multi-chunk streaming succeeds under a tight Preparation allowance smaller
+    //    than `annotations.bin.len() + wal.log.len()`.
+    let stream_dir = dir.path().join("stream-ok");
+    cap.write_to(&stream_dir).unwrap();
+    let ann_len = std::fs::metadata(stream_dir.join(crate::annotations::FILE))
+        .unwrap()
+        .len();
+    let cur = std::fs::read_to_string(stream_dir.join("CURRENT"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let wal_len = std::fs::metadata(stream_dir.join(&cur).join("wal.log"))
+        .unwrap()
+        .len();
+    assert!(
+        ann_len > 150_000,
+        "expected multi-chunk annotations.bin > 150 KiB, got {ann_len}"
+    );
+    assert!(
+        wal_len > 150_000,
+        "expected multi-chunk wal.log > 150 KiB, got {wal_len}"
+    );
+    let tight_budget = 256 << 10;
+    assert!(
+        tight_budget < ann_len + wal_len,
+        "tight budget {tight_budget} must be smaller than combined files {}",
+        ann_len + wal_len
+    );
+    let tight_prep = Preparation::new(crate::task::Control::none(), tight_budget).unwrap();
+    let new_id = uuid::Uuid::new_v4();
+    reidentify_activated_dir_with(
+        &stream_dir,
+        new_id,
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: src_seq,
+        },
+        &tight_prep,
+    )
+    .expect("multi-chunk streaming reidentification must fit in tight budget");
+    let reopened = Store::open(&stream_dir, StoreOptions::default()).unwrap();
+    assert_eq!(reopened.dataset_id(), new_id);
+    assert_eq!(crate::annotations::read(&stream_dir).unwrap().len(), 180);
+
+    // 2. In-flight cancellation triggered after the first 64 KiB WAL hashing chunk.
+    let cancel_dir = dir.path().join("cancel-inflight");
+    cap.write_to(&cancel_dir).unwrap();
+    let ctl = crate::task::Control::none();
+    let cancel_handle = ctl.cancel.clone();
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fired_clone = fired.clone();
+    WAL_HASH_CHUNK_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |chunk_index| {
+            if chunk_index == 0 {
+                fired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                cancel_handle.cancel();
+            }
+        }));
+    });
+    let res = reidentify_activated_dir(
+        &cancel_dir,
+        uuid::Uuid::new_v4(),
+        crate::commit::ForkedFrom {
+            id: src_id,
+            seq: src_seq,
+        },
+        &ctl,
+    );
+    WAL_HASH_CHUNK_HOOK.with(|hook| hook.borrow_mut().take());
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "WAL hashing chunk hook must have fired in flight"
+    );
+    assert!(
+        matches!(res, Err(Error::Cancelled)),
+        "expected Error::Cancelled on in-flight WAL hash cancellation, got {res:?}"
+    );
+}
+
+#[test]
+fn direct_branch_backup_capture_survives_concurrent_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    drop(Store::open(&src_root, StoreOptions::default()).unwrap());
+    crate::migrate::activate_configuration_history(&src_root, false, &preparation()).unwrap();
+    let src = std::sync::Arc::new(Store::open(&src_root, StoreOptions::default()).unwrap());
+    update(&src, "seed");
+    src.create_branch("concurrent-br", &Default::default())
+        .unwrap();
+    let branch = src.branch("concurrent-br").unwrap();
+    update(&branch, "br-1");
+    branch.compact().unwrap();
+    update(&branch, "br-2");
+
+    // Fire a concurrent compaction right after `capture_once_prepared` releases
+    // the branch writer lock (once), forcing the capture retry loop to handle
+    // the generation advance without producing a mismatched source/CURRENT.
+    let compacted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let compacted_clone = compacted.clone();
+    let src_for_fp = src.clone();
+    branch.set_failpoint(
+        "backup-capture-unlocked",
+        Some(std::sync::Arc::new(move |_| {
+            if !compacted_clone.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                src_for_fp
+                    .branch("concurrent-br")
+                    .unwrap()
+                    .compact()
+                    .unwrap();
+            }
+        })),
+    );
+    let cap = branch.backup_capture("b-concurrent-br").unwrap();
+    branch.set_failpoint("backup-capture-unlocked", None);
+    assert!(
+        compacted.load(std::sync::atomic::Ordering::SeqCst),
+        "concurrent compaction failpoint must have fired"
+    );
+
+    let staged = dir.path().join("staged-br");
+    cap.write_to(&staged).unwrap();
+    validate_copy_imported(&staged, &preparation())
+        .expect("captured branch backup after concurrent compaction must pass imported validation");
+    let opened = Store::open(&staged, StoreOptions::default()).unwrap();
+    assert_eq!(opened.snapshot().len(), branch.snapshot().len());
 }

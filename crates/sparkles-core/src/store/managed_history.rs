@@ -185,8 +185,33 @@ pub(crate) struct Bytes {
 }
 
 impl Bytes {
-    pub(crate) fn from_vec(value: Vec<u8>, preparation: &Preparation) -> Result<Self> {
-        let held = preparation.reserve((value.capacity() as u64).saturating_add(64))?;
+    /// Reserve storage in `preparation` before copying `slice` into a new `Vec<u8>`.
+    pub(crate) fn copy_from_slice(slice: &[u8], preparation: &Preparation) -> Result<Self> {
+        let reserve = (slice.len() as u64).saturating_add(64);
+        let held = preparation.reserve(reserve)?;
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(slice.len())
+            .map_err(|_| preparation.exhausted())?;
+        value.extend_from_slice(slice);
+        Ok(Self { value, _held: held })
+    }
+
+    /// Reserve an upfront upper bound in `preparation` before calling `build`, then
+    /// reconcile the reservation to the serialized vector's actual capacity.
+    pub(crate) fn from_serialized(
+        estimate: u64,
+        preparation: &Preparation,
+        build: impl FnOnce() -> Result<Vec<u8>>,
+    ) -> Result<Self> {
+        let mut held = preparation.reserve(estimate.saturating_add(64))?;
+        let value = build()?;
+        let actual = (value.capacity() as u64).saturating_add(64);
+        if actual > held.bytes() {
+            held.grow_to(actual)?;
+        } else {
+            held.release_to(actual);
+        }
         Ok(Self { value, _held: held })
     }
 

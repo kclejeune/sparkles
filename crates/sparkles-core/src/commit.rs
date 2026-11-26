@@ -804,11 +804,12 @@ pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> R
     crate::store::sync_dir(root)
 }
 
-/// Reidentify a closed, already-validated database directory whose configuration
-/// history is activated: preserve the source's provenance under
-/// `evidence-history/imports/`, establish a new destination configuration-history
-/// root and format 2 `evidence-history/origin.json`, and rewrite its primary
-/// identity files under `new_id`.
+/// Reidentify a closed, already-validated, single-generation standalone restored
+/// database directory whose configuration history is activated: preserve the
+/// source's provenance under `evidence-history/imports/`, establish a new
+/// destination configuration-history root and format 2
+/// `evidence-history/origin.json`, and rewrite its primary identity files under
+/// `new_id`. Refuses directories with extra generations or branch-table state.
 pub fn reidentify_configuration_history(
     root: &Path,
     new_id: uuid::Uuid,

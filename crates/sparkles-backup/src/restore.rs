@@ -259,25 +259,22 @@ impl Repository {
                 // Refuse a newer dataset before reidentification or publication,
                 // including restores that request no integrity check.
                 sparkles_core::commit::check_dataset_compatibility(&dir)?;
-                if configuration_v2 && !dir.join("evidence-history/origin.json").is_file() {
-                    return Err(BackupError::new(
-                        Code::InvalidBackup,
-                        "evidence-configuration-history/2 backup is missing evidence-history/origin.json",
-                    )
-                    .into());
+                if configuration_v2 {
+                    sparkles_core::check::imported_configuration_history(&dir, &control)?;
+                } else {
+                    sparkles_core::check::configuration_history(
+                        &dir,
+                        configuration_required,
+                        &control,
+                    )?;
                 }
-                sparkles_core::check::configuration_history(
-                    &dir,
-                    configuration_required,
-                    &control,
-                )?;
                 sparkles_core::control::check_restored(&dir, control_required, source, captured)?;
                 if let Some(from) = forked_from {
                     if configuration_required {
                         sparkles_core::commit::reidentify_configuration_history(
                             &dir, dataset_id, from, &control,
                         )?;
-                        sparkles_core::check::configuration_history(&dir, true, &control)?;
+                        sparkles_core::check::imported_configuration_history(&dir, &control)?;
                     } else {
                         sparkles_core::commit::reidentify(&dir, dataset_id, from)?;
                     }

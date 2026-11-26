@@ -343,6 +343,14 @@ pub fn configuration_history(
     crate::store::configuration_history::validate_copy(root, required, &preparation)
 }
 
+/// Like [`configuration_history`], additionally requiring an authenticated
+/// format 2 imported origin closure (`evidence-configuration-history/2`).
+pub fn imported_configuration_history(root: &Path, control: &crate::task::Control) -> Result<()> {
+    let preparation =
+        crate::store::managed_history::administrative_preparation_with(control.clone())?;
+    crate::store::configuration_history::validate_copy_imported(root, &preparation)
+}
+
 /// Check the database at `root` without modifying it. Fails only when `root` is not a
 /// readable directory; everything else is reported in the [`CheckReport`].
 pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {

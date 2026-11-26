@@ -23,8 +23,14 @@ fn inspection_point(_point: &str) {
     });
 }
 
-pub(super) fn validate(root: &Path, required: bool, preparation: &Preparation) -> Result<()> {
+pub(super) fn validate(
+    root: &Path,
+    required: bool,
+    require_imported: bool,
+    preparation: &Preparation,
+) -> Result<()> {
     preparation.check()?;
+    let required = required || require_imported;
     let published = match primary::recorded_root(root, preparation) {
         Ok(history) => history,
         Err(error) if required => return Err(error),
@@ -50,6 +56,11 @@ pub(super) fn validate(root: &Path, required: bool, preparation: &Preparation) -
         ));
     }
     let imported = imported::reidentify::DiskClosure::load(root, preparation)?;
+    if require_imported && imported.is_none() {
+        return Err(managed_history::unavailable(
+            "evidence-configuration-history/2 requires a format 2 origin closure",
+        ));
+    }
     if imported.is_some() && published.is_none() {
         return Err(managed_history::unavailable(
             "imported configuration origin has no published managed registry root",
@@ -364,10 +375,11 @@ fn inspect_generation(
         let log = match budget.buffered(&path) {
             Ok(loaded) => {
                 let mut reader = loaded.value;
+                let charge = loaded.charge;
                 let extent = reader.get_ref().metadata()?.len();
                 inspection_point("extent");
                 let extent = wal::probe::committed_bound(&mut reader, extent, budget)?;
-                Some((reader, extent))
+                Some((reader, extent, charge))
             }
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
@@ -383,7 +395,7 @@ fn inspect_generation(
             },
             Some(branch) => crate::annotations::seqs_controlled(root, branch, budget)?,
         };
-        let Some((mut reader, extent)) = log else {
+        let Some((mut reader, extent, reader_charge)) = log else {
             if use_imported && imported.is_some_and(|closure| closure.has_ranges(gen_name)) {
                 return Err(managed_history::unavailable(
                     "imported WAL is missing its declared source intervals",
@@ -405,8 +417,9 @@ fn inspect_generation(
             && let (Some(closure), Some(native)) = (imported, primary.as_mut())
             && closure.has_ranges(gen_name)
         {
-            let temporary = metadata_preparation(budget)?;
             let file = reader.into_inner();
+            budget.release(reader_charge);
+            let temporary = metadata_preparation(budget)?;
             closure.prove_wal(
                 family_root,
                 directory,
@@ -414,6 +427,7 @@ fn inspect_generation(
                 file,
                 extent,
                 base,
+                u64::MAX,
                 terms,
                 annotations.value.as_deref(),
                 &path,

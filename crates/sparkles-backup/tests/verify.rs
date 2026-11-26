@@ -1087,29 +1087,56 @@ async fn new_identity_restore_retained_imported_wal_allows_cold_rdf_reads_after_
         history_max_generations: 4,
         ..StoreOptions::default()
     };
-    let dst = Store::open(&dst_root, retain_opts).unwrap();
-    dst.set_retention(sparkles_core::history::Retention {
-        keep_commits: Some(100),
-        ..Default::default()
-    })
-    .unwrap();
-    upd(&dst, "INSERT DATA { <urn:dst-own> <urn:p> 42 }");
-    dst.compact().unwrap();
-    assert_ne!(
-        std::fs::read_to_string(dst_root.join("CURRENT"))
-            .unwrap()
-            .trim(),
-        "gen-0001"
-    );
+    {
+        let dst = Store::open(&dst_root, retain_opts.clone()).unwrap();
+        dst.set_retention(sparkles_core::history::Retention {
+            keep_commits: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+        upd(&dst, "INSERT DATA { <urn:dst-own> <urn:p> 42 }");
+        dst.compact().unwrap();
+        assert_ne!(
+            std::fs::read_to_string(dst_root.join("CURRENT"))
+                .unwrap()
+                .trim(),
+            "gen-0001"
+        );
+    }
 
-    // Cold historical RDF read of the retained imported revision must succeed.
+    // Close and reopen after compaction so `imported_opening` only replayed `gen-0002`
+    // while `gen-0001` remains a retained generation with imported WAL intervals.
+    let dst = Store::open(&dst_root, retain_opts).unwrap();
+
+    // Cold historical RDF read of the retained imported revision must succeed after reopen.
     let (snap, _) = dst
         .snapshot_at(
             &sparkles_core::history::At::Commit(imported_seq),
             &Default::default(),
         )
-        .expect("cold RDF snapshot of retained imported WAL must succeed");
+        .expect("cold RDF snapshot of retained imported WAL must succeed after reopen");
     assert_eq!(snap.len(), imported_quads);
+
+    // Branch creation at the retained imported WAL sequence must resolve the imported
+    // binding (not look up the source digest in the destination lineage) and succeed.
+    dst.create_branch(
+        "from-imported",
+        &sparkles_core::branch::BranchOptions {
+            at: sparkles_core::history::At::Commit(imported_seq),
+            ..Default::default()
+        },
+    )
+    .expect("branch creation at retained imported WAL commit must succeed after reopen");
+    let forked = dst.branch("from-imported").unwrap();
+    assert_eq!(forked.snapshot().len(), imported_quads);
+
+    // Pinning a named snapshot at the retained imported WAL sequence must also succeed.
+    dst.create_snapshot(
+        "pin-imported",
+        &sparkles_core::history::At::Commit(imported_seq),
+        None,
+    )
+    .expect("named snapshot at retained imported WAL commit must succeed after reopen");
 
     // Explicit native evidence view for the imported revision must still refuse.
     let prep =
@@ -1447,4 +1474,286 @@ async fn new_identity_restore_with_check_none_succeeds_and_encrypted_repo_works(
             enc_store.dataset_id()
         );
     }
+}
+
+#[tokio::test]
+async fn materialized_backup_of_compacted_persistent_branch_restores_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = configuration_store(&src_root);
+    let prep =
+        sparkles_core::access::Preparation::new(sparkles_core::task::Control::none(), 64 << 20)
+            .unwrap();
+    let (repo, _) = memory_repo().await;
+
+    src.create_branch("compacted-br", &Default::default())
+        .unwrap();
+    let branch = src.branch("compacted-br").unwrap();
+    upd(&branch, "INSERT DATA { <urn:cbr:1> <urn:p> 1 }");
+    branch.compact().unwrap();
+    upd(&branch, "INSERT DATA { <urn:cbr:2> <urn:p> 2 }");
+    let expected_quads = branch.snapshot().len();
+
+    // Materialized backup of the compacted persistent branch (`CURRENT = gen-0002`,
+    // materialized destination = `gen-0001`).
+    let mat_cap = branch
+        .materialized_backup_capture(
+            "mat-compacted-branch",
+            &sparkles_core::store::MemoryCaptureOptions {
+                tmp_dir: tmp.path().join("scratch-mat-branch"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    repo.create(mat_cap.into(), &opts("mat-compacted-branch", "ds-mcb"))
+        .await
+        .unwrap();
+
+    for (suffix, identity) in [
+        ("auto", sparkles_backup::Identity::Auto),
+        ("new", sparkles_backup::Identity::New),
+    ] {
+        let dir = tmp.path().join(format!("mat-br-{suffix}"));
+        repo.restore(
+            "mat-compacted-branch",
+            &dir,
+            &RestoreOptions {
+                identity,
+                check: sparkles_backup::CheckLevel::Full,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let reopened = Store::open(&dir, StoreOptions::default()).unwrap();
+        assert_eq!(reopened.snapshot().len(), expected_quads);
+        upd(&reopened, "INSERT DATA { <urn:cbr:after> <urn:p> 3 }");
+        assert_eq!(
+            reopened
+                .evidence_view(
+                    &sparkles_core::history::At::Commit(reopened.head_commit().seq),
+                    &prep
+                )
+                .unwrap()
+                .configuration()
+                .dataset_id(),
+            reopened.dataset_id()
+        );
+    }
+}
+
+#[tokio::test]
+async fn transitive_memory_clone_and_memory_branch_backups_preserve_origin_dag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = configuration_store(&src_root);
+    let src_id = src.dataset_id().to_string();
+    let (repo, _) = memory_repo().await;
+
+    // 1. Disk A -> memory clone B -> memory clone B2 -> materialized backup -> restore.
+    let (b, _) = src
+        .clone_to_memory(&Default::default(), StoreOptions::default())
+        .unwrap();
+    let b_id = b.dataset_id().to_string();
+    let (b2, _) = b
+        .clone_to_memory(&Default::default(), StoreOptions::default())
+        .unwrap();
+    let b2_cap = b2
+        .memory_backup_capture(
+            "mem-chain",
+            &sparkles_core::store::MemoryCaptureOptions {
+                tmp_dir: tmp.path().join("scratch-b2"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    repo.create(b2_cap.into(), &opts("mem-chain", "ds-mc"))
+        .await
+        .unwrap();
+    let dst_b2 = tmp.path().join("restored-b2");
+    repo.restore(
+        "mem-chain",
+        &dst_b2,
+        &RestoreOptions {
+            identity: sparkles_backup::Identity::New,
+            check: sparkles_backup::CheckLevel::Full,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut families_b2 = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(dst_b2.join("evidence-history/imports")).unwrap() {
+        let entry = entry.unwrap();
+        let desc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.path().join("origin.json")).unwrap())
+                .unwrap();
+        families_b2.insert(desc["familyId"].as_str().unwrap().to_string());
+    }
+    assert!(
+        families_b2.contains(&src_id),
+        "original disk store A must survive B -> B2 -> backup: {families_b2:?}"
+    );
+    assert!(
+        families_b2.contains(&b_id),
+        "intermediate memory clone B must survive B -> B2 -> backup: {families_b2:?}"
+    );
+
+    // 2. Disk A -> memory clone B -> in-memory branch of B -> materialized backup -> restore.
+    b.create_branch("mem-br", &Default::default()).unwrap();
+    let mbr = b.branch("mem-br").unwrap();
+    upd(&mbr, "INSERT DATA { <urn:mbr:1> <urn:p> 1 }");
+    let mbr_cap = mbr
+        .memory_backup_capture(
+            "mem-branch-chain",
+            &sparkles_core::store::MemoryCaptureOptions {
+                tmp_dir: tmp.path().join("scratch-mbr"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    repo.create(mbr_cap.into(), &opts("mem-branch-chain", "ds-mbr"))
+        .await
+        .unwrap();
+    let dst_mbr = tmp.path().join("restored-mbr");
+    repo.restore(
+        "mem-branch-chain",
+        &dst_mbr,
+        &RestoreOptions {
+            identity: sparkles_backup::Identity::New,
+            check: sparkles_backup::CheckLevel::Full,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut families_mbr = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(dst_mbr.join("evidence-history/imports")).unwrap() {
+        let entry = entry.unwrap();
+        let desc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.path().join("origin.json")).unwrap())
+                .unwrap();
+        families_mbr.insert(desc["familyId"].as_str().unwrap().to_string());
+    }
+    assert!(
+        families_mbr.contains(&src_id),
+        "original disk store A must survive B -> mem-branch -> backup: {families_mbr:?}"
+    );
+    assert!(
+        families_mbr.contains(&b_id),
+        "memory clone B must survive B -> mem-branch -> backup: {families_mbr:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_refuses_format_1_origin_under_v2_manifest_feature() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let src = configuration_store(&src_root);
+    let src_id = src.dataset_id();
+    let (repo, mem) = memory_repo().await;
+    repo.create(
+        src.backup_capture("b-native").unwrap().into(),
+        &opts("b-native", "ds"),
+    )
+    .await
+    .unwrap();
+
+    // Craft a tampered backup claiming `evidence-configuration-history/2` on a native
+    // reader-8 dataset with a metadata-only format 1 `evidence-history/origin.json`
+    // and an unauthenticated `evidence-history/imports/<hex>/origin.json` entry.
+    let mut m = repo.manifest("b-native").await.unwrap();
+    m.name = "b-fmt1-under-v2".to_string();
+    m.requires
+        .retain(|f| f != "evidence-configuration-history/1");
+    m.requires
+        .push("evidence-configuration-history/2".to_string());
+
+    let sha256_hex = |data: &[u8]| {
+        use sha2::{Digest, Sha256};
+        let d = Sha256::digest(data);
+        d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let unauth_import = b"{\"garbage\":true}".to_vec();
+    let import_hex = sha256_hex(&unauth_import);
+    let import_blob = sparkles_backup::blob::encode(&unauth_import, false);
+    mem.put(
+        &sparkles_backup::layout::blob_key(&import_blob.id),
+        PutPayload::from(import_blob.bytes.clone()),
+    )
+    .await
+    .unwrap();
+
+    let fmt1_origin = serde_json::to_vec(&serde_json::json!({
+        "format": 1,
+        "datasetId": src_id,
+        "sources": [format!("sha256:{import_hex}")],
+        "bases": [],
+        "ranges": []
+    }))
+    .unwrap();
+    let origin_blob = sparkles_backup::blob::encode(&fmt1_origin, false);
+    mem.put(
+        &sparkles_backup::layout::blob_key(&origin_blob.id),
+        PutPayload::from(origin_blob.bytes.clone()),
+    )
+    .await
+    .unwrap();
+
+    m.files.push(sparkles_backup::FileEntry {
+        path: "evidence-history/origin.json".into(),
+        kind: sparkles_core::store::FileKind::Immutable,
+        size: fmt1_origin.len() as u64,
+        sha256: sha256_hex(&fmt1_origin),
+        blobs: vec![sparkles_backup::BlobRef {
+            id: origin_blob.id,
+            size: fmt1_origin.len() as u64,
+        }],
+        definition: None,
+    });
+    m.files.push(sparkles_backup::FileEntry {
+        path: format!("evidence-history/imports/{import_hex}/origin.json"),
+        kind: sparkles_core::store::FileKind::Immutable,
+        size: unauth_import.len() as u64,
+        sha256: import_hex,
+        blobs: vec![sparkles_backup::BlobRef {
+            id: import_blob.id,
+            size: unauth_import.len() as u64,
+        }],
+        definition: None,
+    });
+    // Ensure the crafted manifest passes manifest-level grammar validation so
+    // the restore-level format-2 check is what rejects the format 1 substitution.
+    sparkles_backup::manifest::validate(
+        &m,
+        sparkles_backup::layout::PIECE_BYTES,
+        sparkles_core::formats::READABLE_INDEX_FORMATS,
+    )
+    .expect("crafted manifest must pass manifest grammar validation");
+
+    let manifest_bytes = serde_json::to_vec(&m).unwrap();
+    mem.put(
+        &Key::from("backups/b-fmt1-under-v2.json"),
+        PutPayload::from(manifest_bytes),
+    )
+    .await
+    .unwrap();
+
+    let dst_dir = tmp.path().join("fmt1-under-v2-dst");
+    let err = repo
+        .restore(
+            "b-fmt1-under-v2",
+            &dst_dir,
+            &RestoreOptions {
+                identity: sparkles_backup::Identity::Keep,
+                check: sparkles_backup::CheckLevel::None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        !dst_dir.exists(),
+        "failed restore must not publish target directory (err: {err})"
+    );
 }

@@ -653,6 +653,12 @@ impl Preparation {
         &self.inner.used
     }
 
+    /// Bytes currently reserved in the active budget.
+    pub(crate) fn used(&self) -> u64 {
+        let (counter, _) = self.active_budget();
+        counter.load(Ordering::Relaxed)
+    }
+
     /// The allowance not yet reserved. Other clones may reserve it at any moment, so
     /// this only sizes work; storage still needs a [`reserve`](Self::reserve).
     pub(crate) fn room(&self) -> u64 {

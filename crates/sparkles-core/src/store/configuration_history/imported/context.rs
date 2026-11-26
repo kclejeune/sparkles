@@ -141,6 +141,22 @@ struct Headers {
 }
 
 impl Retained {
+    /// Name of the opening generation whose imported ranges were proven at open.
+    pub(in crate::store) fn generation_name(&self) -> &str {
+        &self.generation_name
+    }
+
+    /// Return whether `origin.json` declares any imported WAL intervals for
+    /// main generation `gen_name`.
+    pub(in crate::store) fn has_ranges_for(&self, gen_name: &str) -> bool {
+        self.sources
+            .origin
+            .value
+            .ranges
+            .iter()
+            .any(|r| r.local.branch.is_none() && r.local.generation == gen_name)
+    }
+
     /// Resolve a WAL commit binding on this opening's proven generation using the
     /// already-authenticated `Sources` and `ranges` without re-hashing the closure.
     /// Verifies that `origin.json` on disk has not been replaced since opening.
@@ -161,61 +177,233 @@ impl Retained {
         if gen_name != self.generation_name {
             return Ok(None);
         }
-        for range in &self.ranges {
-            let in_span = (range.span.start <= start_offset
-                || (range.span.start == 0 && start_offset == WAL_REC as u64))
-                && end_offset <= range.span.end
-                && seq >= range.span.first_seq
-                && seq <= range.span.last_seq;
-            if !in_span {
-                // Reject any partial/straddling overlap with a proven imported span.
-                if start_offset < range.span.end && end_offset > range.span.start {
-                    return Err(managed_history::unavailable(
-                        "WAL commit boundary straddles an imported interval",
-                    ));
-                }
+        resolve_binding_in_ranges(
+            &self.sources,
+            &self.ranges,
+            start_offset,
+            end_offset,
+            seq,
+            digest,
+            preparation,
+        )
+    }
+
+    /// Prove a retained older main generation (`gen_name != self.generation_name`)
+    /// through `seq` and its required complete imported intervals using the already
+    /// authenticated `self.sources`, then resolve the WAL commit's binding.
+    /// Caller holds history exclusion so `gen_dir` stays alive during proof.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::store) fn resolve_retained_wal_binding(
+        &self,
+        family: &crate::store::family::Family,
+        gen_dir: &Path,
+        gen_name: &str,
+        actual: &crate::commit::RetainedGenerationCommit,
+        start_offset: u64,
+        end_offset: u64,
+        seq: u64,
+        digest: Option<Sha256Digest>,
+        preparation: &Preparation,
+    ) -> Result<Option<ConfigurationBinding>> {
+        preparation.check()?;
+        family.verify_origin_lock(&self.root, &self.lock)?;
+        family.check_origin_selection(opening_origin_selection(&self.root, preparation)?)?;
+        if !self.has_ranges_for(gen_name) {
+            return Ok(None);
+        }
+        let local = Location {
+            branch: None,
+            generation: gen_name.to_owned(),
+        };
+        local.validate()?;
+        let actual_meta =
+            super::reidentify::read_meta_controlled(&gen_dir.join("meta.json"), preparation)?;
+        let count = self
+            .sources
+            .origin
+            .value
+            .ranges
+            .iter()
+            .filter(|r| r.local == local)
+            .count();
+        let _storage = preparation.reserve(
+            (count as u64)
+                .checked_mul(
+                    (std::mem::size_of::<Range>() + std::mem::size_of::<physical::Span>()) as u64,
+                )
+                .and_then(|n| n.checked_add(1024))
+                .ok_or_else(|| preparation.exhausted())?,
+        )?;
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(count)
+            .map_err(|_| preparation.exhausted())?;
+        for assignment in &self.sources.origin.value.ranges {
+            preparation.check()?;
+            if assignment.local != local {
                 continue;
             }
-            let node = &self.sources.nodes[range.source];
-            return match digest {
-                Some(generation) => {
-                    let registry = documents::read_member(
-                        &node.directory,
-                        &node.descriptor.value,
-                        crate::managed::FILE,
-                        preparation,
-                    )?;
-                    let history = primary::recorded_root_bytes(&registry.value, preparation)?
-                        .ok_or_else(|| {
-                            managed_history::unavailable("imported source root is missing")
-                        })?;
-                    drop(registry);
-                    let identity = ConfigurationIdentity {
-                        dataset_id: node.descriptor.value.family_id,
-                        lineage_id: history.lineage_id,
-                        generation,
-                    };
-                    drop(documents::source_publication(
-                        &node.directory,
-                        &node.descriptor.value,
-                        identity,
-                        preparation,
-                    )?);
-                    Ok(Some(ConfigurationBinding::ImportedUnbound {
-                        source: identity,
-                    }))
-                }
-                None => {
-                    if !range.header.is_pre_cutoff(seq) {
-                        return Err(managed_history::unavailable(
-                            "covered imported commit is missing its configuration reference",
-                        ));
-                    }
-                    Ok(Some(ConfigurationBinding::LegacyUnbound))
-                }
-            };
+            let index = source_index(&self.sources, assignment.source)?;
+            let node = &self.sources.nodes[index];
+            let interval = node
+                .descriptor
+                .value
+                .intervals
+                .get(assignment.interval as usize)
+                .ok_or_else(|| {
+                    managed_history::unavailable("imported range has no declared source interval")
+                })?;
+            let original = original_base(node, &interval.root, &interval.generation, preparation)?;
+            if original.meta != actual_meta
+                || original.physical.commit != actual.commit
+                || original.physical.origin != actual.origin
+                || (actual.configuration != original.physical.configuration
+                    && actual.configuration != retag(original.physical.configuration))
+            {
+                return Err(managed_history::unavailable(
+                    "imported WAL range base differs from retained generation",
+                ));
+            }
+            let header = documents::source_header(
+                &node.directory,
+                &node.descriptor.value,
+                &interval.root,
+                preparation,
+            )?;
+            ranges.push(Range {
+                span: physical::Span {
+                    start: interval.start,
+                    end: interval.end,
+                    sha256: interval.sha256,
+                    first_seq: interval.first_seq,
+                    last_seq: interval.last_seq,
+                },
+                source: index,
+                header,
+            });
         }
-        Ok(None)
+        ranges.sort_unstable_by_key(|range| range.span.start);
+        if ranges
+            .windows(2)
+            .any(|pair| pair[0].span.end > pair[1].span.start)
+        {
+            return Err(managed_history::unavailable(
+                "ambiguous imported physical intervals",
+            ));
+        }
+        // Scope proof to `seq` and every imported interval that starts at or before `seq`.
+        let mut needed = Vec::new();
+        let mut spans = Vec::new();
+        for range in ranges {
+            if range.span.first_seq <= seq {
+                spans.push(physical::Span {
+                    start: range.span.start,
+                    end: range.span.end,
+                    sha256: range.span.sha256,
+                    first_seq: range.span.first_seq,
+                    last_seq: range.span.last_seq,
+                });
+                needed.push(range);
+            }
+        }
+        let proof_target = spans.last().map_or(seq, |s| seq.max(s.last_seq));
+        let state = family.managed.load_full();
+        let creation = self
+            .sources
+            .origin
+            .value
+            .destination
+            .as_ref()
+            .map(|dest| dest.creation_origin(actual, preparation))
+            .transpose()?
+            .flatten();
+        let mut native = primary::Header::from_state(
+            &self.root,
+            actual.dataset_id,
+            actual.dataset_id,
+            creation,
+            state.as_deref(),
+            preparation,
+        )?;
+        // Loan half of the remaining preparation room to the WAL parser's ColdBudget
+        // while keeping the other half available for source publication callbacks.
+        let allowance = preparation.room() / 2;
+        let _loan = preparation.reserve(allowance)?;
+        let options = HistoryOptions {
+            cancel: Some(preparation.control().cancel.flag()),
+            deadline: preparation.control().deadline,
+        };
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(allowance),
+            held: 0,
+        })?;
+        let vocabulary = cold::head_vocabulary_controlled(gen_dir, &self.root, &mut budget)?;
+        let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+        let annotations =
+            crate::annotations::seqs_controlled(&self.root, actual.dataset_id, &mut budget)?;
+        let wal_path = gen_dir.join("wal.log");
+        let file = std::fs::File::open(&wal_path)?;
+        let extent = file.metadata()?.len();
+        let mut config_error = None;
+        let _ = physical::prove_prefix_through(
+            file,
+            &spans,
+            extent,
+            actual.commit.seq,
+            proof_target,
+            terms,
+            annotations.value.as_deref(),
+            &wal_path,
+            &mut budget,
+            &mut |observation| {
+                if config_error.is_none() {
+                    let matched = needed.iter_mut().find(|r| {
+                        (r.span.start <= observation.start_offset
+                            || (r.span.start == 0 && observation.start_offset == WAL_REC as u64))
+                            && observation.point.offset <= r.span.end
+                    });
+                    let result = if let Some(range) = matched {
+                        let node = &self.sources.nodes[range.source];
+                        range
+                            .header
+                            .observation_using(preparation, observation, &mut |identity| {
+                                documents::source_publication(
+                                    &node.directory,
+                                    &node.descriptor.value,
+                                    identity,
+                                    preparation,
+                                )
+                                .map(|_| ())
+                            })
+                    } else {
+                        native.observation(&self.root, preparation, observation)
+                    };
+                    if let Err(error) = result {
+                        config_error = Some(error);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if let Some(error) = config_error {
+            return Err(error);
+        }
+        drop(annotations);
+        drop(vocabulary);
+        let _ = budget;
+        drop(_loan);
+        family.verify_origin_lock(&self.root, &self.lock)?;
+        family.check_origin_selection(opening_origin_selection(&self.root, preparation)?)?;
+        resolve_binding_in_ranges(
+            &self.sources,
+            &needed,
+            start_offset,
+            end_offset,
+            seq,
+            digest,
+            preparation,
+        )
     }
 
     /// Authenticate an `ImportedUnbound` identity against this opening's retained
@@ -683,6 +871,72 @@ impl Pending {
             imports: retained,
         })
     }
+}
+
+fn resolve_binding_in_ranges(
+    sources: &Sources,
+    ranges: &[Range],
+    start_offset: u64,
+    end_offset: u64,
+    seq: u64,
+    digest: Option<Sha256Digest>,
+    preparation: &Preparation,
+) -> Result<Option<ConfigurationBinding>> {
+    for range in ranges {
+        let in_span = (range.span.start <= start_offset
+            || (range.span.start == 0 && start_offset == WAL_REC as u64))
+            && end_offset <= range.span.end
+            && seq >= range.span.first_seq
+            && seq <= range.span.last_seq;
+        if !in_span {
+            // Reject any partial/straddling overlap with a proven imported span.
+            if start_offset < range.span.end && end_offset > range.span.start {
+                return Err(managed_history::unavailable(
+                    "WAL commit boundary straddles an imported interval",
+                ));
+            }
+            continue;
+        }
+        let node = &sources.nodes[range.source];
+        return match digest {
+            Some(generation) => {
+                let registry = documents::read_member(
+                    &node.directory,
+                    &node.descriptor.value,
+                    crate::managed::FILE,
+                    preparation,
+                )?;
+                let history = primary::recorded_root_bytes(&registry.value, preparation)?
+                    .ok_or_else(|| {
+                        managed_history::unavailable("imported source root is missing")
+                    })?;
+                drop(registry);
+                let identity = ConfigurationIdentity {
+                    dataset_id: node.descriptor.value.family_id,
+                    lineage_id: history.lineage_id,
+                    generation,
+                };
+                drop(documents::source_publication(
+                    &node.directory,
+                    &node.descriptor.value,
+                    identity,
+                    preparation,
+                )?);
+                Ok(Some(ConfigurationBinding::ImportedUnbound {
+                    source: identity,
+                }))
+            }
+            None => {
+                if !range.header.is_pre_cutoff(seq) {
+                    return Err(managed_history::unavailable(
+                        "covered imported commit is missing its configuration reference",
+                    ));
+                }
+                Ok(Some(ConfigurationBinding::LegacyUnbound))
+            }
+        };
+    }
+    Ok(None)
 }
 
 fn source_index(sources: &Sources, digest: Sha256Digest) -> Result<usize> {

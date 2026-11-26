@@ -15,13 +15,16 @@ mod validation;
 pub(super) use imported::Identities as OriginalIdentities;
 pub(super) use imported::context::{Pending as ImportedOpening, Retained as ImportedRetained};
 pub(crate) use imported::reidentify::reidentify_activated_dir;
-#[cfg(test)]
-pub(super) use imported::reidentify::write_clone_destination_with_sync;
 pub(super) use imported::reidentify::{
-    DiskClosure, PriorImportFiles, build_branch_standalone_provenance, capture_import_files,
-    capture_materialized_imported_origin, clone_creation_digest, read_anchored_local_file,
-    read_prior_imports_for_clone, verify_imported_identity, verify_imported_identity_for_family,
-    write_clone_destination, write_memory_clone_origin,
+    BranchProvenanceCapture, DiskClosure, PriorImportFiles, build_branch_standalone_provenance,
+    capture_import_files, capture_materialized_imported_origin, clone_creation_digest,
+    materialize_memory_origin_imports, read_anchored_local_file, read_prior_imports_for_clone,
+    verify_imported_identity, verify_imported_identity_for_family, write_clone_destination,
+    write_memory_clone_origin,
+};
+#[cfg(test)]
+pub(super) use imported::reidentify::{
+    WAL_HASH_CHUNK_HOOK, reidentify_activated_dir_with, write_clone_destination_with_sync,
 };
 pub(super) use imported::{
     MAX_MEMBERS as SOURCE_MEMBER_LIMIT, SourceFile as SourceFilePin, SourceManifest,
@@ -42,7 +45,13 @@ pub(super) fn load_disk_closure_for_family(
 /// recovering a WAL or publishing the directory. Backup restores call this even
 /// when the caller disabled optional index integrity checking.
 pub(crate) fn validate_copy(root: &Path, required: bool, preparation: &Preparation) -> Result<()> {
-    validation::validate(root, required, preparation)
+    validation::validate(root, required, false, preparation)
+}
+
+/// Like [`validate_copy`], additionally requiring an authenticated format 2
+/// imported origin closure (`evidence-configuration-history/2`).
+pub(crate) fn validate_copy_imported(root: &Path, preparation: &Preparation) -> Result<()> {
+    validation::validate(root, true, true, preparation)
 }
 
 #[cfg(test)]
@@ -330,23 +339,51 @@ impl Store {
                         let wal_offset = cursor.position().offset;
                         let wal_config = cursor.configuration();
                         let gen_name = entry.name.clone();
+                        let gen_dir = entry.dir.clone();
+                        let physical_commit = physical.value;
                         drop(cursor);
-                        drop(physical);
-                        drop(history);
+                        let _ = budget;
                         drop(_held);
                         if !self.is_branch()
                             && let Some(retained) = &self.imported_opening
-                            && let Some(imported) = retained.resolve_wal_binding(
-                                &self.family,
-                                &gen_name,
-                                wal_start,
-                                wal_offset,
-                                seq,
-                                wal_config,
-                                preparation,
-                            )?
                         {
-                            break imported;
+                            let imported = if gen_name == retained.generation_name() {
+                                drop(history);
+                                retained.resolve_wal_binding(
+                                    &self.family,
+                                    &gen_name,
+                                    wal_start,
+                                    wal_offset,
+                                    seq,
+                                    wal_config,
+                                    preparation,
+                                )?
+                            } else if retained.has_ranges_for(&gen_name) {
+                                // Keep `history` locked so `gen_dir` cannot be collected
+                                // while the retained generation's WAL prefix is proved.
+                                let resolved = retained.resolve_retained_wal_binding(
+                                    &self.family,
+                                    &gen_dir,
+                                    &gen_name,
+                                    &physical_commit,
+                                    wal_start,
+                                    wal_offset,
+                                    seq,
+                                    wal_config,
+                                    preparation,
+                                )?;
+                                drop(history);
+                                resolved
+                            } else {
+                                drop(history);
+                                retained.check_live_origin(&self.family, preparation)?;
+                                None
+                            };
+                            if let Some(imported) = imported {
+                                break imported;
+                            }
+                        } else {
+                            drop(history);
                         }
                         break match wal_config {
                             Some(generation) => {

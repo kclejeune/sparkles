@@ -312,7 +312,9 @@ pub(in crate::store) fn authenticate_retained_generation(
             &actual.value,
             &temporary,
         )?;
+        let closure_bytes = temporary.used();
         drop(temporary);
+        budget.charge(closure_bytes)?;
         if let Some(physical) = physical {
             drop(physical.value);
             budget.release(physical.charge);
@@ -325,39 +327,55 @@ pub(in crate::store) fn authenticate_retained_generation(
         let loaded = match budget.buffered(&path) {
             Ok(loaded) => loaded,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                if closure.has_ranges(&entry.name) {
+                let has_ranges = closure.has_ranges(&entry.name);
+                drop(closure);
+                budget.release(closure_bytes);
+                if has_ranges {
                     return Err(crate::store::managed_history::unavailable(
                         "imported WAL is missing its declared source intervals",
                     ));
                 }
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                drop(closure);
+                budget.release(closure_bytes);
+                return Err(error);
+            }
         };
         let mut reader = loaded.value;
+        let reader_charge = loaded.charge;
         let extent = reader.get_ref().metadata()?.len();
         if closure.has_ranges(&entry.name) {
+            let file = reader.into_inner();
+            budget.release(reader_charge);
             let temporary = budget
                 .owned_limit()?
                 .options
                 .temporary(budget.available())?;
-            let file = reader.into_inner();
-            closure.prove_wal(
+            let result = closure.prove_wal(
                 &family_root,
                 &entry.dir,
                 &entry.name,
                 file,
                 extent,
                 entry.base.seq,
+                through,
                 terms,
                 annotations.value.as_deref(),
                 &path,
                 &mut native,
                 &mut budget,
                 &temporary,
-            )?;
+            );
+            drop(temporary);
+            drop(closure);
+            budget.release(closure_bytes);
+            result?;
             return budget.check();
         }
+        drop(closure);
+        budget.release(closure_bytes);
         let mut configuration_error = None;
         let mut observe = |observation| {
             if configuration_error.is_none() {
