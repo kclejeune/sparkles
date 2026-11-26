@@ -1153,3 +1153,159 @@ fn wait_returns_promptly_when_circuit_failed() {
     drop(tx);
     worker.join().unwrap();
 }
+
+/// An accumulator pass that advances past the requested commit and then fails on a later
+/// delta in the same round leaves `applied >= target` while `failed == true`. Both
+/// immediate-deadline and concurrent timeout paths of `InternalCircuit::wait` must return
+/// `false` rather than reporting success for that failed circuit.
+#[test]
+fn wait_deadline_reports_false_when_accumulator_advances_then_fails() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s, None);
+    let c = rt
+        .attach_internal(
+            &s,
+            InternalSpec::accumulator("tiny-acc", TEAM_FACTS, ["t"]).with_memory(4096),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    // Commit 1 fits comfortably within the 4 KiB budget.
+    upd(&s, "INSERT DATA { :a org:memberOf :t1 . :a :age 1 . }");
+    let c1 = s.snapshot().commit;
+    // Commit 2 blows the memory budget while advancing the join in the same round.
+    let mut big = String::from("INSERT DATA { ");
+    for i in 0..200 {
+        big.push_str(&format!(
+            ":m{i} org:memberOf :t1 . :m{i} :p \"{}\" . ",
+            "v".repeat(64)
+        ));
+    }
+    big.push('}');
+    upd(&s, &big);
+    let c2 = s.snapshot().commit;
+    assert!(c2 > c1);
+
+    // Single round advances commit 1, then fails on commit 2; `clear_state()` preserves
+    // `applied >= c1` while `failed == true`.
+    rt.round(&s);
+    assert!(
+        c.commit() >= c1,
+        "expected accumulator to advance past c1 ({c1}) before failing on c2, got {}",
+        c.commit()
+    );
+    assert!(
+        c.counts(0).is_err(),
+        "accumulator must be failed after budget overrun on commit 2"
+    );
+    assert!(
+        !c.wait(c1, std::time::Duration::ZERO),
+        "wait at zero timeout must return false for failed circuit even when applied >= target"
+    );
+    assert!(!c.wait(c2, std::time::Duration::ZERO));
+
+    // Concurrent worker running the same advance-then-fail round while `wait` expires at
+    // short deadlines must never return `true` for the failed circuit.
+    for _ in 0..8 {
+        let s2 = Arc::new(Store::in_memory(StoreOptions::default()));
+        let rt2 = runtime(&s2, None);
+        let c_conc = rt2
+            .attach_internal(
+                &s2,
+                InternalSpec::accumulator("tiny-acc-conc", TEAM_FACTS, ["t"]).with_memory(4096),
+                InternalAccess::everything(),
+            )
+            .unwrap();
+        upd(&s2, "INSERT DATA { :a org:memberOf :t1 . :a :age 1 . }");
+        let target1 = s2.snapshot().commit;
+        upd(&s2, &big);
+        let s2_w = s2.clone();
+        let rt2_w = rt2.clone();
+        let worker = std::thread::spawn(move || {
+            rt2_w.round(&s2_w);
+        });
+        let ok = c_conc.wait(target1, std::time::Duration::from_micros(200));
+        worker.join().unwrap();
+        assert!(c_conc.counts(0).is_err());
+        assert!(
+            !ok,
+            "wait must never return true when the round fails after advancing past target"
+        );
+        rt2.close(&s2);
+    }
+}
+
+/// Closing a views runtime wakes and exits `wait_built` and `read` promptly with
+/// `views-unavailable` instead of busy-looping until their deadlines (such as the 24-hour
+/// HTTP build task wait).
+#[test]
+fn named_view_waiters_exit_promptly_on_close() {
+    let code = |e: crate::Error| match e {
+        crate::Error::Component(c) => c.code.to_string(),
+        e => e.to_string(),
+    };
+
+    // 1. Already-closed runtime: `wait_built` and `read` return immediately with
+    // `views-unavailable` rather than spinning until timeout.
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s, None);
+    rt.put(&s, "v", ViewDef::table(FACTS)).unwrap();
+    rt.close(&s);
+
+    let started = std::time::Instant::now();
+    let err = rt
+        .wait_built("v", std::time::Duration::from_secs(60))
+        .unwrap_err();
+    assert_eq!(code(err), "views-unavailable");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "wait_built on closed runtime took {:?}",
+        started.elapsed()
+    );
+
+    let snap = s.snapshot();
+    let started = std::time::Instant::now();
+    let read_err = rt
+        .read(&ViewRead {
+            name: "v",
+            at: snap.commit,
+            snap: Some(&snap),
+            allow_stale: false,
+            caller: None,
+            deadline: None,
+            aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: None,
+            max_memory_bytes: None,
+        })
+        .err()
+        .expect("read on closed runtime must fail");
+    assert_eq!(code(read_err), "views-unavailable");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "read on closed runtime took {:?}",
+        started.elapsed()
+    );
+
+    // 2. Concurrent close while a waiter is blocked inside `wait_built` wakes it
+    // immediately instead of spinning for the 60s timeout.
+    let s2 = Arc::new(Store::in_memory(StoreOptions::default()));
+    let rt2 = runtime(&s2, None);
+    rt2.put(&s2, "v", ViewDef::table(FACTS)).unwrap();
+    let s2_close = s2.clone();
+    let rt2_close = rt2.clone();
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        rt2_close.close(&s2_close);
+    });
+    let started = std::time::Instant::now();
+    let err = rt2
+        .wait_built("v", std::time::Duration::from_secs(60))
+        .unwrap_err();
+    closer.join().unwrap();
+    assert_eq!(code(err), "views-unavailable");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "wait_built with concurrent close took {:?}",
+        started.elapsed()
+    );
+}

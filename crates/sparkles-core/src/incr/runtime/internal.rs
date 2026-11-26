@@ -177,7 +177,7 @@ impl InternalCircuit {
             }
             rt.kick();
             if !rt.wait_round_after(epoch, until) {
-                return !self.cell.failed.load(Ordering::Acquire) && self.commit() >= commit;
+                return self.commit() >= commit && !self.cell.failed.load(Ordering::Acquire);
             }
         }
     }

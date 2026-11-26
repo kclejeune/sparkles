@@ -230,6 +230,13 @@ impl Runtime {
         let _operation = Operation::enter();
         let until = Instant::now() + timeout;
         loop {
+            if self.is_closed() {
+                return Err(crate::incr::error(
+                    "views-unavailable",
+                    "the dataset is closing",
+                ));
+            }
+            let epoch = self.round_epoch();
             let mut deferred = DeferredDrops::default();
             let (cell, err) = {
                 let mut reg = self.reg.lock();
@@ -247,9 +254,23 @@ impl Runtime {
             if cell.is_some_and(|c| c.info.lock().status != Status::Building) {
                 break;
             }
+            if self.is_closed() {
+                return Err(crate::incr::error(
+                    "views-unavailable",
+                    "the dataset is closing",
+                ));
+            }
             self.kick();
-            if !self.wait_round(until) && Instant::now() >= until {
-                break;
+            if !self.wait_round_after(epoch, until) {
+                if self.is_closed() {
+                    return Err(crate::incr::error(
+                        "views-unavailable",
+                        "the dataset is closing",
+                    ));
+                }
+                if Instant::now() >= until {
+                    break;
+                }
             }
         }
         let reg = self.reg.lock();

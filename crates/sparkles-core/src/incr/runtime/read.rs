@@ -247,6 +247,12 @@ impl Runtime {
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
             check()?;
+            if self.is_closed() {
+                return Err(crate::incr::error(
+                    "views-unavailable",
+                    "the dataset is closing",
+                ));
+            }
             let host = self.host.read().clone();
             let mode = host.map(|host| (host.aggregate_errors(), host.inference()));
             let step = (Instant::now() + WAIT_STEP).min(until);
@@ -341,18 +347,32 @@ impl Runtime {
                 }
             }
             check()?;
+            if self.is_closed() {
+                return Err(crate::incr::error(
+                    "views-unavailable",
+                    "the dataset is closing",
+                ));
+            }
             self.kick();
             let step = (Instant::now() + WAIT_STEP).min(until);
             let woke = self.wait_round(step);
             check()?;
-            if !woke && Instant::now() >= until {
-                return Err(crate::incr::error(
-                    "view-behind",
-                    format!(
-                        "the view {:?} has not reached commit {} yet; retry, or read it with view:allowStale true",
-                        r.name, r.at
-                    ),
-                ));
+            if !woke {
+                if self.is_closed() {
+                    return Err(crate::incr::error(
+                        "views-unavailable",
+                        "the dataset is closing",
+                    ));
+                }
+                if Instant::now() >= until {
+                    return Err(crate::incr::error(
+                        "view-behind",
+                        format!(
+                            "the view {:?} has not reached commit {} yet; retry, or read it with view:allowStale true",
+                            r.name, r.at
+                        ),
+                    ));
+                }
             }
         }
     }
